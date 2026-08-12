@@ -198,6 +198,8 @@ pub fn resolve_app_dir(path: &str) -> PathBuf {
 
 /// Like [`build_locally`] but streams cargo's output line-by-line to `on_line` as it runs, so a
 /// UI can show a live build log. Returns the built binary path + size on success.
+/// Build with no cancellation — the original signature, unchanged for callers
+/// that have no flag to offer.
 pub fn build_locally_logged(
     app: &str,
     app_dir: &Path,
@@ -205,6 +207,19 @@ pub fn build_locally_logged(
     feats: &[String],
     no_default: bool,
     on_line: &mut dyn FnMut(&str),
+) -> Result<(PathBuf, u64), String> {
+    build_locally_cancellable(app, app_dir, target, feats, no_default, on_line, None)
+}
+
+/// Build, stopping early if `cancel` is set.
+pub fn build_locally_cancellable(
+    app: &str,
+    app_dir: &Path,
+    target: &str,
+    feats: &[String],
+    no_default: bool,
+    on_line: &mut dyn FnMut(&str),
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(PathBuf, u64), String> {
     use std::io::{BufRead, BufReader};
     if !app_dir.join("Cargo.toml").exists() {
@@ -262,13 +277,36 @@ pub fn build_locally_logged(
                 format!("couldn't run the build: {e}")
             }
         })?;
-    // cargo writes progress + errors to stderr; stream it live
+    // cargo writes progress + errors to stderr; stream it live.
+    //
+    // This loop is also where cancellation acts: it runs for the whole build,
+    // so checking the flag per line is the finest granularity available without
+    // a second thread. A cargo build emits lines steadily, so "per line" is in
+    // practice sub-second — and a cancel that waits for the NEXT line is still
+    // vastly better than one that cannot interrupt at all.
+    let mut cancelled = false;
     if let Some(err) = child.stderr.take() {
         for line in BufReader::new(err).lines().map_while(Result::ok) {
+            if cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                // KILL, then keep draining. Dropping the child without killing
+                // leaves cargo running to completion in the background — the
+                // build the user just cancelled still finishes, still writes
+                // its target dir, and still competes for the one CPU.
+                let _ = child.kill();
+                cancelled = true;
+                on_line("build cancelled");
+                break;
+            }
             on_line(&line);
         }
     }
     let status = child.wait().map_err(|e| format!("build wait failed: {e}"))?;
+    if cancelled {
+        // Distinct from a failure: a cancelled build did not fail, and
+        // reporting it as one would put a red error in the log for something
+        // the user chose.
+        return Err(format!("{app}: build cancelled"));
+    }
     if status.success() {
         let bin = resolve_binary(&cargo, app_dir, &cargo_target, &build_id, Some(&build_dir.display().to_string()));
         // A MISSING ARTIFACT IS A FAILURE, not a zero-byte success. This used

@@ -117,14 +117,23 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             }
             ui.label(egui::RichText::new(&label).monospace());
 
-            if ui.add_enabled(!app.task.is_running(), egui::Button::new("run").small()).clicked() {
+            // ALWAYS ENABLED, even mid-build. `run_local` SPAWNS and returns —
+            // it does not wait for the app to exit — so it never needed the
+            // background task slot at all, and taking it meant a build made the
+            // whole app list unlaunchable for minutes.
+            //
+            // Running it inline is also what keeps the two independent: through
+            // `task.run` a launch would queue behind the build it is unrelated
+            // to, and would then be REFUSED rather than queued, because claim()
+            // returns false rather than waiting.
+            if ui.button("run").clicked() {
                 // Run THIS version, not whichever is current — the whole point
                 // of pinning several is being able to run an old one.
                 let target = format!("{name}@{label}");
-                app.task.run(move || match cockpit::flow::run_local(&target, "") {
+                app.apps.note = match cockpit::flow::run_local(&target, "") {
                     Ok(m) => m,
                     Err(e) => format!("error: {e}"),
-                });
+                };
             }
             if !is_current && ui.small_button("make current").clicked() {
                 match gitmind_core::binpin::use_version(&name, &label) {
