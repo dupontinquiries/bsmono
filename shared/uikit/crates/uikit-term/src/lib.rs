@@ -868,7 +868,7 @@ pub fn render_grid(
         let accent = filt(colors.accent);
         painter.rect_filled(rect, 2.0, accent.gamma_multiply(if h.active { 0.35 } else { 0.18 }));
         if h.active {
-            painter.rect_stroke(rect, egui::CornerRadius::same(2), egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+            painter.rect_stroke(rect, egui::CornerRadius::same(2), egui::Stroke::new(1.0_f32, accent), egui::StrokeKind::Outside);
         }
     }
 
@@ -888,7 +888,7 @@ pub fn render_grid(
         painter.rect_stroke(
             galley_rect.expand(2.0),
             egui::CornerRadius::same(4),
-            egui::Stroke::new(1.0, filt(colors.accent)),
+            egui::Stroke::new(1.0_f32, filt(colors.accent)),
             egui::StrokeKind::Outside,
         );
     }

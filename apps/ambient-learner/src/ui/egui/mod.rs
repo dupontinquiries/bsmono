@@ -213,7 +213,7 @@ impl LiveView {
                 egui::pos2(x, y)
             })
             .collect();
-        ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.5, ui.visuals().selection.bg_fill)));
+        ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, ui.visuals().selection.bg_fill)));
     }
 }
 

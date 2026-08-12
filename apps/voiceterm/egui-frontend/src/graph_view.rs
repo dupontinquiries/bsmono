@@ -170,7 +170,7 @@ pub fn graph_ui(ui: &mut Ui, view: &mut GraphView, topo: &nifty::Topology,
     for (id, pos, _) in &placed {
         for nb in topo.neighbors(id) {
             if let Some(q) = at(&nb) {
-                p.line_segment([*pos, q], Stroke::new(1.0, colors.border.gamma_multiply(0.5)));
+                p.line_segment([*pos, q], Stroke::new(1.0_f32, colors.border.gamma_multiply(0.5)));
             }
         }
     }

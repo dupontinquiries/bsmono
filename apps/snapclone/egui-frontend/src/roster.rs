@@ -166,7 +166,7 @@ pub fn roster_ui(ui: &mut egui::Ui, r: &Roster, c: &uikit_egui::PaletteColors) {
             let radius = if speaking { base + 4.0 * r.ring_level() } else { base };
             let col = if speaking { c.accent } else { c.text_weak };
             ui.painter().circle_stroke(rect.center(), radius,
-                                       egui::Stroke::new(2.0, col));
+                                       egui::Stroke::new(2.0_f32, col));
             let name = if p.is_self { format!("{} (you)", p.label()) } else { p.label() };
             ui.colored_label(if speaking { c.text } else { c.text_weak }, name);
         });

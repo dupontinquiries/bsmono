@@ -178,7 +178,7 @@ pub fn canvas(
         if hz < axes.f_min || hz > axes.f_max { continue; }
         let x = axes.pos(&rect, hz, 0.0).x;
         p.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-                       Stroke::new(1.0, colors.border.gamma_multiply(0.35)));
+                       Stroke::new(1.0_f32, colors.border.gamma_multiply(0.35)));
         let label = if hz >= 1000.0 { format!("{:.0}k", hz / 1000.0) } else { format!("{hz:.0}") };
         p.text(Pos2::new(x + 3.0, rect.max.y - 13.0), egui::Align2::LEFT_TOP,
                label, egui::FontId::monospace(9.0), colors.text_weak.gamma_multiply(0.8));
@@ -187,7 +187,7 @@ pub fn canvas(
         if db < axes.db_min || db > axes.db_max { continue; }
         let y = axes.pos(&rect, axes.f_min, db).y;
         p.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
-                       Stroke::new(1.0, colors.border.gamma_multiply(if db == 0.0 { 0.6 } else { 0.22 })));
+                       Stroke::new(1.0_f32, colors.border.gamma_multiply(if db == 0.0 { 0.6 } else { 0.22 })));
     }
 
     // ── the signal ──────────────────────────────────────────────────────────
@@ -201,7 +201,7 @@ pub fn canvas(
             let y = rect.min.y + axes.db_to_norm(*db) * rect.height();
             let t = 1.0 - axes.db_to_norm(*db);
             p.line_segment([Pos2::new(x, rect.max.y), Pos2::new(x, y)],
-                           Stroke::new(1.0, colors.accent.gamma_multiply(0.18 + t * 0.5)));
+                           Stroke::new(1.0_f32, colors.accent.gamma_multiply(0.18 + t * 0.5)));
         }
     }
     rect
@@ -227,14 +227,14 @@ pub fn eq_overlay(
         pts.push(axes.pos(rect, hz, db));
     }
     for pair in pts.windows(2) {
-        p.line_segment([pair[0], pair[1]], Stroke::new(2.0, colors.accent));
+        p.line_segment([pair[0], pair[1]], Stroke::new(2.0_f32, colors.accent));
     }
     for (i, n) in nodes.iter().enumerate() {
         let c = axes.pos(rect, n.hz, n.gain_db);
         let on = Some(i) == selected;
         let col = if n.enabled { colors.accent } else { colors.text_weak };
         p.circle_filled(c, if on { 7.0 } else { 5.0 }, col);
-        p.circle_stroke(c, if on { 7.0 } else { 5.0 }, Stroke::new(1.5, colors.bg_base));
+        p.circle_stroke(c, if on { 7.0 } else { 5.0 }, Stroke::new(1.5_f32, colors.bg_base));
     }
 }
 

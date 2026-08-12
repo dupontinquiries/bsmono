@@ -86,7 +86,7 @@ pub fn draw_theme_picker(ui: &mut egui::Ui, prefs: &mut ReaderPrefs, colors: &Pa
                 ui.painter().rect_stroke(
                     rect,
                     egui::CornerRadius::same(6),
-                    egui::Stroke::new(2.0, colors.accent),
+                    egui::Stroke::new(2.0_f32, colors.accent),
                     egui::StrokeKind::Inside,
                 );
             }

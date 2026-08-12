@@ -65,12 +65,12 @@ pub fn key_fill_pressed(accent: Color32) -> Color32 {
 
 /// Border stroke for a standard glass key.
 pub fn key_border(border: Color32) -> Stroke {
-    Stroke::new(1.0, tint(border, GlassAlphas::BORDER))
+    Stroke::new(1.0_f32, tint(border, GlassAlphas::BORDER))
 }
 
 /// Border stroke for a modifier/special key (softer than a standard key's).
 pub fn key_border_soft(border: Color32) -> Stroke {
-    Stroke::new(1.0, tint(border, GlassAlphas::BORDER_SOFT))
+    Stroke::new(1.0_f32, tint(border, GlassAlphas::BORDER_SOFT))
 }
 
 /// Fill for a strip that must stay legible (e.g. a text/log strip) rather than glassy.
@@ -82,7 +82,7 @@ pub fn opaque_strip_fill(bg_base: Color32) -> Color32 {
 /// surface's one allowed embellishment, drawn as a 1px line rather than an inset shadow (which forces
 /// offscreen compositing; see the CSS comment this ports from).
 pub fn paint_top_hairline(ui: &Ui, rect: Rect) {
-    let stroke = Stroke::new(1.0, Color32::from_white_alpha(GlassAlphas::HAIRLINE));
+    let stroke = Stroke::new(1.0_f32, Color32::from_white_alpha(GlassAlphas::HAIRLINE));
     ui.painter().hline(rect.x_range(), rect.top(), stroke);
 }
 
@@ -93,7 +93,7 @@ pub fn paint_top_hairline(ui: &Ui, rect: Rect) {
 pub fn glass_key(ui: &mut Ui, rect: Rect, label: &str, bg_card: Color32, border: Color32, accent: Color32, text: Color32, modifier: bool) -> egui::Response {
     let resp = ui.interact(rect, ui.id().with(label), Sense::click());
     let (fill, stroke) = if resp.is_pointer_button_down_on() {
-        (key_fill_pressed(accent), Stroke::new(1.0, tint(border, GlassAlphas::BORDER)))
+        (key_fill_pressed(accent), Stroke::new(1.0_f32, tint(border, GlassAlphas::BORDER)))
     } else if modifier {
         if resp.hovered() { (key_fill_modifier_hover(bg_card), key_border_soft(border)) } else { (key_fill_modifier(bg_card), key_border_soft(border)) }
     } else if resp.hovered() {

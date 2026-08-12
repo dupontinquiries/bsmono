@@ -1170,14 +1170,14 @@ pub fn r(n: u8) -> CornerRadius { CornerRadius::same(n) }
 /// seconds; `glow` is the accent (pass the clock-driven light so it rides the day cycle).
 pub fn carved_tab(painter: &egui::Painter, rect: egui::Rect, t: f32, active: bool, glow: Color32) {
     let q = rect.shrink(1.0);
-    let seg = |a: Pos2, b: Pos2, c: Color32| painter.line_segment([a, b], Stroke::new(1.0, c));
+    let seg = |a: Pos2, b: Pos2, c: Color32| painter.line_segment([a, b], Stroke::new(1.0_f32, c));
     seg(q.left_bottom(), q.left_top(), Color32::from_white_alpha(22));   // bevel: lit top-left
     seg(q.left_top(), q.right_top(), Color32::from_white_alpha(22));
     seg(q.right_top(), q.right_bottom(), Color32::from_black_alpha(50)); //        shadowed bottom-right
     seg(q.left_bottom(), q.right_bottom(), Color32::from_black_alpha(50));
     if active {
         let pulse = 0.5 + 0.5 * (t * 2.2).sin();
-        painter.rect_stroke(q, r(3), Stroke::new(1.3, alpha_col(glow, (45.0 + 55.0 * pulse) as u8)), StrokeKind::Inside);
+        painter.rect_stroke(q, r(3), Stroke::new(1.3_f32, alpha_col(glow, (45.0 + 55.0 * pulse) as u8)), StrokeKind::Inside);
         let sx = q.left() + q.width() * (t * 0.5).fract();                // light sweep across the engraving
         let (l, rg) = ((sx - 7.0).max(q.left()), (sx + 7.0).min(q.right()));
         if rg > l { painter.rect_filled(egui::Rect::from_min_max(Pos2::new(l, q.top()), Pos2::new(rg, q.bottom())), r(0), alpha_col(glow, 22)); }
@@ -1230,14 +1230,14 @@ fn paint_carved(p: &egui::Painter, rect: egui::Rect, t: f32, c: Carved) {
 
     // directional bevel — lit top-left, shadowed bottom-right (same idiom as carved_tab)
     let q = rect.shrink(0.7);
-    let seg = |a: Pos2, b: Pos2, col: Color32| p.line_segment([a, b], Stroke::new(1.0, col));
+    let seg = |a: Pos2, b: Pos2, col: Color32| p.line_segment([a, b], Stroke::new(1.0_f32, col));
     let lit = Color32::from_white_alpha(if c.enabled { sk.bevel_lit } else { sk.bevel_lit / 2 + 1 });
     seg(q.left_bottom(), q.left_top(), lit);
     seg(q.left_top(), q.right_top(), lit);
     seg(q.right_top(), q.right_bottom(), Color32::from_black_alpha(sk.bevel_shadow));
     seg(q.left_bottom(), q.right_bottom(), Color32::from_black_alpha(sk.bevel_shadow));
     let rim = lerp_col(pal.line, accent.unwrap_or(pal.line), c.hov);
-    p.rect_stroke(rect, rr, Stroke::new(1.0, rim), StrokeKind::Inside);
+    p.rect_stroke(rect, rr, Stroke::new(1.0_f32, rim), StrokeKind::Inside);
 
     // specular / moisture sheen — soft bright spot toward the sun, shimmering, brighter on hover
     let sheen = c.sheen * sk.sheen;
@@ -1267,7 +1267,7 @@ fn paint_carved(p: &egui::Painter, rect: egui::Rect, t: f32, c: Carved) {
     if let (Some(a), true) = (accent, c.hov > 0.01 || c.down) {
         let pulse = 0.5 + 0.5 * (t * 2.4).sin();
         let amt = if c.down { 1.0 } else { c.hov };
-        p.rect_stroke(rect, rr, Stroke::new(1.3, alpha_col(a, ((45.0 + 55.0 * pulse) * amt) as u8)), StrokeKind::Inside);
+        p.rect_stroke(rect, rr, Stroke::new(1.3_f32, alpha_col(a, ((45.0 + 55.0 * pulse) * amt) as u8)), StrokeKind::Inside);
     }
 }
 
@@ -1346,7 +1346,7 @@ pub fn switch(ui: &mut egui::Ui, on: &mut bool, accent: Color32) -> bool {
     let t = ui.ctx().animate_bool(resp.id, *on);
     let p = ui.painter();
     p.rect_filled(rect, r(9), lerp_col(PANEL2(), accent, t));
-    p.rect_stroke(rect, r(9), Stroke::new(1.0, lerp_col(LINE(), accent, t)), StrokeKind::Inside);
+    p.rect_stroke(rect, r(9), Stroke::new(1.0_f32, lerp_col(LINE(), accent, t)), StrokeKind::Inside);
     let x = egui::lerp((rect.left() + 9.0)..=(rect.right() - 9.0), t);
     p.circle_filled(Pos2::new(x, rect.center().y), 6.5, lerp_col(INK(), Color32::WHITE, t));
     changed
@@ -1452,7 +1452,7 @@ impl Toaster {
                         // clearer separation between stacked toasts so a burst doesn't read as one slab
                         outer_margin: Margin { bottom: 10, ..Default::default() },
                         fill: PANEL2().gamma_multiply(a),
-                        stroke: Stroke::new(1.0, t.accent.gamma_multiply(0.7 * a)),
+                        stroke: Stroke::new(1.0_f32, t.accent.gamma_multiply(0.7 * a)),
                         corner_radius: r(10),
                         shadow: glow(t.accent, 0.4 * a),
                         ..Default::default()
@@ -1489,7 +1489,7 @@ pub fn install(ctx: &Context) {
     v.override_text_color = Some(INK());
     v.panel_fill = BG();
     v.window_fill = PANEL();
-    v.window_stroke = Stroke::new(1.0, LINE());
+    v.window_stroke = Stroke::new(1.0_f32, LINE());
     v.window_corner_radius = r(12);
     v.menu_corner_radius = r(10);
     v.extreme_bg_color = TRACK_BG();
@@ -1499,27 +1499,27 @@ pub fn install(ctx: &Context) {
     v.error_fg_color = RED();
     // selection reads cyan (status colour), distinct from the amber action accent.
     v.selection.bg_fill = CYAN().gamma_multiply(0.22);
-    v.selection.stroke = Stroke::new(1.0, CYAN());
+    v.selection.stroke = Stroke::new(1.0_f32, CYAN());
 
     // Idle panels read as the card colour; hover glows amber; active flips to the
     // amber "button" look. Mild rounding keeps the chrome consistent with cards.
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive] {
         w.bg_fill = PANEL();
         w.weak_bg_fill = PANEL2();
-        w.bg_stroke = Stroke::new(1.0, LINE());
+        w.bg_stroke = Stroke::new(1.0_f32, LINE());
         w.corner_radius = r(6);
     }
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, INK());
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, DIM());
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, INK());
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, DIM());
     v.widgets.hovered.bg_fill = AMBER_INK();
     v.widgets.hovered.weak_bg_fill = AMBER_INK();
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, AMBER());
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, AMBER_SOFT());
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, AMBER());
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, AMBER_SOFT());
     v.widgets.hovered.corner_radius = r(6);
     v.widgets.active.bg_fill = AMBER();
     v.widgets.active.weak_bg_fill = AMBER();
-    v.widgets.active.bg_stroke = Stroke::new(1.0, AMBER());
-    v.widgets.active.fg_stroke = Stroke::new(1.0, AMBER_INK());
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, AMBER());
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, AMBER_INK());
     v.widgets.active.corner_radius = r(6);
     style.visuals = v;
 
@@ -1583,7 +1583,7 @@ pub fn card(ui: &mut egui::Ui, accent: Color32, title: Option<&str>, body: impl 
         inner_margin: Margin::same(14),
         outer_margin: Margin { bottom: 12, ..Default::default() },
         fill: PANEL(),
-        stroke: Stroke::new(1.0, LINE()),
+        stroke: Stroke::new(1.0_f32, LINE()),
         corner_radius: r(12),
         shadow: glow(accent, 0.45),
         ..Default::default()
@@ -1620,8 +1620,8 @@ fn rune_mark(p: &egui::Painter, c: Pos2, s: f32, col: Color32, seed: u32, glow: 
         let seg = strokes[(seed as usize + k) % strokes.len()];
         let a = c + egui::vec2(seg[0].0 * s, seg[0].1 * s);
         let b = c + egui::vec2(seg[1].0 * s, seg[1].1 * s);
-        p.line_segment([a, b], Stroke::new(2.6, halo));
-        p.line_segment([a, b], Stroke::new(1.0, core));
+        p.line_segment([a, b], Stroke::new(2.6_f32, halo));
+        p.line_segment([a, b], Stroke::new(1.0_f32, core));
     }
 }
 
@@ -1635,10 +1635,10 @@ fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: Color32) {
     let shadow = Color32::from_black_alpha(sk.bevel_shadow);
     for inset in [0.8_f32, 2.6] {
         let q = rect.shrink(inset);
-        p.line_segment([q.left_bottom(), q.left_top()], Stroke::new(1.0, lit));
-        p.line_segment([q.left_top(), q.right_top()], Stroke::new(1.0, lit));
-        p.line_segment([q.right_top(), q.right_bottom()], Stroke::new(1.0, shadow));
-        p.line_segment([q.left_bottom(), q.right_bottom()], Stroke::new(1.0, shadow));
+        p.line_segment([q.left_bottom(), q.left_top()], Stroke::new(1.0_f32, lit));
+        p.line_segment([q.left_top(), q.right_top()], Stroke::new(1.0_f32, lit));
+        p.line_segment([q.right_top(), q.right_bottom()], Stroke::new(1.0_f32, shadow));
+        p.line_segment([q.left_bottom(), q.right_bottom()], Stroke::new(1.0_f32, shadow));
     }
     // grain along the top + bottom border bands so the frame reads as stone, not a drawn line
     if pal.material != Material::None {
@@ -1677,17 +1677,17 @@ pub fn carved_trough(p: &egui::Painter, rect: egui::Rect, _t: f32) {
     // inverted bevel: shadow on the top/left lip you look over, light on the bottom/right floor
     for inset in [0.8_f32, 2.6] {
         let q = rect.shrink(inset);
-        p.line_segment([q.left_top(), q.right_top()], Stroke::new(1.0, shadow));
-        p.line_segment([q.left_bottom(), q.left_top()], Stroke::new(1.0, shadow));
-        p.line_segment([q.right_top(), q.right_bottom()], Stroke::new(1.0, lit));
-        p.line_segment([q.left_bottom(), q.right_bottom()], Stroke::new(1.0, lit));
+        p.line_segment([q.left_top(), q.right_top()], Stroke::new(1.0_f32, shadow));
+        p.line_segment([q.left_bottom(), q.left_top()], Stroke::new(1.0_f32, shadow));
+        p.line_segment([q.right_top(), q.right_bottom()], Stroke::new(1.0_f32, lit));
+        p.line_segment([q.left_bottom(), q.right_bottom()], Stroke::new(1.0_f32, lit));
     }
     // soft inner cast-shadow band under the top lip — sells the depth of the recess
     let q = rect.shrink(2.6);
     for i in 0..5 {
         let a = (34.0 * (1.0 - i as f32 / 5.0)) as u8;
         let y = q.top() + i as f32 * 1.5;
-        p.line_segment([egui::pos2(q.left(), y), egui::pos2(q.right(), y)], Stroke::new(1.5, Color32::from_black_alpha(a)));
+        p.line_segment([egui::pos2(q.left(), y), egui::pos2(q.right(), y)], Stroke::new(1.5_f32, Color32::from_black_alpha(a)));
     }
     // material grain along the top + bottom edge bands so the recess reads as stone (not over the text)
     if pal.material != Material::None {
@@ -1710,7 +1710,7 @@ pub fn panel(ui: &mut egui::Ui, accent: Color32, title: &str, copy: Option<Strin
         inner_margin: Margin::same(16),
         outer_margin: Margin { bottom: 14, ..Default::default() },
         fill: alpha_col(PANEL(), 236),     // a touch translucent so the scene reads faintly through the stone
-        stroke: Stroke::new(1.0, LINE()),
+        stroke: Stroke::new(1.0_f32, LINE()),
         corner_radius: r(12),
         shadow: glow(accent, 0.45),
         ..Default::default()
@@ -1752,7 +1752,7 @@ pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
     Frame {
         inner_margin: Margin { left: 9, right: 9, top: 3, bottom: 3 },
         fill: Color32::TRANSPARENT,
-        stroke: Stroke::new(1.0, color),
+        stroke: Stroke::new(1.0_f32, color),
         corner_radius: r(10),
         ..Default::default()
     }
@@ -1789,7 +1789,7 @@ pub fn stat_tile(ui: &mut egui::Ui, label: &str, value: &str, accent: Color32) {
     Frame {
         inner_margin: Margin::symmetric(14, 10),
         fill: PANEL2(),
-        stroke: Stroke::new(1.0, LINE()),
+        stroke: Stroke::new(1.0_f32, LINE()),
         corner_radius: r(10),
         ..Default::default()
     }
@@ -1811,7 +1811,7 @@ pub fn list_item(ui: &mut egui::Ui, selected: bool, body: impl FnOnce(&mut egui:
         inner_margin: Margin { left: 10, right: 10, top: 8, bottom: 8 },
         outer_margin: Margin { bottom: 5, ..Default::default() },
         fill,
-        stroke: Stroke::new(1.0, stroke),
+        stroke: Stroke::new(1.0_f32, stroke),
         corner_radius: r(8),
         ..Default::default()
     }
@@ -1822,7 +1822,7 @@ pub fn list_item(ui: &mut egui::Ui, selected: bool, body: impl FnOnce(&mut egui:
     let resp = inner.response.interact(Sense::click());
     let t = ui.ctx().animate_bool(resp.id, resp.hovered());
     if t > 0.0 && !selected {
-        ui.painter().rect_stroke(resp.rect, r(8), Stroke::new(1.0, AMBER().gamma_multiply(0.45 * t)), StrokeKind::Inside);
+        ui.painter().rect_stroke(resp.rect, r(8), Stroke::new(1.0_f32, AMBER().gamma_multiply(0.45 * t)), StrokeKind::Inside);
     }
     resp.clicked()
 }
@@ -1834,7 +1834,7 @@ pub fn event_pill(ui: &mut egui::Ui, kind: &str, count: usize, spike: bool) {
     Frame {
         inner_margin: Margin { left: 9, right: 9, top: 4, bottom: 4 },
         fill: TRACK_BG(),
-        stroke: Stroke::new(1.0, LINE()),
+        stroke: Stroke::new(1.0_f32, LINE()),
         corner_radius: r(6),
         ..Default::default()
     }
@@ -1862,19 +1862,19 @@ pub fn metric_track(
         fr.set_width(rect.width() * f);
         p.rect_filled(fr, r(4), if over { RED() } else { accent });
     }
-    p.rect_stroke(rect, r(4), Stroke::new(1.0, LINE()), StrokeKind::Inside);
+    p.rect_stroke(rect, r(4), Stroke::new(1.0_f32, LINE()), StrokeKind::Inside);
     let x_at = |v: f32| rect.left() + v.clamp(0.0, 1.0) * rect.width();
     if let Some(b) = budget {
         let x = x_at(b);
-        p.line_segment([Pos2::new(x, rect.top() - 3.0), Pos2::new(x, rect.bottom() + 3.0)], Stroke::new(1.0, FAINT()));
+        p.line_segment([Pos2::new(x, rect.top() - 3.0), Pos2::new(x, rect.bottom() + 3.0)], Stroke::new(1.0_f32, FAINT()));
     }
     if let Some(mx) = maxf {
         let x = x_at(mx);
-        p.line_segment([Pos2::new(x, rect.top() + 3.0), Pos2::new(x, rect.bottom() - 3.0)], Stroke::new(2.0, MAXMARK()));
+        p.line_segment([Pos2::new(x, rect.top() + 3.0), Pos2::new(x, rect.bottom() - 3.0)], Stroke::new(2.0_f32, MAXMARK()));
     }
     if let Some(wk) = whisker {
         let x = x_at(wk);
-        p.line_segment([Pos2::new(x, rect.top() - 2.0), Pos2::new(x, rect.bottom() + 2.0)], Stroke::new(2.0, WHISKER()));
+        p.line_segment([Pos2::new(x, rect.top() - 2.0), Pos2::new(x, rect.bottom() + 2.0)], Stroke::new(2.0_f32, WHISKER()));
     }
 }
 

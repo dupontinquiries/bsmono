@@ -213,7 +213,7 @@ pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
                 let g = c.success;
                 egui::Color32::from_rgba_unmultiplied(g.r(), g.g(), g.b(), (255.0 * lit) as u8)
             } else { c.border };
-            ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(2.0, border),
+            ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(2.0_f32, border),
                                      egui::StrokeKind::Inside);
         }
         let status_col = if matches!(s.phase, Phase::Found { .. } | Phase::Done(_)) {

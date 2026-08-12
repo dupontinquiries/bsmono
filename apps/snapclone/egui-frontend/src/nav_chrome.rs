@@ -223,7 +223,7 @@ pub fn strip_ui(ui: &mut egui::Ui, s: &TabStrip, c: &uikit_egui::PaletteColors) 
     let y = ui.cursor().min.y - 2.0;
     ui.painter().line_segment(
         [egui::pos2(start.x + x + 2.0, y), egui::pos2(start.x + x + uw - 2.0, y)],
-        egui::Stroke::new(2.0, c.accent));
+        egui::Stroke::new(2.0_f32, c.accent));
     picked
 }
 
@@ -242,15 +242,15 @@ pub fn peel_ui(ui: &mut egui::Ui, h: &mut PeelHint, rect: egui::Rect,
     let p = ui.painter();
     if e.left {
         p.line_segment([egui::pos2(rect.left() + 2.0, mid - 16.0),
-                        egui::pos2(rect.left() + 8.0, mid)], egui::Stroke::new(2.0, col));
+                        egui::pos2(rect.left() + 8.0, mid)], egui::Stroke::new(2.0_f32, col));
         p.line_segment([egui::pos2(rect.left() + 8.0, mid),
-                        egui::pos2(rect.left() + 2.0, mid + 16.0)], egui::Stroke::new(2.0, col));
+                        egui::pos2(rect.left() + 2.0, mid + 16.0)], egui::Stroke::new(2.0_f32, col));
     }
     if e.right {
         p.line_segment([egui::pos2(rect.right() - 2.0, mid - 16.0),
-                        egui::pos2(rect.right() - 8.0, mid)], egui::Stroke::new(2.0, col));
+                        egui::pos2(rect.right() - 8.0, mid)], egui::Stroke::new(2.0_f32, col));
         p.line_segment([egui::pos2(rect.right() - 8.0, mid),
-                        egui::pos2(rect.right() - 2.0, mid + 16.0)], egui::Stroke::new(2.0, col));
+                        egui::pos2(rect.right() - 2.0, mid + 16.0)], egui::Stroke::new(2.0_f32, col));
     }
 }
 

@@ -165,7 +165,7 @@ pub fn reticle_ui(ui: &mut egui::Ui, r: &Reticle, view: egui::Rect,
     let col = egui::Color32::from_rgba_unmultiplied(
         col.r(), col.g(), col.b(), (a * 255.0) as u8);
     ui.painter().rect_stroke(egui::Rect::from_center_size(centre, egui::vec2(size, size)),
-                             4.0, egui::Stroke::new(2.0, col), egui::StrokeKind::Middle);
+                             4.0, egui::Stroke::new(2.0_f32, col), egui::StrokeKind::Middle);
 }
 
 #[cfg(test)]

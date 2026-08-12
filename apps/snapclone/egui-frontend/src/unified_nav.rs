@@ -85,7 +85,7 @@ impl UnifiedNav {
                     cur.1 += (target.1 - cur.1) * 0.25;
                     let y = ui.min_rect().bottom() + 2.0;
                     ui.painter().line_segment(
-                        [Pos2::new(cur.0, y), Pos2::new(cur.1, y)], Stroke::new(2.0, accent));
+                        [Pos2::new(cur.0, y), Pos2::new(cur.1, y)], Stroke::new(2.0_f32, accent));
                     if (cur.0 - target.0).abs() > 0.5 { ui.ctx().request_repaint(); }
                 }
                 ui.add_space(ui.available_width().max(0.0)); // stretch: keep › at the right edge

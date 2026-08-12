@@ -127,7 +127,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         for &a in &am.anchors {
             let x = rect.left() + rect.width() * (a as f32 / n as f32);
             p.line_segment([egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
-                           egui::Stroke::new(1.0, ui.visuals().hyperlink_color));
+                           egui::Stroke::new(1.0_f32, ui.visuals().hyperlink_color));
         }
         ui.label(egui::RichText::new("full decode + A/B comparison are the next Player slices; this lands the seek foundation the GTK app's playback fix depends on").weak().small());
     }

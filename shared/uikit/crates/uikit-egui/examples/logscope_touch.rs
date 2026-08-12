@@ -123,7 +123,7 @@ impl eframe::App for Demo {
                 let state = if i == self.focus { carved::State::Down } else { carved::State::Rest };
                 carved::paint_carved(ui, rect, c.bg_card, c.accent, &self.skin, state, 0.0);
                 if i == self.focus {
-                    painter.rect_stroke(rect, egui::Rounding::same(8.0), Stroke::new(1.0, c.accent));
+                    painter.rect_stroke(rect, egui::Rounding::same(8.0), Stroke::new(1.0_f32, c.accent));
                 }
                 let vc = match self.nodes[i].verdict {
                     Verdict::Ok => c.success,

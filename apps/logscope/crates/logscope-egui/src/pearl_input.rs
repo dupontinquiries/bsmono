@@ -109,8 +109,8 @@ impl PearlInput {
                 for (bi, off) in blur.iter().enumerate() {
                     let edge = nacre(frac, if bi == 0 { 0.12 } else { 0.045 });
                     let (a, b) = (*off, *off);
-                    if i + 1 <= fcn { p.line_segment([p00 + a, node(i + 1, j) + b], egui::Stroke::new(0.9, edge)); }
-                    if j + 1 <= frn { p.line_segment([p00 + a, node(i, j + 1) + b], egui::Stroke::new(0.9, edge)); }
+                    if i + 1 <= fcn { p.line_segment([p00 + a, node(i + 1, j) + b], egui::Stroke::new(0.9_f32, edge)); }
+                    if j + 1 <= frn { p.line_segment([p00 + a, node(i, j + 1) + b], egui::Stroke::new(0.9_f32, edge)); }
                 }
             }
         }
@@ -121,8 +121,8 @@ impl PearlInput {
             let prog = 1.0 - self.ripple_t;
             let rad = prog * rect.width() * 0.6;
             let a = self.ripple_t * 0.7;
-            p.circle_stroke(cen, rad, egui::Stroke::new(2.0, nacre(prog, a)));
-            p.circle_stroke(cen, rad * 0.7, egui::Stroke::new(1.2, nacre(prog + 0.3, a * 0.7)));
+            p.circle_stroke(cen, rad, egui::Stroke::new(2.0_f32, nacre(prog, a)));
+            p.circle_stroke(cen, rad * 0.7, egui::Stroke::new(1.2_f32, nacre(prog + 0.3, a * 0.7)));
         }
 
 
@@ -236,7 +236,7 @@ impl PearlInput {
         for s in 0..6 {
             let f = s as f32 / 6.0;
             let a = (34.0 * (1.0 - f)) as u8;
-            p.rect_stroke(rect.shrink(1.0 + f * 4.0), egui::CornerRadius::same(cr), egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(0, 0, 0, a)), egui::StrokeKind::Inside);
+            p.rect_stroke(rect.shrink(1.0 + f * 4.0), egui::CornerRadius::same(cr), egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, a)), egui::StrokeKind::Inside);
         }
 
         // hint when empty

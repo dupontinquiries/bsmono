@@ -142,7 +142,7 @@ impl Toasts {
                 // panel: the reference's dark neutral, NOT theme bg — toasts read the same on
                 // every palette
                 painter.rect_filled(rect, CornerRadius::same(8), a(Color32::from_rgba_unmultiplied(26, 26, 31, 235)));
-                painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, a(ui.visuals().widgets.noninteractive.bg_stroke.color)), StrokeKind::Inside);
+                painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0_f32, a(ui.visuals().widgets.noninteractive.bg_stroke.color)), StrokeKind::Inside);
                 if let Some(sc) = strip {
                     let s = egui::Rect::from_min_size(
                         egui::pos2(rect.left() + 1.0, rect.top() + 1.0),

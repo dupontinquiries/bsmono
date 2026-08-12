@@ -370,7 +370,7 @@ impl eframe::App for App {
                     }
                     painter.add(egui::Shape::line(
                         pts,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 220, 160)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 220, 160)),
                     ));
                 }
             });
@@ -386,7 +386,7 @@ impl eframe::App for App {
 
             // background grid
             painter.rect_filled(rect, 6.0, egui::Color32::from_gray(24));
-            let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(40));
+            let grid = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(40));
             for k in 1..6 {
                 let fx = rect.left() + rect.width() * k as f32 / 6.0;
                 let fy = rect.top() + rect.height() * k as f32 / 6.0;
@@ -394,7 +394,7 @@ impl eframe::App for App {
                 painter.line_segment([egui::pos2(rect.left(), fy), egui::pos2(rect.right(), fy)], grid);
             }
             // center crosshair
-            let axis = egui::Stroke::new(1.0, egui::Color32::from_gray(70));
+            let axis = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70));
             painter.line_segment(
                 [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
                 axis,
@@ -442,14 +442,14 @@ impl eframe::App for App {
             // A / B markers
             let pa = to_pad(self.z_a.first().copied().unwrap_or(0.0), self.z_a.get(1).copied().unwrap_or(0.0));
             let pb = to_pad(self.z_b.first().copied().unwrap_or(0.0), self.z_b.get(1).copied().unwrap_or(0.0));
-            painter.circle_stroke(pa, 7.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 160, 255)));
+            painter.circle_stroke(pa, 7.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(90, 160, 255)));
             painter.text(pa + egui::vec2(10.0, -10.0), egui::Align2::LEFT_CENTER, "A",
                 egui::FontId::proportional(14.0), egui::Color32::from_rgb(90, 160, 255));
-            painter.circle_stroke(pb, 7.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 150, 90)));
+            painter.circle_stroke(pb, 7.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 150, 90)));
             painter.text(pb + egui::vec2(10.0, -10.0), egui::Align2::LEFT_CENTER, "B",
                 egui::FontId::proportional(14.0), egui::Color32::from_rgb(255, 150, 90));
             // A->B guide line
-            painter.line_segment([pa, pb], egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+            painter.line_segment([pa, pb], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)));
 
             // current position glow
             let cur = to_pad(current_z.first().copied().unwrap_or(0.0), current_z.get(1).copied().unwrap_or(0.0));

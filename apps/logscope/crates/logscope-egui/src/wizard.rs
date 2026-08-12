@@ -99,7 +99,7 @@ impl Wizard {
                 fill: theme::PANEL(),
                 corner_radius: theme::r(14),
                 inner_margin: egui::Margin::same(22),
-                stroke: egui::Stroke::new(1.0, theme::LINE()),
+                stroke: egui::Stroke::new(1.0_f32, theme::LINE()),
                 ..Default::default()
             })
             .order(egui::Order::Foreground)

@@ -69,7 +69,7 @@ impl ReplVoiceGlow {
                 let halo_col = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (halo * 255.0) as u8);
                 egui::Frame::popup(ui.style())
                     .fill(Color32::from_rgb(18, 23, 31))
-                    .stroke(egui::Stroke::new(1.5, halo_col))
+                    .stroke(egui::Stroke::new(1.5_f32, halo_col))
                     .corner_radius(14)
                     .inner_margin(egui::Margin::same(14))
                     .show(ui, |ui| {

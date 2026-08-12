@@ -178,7 +178,7 @@ pub fn timeline(
         if x > rect.max.x { break; }
         if x < origin.x + view.gutter { continue; }
         painter.line_segment([Pos2::new(x, origin.y + RULER_H - 6.0), Pos2::new(x, origin.y + RULER_H)],
-                             Stroke::new(1.0, colors.border));
+                             Stroke::new(1.0_f32, colors.border));
         painter.text(Pos2::new(x + 3.0, origin.y + 3.0), Align2::LEFT_TOP,
                      format_timecode(Ticks::from_seconds(s as f64)),
                      FontId::monospace(10.0), colors.text_weak);
@@ -213,7 +213,7 @@ pub fn timeline(
             // whole point of the presence channel: stop the collision, don't
             // arbitrate it afterwards
             if !doc.peers_on(clip.id).is_empty() {
-                painter.rect_stroke(r.expand(1.5), 4.0, Stroke::new(2.0, colors.warning), egui::StrokeKind::Outside);
+                painter.rect_stroke(r.expand(1.5), 4.0, Stroke::new(2.0_f32, colors.warning), egui::StrokeKind::Outside);
             }
             // waveform, from the peak pyramid — one column per pixel, so the
             // cost of drawing a clip is its WIDTH, not its duration. This is
@@ -239,7 +239,7 @@ pub fn timeline(
                         let (lo, hi) = (mm.min.clamp(-1.0, 1.0), mm.max.clamp(-1.0, 1.0));
                         painter.line_segment(
                             [Pos2::new(x, mid - hi * half), Pos2::new(x, mid - lo * half)],
-                            Stroke::new(1.0, wave));
+                            Stroke::new(1.0_f32, wave));
                     }
                 }
             }
@@ -260,7 +260,7 @@ pub fn timeline(
         if x < origin.x + view.gutter || x > rect.max.x { continue; }
         let tint = peer_color(peer.site.0);
         painter.line_segment([Pos2::new(x, origin.y + RULER_H), Pos2::new(x, rect.max.y)],
-                             Stroke::new(1.5, tint));
+                             Stroke::new(1.5_f32, tint));
         // the name rides at the top so several peers stay readable
         painter.text(Pos2::new(x + 3.0, origin.y + RULER_H + 1.0), Align2::LEFT_TOP,
                      &peer.name, FontId::proportional(10.0), tint);
@@ -270,7 +270,7 @@ pub fn timeline(
     let px = view.time_to_x(playhead, origin.x);
     if px >= origin.x + view.gutter {
         painter.line_segment([Pos2::new(px, origin.y), Pos2::new(px, rect.max.y)],
-                             Stroke::new(2.0, colors.danger));
+                             Stroke::new(2.0_f32, colors.danger));
     }
 
     resp.interact_pointer_pos()

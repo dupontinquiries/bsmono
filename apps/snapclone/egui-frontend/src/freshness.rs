@@ -89,7 +89,7 @@ pub fn node_ui(ui: &mut egui::Ui, name: &str, bearing_deg: f32, distance_m: f32,
             let dir = egui::vec2(a.sin(), -a.cos());
             let col = c.accent.gamma_multiply(p.opacity);
             ui.painter().arrow(rect.center() - dir * 9.0, dir * 18.0,
-                               egui::Stroke::new(2.0, col));
+                               egui::Stroke::new(2.0_f32, col));
         }
         ui.vertical(|ui| {
             ui.colored_label(c.text.gamma_multiply(p.opacity.max(0.5)), name);

@@ -247,7 +247,7 @@ impl SnapcloneApp {
             // gradient-ish fill via hue; real build would draw the decoded thumbnail
             let fill = egui::ecolor::Hsva::new(photo.hue / 360.0, 0.45, 0.30, 1.0).into();
             painter.rect_filled(rect, 6.0, fill);
-            painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, STROKE));
+            painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0_f32, STROKE));
             // sync badge
             let (c, _) = match photo.sync {
                 Sync::Synced => (SYNC_OK, "✓"),
@@ -297,7 +297,7 @@ impl SnapcloneApp {
 fn peer_pill(ui: &mut egui::Ui, dot: egui::Color32, txt: &str) {
     egui::Frame::new()
         .fill(CARD)
-        .stroke(egui::Stroke::new(1.0, STROKE))
+        .stroke(egui::Stroke::new(1.0_f32, STROKE))
         .rounding(10.0)
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| {
@@ -315,7 +315,7 @@ fn apply_snapclone_theme(ctx: &egui::Context) {
     v.window_fill = PANEL;
     v.extreme_bg_color = egui::Color32::from_rgb(0x14, 0x14, 0x14);
     v.selection.bg_fill = TEAL;
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, STROKE);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, STROKE);
     v.override_text_color = Some(egui::Color32::from_rgb(0xe6, 0xe6, 0xe6));
     ctx.set_visuals(v);
 }

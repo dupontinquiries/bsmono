@@ -206,7 +206,7 @@ pub fn map_ui(ui: &mut egui::Ui, p: &mut MapPage, c: &uikit_egui::PaletteColors)
             let col = if pt.is_location { c.accent } else { c.text_weak };
             painter.circle_filled(at, r, col);
             if selected {
-                painter.circle_stroke(at, r + 4.0, egui::Stroke::new(2.0, c.accent));
+                painter.circle_stroke(at, r + 4.0, egui::Stroke::new(2.0_f32, c.accent));
             }
         }
     }

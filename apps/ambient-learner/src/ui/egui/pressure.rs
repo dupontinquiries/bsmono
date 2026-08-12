@@ -161,7 +161,7 @@ pub fn gauge_ui(ui: &mut egui::Ui, p: Pressure, eased: f32,
         painter.line_segment(
             [centre + egui::vec2(a0.cos(), a0.sin()) * radius,
              centre + egui::vec2(a1.cos(), a1.sin()) * radius],
-            egui::Stroke::new(2.0, c.border));
+            egui::Stroke::new(2.0_f32, c.border));
     }
 
     // The needle, at the eased position rather than the raw one.
@@ -170,7 +170,7 @@ pub fn gauge_ui(ui: &mut egui::Ui, p: Pressure, eased: f32,
     // Saturation is shown in the needle's colour: a needle pinned at the edge
     // otherwise looks like a broken one.
     let needle_col = if p.saturated() { c.warning } else { c.accent };
-    painter.line_segment([centre, tip], egui::Stroke::new(3.0, needle_col));
+    painter.line_segment([centre, tip], egui::Stroke::new(3.0_f32, needle_col));
     painter.circle_filled(centre, 4.0, needle_col);
 
     painter.text(centre + egui::vec2(0.0, -radius * 0.45), egui::Align2::CENTER_CENTER,

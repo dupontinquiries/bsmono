@@ -57,7 +57,7 @@ pub fn action_stack(ui: &mut Ui, labels: &[&str], height: f32, c: &PaletteColors
     for (i, label) in labels.iter().enumerate() {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
         let fill = if resp.hovered() { c.bg_hover } else { c.bg_raised };
-        ui.painter().rect(rect, CornerRadius::same(4), fill, Stroke::new(1.0, c.border), StrokeKind::Inside);
+        ui.painter().rect(rect, CornerRadius::same(4), fill, Stroke::new(1.0_f32, c.border), StrokeKind::Inside);
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, *label, FontId::proportional(13.0), c.text);
         if resp.clicked() { clicked = Some(i); }
         ui.add_space(4.0);
@@ -93,7 +93,7 @@ pub fn chip_row_ex(ui: &mut Ui, chips: &[Chip], height: f32, c: &PaletteColors) 
             let w = chip.width_chars as f32 * 8.0 + 22.0;
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, height), Sense::click_and_drag());
             let fill = if resp.is_pointer_button_down_on() { c.accent_soft } else if resp.hovered() { c.bg_hover } else { c.bg_raised };
-            ui.painter().rect(rect, CornerRadius::same(6), fill, Stroke::new(1.0, c.border), StrokeKind::Inside);
+            ui.painter().rect(rect, CornerRadius::same(6), fill, Stroke::new(1.0_f32, c.border), StrokeKind::Inside);
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, chip.label, FontId::proportional(13.0), c.text);
             if resp.clicked() { clicked = Some(i); }
             responses.push(resp);
@@ -133,7 +133,7 @@ pub fn fab_button(ui: &mut Ui, rect: Rect, glyph: &str, c: &PaletteColors) -> Re
 /// Paint an accent-coloured border around a content area (e.g. the reference screenshots' visible
 /// outline around the terminal/main surface).
 pub fn accent_border(ui: &Ui, rect: Rect, c: &PaletteColors) {
-    ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.5, c.accent), StrokeKind::Outside);
+    ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.5_f32, c.accent), StrokeKind::Outside);
 }
 
 #[cfg(test)]

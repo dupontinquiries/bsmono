@@ -382,7 +382,7 @@ fn apply_logscope_theme(ctx: &egui::Context) {
     v.window_fill = PANEL;
     v.extreme_bg_color = egui::Color32::from_rgb(0x10, 0x13, 0x16);
     v.selection.bg_fill = ACCENT.linear_multiply(0.4);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, RAIL);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, RAIL);
     v.override_text_color = Some(TEXT);
     ctx.set_visuals(v);
 }

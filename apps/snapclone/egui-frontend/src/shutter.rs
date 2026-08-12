@@ -213,7 +213,7 @@ pub fn shutter_ui(ui: &mut egui::Ui, s: &ShutterButton, size: f32,
     let centre = rect.center();
     let r = size * 0.5 - 3.0;
     let ring = if s.recording() { c.danger } else { c.text };
-    ui.painter().circle_stroke(centre, r, egui::Stroke::new(3.0, ring));
+    ui.painter().circle_stroke(centre, r, egui::Stroke::new(3.0_f32, ring));
     if s.recording() {
         // A filled square while recording, and a locked recording gets a
         // second ring — the user needs to know their finger is no longer load
@@ -222,7 +222,7 @@ pub fn shutter_ui(ui: &mut egui::Ui, s: &ShutterButton, size: f32,
         ui.painter().rect_filled(
             egui::Rect::from_center_size(centre, egui::vec2(side, side)), 3.0, c.danger);
         if s.locked() {
-            ui.painter().circle_stroke(centre, r + 5.0, egui::Stroke::new(2.0, c.danger));
+            ui.painter().circle_stroke(centre, r + 5.0, egui::Stroke::new(2.0_f32, c.danger));
         }
     } else {
         ui.painter().circle_filled(centre, r * 0.82, c.text);

@@ -130,7 +130,7 @@ pub fn tile_strip_ui(ui: &mut egui::Ui, view: &ComposerView,
         let fill = if t.slot == 0 { c.bg_raised } else { c.bg_base };
         ui.painter().rect_filled(r, 8.0, fill);
         if t.slot == 0 {
-            ui.painter().rect_stroke(r, 8.0, egui::Stroke::new(2.0, c.accent),
+            ui.painter().rect_stroke(r, 8.0, egui::Stroke::new(2.0_f32, c.accent),
                                      egui::StrokeKind::Outside);
         }
         if audible(t) {

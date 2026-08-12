@@ -117,7 +117,7 @@ impl LiveBackground {
                 .collect();
             let mut c = *color;
             c = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), self.a(90.0));
-            painter.add(egui::Shape::line(pts, Stroke::new(2.0, c)));
+            painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, c)));
         }
     }
 

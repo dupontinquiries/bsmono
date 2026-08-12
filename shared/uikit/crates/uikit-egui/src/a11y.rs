@@ -261,7 +261,7 @@ impl A11yScene {
     pub fn paint_focus_ring(&self, ui: &Ui, accent: Color32) {
         if let Some(it) = self.focused() {
             if let Some(rect) = it.rect {
-                ui.painter().rect_stroke(rect.expand(2.0), CornerRadius::same(4), Stroke::new(2.0, accent), egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(rect.expand(2.0), CornerRadius::same(4), Stroke::new(2.0_f32, accent), egui::StrokeKind::Inside);
             }
         }
     }

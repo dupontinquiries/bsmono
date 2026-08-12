@@ -120,7 +120,7 @@ fn sparkline(ui: &mut egui::Ui, series: &[f32], tint: egui::Color32) {
         egui::Pos2::new(x, y)
     }).collect();
     for w in pts.windows(2) {
-        ui.painter().line_segment([w[0], w[1]], egui::Stroke::new(2.0, tint));
+        ui.painter().line_segment([w[0], w[1]], egui::Stroke::new(2.0_f32, tint));
     }
     if let Some(last) = pts.last() {
         ui.painter().circle_filled(*last, 3.5, tint);
