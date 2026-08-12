@@ -1,0 +1,22 @@
+[package]
+name = "ink-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Headless freehand-ink engine for the portfolio: stroke capture (pressure + time), one-euro smoothing, RDP simplification, f64 infinite-ish canvas camera, spatial-indexed canvas with undo, a pen/touch pointer router that partitions contacts between inking and touchkit navigation, sketch→shape recognition with niftyplot graph export, a grayscale rasterizer (PGM) for handwriting datasets, and the .ink corpus format. std-only, no UI, no deps — same contract as touchkit."
+
+[lib]
+path = "src/lib.rs"
+
+# Dependency-free core (std only), same rationale as touchkit: cross-compiles
+# trivially to aarch64/musl for the phones. The egui adapter lives in
+# sketches/, never as a feature that drags UI crates into a headless build.
+[dependencies]
+
+[dev-dependencies]
+# Integration test only: the niftyplot text ink-kit emits must round-trip
+# through the real parser. Path dep — builds offline.
+nifty-core = { path = "../nifty-core" }
+
+[dev-dependencies.touchkit]
+path = "../touchkit"

@@ -665,3 +665,9 @@ kind = "cargo"
 role = "library"
 notes = "Ambient-light policy: cover detection from differentials (pairs with hover-kit's proximity gate), a brightness PID in perceptual space with anti-windup, derivative-on-measurement, a deadband and asymmetric slew, plus adaptive white point and theme tinting capped at the fleet's 0.18 contrast ceiling. No sysfs, no rendering."
 
+[shared.ink-kit]
+path = "shared/ink-kit"
+kind = "cargo"
+role = "library"
+notes = "Headless freehand-ink engine: stroke capture with pressure, one-euro smoothing, RDP simplification, an f64 infinite canvas camera, spatial-indexed undo, and a pointer router that partitions contacts between inking and touchkit navigation without changing touchkit's frame-driven contract. std-only, no deps — same rationale as touchkit, so it cross-compiles to the phone targets."
+
