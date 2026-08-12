@@ -324,13 +324,28 @@ fn run_args_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(format!("{h}/.config/gitmind/run-args.json")))
 }
 
-/// The saved launch flags for a local app (empty if none).
+/// The launch flags for a local app: the user's saved ones, or the built-in
+/// default for apps that need one to open a window at all.
+///
+/// The saved value WINS when present, because a user who set flags meant them —
+/// but an app nobody has configured must still start. beatspace is the case:
+/// `gui` is a required subcommand alongside `train` and `gpu`, so launching it
+/// bare prints usage and exits, and the run button appears to do nothing.
+///
+/// Shares its table with `binpin::gui_launch_args`, which does the same job for
+/// the .desktop file. Two launch paths, one answer — and they were allowed to
+/// disagree until now: the desktop entry knew about `gui` and gitmind's own run
+/// button did not.
 pub fn run_args(name: &str) -> String {
-    let Some(p) = run_args_path() else { return String::new() };
-    let Ok(text) = std::fs::read_to_string(&p) else { return String::new() };
-    serde_json::from_str::<serde_json::Value>(&text).ok()
+    let saved = run_args_path()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|v| v.get(name).and_then(|x| x.as_str()).map(|s| s.to_string()))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !saved.trim().is_empty() {
+        return saved;
+    }
+    gitmind_core::binpin::gui_launch_args(name).join(" ")
 }
 
 /// Remember the launch flags for a local app.
@@ -1000,7 +1015,9 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     }
     let coding = ["gitmind", "logscope", "bot-arena"];
     let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound"];
-    let music = ["beatspace", "krapper", "bo-suite", "fao-codec"];
+    // beatspace is a CUSTOM entry below (it needs run_flags), so it is not in
+    // this simple list — being in both would put it in the group twice.
+    let music = ["krapper", "bo-suite", "fao-codec"];
     let work = ["voiceterm", "ambient-learner", "rusty-board"];
     let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
     // bsettings: crate `bigsilicon-settings` at apps/settings-app, GUI bin needs the `gui` feature.
@@ -1024,6 +1041,20 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // the entry's `name`, which is "studio" and happens to be right — but only
     // by coincidence, since the crate is studio-app. Writing it down means a
     // later rename of either does not silently break the lookup.
+    // beatspace needs `gui` to open a window: it is a required subcommand, so a
+    // bare launch prints usage and exits. run_args supplies it for the run
+    // button and gui_launch_args for the .desktop file — this sets run_flags so
+    // the value is also recorded in the app entry written at install time,
+    // which is the third place a launch can originate.
+    let beatspace = || crate::suite::SuiteApp {
+        name: "beatspace".into(),
+        path: "apps/beatspace".into(),
+        features: vec![],
+        no_default: false,
+        target: String::new(),
+        run_flags: "gui".into(),
+        bin_name: None,
+    };
     let studio = || crate::suite::SuiteApp {
         name: "studio".into(),
         path: "apps/studio/crates/studio-app".into(),
@@ -1056,12 +1087,19 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     media_group.apps.push(unendlich());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
+    all_group.apps.push(beatspace());
     all_group.apps.push(studio());
     all_group.apps.push(unendlich());
     vec![
         group("coding", "Development & analysis tools", &coding),
         media_group,
-        group("music", "Audio synthesis, codecs & music", &music),
+        {
+            // beatspace joins its group here rather than via the simple list,
+            // because it carries run_flags the list cannot express.
+            let mut m = group("music", "Audio synthesis, codecs & music", &music);
+            m.apps.push(beatspace());
+            m
+        },
         work_group,
         all_group,
     ]
