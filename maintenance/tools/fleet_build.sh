@@ -19,6 +19,10 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 FILTER="${1:-}"
+# Full logs for failures, so a 137-error build can be read without running it
+# again. Under /tmp rather than in the repo: these are transient and a stray
+# 4 MB log committed by accident is worse than one that vanishes on reboot.
+LOGDIR="${FLEET_LOGDIR:-/tmp/fleet-logs}"
 FAILED=()
 OK=0
 
@@ -38,7 +42,45 @@ check() {
         local n; n=$(grep -cE '^error' /tmp/fleet.$$)
         FAILED+=("$label ($n errors)")
         echo "  FAIL $label — $n errors"
-        grep -E '^error' /tmp/fleet.$$ | head -2 | sed 's/^/       /'
+
+        # DISTINCT MESSAGES, GROUPED AND COUNTED, not the first two lines.
+        #
+        # `head -2` was actively misleading on a large failure: 137 errors in
+        # ambient-learner are almost all ONE missing import cascading, and two
+        # sample lines cannot say which. Worse, cargo prints its "could not
+        # compile" summary LAST, so on a small failure head -2 could show the
+        # summary and nothing about the cause.
+        #
+        # Collapsing identical messages and counting them puts the shape of the
+        # failure first: "132x unresolved import" is a one-line fix, "17 distinct
+        # type errors" is an afternoon.
+        grep -E '^error' /tmp/fleet.$$ \
+            | grep -vE '^error: could not compile' \
+            | sed -E 's/^error(\[[A-Z0-9]+\])?: //' \
+            | sort | uniq -c | sort -rn | head -5 \
+            | sed -E 's/^ *([0-9]+) /       \1x /'
+
+        # WHERE, not just what. An error message without a file is a search;
+        # cargo's `--> path:line` lines are the actionable half and were being
+        # dropped entirely. Shown for the first few distinct files so a
+        # cascading failure does not bury the list.
+        grep -E '^\s+--> ' /tmp/fleet.$$ \
+            | sed -E 's/^\s+--> //' | cut -d: -f1 \
+            | sort -u | head -3 \
+            | sed 's/^/       in /'
+
+        # The summary line names the CRATE that failed, which in a workspace is
+        # not always the one being built — fao-codec's failure is in a member,
+        # and knowing which saves opening the whole tree.
+        grep -m1 -E '^error: could not compile' /tmp/fleet.$$ \
+            | sed -E 's/^error: /       /' | cut -c1-100
+
+        # Keep the full log for anything that failed, and say where. The old
+        # script deleted it unconditionally, so reproducing a 137-error failure
+        # meant running the whole build again.
+        mkdir -p "$LOGDIR"
+        cp /tmp/fleet.$$ "$LOGDIR/${label//\//-}.log"
+        echo "       full log: $LOGDIR/${label//\//-}.log"
     else
         OK=$((OK+1))
     fi
