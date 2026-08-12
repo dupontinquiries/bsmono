@@ -42,6 +42,15 @@ impl CentralView {
 
 struct VoicetermApp {
     app: App,
+    /// The accelerometer, if this device has one. `None` on a desktop, which is
+    /// not a failure — discovery returning None is how the feature stays absent
+    /// rather than broken.
+    accel: Option<voiceterm_egui::iio_accel::IioAccel>,
+    /// Flick detection relative to the phone's CURRENT resting attitude, so a
+    /// flick means the same thing lying on a desk as held upright.
+    flicks: voiceterm_egui::iio_accel::RelativeFlicks,
+    /// Last orientation seen, for the rotation hint.
+    orientation: voiceterm_egui::iio_accel::OrientationUp,
     /// Bytes destined for a PTY: the encoded control keys plus any submitted
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
@@ -415,6 +424,52 @@ impl eframe::App for VoicetermApp {
             //
             // Intercepted before handle_input for that reason: a chord that is
             // also encodable must not do both.
+            // MOTION, on the same frame as the keys. Flicks switch tabs and
+            // orientation drives the rotation hint — the accelerometer was
+            // ported with 40 tests and read by nothing, so a phone that knows
+            // which way up it is was throwing that away every frame.
+            if let Some(a) = self.accel.as_mut() {
+                let (reading, up, _tilt) = a.poll();
+                if let voiceterm_egui::iio_accel::Reading::Ok { x, y, z, scale } = reading {
+                    let t_ms = ui.input(|i| i.time) * 1000.0;
+                    // Reading::Ok carries RAW i32 counts and a Scale; Sample
+                    // wants f64 metres. Feeding the counts unscaled would make
+                    // the flick threshold depend on the sensor's resolution —
+                    // a different phone would need a different flick.
+                    let sample = voiceterm_egui::iio_accel::Sample {
+                        x: x as f64 * scale.x,
+                        y: y as f64 * scale.y,
+                        z: z as f64 * scale.z,
+                        t_ms,
+                    };
+                    if let Some(f) = self.flicks.feed(sample) {
+                        // Relative to the phone's CURRENT attitude, so a flick
+                        // means the same thing on a desk as held upright — the
+                        // reason RelativeFlicks exists rather than a raw axis
+                        // threshold.
+                        use voiceterm_egui::iio_accel::RelFlick;
+                        let n = self.workspace.tabs.len();
+                        if n > 1 {
+                            let to = match f {
+                                RelFlick::Left => (self.workspace.active + 1) % n,
+                                RelFlick::Right => (self.workspace.active + n - 1) % n,
+                                // Up/Down are not tab moves. Ignored rather
+                                // than mapped to something plausible: a gesture
+                                // that does a surprising thing is worse than
+                                // one that does nothing.
+                                _ => self.workspace.active,
+                            };
+                            if to != self.workspace.active {
+                                self.workspace.apply(
+                                    &voiceterm_egui::gesture_menus::WsCall::Command(
+                                        format!("go to tab {}", to + 1)));
+                            }
+                        }
+                    }
+                }
+                self.orientation = up;
+            }
+
             let mut chorded = false;
             for out in voiceterm_egui::pty_input::drain_egui(
                 ui, voiceterm_egui::pty_input::TermMode::default(),
@@ -730,6 +785,12 @@ fn main() -> eframe::Result<()> {
     },
         Box::new(move |_cc| {
             Ok(Box::new(VoicetermApp {
+                // Discovery once at startup, not per frame: scanning
+                // /sys/bus/iio/devices every repaint is a directory walk at 60
+                // Hz for a device that does not appear mid-session.
+                accel: voiceterm_egui::iio_accel::IioAccel::discover(),
+                flicks: Default::default(),
+                orientation: voiceterm_egui::iio_accel::OrientationUp::Undefined,
                 chrome: Default::default(),
                 pty_out: Vec::new(),
                 app,
