@@ -106,7 +106,7 @@ pub fn exists() -> bool {
 
 pub fn load() -> (Save, Bindings, Config) {
     let mut s = Save::default();
-    let mut b = Bindings::classic();
+    let mut b = Bindings::default_scheme();
     let mut cfg = Config::default();
     let Ok(text) = std::fs::read_to_string(path()) else { return (s, b, cfg) };
     let mut saw_bind = false;

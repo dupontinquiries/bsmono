@@ -275,6 +275,49 @@ pub struct Bindings {
 }
 
 impl Bindings {
+    /// The current default control scheme, replacing the old WASD
+    /// layout with the home-row cluster tuned in playtesting, plus a
+    /// deliberate move: Jump off the thumb's most-reached keys entirely
+    /// (mouse-right + pad south) so Autotarget can own Space outright,
+    /// Boost and Fire moving to a trigger-first feel, and 1/2/3 freed
+    /// from the legacy car-picker for the hotbar (`hotbar.rs`) to use.
+    pub fn default_scheme() -> Bindings {
+        use Action::*;
+        let mut b = Bindings::classic();
+        let set = |b: &mut Bindings, a: Action, v: Vec<Bind>| {
+            *b.slot(a) = v;
+        };
+        set(&mut b, Forward, vec![ch(".")]);
+        set(&mut b, Reverse, vec![ch("e")]);
+        set(&mut b, SteerL, vec![ch("o")]);
+        set(&mut b, SteerR, vec![ch("u")]);
+        // ROLL LEFT HAS NO DEFAULT KEY. Left off on purpose in this
+        // pass — flag it if that reads as a mistake rather than a
+        // choice; RollR keeps its key so air roll is not silently
+        // one-sided, and a pad's left bumper/stick still reaches it
+        // through the existing pad table untouched.
+        set(&mut b, RollL, vec![]);
+        set(&mut b, RollR, vec![ch("p")]);
+        set(&mut b, Jump, vec![Bind::Mouse(MouseButton::Right), Bind::Pad(crate::gamepad::PB_SOUTH)]);
+        set(&mut b, Boost, vec![Bind::Pad(crate::gamepad::PB_EAST)]);
+        set(&mut b, Slide, vec![ch("a"), Bind::Pad(crate::gamepad::PB_WEST)]);
+        set(&mut b, Transform, vec![named(NamedKey::PageDown), Bind::Pad(crate::gamepad::PB_LB)]);
+        set(&mut b, AutoTarget, vec![named(NamedKey::Space), Bind::Pad(crate::gamepad::PB_R3)]);
+        // FIRE HAS NO KEYBOARD/MOUSE BIND IN THIS PASS EITHER — the
+        // requested scheme names only the pad trigger. Left as given
+        // rather than quietly keeping the old mouse-left default;
+        // flagged for the same reason RollL is.
+        set(&mut b, Fire, vec![Bind::Pad(crate::gamepad::PB_RT)]);
+        set(&mut b, CycleForm, vec![Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_DUP)]);
+        // CAR1/2/3 ARE UNBOUND BY DEFAULT. 1-9 now drive the hotbar
+        // (`hotbar.rs`'s nine slots); the actions still exist for
+        // anyone who wants to bind them back in the Binds menu.
+        set(&mut b, Car1, vec![]);
+        set(&mut b, Car2, vec![]);
+        set(&mut b, Car3, vec![]);
+        b
+    }
+
     /// Classic layout: WASD as characters (identical to the original scheme on
     /// QWERTY; on other layouts it follows the letters, not the positions).
     pub fn classic() -> Bindings {
