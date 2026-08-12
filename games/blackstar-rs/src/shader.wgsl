@@ -40,8 +40,19 @@ struct RtShape {
 @group(0) @binding(4) var t_csdf: texture_3d<f32>;
 @group(0) @binding(5) var s_csdf: sampler;
 
-const CSDF_SLAB: f32 = 32.0;
-const CSDF_D: f32 = 384.0; // SLAB x 12 models
+const CSDF_SLAB: f32 = 16.0; // was 32.0 -- already didn't match render.rs's
+// CSDF_SLAB (44) before this pass touched either constant. Now kept in
+// sync with render.rs's CSDF_SLAB (16) on purpose: three numbers had to
+// agree (this one, render.rs's CSDF_SLAB, and CSDF_D below), and two
+// of the three were already wrong before any of this session's changes.
+// CSDF_D must equal CSDF_SLAB * CSDF_MAXM exactly (render.rs). Full
+// roster coverage (123 models: cars, electric doubles, hovercars, and
+// all 48 bot families) needed both SLAB shrunk (44 -> 16) and MAXM
+// raised (12 -> 126) together, staying under the hard 2048-depth
+// limit a genuine D3 texture has under this project's requested
+// limits; 16*126=2016. (This constant was independently wrong before
+// either change too: 384 vs. the true 44*12=528 at the original cap.)
+const CSDF_D: f32 = 2016.0; // SLAB(16) x MAXM(126)
 
 // baked candidate grid (must match render.rs RC_* consts)
 const RC_DIM: u32 = 40u;

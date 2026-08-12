@@ -554,6 +554,43 @@ pub fn load_raw(dir: &Path, target_len: f32) -> (Vec<RawPrim>, Vec3) {
     (raws, half)
 }
 
+/// The gltf-read step alone: raw source vertices, no orientation, no
+/// centering, no scale. Everything downstream in `load_raw_at` runs the
+/// (potentially wrong) orientation guess before returning anything, which
+/// makes it useless for diagnosing THAT guess. This is the same read,
+/// stopped before that step — the ground truth `--orient` checks against.
+pub fn load_raw_unoriented(dir: &Path) -> Vec<RawPrim> {
+    let glb = dir.with_extension("glb");
+    let (doc, bin) = if glb.is_file() {
+        let d = gltf::Gltf::open(&glb).unwrap_or_else(|e| panic!("open {:?}: {e}", glb));
+        let blob = d.blob.clone().unwrap_or_default();
+        (d, blob)
+    } else if dir.join("slim.glb").is_file() {
+        let f = dir.join("slim.glb");
+        let d = gltf::Gltf::open(&f).unwrap_or_else(|e| panic!("open {:?}: {e}", f));
+        let blob = d.blob.clone().unwrap_or_default();
+        (d, blob)
+    } else {
+        let d = gltf::Gltf::open(dir.join("scene.gltf")).unwrap_or_else(|e| panic!("open {:?}: {e}", dir));
+        let buffer_uri = d
+            .buffers()
+            .next()
+            .and_then(|b| match b.source() {
+                gltf::buffer::Source::Uri(u) => Some(u.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "scene.bin".into());
+        let bytes = std::fs::read(dir.join(&buffer_uri)).expect("read scene.bin");
+        (d, bytes)
+    };
+    let mut raws: Vec<RawPrim> = Vec::new();
+    let scene = doc.default_scene().or_else(|| doc.scenes().next()).expect("no scene");
+    for node in scene.nodes() {
+        collect_node(&node, Mat4::IDENTITY, Tag::Body, &bin, &mut raws);
+    }
+    raws
+}
+
 /// `load_raw` plus the two values the upload path still needs to place wheel
 /// pivots: the pre-scale centre and the scale factor.
 pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Vec3, Vec3, f32) {

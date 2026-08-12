@@ -54,6 +54,9 @@ pub struct Save {
     /// the Watch's current form, resolve, and whether Photon Man has
     /// ever been reached deliberately (see watch.rs)
     pub watch: String,
+    /// the action bar: nine slots, each item's side and ammo type,
+    /// and the active slot (see hotbar.rs)
+    pub hotbar: String,
 }
 
 impl Default for Save {
@@ -86,6 +89,7 @@ impl Default for Save {
             bag: String::new(),
             vault: String::new(),
             watch: String::new(),
+            hotbar: String::new(),
             look: String::new(),
         }
     }
@@ -102,7 +106,7 @@ pub fn exists() -> bool {
 
 pub fn load() -> (Save, Bindings, Config) {
     let mut s = Save::default();
-    let mut b = Bindings::classic();
+    let mut b = Bindings::default_scheme();
     let mut cfg = Config::default();
     let Ok(text) = std::fs::read_to_string(path()) else { return (s, b, cfg) };
     let mut saw_bind = false;
@@ -122,6 +126,7 @@ pub fn load() -> (Save, Bindings, Config) {
             "bag" => s.bag = v.to_string(),
             "vault" => s.vault = v.to_string(),
             "watch" => s.watch = v.to_string(),
+            "hotbar" => s.hotbar = v.to_string(),
             "look" => s.look = v.to_string(),
             "total_rings" => s.total_rings = v.parse().unwrap_or(s.total_rings),
             "total_car_rings" => s.total_car_rings = v.parse().unwrap_or(s.total_car_rings),
@@ -178,7 +183,7 @@ pub fn store(s: &Save, b: &Bindings, cfg: &Config) {
     if !s.nightfalls.is_empty() {
         let _ = writeln!(out, "nightfalls {}", s.nightfalls);
     }
-    for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("bag", &s.bag), ("vault", &s.vault), ("watch", &s.watch)] {
+    for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("bag", &s.bag), ("vault", &s.vault), ("watch", &s.watch), ("hotbar", &s.hotbar)] {
         if !v.is_empty() {
             let _ = writeln!(out, "{k} {v}");
         }

@@ -1105,7 +1105,7 @@ pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: 
 }
 
 // ------------------------------------------------------------- controls ----
-pub const BIND_ROWS: usize = ACTIONS.len() + 3; // + classic, dvorak, back
+pub const BIND_ROWS: usize = ACTIONS.len() + 4; // + default, classic, dvorak, back
 
 pub fn bindings_menu(ui: &mut Vec<UiVert>, a: f32, b: &Bindings, sel: usize, capturing: bool, scroll: usize, cur: (f32, f32)) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
@@ -1136,7 +1136,7 @@ pub fn bindings_menu(ui: &mut Vec<UiVert>, a: f32, b: &Bindings, sel: usize, cap
         let val = fit(&raw, 0.72 - rx, px, a);
         font::text(ui, rx, y, px, a, if capturing && i == sel { GOLD } else { DIM }, &val);
     }
-    let extras = ["PRESET: CLASSIC (WASD)", "PRESET: DVORAK (.OEU HOME ROW)", "BACK"];
+    let extras = ["PRESET: DEFAULT (.EOU + TRIGGERS)", "PRESET: CLASSIC (WASD)", "PRESET: DVORAK (.OEU HOME ROW)", "BACK"];
     for (k, lab) in extras.iter().enumerate() {
         let i = ACTIONS.len() + k;
         if i < start || i >= end {
