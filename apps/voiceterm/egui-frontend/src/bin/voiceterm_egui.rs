@@ -51,6 +51,11 @@ struct VoicetermApp {
     flicks: voiceterm_egui::iio_accel::RelativeFlicks,
     /// Last orientation seen, for the rotation hint.
     orientation: voiceterm_egui::iio_accel::OrientationUp,
+    /// Progress bars spotted in terminal output. The engine
+    /// (`dumb_summary::detect_progress_bars`) has always been able to find
+    /// them; nothing showed you that it had — which is the whole gap the
+    /// detect module names.
+    progress: voiceterm_egui::detect::ProgressReadout,
     /// Bytes destined for a PTY: the encoded control keys plus any submitted
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
@@ -182,6 +187,10 @@ impl eframe::App for VoicetermApp {
                     }
                 }
             });
+            // Above the keycaps, below the grid: a build's progress belongs
+            // where the output is, not in a status bar the user is not looking
+            // at while watching a compile.
+            voiceterm_egui::detect::progress_ui(ui, &self.progress, &self.colors);
             if let Some(send) = keycap_bar_ui(ui, TERMINAL_KEYCAPS, &self.colors) {
                 self.app.terminal.feed(send);
             }
@@ -229,7 +238,13 @@ impl eframe::App for VoicetermApp {
                             if let Some(cmd) = self.blocks.get_block_command(id).map(str::to_string) {
                                 // demo semantics: echo the command line into the grid (a PTY
                                 // would receive cmd + \r) and track it as a new block
-                                self.app.terminal.feed(&format!("$ {cmd}\r\n"));
+                                let echoed = format!("$ {cmd}\r\n");
+                                // Observe what goes into the grid, not what
+                                // comes out of the keyboard: a progress bar is
+                                // OUTPUT, and watching the input side would
+                                // never see one.
+                                self.progress.observe(&echoed);
+                                self.app.terminal.feed(&echoed);
                                 self.blocks.submit_command(&cmd, 0);
                             }
                         }
@@ -791,6 +806,7 @@ fn main() -> eframe::Result<()> {
                 accel: voiceterm_egui::iio_accel::IioAccel::discover(),
                 flicks: Default::default(),
                 orientation: voiceterm_egui::iio_accel::OrientationUp::Undefined,
+                progress: Default::default(),
                 chrome: Default::default(),
                 pty_out: Vec::new(),
                 app,
