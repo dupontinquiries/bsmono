@@ -3516,9 +3516,12 @@ impl Game {
                 if sel < ACTIONS.len() {
                     self.mode = Mode::Binds { sel, capturing: true };
                 } else if sel == ACTIONS.len() {
+                    self.binds = Bindings::default_scheme();
+                    self.toastf("PRESET: DEFAULT");
+                } else if sel == ACTIONS.len() + 1 {
                     self.binds = Bindings::classic();
                     self.toastf("PRESET: CLASSIC");
-                } else if sel == ACTIONS.len() + 1 {
+                } else if sel == ACTIONS.len() + 2 {
                     self.binds = Bindings::dvorak();
                     self.toastf("PRESET: DVORAK");
                 } else {
