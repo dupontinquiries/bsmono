@@ -135,10 +135,29 @@ UNENDLICH_PROFILE=rd24 UNENDLICH_OCTREE_POOL_MB=4096 UNENDLICH_SPAWN_ARCHE=drago
 Override anything by setting it explicitly, e.g. add `UNENDLICH_SHADOW_CHUNK_STRIDE=1` to get
 full-detail shadows for one run. Add a profile by extending `profile()` in runtime_flags.rs.
 
-### Pruning follow-up (not done yet — needs harness validation)
-Most of the `rd24` toggles are "always 1" in practice (PREFETCH, REMESH_GATE, SKY_CULL,
-ADAPTIVE_UPLOADS, SUBMIT_SKIP, SLACK_SCHEDULER, BIASED_SHELL_WALK, UPLOAD_PRIORITY,
-SHADOW_CACHE, DEVICE_LOCAL_MESH, GPU_MESHER=2). Each could have its DEFAULT flipped to the
-proven value and become a kill-switch (set =0 to disable) instead of an opt-in — which would
-shrink even the profile. Doing that changes behavior for every binary + the harness, so promote
-them one at a time with `harness/run.sh` green between each, rather than in a batch.
+### Pruning follow-up — CORRECTED (r-perf-doc-fix): mostly already done
+This section previously said all 11 toggles below were still opt-in and needed
+promoting. Checked each one's actual current default directly in source
+(not assumed from this doc) — **9 of 11 were already promoted to default-ON at
+R27**, tagged `// R27: default ON` right in the code: PREFETCH (core
+load-ahead request — see the caveat below), REMESH_GATE, SKY_CULL,
+ADAPTIVE_UPLOADS, SUBMIT_SKIP, SLACK_SCHEDULER, BIASED_SHELL_WALK,
+UPLOAD_PRIORITY, SHADOW_CACHE, DEVICE_LOCAL_MESH. This doc simply never got
+updated when that promotion landed — don't re-verify these, they're done.
+
+Two real exceptions, not just stale-doc noise:
+- **PREFETCH is only half-promoted.** `chunk_manager.rs`'s core load-ahead
+  *request* path defaults ON (R27). The bin's separate prefetch *upload-lane*
+  integration (`prefetch_upload_enabled` in `unendlich_fullgame.rs` /
+  `unendlich_world.rs`) is still genuinely opt-in (`== Some("1")`, no R27 tag).
+  Same env var name, two different gates, only one promoted — worth promoting
+  the upload-lane one too, following R27's own pattern, once it's been
+  through the harness the same way the others were.
+- **GPU_MESHER=2 must NOT be promoted right now.** It's not just still
+  opt-in — it's currently hard-force-disabled: `unendlich_fullgame.rs`
+  line ~1370 sets `gpu_mesher_mode: u32 = 0` unconditionally with the comment
+  "r612: FORCED to CPU mesher to isolate the 'broken planes' — ignores
+  UNENDLICH_GPU_MESHER... Revert this line to restore env control." Until
+  that's reverted (which needs the underlying bug actually fixed, not just
+  the override removed), this flag isn't just unpromoted, it's disconnected
+  from the env var entirely regardless of what a user sets.

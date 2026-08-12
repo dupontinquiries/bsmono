@@ -135,8 +135,18 @@ pub fn is_sky_chunk(surface_target: f64, chunk_y: i32, margin_chunks: i32) -> bo
 /// is enqueued (no tier saturated), completions no longer open new work, so the
 /// full RD-sphere traversal is skipped instead of paying ~31ms/frame at RD=12.
 /// Pure so the decision is unit-testable without a live manager.
-/// v0.25-prefetch flag gates. Default OFF so behavior is unchanged until the
-/// player opts in (`UNENDLICH_PREFETCH=1`).
+/// v0.25-prefetch flag gates.
+///
+/// r-perf-doc-fix: was "Default OFF so behavior is unchanged until the
+/// player opts in" — stale, contradicted the code directly below it
+/// (`unwrap_or(true) // R27: default ON`) ever since the R27 promotion.
+/// Corrected to match what the code has actually done since R27: default
+/// ON, `UNENDLICH_PREFETCH=0` is the kill-switch. Note this is the CORE
+/// load-ahead request path only — the bin's separate upload-lane
+/// integration (`prefetch_upload_enabled` in unendlich_fullgame.rs /
+/// unendlich_world.rs, gated `== Some("1")`) is still genuinely opt-in;
+/// PREFETCH is a half-promoted flag, not fully promoted, despite the
+/// single env var name suggesting one on/off switch.
 fn prefetch_enabled() -> bool {
     std::env::var("UNENDLICH_PREFETCH")
         .map(|v| v != "0" && !v.is_empty())
@@ -2093,6 +2103,42 @@ impl ChunkManager {
             worst_col_runs,
         }
     }
+
+    /// SURFACERUN_KIT.md Step 1: "live residency telemetry" — the go/no-go
+    /// gate for wiring the SurfaceRun/Procedural upload paths. Pure
+    /// measurement, no GPU change: for every currently-loaded chunk, derive
+    /// the same `ChunkStats` the real upload path would (reusing
+    /// `compression_stats`'s exact scratch-reuse iteration pattern, so this
+    /// doesn't double the per-run compression-accounting cost), compute its
+    /// LOD relative to `player` the same way the live streaming loop does
+    /// (`lod::desired_lod_for`), and feed both into `upload_repr::classify`
+    /// via `project_residency`.
+    ///
+    /// Call once per run summary (like `compression_stats`), not per frame —
+    /// this walks every loaded chunk, same cost class as the compression
+    /// pass already paid there.
+    pub fn residency_projection(
+        &self,
+        player: crate::world::chunk::ChunkCoord,
+        render_distance: i32,
+        policy: &crate::world::upload_repr::UploadPolicy,
+        octree_bytes_each: u64,
+    ) -> crate::world::upload_repr::ResidencyProjection {
+        use crate::world::surface_run::SurfaceRunChunk;
+        use crate::world::lod::desired_lod_for;
+        use crate::world::upload_repr::ChunkStats;
+
+        let mut scratch = SurfaceRunChunk::empty();
+        let stats: Vec<ChunkStats> = self.chunks.iter().map(|entry| {
+            let chunk = entry.value();
+            scratch.from_chunk_into(chunk);
+            let lod = desired_lod_for(chunk.coord, player, render_distance);
+            ChunkStats::from_surface_run(&scratch, lod, chunk.dirty)
+        }).collect();
+
+        crate::world::upload_repr::project_residency(stats.into_iter(), policy, octree_bytes_each)
+    }
+
 
     /// Current tick period in seconds. Returns the default if ticks
     /// aren't enabled. Combined with `current_tick`, these define
