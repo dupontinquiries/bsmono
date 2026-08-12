@@ -328,10 +328,210 @@ pub fn nightfall_drop(burn: Element) -> Option<Item> {
         .map(Item::Armor)
 }
 
+/// Which mount or hand a weapon prefers — set at the catalog level in
+/// `WEAPONS` below, and overridable per hotbar slot
+/// (`hotbar.rs`'s whole point: the same rifle can be re-declared for
+/// the other hand in a different slot without touching the catalog).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Left,
+    Right,
+    /// no preference — a sidearm, or a two-handed weapon
+    Either,
+}
+
+impl Side {
+    pub fn name(self) -> &'static str {
+        match self {
+            Side::Left => "left",
+            Side::Right => "right",
+            Side::Either => "either",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Side> {
+        match s {
+            "left" => Some(Side::Left),
+            "right" => Some(Side::Right),
+            "either" => Some(Side::Either),
+            _ => None,
+        }
+    }
+}
+
+/// What a weapon draws on to fire — the rail it belongs to
+/// (`Rail::Kinetic`/`Energy`/`Power`), plus `Melee`, which no rail
+/// covers because a blade draws on nothing at all. This is the
+/// "ammo type" the hotbar tags each slot with; it usually just mirrors
+/// `rail_of(verb)`, but a slot can be told otherwise on purpose (see
+/// `Side`'s own note — the same override philosophy).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AmmoType {
+    Kinetic,
+    Energy,
+    Power,
+    Melee,
+}
+
+impl AmmoType {
+    pub fn name(self) -> &'static str {
+        match self {
+            AmmoType::Kinetic => "kinetic",
+            AmmoType::Energy => "energy",
+            AmmoType::Power => "power",
+            AmmoType::Melee => "melee",
+        }
+    }
+    pub fn parse(s: &str) -> Option<AmmoType> {
+        match s {
+            "kinetic" => Some(AmmoType::Kinetic),
+            "energy" => Some(AmmoType::Energy),
+            "power" => Some(AmmoType::Power),
+            "melee" => Some(AmmoType::Melee),
+            _ => None,
+        }
+    }
+    /// The rail this ammo type actually draws from, or `None` for a
+    /// blade drawing on nothing.
+    pub fn rail(self) -> Option<Rail> {
+        match self {
+            AmmoType::Kinetic => Some(Rail::Kinetic),
+            AmmoType::Energy => Some(Rail::Energy),
+            AmmoType::Power => Some(Rail::Power),
+            AmmoType::Melee => None,
+        }
+    }
+}
+
+/// A named weapon in the starter armory — geometry drawn from the
+/// model catalog's own reference library
+/// (`blackstar/catalog/representatives/*.svxr`), where six real
+/// candidates surfaced: three blades by aspect ratio alone (a blade
+/// silhouette is long and thin almost by definition — the two swords
+/// measure roughly 10:1 across their longest axis, the slasher 4.6:1)
+/// and three sidearms/rifles in the 1.3:1 to 2.9:1 range a handheld
+/// gun's body-plus-barrel shape actually produces. Catalog names carry
+/// real-world and franchise references (an asset library scraped from
+/// many sources); the in-game names below are original, matching this
+/// project's own house rule against reusing borrowed names verbatim.
+pub struct WeaponSpec {
+    pub name: &'static str,
+    pub verb: Verb,
+    pub element: Element,
+    pub side: Side,
+    pub ammo: AmmoType,
+    /// the source reference, for provenance — not shown to the player
+    pub asset: &'static str,
+}
+
+pub const WEAPONS: [WeaponSpec; 6] = [
+    // -- melee: aspect ratios 4.6:1 to 10.7:1, genuinely blade-shaped --
+    WeaponSpec {
+        name: "FIRSTEDGE",
+        verb: Verb::Thrust,
+        element: Element::None,
+        side: Side::Right,
+        ammo: AmmoType::Melee,
+        asset: "imported_ancient_bronze_sword_liptov",
+    },
+    WeaponSpec {
+        name: "GREYFALL",
+        verb: Verb::Thrust,
+        element: Element::Rock,
+        side: Side::Either,
+        ammo: AmmoType::Melee,
+        asset: "imported_titanium_great_sword",
+    },
+    WeaponSpec {
+        name: "RAILFANG",
+        verb: Verb::Thrust,
+        element: Element::Electric,
+        side: Side::Left,
+        ammo: AmmoType::Melee,
+        asset: "imported_caiman_rail_slasher_3d_model_stylized_weapon",
+    },
+    // -- guns: aspect ratios 1.3:1 to 2.9:1, body-plus-barrel silhouettes --
+    WeaponSpec {
+        name: "LONGCOIL",
+        verb: Verb::Chain,
+        element: Element::None,
+        side: Side::Right,
+        ammo: AmmoType::Kinetic,
+        asset: "imported_scifi_assault_rifle",
+    },
+    WeaponSpec {
+        name: "ASHPULSE",
+        verb: Verb::Beam,
+        element: Element::Fire,
+        side: Side::Right,
+        ammo: AmmoType::Energy,
+        asset: "imported_mi_214_plasma_blaster",
+    },
+    WeaponSpec {
+        name: "SNAPBURN",
+        verb: Verb::Pierce,
+        element: Element::Electric,
+        side: Side::Either,
+        ammo: AmmoType::Kinetic,
+        asset: "imported_futuristic_handheld_blaster_pistol",
+    },
+];
+
+pub fn weapon_named(name: &str) -> Option<&'static WeaponSpec> {
+    WEAPONS.iter().find(|w| w.name.eq_ignore_ascii_case(name))
+}
+
+/// Build the `gear::Item` this spec would put in a bag — a `WeaponSpec`
+/// is a catalog entry, not inventory; this is the bridge.
+pub fn weapon_item(spec: &WeaponSpec) -> Item {
+    Item::Weapon { verb: spec.verb, element: spec.element, from: None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::raidcon::BOSSES;
+
+    #[test]
+    fn the_armory_has_real_melee_and_ranged_and_every_name_is_unique() {
+        let melee: Vec<_> = WEAPONS.iter().filter(|w| w.ammo == AmmoType::Melee).collect();
+        let ranged: Vec<_> = WEAPONS.iter().filter(|w| w.ammo != AmmoType::Melee).collect();
+        assert!(melee.len() >= 3, "not enough sabers");
+        assert!(ranged.len() >= 3, "not enough guns");
+        for m in &melee {
+            assert_eq!(m.verb, Verb::Thrust, "{} is tagged melee but does not thrust", m.name);
+            assert!(m.ammo.rail().is_none(), "{} draws ammo but is melee", m.name);
+        }
+        for r in &ranged {
+            assert!(r.ammo.rail().is_some(), "{} has no rail for its own ammo type", r.name);
+        }
+        let mut names: Vec<_> = WEAPONS.iter().map(|w| w.name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), WEAPONS.len(), "the armory has a duplicate name");
+        // side and ammo round-trip their save codes
+        for s in [Side::Left, Side::Right, Side::Either] {
+            assert_eq!(Side::parse(s.name()), Some(s));
+        }
+        for a in [AmmoType::Kinetic, AmmoType::Energy, AmmoType::Power, AmmoType::Melee] {
+            assert_eq!(AmmoType::parse(a.name()), Some(a));
+        }
+    }
+
+    #[test]
+    fn every_armory_weapon_builds_a_real_bag_item_and_rails_correctly() {
+        for w in &WEAPONS {
+            let it = weapon_item(w);
+            match &it {
+                Item::Weapon { verb, .. } => assert_eq!(*verb, w.verb),
+                other => panic!("{} built {other:?}, not a weapon", w.name),
+            }
+            if let Some(rail) = w.ammo.rail() {
+                assert_eq!(rail_of(w.verb), rail, "{}'s ammo type disagrees with its own verb's rail", w.name);
+            }
+        }
+        assert!(weapon_named("firstedge").is_some(), "lookup is not case-insensitive");
+        assert!(weapon_named("nonexistent-blade").is_none());
+    }
 
     #[test]
     fn items_roundtrip_their_codes() {
