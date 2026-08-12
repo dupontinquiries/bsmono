@@ -209,6 +209,41 @@ impl Editor {
         self.goal_col = None;
     }
 
+    /// Apply many non-overlapping `(start, end, text)` replacements as ONE
+    /// undo step — "replace all," not "replace, then replace, then replace
+    /// N-1 more times." Ranges are sorted and applied HIGH-TO-LOW: an edit
+    /// at a later offset never shifts an earlier one, so processing back to
+    /// front means every range in the input can be computed once, up front,
+    /// against the ORIGINAL text — no caller-side offset bookkeeping. Caret
+    /// lands at the last (lowest-offset) replacement's end.
+    pub fn replace_many(&mut self, mut ranges: Vec<(usize, usize, String)>, now_ms: u64) {
+        if ranges.is_empty() {
+            return;
+        }
+        let _ = now_ms; // batched edits don't coalesce with typing either way
+        ranges.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut ops = Vec::with_capacity(ranges.len() * 2);
+        let mut caret = self.sel.head;
+        for (start, end, text) in &ranges {
+            let (start, end) = (*start, *end);
+            if start < end {
+                let del = Op::delete_range(&self.buffer, start, end);
+                del.apply(&mut self.buffer);
+                ops.push(del);
+            }
+            let ins = Op::Insert { at: start, text: text.clone() };
+            ins.apply(&mut self.buffer);
+            caret = ins.caret_after();
+            if !text.is_empty() {
+                ops.push(ins);
+            }
+        }
+        self.history.record_group(ops);
+        self.sel = Selection::caret(self.buffer.clamp(caret));
+        self.version += 1;
+        self.goal_col = None;
+    }
+
     pub fn undo(&mut self) {
         if let Some(ops) = self.history.pop_undo() {
             for op in &ops {
@@ -482,6 +517,53 @@ mod tests {
         e2.sel = Selection { anchor: 0, head: 1 }; // a real selection, not a caret
         e2.newline_smart(0);
         assert_eq!(e2.buffer.to_string(), "\n}\n", "a selection falls through too, never brace-splits");
+    }
+
+    #[test]
+    fn replace_many_applies_all_ranges_correctly() {
+        let mut e = Editor::from_str("cat cat cat\n");
+        // Three non-overlapping "cat" -> "dog" replacements.
+        let ranges = vec![
+            (0usize, 3usize, "dog".to_string()),
+            (4, 7, "dog".to_string()),
+            (8, 11, "dog".to_string()),
+        ];
+        e.replace_many(ranges, 0);
+        assert_eq!(e.buffer.to_string(), "dog dog dog\n");
+    }
+
+    #[test]
+    fn replace_many_is_one_undo_step_for_every_match() {
+        let mut e = Editor::from_str("aa aa aa aa\n");
+        let ranges: Vec<(usize, usize, String)> = (0..4).map(|i| (i * 3, i * 3 + 2, "bb".to_string())).collect();
+        e.replace_many(ranges, 0);
+        assert_eq!(e.buffer.to_string(), "bb bb bb bb\n");
+        e.undo();
+        assert_eq!(e.buffer.to_string(), "aa aa aa aa\n", "ONE undo restores every replacement, not one at a time");
+        e.redo();
+        assert_eq!(e.buffer.to_string(), "bb bb bb bb\n", "and one redo replays all four");
+    }
+
+    #[test]
+    fn replace_many_handles_different_length_replacement_text() {
+        // Shrinking and growing replacements in the same batch — offsets
+        // are computed against the ORIGINAL text (high-to-low application),
+        // so a growing replacement at a lower offset can't corrupt a
+        // higher-offset one that's already been applied.
+        let mut e = Editor::from_str("x-y-z\n");
+        let ranges = vec![
+            (0usize, 1usize, "LONG".to_string()),  // x -> LONG (grows)
+            (4, 5, "z".to_string()),                // z -> z (no-op length)
+        ];
+        e.replace_many(ranges, 0);
+        assert_eq!(e.buffer.to_string(), "LONG-y-z\n");
+    }
+
+    #[test]
+    fn replace_many_empty_is_a_true_noop() {
+        let mut e = Editor::from_str("unchanged\n");
+        e.replace_many(vec![], 0);
+        assert_eq!(e.buffer.to_string(), "unchanged\n");
     }
 
 }

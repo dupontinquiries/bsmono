@@ -53,6 +53,7 @@ pub enum K {
     Period,
     B,
     M,
+    H,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -67,6 +68,23 @@ pub struct FindState {
     pub cur: usize,
     last_version: u64,
     last_query: String,
+    /// Ctrl+H's addition: `None` = find-only (Ctrl+F's original behavior,
+    /// byte-for-byte unchanged). `Some(text)` = replace mode; `focus` says
+    /// which field Text/Backspace events edit.
+    pub replace: Option<String>,
+    pub focus: FindFocus,
+    /// Where in `AppState::find_history` Ctrl+Up/Ctrl+Down currently sits.
+    /// `None` = the live typed query, not browsing history. Typing resets
+    /// this to `None` — cycling shows past queries, but the moment someone
+    /// types, they're composing a new one, not editing an old one in place.
+    history_ix: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FindFocus {
+    #[default]
+    Query,
+    Replace,
 }
 
 impl FindState {
@@ -187,6 +205,11 @@ pub struct AppState {
     /// answers "what's on disk that isn't committed", the same question the
     /// physical viewer's worktree marks answer).
     pub git_changed: Vec<(usize, usize)>,
+    /// Past find queries, most-recent-last, deduped against immediate
+    /// repeats. Committed on close (Escape) — a query typed and abandoned
+    /// mid-search doesn't clutter history the way committing per-keystroke
+    /// would.
+    pub find_history: Vec<String>,
     /// The file's timeline: commits + gitmind checkpoints, newest first.
     pub revs: Vec<gitspace::Rev>,
     /// None = live and editable; Some(i) = READ-ONLY preview of revs[i].
@@ -256,6 +279,7 @@ impl AppState {
             last_follow_line: usize::MAX,
             git: None,
             git_changed: Vec::new(),
+            find_history: Vec::new(),
             revs: Vec::new(),
             rev_ix: None,
             live_text: None,
@@ -780,13 +804,31 @@ impl AppState {
     // ── find (Ctrl+F) ───────────────────────────────────────────────────────
 
     pub fn open_find(&mut self) {
+        self.open_find_ex(false);
+    }
+
+
+    pub fn open_find_with_replace(&mut self) {
+        self.open_find_ex(true);
+    }
+
+    fn open_find_ex(&mut self, with_replace: bool) {
         let seed = if !self.editor.sel.is_caret() {
             let t = self.editor.selected_text();
             if t.contains('\n') { String::new() } else { t }
         } else {
             String::new()
         };
-        let mut f = FindState { query: seed, matches: Vec::new(), cur: 0, last_version: u64::MAX, last_query: String::new() };
+        let mut f = FindState {
+            query: seed,
+            matches: Vec::new(),
+            cur: 0,
+            last_version: u64::MAX,
+            last_query: String::new(),
+            history_ix: None,
+            replace: if with_replace { Some(String::new()) } else { None },
+            focus: FindFocus::Query,
+        };
         f.recompute(&self.editor.buffer, self.editor.version);
         self.find = Some(f);
         self.find_jump(1, true);
@@ -794,37 +836,161 @@ impl AppState {
 
     /// Returns Some(effects) when the event was consumed by find; None when
     /// it closed find and should still be handled normally (never currently).
-    fn handle_find(&mut self, ev: &Ev, _now_ms: u64) -> Option<Effects> {
+    fn handle_find(&mut self, ev: &Ev, now_ms: u64) -> Option<Effects> {
         let fx = Effects::default();
+        // Which string Text/Backspace edit: the query (find-only's original,
+        // unchanged target) or the replace text, once replace mode has
+        // focus there. Never both at once.
+        let editing_replace = self
+            .find
+            .as_ref()
+            .is_some_and(|f| f.replace.is_some() && f.focus == FindFocus::Replace);
         match ev {
             Ev::Text(t) => {
                 if let Some(f) = &mut self.find {
-                    f.query.push_str(t);
+                    if editing_replace {
+                        f.replace.as_mut().unwrap().push_str(t);
+                    } else {
+                        f.query.push_str(t);
+                        f.history_ix = None;
+                    }
                 }
-                self.find_refresh_jump();
+                if !editing_replace {
+                    self.find_refresh_jump();
+                }
             }
             Ev::Paste(t) => {
+                let clean = t.replace('\n', " ");
                 if let Some(f) = &mut self.find {
-                    f.query.push_str(&t.replace('\n', " "));
+                    if editing_replace {
+                        f.replace.as_mut().unwrap().push_str(&clean);
+                    } else {
+                        f.query.push_str(&clean);
+                        f.history_ix = None;
+                    }
                 }
-                self.find_refresh_jump();
+                if !editing_replace {
+                    self.find_refresh_jump();
+                }
             }
             Ev::Key { key: K::Backspace, .. } => {
                 if let Some(f) = &mut self.find {
-                    f.query.pop();
+                    if editing_replace {
+                        f.replace.as_mut().unwrap().pop();
+                    } else {
+                        f.query.pop();
+                        f.history_ix = None;
+                    }
                 }
-                self.find_refresh_jump();
+                if !editing_replace {
+                    self.find_refresh_jump();
+                }
             }
-            Ev::Key { key: K::Escape, .. } => self.find = None,
+            Ev::Key { key: K::Escape, .. } => {
+                if let Some(f) = self.find.take() {
+                    let q = f.query.trim().to_string();
+                    if !q.is_empty() && self.find_history.last() != Some(&q) {
+                        self.find_history.push(q);
+                    }
+                }
+            }
+            Ev::Key { key: K::Tab, .. } => {
+                if let Some(f) = &mut self.find {
+                    if f.replace.is_some() {
+                        f.focus = if f.focus == FindFocus::Query { FindFocus::Replace } else { FindFocus::Query };
+                    }
+                }
+            }
+            Ev::Key { key: K::Enter, shift, ctrl: true, .. } if editing_replace => {
+                let _ = shift;
+                self.replace_all(now_ms);
+            }
+            Ev::Key { key: K::Enter, .. } if editing_replace => {
+                self.replace_current(now_ms);
+            }
             Ev::Key { key: K::Enter, shift, .. } | Ev::Key { key: K::F3, shift, .. } => {
                 self.find_jump(if *shift { -1 } else { 1 }, false);
             }
+            Ev::Key { key: K::Down, ctrl: true, .. } => self.find_history_step(1),
+            Ev::Key { key: K::Up, ctrl: true, .. } => self.find_history_step(-1),
             Ev::Key { key: K::Down, .. } => self.find_jump(1, false),
             Ev::Key { key: K::Up, .. } => self.find_jump(-1, false),
             Ev::Key { key: K::F, ctrl: true, .. } => {} // already open; keep typing
+            Ev::Key { key: K::H, ctrl: true, .. } => {
+                if let Some(f) = &mut self.find {
+                    if f.replace.is_none() {
+                        f.replace = Some(String::new());
+                    }
+                }
+            }
             _ => return Some(fx), // swallow everything else while the bar is up
         }
         Some(fx)
+    }
+
+    /// Replace the CURRENT match with the replace text, then jump to what is
+    /// now the next match — the same "replace, then advance" a person
+    /// expects from a Find & Replace "Replace" button. One undo step per
+    /// press (`Editor::replace_range`'s existing contract).
+    fn replace_current(&mut self, now_ms: u64) {
+        let Some(f) = &self.find else { return };
+        let (Some(replacement), Some(&(a, b))) = (f.replace.clone(), f.matches.get(f.cur)) else { return };
+        self.editor.replace_range(a, b, &replacement);
+        self.after_edit(now_ms);
+        self.find_refresh_jump();
+    }
+
+    /// Replace EVERY match in one `Editor::replace_many` call — one undo
+    /// step for the whole operation, not one per match.
+    fn replace_all(&mut self, now_ms: u64) {
+        let Some(f) = &self.find else { return };
+        let Some(replacement) = f.replace.clone() else { return };
+        if f.matches.is_empty() {
+            return;
+        }
+        let ranges: Vec<(usize, usize, String)> = f.matches.iter().map(|&(a, b)| (a, b, replacement.clone())).collect();
+        let n = ranges.len();
+        self.editor.replace_many(ranges, now_ms);
+        self.after_edit(now_ms);
+        self.set_status(&format!("replaced {n} match{}", if n == 1 { "" } else { "es" }), now_ms);
+        self.find_refresh_jump();
+    }
+
+    /// Ctrl+Up (`d = -1`, older) / Ctrl+Down (`d = 1`, newer) through
+    /// `find_history`. Older from the live-typed state starts at the most
+    /// recent entry; newer than the most recent entry returns to an empty
+    /// query — the same "one past the newest = blank line" convention a
+    /// shell's history gives you.
+    fn find_history_step(&mut self, d: isize) {
+        if self.find_history.is_empty() {
+            return;
+        }
+        let Some(f) = &mut self.find else { return };
+        let n = self.find_history.len() as isize;
+        match f.history_ix {
+            // Older from live: land on the most recent entry. Newer from
+            // live is a no-op — there's nothing more recent than "live."
+            None => {
+                if d < 0 {
+                    f.history_ix = Some((n - 1) as usize);
+                    f.query = self.find_history[(n - 1) as usize].clone();
+                }
+            }
+            Some(i) => {
+                let next = i as isize + d;
+                if next < 0 {
+                    // Older than the oldest entry: CLAMP, don't wrap to
+                    // blank — that reset is only for the opposite end.
+                } else if next >= n {
+                    f.history_ix = None;
+                    f.query.clear();
+                } else {
+                    f.history_ix = Some(next as usize);
+                    f.query = self.find_history[next as usize].clone();
+                }
+            }
+        }
+        self.find_refresh_jump();
     }
 
     fn find_refresh_jump(&mut self) {
@@ -984,6 +1150,7 @@ impl AppState {
             (O, true) => self.open_palette_in_open_mode(),
             (P, true) => self.open_palette(),
             (F, true) => self.open_find(),
+            (H, true) => self.open_find_with_replace(),
             (E, true) => self.toggle_follow(now_ms),
             (Comma, true) => self.rev_step(1, now_ms),
             (Period, true) => self.rev_step(-1, now_ms),
@@ -1178,7 +1345,9 @@ impl AppState {
     pub fn caret_from_click(&self, x: f32, y: f32, line_h: f32, char_w: f32) -> usize {
         let line = ((y / line_h).floor().max(0.0)) as usize;
         let line = line.min(self.editor.buffer.len_lines().saturating_sub(1));
-        let col = ((x / char_w) + 0.5).floor().max(0.0) as usize;
+        let text = self.editor.buffer.line(line);
+        let target_visual = ((x / char_w) + 0.5).floor().max(0.0) as usize;
+        let col = aperture_core::width::visual_to_char_col(&text, target_visual);
         self.editor
             .buffer
             .pos_to_char(aperture_core::Pos::new(line, col))
@@ -1775,6 +1944,178 @@ mod tests {
             "Enter must not mutate a 'read-only' preview buffer"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn caret_from_click_accounts_for_wide_cjk_glyphs() {
+        let mut s = AppState::new(None, false);
+        // "a漢b" -- a(1 cell) [wide glyph](2 cells) b(1 cell): visual columns 0,1,3,4.
+        typed(&mut s, "a漢b", 0);
+        let char_w = 8.0;
+        let line_h = 20.0;
+        assert_eq!(s.caret_from_click(0.0, 0.0, line_h, char_w), 0);
+        assert_eq!(s.caret_from_click(char_w * 1.0, 0.0, line_h, char_w), 1);
+        assert_eq!(s.caret_from_click(char_w * 2.0, 0.0, line_h, char_w), 2);
+        assert_eq!(s.caret_from_click(char_w * 3.0, 0.0, line_h, char_w), 2);
+        assert_eq!(s.caret_from_click(char_w * 99.0, 0.0, line_h, char_w), 3);
+    }
+
+    #[test]
+    fn caret_from_click_is_unchanged_for_plain_ascii() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "let x = 1;", 0);
+        let char_w = 8.0;
+        for col in 0..=10usize {
+            assert_eq!(s.caret_from_click(col as f32 * char_w, 0.0, 20.0, char_w), col, "col {col}");
+        }
+    }
+
+    #[test]
+    fn find_replace_current_replaces_one_and_advances() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "cat cat cat", 0);
+        s.editor.sel = Selection::caret(0);
+        s.open_find_with_replace();
+        s.handle(Ev::Text("cat".into()), 10);
+        {
+            let f = s.find.as_mut().unwrap();
+            f.focus = FindFocus::Replace;
+        }
+        s.handle(Ev::Text("dog".into()), 20);
+        key(&mut s, K::Enter, false, 30); // replace current, jump to next
+        assert_eq!(s.editor.buffer.to_string(), "dog cat cat", "only the first match replaced");
+        assert_eq!(s.find.as_ref().unwrap().cur, 0, "now pointing at the (new) first remaining match");
+    }
+
+    #[test]
+    fn find_replace_all_is_one_undo_step() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "cat cat cat", 0);
+        s.editor.sel = Selection::caret(0);
+        s.open_find_with_replace();
+        s.handle(Ev::Text("cat".into()), 10);
+        { s.find.as_mut().unwrap().focus = FindFocus::Replace; }
+        s.handle(Ev::Text("dog".into()), 20);
+        s.handle(Ev::Key { key: K::Enter, ctrl: true, shift: false, alt: false }, 30);
+        assert_eq!(s.editor.buffer.to_string(), "dog dog dog");
+        assert!(s.status.as_ref().unwrap().0.contains("replaced 3"));
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "cat cat cat", "one undo restores every replacement");
+    }
+
+    #[test]
+    fn find_tab_toggles_focus_and_routes_typing_correctly() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "abc", 0);
+        s.open_find_with_replace();
+        assert_eq!(s.find.as_ref().unwrap().focus, FindFocus::Query);
+        s.handle(Ev::Text("a".into()), 10);
+        assert_eq!(s.find.as_ref().unwrap().query, "a", "types into query by default");
+        key(&mut s, K::Tab, false, 20);
+        assert_eq!(s.find.as_ref().unwrap().focus, FindFocus::Replace);
+        s.handle(Ev::Text("X".into()), 30);
+        assert_eq!(s.find.as_ref().unwrap().query, "a", "query untouched once focus moved");
+        assert_eq!(s.find.as_ref().unwrap().replace.as_deref(), Some("X"));
+        key(&mut s, K::Tab, false, 40);
+        assert_eq!(s.find.as_ref().unwrap().focus, FindFocus::Query);
+    }
+
+    #[test]
+    fn plain_ctrl_f_still_has_no_replace_field_at_all() {
+        // Ctrl+F alone must be byte-for-byte the old find-only behavior.
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "abc", 0);
+        s.open_find();
+        assert!(s.find.as_ref().unwrap().replace.is_none());
+        key(&mut s, K::Tab, false, 0); // Tab is a no-op without a replace field
+        assert_eq!(s.find.as_ref().unwrap().focus, FindFocus::Query);
+    }
+
+    #[test]
+    fn replace_all_with_no_matches_does_nothing() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "hello", 0);
+        s.editor.sel = Selection::caret(0);
+        s.open_find_with_replace();
+        s.handle(Ev::Text("zzz".into()), 10);
+        { s.find.as_mut().unwrap().focus = FindFocus::Replace; }
+        s.handle(Ev::Text("q".into()), 20);
+        s.handle(Ev::Key { key: K::Enter, ctrl: true, shift: false, alt: false }, 30);
+        assert_eq!(s.editor.buffer.to_string(), "hello", "nothing to replace, nothing changes");
+    }
+
+    #[test]
+    fn find_history_commits_on_close_and_cycles_with_ctrl_arrows() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "alpha beta gamma", 0);
+        s.editor.sel = Selection::caret(0);
+
+        s.open_find();
+        s.handle(Ev::Text("alpha".into()), 10);
+        key(&mut s, K::Escape, false, 20); // commits "alpha" to history
+        assert_eq!(s.find_history, vec!["alpha".to_string()]);
+        assert!(s.find.is_none());
+
+        // find_jump's own side effect selects the match text; open_find
+        // seeds from a non-caret selection on purpose (search-the-selection
+        // is an existing, intentional feature). Reset to a caret so THIS
+        // session starts from an empty query, same as a user clicking
+        // elsewhere before searching again.
+        s.editor.sel = Selection::caret(0);
+        s.open_find();
+        s.handle(Ev::Text("beta".into()), 30);
+        key(&mut s, K::Escape, false, 40);
+        assert_eq!(s.find_history, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // Fresh session: Ctrl+Up recalls the most recent entry first.
+        s.editor.sel = Selection::caret(0);
+        s.open_find();
+        s.handle(Ev::Key { key: K::Up, ctrl: true, shift: false, alt: false }, 50);
+        assert_eq!(s.find.as_ref().unwrap().query, "beta");
+        s.handle(Ev::Key { key: K::Up, ctrl: true, shift: false, alt: false }, 60);
+        assert_eq!(s.find.as_ref().unwrap().query, "alpha", "older still");
+        s.handle(Ev::Key { key: K::Up, ctrl: true, shift: false, alt: false }, 70);
+        assert_eq!(s.find.as_ref().unwrap().query, "alpha", "clamped at the oldest entry");
+        s.handle(Ev::Key { key: K::Down, ctrl: true, shift: false, alt: false }, 80);
+        assert_eq!(s.find.as_ref().unwrap().query, "beta", "newer");
+        s.handle(Ev::Key { key: K::Down, ctrl: true, shift: false, alt: false }, 90);
+        assert_eq!(s.find.as_ref().unwrap().query, "", "one past the newest: blank, shell-history style");
+
+        // Typing resets history browsing to "live", not editing history in place.
+        s.handle(Ev::Key { key: K::Up, ctrl: true, shift: false, alt: false }, 100);
+        assert_eq!(s.find.as_ref().unwrap().query, "beta");
+        s.handle(Ev::Text("!".into()), 110);
+        assert_eq!(s.find.as_ref().unwrap().query, "beta!");
+        key(&mut s, K::Escape, false, 120);
+        assert_eq!(s.find_history, vec!["alpha".to_string(), "beta".to_string(), "beta!".to_string()]);
+    }
+
+    #[test]
+    fn find_history_ignores_empty_and_consecutive_duplicate_queries() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "x", 0);
+        s.editor.sel = Selection::caret(0);
+
+        s.open_find();
+        key(&mut s, K::Escape, false, 10); // never typed anything: no entry
+        assert!(s.find_history.is_empty());
+
+        s.open_find();
+        s.handle(Ev::Text("x".into()), 20);
+        key(&mut s, K::Escape, false, 30);
+        s.editor.sel = Selection::caret(0);
+        s.open_find();
+        s.handle(Ev::Text("x".into()), 40);
+        key(&mut s, K::Escape, false, 50);
+        assert_eq!(s.find_history, vec!["x".to_string()], "immediate repeat isn't duplicated");
+    }
+
+    #[test]
+    fn find_history_arrows_are_a_noop_with_no_history() {
+        let mut s = AppState::new(None, false);
+        s.open_find();
+        s.handle(Ev::Key { key: K::Up, ctrl: true, shift: false, alt: false }, 0);
+        assert_eq!(s.find.as_ref().unwrap().query, "");
     }
 
 }

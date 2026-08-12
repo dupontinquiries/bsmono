@@ -11,9 +11,12 @@
 
 use egui::Color32;
 use scene_kit::gpuscene::{MAT_INSCRIPTION, MAT_INSCRIPTION2};
+use scene_kit::mesh3d::graph_scene;
 use scene_kit::mesh3d::{cuboid, panel, panel_uv, with_mat, Mesh3};
 use scene_kit::spatial::Vec3;
 
+use crate::graph;
+use aperture_core::gitspace::Rev;
 use crate::rooms::{room_mat, Station, CORRIDOR_HALF_W, STATION_SPACING};
 
 pub struct World {
@@ -89,14 +92,44 @@ fn push_lectern(
     (ix, center, right, up, page_w, page_h)
 }
 
+/// Append the commit-history graph (logscope's `graph_scene`, a node per
+/// revision, an edge per parent) as a small cluster at the vestibule — the
+/// first thing visible on entering, before walking a single station. Empty
+/// or single-node history renders nothing (a lone dot with no edges isn't
+/// informative, and an empty graph is just noise).
+fn push_history_graph(meshes: &mut Vec<Mesh3>, revs: &[Rev], rev_ix: Option<usize>) {
+    if revs.len() < 2 {
+        return;
+    }
+    let g = graph::layout(revs, rev_ix, V(-9.5, 9.0, 8.5), 1.6, V(1.0, 0.0, 0.0));
+    meshes.extend(graph_scene(
+        &g.centers,
+        &g.colors,
+        &g.edges,
+        g.active,
+        0.42,
+        0.10,
+        Color32::from_rgb(226, 196, 108),
+        Color32::from_rgb(120, 118, 112),
+    ));
+}
+
 /// The classic single room (no outline): lectern at the origin, the four
 /// context-material plinths behind.
 pub fn build(aspect: f32) -> World {
+    build_with_history(aspect, &[], None)
+}
+
+/// [`build`] plus the history graph — kept as a separate entry point so
+/// `build`'s existing signature (used by tests and the empty-outline
+/// fallback) never has to know about git at all.
+pub fn build_with_history(aspect: f32, revs: &[Rev], rev_ix: Option<usize>) -> World {
     let mut meshes = Vec::new();
     meshes.push(with_mat(
         cuboid(V(0.0, -0.6, 0.0), V(46.0, 0.6, 40.0), Color32::from_rgb(126, 124, 120)),
         2.0,
     ));
+    push_history_graph(&mut meshes, revs, rev_ix);
     let (page_ix, page_center, page_right, page_up, page_w, page_h) =
         push_lectern(&mut meshes, V(0.0, 0.0, 0.0), aspect);
 
@@ -126,11 +159,20 @@ pub fn atlas_v_window(row: usize, cell_px: f32, tex_h: f32) -> (f32, f32) {
 }
 
 /// The corridor: one station per outline item, the lectern at `focus`.
-pub fn build_rooms(stations: &[Station], focus: usize, aspect: f32, atlas_cell_px: f32, atlas_h: f32) -> World {
+pub fn build_rooms(
+    stations: &[Station],
+    focus: usize,
+    aspect: f32,
+    atlas_cell_px: f32,
+    atlas_h: f32,
+    revs: &[Rev],
+    rev_ix: Option<usize>,
+) -> World {
     if stations.is_empty() {
-        return build(aspect);
+        return build_with_history(aspect, revs, rev_ix);
     }
     let mut meshes = Vec::new();
+    push_history_graph(&mut meshes, revs, rev_ix);
     let len = 20.0 + stations.len() as f32 * STATION_SPACING;
 
     // Corridor floor: one long slab down −z.
@@ -170,6 +212,12 @@ pub fn build_rooms(stations: &[Station], focus: usize, aspect: f32, atlas_cell_p
             let h = st.heat;
             let col = if st.touched {
                 Color32::from_rgb(96, 168, 84)
+            } else if st.dormant {
+                // Sealed, not just quiet: dimmer and greyer than the ember
+                // scale ever goes, so "hasn't moved in months" reads as
+                // genuinely different from "cooled off this week" rather
+                // than the far end of the same gradient.
+                Color32::from_rgb(110, 108, 106)
             } else {
                 Color32::from_rgb(
                     (150.0 + 60.0 * h) as u8,
@@ -177,18 +225,30 @@ pub fn build_rooms(stations: &[Station], focus: usize, aspect: f32, atlas_cell_p
                     (120.0 - 50.0 * h) as u8,
                 )
             };
-            let mut plinth = with_mat(cuboid(V(st.pos.x, 2.0, st.pos.z), V(1.7, 2.0, 1.7), col), mat);
-            plinth.emissive = if st.touched { 0.55 } else { 0.4 * h };
+            // large: the plinth itself grows — a bigger item gets a
+            // physically bigger room, logscope's Chamber ("token-heavy →
+            // larger") with real line-count standing in for token mass.
+            let half = if st.large { V(2.3, 2.3, 2.3) } else { V(1.7, 2.0, 1.7) };
+            let mut plinth = with_mat(cuboid(V(st.pos.x, half.y, st.pos.z), half, col), mat);
+            plinth.emissive = if st.touched { 0.55 } else if st.dormant { 0.0 } else { 0.4 * h };
             meshes.push(plinth);
             if st.touched {
                 // A thin marker cap, unmistakable even from far down the
                 // corridor before the color read is legible.
                 let mut cap = with_mat(
-                    cuboid(V(st.pos.x, 4.4, st.pos.z), V(0.5, 0.18, 0.5), Color32::from_rgb(120, 200, 100)),
+                    cuboid(V(st.pos.x, half.y * 2.2, st.pos.z), V(0.5, 0.18, 0.5), Color32::from_rgb(120, 200, 100)),
                     mat,
                 );
                 cap.emissive = 0.7;
                 meshes.push(cap);
+            } else if st.dormant {
+                // A capstone, not a cap: flat, wide, unlit — sealing the
+                // room shut rather than crowning it. The silhouette itself
+                // says "closed off" before any color is legible at all.
+                meshes.push(with_mat(
+                    cuboid(V(st.pos.x, half.y * 2.05, st.pos.z), V(half.x * 1.15, 0.14, half.x * 1.15), Color32::from_rgb(96, 94, 92)),
+                    mat,
+                ));
             }
         }
         // Name plaque: atlas row i, standing above the plinth (or hung from
@@ -293,8 +353,8 @@ mod tests {
         let st = layout(items());
         let cell = 16.0;
         let atlas_h = cell * (st.len() as f32 + 2.0);
-        let w0 = build_rooms(&st, 0, 2.2, cell, atlas_h);
-        let w2 = build_rooms(&st, 2, 2.2, cell, atlas_h);
+        let w0 = build_rooms(&st, 0, 2.2, cell, atlas_h, &[], None);
+        let w2 = build_rooms(&st, 2, 2.2, cell, atlas_h, &[], None);
         assert_eq!(w0.plaque_ix.len(), 3, "every station has a clickable plaque");
         assert!(w2.page_center.z < w0.page_center.z, "the lectern follows the focus deeper in");
         let uv_of = |w: &World, i: usize| w.meshes[w.plaque_ix[i].1].uvs.clone().unwrap();
@@ -307,8 +367,62 @@ mod tests {
 
     #[test]
     fn empty_outline_falls_back_to_the_single_room() {
-        let w = build_rooms(&[], 0, 2.2, 16.0, 64.0);
+        let w = build_rooms(&[], 0, 2.2, 16.0, 64.0, &[], None);
         assert!(w.plaque_ix.is_empty());
         assert!(w.page_center.z.abs() < 9.0, "classic room at the origin");
     }
+    #[test]
+    fn history_graph_appears_with_real_multi_commit_history_and_is_absent_otherwise() {
+        let rev = |oid: &str, parents: &[&str]| Rev {
+            oid: oid.into(), time: 0, subject: oid.into(),
+            kind: aperture_core::gitspace::RevKind::Commit,
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+        };
+        let n_before = build(2.2).meshes.len();
+
+        // Two commits: a graph should appear (at least 2 spheres + 1 tube = 3 meshes over baseline).
+        let two = vec![rev("b", &["a"]), rev("a", &[])];
+        let w = build_with_history(2.2, &two, None);
+        assert!(w.meshes.len() >= n_before + 3, "graph meshes present: {} vs baseline {}", w.meshes.len(), n_before);
+
+        // Zero or one commit: no graph (a lone dot isn't informative).
+        assert_eq!(build_with_history(2.2, &[], None).meshes.len(), n_before);
+        let one = vec![rev("a", &[])];
+        assert_eq!(build_with_history(2.2, &one, None).meshes.len(), n_before);
+    }
+
+    #[test]
+    fn large_stations_get_a_physically_bigger_plinth_and_dormant_ones_a_capstone() {
+        let mk = |name: &str, end_line: usize, heat: f32, dormant: bool, large: bool| Station {
+            item: aperture_core::syntax::OutlineItem { kind: aperture_core::syntax::OutlineKind::Fn, name: name.into(), sig: name.into(), line: 0, end_line },
+            pos: Vec3::new(-8.0, 0.0, -10.0),
+            env: crate::rooms::room_env(aperture_core::syntax::OutlineKind::Fn, name),
+            atlas_row: 0,
+            heat,
+            touched: false,
+            dormant,
+            large,
+        };
+        let small = mk("small", 3, 0.5, false, false);
+        let big = mk("big", 40, 0.5, false, true);
+        let sealed = mk("sealed", 3, 0.0, true, false);
+
+        let w_small = build_rooms(std::slice::from_ref(&small), 0, 2.2, 16.0, 64.0, &[], None);
+        let w_big = build_rooms(std::slice::from_ref(&big), 0, 2.2, 16.0, 64.0, &[], None);
+        let w_sealed = build_rooms(std::slice::from_ref(&sealed), 0, 2.2, 16.0, 64.0, &[], None);
+
+        // Large: find the plinth mesh (skip the shared corridor floor at index 0) and check its half-extent.
+        let plinth_small = &w_small.meshes[1];
+        let plinth_big = &w_big.meshes[1];
+        assert!(plinth_big.verts.iter().map(|v| v.x.abs()).fold(0.0f32, f32::max)
+            > plinth_small.verts.iter().map(|v| v.x.abs()).fold(0.0f32, f32::max),
+            "the large station's plinth is physically wider");
+
+        // Dormant: one extra mesh (the capstone) vs a plain, non-touched, non-large, non-dormant station.
+        let ordinary = mk("ordinary", 3, 0.5, false, false);
+        let w_ordinary = build_rooms(std::slice::from_ref(&ordinary), 0, 2.2, 16.0, 64.0, &[], None);
+        assert_eq!(w_sealed.meshes.len(), w_ordinary.meshes.len() + 1, "capstone adds exactly one mesh");
+        assert_eq!(w_sealed.meshes[1].emissive, 0.0, "sealed rooms don't glow");
+    }
+
 }

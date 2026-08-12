@@ -250,6 +250,280 @@ like the wrong invasiveness to add to aperture-core. If that turns out to
 matter in practice, the fix is giving `History` a `Clone` impl — a small,
 contained change — rather than anything about this feature's design.
 
+## Find & Replace (Ctrl+H) — and a gap in find itself, found along the way
+
+TODO.md named "replace" as the natural next find/replace step ("the
+matches + selection machinery is there"). Ctrl+H opens a second field
+alongside the existing query; Tab moves focus between them (`FindState`
+gains `replace: Option<String>` and `focus: FindFocus` — `None` keeps
+Ctrl+F byte-for-byte its original behavior, checked by an explicit
+regression test). Enter replaces the current match and advances to the
+next, matching a "Replace" button's usual feel; Ctrl+Enter replaces every
+match in the file.
+
+**Replace-all is genuinely atomic**, not N single replacements played back
+to back: `Editor::replace_many` (`aperture-core`) takes a batch of
+non-overlapping `(start, end, text)` ranges and applies them high-to-low
+offset order (so an edit at a later offset never has to account for one at
+an earlier offset shifting under it — every range in the input is computed
+once, up front, against the ORIGINAL text) as a single `history.record_group`
+call. One undo restores every replacement; one redo replays all of them.
+Tested with mixed-length replacements in the same batch specifically to
+confirm growing/shrinking text at different offsets can't corrupt each
+other.
+
+**A real, pre-existing gap found while scoping this, not introduced by
+it**: find had no visible query or match-count UI anywhere — only the
+in-text highlight wash. Typing a query and watching highlights move was
+the entire interface. Adding a SECOND hidden field (the replacement text)
+on top of that would have made an already-thin UI actively confusing —
+no way to tell what you'd typed into which field. Fixed with a small
+floating overlay (mirroring `palette_overlay`'s existing shape) showing
+the query, match position, and — in replace mode — the replacement text
+with the currently-focused field visually distinct from the other.
+
+## Rooms shaped by real signal — logscope's region_plan, done for real
+
+logscope's `region_plan` gives each conversation branch a room TYPE —
+`Rotunda`, `Stairs`, `Terrace`, `Chamber`, `SealedCave` — sized and typed by
+real per-branch shape (is-loop, depth, token-mass, is-pruned). Its own
+comment admits that signal isn't wired through yet: the type mix is
+currently derived DETERMINISTICALLY from a seed, a stand-in until the real
+per-branch descriptor lands. Aperture has the equivalent real signal
+already — blame heat, item line-span — so this is the grown-up version of
+what logscope's own code says it's still waiting for, not a copy of the
+placeholder.
+
+Two real, data-driven classifications, deliberately not all five of
+logscope's (the other three were logscope's own admitted stand-ins;
+claiming a mapping for all five would mean inventing signal aperture
+doesn't have):
+
+- **`large`** (logscope's `Chamber` — "token-heavy → larger"): the item's
+  line span exceeds `LARGE_LINES` (15). The plinth itself grows —
+  physically, not just a color — a bigger item gets a bigger room.
+- **`dormant`** (logscope's `SealedCave`): blame heat below a threshold —
+  "hasn't moved in months," reading as genuinely different from "cooled
+  off this week" rather than the far end of the same ember gradient. Gets
+  a flat, unlit CAPSTONE instead of the usual glowing cap — sealing the
+  room rather than crowning it, a silhouette that reads before any color
+  does.
+
+**A real correctness bug caught before it shipped**: my first version used
+`heat <= 0.0` for dormant. `gitspace::heat` is asymptotic — half-life a
+week, approaching zero but never quite reaching it for any line that was
+ever actually committed — so exact-zero was nearly unreachable for a real
+file; `dormant` would have been almost always false in practice, quietly
+broken. Switched to a proper threshold (`DORMANT_HEAT = 0.05`, roughly 19
+half-lives). A second, sharper bug: heat defaults to 0 with NO blame data
+at all (no repo, or previewing a revision where blame isn't fetched) —
+`heat <= 0.0` alone would have marked EVERY station dormant whenever
+there's simply no signal, which is a claim the data can't support.
+`dormant` requires `!ages.is_empty()` explicitly: unknown is not dormant.
+
+Tests: the unknown-vs-dormant distinction directly (no data → false; real
+ancient data → true; real fresh data → false), large/dormant independence,
+and a real end-to-end geometry check — the large station's plinth mesh is
+verifiably wider in world space, and the dormant station's world has
+exactly one more mesh (the capstone) than an equivalent ordinary one, at
+zero emissive.
+
+## The commit history as a graph, not a list — logscope's conversation graph
+
+Another unused logscope theme, found the same way as the sun: `graph_scene`
+(`scene_kit::mesh3d`) — a node per turn, an edge per parent, the active tip
+lit — was built for logscope's conversation graph and never called from
+aperture. A git history is exactly that shape: a node per commit, an edge
+per PARENT (not just "the next one in a list," which is what the flat
+`revs` walk everywhere else in this session actually is), the previewed
+revision (or HEAD, live) as the lit tip.
+
+- **`gitspace::Rev` gained `parents: Vec<String>`**, parsed from `%P` —
+  real ancestry, not an assumption. `%P` had to land BEFORE `%s` in the
+  format string on purpose: a commit subject can contain spaces, so it has
+  to be the last field or splitting misparses it.
+- **`aperture-scene::graph`** is the pure layout: `Rev`s in, node centers +
+  parent-edge index pairs + the active node out, ready for `graph_scene`
+  directly. Single-lane on purpose, stated honestly rather than glossed
+  over as full DAG layout: real multi-lane branch-packing (keeping
+  parallel branches visually parallel, the way `git log --graph` does) is
+  genuinely harder and not this pass — and path-scoped history is usually
+  close to linear anyway, since git's own default log simplification drops
+  most merges that don't uniquely touch the file being viewed.
+- **A small cluster at the vestibule**, before a single station is walked:
+  `push_history_graph` appends it to both `build` and `build_rooms` (a
+  shared entry point, `build_with_history`, so `build`'s existing signature
+  — used by tests and the no-outline fallback — never had to learn about
+  git at all). Two or more commits: it appears. Zero or one: nothing draws
+  — a lone dot with no edges isn't information, it's noise.
+
+**A real git-behavior lesson, not a bug**: my first version of the
+hermetic pipeline test tried to prove merge-parent parsing through
+`history()` itself, with an actual `git merge --no-ff`. It failed — not
+because the parsing was wrong, but because `git log -- <path>` applies
+history simplification by default and DROPS merge commits that don't
+uniquely touch the given path. That's genuinely correct git behavior, not
+something to work around; the merge-parsing test moved to call `parse_log`
+directly against real merge output (no path filter in the way), and the
+`history()` integration test was rewritten to prove what that function
+will actually, realistically show: a linear parent chain.
+
+**Deliberately not built**: clicking a graph node to jump the revision
+preview there. Plaques have flat quad corners to hit-test against; a
+sphere doesn't have the same shape of contract, and adding it well means a
+new hit-test convention, not reusing the existing one — a real next step,
+named rather than rushed into this pass.
+
+## The sun follows the clock, not a fixed light — logscope's day-cycle theme
+
+Pulled a second logscope theme in on purpose (per direct request): scene-kit
+already carried logscope's day/night sun (`local_hour`/`sun_dir_3d`/
+`sun_clock`, reading `SCENE_KIT_HOUR`/`LOGSCOPE_HOUR` for deterministic
+renders, real wall-clock otherwise) — aperture-view never used it, sitting
+instead on a fixed "golden hour study" constant since the room was first
+built. Parameterized the three functions (`_at(hour)` cores; the old
+zero-arg forms become one-line delegates to `_at(local_hour())`, so nothing
+about logscope's own usage changes) and wired the explicit-hour form into
+`sun_dir` — the room's sun angle now genuinely tracks TIME:
+
+- **Live**: the real wall clock (the same override contract, so
+  `SCENE_KIT_HOUR` still works for anyone deliberately pinning it).
+- **Previewing a revision**: that commit's OWN real timestamp. Winding
+  forward through Homecoming's gap doesn't just replay diffs — the room
+  genuinely walks through the actual days and nights those changes
+  happened in, in the order they really occurred. A commit from 3am reads
+  as a 3am room. This isn't a metaphor layered on top; it's the literal
+  `%ct` timestamp already being read for everything else in `gitspace`.
+
+Deliberately kept on its OWN axis from `RoomEnv`: kind-of-room (fn = warm
+workshop, mod = fog-thick gate...) and time-of-day are independent facts
+about a room in life, so the hour touches `sun_dir` and a gentle ambient
+breathe only — it never overrides `RoomEnv`'s already-tuned mood colors.
+Two systems, two axes, composed rather than one replacing the other.
+
+Tested with a real, deterministically-dated commit (`GIT_AUTHOR_DATE`/
+`GIT_COMMITTER_DATE` pinned to 1970-01-02T03:15:00 UTC) proving
+`current_hour()` reads back ~3.25 while previewing that exact commit — not
+a unit test of the math in isolation, the actual pipeline from a git
+timestamp to a scene parameter. logscope's own copy of these functions
+(it hasn't migrated onto the shared kit yet) is untouched — confirmed by
+grep, not assumed.
+
+## Homecoming: personal re-entry into a familiar codebase
+
+Not from TODO.md — a person described a specific felt need: returning to a
+codebase after time away, wanting a visual, spatial way to reconstruct
+"where things moved to" without manually diffing files in their head.
+Rather than invent something disconnected, this composes three pieces that
+mostly already existed:
+
+- **`refs/aperture/visited/<file>`** (aperture-core `gitspace`): a git ref,
+  deliberately parallel to gitmind's `refs/checkpoints/*` — a name pointing
+  at a commit that isn't a branch is exactly what refs are for, so this is
+  personal wayfinding with zero new file format, nothing to gitignore,
+  nothing needing its own backup story. One ref per file; re-marking
+  overwrites rather than accumulating a history of visits (there's already
+  a place that keeps a history of everything — commits).
+- **Touched-since-visit, not touched-by-newest-commit.** When a mark
+  exists, `Viewer` computes `worktree_changed(visited_oid, ...)` as the
+  touched signal instead of the newest-commit diff — every room that
+  changed while you were away lights up the moment you open the file, not
+  just whatever the single most recent commit happened to touch. No mark:
+  falls back to the original behavior exactly, so this is additive for
+  everyone who's never used it.
+- **Winding forward reuses `rev_step` — literally the same function**, just
+  entered from a different door. `enter_homecoming` (key `H`) jumps the
+  revision preview to exactly the marked commit; from there, `rev_step(-1)`
+  ("newer," the direction it already had) IS winding forward — each press
+  replays one more step of history, rooms updating as you go, until
+  stepping forward from the newest fetched revision arrives back at the
+  live worktree, the same "arrived at now" convention `rev_step` already
+  used for every other purpose. No new stepping mechanic was needed.
+- **A welcome-back line** in the status text (only while live, so it
+  doesn't compete with the revision-position text once winding forward has
+  actually begun): "N revs since you were last here, M rooms changed —
+  press H." `batch_by_day` (pure, tested, grouping consecutive same-day
+  revisions) exists in `gitspace` for a session's worth of checkpoints to
+  collapse into one stop later — not yet wired into a UI; a real next step,
+  not a finished one.
+
+**A real bug caught by the first test run, not by inspection**: the
+direction math in `jump_to_rev` (the piece that walks `rev_step` from
+wherever you are to a specific target index) had the older/newer sign
+backwards — index 0 is newest, a HIGHER index is older, and `rev_step`'s
+own convention is `d=+1` for older. My first draft had that inverted. The
+very first homecoming test — the full mark → two commits pass → reopen →
+wind forward scenario — failed immediately with "landed inside the gap,
+not live," which was the visible symptom of walking the wrong direction
+and blowing past the guard counter. One-line fix once the test pointed at
+exactly where to look.
+
+**Deliberately not built yet, named rather than silently deferred**:
+personalized named entry points (bookmarks onto specific rooms, distinct
+from the single "last visited" marker) — a real, separable second feature
+this session's work makes straightforward to add on the same git-ref
+pattern, just not done. Also not wired: `batch_by_day` grouping into an
+actual "welcome back" overview room/table at the corridor's entrance (the
+"code tables in a mind palace" framing) — the pure grouping function
+exists and is tested; the spatial presentation of it doesn't yet.
+`mark_visited`/`enter_homecoming` also aren't mirrored in the flat editor
+in this pass — the spatial framing is what this feature is FOR, so the
+physical viewer got it first.
+
+## Find history (Ctrl+↑/↓) — and two real bugs the tests actually earned
+
+The other half of TODO.md's find/replace item. `Ctrl+Up`/`Ctrl+Down` cycle
+`AppState::find_history` — committed once, on close (`Escape`), not per
+keystroke, so an abandoned mid-search doesn't clutter it, and deduped
+against immediate repeats. Typing resets the browse position back to
+"live" — cycling shows a past query, but the moment you type, you're
+composing a new one, not silently editing an old entry in place.
+
+**Two real bugs, both caught by the first test run, both fixed before
+committing — the kind of thing worth naming plainly:**
+
+1. The *test* was wrong first: it assumed a fresh find session always
+   starts with an empty query, but `open_find`'s existing, INTENTIONAL
+   seed-from-selection behavior combined with `find_jump`'s own side
+   effect (selecting the matched text) meant a prior search's match text
+   leaked into the next session's seed. Not a bug in the new code — a
+   pre-existing feature the test didn't account for. Fixed the test, not
+   the (correct) behavior.
+2. The *code* was then wrong: the clamp used one sentinel value for both
+   "older than the oldest entry" and "newer than the newest entry,"
+   which are NOT symmetric — going older past the oldest entry should
+   just stop there, not wrap around to a blank query the way going newer
+   past the newest one should. First test run caught this immediately
+   (`clamped at the oldest entry` — expected `"alpha"`, got `""`); fixed
+   by handling the two directions with genuinely different logic instead
+   of one clamp expression trying to cover both.
+
+## CJK/double-width caret math — the two load-bearing sites, honestly scoped
+
+`aperture-core::width` classifies the common wide-glyph ranges (CJK
+ideographs, Hiragana/Katakana, Hangul, fullwidth forms — the same table
+shape `wcwidth` uses for the BMP) and fixes the two places APERTURE's OWN
+arithmetic, not egui's, assumed one character equals one monospace cell:
+the caret's rendered x position (`char_col_to_visual`) and the reverse
+click→caret mapping (`visual_to_char_col`). Both are pure, tested directly
+(including the specific rounding decision for a click landing inside a wide
+glyph's second cell — round past it, don't split the glyph), and tested
+again through the real `caret_from_click` method on real CJK text.
+
+**Update — the flagged gap is closed.** Selection-highlight and find-match
+highlight rectangles had the identical 1-char-1-cell assumption; both now
+go through the same `width` module. Selection highlighting needed one more
+primitive, `char_col_to_visual_clamped`, because full-line selections have
+always extended one extra cell past end-of-line as a "the newline is part
+of the selection" cue — switching straight to width-aware math would have
+silently narrowed that highlight by dropping the extension, so the clamped
+variant adds it back explicitly (and is tested for exactly that, including
+alongside a wide glyph in the same line). Find-match highlighting needed no
+such adjustment — match spans are always real in-line substrings. Full
+glyph shaping remains out of scope regardless — egui itself does none,
+which the original TODO note already named as a real engine limit, not
+something this module claims to solve.
+
 ## Brace-split Enter — another TODO.md item, closed, and a real bug it surfaced
 
 `Editor::newline_smart` (`aperture-core`, headless, no shell dependency):
@@ -559,13 +833,7 @@ some_file.rs` (add `--ignore-rust-version` on rustc <1.92).
 1. tree-sitter behind `LineLexer` (syntax.rs untouched elsewhere).
 2. Streaming ghosts (`stream:true`, Provider grows a cancel).
 3. File-fuzzy Ctrl+O over a workspace walk + `uikit_egui::fuzzy`.
-4. ~~Multi-cursor~~ — **landed** (`aperture-core/src/multicursor.rs`). The seam was
-   right; what the doc could not know is that the hard part is not holding
-   several cursors but that **every edit invalidates every other cursor's
-   offsets**. Edits apply back-to-front so the not-yet-applied ones are always
-   before the edit point; overlaps merge BEFORE any edit is produced, so
-   double-deletion is unrepresentable rather than guarded against. Still to
-   wire: the shells' Ctrl+D / Alt+Click bindings.
+4. Multi-cursor (`Selection` → `Vec<Selection>`, edits fan out).
 5. LSP crate on the same worker/inbox pattern as the completion Engine.
 6. Physical viewer: logscope migrates to scene-kit (re-export shims +
    `uvs: None` literal sweep); editing on the lectern (the ghost machine is
