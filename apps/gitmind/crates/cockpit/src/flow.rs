@@ -841,6 +841,41 @@ pub fn catalog_apps() -> Vec<crate::suite::SuiteApp> {
     out
 }
 
+/// Install, stopping early if `cancel` is set.
+///
+/// Only the CARGO path is cancellable. A CMake or Python build goes through
+/// `buildsystem`, which shells out differently — offering a cancel button that
+/// silently does nothing there would be worse than not offering one, so those
+/// fall through to the uncancellable path and the caller's button simply has no
+/// effect it can promise.
+pub fn install_suite_app_cancellable(
+    app: &crate::suite::SuiteApp,
+    on_line: &mut dyn FnMut(&str),
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Installed, String> {
+    CANCEL.with(|c| *c.borrow_mut() = cancel);
+    let r = install_suite_app_logged(app, on_line);
+    CANCEL.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+thread_local! {
+    /// The cancel flag for the build running on THIS thread.
+    ///
+    /// A thread-local rather than a parameter threaded through six functions:
+    /// install_suite_app_logged dispatches across cargo/cmake/python/make/go
+    /// and each has its own call chain, so widening all of them to carry an
+    /// Option nobody but the cargo path reads would be churn for no gain. The
+    /// task runs one build per thread, so the scope is exactly right.
+    static CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The cancel flag for the build on this thread, if one was set.
+pub fn thread_cancel_flag() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    CANCEL.with(|c| c.borrow().clone())
+}
+
 pub fn install_suite_app_logged(app: &crate::suite::SuiteApp, on_line: &mut dyn FnMut(&str)) -> Result<Installed, String> {
     let target = if app.target.trim().is_empty() { native_triple_local() } else { app.target.clone() };
     let app_dir = crate::ops::resolve_app_dir(&app.path);
@@ -853,13 +888,16 @@ pub fn install_suite_app_logged(app: &crate::suite::SuiteApp, on_line: &mut dyn 
     let is_cargo = matches!(detected.as_ref().map(|d| &d.kind), Some(crate::buildsystem::Kind::Cargo) | None);
 
     if is_cargo {
-        let (bin, _) = crate::ops::build_locally_logged(
+        let (bin, _) = crate::ops::build_locally_cancellable(
             app.build_app_id(),
             &app_dir,
             &target,
             &app.features,
             app.no_default,
             on_line,
+            // The flag set by install_suite_app_cancellable, if the caller
+            // offered one. None here is the uncancellable path, unchanged.
+            thread_cancel_flag(),
         )
         .map_err(|e| format!("build: {e}"))?;
         add_to_apps(&bin, &app.name, "suite", &app.run_flags)

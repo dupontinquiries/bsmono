@@ -174,9 +174,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 a.features = app.fleet.feature_toggles.iter().filter(|(_, on)| *on).map(|(n, _)| n.clone()).collect();
                 a.no_default = true;
             }
+            let cancel = app.task.cancel_flag();
             app.task.run_logged(move |sink| {
                 let mut on_line = |l: &str| sink.push(l);
-                match cockpit::flow::install_suite_app_logged(&a, &mut on_line) {
+                match cockpit::flow::install_suite_app_cancellable(&a, &mut on_line, Some(cancel)) {
                     Ok(i) => format!("✓ installed {} → {}", i.name, i.path),
                     Err(e) => format!("error: {e}"),
                 }
@@ -248,7 +249,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if app.task.is_running() {
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label("building…");
+            ui.label(if app.task.cancelled() { "cancelling…" } else { "building…" });
+            // CANCEL, next to the spinner rather than somewhere else: the
+            // spinner is what the user is looking at when they want to stop.
+            //
+            // Disabled once pressed, because the flag is checked between output
+            // lines — a second press does nothing and an enabled button that
+            // does nothing reads as a broken button.
+            if ui.add_enabled(!app.task.cancelled(),
+                              egui::Button::new("cancel").small()).clicked() {
+                app.task.cancel();
+            }
         });
         ui.ctx().request_repaint();
     }
