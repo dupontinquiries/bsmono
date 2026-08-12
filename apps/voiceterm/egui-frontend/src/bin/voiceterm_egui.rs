@@ -25,20 +25,75 @@ use voiceterm_egui::App;
 /// terminal first, and a switcher that made it a peer of the mail reader would
 /// be the wrong app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CentralView { Terminal, Mail, Browser, Graph, Table, Archive }
+enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive }
+
+/// Build a `Doc` from bundled markdown.
+///
+/// The view's contract is "already-converted HTML — the host owns the markdown
+/// and the conversion", so the conversion lives here. Deliberately minimal:
+/// headings, paragraphs and code fences, because a full markdown renderer is a
+/// dependency and these documents are the project's own, written to be read as
+/// plain text first.
+fn doc(name: &str, title: &str, md: &str) -> voiceterm_egui::manpage_view::Doc {
+    let mut html = String::with_capacity(md.len() + 256);
+    let mut in_code = false;
+    for line in md.lines() {
+        if let Some(rest) = line.strip_prefix("```") {
+            // Fences toggle rather than nest: a stray closing fence in prose
+            // would otherwise swallow the remainder of the document.
+            let _ = rest;
+            html.push_str(if in_code { "</pre>" } else { "<pre>" });
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            html.push_str(&escape(line));
+            html.push('\n');
+            continue;
+        }
+        let t = line.trim_end();
+        if let Some(h) = t.strip_prefix("### ") {
+            html.push_str(&format!("<h3>{}</h3>", escape(h)));
+        } else if let Some(h) = t.strip_prefix("## ") {
+            html.push_str(&format!("<h2>{}</h2>", escape(h)));
+        } else if let Some(h) = t.strip_prefix("# ") {
+            html.push_str(&format!("<h1>{}</h1>", escape(h)));
+        } else if t.is_empty() {
+            html.push_str("<br>");
+        } else {
+            html.push_str(&format!("<p>{}</p>", escape(t)));
+        }
+    }
+    // An unclosed fence at EOF: close it, or the reader renders the rest of the
+    // document inside a <pre> that never ends.
+    if in_code { html.push_str("</pre>"); }
+    voiceterm_egui::manpage_view::Doc {
+        name: name.to_string(), title: title.to_string(), html,
+    }
+}
+
+/// Escape the three characters that would otherwise inject markup.
+///
+/// These documents are ours, but they contain shell snippets and XML examples —
+/// an unescaped `<` in a code fence silently eats everything to the next `>`.
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
 
 impl CentralView {
     // The array LENGTH is part of the type: adding a variant without widening
     // this is a compile error rather than a tab that silently never renders,
     // which is the failure mode a Vec here would have had.
-    const ALL: [CentralView; 6] = [CentralView::Terminal, CentralView::Mail,
+    const ALL: [CentralView; 7] = [CentralView::Terminal, CentralView::Mail,
                                    CentralView::Browser, CentralView::Graph,
-                                   CentralView::Table, CentralView::Archive];
+                                   CentralView::Table, CentralView::Docs,
+                                   CentralView::Archive];
     fn label(self) -> &'static str {
         match self {
             CentralView::Terminal => "Terminal", CentralView::Mail => "Mail",
             CentralView::Browser => "Web", CentralView::Graph => "Graph",
-            CentralView::Table => "Table", CentralView::Archive => "Archive",
+            CentralView::Table => "Table", CentralView::Docs => "Docs",
+            CentralView::Archive => "Archive",
         }
     }
 }
@@ -68,6 +123,10 @@ struct VoicetermApp {
     /// routed here; the view is generic over where the rows came from.
     table_headers: Vec<String>,
     table_rows: Vec<Vec<String>>,
+    /// The bundled-document reader. The view takes documents rather than
+    /// fetching them — its own header explains why the engine could not be
+    /// included here — so the HOST owns which docs exist and the conversion.
+    docs: voiceterm_egui::manpage_view::ManpageView,
     /// Bytes destined for a PTY: the encoded control keys plus any submitted
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
@@ -460,6 +519,16 @@ impl eframe::App for VoicetermApp {
                             let out = voiceterm_egui::table_view::submit_with_engine(
                                 &mut self.table);
                             let _ = out;
+                        }
+                    }
+                    CentralView::Docs => {
+                        if let Some(name) = voiceterm_egui::manpage_view::manpage_ui(
+                            ui, &mut self.docs, &c)
+                        {
+                            // The view returns a NAVIGATION target, not a
+                            // command: a link inside a document names another
+                            // document, and following it is the reader's job.
+                            let _ = name;
                         }
                     }
                     CentralView::Archive => {
@@ -861,6 +930,22 @@ fn main() -> eframe::Result<()> {
                 // transform" while sitting on four rows. The constructor takes
                 // the flag precisely because it cannot be inferred from here.
                 table: voiceterm_egui::table_view::TableView::new(true),
+                docs: {
+                    let mut v = voiceterm_egui::manpage_view::ManpageView::default();
+                    // include_str!, not a runtime read: the docs ship WITH the
+                    // binary, so a phone install cannot end up with a reader
+                    // and no documents — and there is no path to get wrong at
+                    // startup on a device whose layout differs from the repo's.
+                    v.set_docs(vec![
+                        doc("readme", "README", include_str!("../../docs/README.md")),
+                        doc("roadmap", "Roadmap", include_str!("../../docs/ROADMAP.md")),
+                        doc("pane-voice", "Pane voice",
+                            include_str!("../../docs/PANE_VOICE.md")),
+                        doc("niftyplot", "niftyplot spec",
+                            include_str!("../../docs/niftyplot-spec.md")),
+                    ]);
+                    v
+                },
                 table_headers: vec!["name".into(), "size".into(), "modified".into()],
                 table_rows: vec![
                     vec!["Cargo.toml".into(), "1204".into(), "10:19".into()],
