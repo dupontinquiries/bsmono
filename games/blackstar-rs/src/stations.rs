@@ -38,6 +38,7 @@ use crate::raidlog::RaidLog;
 use crate::save;
 use crate::ship::Phase;
 use crate::vault::Vault;
+use crate::hotbar::Hotbar;
 use crate::watch::{self, Watch, NATIVE, PHOTON};
 
 /// The rooms with consoles in them.
@@ -136,6 +137,7 @@ pub struct Shipboard {
     pub gear: Gear,
     pub vault: Vault,
     pub watch: Watch,
+    pub hotbar: Hotbar,
 }
 
 impl Shipboard {
@@ -149,6 +151,7 @@ impl Shipboard {
             gear: Gear::from_save(&sv.armed, &sv.worn, &sv.bag),
             vault: Vault::from_line(&sv.vault),
             watch: Watch::from_line(&sv.watch),
+            hotbar: Hotbar::from_line(&sv.hotbar),
         }
     }
     pub fn store(&self) {
@@ -163,6 +166,7 @@ impl Shipboard {
         sv.bag = bag;
         sv.vault = self.vault.line();
         sv.watch = self.watch.line();
+        sv.hotbar = self.hotbar.line();
         save::store(&sv, &b, &cfg);
     }
     pub fn energon(&self) -> u32 {
@@ -486,6 +490,7 @@ mod tests {
             gear: Gear::default(),
             vault: Vault::default(),
             watch: Watch::default(),
+            hotbar: Hotbar::default(),
         }
     }
 
