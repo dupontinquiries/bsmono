@@ -127,6 +127,8 @@ struct VoicetermApp {
     /// fetching them — its own header explains why the engine could not be
     /// included here — so the HOST owns which docs exist and the conversion.
     docs: voiceterm_egui::manpage_view::ManpageView,
+    /// The spoken mail phrase, parsed by the selector grammar.
+    mail_phrase: String,
     /// Bytes destined for a PTY: the encoded control keys plus any submitted
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
@@ -431,6 +433,31 @@ impl eframe::App for VoicetermApp {
                 let c = self.colors;
                 match self.view {
                     CentralView::Mail => {
+                        // The spoken selector, above the typed query. "my last
+                        // couple emails from bob" parses to a count and a
+                        // sender — the grammar every mail intent except
+                        // OpenDrafts is built on, and it had no surface at all.
+                        ui.horizontal(|ui| {
+                            ui.label("say:");
+                            ui.text_edit_singleline(&mut self.mail_phrase);
+                        });
+                        if !self.mail_phrase.trim().is_empty() {
+                            let sel = voiceterm_egui::mail_selector::parse_selector(
+                                &self.mail_phrase);
+                            let hits = self.mail.selected_by(&sel);
+                            // Echo what the grammar UNDERSTOOD, not just the
+                            // result. A selector that silently picks the wrong
+                            // sender looks like missing mail; showing the parse
+                            // makes the misunderstanding visible.
+                            let mut parts = Vec::new();
+                            if let Some(f) = &sel.from { parts.push(format!("from {f}")); }
+                            if let Some(a) = &sel.about { parts.push(format!("about {a}")); }
+                            parts.push(if sel.all { "all".into() }
+                                       else { format!("count {}", sel.count) });
+                            ui.label(egui::RichText::new(format!(
+                                "{} → {} thread(s)", parts.join(", "), hits.len()))
+                                .weak().size(11.0));
+                        }
                         if let Some(conv) = voiceterm_egui::mail_view::list_ui(ui, &mut self.mail, &c) {
                             self.toasts.info(format!("opened {conv}"), ui.input(|i| i.time));
                         }
@@ -929,6 +956,7 @@ fn main() -> eframe::Result<()> {
                 // FALSE, and a view told it has no data reports "nothing to
                 // transform" while sitting on four rows. The constructor takes
                 // the flag precisely because it cannot be inferred from here.
+                mail_phrase: String::new(),
                 table: voiceterm_egui::table_view::TableView::new(true),
                 docs: {
                     let mut v = voiceterm_egui::manpage_view::ManpageView::default();
