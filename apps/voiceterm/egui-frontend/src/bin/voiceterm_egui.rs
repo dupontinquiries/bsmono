@@ -25,17 +25,20 @@ use voiceterm_egui::App;
 /// terminal first, and a switcher that made it a peer of the mail reader would
 /// be the wrong app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CentralView { Terminal, Mail, Browser, Graph, Archive }
+enum CentralView { Terminal, Mail, Browser, Graph, Table, Archive }
 
 impl CentralView {
-    const ALL: [CentralView; 5] = [CentralView::Terminal, CentralView::Mail,
+    // The array LENGTH is part of the type: adding a variant without widening
+    // this is a compile error rather than a tab that silently never renders,
+    // which is the failure mode a Vec here would have had.
+    const ALL: [CentralView; 6] = [CentralView::Terminal, CentralView::Mail,
                                    CentralView::Browser, CentralView::Graph,
-                                   CentralView::Archive];
+                                   CentralView::Table, CentralView::Archive];
     fn label(self) -> &'static str {
         match self {
             CentralView::Terminal => "Terminal", CentralView::Mail => "Mail",
             CentralView::Browser => "Web", CentralView::Graph => "Graph",
-            CentralView::Archive => "Archive",
+            CentralView::Table => "Table", CentralView::Archive => "Archive",
         }
     }
 }
@@ -56,6 +59,15 @@ struct VoicetermApp {
     /// them; nothing showed you that it had — which is the whole gap the
     /// detect module names.
     progress: voiceterm_egui::detect::ProgressReadout,
+    /// Table view state: the op stack, the command line, the status. The
+    /// ENGINE (table_ops + table_nlp) was already here and is not
+    /// re-implemented — what was missing is the surface that owns a stack and
+    /// lets you take one back.
+    table: voiceterm_egui::table_view::TableView,
+    /// The table being transformed. Demo data until a command's output is
+    /// routed here; the view is generic over where the rows came from.
+    table_headers: Vec<String>,
+    table_rows: Vec<Vec<String>>,
     /// Bytes destined for a PTY: the encoded control keys plus any submitted
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
@@ -411,6 +423,19 @@ impl eframe::App for VoicetermApp {
                                 .map(|e| (e.from.clone(), e.to.clone())).collect();
                             let topo = voiceterm_egui::graph_view::nifty::Topology::new(&ids, &edges);
                             voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
+                        }
+                    }
+                    CentralView::Table => {
+                        // The view returns a submitted line; the ENGINE decides
+                        // what it means. Routing it through submit_with_engine
+                        // rather than parsing here is what keeps table_nlp the
+                        // single place a command is understood.
+                        if let Some(_line) = voiceterm_egui::table_view::table_view_ui(
+                            ui, &mut self.table, &self.table_headers, &self.table_rows, &c)
+                        {
+                            let out = voiceterm_egui::table_view::submit_with_engine(
+                                &mut self.table);
+                            let _ = out;
                         }
                     }
                     CentralView::Archive => {
@@ -807,6 +832,18 @@ fn main() -> eframe::Result<()> {
                 flicks: Default::default(),
                 orientation: voiceterm_egui::iio_accel::OrientationUp::Undefined,
                 progress: Default::default(),
+                // TableView::new(true), not Default: has_data defaults to
+                // FALSE, and a view told it has no data reports "nothing to
+                // transform" while sitting on four rows. The constructor takes
+                // the flag precisely because it cannot be inferred from here.
+                table: voiceterm_egui::table_view::TableView::new(true),
+                table_headers: vec!["name".into(), "size".into(), "modified".into()],
+                table_rows: vec![
+                    vec!["Cargo.toml".into(), "1204".into(), "10:19".into()],
+                    vec!["build.sh".into(), "88".into(), "09:41".into()],
+                    vec!["src".into(), "4096".into(), "10:22".into()],
+                    vec!["old.bak".into(), "51200".into(), "08:03".into()],
+                ],
                 chrome: Default::default(),
                 pty_out: Vec::new(),
                 app,
