@@ -34,6 +34,7 @@ mod replay;
 mod academy;
 mod stream;
 mod hud;
+mod hotbar;
 mod hydro;
 mod idle;
 mod input;
@@ -67,6 +68,8 @@ mod vault;
 mod energon;
 mod finale;
 mod nightfall;
+mod orient;
+mod orientsim;
 mod skirmish;
 mod raid;
 mod raidcon;
@@ -676,6 +679,13 @@ struct Game {
     /// assumed Cruise phase — the phase gate is real and tested in
     /// `deck.rs`; wiring a hull into the loop is its own seam.
     deck: Option<deck::Deck>,
+    /// the action bar, live during play — loaded once at boot rather
+    /// than through a Deck console, since quick-select has to work
+    /// without opening a menu. Firing whatever the active slot holds
+    /// is not wired yet (a real seam, not an oversight): this pass
+    /// only gets selection live, matching the number keys freed from
+    /// the old car-picker.
+    hotbar: hotbar::Hotbar,
     held: HashSet<Key>,
     held_mouse: HashSet<MouseButton>,
     jump_edge: bool,
@@ -946,6 +956,11 @@ fn main() {
         gearsim::run(&argv);
         return;
     }
+    if argv.iter().any(|a| a == "--orient") {
+        // diagnose or fix a bot pose's orientation; see orient.rs
+        orientsim::run(&argv);
+        return;
+    }
     if argv.iter().any(|a| a == "--intel") {
         // Blackstar's own Array logs, unlocked once his flagship falls
         let (sv, _, _) = save::load();
@@ -975,6 +990,7 @@ fn main() {
     env_logger::init();
     let opts = parse_args();
     let (mut sv, mut binds, mut cfg) = save::load();
+    let hotbar = hotbar::Hotbar::from_line(&sv.hotbar);
     if let Some(seed) = opts.seed {
         sv.seed = seed;
     }
@@ -1523,6 +1539,7 @@ fn main() {
         mode: Mode::Splash,
         menu_from_pause: false,
         deck: None,
+        hotbar,
         held: HashSet::new(),
         held_mouse: HashSet::new(),
         jump_edge: false,
@@ -1767,6 +1784,7 @@ impl Game {
         self.save.music = self.snd.music_on;
         self.save.ball_cam = self.cam.ball_cam;
         self.save.car = self.cars.active;
+        self.save.hotbar = self.hotbar.line();
         save::store(&self.save, &self.binds, &self.cfg);
     }
 
@@ -3262,6 +3280,31 @@ impl Game {
                 }
                 return;
             }
+            // THE ACTION BAR. 1-9 select a hotbar slot outright — legal
+            // even on an empty one, same rule `hotbar.rs` documents for
+            // Minecraft's own bar. Firing whatever lands in the active
+            // slot is not wired to these keys yet; selection is.
+            if let Key::Character(s) = &key {
+                if s.len() == 1 {
+                    if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
+                        if (1..=hotbar::SLOTS as u32).contains(&d) {
+                            let i = (d - 1) as usize;
+                            let _ = self.hotbar.select(i);
+                            let label = match self.hotbar.slot(i) {
+                                Some(slot) => match &slot.item {
+                                    gear::Item::Weapon { verb, element, .. } => {
+                                        format!("{} {}", element.name(), gear::verb_name(*verb))
+                                    }
+                                    gear::Item::Armor(m) => m.name.to_string(),
+                                },
+                                None => "-- empty --".to_string(),
+                            };
+                            self.toastf(&format!("[{}] {label}", d));
+                            return;
+                        }
+                    }
+                }
+            }
         }
         // arm the repeat for navigation keys, in menus only. Done here rather
         // than in the winit handler so it follows every path that reaches
@@ -3487,9 +3530,12 @@ impl Game {
                 if sel < ACTIONS.len() {
                     self.mode = Mode::Binds { sel, capturing: true };
                 } else if sel == ACTIONS.len() {
+                    self.binds = Bindings::default_scheme();
+                    self.toastf("PRESET: DEFAULT");
+                } else if sel == ACTIONS.len() + 1 {
                     self.binds = Bindings::classic();
                     self.toastf("PRESET: CLASSIC");
-                } else if sel == ACTIONS.len() + 1 {
+                } else if sel == ACTIONS.len() + 2 {
                     self.binds = Bindings::dvorak();
                     self.toastf("PRESET: DVORAK");
                 } else {
