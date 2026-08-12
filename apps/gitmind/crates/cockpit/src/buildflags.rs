@@ -113,6 +113,59 @@ pub fn build_id(app: &str, toml: &str) -> String {
     crate_name(toml).unwrap_or_else(|| app.to_string())
 }
 
+/// The name of the ARTIFACT cargo will produce, which is not always the
+/// package name.
+///
+/// `build_id` answers "what do I pass to `-p`" and is the package name. This
+/// answers "what file will appear in target/release", and an explicit
+/// `[[bin]] name = ...` overrides the package:
+///
+/// ```text
+///   [package] name = "studio-app"     ->  -p studio-app
+///   [[bin]]   name = "studio"         ->  target/release/studio
+/// ```
+///
+/// Conflating the two is what produced "✓ built (0 KB)" and then, once that
+/// was made an error, "cargo succeeded but no binary at .../studio-app". The
+/// build was right both times; only the lookup was wrong.
+///
+/// Falls back to `build_id` when there is no `[[bin]]` name, which is the
+/// common case where package and binary agree.
+pub fn artifact_name(app: &str, toml: &str) -> String {
+    if let Some(n) = first_bin_name(toml) {
+        return n;
+    }
+    build_id(app, toml)
+}
+
+/// The first `[[bin]] name = "..."` in a manifest.
+///
+/// First rather than "the one matching the package": a crate with several bins
+/// lists the primary one first by convention, and picking by name would fail
+/// for exactly the case this exists to handle — where the bin is NOT named
+/// after the package.
+fn first_bin_name(toml: &str) -> Option<String> {
+    let mut in_bin = false;
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_bin = t == "[[bin]]";
+            continue;
+        }
+        if in_bin {
+            if let Some(rest) = t.strip_prefix("name") {
+                if let Some(v) = rest.split('=').nth(1) {
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The crate's `[package] description`, if any. Pure — unit-tested.
 pub fn package_description(toml: &str) -> Option<String> {
     read_section_string(toml, "[package]", "description").filter(|s| !s.is_empty())
@@ -687,5 +740,48 @@ mod test_argv_tests {
     fn a_cross_target_is_passed_through() {
         let t = cargo_test_argv("voiceterm", "aarch64-unknown-linux-gnu", &[], false);
         assert!(t.windows(2).any(|w| w == ["--target", "aarch64-unknown-linux-gnu"]));
+    }
+}
+
+#[cfg(test)]
+mod artifact_name_tests {
+    use super::*;
+
+    const STUDIO: &str = "[package]\nname = \"studio-app\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"studio\"\npath = \"src/main.rs\"\n";
+
+    #[test]
+    fn an_explicit_bin_name_wins_over_the_package_name() {
+        // The reported failure: cargo built studio-app and produced
+        // target/release/studio, and the lookup went to .../studio-app.
+        assert_eq!(build_id("studio", STUDIO), "studio-app", "-p takes the package");
+        assert_eq!(artifact_name("studio", STUDIO), "studio", "the file is the bin");
+    }
+
+    #[test]
+    fn without_a_bin_section_the_package_name_is_the_artifact() {
+        let plain = "[package]\nname = \"krapper\"\n";
+        assert_eq!(artifact_name("krapper", plain), "krapper");
+    }
+
+    #[test]
+    fn a_name_key_outside_a_bin_section_is_not_a_bin_name() {
+        // [package] also has `name`, and reading the first `name =` in the file
+        // would return the PACKAGE every time — silently making this function
+        // identical to build_id.
+        let t = "[package]\nname = \"pkg\"\n\n[dependencies]\n\n[[bin]]\nname = \"realbin\"\n";
+        assert_eq!(artifact_name("pkg", t), "realbin");
+    }
+
+    #[test]
+    fn the_first_bin_wins_when_there_are_several() {
+        // bsettings ships bsettings-cli and bsettings; the primary is listed
+        // first by convention.
+        let t = "[package]\nname = \"p\"\n\n[[bin]]\nname = \"first\"\n\n[[bin]]\nname = \"second\"\n";
+        assert_eq!(artifact_name("p", t), "first");
+    }
+
+    #[test]
+    fn an_empty_manifest_falls_back_to_the_app_name() {
+        assert_eq!(artifact_name("unendlich", ""), "unendlich");
     }
 }

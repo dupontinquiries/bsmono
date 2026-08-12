@@ -1125,12 +1125,12 @@ fn main() -> eframe::Result<()> {
                     // and no documents — and there is no path to get wrong at
                     // startup on a device whose layout differs from the repo's.
                     v.set_docs(vec![
-                        doc("readme", "README", include_str!("../../docs/README.md")),
-                        doc("roadmap", "Roadmap", include_str!("../../docs/ROADMAP.md")),
+                        doc("readme", "README", include_str!("../../../docs/README.md")),
+                        doc("roadmap", "Roadmap", include_str!("../../../docs/ROADMAP.md")),
                         doc("pane-voice", "Pane voice",
-                            include_str!("../../docs/PANE_VOICE.md")),
+                            include_str!("../../../docs/PANE_VOICE.md")),
                         doc("niftyplot", "niftyplot spec",
-                            include_str!("../../docs/niftyplot-spec.md")),
+                            include_str!("../../../docs/niftyplot-spec.md")),
                     ]);
                     v
                 },

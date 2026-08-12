@@ -308,7 +308,12 @@ pub fn build_locally_cancellable(
         return Err(format!("{app}: build cancelled"));
     }
     if status.success() {
-        let bin = resolve_binary(&cargo, app_dir, &cargo_target, &build_id, Some(&build_dir.display().to_string()));
+        // The ARTIFACT name, not the package name: an explicit [[bin]]
+        // overrides [package], and studio is exactly that shape (package
+        // studio-app, bin studio). Passing build_id here looked for a file
+        // cargo never emitted.
+        let artifact = crate::buildflags::artifact_name(app, &root_toml);
+        let bin = resolve_binary(&cargo, app_dir, &cargo_target, &artifact, Some(&build_dir.display().to_string()));
         // A MISSING ARTIFACT IS A FAILURE, not a zero-byte success. This used
         // to `unwrap_or(0)` and print "✓ built bsettings (0 KB)" — a tick, a
         // name, and no binary, which is the most misleading line this function
