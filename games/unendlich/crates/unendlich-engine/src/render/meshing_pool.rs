@@ -744,8 +744,35 @@ fn worker_loop(
         // Far/VeryFar, take the reverse-regen path that bypasses the
         // chunk's block grid entirely. Same output shape, no block-grid
         // dependency. Near/Mid always go through the materialised path.
+        //
+        // r-perf-far-regen: PERF_FINDING_meshing_and_steady.md's "far=11-13ms
+        // per chunk" chug is this regen — it re-runs multi-octave density +
+        // cave noise per grid cell instead of reading blocks. Traced where
+        // `req.chunk` actually comes from (unendlich_fullgame.rs's request
+        // loop: `near_iter`/`mid_iter`/`far_iter`/`vfar_iter` all draw from
+        // the SAME loaded-chunk source, uniformly, as `(coord, chunk,
+        // version)`): by the time ANY request reaches this dispatch, the
+        // chunk-loading pipeline has ALREADY materialized it with real
+        // blocks — there's no code path where a far/vfar request carries an
+        // empty placeholder. So the "no block-grid dependency" premise in
+        // the v0.23.7 comment above, whatever motivated it at the time,
+        // doesn't reflect a case that's actually reachable today: the
+        // materialized data the regen avoids using is already sitting right
+        // there in `req.chunk`, unused.
+        //
+        // Staged as an opt-in flag (UNENDLICH_FAR_MESH_FROM_CHUNK=1) rather
+        // than flipping the default — same promotion pattern this codebase
+        // already uses (R27's SUBMIT_SKIP/SLACK_SCHEDULER/etc: land opt-in,
+        // A/B through the harness, promote once green — see
+        // docs/PERF-LEVERS.md). This is a CPU-only code-path change (no
+        // shader/GPU involved) but still real render-output-affecting
+        // logic; I can't visually confirm far terrain looks identical
+        // between the two paths from this sandbox, so it doesn't default on.
+        let far_mesh_from_chunk = std::env::var("UNENDLICH_FAR_MESH_FROM_CHUNK")
+            .ok().as_deref() == Some("1");
         let is_virtual_eligible = matches!(req.lod, LodLevel::Far | LodLevel::VeryFar)
-            && req.generator.is_some();
+            && req.generator.is_some()
+            && !far_mesh_from_chunk;
         // v0.30: reaching this CPU greedy path for a Near chunk while the octree
         // GPU mesher is wired means the octree was absent at submit and we're
         // paying the full greedy mesh on the worker thread (the `near` spike). Count it.
