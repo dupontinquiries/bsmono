@@ -27,6 +27,52 @@ use voiceterm_egui::App;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive }
 
+/// How many files a snapshot of `root` would capture.
+///
+/// Walks with `snapshot_policy`'s rules rather than counting everything: the
+/// skip list is the difference between snapshotting a source tree and
+/// snapshotting node_modules, and `should_descend` refuses a directory by NAME
+/// before its contents are ever read — which is what makes the walk cheap
+/// enough to run at command-submit time.
+fn snapshot_scope(root: &str) -> usize {
+    use voiceterm_egui::snapshot_policy::{decide, should_descend, Candidate, Capture};
+    fn walk(dir: &std::path::Path, base: &std::path::Path, depth: usize, taken: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(rel) = path.strip_prefix(base) else { continue };
+            let rel_s = rel.to_string_lossy().to_string();
+            let name = e.file_name();
+            let name_s = name.to_string_lossy().to_string();
+            let meta = match e.metadata() { Ok(m) => m, Err(_) => continue };
+            if meta.is_dir() {
+                if should_descend(&name_s, depth) {
+                    walk(&path, base, depth + 1, taken);
+                }
+                continue;
+            }
+            let c = Candidate {
+                rel: &rel_s,
+                size: meta.len(),
+                depth,
+                is_symlink: meta.file_type().is_symlink(),
+                // to_string_lossy would have replaced invalid bytes, so a
+                // round-trip mismatch is exactly the non-UTF-8 case the policy
+                // rejects.
+                name_is_utf8: name.to_str().is_some(),
+            };
+            match decide(&c, *taken) {
+                Capture::Skipped(_) => {}
+                _ => *taken += 1,
+            }
+        }
+    }
+    let base = std::path::Path::new(root);
+    let mut taken = 0;
+    walk(base, base, 0, &mut taken);
+    taken
+}
+
 /// Build a `Doc` from bundled markdown.
 ///
 /// The view's contract is "already-converted HTML — the host owns the markdown
@@ -317,6 +363,31 @@ impl eframe::App for VoicetermApp {
                                 // OUTPUT, and watching the input side would
                                 // never see one.
                                 self.progress.observe(&echoed);
+                                // RISK BEFORE RUNNING, not after. cmd_risk
+                                // decides whether snapshot_policy's capture
+                                // should run, and the asymmetry is the design:
+                                // a false positive is one wasted snapshot the
+                                // store dedups away, a false negative is a
+                                // command that mutated the directory with no
+                                // way back. So Unknown snapshots too.
+                                let risk = voiceterm_egui::cmd_risk::classify(&cmd);
+                                if risk.needs_snapshot() {
+                                    // The policy decides WHAT the capture would
+                                    // take. Counting the cwd rather than
+                                    // writing a store: the store is GITLOG-2's
+                                    // and lives outside this port, so producing
+                                    // a real snapshot here would be a second
+                                    // implementation of it. The count is the
+                                    // honest half — it proves the policy runs
+                                    // against real files and tells the user the
+                                    // scale of what is protected.
+                                    let n = snapshot_scope(".");
+                                    self.toasts.info(
+                                        format!("{}: would snapshot {n} file(s)",
+                                                if risk == voiceterm_egui::cmd_risk::Risk::Unknown
+                                                { "unknown command" } else { "mutating" }),
+                                        ui.input(|i| i.time));
+                                }
                                 self.app.terminal.feed(&echoed);
                                 self.blocks.submit_command(&cmd, 0);
                             }
