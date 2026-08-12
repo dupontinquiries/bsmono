@@ -58,8 +58,59 @@ pub const RC_DIM: usize = 40;
 /// distances byte-encoded as (d + 0.6) / 2.4
 pub const CSDF_W: u32 = 36;
 pub const CSDF_H: u32 = 24;
-pub const CSDF_SLAB: u32 = 44;
-pub const CSDF_MAXM: u32 = 12;
+/// Z-resolution of ONE model's baked SDF slab. Was 44; cut to 16 to
+/// make room for full roster coverage under the hard 3D-texture depth
+/// limit (see `CSDF_MAXM`'s own doc, right below, for the limit
+/// itself) — the actual trade-off this session's "ungate more
+/// vehicles" request runs into: `SLAB * MAXM` is a fixed budget, and
+/// raising model COUNT enough to reach the bot roster (48 families,
+/// on top of 33 base cars + 28 electric doubles + 14 hovercars = 123
+/// total) means each model gets less depth resolution. 16 is a real
+/// cut (2.75x less than 44), not a free lunch — flagged here rather
+/// than buried in a number, and easy to walk back if it reads as a
+/// visible quality loss once someone can actually look at it.
+pub const CSDF_SLAB: u32 = 16;
+/// How many models can hold a baked collision/reflection SDF at once.
+/// Was 12 — a base garage of 33 named cars plus 14 hovercars already
+/// exceeds that before a single electric variant or bot is counted,
+/// and the bot roster alone (`assets/bots/`) is 48 families. Raised to
+/// comfortably cover the current roster with real headroom: the cost
+/// is trivial — `CSDF_W * CSDF_H * CSDF_SLAB` bytes per model slot,
+/// about 37KB each, so even a generous cap costs single-digit
+/// megabytes of GPU memory. `shader.wgsl`'s `CSDF_D` constant MUST
+/// equal `CSDF_SLAB as f32 * CSDF_MAXM as f32` exactly — it did not,
+/// even at the old cap (384 vs. the true 528), a second, independent
+/// bug from this one: the SDF depth-slice normalization has likely
+/// been sampling into the wrong model's slab for a while. Both are
+/// fixed together here since changing one without the other would
+/// make the mismatch worse, not better.
+/// How many models can hold a baked collision/reflection SDF at once.
+/// Was 12 — a base garage of 33 named cars plus 14 hovercars already
+/// exceeds that before a single electric variant or bot is counted,
+/// and the bot roster alone (`assets/bots/`) is 48 families: 123
+/// models total need a slot to fully "ungate" the `[`/`]` switcher.
+///
+/// The SDF texture below is a genuine `TextureDimension::D3` (a real
+/// volume texture, not a 2D array), and `render.rs` requests
+/// `wgpu::Limits::default()` rather than the adapter's native limits
+/// — so the effective `max_texture_dimension_3d` is WebGPU's baseline
+/// guarantee, 2048, regardless of what the actual GPU could do.
+/// `CSDF_SLAB * CSDF_MAXM` is that texture's depth and cannot safely
+/// exceed it. Reaching 123 models within that budget meant cutting
+/// `CSDF_SLAB` from 44 to 16 (see its own doc) rather than raising
+/// this count alone — raising MAXM without shrinking SLAB first would
+/// have hit the same wall this comment already found once, at 44
+/// models, with cars and hovercars alone still short of the full
+/// roster. 126 gives 123 real headroom without touching the 2048
+/// ceiling (16*126=2016).
+///
+/// `shader.wgsl`'s `CSDF_D` constant MUST equal
+/// `CSDF_SLAB as f32 * CSDF_MAXM as f32` exactly — it did not, even
+/// at the ORIGINAL cap (384 vs. the true 44*12=528), an independent
+/// bug fixed in the same pass that first touched this constant: the
+/// SDF depth-slice normalization had likely been sampling into the
+/// wrong model's slab for a while before either of these changes.
+pub const CSDF_MAXM: u32 = 126;
 pub const RC_K: usize = 28;
 pub const RC_STRIDE: usize = 32;
 pub const HMAP_SIZE: u32 = 1024;
