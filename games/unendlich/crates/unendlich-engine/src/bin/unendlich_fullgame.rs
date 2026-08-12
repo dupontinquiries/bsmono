@@ -15020,10 +15020,32 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         renderer.mesh_idx_capacity() / (1024 * 1024),
     );
     log::info!("{}", gpu_mem_summary);
-    let body = format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+    // SURFACERUN_KIT.md Step 1: residency projection — the go/no-go
+    // telemetry for wiring the SurfaceRun/Procedural upload paths. Pure
+    // measurement (ChunkManager::residency_projection reuses
+    // compression_stats's exact scratch-reuse iteration, no GPU touched).
+    // Compares what the octree pool WOULD cost if the far/mid bands rode
+    // the cheap paths, against octree_per_chunk measured above, at the
+    // final player position/render-distance this run ended at.
+    let policy = unendlich_engine::world::upload_repr::UploadPolicy::default();
+    let proj = chunk_manager.residency_projection(
+        last_player_chunk,
+        runtime_render_distance(),
+        &policy,
+        octree_per_chunk,
+    );
+    let residency_summary = format!(
+        "residency_projection: octree_mb={} ({} ch) srun_kb={} ({} ch) procedural_ch={} | all_octree_baseline_mb={}",
+        proj.octree_bytes >> 20, proj.octree_chunks,
+        proj.surface_run_bytes >> 10, proj.surface_run_chunks,
+        proj.procedural_chunks,
+        proj.all_octree_baseline_bytes(octree_per_chunk) >> 20,
+    );
+    log::info!("{}", residency_summary);
+    let body = format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         gpu_summary, cpu_summary, mesher_summary, workload_summary,
         mem_summary, comp_summary, gpu_mem_summary, tick_apply_summary,
-        empty_mesh_summary,
+        empty_mesh_summary, residency_summary,
     );
     // v0.24.2c.8: shutdown event records duration + the "did we hit
     // the max-duration cap?" signal. Emitted BEFORE the RunBlock so
