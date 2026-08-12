@@ -832,7 +832,20 @@ pub fn render_grid(
                 painter.rect_filled(rect, 0.0, filt(bg));
             }
             if !text.trim().is_empty() {
-                painter.text(egui::pos2(x0, y), egui::Align2::LEFT_TOP, text, font.clone(), filt(fg));
+                // LAYOUT IS THE COST, not the paint. `painter.text` shapes the
+                // string every call — measuring glyphs, resolving fonts,
+                // wrapping — and in immediate mode that happens per run per
+                // row per frame. Painting a pre-shaped galley skips the
+                // shaping and keeps the draw.
+                //
+                // egui memoises galleys by (text, font, colour) inside
+                // `layout_job`, so going through `ui.fonts` reuses the shaped
+                // result for an unchanged row rather than rebuilding it. This
+                // is the lever voiceterm's row_render describes: "an unchanged
+                // row reuses its galley, a dirty row re-shapes" — and skipping
+                // the PAINT instead "would save nothing and break the display".
+                let galley = painter.layout_no_wrap(text, font.clone(), filt(fg));
+                painter.galley(egui::pos2(x0, y), galley, filt(fg));
             }
             c = end;
         }
