@@ -27,6 +27,68 @@ use voiceterm_egui::App;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive }
 
+impl VoicetermApp {
+    /// The connections graph over what this app actually holds.
+    ///
+    /// Bookmarks become Pages and mail threads become ChatThreads, because
+    /// those are the two data systems with real content here. The other four
+    /// node kinds are left unproduced rather than faked — a graph of invented
+    /// nodes looks like a working feature and tells you nothing true.
+    fn connections_nodes(&self)
+        -> (Vec<voiceterm_egui::connections_graph::Node>,
+            Vec<voiceterm_egui::connections_graph::Edge>) {
+        use voiceterm_egui::connections_graph as cg;
+        let mut nodes = Vec::new();
+        for b in self.browser.bookmarks.all() {
+            nodes.push(cg::Node {
+                id: cg::node_id(cg::NodeKind::Page, &b.url),
+                kind: cg::NodeKind::Page,
+                title: b.title.clone(),
+                subtitle: b.url.clone(),
+            });
+        }
+        for t in &self.mail.threads {
+            nodes.push(cg::Node {
+                id: cg::node_id(cg::NodeKind::ChatThread, &t.conversation_id),
+                kind: cg::NodeKind::ChatThread,
+                title: t.subject.clone(),
+                subtitle: t.participants.join(", "),
+            });
+        }
+
+        // SameDomain is the one edge this data can honestly produce: two
+        // bookmarks on one host are related, weakly. The others need a link
+        // the app does not record — a recording tagged with the page it was
+        // captured on, a chat that cites a URL — so producing them would be
+        // asserting a connection nobody established.
+        let mut edges = Vec::new();
+        let pages: Vec<(&str, String)> = self.browser.bookmarks.all().iter()
+            .map(|b| (b.url.as_str(), host_of(&b.url)))
+            .collect();
+        for (i, (ua, ha)) in pages.iter().enumerate() {
+            for (ub, hb) in pages.iter().skip(i + 1) {
+                if !ha.is_empty() && ha == hb {
+                    edges.push(cg::Edge {
+                        from: cg::node_id(cg::NodeKind::Page, ua),
+                        to: cg::node_id(cg::NodeKind::Page, ub),
+                        reason: cg::EdgeReason::SameDomain,
+                    });
+                }
+            }
+        }
+        (nodes, cg::prune(edges))
+    }
+}
+
+/// The host part of a URL, or empty when there is not one.
+///
+/// Deliberately not a URL parser: this only needs the authority, and pulling in
+/// a crate to find one `/` would be the tail wagging the dog.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split('/').next().unwrap_or("").to_lowercase()
+}
+
 /// How many files a snapshot of `root` would capture.
 ///
 /// Walks with `snapshot_policy`'s rules rather than counting everything: the
@@ -588,6 +650,33 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     CentralView::Graph => {
+                        // CONNECTIONS, above the niftyplot source. Two
+                        // different graphs on one tab: this one is over the
+                        // app's OWN data — "a unified Node abstraction over the
+                        // existing data systems" — while the source box below
+                        // draws a diagram the user wrote. Neither replaces the
+                        // other.
+                        let cg = self.connections_nodes();
+                        ui.label(egui::RichText::new(format!(
+                            "connections: {} node(s), {} edge(s)", cg.0.len(), cg.1.len()))
+                            .weak().size(11.0));
+                        for e in cg.1.iter().take(6) {
+                            // The WEIGHT is shown, not just the link. An edge
+                            // the user cannot judge is a line they must take on
+                            // trust, and SameDomain is explicitly "weak but
+                            // useful" — showing its weight is what lets them
+                            // discount it.
+                            //
+                            // EdgeReason has weight() and Debug, not label():
+                            // checked, because a label() method does exist on
+                            // NodeKind and reaching for the same name on the
+                            // sibling type is exactly the mistake to make here.
+                            ui.label(egui::RichText::new(format!(
+                                "  {:?} (w {:.2}) — {} → {}",
+                                e.reason, e.reason.weight(), e.from, e.to))
+                                .weak().size(10.0));
+                        }
+                        ui.separator();
                         // Parsed from the source, exactly as the Qt bin's
                         // nifty_topology does: parse, then take ids and edges.
                         ui.add(egui::TextEdit::multiline(&mut self.graph_source)
