@@ -172,6 +172,41 @@ impl MailView {
         }
     }
 
+    /// Threads matching a SPOKEN selector — "my last couple emails from bob".
+    ///
+    /// Separate from `visible()` rather than replacing it, because the two are
+    /// different acts: a typed query is a substring search the user refines by
+    /// looking, while a spoken selector is a sentence parsed once. Folding the
+    /// selector into `visible` would mean typing "from" in the box silently
+    /// changed what the box means.
+    ///
+    /// The count is applied LAST, after filtering: "my last two emails from
+    /// bob" means two of bob's, not bob's within the last two overall.
+    pub fn selected_by(&self, sel: &crate::mail_selector::Selector) -> Vec<&Thread> {
+        let mut out: Vec<&Thread> = self.threads.iter().filter(|t| {
+            let from_ok = match &sel.from {
+                None => true,
+                Some(f) => {
+                    let f = f.to_lowercase();
+                    t.participants.iter().any(|p| p.to_lowercase().contains(&f))
+                }
+            };
+            let about_ok = match &sel.about {
+                None => true,
+                Some(a) => t.subject.to_lowercase().contains(&a.to_lowercase()),
+            };
+            from_ok && about_ok
+        }).collect();
+        // "all" means no cap; otherwise take the newest `count`. Threads are
+        // already in the order set_messages produced, so this is a take rather
+        // than a re-sort — re-sorting here would silently disagree with the
+        // list the user is looking at.
+        if !sel.all && sel.count > 0 && out.len() > sel.count {
+            out.truncate(sel.count);
+        }
+        out
+    }
+
     /// Threads matching the query, searched over subject and participants.
     ///
     /// Case-insensitive and substring, deliberately: a mail search that requires
