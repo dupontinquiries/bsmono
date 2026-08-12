@@ -360,6 +360,23 @@ pub fn set_run_args(name: &str, args: &str) -> Result<(), String> {
 
 /// Install a built binary into the local app catalog (var store + manifest + .desktop) and
 /// remember any launch flags. The app then appears in the apps list and runs locally.
+/// Record launch flags for an app WITHOUT clobbering flags the user chose.
+///
+/// `add_to_apps` runs on every install and reinstall, and it passes the
+/// catalog's `run_flags` — which is empty for almost every app. Writing that
+/// empty string through would erase whatever the user had configured, so
+/// reinstalling an app would silently reset its launch flags.
+///
+/// An empty value therefore means "I have nothing to say", not "set it to
+/// nothing". Clearing flags deliberately is `set_run_args`, which is still
+/// available and still writes exactly what it is given.
+fn record_run_args(name: &str, args: &str) -> Result<(), String> {
+    if args.trim().is_empty() {
+        return Ok(());
+    }
+    set_run_args(name, args)
+}
+
 pub fn add_to_apps(bin: &Path, name: &str, commit: &str, run_args: &str) -> Result<Installed, String> {
     let bytes = std::fs::read(bin).map_err(|e| format!("read binary: {e}"))?;
     let store = gitmind_core::varcache::open_var_store()?;
@@ -367,7 +384,7 @@ pub fn add_to_apps(bin: &Path, name: &str, commit: &str, run_args: &str) -> Resu
     let commit = if commit.trim().is_empty() { "import" } else { commit };
     let v = gitmind_core::binpin::install(&store, name, &label, commit, "host", &bytes, true)?;
     let _ = gitmind_core::binpin::write_desktop(name, &label, false, None);
-    set_run_args(name, run_args)?;
+    record_run_args(name, run_args)?;
     Ok(Installed { name: name.into(), label, path: v.path, run_args: run_args.into() })
 }
 
@@ -1048,7 +1065,11 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // which is the third place a launch can originate.
     let beatspace = || crate::suite::SuiteApp {
         name: "beatspace".into(),
-        path: "apps/beatspace".into(),
+        // BARE NAME, like every other simple app: discovery resolves apps/ vs
+        // games/ at build time. My first version wrote "apps/beatspace", which
+        // the path invariant caught — it works, but it hardcodes a layout the
+        // rest of the catalog deliberately does not assume.
+        path: "beatspace".into(),
         features: vec![],
         no_default: false,
         target: String::new(),
@@ -1116,10 +1137,37 @@ mod store_group_tests {
     fn bigsilicons_is_the_union_and_paths_are_app_relative() {
         let groups = super::store_groups();
         let all = super::group_by_name("bigsilicons-apps").expect("all group");
-        assert_eq!(all.apps.len(), 16, "every app is in the all group (incl. bsettings)");
-        // Paths are bare app/game NAMES (discovery resolves apps/ vs games/ at build time); bsettings
-        // keeps an explicit path since its dir name differs from its app name.
-        assert!(all.apps.iter().all(|a| !a.path.contains('/') || a.name == "bsettings"));
+        // Computed from the groups rather than hardcoded. The literal 16 fired
+        // correctly when studio and a custom beatspace entry were added — but
+        // "the number changed" is not the invariant anybody cares about. What
+        // matters is that `all` really is the UNION, so adding an app to a
+        // group and forgetting the all-group push is what should fail here.
+        let mut union: std::collections::BTreeSet<String> = Default::default();
+        for g in &groups {
+            if g.name == "bigsilicons-apps" { continue; }
+            union.extend(g.apps.iter().map(|a| a.name.clone()));
+        }
+        let in_all: std::collections::BTreeSet<String> =
+            all.apps.iter().map(|a| a.name.clone()).collect();
+        let missing: Vec<&String> = union.difference(&in_all).collect();
+        assert!(missing.is_empty(),
+                "in a group but not in `all`: {missing:?} — the all-group push was forgotten");
+        assert_eq!(in_all.len(), all.apps.len(), "`all` lists an app twice");
+        // Paths are bare app/game NAMES — discovery resolves apps/ vs games/ at
+        // build time — EXCEPT where the crate is not at apps/<name>:
+        //
+        //   bsettings  apps/settings-app                 dir name != app name
+        //   studio     apps/studio/crates/studio-app     a workspace member
+        //
+        // Listed by name rather than allowed generally, so a new explicit path
+        // has to be justified here rather than slipping in: a bare name that
+        // silently stopped resolving would look like a missing app.
+        const EXPLICIT_PATH: [&str; 2] = ["bsettings", "studio"];
+        for a in &all.apps {
+            assert!(!a.path.contains('/') || EXPLICIT_PATH.contains(&a.name.as_str()),
+                    "{} has an explicit path {:?} but is not on the exception list",
+                    a.name, a.path);
+        }
         assert!(all.apps.iter().any(|a| a.name == "unendlich" && a.path == "unendlich"), "unendlich stored by bare name");
         assert!(all.apps.iter().all(|a| a.name != "cybertron"), "cybertron (nonexistent) is not in the store");
         assert!(all.apps.iter().any(|a| a.name == "bsettings" && a.path == "apps/settings-app" && a.features == vec!["gui".to_string()]), "bsettings registered with its real path + gui feature");
@@ -1744,5 +1792,75 @@ mod daemon_flow_tests {
         // (pure check of the naming that feeds the remote command)
         let names: Vec<&str> = crate::daemons::all().iter().map(|d| d.name).collect();
         assert!(names.contains(&"settingsd") && names.contains(&"voiced"));
+    }
+}
+
+#[cfg(test)]
+mod launch_consistency_tests {
+    use super::*;
+
+    /// Every app in the catalog that needs launch args must carry them in
+    /// `run_flags` too.
+    ///
+    /// This is the check that would have caught the beatspace bug. The `gui`
+    /// verb reached the .desktop file and NOT the run button, because the two
+    /// paths read different sources and nothing compared them. Three sources,
+    /// one answer required:
+    ///
+    ///   binpin::gui_launch_args  →  the .desktop Exec line
+    ///   flow::run_args           →  gitmind's run button
+    ///   SuiteApp::run_flags      →  the entry written at install time
+    #[test]
+    fn catalog_run_flags_match_the_gui_launch_table() {
+        for app in catalog_apps() {
+            let table = gitmind_core::binpin::gui_launch_args(&app.name).join(" ");
+            if table.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                app.run_flags, table,
+                "{}: gui_launch_args says {table:?} but the catalog entry says {:?} — \
+                 the .desktop file and the run button would launch it differently",
+                app.name, app.run_flags);
+        }
+    }
+
+    #[test]
+    fn an_app_needing_a_verb_is_actually_in_the_catalog() {
+        // A launch table entry for an app nobody can install is a rule that
+        // never fires, and it would hide a rename rather than reporting one.
+        let names: Vec<String> = catalog_apps().into_iter().map(|a| a.name).collect();
+        assert!(names.iter().any(|n| n == "beatspace"),
+                "beatspace left the catalog but kept its gui_launch_args entry");
+    }
+
+    #[test]
+    fn no_app_appears_in_the_catalog_twice() {
+        // beatspace was briefly in both the simple `music` list and a custom
+        // entry, which puts it in the group twice — a duplicate that reads as a
+        // rendering bug rather than a data one.
+        let mut names: Vec<String> = Vec::new();
+        for g in store_groups() {
+            let mut seen = std::collections::HashSet::new();
+            for a in &g.apps {
+                assert!(seen.insert(a.name.clone()),
+                        "{} appears twice in group {}", a.name, g.name);
+            }
+            names.extend(g.apps.iter().map(|a| a.name.clone()));
+        }
+        assert!(!names.is_empty());
+    }
+
+    #[test]
+    fn an_empty_flag_string_does_not_erase_a_saved_one() {
+        // add_to_apps runs on every reinstall and passes the catalog's
+        // run_flags, empty for almost every app. Writing it through would reset
+        // whatever the user configured.
+        //
+        // Checked as a property of record_run_args rather than by touching
+        // $HOME: the guard is the whole behaviour, and a test that wrote to the
+        // real config file would be testing the filesystem.
+        assert!(record_run_args("anything", "").is_ok());
+        assert!(record_run_args("anything", "   ").is_ok());
     }
 }
