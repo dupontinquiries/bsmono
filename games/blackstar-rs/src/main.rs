@@ -68,6 +68,8 @@ mod vault;
 mod energon;
 mod finale;
 mod nightfall;
+mod orient;
+mod orientsim;
 mod skirmish;
 mod raid;
 mod raidcon;
@@ -952,6 +954,11 @@ fn main() {
     if argv.iter().any(|a| a == "--gear") {
         // the bearer's sheet, the ship's vault, the clone gallery
         gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--orient") {
+        // diagnose or fix a bot pose's orientation; see orient.rs
+        orientsim::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--intel") {
