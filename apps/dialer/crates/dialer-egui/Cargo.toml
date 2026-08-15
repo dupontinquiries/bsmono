@@ -1,0 +1,27 @@
+[package]
+name = "dialer-egui"
+version = "0.1.0"
+edition = "2021"
+description = "The phone app's egui surface on uikit-egui: glass-key dialpad, full-screen in-call view with DTMF, recents from the JSONL history — over dialer-core's session model, with the ModemManager backend default-on and the simulated modem as the desktop/demo fallback."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "dialer-egui"
+path = "src/bin/dialer_egui.rs"
+required-features = ["app"]
+
+[dependencies]
+egui = "0.34"
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+# for apply_palette's &Palette argument — uikit-egui consumes but does not re-export it
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
+dialer-core = { path = "../dialer-core" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[features]
+# `app` default-on per the house convention for every -egui port; `mm` pulls
+# zbus into dialer-core. Turn `mm` off for a bus-free build (the shell then
+# always runs the simulated modem).
+default = ["app", "mm"]
+app = ["dep:eframe"]
+mm = ["dialer-core/mm"]

@@ -678,3 +678,14 @@ role = "app"
 daemon = false
 notes = "A local camera. Captures land on this device and go nowhere until the user picks a target: photosync (their own machines, content-addressed) or a snapclone contact (a person, not recallable). The two are kept distinct in the type system because collapsing them is how a backup becomes a disclosure. Headless core + eframe shell, so the sharing rules test without a camera."
 
+
+[apps.dialer]
+path = "apps/dialer"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false             # a phone app wants the system bus + modem; Flatpak later if ever
+runtime = "none"            # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop", "phone"]
+primary = true              # egui-first from birth; no Qt/GTK surface exists to archive
+notes = "phone calls over ModemManager (zbus blocking, poll loop) with a simulated-modem fallback for desktop/demo. Headless dialer-core (session model + Command/Event link + JSONL history, 10 unit tests) under crates/, dialer-egui on uikit-egui (glass_key dialpad doubling as the DTMF pad, Nav Keypad/Recents, Adaptive touch sizing). `cargo build --release -p dialer-egui` produces the deployable bin (`app` and `mm` features default-on); `--no-default-features --features app` builds bus-free with only the mock."
