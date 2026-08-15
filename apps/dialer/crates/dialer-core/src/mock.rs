@@ -17,9 +17,17 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use crate::link::{Command, Event, Link};
+use crate::message::Payload;
 use crate::types::{CallDirection, CallInfo, CallState};
 
 const TICK: Duration = Duration::from_millis(250);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 struct MockCall {
     info: CallInfo,
@@ -91,6 +99,23 @@ pub fn spawn() -> Link {
                         let _ = ev_tx.send(Event::Info(format!(
                             "APN '{}' for {} applied (simulated)", s.apn, s.carrier
                         )));
+                    }
+                    Ok(Command::SendMessage { peer, payload }) => {
+                        let _ = ev_tx.send(Event::MessageSent { peer: peer.clone() });
+                        // Canned reply so the thread view has both directions,
+                        // and a scripted command-suggestion so the handoff card
+                        // (and its guard) is exercisable on the desktop.
+                        let now = unix_now();
+                        let reply = match &payload {
+                            Payload::CommandSuggestion { .. } =>
+                                Payload::text("got it — I'll take a look"),
+                            _ => Payload::CommandSuggestion {
+                                command: "cargo test -p dialer-core".into(),
+                                cwd: Some("~/monorepo".into()),
+                                note: Some("run this when you get a sec".into()),
+                            },
+                        };
+                        let _ = ev_tx.send(Event::MessageIn { peer, payload: reply, ts: now });
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return, // shell dropped the link

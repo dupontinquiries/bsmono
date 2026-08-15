@@ -20,9 +20,12 @@
 //! (`MMCallState`, `MMCallDirection`) so the mm backend is a cast, not a
 //! mapping table that can drift.
 
+pub mod command_guard;
+pub mod conversation;
 pub mod history;
 pub mod link;
 pub mod matrix;
+pub mod message;
 pub mod mock;
 pub mod number;
 pub mod providers;

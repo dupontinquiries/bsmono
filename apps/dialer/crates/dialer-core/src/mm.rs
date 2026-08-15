@@ -38,6 +38,7 @@ use zbus::proxy::CacheProperties;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::link::{ApnSetting, Command, Event, Link};
+use crate::message::{self, Payload};
 use crate::types::{CallDirection, CallInfo, CallState};
 
 const MM_SERVICE: &str = "org.freedesktop.ModemManager1";
@@ -53,6 +54,36 @@ trait ModemVoice {
     fn create_call(&self, properties: HashMap<&str, Value<'_>>) -> zbus::Result<OwnedObjectPath>;
     fn list_calls(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
     fn delete_call(&self, path: &ObjectPath<'_>) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.ModemManager1.Modem.Messaging",
+    default_service = "org.freedesktop.ModemManager1"
+)]
+trait ModemMessaging {
+    /// Create an SMS object from properties (at least "number" and "text");
+    /// returns its path. Must then be Sent via the Sms interface.
+    fn create(&self, properties: HashMap<&str, Value<'_>>) -> zbus::Result<OwnedObjectPath>;
+    fn list(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+    fn delete(&self, path: &ObjectPath<'_>) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.ModemManager1.Sms",
+    default_service = "org.freedesktop.ModemManager1"
+)]
+trait Sms {
+    fn send(&self) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn number(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn text(&self) -> zbus::Result<String>;
+    /// MMSmsState: 0 unknown,1 stored,2 receiving,3 received,4 sending,5 sent.
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<u32>;
+    /// MMSmsPduType: 1 deliver (inbound), 2 submit (outbound we created).
+    #[zbus(property)]
+    fn pdu_type(&self) -> zbus::Result<u32>;
 }
 
 #[zbus::proxy(
@@ -167,8 +198,19 @@ pub fn spawn() -> Result<Link, String> {
                 }
             }
 
+            // Messaging proxy (optional — some modems/data-only devices lack it).
+            let messaging = (|| -> zbus::Result<ModemMessagingProxyBlocking<'_>> {
+                Ok(ModemMessagingProxyBlocking::builder(&conn)
+                    .path(modem_str.clone())?
+                    .cache_properties(CacheProperties::No)
+                    .build()?)
+            })().ok();
+
             // What we believe about each live call (keyed by object path).
             let mut known: HashMap<String, CallState> = HashMap::new();
+            // SMS object paths already surfaced inbound, so the poll doesn't
+            // re-deliver them every tick.
+            let mut seen_sms: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             loop {
                 // 1) one command per tick at most — dialing is not a hot path
@@ -209,6 +251,34 @@ pub fn spawn() -> Result<Link, String> {
                         }
                     }
                     Ok(Command::SimulateIncoming(_)) => { /* real modems only ring for real */ }
+                    Ok(Command::SendMessage { peer, payload }) => {
+                        let Some(number) = peer.strip_prefix("tel:") else {
+                            // Matrix peers are the matrix backend's job.
+                            let _ = ev_tx.send(Event::Error(
+                                "this modem only sends SMS (tel: peers)".into()));
+                            continue;
+                        };
+                        let text = payload.to_sms();
+                        match &messaging {
+                            None => { let _ = ev_tx.send(Event::Error("no SMS support on this modem".into())); }
+                            Some(m) => {
+                                let mut props: HashMap<&str, Value<'_>> = HashMap::new();
+                                props.insert("number", Value::from(number));
+                                props.insert("text", Value::from(text.as_str()));
+                                let res = m.create(props).and_then(|path| {
+                                    SmsProxyBlocking::builder(&conn)
+                                        .path(path.as_str().to_string())?
+                                        .cache_properties(CacheProperties::No)
+                                        .build()?
+                                        .send()
+                                });
+                                match res {
+                                    Ok(()) => { let _ = ev_tx.send(Event::MessageSent { peer: peer.clone() }); }
+                                    Err(e) => { let _ = ev_tx.send(Event::Error(format!("send SMS: {e}"))); }
+                                }
+                            }
+                        }
+                    }
                     Ok(Command::ApplyApn(setting)) => {
                         let _ = ev_tx.send(match apply_apn_nm(&conn, &setting) {
                             Ok(()) => Event::Info(format!(
@@ -276,6 +346,41 @@ pub fn spawn() -> Result<Link, String> {
                     }
                 }
 
+                // Inbound SMS: list, deliver any received/deliver PDUs we
+                // haven't seen, then delete so the store doesn't grow.
+                if let Some(m) = &messaging {
+                    if let Ok(list) = m.list() {
+                        for path in list {
+                            let id = path.as_str().to_string();
+                            if seen_sms.contains(&id) {
+                                continue;
+                            }
+                            let sms = match SmsProxyBlocking::builder(&conn)
+                                .path(id.clone())
+                                .and_then(|b| Ok(b.cache_properties(CacheProperties::No)))
+                                .and_then(|b| b.build())
+                            {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let pdu = sms.pdu_type().unwrap_or(0);
+                            let state = sms.state().unwrap_or(0);
+                            // deliver (1) + received (3): a real inbound message.
+                            if pdu == 1 && state == 3 {
+                                let number = sms.number().unwrap_or_default();
+                                let text = sms.text().unwrap_or_default();
+                                seen_sms.insert(id.clone());
+                                let _ = ev_tx.send(Event::MessageIn {
+                                    peer: format!("tel:{number}"),
+                                    payload: message::parse_sms(&text),
+                                    ts: unix_now(),
+                                });
+                                let _ = m.delete(&path);
+                            }
+                        }
+                    }
+                }
+
                 // Calls that vanished without us seeing Terminated.
                 let gone: Vec<String> = known.keys().filter(|k| !seen.contains(*k)).cloned().collect();
                 for id in gone {
@@ -287,6 +392,13 @@ pub fn spawn() -> Result<Link, String> {
         .map_err(|e| format!("spawn mm thread: {e}"))?;
 
     Ok(Link { tx: cmd_tx, rx: ev_rx, kind: "modemmanager" })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Write a GSM connection profile carrying the APN. `autoconnect=true` so

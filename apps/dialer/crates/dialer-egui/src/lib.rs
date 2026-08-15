@@ -18,16 +18,22 @@
 //! ([`Command::Dtmf`] instead of the entry buffer), which is the actual
 //! semantics of a phone keypad and cheaper than a second widget.
 
+pub mod messages;
 pub mod wizard;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dialer_core::command_guard::GuardPolicy;
+use dialer_core::conversation::{Conversations, Dir, Message};
 use dialer_core::history::HistoryStore;
 use dialer_core::link::{Command, Event, Link};
+use dialer_core::message::Payload;
 use dialer_core::number;
 use dialer_core::session::{ModemStatus, Outcome, Session};
 use dialer_core::types::{CallDirection, CallInfo};
-use uikit_egui::{Adaptive, Nav, PaletteColors};
+use uikit_egui::confirm_dialog::{ConfirmDialog, Outcome as ConfirmOutcome};
+use uikit_egui::{Adaptive, GestureLayer, Nav, PaletteColors};
+use messages::{MessagesState, MsgAction};
 
 /// Must match packaging exactly or the icon/dock grouping silently breaks
 /// (see krapper's note on the same constant).
@@ -35,6 +41,8 @@ pub const APP_ID: &str = "org.ecosystem.Dialer";
 
 const PAGE_KEYPAD: usize = 0;
 const PAGE_RECENTS: usize = 1;
+const PAGE_MESSAGES: usize = 2;
+const PAGE_COUNT: usize = 3;
 
 /// The twelve keys, row-major. One source for both dial and DTMF pads.
 pub const KEYPAD: [[char; 3]; 4] = [
@@ -101,7 +109,12 @@ pub struct Shell {
     session: Session,
     history: HistoryStore,
     nav: Nav,
+    gesture: GestureLayer,
     entry: String,
+    convs: Conversations,
+    guard: GuardPolicy,
+    msg: MessagesState,
+    run_confirm: Option<(String, ConfirmDialog)>,
     /// DTMF pad open on the in-call screen; tones sent so far (readout).
     dtmf_open: bool,
     dtmf_sent: String,
@@ -112,10 +125,15 @@ pub struct Shell {
 impl Shell {
     pub fn new(link: Link, fallback_reason: Option<String>, colors: PaletteColors) -> Shell {
         let (history, warn) = HistoryStore::open(&HistoryStore::default_path());
+        let (convs, cwarn) = Conversations::open(&Conversations::default_path());
         let mut toasts = uikit_egui::toast::Toasts::new();
         if let Some(w) = warn {
             toasts.warning(w, 0.0);
         }
+        if let Some(w) = cwarn {
+            toasts.warning(w, 0.0);
+        }
+        let guard = load_guard_policy();
         // A saved Matrix session comes up on launch; failure is a toast,
         // not a launch blocker.
         #[cfg(feature = "matrix")]
@@ -136,12 +154,17 @@ impl Shell {
             link,
             matrix_link,
             matrix_status: None,
-            wizard: if wizard::setup_was_completed() { None } else { Some(wizard::Wizard::new(None)) },
+            wizard: if wizard::setup_was_completed() { None } else { Some(wizard::Wizard::new(None, guard.clone())) },
             fallback_reason,
             session: Session::default(),
             history,
-            nav: Nav::new(2),
+            nav: Nav::new(PAGE_COUNT),
+            gesture: GestureLayer::horizontal_page(360.0),
             entry: String::new(),
+            convs,
+            guard,
+            msg: MessagesState::default(),
+            run_confirm: None,
             dtmf_open: false,
             dtmf_sent: String::new(),
             toasts,
@@ -173,6 +196,102 @@ impl Shell {
         }
     }
 
+    fn on_message_in(&mut self, peer: String, payload: Payload, ts: u64, now: f64) {
+        let preview = payload.preview();
+        // If the thread is open, mark read immediately; else it counts unread.
+        let read = matches!(&self.msg.view, messages::MessagesView::Thread(p) if *p == peer)
+            && self.nav.page() == PAGE_MESSAGES
+            && self.wizard.is_none();
+        let m = Message { peer: peer.clone(), dir: Dir::In, payload, ts, read };
+        if let Err(e) = self.convs.append(m) {
+            self.toasts.error(e, now);
+        }
+        if !read {
+            self.toasts.info(format!("{}: {}", messages::peer_display(&peer), preview), now);
+        }
+    }
+
+    fn record_outgoing(&mut self, peer: &str, payload: Payload, now: f64) {
+        let m = Message {
+            peer: peer.to_string(),
+            dir: Dir::Out,
+            payload,
+            ts: now_unix(),
+            read: true,
+        };
+        if let Err(e) = self.convs.append(m) {
+            self.toasts.error(e, now);
+        }
+    }
+
+    /// Route a SendMessage to the transport implied by the peer prefix.
+    fn send_message(&mut self, peer: String, payload: Payload, now: f64) {
+        self.record_outgoing(&peer, payload.clone(), now);
+        let cmd = Command::SendMessage { peer: peer.clone(), payload };
+        let tx = if peer.starts_with("matrix") {
+            self.matrix_link.as_ref().map(|l| &l.tx)
+        } else {
+            Some(&self.link.tx)
+        };
+        match tx {
+            Some(tx) if tx.send(cmd).is_ok() => {}
+            Some(_) => self.toasts.error("backend stopped — restart the app", now),
+            None => self.toasts.error("no backend for that peer", now),
+        }
+    }
+
+    fn handle_msg_actions(&mut self, actions: Vec<MsgAction>, ctx: &egui::Context, now: f64) {
+        for a in actions {
+            match a {
+                MsgAction::Send { peer, payload } => self.send_message(peer, payload, now),
+                MsgAction::Copy(text) => {
+                    ctx.copy_text(text);
+                    self.toasts.success("copied", now);
+                }
+                MsgAction::OpenUri(uri) => {
+                    ctx.open_url(egui::OpenUrl::new_tab(uri));
+                }
+                MsgAction::OpenPath(path) => {
+                    // A confined view: hand it to the desktop opener.
+                    ctx.open_url(egui::OpenUrl::new_tab(format!("file://{}", path.display())));
+                }
+                MsgAction::ViewDenied(path) => {
+                    self.toasts.error(format!("view denied (outside allowed roots): {path}"), now);
+                }
+                MsgAction::RunConfirmed { command } => {
+                    // Never run straight from a card: always stage a modal that
+                    // re-shows the exact command. The guard already said it MAY
+                    // run; the modal is the human's last look.
+                    let dialog = ConfirmDialog::new(
+                        "Run this command?",
+                        format!("{command}
+
+This executes on your device."),
+                        "Run",
+                    )
+                    .with_timeout(20.0);
+                    self.run_confirm = Some((command, dialog));
+                }
+            }
+        }
+    }
+
+    /// Actually spawn a guard- and user-approved command. No shell: the
+    /// tokenised argv is executed directly, so payload metacharacters are
+    /// inert (see command_guard). Detached; output is not captured here.
+    fn spawn_command(&mut self, command: &str, now: f64) {
+        match dialer_core::command_guard::tokenize(command) {
+            Ok(tokens) => {
+                let (prog, args) = tokens.split_first().expect("tokenize rejects empty");
+                match std::process::Command::new(prog).args(args).spawn() {
+                    Ok(_) => self.toasts.success(format!("ran: {command}"), now),
+                    Err(e) => self.toasts.error(format!("run failed: {e}"), now),
+                }
+            }
+            Err(e) => self.toasts.error(format!("won't run: {e}"), now),
+        }
+    }
+
     fn drain_events(&mut self, epoch: u64, now: f64) {
         loop {
             match self.link.rx.try_recv() {
@@ -184,6 +303,8 @@ impl Shell {
                     }
                     self.toasts.success(msg, now);
                 }
+                Ok(Event::MessageIn { peer, payload, ts }) => self.on_message_in(peer, payload, ts, now),
+                Ok(Event::MessageSent { .. }) => {}
                 Ok(ev) => {
                     if let Event::ModemDown { detail } = &ev {
                         self.toasts.warning(format!("modem lost: {detail}"), now);
@@ -193,19 +314,20 @@ impl Shell {
                 Err(_) => break,
             }
         }
-        if let Some(mx) = &self.matrix_link {
-            loop {
-                match mx.rx.try_recv() {
-                    // Matrix up/down is its own status, not the modem's.
-                    Ok(Event::ModemUp { label }) => self.matrix_status = Some(label),
-                    Ok(Event::ModemDown { detail }) => {
-                        self.matrix_status = Some(format!("offline: {detail}"))
-                    }
-                    Ok(Event::Error(e)) => self.toasts.error(e, now),
-                    Ok(Event::Info(msg)) => self.toasts.success(msg, now),
-                    Ok(ev) => self.session.apply(ev, epoch),
-                    Err(_) => break,
-                }
+        // Drain the matrix link the same way, keeping matrix status separate.
+        let mx_events: Vec<Event> = match &self.matrix_link {
+            Some(mx) => std::iter::from_fn(|| mx.rx.try_recv().ok()).collect(),
+            None => Vec::new(),
+        };
+        for ev in mx_events {
+            match ev {
+                Event::ModemUp { label } => self.matrix_status = Some(label),
+                Event::ModemDown { detail } => self.matrix_status = Some(format!("offline: {detail}")),
+                Event::Error(e) => self.toasts.error(e, now),
+                Event::Info(msg) => self.toasts.success(msg, now),
+                Event::MessageIn { peer, payload, ts } => self.on_message_in(peer, payload, ts, now),
+                Event::MessageSent { .. } => {}
+                ev => self.session.apply(ev, epoch),
             }
         }
         for entry in self.session.take_history() {
@@ -458,12 +580,20 @@ impl Shell {
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui, adaptive: &Adaptive) {
-        let names = ["Keypad", "Recents"];
+        let unread = self.convs.total_unread();
+        let names = ["Keypad", "Recents", "Messages"];
         ui.horizontal(|ui| {
             let w = ui.available_width() / names.len() as f32;
             for (i, name) in names.iter().enumerate() {
                 let selected = self.nav.page() == i;
-                let text = egui::RichText::new(*name).size(15.0).color(if selected {
+                let label = if i == PAGE_MESSAGES && unread > 0 {
+                    format!("{name} ●{unread}")
+                } else {
+                    name.to_string()
+                };
+                let text = egui::RichText::new(label).size(15.0).color(if selected {
+                    self.colors.accent
+                } else if i == PAGE_MESSAGES && unread > 0 {
                     self.colors.accent
                 } else {
                     self.colors.text_weak
@@ -495,7 +625,7 @@ impl Shell {
             }
             if self.wizard.is_none() && ui.small_button("setup").clicked() {
                 let user = self.matrix_status.clone().filter(|s| !s.starts_with("offline:"));
-                self.wizard = Some(wizard::Wizard::new(user));
+                self.wizard = Some(wizard::Wizard::new(user, self.guard.clone()));
             }
             if self.link.kind == "mock" {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -535,6 +665,13 @@ impl Shell {
                     self.matrix_status = None;
                     self.toasts.success("Matrix session forgotten", now);
                 }
+                wizard::WizardOut::SetGuardPolicy(p) => {
+                    self.guard = p.clone();
+                    match save_guard_policy(&p) {
+                        Ok(()) => self.toasts.success("command policy saved", now),
+                        Err(e) => self.toasts.error(e, now),
+                    }
+                }
                 wizard::WizardOut::Close => self.wizard = None,
             }
         }
@@ -567,27 +704,76 @@ impl Shell {
                 }
             });
 
+        let mut msg_actions: Vec<MsgAction> = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(self.colors.bg_base).inner_margin(10.0))
-            .show(ctx, |ui| match &foreground {
-                // A ringing/active call outranks the wizard: the phone part
-                // of the phone is never behind setup.
-                Some(call) => self.in_call(ui, call.clone(), &adaptive, epoch, now),
-                None if self.wizard.is_some() => {
-                    let mut w = self.wizard.take().expect("checked is_some");
-                    let operator = self.session.operator.clone();
-                    let mut outs = Vec::new();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        outs = w.ui(ui, &self.colors, operator.as_deref());
-                    });
-                    self.wizard = Some(w);
-                    self.handle_wizard(outs, now);
+            .show(ctx, |ui| {
+                match &foreground {
+                    // A ringing/active call outranks the wizard: the phone
+                    // part of the phone is never behind setup.
+                    Some(call) => {
+                        self.in_call(ui, call.clone(), &adaptive, epoch, now);
+                        return;
+                    }
+                    None if self.wizard.is_some() => {
+                        let mut w = self.wizard.take().expect("checked is_some");
+                        let operator = self.session.operator.clone();
+                        let mut outs = Vec::new();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            outs = w.ui(ui, &self.colors, operator.as_deref());
+                        });
+                        self.wizard = Some(w);
+                        self.handle_wizard(outs, now);
+                        return;
+                    }
+                    None => {}
                 }
-                None => match self.nav.page() {
+
+                // Swipe paging across the three idle pages. Only arms when we
+                // aren't inside an open thread (the thread's own vertical
+                // scroll + its back button own that surface).
+                let surface = ui.available_rect_before_wrap();
+                let in_thread = self.nav.page() == PAGE_MESSAGES
+                    && matches!(self.msg.view, messages::MessagesView::Thread(_));
+                if !in_thread {
+                    let frame = self.gesture.update(ui, surface, true);
+                    if let Some(dir) = frame.page_jump {
+                        let next = (self.nav.page() as i32 + dir.sign())
+                            .clamp(0, PAGE_COUNT as i32 - 1) as usize;
+                        self.nav.go_page(next);
+                    }
+                }
+
+                match self.nav.page() {
                     PAGE_RECENTS => self.recents_page(ui, epoch, now),
+                    PAGE_MESSAGES => {
+                        // Opening a thread clears its unread.
+                        if let messages::MessagesView::Thread(peer) = self.msg.view.clone() {
+                            self.convs.mark_read(&peer);
+                        }
+                        msg_actions = messages::messages_page(
+                            ui, &self.convs, &mut self.msg, &self.guard, &self.colors, epoch,
+                        );
+                    }
                     _ => self.keypad_page(ui, &adaptive, now),
-                },
+                }
             });
+        if !msg_actions.is_empty() {
+            self.handle_msg_actions(msg_actions, ctx, now);
+        }
+
+        // The run-confirm modal, if a command is staged.
+        if let Some((command, dialog)) = &mut self.run_confirm {
+            match dialog.show(ctx) {
+                ConfirmOutcome::Confirmed => {
+                    let cmd = command.clone();
+                    self.run_confirm = None;
+                    self.spawn_command(&cmd, now);
+                }
+                ConfirmOutcome::Cancelled => self.run_confirm = None,
+                ConfirmOutcome::Pending => {}
+            }
+        }
 
         self.toasts.ui(ctx, 64.0);
 
@@ -658,6 +844,31 @@ pub fn run(choice: BackendChoice) -> eframe::Result<()> {
             Ok(Box::new(Shell::new(link, fallback, colors)))
         }),
     )
+}
+
+/// Guard policy location, next to the other prefs.
+fn guard_policy_path() -> std::path::PathBuf {
+    HistoryStore::default_path()
+        .parent()
+        .map(|d| d.join("command-policy.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from("command-policy.json"))
+}
+
+/// Load the command guard policy; conservative default (running off) if there
+/// is no file or it's unreadable — a corrupt policy must never fail *open*.
+fn load_guard_policy() -> GuardPolicy {
+    std::fs::read_to_string(guard_policy_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_guard_policy(p: &GuardPolicy) -> Result<(), String> {
+    let path = guard_policy_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(p).unwrap()).map_err(|e| e.to_string())
 }
 
 /// The shared default palette — this app is not a Qt/GTK port, so per the

@@ -66,6 +66,61 @@ First launch (or the status-bar `setup` button) opens a two-step wizard:
    deliberately not used — four HTTP endpoints via `ureq` in the house
    visible-loop style, with every JSON parser a pure tested function.
 
+## Messaging & gesture nav
+
+**Gestures:** swipe left/right pages across Keypad ↔ Recents ↔ Messages using
+the shared `uikit_egui::GestureLayer` (the FP5-tuned `TwoTierGesture`), so the
+feel matches the rest of the fleet. Swipe is disarmed inside an open thread so
+it doesn't fight the message list's vertical scroll.
+
+**SMS** over ModemManager's `Modem.Messaging`/`Sms` interfaces (feature `mm`):
+send creates+sends an SMS object; inbound is polled (deliver PDU + received
+state), delivered as an event, then deleted from the modem store. Threads are
+per-peer, persisted as JSONL (`messages.jsonl`), unread-tracked.
+
+**Linux handoff protocol** (`message.rs`) — a small structured payload carried
+two ways: lossless JSON as a Matrix custom event
+(`org.ecosystem.dialer.payload`, with an `m.room.message` text fallback so
+plain clients see something), and a compact `run:` / `file:` / `view:` text
+encoding for SMS that a non-app recipient can still read. Payloads:
+
+- `Text`
+- `CommandSuggestion { command, cwd?, note? }` — a *suggestion*, see below
+- `FileOffer { name, mime?, size?, uri }` — a pointer, no bytes in the message
+- `FileView { path }` — "open this local path", confined by the guard
+
+The key safety property: a normal message is never misread as a command — only
+the explicit `run:` prefix (or the JSON kind) upgrades it.
+
+## Command execution: the threat model
+
+Received command text is attacker-controlled. `command_guard.rs` is the single
+gate:
+
+- **Running is OFF by default** (`allow_run = false`); inbound commands are
+  display + copy only. The opt-in lives in the setup wizard's Commands step
+  with the warning attached.
+- **Even enabled, every run is confirmed** in a modal showing the exact
+  command, unless the sender is on an explicit allowlist AND the command
+  matches an allowed prefix.
+- **No shell.** An approved command is tokenised (quote-aware, control-char
+  rejecting) and spawned as argv via `std::process::Command` — `;`, `|`, `$()`
+  are literal argument bytes, inert. A newline in the payload is rejected
+  outright so a second command can't be smuggled past the confirmation.
+- **File-view is path-confined**: a `view:` path must canonicalise under a
+  configured root or it's denied (`../` escapes and `/etc/shadow` go nowhere).
+
+A corrupt policy file fails *closed* (running off). None of this trusts the
+transport — E2EE tells you who sent a thing, not that it's safe to run.
+
+## Real cellular MMS
+
+Not implemented. Cellular MMS (multimedia over the carrier MMSC/WAP) needs
+**mmsd-tng**; ModemManager doesn't carry MMS content. The handoff protocol
+above is the richer-message story over Matrix/SMS-text instead. mmsd-tng is
+the integration point if picture-MMS is wanted later — it would be a fourth
+backend on the same Link, emitting the same `MessageIn`/`MessageSent`.
+
 ## Deliberate v1 boundaries
 
 - No contacts, no SMS/USSD, no call audio routing (on ModemManager devices
@@ -82,11 +137,22 @@ First launch (or the status-bar `setup` button) opens a two-step wizard:
 
 ## Verification status (authoring pass)
 
-`dialer-core` compiled and its 19 unit tests ran green on rustc 1.75, both
-default-features and `--features matrix` (the latter with ureq pinned to
-2.9.7 plus url 2.5.0 / zeroize 1.7.0 downgrades, needed only because that
-sandbox cargo predates `edition2024`; modern toolchains resolve `ureq = "2"`
-freely and the APIs used are stable across 2.x). Everything touching zbus (`mm.rs`) and the
+`dialer-core`: **35 unit tests green on rustc 1.75**, both default-features and
+`--features matrix`. New coverage includes the payload SMS round-trip and the
+"plain text is never a command" property, the guard (running-off default,
+trusted+prefixed bypass, shell-metacharacter inertness, newline rejection,
+view-root confinement), the conversation store, and Matrix inbound
+message/handoff parsing. (`--features matrix` needs ureq pinned to 2.9.7 + url
+2.5.0/zeroize 1.7.0 downgrades ONLY because the sandbox cargo predates
+`edition2024`; a modern toolchain resolves `ureq = "2"` freely.)
+
+The egui surface, the mm.rs SMS additions (zbus), and the Matrix send path are
+**not run here** (sandbox toolchain predates egui 0.34's MSRV). They pass
+rustcheck Tier 0, and every egui-0.34 API the shell uses was checked by name
+and signature against the egui 0.34 source (`corner_radius`, `copy_text`,
+`open_url`/`OpenUrl::new_tab`, `stick_to_bottom(bool)`, `Frame::new`,
+`long_touched`). A hardware `cargo build` is still required before calling any
+of it working. Everything touching zbus (`mm.rs`) and the
 whole egui surface is static-checked only (suspenders) — the sandbox
 toolchain predates egui 0.34's MSRV — and needs a real `cargo build` plus an
 on-device pass (FP5/PinePhone with ModemManager) before being called working.

@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::link::Event;
+use crate::message::{self, Payload};
 use crate::types::{CallDirection, CallInfo, CallState};
 
 #[cfg(feature = "matrix")]
@@ -112,6 +113,11 @@ pub fn parse_login(json: &str, homeserver: &str) -> Result<Creds, String> {
     })
 }
 
+/// The custom Matrix event type carrying a structured handoff payload. A
+/// client without this app still gets the accompanying `m.room.message`
+/// fallback (we send both).
+pub const PAYLOAD_EVENT_TYPE: &str = "org.ecosystem.dialer.payload";
+
 /// One live invite we may need to hang up on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveInvite {
@@ -183,11 +189,69 @@ pub fn parse_sync(json: &str, my_user: &str) -> Result<(String, Vec<Event>, Vec<
                         state: CallState::Terminated,
                     });
                 }
+                // Our structured handoff event (command/file payloads).
+                t if t == PAYLOAD_EVENT_TYPE && sender != my_user => {
+                    if let Some(json) = content.map(|c| c.to_string()) {
+                        if let Ok(payload) = Payload::from_json(&json) {
+                            let ts = ev.get("origin_server_ts").and_then(|t| t.as_u64())
+                                .map(|ms| ms / 1000).unwrap_or_else(now_secs);
+                            events.push(Event::MessageIn {
+                                peer: format!("matrix:{sender}"),
+                                payload,
+                                ts,
+                            });
+                        }
+                    }
+                }
+                // Plain room messages from others become Text payloads. A
+                // message that is itself our SMS-style `run:`/`file:` text is
+                // upgraded, so the handoff works cross-transport too.
+                "m.room.message" if sender != my_user => {
+                    let body = content.and_then(|c| c.get("body")).and_then(|b| b.as_str());
+                    if let Some(body) = body {
+                        let ts = ev.get("origin_server_ts").and_then(|t| t.as_u64())
+                            .map(|ms| ms / 1000).unwrap_or_else(now_secs);
+                        events.push(Event::MessageIn {
+                            peer: format!("matrix:{sender}"),
+                            payload: message::parse_sms(body),
+                            ts,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
     }
     Ok((next, events, invites))
+}
+
+/// From a raw /sync body, map each room's message/handoff senders to that
+/// room id, so a reply can target the right room. Pure; unit-tested.
+pub fn sender_rooms(sync_json: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(sync_json) else { return out };
+    let Some(join) = v.get("rooms").and_then(|r| r.get("join")).and_then(|j| j.as_object())
+    else { return out };
+    for (room_id, room) in join {
+        let evs = room.get("timeline").and_then(|t| t.get("events")).and_then(|e| e.as_array());
+        let Some(evs) = evs else { continue };
+        for ev in evs {
+            let t = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if t == "m.room.message" || t == PAYLOAD_EVENT_TYPE {
+                if let Some(sender) = ev.get("sender").and_then(|s| s.as_str()) {
+                    out.push((sender.to_string(), room_id.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ------------------------------------------------------------------- HTTP
@@ -238,6 +302,35 @@ pub fn login(homeserver: &str, user: &str, password: &str) -> Result<Creds, Stri
     parse_login(&text, homeserver)
 }
 
+/// Send a payload to a room: the structured custom event first (rich
+/// clients), then an `m.room.message` text fallback so any Matrix client
+/// shows *something*. Two PUTs; the fallback failure is not fatal.
+#[cfg(feature = "matrix")]
+fn send_matrix(
+    ag: &ureq::Agent,
+    creds: &Creds,
+    auth: &str,
+    room: &str,
+    payload: &Payload,
+    txn: u64,
+) -> Result<(), String> {
+    let base = &creds.homeserver;
+    // 1) custom event
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{room}/send/{}/dialer{txn}",
+        PAYLOAD_EVENT_TYPE
+    );
+    ag.put(&url)
+        .set("Authorization", auth)
+        .send_string(&payload.to_json())
+        .map_err(|e| format!("{e}"))?;
+    // 2) human-readable fallback
+    let body = serde_json::json!({ "msgtype": "m.text", "body": payload.to_sms() });
+    let url = format!("{base}/_matrix/client/v3/rooms/{room}/send/m.room.message/dialerf{txn}");
+    let _ = ag.put(&url).set("Authorization", auth).send_string(&body.to_string());
+    Ok(())
+}
+
 /// Spawn the sync-loop backend. Fails fast (bad token, unreachable server)
 /// so the shell can toast instead of running a dead link.
 #[cfg(feature = "matrix")]
@@ -261,6 +354,7 @@ pub fn spawn(creds: Creds) -> Result<Link, String> {
             let auth = format!("Bearer {}", creds.access_token);
             let mut since: Option<String> = None;
             let mut live: HashMap<String, LiveInvite> = HashMap::new(); // link id → invite
+            let mut dm_room: HashMap<String, String> = HashMap::new();  // "@user:x" → "!room:x"
             let mut txn = 0u64;
 
             loop {
@@ -291,6 +385,28 @@ pub fn spawn(creds: Creds) -> Result<Link, String> {
                                     let _ = ev_tx.send(Event::Error(format!("matrix hangup: {e}")));
                                 }
                             }
+                        }
+                        Ok(Command::SendMessage { peer, payload }) => {
+                            // Resolve the target room: explicit "matrix/!room"
+                            // or a mxid we've exchanged messages with.
+                            let room = if let Some(r) = peer.strip_prefix("matrix/") {
+                                Some(r.to_string())
+                            } else if let Some(mx) = peer.strip_prefix("matrix:") {
+                                dm_room.get(mx).cloned()
+                            } else {
+                                None
+                            };
+                            let Some(room) = room else {
+                                let _ = ev_tx.send(Event::Error(format!(
+                                    "no known Matrix room for {peer} (open a chat there first)")));
+                                continue;
+                            };
+                            txn += 1;
+                            let ok = send_matrix(&ag, &creds, &auth, &room, &payload, txn);
+                            let _ = ev_tx.send(match ok {
+                                Ok(()) => Event::MessageSent { peer: peer.clone() },
+                                Err(e) => Event::Error(format!("matrix send: {e}")),
+                            });
                         }
                         // No media engine yet — see module docs. The shell
                         // hides Accept for matrix calls; this is the backstop.
@@ -332,6 +448,9 @@ pub fn spawn(creds: Creds) -> Result<Link, String> {
                         continue;
                     }
                 };
+                for (mxid, room) in sender_rooms(&body) {
+                    dm_room.insert(mxid, room);
+                }
                 match parse_sync(&body, &creds.user_id) {
                     Ok((next, events, invites)) => {
                         since = Some(next);
@@ -399,15 +518,19 @@ mod tests {
         assert_eq!(invites.len(), 1);
         assert_eq!(invites[0].call_id, "c123");
         assert_eq!(invites[0].version, serde_json::json!("1"));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        // Exactly one CallAdded (the invite); the "hi" room message also
+        // yields a MessageIn, and our own invite is dropped.
+        let added: Vec<&Event> = events.iter()
+            .filter(|e| matches!(e, Event::CallAdded(_))).collect();
+        assert_eq!(added.len(), 1);
+        match added[0] {
             Event::CallAdded(info) => {
                 assert_eq!(info.id, "matrix/!room:x.org/c123");
                 assert_eq!(info.number, "@bob:x.org");
                 assert_eq!(info.state, CallState::RingingIn);
                 assert_eq!(info.direction, CallDirection::Incoming);
             }
-            other => panic!("expected CallAdded, got {other:?}"),
+            _ => unreachable!(),
         }
     }
 
@@ -429,6 +552,44 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, ["matrix/!r:x/c1", "matrix/!r:x/c2"]);
+    }
+
+    #[test]
+    fn sender_rooms_indexes_message_senders_by_room() {
+        let j = r#"{ "next_batch":"n", "rooms": { "join": {
+            "!r1:x": { "timeline": { "events": [
+                { "type":"m.room.message", "sender":"@a:x", "content":{"body":"hi"} } ] } },
+            "!r2:x": { "timeline": { "events": [
+                { "type":"org.ecosystem.dialer.payload", "sender":"@b:x", "content":{"kind":"text","body":"y"} } ] } }
+        } } }"#;
+        let map = sender_rooms(j);
+        assert!(map.contains(&("@a:x".to_string(), "!r1:x".to_string())));
+        assert!(map.contains(&("@b:x".to_string(), "!r2:x".to_string())));
+    }
+
+    #[test]
+    fn inbound_room_message_and_custom_payload_become_messagein() {
+        let j = r#"{ "next_batch":"n", "rooms": { "join": { "!r:x": { "timeline": { "events": [
+            { "type":"m.room.message", "sender":"@a:x", "origin_server_ts": 5000,
+              "content": { "msgtype":"m.text", "body":"run: ls -la" } },
+            { "type":"org.ecosystem.dialer.payload", "sender":"@a:x", "origin_server_ts": 6000,
+              "content": { "kind":"file_offer", "name":"a.txt", "uri":"mxc://x/a" } }
+        ] } } } } }"#;
+        let (_, events, _) = parse_sync(j, "@me:x").unwrap();
+        // First: the run: text upgraded to a command suggestion.
+        match &events[0] {
+            Event::MessageIn { peer, payload, ts } => {
+                assert_eq!(peer, "matrix:@a:x");
+                assert_eq!(*ts, 5); // ms -> s
+                assert!(matches!(payload, Payload::CommandSuggestion { .. }));
+            }
+            other => panic!("expected MessageIn, got {other:?}"),
+        }
+        match &events[1] {
+            Event::MessageIn { payload: Payload::FileOffer { name, .. }, .. } =>
+                assert_eq!(name, "a.txt"),
+            other => panic!("expected file offer MessageIn, got {other:?}"),
+        }
     }
 
     #[test]

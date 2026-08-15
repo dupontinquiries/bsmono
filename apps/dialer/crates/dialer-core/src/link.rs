@@ -9,6 +9,7 @@
 
 use std::sync::mpsc::{Receiver, Sender};
 
+use crate::message::Payload;
 use crate::types::{CallId, CallInfo, CallState};
 
 /// What the setup wizard applies: enough to write a NetworkManager GSM
@@ -40,6 +41,11 @@ pub enum Command {
     /// NetworkManager GSM connection; the mock pretends. Answered by
     /// `Event::Info` or `Event::Error`.
     ApplyApn(ApnSetting),
+    /// Send a message to a peer. `peer` is transport-qualified
+    /// ("tel:+1555…" for SMS via the modem, "matrix:@a:x"/"matrix/!room:x"
+    /// for Matrix). The backend picks the wire encoding (SMS text vs Matrix
+    /// custom event).
+    SendMessage { peer: String, payload: Payload },
     /// Stop the backend thread.
     Quit,
 }
@@ -63,6 +69,13 @@ pub enum Event {
     /// A success worth telling the user about (APN applied, account signed
     /// in). The Info/Error pair keeps backends out of the toast business.
     Info(String),
+    /// A message arrived from `peer` (already parsed into a payload; SMS
+    /// bodies pass through `message::parse_sms`, Matrix custom events through
+    /// `Payload::from_json`). `ts` is unix seconds.
+    MessageIn { peer: String, payload: Payload, ts: u64 },
+    /// A previously-sent message was accepted by the network (SMS delivery
+    /// state / Matrix event id). Best-effort; not all transports report it.
+    MessageSent { peer: String },
     /// Something failed; the shell toasts it and moves on.
     Error(String),
 }

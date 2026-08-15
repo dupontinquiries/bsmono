@@ -105,8 +105,8 @@ impl Session {
                 }
             }
             Event::Operator { mccmnc } => self.operator = Some(mccmnc),
-            // Toast material, not state — surfaced by the shell.
-            Event::Info(_) | Event::Error(_) => {}
+            // Toast material / messaging — handled by the shell, not call state.
+            Event::Info(_) | Event::Error(_) | Event::MessageIn { .. } | Event::MessageSent { .. } => {}
         }
     }
 

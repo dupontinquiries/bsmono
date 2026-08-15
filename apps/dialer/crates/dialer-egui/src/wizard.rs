@@ -16,6 +16,7 @@
 use std::sync::mpsc::{channel, Receiver};
 
 use dialer_core::link::ApnSetting;
+use dialer_core::command_guard::GuardPolicy;
 use dialer_core::matrix::Creds;
 use dialer_core::providers::{self, Apn, Source};
 use uikit_egui::PaletteColors;
@@ -24,6 +25,7 @@ use uikit_egui::PaletteColors;
 pub enum Phase {
     Carrier,
     Matrix,
+    Commands,
     Done,
 }
 
@@ -38,9 +40,11 @@ pub enum Step {
 pub fn next_phase(current: Phase, step: Step) -> Phase {
     match (current, step) {
         (Phase::Carrier, Step::Next) => Phase::Matrix,
-        (Phase::Matrix, Step::Next) => Phase::Done,
+        (Phase::Matrix, Step::Next) => Phase::Commands,
+        (Phase::Commands, Step::Next) => Phase::Done,
         (Phase::Matrix, Step::Back) => Phase::Carrier,
-        (Phase::Done, Step::Back) => Phase::Matrix,
+        (Phase::Commands, Step::Back) => Phase::Matrix,
+        (Phase::Done, Step::Back) => Phase::Commands,
         (_, Step::Finish) => Phase::Done,
         (p, _) => p,
     }
@@ -53,6 +57,7 @@ pub enum WizardOut {
     ApplyApn(ApnSetting),
     MatrixSignedIn(Creds),
     MatrixForgotten,
+    SetGuardPolicy(GuardPolicy),
     Close,
 }
 
@@ -94,12 +99,29 @@ pub struct Wizard {
     mx_status: String,
     mx_busy: Option<Receiver<Result<Creds, String>>>,
     mx_signed_in: Option<String>, // user_id
+    // commands step
+    policy: GuardPolicy,
+    trusted_raw: String,
+    prefixes_raw: String,
+    roots_raw: String,
 }
 
 impl Wizard {
-    pub fn new(matrix_user: Option<String>) -> Wizard {
+    pub fn new(matrix_user: Option<String>, policy: GuardPolicy) -> Wizard {
         let (apns, source) = providers::load();
+        let trusted_raw = policy.trusted_senders.join("\n");
+        let prefixes_raw = policy.allowed_prefixes.join("\n");
+        let roots_raw = policy
+            .view_roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         Wizard {
+            policy,
+            trusted_raw,
+            prefixes_raw,
+            roots_raw,
             phase: Phase::Carrier,
             apns,
             source,
@@ -323,6 +345,54 @@ impl Wizard {
         );
     }
 
+    fn commands_ui(&mut self, ui: &mut egui::Ui, colors: &PaletteColors, out: &mut Vec<WizardOut>) {
+        ui.heading("Shared commands & files");
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "A contact can send a suggested command or a file. Commands are                  NEVER run automatically — you see the exact text and confirm each one.",
+            )
+            .small()
+            .color(colors.text_weak),
+        );
+        ui.add_space(8.0);
+
+        ui.checkbox(&mut self.policy.allow_run, "Allow running received commands");
+        if self.policy.allow_run {
+            ui.label(
+                egui::RichText::new(
+                    "With this on, an inbound command shows a Run button that opens a                      confirmation. Only trusted senders + allowed prefixes skip the                      confirmation. Commands run as argv (no shell) — metacharacters are inert.",
+                )
+                .small()
+                .color(colors.warning),
+            );
+            ui.add_space(6.0);
+            ui.label("Trusted senders (one per line, e.g. matrix:@me:x.org, tel:+15551234):");
+            ui.add(egui::TextEdit::multiline(&mut self.trusted_raw).desired_rows(2).desired_width(f32::INFINITY));
+            ui.label("Auto-run prefixes for trusted senders (one per line, e.g. 'git ', 'cargo test'):");
+            ui.add(egui::TextEdit::multiline(&mut self.prefixes_raw).desired_rows(2).desired_width(f32::INFINITY));
+        }
+        ui.add_space(6.0);
+        ui.label("Folders a received 'view:' path may open (one per line; empty = deny all):");
+        ui.add(egui::TextEdit::multiline(&mut self.roots_raw).desired_rows(2).desired_width(f32::INFINITY));
+
+        ui.add_space(8.0);
+        if ui.button("Save command policy").clicked() {
+            self.policy.trusted_senders =
+                self.trusted_raw.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+            self.policy.allowed_prefixes =
+                self.prefixes_raw.lines().map(|l| l.to_string()).filter(|l| !l.trim().is_empty()).collect();
+            self.policy.view_roots = self
+                .roots_raw
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect();
+            out.push(WizardOut::SetGuardPolicy(self.policy.clone()));
+        }
+    }
+
     /// Render the current phase; returns actions for the shell. `operator`
     /// is the modem-reported MCC+MNC, when known.
     pub fn ui(
@@ -332,11 +402,12 @@ impl Wizard {
         operator: Option<&str>,
     ) -> Vec<WizardOut> {
         let mut out = Vec::new();
-        let steps = ["1 · Carrier", "2 · Matrix", "3 · Done"];
+        let steps = ["1 · Carrier", "2 · Matrix", "3 · Commands", "4 · Done"];
         let idx = match self.phase {
             Phase::Carrier => 0,
             Phase::Matrix => 1,
-            Phase::Done => 2,
+            Phase::Commands => 2,
+            Phase::Done => 3,
         };
         ui.horizontal(|ui| {
             for (i, s) in steps.iter().enumerate() {
@@ -349,6 +420,7 @@ impl Wizard {
         match self.phase {
             Phase::Carrier => self.carrier_ui(ui, colors, operator, &mut out),
             Phase::Matrix => self.matrix_ui(ui, colors, &mut out),
+            Phase::Commands => self.commands_ui(ui, colors, &mut out),
             Phase::Done => {
                 ui.heading("All set");
                 ui.add_space(6.0);
