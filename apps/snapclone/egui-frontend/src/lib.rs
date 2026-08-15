@@ -331,6 +331,11 @@ pub struct Snapclone {
     /// unread badges — and the badge is the reason it needs wiring rather than
     /// just drawing: a count nobody updates is worse than no count.
     pub tabs: crate::tab_bar::TabBar,
+    /// A horizontal swipe in progress, if one is. `None` between gestures
+    /// rather than a Swipe with a zero drag: "not swiping" and "swiping
+    /// nowhere" render differently — the second holds the page a pixel off
+    /// centre and never springs back.
+    pub swipe: Option<crate::swipe_physics::Swipe>,
     /// (sender id, caption) for the snaps floating on the map, newest first.
     pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
@@ -436,6 +441,7 @@ impl Snapclone {
             // in TabBar::default() because the bar is generic over its tabs —
             // a default set inside the widget would be this app's navigation
             // leaking into a shared component.
+            swipe: None,
             tabs: crate::tab_bar::TabBar::new(vec![
                 crate::tab_bar::Tab::new("camera", "Camera"),
                 crate::tab_bar::Tab::new("chats", "Chats"),
@@ -481,6 +487,47 @@ impl Snapclone {
     /// Confirm the pending delete. Split from apply_friends because the
     /// confirmation arrives as its own answer, not as part of the tap that
     /// asked the question.
+    /// Start a horizontal page swipe.
+    ///
+    /// The BOUNDS come from where we are in the tab list, and they are the
+    /// whole reason this is not just a drag: at the first tab there is no
+    /// previous page, so the rubber band resists instead of turning. Without
+    /// them the first tab would swipe to nothing and spring back, which reads
+    /// as a dropped gesture rather than an edge.
+    pub fn begin_swipe(&mut self, x: f32, page_w: f32, t_ms: f32) {
+        let cur = self.tabs.current();
+        let bounds = crate::swipe_physics::Bounds {
+            can_prev: cur > 0,
+            can_next: cur + 1 < self.tabs.len(),
+        };
+        self.swipe = Some(crate::swipe_physics::Swipe::begin(page_w, bounds, x, t_ms));
+    }
+
+    /// Finish the swipe and turn the page if it earned it.
+    ///
+    /// Returns the tab now showing. The physics decides — distance past the
+    /// commit threshold OR enough velocity — so a fast flick turns the page
+    /// without crossing half the screen, which is what makes one-handed use
+    /// possible at all.
+    pub fn end_swipe(&mut self, t_ms: f32) -> usize {
+        use crate::swipe_physics::Commit;
+        let Some(sw) = self.swipe.as_mut() else { return self.tabs.current() };
+        let commit = sw.release(t_ms);
+        self.swipe = None;
+        let cur = self.tabs.current();
+        let next = match commit {
+            // Saturating rather than wrapping: a swipe past the last tab should
+            // stop, not land on Camera. Bounds already prevent it, and this is
+            // the second guard on an action the user cannot undo by swiping
+            // back the same way.
+            Commit::Prev => cur.saturating_sub(1),
+            Commit::Next => (cur + 1).min(self.tabs.len().saturating_sub(1)),
+            Commit::Cancel => cur,
+        };
+        self.tabs.set_current(next);
+        next
+    }
+
     /// Index of the Chats tab, whose badge shows unread messages.
     ///
     /// Named rather than written as `1` at the call site: the tab order is a
@@ -2827,6 +2874,55 @@ mod modal_render_tests {
         }
         assert!(undrawn.is_empty(),
                 "presented but never drawn: {undrawn:?} — these block input while invisible");
+    }
+}
+
+#[cfg(test)]
+mod swipe_nav_tests {
+    fn app() -> super::Snapclone { super::Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn a_swipe_past_the_last_tab_stays_put() {
+        // Bounds already refuse it, and this is the second guard: landing back
+        // on Camera from the far end is a wrap the user did not ask for and
+        // cannot undo by swiping the same way again.
+        let mut a = app();
+        let last = a.tabs.len() - 1;
+        a.tabs.set_current(last);
+        a.begin_swipe(300.0, 400.0, 0.0);
+        // A long drag left = "next", which does not exist here.
+        if let Some(sw) = a.swipe.as_mut() { sw.update(0.0, 100.0); }
+        assert_eq!(a.end_swipe(120.0), last);
+    }
+
+    #[test]
+    fn a_swipe_before_the_first_tab_stays_put() {
+        let mut a = app();
+        a.tabs.set_current(0);
+        a.begin_swipe(50.0, 400.0, 0.0);
+        if let Some(sw) = a.swipe.as_mut() { sw.update(390.0, 100.0); }
+        assert_eq!(a.end_swipe(120.0), 0);
+    }
+
+    #[test]
+    fn releasing_without_a_swipe_is_not_a_page_turn() {
+        // end_swipe can be called on a frame where no gesture started — a
+        // pointer-up with no drag — and must not move the page.
+        let mut a = app();
+        a.tabs.set_current(2);
+        assert_eq!(a.end_swipe(10.0), 2);
+        assert!(a.swipe.is_none());
+    }
+
+    #[test]
+    fn the_gesture_clears_after_release() {
+        // A Swipe left in place would keep rendering the page a few pixels off
+        // centre, with nothing to spring it back.
+        let mut a = app();
+        a.begin_swipe(100.0, 400.0, 0.0);
+        assert!(a.swipe.is_some());
+        a.end_swipe(50.0);
+        assert!(a.swipe.is_none());
     }
 }
 
