@@ -110,3 +110,29 @@ its input and these deviation numbers as its acceptance test.
 The packer itself. This document is the measurement and the constraint it found;
 writing `build_bots_web.py` and the loader side is the next step, and it should
 carry the per-chassis-box rule as a test rather than a comment.
+
+## The history rewrite
+
+Quantising shrank the working tree but GREW the bundle: 904 MB, because git
+still held both the old float32 blobs and the new packs. A deletion does not
+reclaim anything until the old objects go.
+
+`git filter-repo --invert-paths` stripped every `scene.bin` under a chassis that
+now has a `bots.pack` — 1,289 blobs, 892 MB of history.
+
+Two things made this safe to do rather than a gamble:
+
+* **The strip list was generated from the packs, not from a glob.** One rule per
+  pose directory of each of the 217 packed chassis, so the four chassis that
+  could NOT be packed keep their `scene.bin` in history and on disk. A
+  `glob:**/scene.bin` would have deleted the only copy of those four.
+* **Packing was verified before deleting.** `pack_bots.py --verify` decoded all
+  217 and compared against the originals while the originals still existed.
+
+Result: `.git` 1.1 GB -> 529 MB, bundle 904 MB -> 521 MB, working tree
+unchanged (`git status` clean, 217 packs and 204 exception files present),
+`git fsck` silent across 3,259 commits.
+
+**This rewrites history**, so every clone must re-fetch rather than pull. The
+repo had been through this once before — filter-repo's own `already_ran` marker
+was dated a week earlier — which is why it asked to confirm continuation.
