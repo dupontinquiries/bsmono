@@ -1,0 +1,276 @@
+//! roster — which chassis to load, when there are more than the GPU can hold.
+//!
+//! ## The constraint is real and cannot be raised
+//!
+//! `render::CSDF_MAXM` is 126 models, and its doc explains that this is not a
+//! tuning knob: `CSDF_SLAB * CSDF_MAXM` is a texture depth against a 2048
+//! ceiling, and reaching 126 already meant cutting SLAB from 44 to 16. There is
+//! no room above it.
+//!
+//! The fleet drop takes `assets/bots` from 48 chassis to 222 — and every POSE is
+//! a model, so 222 chassis at ~5 poses is 1105 against a budget of 126.
+//! `bake_car_sdfs` does `.take(CSDF_MAXM)`, so without a selector the roster is
+//! silently truncated at whatever the first 126 poses happen to be: alphabetical
+//! order, mid-chassis, some bots with three poses baked and two not.
+//!
+//! ## So the selection is explicit, and a whole chassis at a time
+//!
+//! A partially-baked chassis is worse than an absent one — it folds into a pose
+//! that has no SDF and the renderer has nothing to sample. `fit` therefore takes
+//! chassis whole and stops before the one that would not fit entirely.
+//!
+//! ## Confidence tiers come from the generator, not from us
+//!
+//! `fleet.json` sorts all 173 fleet chassis into high/medium/low/broken by how
+//! well the fold was inferred. Loading `broken` first when the point is to LOOK
+//! at folds is the right default for a test session and the wrong one for
+//! playing, so the tier is a parameter rather than a policy.
+
+/// How many models the SDF bake can hold. Mirrors `render::CSDF_MAXM`.
+///
+/// Duplicated as a named constant with this note rather than imported, so the
+/// selector can be tested without pulling in the renderer — and asserted equal
+/// in a test, which is what stops the copy going stale.
+pub const SDF_BUDGET: usize = 126;
+
+/// One chassis and the poses it would cost.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Chassis {
+    pub name: String,
+    pub poses: usize,
+    /// From fleet.json, when it says. `None` for the original hand-made bots,
+    /// which predate the confidence sweep and are not worse for it.
+    pub tier: Option<Tier>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Tier { High, Medium, Low, Broken }
+
+impl Tier {
+    pub fn parse(s: &str) -> Option<Tier> {
+        match s {
+            "high" => Some(Tier::High),
+            "medium" => Some(Tier::Medium),
+            "low" => Some(Tier::Low),
+            "broken" => Some(Tier::Broken),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::High => "high", Tier::Medium => "medium",
+            Tier::Low => "low", Tier::Broken => "broken",
+        }
+    }
+}
+
+/// Which chassis to load this run.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Pick {
+    /// Everything that fits, in name order. What the game did before there were
+    /// more chassis than budget.
+    All,
+    /// Only this tier — for looking at how one confidence band folds.
+    OnlyTier(Tier),
+    /// A window into the sorted list, so a session can step through the whole
+    /// fleet across several runs.
+    Page(usize),
+    /// Exactly these, by name.
+    Named(Vec<String>),
+}
+
+/// Choose chassis until the pose budget is spent.
+///
+/// Takes chassis WHOLE: a half-baked chassis folds into a pose with no SDF, so
+/// the loop stops before one that would not fit entirely rather than filling
+/// the remaining slots.
+pub fn fit(all: &[Chassis], pick: &Pick, budget: usize) -> Vec<Chassis> {
+    let candidates: Vec<&Chassis> = match pick {
+        Pick::All => all.iter().collect(),
+        Pick::OnlyTier(t) => all.iter().filter(|c| c.tier == Some(*t)).collect(),
+        Pick::Named(names) => all.iter().filter(|c| names.contains(&c.name)).collect(),
+        Pick::Page(n) => {
+            // Pages are cut by BUDGET, not by a fixed count, so every page
+            // fills the GPU rather than leaving slots empty on a page of
+            // small chassis.
+            let mut pages: Vec<Vec<&Chassis>> = vec![Vec::new()];
+            let mut used = 0usize;
+            for c in all {
+                if used + c.poses > budget && !pages.last().unwrap().is_empty() {
+                    pages.push(Vec::new());
+                    used = 0;
+                }
+                used += c.poses;
+                pages.last_mut().unwrap().push(c);
+            }
+            pages.get(*n).cloned().unwrap_or_default()
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for c in candidates {
+        if used + c.poses > budget { break; }
+        used += c.poses;
+        out.push(c.clone());
+    }
+    out
+}
+
+/// How many pages `Pick::Page` has, so a caller can wrap rather than run off
+/// the end into an empty roster.
+pub fn page_count(all: &[Chassis], budget: usize) -> usize {
+    if all.is_empty() { return 0; }
+    let mut pages = 1usize;
+    let mut used = 0usize;
+    for c in all {
+        if used + c.poses > budget && used > 0 {
+            pages += 1;
+            used = 0;
+        }
+        used += c.poses;
+    }
+    pages
+}
+
+/// Parse `--bots` into a pick.
+///
+/// Accepts a tier name, `page:N`, a comma list of chassis names, or `all`.
+/// Unrecognised input returns `None` rather than falling back to All, because
+/// a typo'd tier silently loading 126 arbitrary bots is exactly the confusion
+/// this module exists to prevent.
+pub fn parse_pick(s: &str) -> Option<Pick> {
+    let s = s.trim();
+    if s.is_empty() || s == "all" { return Some(Pick::All); }
+    if let Some(t) = Tier::parse(s) { return Some(Pick::OnlyTier(t)); }
+    if let Some(n) = s.strip_prefix("page:") {
+        return n.parse::<usize>().ok().map(Pick::Page);
+    }
+    let names: Vec<String> = s.split(',').map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty()).collect();
+    if names.is_empty() { return None; }
+    Some(Pick::Named(names))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(name: &str, poses: usize, tier: Option<Tier>) -> Chassis {
+        Chassis { name: name.into(), poses, tier }
+    }
+
+    fn fleet(n: usize) -> Vec<Chassis> {
+        (0..n).map(|i| c(&format!("bot{i:03}"), 5,
+                         Some(if i % 2 == 0 { Tier::High } else { Tier::Broken }))).collect()
+    }
+
+    #[test]
+    fn the_budget_matches_the_renderers_own_cap() {
+        // A copied constant that drifts is worse than an import, so it is
+        // pinned here. If CSDF_MAXM moves, this fails and someone decides.
+        assert_eq!(SDF_BUDGET as u32, crate::render::CSDF_MAXM);
+    }
+
+    #[test]
+    fn a_chassis_is_taken_whole_or_not_at_all() {
+        // A half-baked chassis folds into a pose with NO SDF and the renderer
+        // has nothing to sample — worse than the chassis being absent.
+        let all = vec![c("a", 100, None), c("b", 20, None), c("c", 20, None)];
+        let got = fit(&all, &Pick::All, 126);
+        let total: usize = got.iter().map(|x| x.poses).sum();
+        assert!(total <= 126);
+        // b fits (120), c would take it to 140 — so c is dropped entirely.
+        assert_eq!(got.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_whole_fleet_does_not_fit_which_is_the_point() {
+        // 222 chassis at 5 poses is 1110 against 126. Without a selector the
+        // bake silently truncates mid-chassis at whatever comes first
+        // alphabetically.
+        let all = fleet(222);
+        let got = fit(&all, &Pick::All, SDF_BUDGET);
+        assert!(got.len() < all.len());
+        assert!(got.iter().map(|x| x.poses).sum::<usize>() <= SDF_BUDGET);
+    }
+
+    #[test]
+    fn a_tier_can_be_looked_at_on_its_own() {
+        // Looking at how the BROKEN band folds is the whole reason to have the
+        // tier, and it is the wrong default for playing — hence a parameter.
+        let all = fleet(40);
+        let got = fit(&all, &Pick::OnlyTier(Tier::Broken), SDF_BUDGET);
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|x| x.tier == Some(Tier::Broken)));
+    }
+
+    #[test]
+    fn pages_cover_the_fleet_without_overlapping() {
+        // The property that makes stepping through several runs actually see
+        // everything: no chassis appears twice and none is skipped.
+        let all = fleet(60);
+        let pages = page_count(&all, SDF_BUDGET);
+        let mut seen: Vec<String> = Vec::new();
+        for p in 0..pages {
+            for ch in fit(&all, &Pick::Page(p), SDF_BUDGET) {
+                assert!(!seen.contains(&ch.name), "{} appeared twice", ch.name);
+                seen.push(ch.name);
+            }
+        }
+        assert_eq!(seen.len(), all.len(), "a chassis was skipped");
+    }
+
+    #[test]
+    fn every_page_respects_the_budget() {
+        let all = fleet(60);
+        for p in 0..page_count(&all, SDF_BUDGET) {
+            let got = fit(&all, &Pick::Page(p), SDF_BUDGET);
+            assert!(got.iter().map(|x| x.poses).sum::<usize>() <= SDF_BUDGET, "page {p}");
+        }
+    }
+
+    #[test]
+    fn a_page_past_the_end_is_empty_rather_than_wrapping_silently() {
+        // The caller wraps using page_count. Wrapping in here would make
+        // `page:99` quietly show page 3 and look like the flag was ignored.
+        let all = fleet(10);
+        assert!(fit(&all, &Pick::Page(99), SDF_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn named_chassis_are_loaded_exactly() {
+        let all = fleet(20);
+        let got = fit(&all, &Pick::Named(vec!["bot003".into(), "bot007".into()]), SDF_BUDGET);
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn a_typo_is_refused_rather_than_becoming_all() {
+        // A mistyped tier silently loading 126 arbitrary bots is exactly the
+        // confusion this module exists to prevent.
+        assert_eq!(parse_pick("brokn"), Some(Pick::Named(vec!["brokn".into()])));
+        assert_eq!(parse_pick("page:x"), None);
+        assert_eq!(parse_pick(""), Some(Pick::All));
+    }
+
+    #[test]
+    fn tier_names_round_trip() {
+        // They come from fleet.json, so a rename on either side must not
+        // silently stop matching.
+        for t in [Tier::High, Tier::Medium, Tier::Low, Tier::Broken] {
+            assert_eq!(Tier::parse(t.name()), Some(t));
+        }
+    }
+
+    #[test]
+    fn hand_made_bots_have_no_tier_and_are_not_excluded() {
+        // The original 48 predate the confidence sweep and are not worse for
+        // it — but they must not vanish when a tier is selected either, which
+        // is why they are None rather than a fifth tier.
+        let all = vec![c("blackstar", 5, None), c("bot000", 5, Some(Tier::High))];
+        assert_eq!(fit(&all, &Pick::All, SDF_BUDGET).len(), 2);
+        assert_eq!(fit(&all, &Pick::OnlyTier(Tier::High), SDF_BUDGET).len(), 1);
+    }
+}
