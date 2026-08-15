@@ -1234,6 +1234,40 @@ impl Snapclone {
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
+        // THE VIDEO VIEWER. Fifth modal, and the contract is the OPPOSITE of
+        // the snap viewer beside it: a video snap is PERSISTENT. snaps.rs wipes
+        // an image's bytes on close; this deliberately does not, and the
+        // module is blunt about why the two must not be confused — "the wrong
+        // one would either destroy a video the user was allowed to keep or keep
+        // an image they were promised would vanish".
+        //
+        // So there is no countdown here, and its absence is a statement.
+        if self.video.is_some() {
+            let r = self.modal.topmost(crate::modal::Layer::Dialog)
+                .filter(|p| p.id.starts_with("video:"))
+                .map(|p| p.rect.clone());
+            if let Some(r) = r {
+                let area = egui::Rect::from_min_size(
+                    egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+                ui.painter().rect_filled(area, 8.0, colors.bg_base);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+                let ev = self.video.as_mut().and_then(|v|
+                    crate::video_viewer::video_viewer_ui(&mut child, v, "~/Videos", &colors));
+                if child.button("close").clicked() {
+                    // close() carries no wipe, by design — the snap outlives
+                    // the viewer. Clearing the state here is all that closing
+                    // means for a persistent video.
+                    self.video = None;
+                    self.modal.dismiss_topmost();
+                }
+                if let Some(crate::video_viewer::VideoEvent::Closed) = ev {
+                    self.video = None;
+                    self.modal.dismiss_topmost();
+                }
+            }
+        }
+
         // THE SNAP VIEWER. Fourth modal to get a body — and the one whose
         // absence actually destroyed data: close_snap's own note says "the
         // countdown is NOT stopped", so an undrawn snap expired on schedule.
@@ -2841,7 +2875,7 @@ mod modal_render_tests {
         // Listing them keeps the test GREEN and the debt VISIBLE: a new modal
         // is a failure, and clearing one of these is deleting a line from here.
         // Removing the check instead would lose both properties.
-        let known_undrawn = ["video:", "editor:"];
+        let known_undrawn = ["editor:"];
         let mut undrawn = Vec::new();
         for id in presented {
             // A renderer is a `topmost(...)` filtered on the id. Anything else
