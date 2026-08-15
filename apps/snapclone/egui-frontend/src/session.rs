@@ -309,6 +309,24 @@ impl Outbox {
     pub fn is_empty(&self) -> bool { self.rows.is_empty() }
 
     /// A new send goes on top — `insertWidget(0, card)`.
+    /// Rows that are waiting on something external rather than progressing.
+    ///
+    /// `Offline` and `Failed` are the two the app can act on: the first resumes
+    /// by itself when the network returns, the second needs a retry. Counting
+    /// them is what lets a caller say "3 waiting" instead of leaving a send
+    /// looking stuck with no explanation.
+    ///
+    /// A COUNT, not a retry sweep. My first version called `row.retry()` — that
+    /// method belongs to `send_state::SendRow`, a DIFFERENT type with the same
+    /// name, and session's row carries a transfer `Phase` instead. Reaching
+    /// for a method because the type name matched is the mistake the compiler
+    /// caught here.
+    pub fn stalled(&self) -> usize {
+        self.rows.iter()
+            .filter(|r| matches!(r.phase, Phase::Offline | Phase::Failed))
+            .count()
+    }
+
     pub fn add(&mut self, id: &str, recipient: &str, sent_at: i64) {
         self.rows.insert(0, SendRow {
             id: id.into(), recipient: recipient.into(), sent_at,

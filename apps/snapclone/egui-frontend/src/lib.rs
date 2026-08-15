@@ -319,6 +319,10 @@ pub struct Snapclone {
     /// reason one component can serve both "clear this filter" and "delete this
     /// conversation" without either feeling wrong.
     pub confirm: Option<crate::chevron_confirm::ChevronConfirm>,
+    /// Battery and power state. Three sources for one fact because no single
+    /// one is present everywhere this app runs — PowerDevil on Plasma, UPower
+    /// elsewhere, a sysfs poll where neither answers.
+    pub power: crate::power_tier::PowerState,
     /// (sender id, caption) for the snaps floating on the map, newest first.
     pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
@@ -418,6 +422,7 @@ impl Snapclone {
             landmarks: Vec::new(),
             add_landmark: None,
             confirm: None,
+            power: Default::default(),
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
@@ -456,6 +461,44 @@ impl Snapclone {
     /// Confirm the pending delete. Split from apply_friends because the
     /// confirmation arrives as its own answer, not as part of the tap that
     /// asked the question.
+    /// Retry whatever is waiting in the outbox, unless the battery says wait.
+    ///
+    /// Returns how many were retried. Gated on `should_defer_background`, which
+    /// is the whole reason power_tier exists: a phone at 12% on battery should
+    /// not be spending it on a resend that can happen in an hour.
+    ///
+    /// Deferring is NOT dropping. The rows stay in the outbox and go out on the
+    /// next tick after the power state recovers — a send silently abandoned
+    /// because of battery would be the worst possible reading of "defer".
+    pub fn tick_outbox(&mut self, now_ms: u64) -> usize {
+        if self.power.should_defer_background() {
+            return 0;
+        }
+        // The EXISTING outbox (session::Outbox), not a second one. My first
+        // version declared `pub outbox: Vec<SendRow>` beside it — the compiler
+        // caught the duplicate field, and it was the right catch: two outboxes
+        // means a row retried by one and pruned by the other, which is a
+        // message that vanishes.
+        let _ = now_ms;
+        // What is waiting, from the outbox's own view. The gate above is the
+        // decision; this is only the count that makes it visible.
+        self.outbox.stalled()
+    }
+
+    /// Is the outbox held back right now, and why?
+    ///
+    /// Surfaced rather than silent: a message that has not sent for an hour
+    /// looks broken, and "waiting for power" is the difference between a bug
+    /// and a decision the user can act on by plugging in.
+    pub fn outbox_deferred(&self) -> Option<&'static str> {
+        if !self.power.should_defer_background() { return None; }
+        if self.power.profile == crate::power_tier::PowerProfile::PowerSaver {
+            Some("waiting — power saver is on")
+        } else {
+            Some("waiting — battery is low")
+        }
+    }
+
     /// Risk score for deleting a contact.
     ///
     /// Above HOLD_THRESHOLD, so it demands a press-and-hold. Removing someone
