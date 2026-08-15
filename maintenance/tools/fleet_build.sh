@@ -26,6 +26,14 @@
 # code a user runs.
 set -uo pipefail
 
+# For a SINGLE app, use dev.sh rather than copying an invocation from here:
+#
+#   maintenance/tools/dev.sh check <app>    headless, no system libs
+#   maintenance/tools/dev.sh run   <app>    release + audio, what a person wants
+#
+# It carries the --no-default-features rule this script does not, which is why
+# `cargo check` on blackstar-rs failed on alsa-sys for a whole session.
+
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 FILTER="${1:-}"
 # Full logs for failures, so a 137-error build can be read without running it
