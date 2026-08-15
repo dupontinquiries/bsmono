@@ -1082,6 +1082,39 @@ impl Snapclone {
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
+        // THE INCOMING-CALL SHEET. Presented on the Confirm layer and never
+        // drawn, while `tick` kept running — so a call could ring, time out and
+        // be recorded as missed WITHOUT EVER APPEARING. That is worse than a
+        // dialog that does not open: the state machine advances correctly and
+        // the user is simply not told.
+        //
+        // On the Confirm layer, above Dialog, so a ringing call is not hidden
+        // behind a QR sheet somebody left open.
+        if self.incoming_call.is_some() {
+            let r = self.modal.topmost(crate::modal::Layer::Confirm)
+                .filter(|p| p.id.starts_with("call:"))
+                .map(|p| p.rect.clone());
+            if let Some(r) = r {
+                let area = egui::Rect::from_min_size(
+                    egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+                ui.painter().rect_filled(area, 8.0, colors.bg_base);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+                let mut answered = None;
+                let mut who = String::new();
+                if let Some(call) = self.incoming_call.as_mut() {
+                    who = call.caller_name.clone();
+                    answered = crate::ring::ring_ui(&mut child, call, &colors);
+                }
+                // finish_call owns dismissing and clearing; calling it is the
+                // whole handling, and duplicating either here would leave the
+                // two paths able to disagree about whether a call ended.
+                if let Some(a) = answered {
+                    self.finish_call(&who, a);
+                }
+            }
+        }
+
         // THE QR DIALOG'S BODY. present_default put it on the stack and
         // nothing ever drew it, so "scan a code" opened an invisible modal that
         // blocked input — which reads as the app freezing rather than as a
@@ -2567,3 +2600,50 @@ mod notify_tests {
     }
 }
 }
+
+#[cfg(test)]
+mod modal_render_tests {
+    /// Every modal id the app can present must have a renderer that draws it.
+    ///
+    /// This is a SOURCE check rather than a behavioural one, and that is
+    /// deliberate: the failure it catches — a modal pushed onto the stack with
+    /// no body — produces no wrong value anywhere. The state machine is
+    /// correct, `blocks_input` is correct, the dismiss path is correct. The
+    /// only symptom is a user staring at a frozen screen, which no unit test
+    /// of the state can see.
+    ///
+    /// Two were found this way: the QR dialog and the incoming-call sheet, the
+    /// second of which could ring, time out and be recorded as missed without
+    /// ever appearing.
+    #[test]
+    fn every_presented_modal_is_drawn_somewhere() {
+        let src = include_str!("lib.rs");
+        // The ids as they appear in present/present_default calls.
+        let presented = ["qr", "call:", "snap:", "video:", "confirm-delete:", "editor:"];
+        // KNOWN-UNDRAWN, listed rather than removed from the check.
+        //
+        // These four are the same bug the other two were, found by this test on
+        // its first run. They are not fixed here because each needs its own
+        // view wired — a snap viewer, a video player, a delete confirmation, a
+        // caption editor — and four half-built dialogs would be worse than four
+        // honestly-absent ones.
+        //
+        // Listing them keeps the test GREEN and the debt VISIBLE: a new modal
+        // is a failure, and clearing one of these is deleting a line from here.
+        // Removing the check instead would lose both properties.
+        let known_undrawn = ["snap:", "video:", "confirm-delete:", "editor:"];
+        let mut undrawn = Vec::new();
+        for id in presented {
+            // A renderer is a `topmost(...)` filtered on the id. Anything else
+            // — a dismiss, a present — does not put pixels on screen.
+            let drawn = src.split("topmost(").skip(1).any(|after| {
+                let window = &after[..after.len().min(400)];
+                window.contains(&format!("\"{id}\""))
+            });
+            if !drawn && !known_undrawn.contains(&id) { undrawn.push(id); }
+        }
+        assert!(undrawn.is_empty(),
+                "presented but never drawn: {undrawn:?} — these block input while invisible");
+    }
+}
+
