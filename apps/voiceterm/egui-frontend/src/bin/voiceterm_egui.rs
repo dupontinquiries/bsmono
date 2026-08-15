@@ -253,6 +253,11 @@ struct VoicetermApp {
     /// where naive implementations go quietly wrong and date_phrase already
     /// got it right.
     date_phrase: String,
+    /// Which summary paths may run. ONE value with two consumers, not two
+    /// booleans: the original is explicit that a third state — terminal on,
+    /// web on, but "summaries off" somewhere else — is the bug this shape
+    /// prevents.
+    summary_scope: voiceterm_egui::summary_scope::Scope,
     /// Bytes destined for a PTY: the encoded control keys plus any submitted
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
@@ -384,6 +389,19 @@ impl eframe::App for VoicetermApp {
                     }
                 }
             });
+            // The scope control. A segmented row rather than two checkboxes,
+            // because two checkboxes can express a state this deliberately
+            // cannot — and the pair would drift the first time one was saved
+            // and the other was not.
+            ui.horizontal(|ui| {
+                ui.label("summaries:");
+                for sc in voiceterm_egui::summary_scope::Scope::ALL {
+                    if ui.selectable_label(self.summary_scope == sc, sc.label()).clicked() {
+                        self.summary_scope = sc;
+                    }
+                }
+            });
+
             // The date question, beside the terminal it answers into. A voice
             // terminal is exactly where "how long until christmas" gets asked,
             // and the answer is a line of text — the same shape as any other
@@ -469,7 +487,13 @@ impl eframe::App for VoicetermApp {
                                 // comes out of the keyboard: a progress bar is
                                 // OUTPUT, and watching the input side would
                                 // never see one.
-                                self.progress.observe(&echoed);
+                                // Gated: with summaries off, the detector does
+                                // not run at all rather than running and being
+                                // ignored. On a phone that is the difference
+                                // between a setting and a lie.
+                                if self.summary_scope.terminal_enabled() {
+                                    self.progress.observe(&echoed);
+                                }
                                 // RISK BEFORE RUNNING, not after. cmd_risk
                                 // decides whether snapshot_policy's capture
                                 // should run, and the asymmetry is the design:
@@ -679,6 +703,17 @@ impl eframe::App for VoicetermApp {
                                 status: voiceterm_egui::explore::PageStatus::Visited,
                             })
                             .collect();
+                        // The page path is gated on the SAME value, and says so
+                        // when it is off. The sitemap itself is navigation
+                        // rather than summarisation, so it stays — what the
+                        // scope withholds is the derived text, and hiding the
+                        // navigation too would look like a broken tab rather
+                        // than an honoured setting.
+                        if !self.summary_scope.web_enabled() {
+                            ui.label(egui::RichText::new(
+                                "page summaries are off for this scope")
+                                .weak().small());
+                        }
                         let groups = voiceterm_egui::explore::group_rows(&pages);
                         if let Some(path) = voiceterm_egui::explore::sitemap_ui(ui, &groups, &c) {
                             self.browser.load(&path);
@@ -1163,6 +1198,10 @@ fn main() -> eframe::Result<()> {
                 // the flag precisely because it cannot be inferred from here.
                 mail_phrase: String::new(),
                 date_phrase: String::new(),
+                // Terminal-only by default: summarising what you typed is
+                // local, summarising a page means reading it. Full is a choice
+                // the user makes, not one they inherit.
+                summary_scope: voiceterm_egui::summary_scope::Scope::Terminal,
                 table: voiceterm_egui::table_view::TableView::new(true),
                 docs: {
                     let mut v = voiceterm_egui::manpage_view::ManpageView::default();

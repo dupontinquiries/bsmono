@@ -15,6 +15,15 @@
 # Checks the LIB, the BINS and the TESTS separately, because they fail
 # independently — av1tuner's library was fine while its tests were not, so a
 # plain `cargo build` would have reported it healthy.
+#
+# `--all-targets` is doing that, and it is the line worth defending. A change
+# that only touches a lib module still needs it: voiceterm's binary built a
+# struct with four of its six fields, `cargo test --lib` passed because the
+# binary is not a lib target, and the error sat in main for a full session.
+#
+# So when working on one crate, `cargo check --all-targets` is the equivalent of
+# this script for that crate. `--lib` alone is the check that misses exactly the
+# code a user runs.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
