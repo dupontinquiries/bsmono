@@ -60,6 +60,51 @@ at the fold, which is exactly the case a static-model test would miss.
 978 MB now. The bundle should come back under 300 MB — the 500 MB figure is
 about right if the gltf is packed too.
 
+## Can the engine rebuild the intermediates from the vehicle pose?
+
+Asked directly, and the answer is **no, not as the engine stands** — but the
+prize is big enough to say exactly why, because the shape of the "no" is what a
+future fix has to attack.
+
+**What the engine actually does.** `Morph::sample` reads `self.poses[k]` and
+`self.poses[k+1]` and lerps between them. It interpolates BETWEEN STORED POSES;
+it does not synthesise them. And `compact.rs` — the new displacement field — is
+explicit that it is "layered over the existing lerp, not a replacement for it",
+with a curve that is "0 at both ends of the fold". It reshapes the middle. It
+does not create the middle.
+
+**Measured, not inferred.** If the intermediates were derivable by lerping the
+two endpoints, they would sit close to that line. They do not:
+
+```
+quickfire  f01 t=0.25   deviation from endpoint-lerp: 53.9% of span
+           f02 t=0.50                                 61.1%
+           f03 t=0.75                                 45.1%
+vanquish   f01 t=0.25                                 49.0%
+           f02 t=0.50                                 63.3%
+           f03 t=0.75                                 46.7%
+```
+
+A vertex halfway through the fold is over half the model's own extent away from
+where a straight line between vehicle and robot would put it. That is exactly
+what a fold IS — panels rotate about hinges, and a rotation is not a straight
+line. Discarding the intermediates would replace every fold with the slide that
+`compact.rs`'s header calls "exactly the trick this project set out not to do".
+
+**What it would save**: 785 MB of poses down to 314 MB, so 471 MB. Worth
+wanting.
+
+**What would have to exist first.** The intermediates encode per-part rotations.
+Reconstructing them needs the hinge structure — which axis each prim turns
+about, and through what angle — and that is what `joints.json` in each chassis
+directory is for. An engine that read joints and rotated prims could store two
+poses and generate the rest. That is a real feature with a clear input, and it
+is not what `Morph` does today: `Morph` knows vertices, not joints.
+
+So the honest sequence is: quantise now for ~205 MB with no behaviour change,
+and treat joint-driven synthesis as its own piece of work with `joints.json` as
+its input and these deviation numbers as its acceptance test.
+
 ## Not done here
 
 The packer itself. This document is the measurement and the constraint it found;
