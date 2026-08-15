@@ -120,6 +120,12 @@ pub struct Snapclone {
     pub cameras: Vec<crate::camera_select::Device>,
     /// Which one is showing, and whether to mirror it.
     pub cam_selection: Option<crate::camera_select::Selection>,
+    /// The shutter's gesture state — tap/hold/lock/mode-picker.
+    pub shutter: crate::shutter::ShutterButton,
+    /// What the shutter last did, shown under it. Plain state rather than a
+    /// toast system: this app has none, and adding one to report a duration
+    /// would be the tail wagging the dog.
+    pub shutter_note: String,
     /// Latest-frame-wins slot between the capture thread and the paint.
     pub frames: crate::frame_pump::FrameSlot,
     /// The uploaded texture, kept across frames so an unchanged frame is not
@@ -314,6 +320,8 @@ impl Snapclone {
             camera: None,
             cameras: Vec::new(),
             cam_selection: None,
+            shutter: Default::default(),
+            shutter_note: String::new(),
             frames: Default::default(),
             cam_texture: None,
             last_frame_ms: None,
@@ -1104,8 +1112,56 @@ impl Snapclone {
             if crate::glass::glass_button_ui(ui, &mut self.glass_flip, "⟲", 44.0, c) {
                 self.viewfinder.flip();
             }
-            if crate::glass::glass_button_ui(ui, &mut self.glass_shutter, "◉", 56.0, c) {
-                self.shutter_pressed = true;
+            // THE REAL SHUTTER, not a button that sets a bool. One control,
+            // four gestures: tap for a photo, hold to record, swipe up to lock
+            // recording hands-free, swipe down for the mode picker. A plain
+            // button can express exactly one of those.
+            //
+            // shutter_ui senses DRAG rather than click, because `clicked()`
+            // fires on any release however long the press lasted — which is the
+            // trap that makes hold-to-record indistinguishable from tap.
+            let resp = crate::shutter::shutter_ui(ui, &self.shutter, 56.0, c);
+            let ev = if resp.drag_started() {
+                resp.interact_pointer_pos().and_then(|p| self.shutter.press(p.x, p.y))
+            } else if resp.dragged() {
+                resp.interact_pointer_pos().and_then(|p| self.shutter.moved(p.x, p.y))
+            } else if resp.drag_stopped() {
+                resp.interact_pointer_pos().and_then(|p| self.shutter.release(p.x, p.y))
+            } else {
+                // The hold threshold is a TIMER, so it must be ticked on frames
+                // where the finger has not moved — otherwise a perfectly still
+                // press never becomes a recording.
+                self.shutter.tick(ui.input(|i| i.stable_dt) * 1000.0)
+            };
+            match ev {
+                Some(crate::shutter::Shutter::Photo) => self.shutter_pressed = true,
+                Some(crate::shutter::Shutter::RecordStopped { duration_ms }) => {
+                    // Report the DURATION: a recording that stopped without
+                    // saying how long it was leaves the user unsure whether it
+                    // captured anything at all.
+                    self.shutter_note = format!("recorded {:.1}s",
+                                                duration_ms as f32 / 1000.0);
+                }
+                Some(crate::shutter::Shutter::OpenModePicker) => {
+                    // The voice/text picker does not exist yet, so this RECORDS
+                    // the request rather than calling a method I would have to
+                    // invent. A swipe that silently does nothing is worse than
+                    // one that says the destination is not built — the user
+                    // repeats the gesture harder, assuming they missed.
+                    self.shutter_note = "mode picker not implemented yet".into();
+                }
+                // RecordStarted and RecordLocked are reflected by the button
+                // itself — it turns red and shows the lock — so re-announcing
+                // them in a toast would be noise over the thing already saying it.
+                _ => {}
+            }
+            if !self.shutter_note.is_empty() && !self.shutter.recording() {
+                ui.colored_label(c.text_weak, &self.shutter_note);
+            }
+            if self.shutter.recording() {
+                ui.colored_label(c.warning, format!("● {:.1}s{}",
+                    self.shutter.record_ms() as f32 / 1000.0,
+                    if self.shutter.locked() { " locked" } else { "" }));
             }
             if ui.selectable_label(self.viewfinder.full_bleed, "fill").clicked() {
                 self.viewfinder.full_bleed = !self.viewfinder.full_bleed;
