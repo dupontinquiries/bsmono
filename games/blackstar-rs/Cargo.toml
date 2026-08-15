@@ -19,6 +19,11 @@ gamepad = ["dep:gilrs"]
 analog = ["dep:libloading"]
 
 [dependencies]
+# Inflate for bots.pack (see src/botpack.rs). Already in Cargo.lock via flate2's
+# tree, so declaring it directly costs no new download — and miniz_oxide rather
+# than flate2 because this only ever DECOMPRESSES, and flate2 pulls a C zlib
+# backend by default.
+miniz_oxide = "0.8"
 # Same proven combo as the reference repo's games (clawbound/soldier): wgpu 22 + winit 0.29.
 wgpu = "22"
 winit = "0.29"

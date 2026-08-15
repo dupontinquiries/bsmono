@@ -1980,6 +1980,7 @@ dependencies = [
  "image",
  "libloading",
  "log",
+ "miniz_oxide",
  "naga",
  "netcode",
  "pollster",

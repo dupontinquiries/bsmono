@@ -7,6 +7,7 @@ mod airlock;
 mod analog;
 mod ballistics;
 mod bigbody;
+mod botpack;
 mod bots;
 mod roster;
 mod sections;

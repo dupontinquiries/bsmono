@@ -580,7 +580,19 @@ pub fn load_raw_unoriented(dir: &Path) -> Vec<RawPrim> {
                 _ => None,
             })
             .unwrap_or_else(|| "scene.bin".into());
-        let bytes = std::fs::read(dir.join(&buffer_uri)).expect("read scene.bin");
+        // scene.bin, or the quantised pack that replaced it.
+        //
+        // tools/pack_bots.py folds a whole fold strip into one bots.pack in the
+        // CHASSIS directory — one quantisation box across every pose, because a
+        // per-pose box would make the same world position decode differently in
+        // different poses and warp the fold. Decoding here rather than at a
+        // higher level means everything downstream sees the float32 buffer it
+        // always saw.
+        let bytes = match std::fs::read(dir.join(&buffer_uri)) {
+            Ok(b) => b,
+            Err(_) => crate::botpack::pose_buffer(dir)
+                .unwrap_or_else(|| panic!("no scene.bin and no bots.pack for {dir:?}")),
+        };
         (d, bytes)
     };
     let mut raws: Vec<RawPrim> = Vec::new();
@@ -630,7 +642,19 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
                 _ => None,
             })
             .unwrap_or_else(|| "scene.bin".into());
-        let bytes = std::fs::read(dir.join(&buffer_uri)).expect("read scene.bin");
+        // scene.bin, or the quantised pack that replaced it.
+        //
+        // tools/pack_bots.py folds a whole fold strip into one bots.pack in the
+        // CHASSIS directory — one quantisation box across every pose, because a
+        // per-pose box would make the same world position decode differently in
+        // different poses and warp the fold. Decoding here rather than at a
+        // higher level means everything downstream sees the float32 buffer it
+        // always saw.
+        let bytes = match std::fs::read(dir.join(&buffer_uri)) {
+            Ok(b) => b,
+            Err(_) => crate::botpack::pose_buffer(dir)
+                .unwrap_or_else(|| panic!("no scene.bin and no bots.pack for {dir:?}")),
+        };
         (d, bytes)
     };
 
