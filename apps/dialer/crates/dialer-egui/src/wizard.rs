@@ -470,9 +470,18 @@ mod tests {
     #[test]
     fn phases_walk_forward_back_and_finish_jumps_to_done() {
         assert_eq!(next_phase(Phase::Carrier, Step::Next), Phase::Matrix);
-        assert_eq!(next_phase(Phase::Matrix, Step::Next), Phase::Done);
+        // Matrix -> Commands -> Done. A Commands phase was inserted between
+        // them by the iOS-model commit; this test still asserted the older
+        // two-step chain and failed on the merge.
+        //
+        // Updated rather than relaxed: walking the WHOLE chain in both
+        // directions is what makes an inserted phase fail here, and that is
+        // exactly the failure that just did its job.
+        assert_eq!(next_phase(Phase::Matrix, Step::Next), Phase::Commands);
+        assert_eq!(next_phase(Phase::Commands, Step::Next), Phase::Done);
         assert_eq!(next_phase(Phase::Matrix, Step::Back), Phase::Carrier);
-        assert_eq!(next_phase(Phase::Done, Step::Back), Phase::Matrix);
+        assert_eq!(next_phase(Phase::Commands, Step::Back), Phase::Matrix);
+        assert_eq!(next_phase(Phase::Done, Step::Back), Phase::Commands);
         assert_eq!(next_phase(Phase::Carrier, Step::Finish), Phase::Done);
         // no-ops keep their phase
         assert_eq!(next_phase(Phase::Carrier, Step::Back), Phase::Carrier);

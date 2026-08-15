@@ -792,7 +792,18 @@ This executes on your device."),
                     self.run_confirm = None;
                     self.spawn_command(&cmd, now);
                 }
+                // Cancelled AND Discarded both refuse the command. This
+                // fleet's confirm_dialog has a Discarded variant the sibling's
+                // did not — a timeout-driven dismissal rather than a deliberate
+                // no. They are different reasons and the same answer, and for a
+                // guard on running a command from a remote handoff, the safe
+                // reading of "the dialog went away on its own" is DO NOT RUN.
+                //
+                // Left as separate arms rather than a wildcard: a future
+                // variant should fail this match and be decided, not silently
+                // inherit whatever the last arm does.
                 ConfirmOutcome::Cancelled => self.run_confirm = None,
+                ConfirmOutcome::Discarded => self.run_confirm = None,
                 ConfirmOutcome::Pending => {}
             }
         }
@@ -812,6 +823,12 @@ This executes on your device."),
 
 #[cfg(feature = "app")]
 impl eframe::App for Shell {
+    // This fleet's eframe requires `ui` alongside `update`; the app is driven
+    // from update() below, exactly as every other egui frontend here does it.
+    // The sibling that wrote this crate was building against a version without
+    // it, which is why the trait was satisfied there and not here.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame(ctx);
     }

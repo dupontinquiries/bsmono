@@ -11,6 +11,9 @@ path = "src/bin/dialer_egui.rs"
 required-features = ["app"]
 
 [dependencies]
+# Used by the handoff protocol encoder in lib.rs. Present in dialer-core and
+# missing here, which only surfaced when this crate was built on its own.
+serde_json = "1"
 egui = "0.34"
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 # for apply_palette's &Palette argument — uikit-egui consumes but does not re-export it

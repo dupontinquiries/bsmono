@@ -149,7 +149,14 @@ fn find_voice_modem(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> 
         .filter(|(_, ifaces)| ifaces.contains_key(VOICE_IFACE))
         .map(|(p, _)| p)
         .collect();
-    paths.sort(); // deterministic pick when multiple modems exist
+    // Sorted by the path STRING: zbus's OwnedObjectPath has no Ord, so
+    // `paths.sort()` does not compile — it only derefs to the path text. The
+    // intent is unchanged and worth keeping: with two modems (a phone with a
+    // second SIM, or a USB stick alongside the built-in) an unsorted pick is
+    // whichever D-Bus enumerated first, which can differ between boots. A
+    // dialer that calls out through a different SIM on Tuesday is a billing
+    // surprise, not a cosmetic one.
+    paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     Ok(paths.into_iter().next())
 }
 
