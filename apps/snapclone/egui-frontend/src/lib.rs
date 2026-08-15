@@ -328,6 +328,14 @@ pub struct Snapclone {
     /// The name being typed. Seeded from the current one so the dialog opens
     /// showing what it is about to change rather than a blank box.
     pub editor_name: String,
+    /// Peers heard from over gossip. The app's `peers` list is what the USER
+    /// has; this is what the NETWORK reports, and they are different questions:
+    /// a contact you added stays in your list when they go offline, while a
+    /// device that stopped gossiping is simply gone.
+    pub view: crate::gossip::PeerView,
+    /// When the view was last pruned, so pruning runs on its own schedule
+    /// rather than once per frame.
+    last_prune_ms: u64,
     /// Battery and power state. Three sources for one fact because no single
     /// one is present everywhere this app runs — PowerDevil on Plasma, UPower
     /// elsewhere, a sysfs poll where neither answers.
@@ -456,6 +464,8 @@ impl Snapclone {
             confirm_id: String::new(),
             editor_id: String::new(),
             editor_name: String::new(),
+            view: Default::default(),
+            last_prune_ms: 0,
             power: Default::default(),
             // The five surfaces this app actually has. Built here rather than
             // in TabBar::default() because the bar is generic over its tabs —
@@ -537,6 +547,50 @@ impl Snapclone {
     /// them, the page shows someone as online who left an hour ago.
     pub fn sync_roster(&mut self) {
         self.roster.set(self.peers.iter().map(Snapclone::friend_of).collect());
+    }
+
+    /// A gossip record arrived. Returns whether it was accepted.
+    ///
+    /// Every datagram goes through `gossip::accept` first — it refuses
+    /// unsigned records, our own multicast echo, and anything oversized. That
+    /// check is the whole security boundary for discovery: gossip arrives from
+    /// ANYONE on the subnet, so a record that skips it can claim to be any
+    /// peer.
+    pub fn on_gossip(&mut self, rec: crate::gossip::PeerRecord, datagram_len: usize) -> bool {
+        if crate::gossip::accept(&rec, datagram_len, &self.local_id).is_err() {
+            return false;
+        }
+        // A discovered device becomes a peer row only if the user does not
+        // already have one. Discovery ADDS reachability information; it does
+        // not get to rename or replace a contact the user chose to keep.
+        let id = rec.id.clone();
+        self.view.observe(rec);
+        if !self.peers.iter().any(|p| p.name == id) {
+            self.peers.push(Peer { name: id, online: true });
+            self.sync_roster();
+        }
+        true
+    }
+
+    /// Age out peers nobody has heard from, on the gossip prune schedule.
+    ///
+    /// Called every frame, acting every PRUNE_MS: a view pruned per frame would
+    /// walk the peer list sixty times a second to do nothing, and one pruned
+    /// only on a timer tick needs a timer.
+    pub fn tick_gossip(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_prune_ms) < crate::gossip::PRUNE_MS {
+            return;
+        }
+        self.last_prune_ms = now_ms;
+        for lost in self.view.prune(now_ms) {
+            // Marked offline, NOT removed. A device that stopped gossiping may
+            // be asleep, and deleting the row would lose a contact the user
+            // added deliberately — the two lists answer different questions.
+            if let Some(p) = self.peers.iter_mut().find(|p| p.name == lost) {
+                p.online = false;
+            }
+        }
+        self.sync_roster();
     }
 
     /// Confirm the pending delete. Split from apply_friends because the
@@ -1374,6 +1428,9 @@ impl Snapclone {
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
+        // Discovery ages on its own schedule. Driven from the frame because
+        // this app has no timer thread — the guard inside makes that cheap.
+        self.tick_gossip((ui.input(|i| i.time) * 1000.0) as u64);
         // THE CONTACT EDITOR. Last of the six modals to get a body.
         //
         // It renames only. The Peer this app holds carries a name and an online
@@ -3257,6 +3314,77 @@ mod badge_tests {
         app.sync_badges();
         let shown = app.tabs.tabs()[super::Snapclone::CHATS_TAB].badge;
         assert_eq!(shown as usize, app.inbox.unread_count());
+    }
+}
+
+#[cfg(test)]
+mod gossip_wiring_tests {
+    use super::*;
+
+    fn rec(id: &str, seen: u64) -> crate::gossip::PeerRecord {
+        crate::gossip::PeerRecord {
+            id: id.into(), host: "192.168.1.9".into(), port: 9876,
+            last_seen_ms: seen, verified: true,
+        }
+    }
+
+    #[test]
+    fn an_unsigned_record_never_becomes_a_peer() {
+        // Gossip arrives from anyone on the subnet. A record that skips
+        // `accept` can claim to be any peer, so this is the security boundary
+        // for discovery rather than a validation nicety.
+        let mut s = Snapclone::new(vec![]);
+        let mut r = rec("sc-a", 0);
+        r.verified = false;
+        assert!(!s.on_gossip(r, 100));
+        assert!(s.peers.is_empty());
+    }
+
+    #[test]
+    fn our_own_echo_does_not_add_us_to_our_own_roster() {
+        let mut s = Snapclone::new(vec![]);
+        s.local_id = "sc-me".into();
+        assert!(!s.on_gossip(rec("sc-me", 0), 100));
+        assert!(s.peers.is_empty());
+    }
+
+    #[test]
+    fn a_discovered_device_becomes_a_peer() {
+        let mut s = Snapclone::new(vec![]);
+        assert!(s.on_gossip(rec("sc-a", 0), 100));
+        assert_eq!(s.peers.len(), 1);
+        assert!(s.peers[0].online);
+    }
+
+    #[test]
+    fn discovery_does_not_duplicate_a_contact_the_user_already_has() {
+        // Discovery ADDS reachability; it does not get to add a second row for
+        // somebody already in the list.
+        let mut s = Snapclone::new(vec![Peer { name: "sc-a".into(), online: false }]);
+        s.on_gossip(rec("sc-a", 0), 100);
+        assert_eq!(s.peers.len(), 1);
+    }
+
+    #[test]
+    fn a_silent_peer_goes_offline_rather_than_disappearing() {
+        // The two lists answer different questions: a device that stopped
+        // gossiping may be asleep, and deleting the row would lose a contact
+        // the user added deliberately.
+        let mut s = Snapclone::new(vec![]);
+        s.on_gossip(rec("sc-a", 0), 100);
+        s.tick_gossip(crate::gossip::FAILURE_MS + crate::gossip::PRUNE_MS);
+        assert_eq!(s.peers.len(), 1, "the contact was deleted, not just marked");
+        assert!(!s.peers[0].online);
+    }
+
+    #[test]
+    fn pruning_runs_on_its_schedule_not_every_frame() {
+        // Per-frame pruning walks the peer list sixty times a second to do
+        // nothing.
+        let mut s = Snapclone::new(vec![]);
+        s.on_gossip(rec("sc-a", 0), 100);
+        s.tick_gossip(crate::gossip::PRUNE_MS - 1);
+        assert!(s.peers[0].online, "pruned before the interval elapsed");
     }
 }
 
