@@ -310,6 +310,12 @@ pub struct OctreeBufferPool {
     /// already there. With it, post-first-batch dispatches do zero
     /// uploads for unchanged chunks.
     content_versions: HashMap<ChunkCoord, u64>,
+    /// r-t1-pool-pin: spans currently readable by an in-flight GPU
+    /// dispatch. Frees (evict / upload-replace) of pinned spans are
+    /// deferred and executed at [`Self::unpin_spans`]. Lets the mesher
+    /// release this pool's mutex for the duration of its fence wait —
+    /// the T1 hitch fix (docs/device_logs/TRIAGE_r462.md).
+    pins: crate::render::octree_pin::PinLedger<OctreeSlot>,
 }
 
 // SAFETY: `map_ptr` is a raw pointer into device memory we own; all
@@ -355,6 +361,7 @@ impl OctreeBufferPool {
             capacity,
             slots_by_chunk: HashMap::new(),
             content_versions: HashMap::new(),
+            pins: crate::render::octree_pin::PinLedger::new(),
         })
     }
 
@@ -458,12 +465,21 @@ impl OctreeBufferPool {
         // single-shot and finished before this is called.
         let old_slot = self.slots_by_chunk.insert(coord, new_slot);
         if let Some(old) = old_slot {
-            // free errors are ignorable here: the worst case is a
-            // leaked span which the allocator will surface as
-            // exhaustion much later. We log so the leak isn't silent.
-            if let Err(e) = self.cpu.free(old) {
-                log::warn!("octree pool: free of replaced slot for {:?} failed: {} \
-                            (continuing; slot is leaked)", coord, e);
+            // r-t1-pool-pin: if the old span is pinned by an in-flight
+            // dispatch, defer its free to unpin. The GPU keeps reading a
+            // consistent (older) snapshot from the old span; the new span
+            // is a fresh allocation so there's no aliasing. This is the
+            // same result as the pre-pin behavior, where the uploader
+            // would have blocked on the pool mutex until the batch ended
+            // and then replaced.
+            if let Some(old) = self.pins.request_free(old.byte_offset, old) {
+                // free errors are ignorable here: the worst case is a
+                // leaked span which the allocator will surface as
+                // exhaustion much later. We log so the leak isn't silent.
+                if let Err(e) = self.cpu.free(old) {
+                    log::warn!("octree pool: free of replaced slot for {:?} failed: {} \
+                                (continuing; slot is leaked)", coord, e);
+                }
             }
         }
         Ok(new_slot)
@@ -473,13 +489,45 @@ impl OctreeBufferPool {
     /// `evict_chunk` path. No-op if the chunk isn't tracked.
     pub fn evict(&mut self, coord: ChunkCoord) {
         if let Some(slot) = self.slots_by_chunk.remove(&coord) {
-            if let Err(e) = self.cpu.free(slot) {
-                log::warn!("octree pool: evict for {:?} failed: {} (slot leaked)", coord, e);
+            // r-t1-pool-pin: pinned span → the table entry goes away now
+            // (the chunk is logically evicted) but the bytes stay valid
+            // for the in-flight dispatch; the actual free runs at unpin.
+            if let Some(slot) = self.pins.request_free(slot.byte_offset, slot) {
+                if let Err(e) = self.cpu.free(slot) {
+                    log::warn!("octree pool: evict for {:?} failed: {} (slot leaked)", coord, e);
+                }
             }
         }
         // v0.24.31-version-tracked: drop the content version too so a
         // future re-upload doesn't get short-circuited against stale.
         self.content_versions.remove(&coord);
+    }
+
+    /// r-t1-pool-pin: mark `slot`'s span as read by an in-flight GPU
+    /// dispatch. While pinned, the span is never freed or reallocated —
+    /// evicts and upload-replacements of it are deferred. Reentrant
+    /// (refcounted); every pin needs a matching offset in a later
+    /// [`Self::unpin_spans`] call.
+    pub fn pin_slot(&mut self, slot: OctreeSlot) {
+        self.pins.pin(slot.byte_offset);
+    }
+
+    /// r-t1-pool-pin: release a batch of pins (by span byte offset) and
+    /// execute every deferred free that became unblocked. Called by the
+    /// mesher after its fence signals, under a brief pool lock.
+    pub fn unpin_spans(&mut self, offsets: &[u64]) {
+        for slot in self.pins.unpin_many(offsets) {
+            if let Err(e) = self.cpu.free(slot) {
+                log::warn!("octree pool: deferred free at offset {} failed: {} (slot leaked)",
+                    slot.byte_offset, e);
+            }
+        }
+    }
+
+    /// r-t1-pool-pin telemetry: (pinned span count, deferred free count).
+    /// `deferred > 0` while no dispatch is in flight means a leaked pin.
+    pub fn pin_stats(&self) -> (usize, usize) {
+        (self.pins.pinned_count(), self.pins.deferred_count())
     }
 
     /// v0.24.31-version-tracked: upload only if the chunk's content
@@ -519,6 +567,10 @@ impl OctreeBufferPool {
         device.free_memory(self.memory, None);
         self.slots_by_chunk.clear();
         self.content_versions.clear();
+        // r-t1-pool-pin: caller guarantees no GPU work in flight at
+        // destroy, so any remaining pins are dead — drop them (spans are
+        // going away with the buffer anyway).
+        let _ = self.pins.clear();
     }
 }
 

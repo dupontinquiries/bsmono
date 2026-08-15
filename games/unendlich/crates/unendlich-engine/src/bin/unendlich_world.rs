@@ -1224,6 +1224,33 @@ fn main() {
     // sync, FIFO swap chain wait, GPU pipeline stall on resource access).
     let mut t_draw_us: u64 = 0;
 
+    // r-t6-frame-sections (T6, docs/device_logs/TRIAGE_r462.md): per-FRAME
+    // section counters, distinct from the 1s-window accumulators above. The
+    // LONG FRAME warn used to print the window accumulators, which mix up to
+    // 1s of *other* frames (or almost nothing, if the 1Hz reset just ran) —
+    // that's how log-r462 showed `draw=883ms` in one line and `draw=43ms` in
+    // another for the same hitch. These counters are reset every iteration,
+    // so at the top of iteration N+1 they hold exactly the sections of the
+    // frame whose dt is being judged. `residual` (dt − Σsections) is time in
+    // NO instrumented section — un-instrumented lock waits show up there.
+    #[derive(Default, Clone, Copy)]
+    struct FrameSections {
+        cloud_remesh_us: u64,
+        evict_us: u64,
+        submit_us: u64,
+        upload_us: u64,
+        mgr_update_us: u64,
+        tick_sim_us: u64,
+        draw_us: u64,
+    }
+    impl FrameSections {
+        fn sum_us(&self) -> u64 {
+            self.cloud_remesh_us + self.evict_us + self.submit_us + self.upload_us
+                + self.mgr_update_us + self.tick_sim_us + self.draw_us
+        }
+    }
+    let mut frame_sections = FrameSections::default();
+
     // Cloud animation cadence: every N seconds, bump the version of
     // any loaded chunk that intersects the cloud band. The streaming
     // loop's version-aware filter then resubmits those chunks for
@@ -1469,20 +1496,34 @@ fn main() {
         // part of the frame stretched without waiting for the next 1Hz
         // log boundary.
         if dt_ms > 100.0 && frame_count > 5 {
+            // r-t6-frame-sections: `frame_sections` still holds the sections
+            // of exactly the frame whose dt we're judging (it's reset just
+            // below, after this check). `other` is dt minus every
+            // instrumented section — a large `other` means the stall is in
+            // un-instrumented code (input/entity building, or a lock wait
+            // outside the timed blocks).
+            let fs = frame_sections;
+            let other_ms = (dt_ms - fs.sum_us() as f64 / 1000.0).max(0.0);
             log::warn!(
-                "LONG FRAME: dt={:.1}ms (sections may have already accumulated some of this; \
-                 recent 1s totals: cloud_remesh={:.1}ms evict={:.1}ms submit={:.1}ms \
-                 upload={:.1}ms mgr_update={:.1}ms tick_sim={:.1}ms draw={:.1}ms)",
+                "LONG FRAME: dt={:.1}ms — this frame: cloud_remesh={:.1}ms evict={:.1}ms \
+                 submit={:.1}ms upload={:.1}ms mgr_update={:.1}ms tick_sim={:.1}ms \
+                 draw={:.1}ms other={:.1}ms (1s-window totals: draw={:.1}ms)",
                 dt_ms,
-                t_cloud_remesh_us as f64 / 1000.0,
-                t_eviction_us as f64 / 1000.0,
-                t_submit_us as f64 / 1000.0,
-                t_upload_us as f64 / 1000.0,
-                t_manager_update_us as f64 / 1000.0,
-                t_tick_sim_us as f64 / 1000.0,
+                fs.cloud_remesh_us as f64 / 1000.0,
+                fs.evict_us as f64 / 1000.0,
+                fs.submit_us as f64 / 1000.0,
+                fs.upload_us as f64 / 1000.0,
+                fs.mgr_update_us as f64 / 1000.0,
+                fs.tick_sim_us as f64 / 1000.0,
+                fs.draw_us as f64 / 1000.0,
+                other_ms,
                 t_draw_us as f64 / 1000.0,
             );
         }
+        // r-t6-frame-sections: reset AFTER the warn above consumed the
+        // previous frame's numbers; this iteration's sections accumulate
+        // fresh from here.
+        frame_sections = FrameSections::default();
 
         // Advance world time. Mesh requests submitted later this frame will
         // bake the new sun direction into their lighting.
@@ -1643,7 +1684,9 @@ fn main() {
         chunk_manager.update_with_interest_points(&[
             (pos.x as i32, pos.y as i32, pos.z as i32),
         ]);
-        t_manager_update_us += t_mgr.elapsed().as_micros() as u64;
+        let section_elapsed_us = t_mgr.elapsed().as_micros() as u64;
+        t_manager_update_us += section_elapsed_us;
+        frame_sections.mgr_update_us += section_elapsed_us; // r-t6-frame-sections
 
         // Advance simulation ticks (plant lifecycle, future leaf decay,
         // fluid flow, etc.) by this frame's real elapsed time. Internally
@@ -1653,7 +1696,9 @@ fn main() {
         _render_probe.set(unendlich_engine::thread_probe::Activity::TickSim);
         chunk_manager.tick_simulation(dt);
         _render_probe.set(unendlich_engine::thread_probe::Activity::Working);
-        t_tick_sim_us += t_tick.elapsed().as_micros() as u64;
+        let section_elapsed_us = t_tick.elapsed().as_micros() as u64;
+        t_tick_sim_us += section_elapsed_us;
+        frame_sections.tick_sim_us += section_elapsed_us; // r-t6-frame-sections
 
         // ---- Ambient ecosystem: stream chunks in/out + tick roamers ----
         {
@@ -2491,7 +2536,9 @@ fn main() {
             for coord in cloud_coords {
                 chunk_manager.bump_chunk_version(coord);
             }
-            t_cloud_remesh_us += t0.elapsed().as_micros() as u64;
+            let section_elapsed_us = t0.elapsed().as_micros() as u64;
+            t_cloud_remesh_us += section_elapsed_us;
+            frame_sections.cloud_remesh_us += section_elapsed_us; // r-t6-frame-sections
         }
 
         // ---- Lava → HeatSourceMap periodic sync ----
@@ -2652,7 +2699,9 @@ fn main() {
                 loaded.into_iter().filter(|c| !in_render_distance(*c)).collect();
             renderer.evict_chunks(&to_evict);
         }
-        t_eviction_us += t0.elapsed().as_micros() as u64;
+        let section_elapsed_us = t0.elapsed().as_micros() as u64;
+        t_eviction_us += section_elapsed_us;
+        frame_sections.evict_us += section_elapsed_us; // r-t6-frame-sections
 
         // ---- Submit nearby chunks to the meshing pool ----
         let t_submit_start = Instant::now();
@@ -3029,7 +3078,9 @@ fn main() {
             submit_skip_last_loaded_count = cur_loaded_count;
             submit_skip_last_player_chunk = cur_player_chunk;
         }
-        t_submit_us += t_submit_start.elapsed().as_micros() as u64;
+        let section_elapsed_us = t_submit_start.elapsed().as_micros() as u64;
+        t_submit_us += section_elapsed_us;
+        frame_sections.submit_us += section_elapsed_us; // r-t6-frame-sections
 
         // ---- Pull completed meshes and upload (time-budgeted) ----
         //
@@ -3317,7 +3368,9 @@ fn main() {
             if upload_bytes_this_frame >= upload_bytes_budget { break; }
         }
         let _ = uploaded_this_frame;
-        t_upload_us += upload_start.elapsed().as_micros() as u64;
+        let section_elapsed_us = upload_start.elapsed().as_micros() as u64;
+        t_upload_us += section_elapsed_us;
+        frame_sections.upload_us += section_elapsed_us; // r-t6-frame-sections
 
         // v0.24.3 upload-pressure event: when per-frame upload bytes
         // exceeds the threshold, emit an event so we can correlate
@@ -3590,7 +3643,9 @@ fn main() {
             &ctx, &local_player.view, &atmos,
         );
         _render_probe.set(unendlich_engine::thread_probe::Activity::Working);
-        t_draw_us += t_draw_start.elapsed().as_micros() as u64;
+        let section_elapsed_us = t_draw_start.elapsed().as_micros() as u64;
+        t_draw_us += section_elapsed_us;
+        frame_sections.draw_us += section_elapsed_us; // r-t6-frame-sections
         match draw_result {
             Ok(true) => {
                 frame_count += 1;

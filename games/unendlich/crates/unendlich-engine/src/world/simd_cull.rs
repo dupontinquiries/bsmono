@@ -1,4 +1,4 @@
-//! `world::simd_cull` — batch sphere-vs-frustum culling, SSE on x86_64.
+//! `world::simd_cull` — batch sphere-vs-frustum culling, SSE on x86_64, NEON on aarch64.
 //!
 //! A front-end CPU pre-cull: given many chunk bounding spheres and the six frustum
 //! planes, decide which spheres are potentially visible so the uploader/dispatcher
@@ -7,9 +7,9 @@
 //! iteration with SSE. Data is Structure-of-Arrays (`xs/ys/zs/rs`) so each SIMD lane
 //! loads contiguously with no gather.
 //!
-//! [`cull_spheres`] dispatches to the SSE path on x86_64 and the scalar path
-//! elsewhere; both are kept and a differential test pins them to identical output,
-//! so the unsafe intrinsics can't silently diverge.
+//! [`cull_spheres`] dispatches to the SSE path on x86_64, the NEON path on
+//! aarch64, and the scalar path elsewhere; all are kept and a differential test
+//! pins them to identical output, so the unsafe intrinsics can't silently diverge.
 
 /// Plane convention: a point `p` is inside plane `[a,b,c,d]` when
 /// `a*px + b*py + c*pz + d >= 0`. A sphere of radius `r` centred at `p` is culled
@@ -58,10 +58,87 @@ pub fn cull_spheres(
         // SSE/SSE2 are part of the x86_64 baseline, so this is always available.
         unsafe { cull_spheres_sse(xs, ys, zs, rs, planes) }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON (AdvSIMD) is part of the aarch64 baseline — no feature detection.
+        unsafe { cull_spheres_neon(xs, ys, zs, rs, planes) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         cull_spheres_scalar(xs, ys, zs, rs, planes)
     }
+}
+
+/// NEON 4-wide mirror of the SSE path.
+///
+/// One deliberate difference from the SSE body: `dist` uses the *scalar*
+/// association `((p0*x + p1*y) + p2*z) + p3`, not SSE's balanced-tree
+/// `(p0*x + p1*y) + (p2*z + p3)`. f32 addition is not associative, so the
+/// balanced form can flip a `dist < -r` comparison on spheres sitting exactly
+/// at the last-ulp of a plane; matching the scalar association keeps the
+/// differential test airtight rather than probabilistic. No FMA (`vfmaq_f32`)
+/// for the same reason — the scalar path compiles unfused.
+#[cfg(target_arch = "aarch64")]
+unsafe fn cull_spheres_neon(
+    xs: &[f32],
+    ys: &[f32],
+    zs: &[f32],
+    rs: &[f32],
+    planes: &[Plane],
+) -> Vec<bool> {
+    use core::arch::aarch64::*;
+
+    let n = xs.len();
+    let mut out = vec![true; n];
+    let mut i = 0usize;
+
+    while i + 4 <= n {
+        let x = vld1q_f32(xs.as_ptr().add(i));
+        let y = vld1q_f32(ys.as_ptr().add(i));
+        let z = vld1q_f32(zs.as_ptr().add(i));
+        let r = vld1q_f32(rs.as_ptr().add(i));
+        let neg_r = vnegq_f32(r);
+
+        // Accumulate "rejected by some plane" across all six planes.
+        let mut rejected = vdupq_n_u32(0);
+        for p in planes {
+            let px = vdupq_n_f32(p[0]);
+            let py = vdupq_n_f32(p[1]);
+            let pz = vdupq_n_f32(p[2]);
+            let pw = vdupq_n_f32(p[3]);
+            // dist = ((p0*x + p1*y) + p2*z) + p3  — scalar association, see above.
+            let dist = vaddq_f32(
+                vaddq_f32(vaddq_f32(vmulq_f32(px, x), vmulq_f32(py, y)), vmulq_f32(pz, z)),
+                pw,
+            );
+            // lane is rejected where dist < -r
+            let rej = vcltq_f32(dist, neg_r);
+            rejected = vorrq_u32(rejected, rej);
+        }
+
+        // Lane k all-ones → rejected → not visible.
+        let mut lanes = [0u32; 4];
+        vst1q_u32(lanes.as_mut_ptr(), rejected);
+        out[i] = lanes[0] == 0;
+        out[i + 1] = lanes[1] == 0;
+        out[i + 2] = lanes[2] == 0;
+        out[i + 3] = lanes[3] == 0;
+        i += 4;
+    }
+
+    // Scalar tail for the remaining < 4 spheres.
+    while i < n {
+        let mut visible = true;
+        for p in planes {
+            if p[0] * xs[i] + p[1] * ys[i] + p[2] * zs[i] + p[3] < -rs[i] {
+                visible = false;
+                break;
+            }
+        }
+        out[i] = visible;
+        i += 1;
+    }
+    out
 }
 
 #[cfg(target_arch = "x86_64")]

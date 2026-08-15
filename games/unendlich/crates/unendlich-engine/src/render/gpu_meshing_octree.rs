@@ -491,18 +491,33 @@ impl OctreeGpuMesher {
         // pool will allocate (or reuse) a span per chunk and return
         // the absolute node base index. We capture indices into a
         // local vec, then carry them through the meta-write step.
-        // The pool lock is HELD for the entire dispatch+readback
-        // window so main-thread evictions can't reuse a span while
-        // the GPU is mid-read.
         //
-        // Lock duration: ~1 ms per batch. Main-thread upload waits
-        // ~30 µs on average (see DESIGN_NOTES Increment 74 for the
-        // contention analysis).
+        // Lock policy (r-t1-pool-pin, T1 in docs/device_logs/TRIAGE_r462.md):
+        // - Default (UNENDLICH_GPU_POOL_PIN unset/0): the pool lock is HELD
+        //   for the entire dispatch+readback window so main-thread evictions
+        //   can't reuse a span while the GPU is mid-read. On Asahi the
+        //   dispatch's submit-to-signal wall time is 47–889 ms, so every
+        //   main/render-thread pool touch (evict_chunks, world reset, coord
+        //   snapshot, uploads) can stall behind this lock for that long —
+        //   the log-r462 LONG FRAMEs (dt 113–664 ms with GPU total=7.75 ms).
+        //   (The old "~1 ms per batch" claim here predated that data.)
+        // - UNENDLICH_GPU_POOL_PIN=1: spans this dispatch reads (batch
+        //   chunks + resident neighbors) are PINNED under the lock, then the
+        //   lock is RELEASED for the fence wait + readback and re-taken
+        //   briefly to unpin. Frees of pinned spans defer to unpin, so the
+        //   GPU-visible bytes are identical to the lock-held mode; only the
+        //   mutex hold time changes. Default OFF until A/B'd on hardware.
+        let pool_pin = std::env::var("UNENDLICH_GPU_POOL_PIN")
+            .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
         let pool_guard = self.octree_pool.lock()
             .map_err(|_| OctreeMeshError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
 
         // Per-active-slot: pool's base_node_index (u32::MAX = upload failed).
         let mut node_bases: Vec<u32> = Vec::with_capacity(active_slots.len());
+        // r-t1-pool-pin: byte offsets pinned for this dispatch, one entry
+        // per pin() call (duplicates legal — the ledger refcounts), so
+        // unpin_spans(&pin_offsets) is exactly symmetric.
+        let mut pin_offsets: Vec<u64> = Vec::new();
         // v0.24.30-cross-chunk: per-active-slot, the 6 neighbor
         // octree bases in the pool (or u32::MAX if not resident).
         // Order: [+X, -X, +Y, -Y, +Z, -Z].
@@ -523,7 +538,13 @@ impl OctreeGpuMesher {
                 // track version yet, so for now we upload every time
                 // to guarantee freshness. The TODO is filed.
                 match pool.upload_if_changed(c.coord, &c.octree, c.version) {
-                    Ok(slot) => node_bases.push(slot.base_node_index()),
+                    Ok(slot) => {
+                        if pool_pin {
+                            pool.pin_slot(slot);
+                            pin_offsets.push(slot.byte_offset);
+                        }
+                        node_bases.push(slot.base_node_index());
+                    }
                     Err(e) => {
                         log::warn!(
                             "OctreeGpuMesher: pool upload failed for {:?}: {}; \
@@ -549,20 +570,62 @@ impl OctreeGpuMesher {
                 // The cost is 6 HashMap lookups per chunk. At 64
                 // chunks per batch that's ~384 lookups — bounded
                 // and cheap relative to the GPU work.
-                let lookup = |dc: (i32, i32, i32)| -> u32 {
+                //
+                // r-t1-pool-pin: resolved as a two-step (lookup all six,
+                // then pin) because pinning needs `&mut pool` and the old
+                // closure held a shared borrow.
+                const NEIGHBOR_DELTAS: [(i32, i32, i32); 6] = [
+                    ( 1,  0,  0), // +X
+                    (-1,  0,  0), // -X
+                    ( 0,  1,  0), // +Y
+                    ( 0, -1,  0), // -Y
+                    ( 0,  0,  1), // +Z
+                    ( 0,  0, -1), // -Z
+                ];
+                let mut bases = [u32::MAX; 6];
+                for (k, dc) in NEIGHBOR_DELTAS.iter().enumerate() {
                     let nc = crate::world::chunk::ChunkCoord::new(
                         c.coord.x + dc.0, c.coord.y + dc.1, c.coord.z + dc.2,
                     );
-                    pool.slot(nc).map(|s| s.base_node_index()).unwrap_or(u32::MAX)
+                    if let Some(s) = pool.slot(nc) {
+                        bases[k] = s.base_node_index();
+                        if pool_pin {
+                            pool.pin_slot(s);
+                            pin_offsets.push(s.byte_offset);
+                        }
+                    }
+                }
+                neighbor_bases.push(bases);
+            }
+
+            // r-t1-pool-pin: with pinning on, every span this dispatch
+            // reads is now pinned — the pool can safely take uploads and
+            // evictions from other threads while the GPU runs (frees of
+            // pinned spans defer to the unpin below). Release the mutex
+            // BEFORE the fence wait; this is the T1 fix.
+            if pool_pin {
+                drop(pool);
+                let dispatched = self.dispatch_and_wait(
+                    &active_slots, chunks, &node_bases, &neighbor_bases,
+                    lod_stride, &mut outputs,
+                );
+                // Readback touches only the mesher's own output buffers,
+                // never the pool. Skip it if the dispatch failed.
+                let read = match &dispatched {
+                    Ok(()) => self.readback_outputs(&active_slots, &mut outputs),
+                    Err(_) => Ok(()),
                 };
-                neighbor_bases.push([
-                    lookup(( 1,  0,  0)),  // +X
-                    lookup((-1,  0,  0)),  // -X
-                    lookup(( 0,  1,  0)),  // +Y
-                    lookup(( 0, -1,  0)),  // -Y
-                    lookup(( 0,  0,  1)),  // +Z
-                    lookup(( 0,  0, -1)),  // -Z
-                ]);
+                // Unpin on EVERY path — a leaked pin permanently blocks the
+                // span's free (visible as pin_stats().1 > 0 at idle).
+                match self.octree_pool.lock() {
+                    Ok(mut pool) => pool.unpin_spans(&pin_offsets),
+                    Err(_) => log::error!(
+                        "OctreeGpuMesher: octree pool poisoned at unpin — \
+                         {} pinned spans leaked", pin_offsets.len()),
+                }
+                dispatched?;
+                read?;
+                return Ok(outputs);
             }
 
             // Pool guard `pool` stays live through the dispatch call

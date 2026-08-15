@@ -274,6 +274,26 @@ pub fn lod_bands_for_rd_with_fidelity(rd: i32, fidelity: f32) -> LodBands {
     LodBands { near, mid, far }
 }
 
+/// r-t3-band-reconcile (T3, docs/device_logs/TRIAGE_r462.md): validate an
+/// explicit band override against the actual render distance.
+///
+/// `desired_lod_for` clamps every outer to `rd`, so an override whose NEAR
+/// outer reaches `rd` classifies every in-range chunk as Near — LOD is
+/// silently inert and everything meshes at full resolution (the log-r462
+/// configuration: bands 4,6,8 at RD=4 → `lod_mid=0 lod_far=0`, amplifying
+/// the T1 hitches). Mid/far outers ≥ rd are legitimate (those tiers come
+/// up empty — the documented graceful degradation), but `near ≥ rd` has no
+/// valid reading, so the override is rejected in favor of the RD-relative
+/// curve. Pure so it unit-tests headlessly; the env/warn plumbing lives in
+/// [`LodBands::resolved`].
+pub fn reconcile_band_override(b: LodBands, rd: i32, fidelity: f32) -> LodBands {
+    if b.near < rd.max(1) {
+        b
+    } else {
+        lod_bands_for_rd_with_fidelity(rd, fidelity)
+    }
+}
+
 impl LodBands {
     /// Construct with explicit values. Validates strictly increasing
     /// and all positive. Returns a human-readable error on invalid
@@ -342,9 +362,36 @@ impl LodBands {
     /// The bands to use for a given render distance: the explicit env override
     /// if set, else the RD-relative default ([`lod_bands_for_rd`]). This is the
     /// single source of truth shared by `desired_lod_for` and `request_visible`.
+    ///
+    /// r-t3-band-reconcile (T3, docs/device_logs/TRIAGE_r462.md): an explicit
+    /// override whose NEAR outer reaches the render distance disables LOD
+    /// entirely — `desired_lod_for` clamps `near.min(rd)`, so with near ≥ rd
+    /// every chunk inside RD classifies as Near and meshes at full
+    /// resolution. That's exactly the log-r462 configuration
+    /// (`UNENDLICH_LOD_BANDS=4,6,8` at RD=4 → `lod_mid=0 lod_far=0`), and it
+    /// amplifies the T1 mesh hitches precisely when the operator is trying to
+    /// tune them away. Mid/far outers ≥ rd are fine (those tiers just come up
+    /// empty — graceful degradation), but near ≥ rd has no valid reading, so
+    /// it falls back to the RD-relative curve with a one-shot warning.
     pub fn resolved(rd: i32) -> LodBands {
         match Self::env_override() {
-            Some(b) => b,
+            Some(b) => {
+                let r = reconcile_band_override(b, rd, Self::fidelity_env());
+                if r != b {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    // resolved() runs per chunk per frame — warn once, not 10⁵/s.
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            "UNENDLICH_LOD_BANDS={},{},{} has near ≥ render distance {} — \
+                             every chunk would mesh at Near (LOD inert, see TRIAGE_r462 T3). \
+                             Using RD-relative bands {},{},{} instead; set near < {} to override.",
+                            b.near, b.mid, b.far, rd, r.near, r.mid, r.far, rd,
+                        );
+                    }
+                }
+                r
+            }
             None => lod_bands_for_rd_with_fidelity(rd, Self::fidelity_env()),
         }
     }
@@ -926,6 +973,40 @@ mod tests {
             assert!(b.far > b.mid, "rd {rd}: far {} !> mid {}", b.far, b.mid);
             // new() applies the same validation the env path uses.
             assert!(LodBands::new(b.near, b.mid, b.far).is_ok(), "rd {rd}: {:?} fails validation", b);
+        }
+    }
+
+    #[test]
+    fn reconcile_keeps_valid_overrides() {
+        // Override with near inside RD is honored verbatim, even when
+        // mid/far poke past RD (those tiers just come up empty).
+        let b = LodBands { near: 3, mid: 6, far: 8 };
+        assert_eq!(reconcile_band_override(b, 8, 1.0), b);
+        assert_eq!(reconcile_band_override(b, 4, 1.0), b, "mid/far ≥ rd is legal");
+    }
+
+    #[test]
+    fn reconcile_rejects_lod_inert_overrides() {
+        // The exact log-r462 T3 configuration: bands 4,6,8 at RD=4.
+        // near == rd means no chunk can ever leave Near → fall back.
+        let b = LodBands { near: 4, mid: 6, far: 8 };
+        let r = reconcile_band_override(b, 4, 1.0);
+        assert_eq!(r, lod_bands_for_rd(4));
+        assert!(r.near < 4, "fallback must actually engage LOD inside RD");
+        // near > rd is equally inert.
+        let r2 = reconcile_band_override(LodBands { near: 9, mid: 12, far: 20 }, 4, 1.0);
+        assert_eq!(r2, lod_bands_for_rd(4));
+    }
+
+    #[test]
+    fn reconcile_fallback_engages_lod_at_every_rd() {
+        // Whatever RD the operator runs, a rejected override must land on
+        // bands where at least one chunk inside RD is non-Near (near < rd)
+        // — for every rd ≥ 3. (rd 1–2: the RD-relative floor is near=2, so
+        // a 1–2 chunk world is all-Near by construction; nothing to engage.)
+        for rd in 3..=64 {
+            let r = reconcile_band_override(LodBands { near: rd, mid: rd + 1, far: rd + 2 }, rd, 1.0);
+            assert!(r.near < rd, "rd {rd}: fallback near {} must be < rd", r.near);
         }
     }
 

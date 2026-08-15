@@ -54,6 +54,14 @@ pub mod world_renderer;
 // `UNENDLICH_OCTREE_VERIFY=1`). No production consumer migrates this
 // ship; this is foundation for the mesher/raycast migrations.
 pub mod octree_buffer;
+// r-t1-pool-pin: span pin ledger so the octree mesher's fence wait doesn't
+// hold the pool mutex (T1 hitch, docs/device_logs/TRIAGE_r462.md). Pure —
+// no Vulkan types — so it unit-tests headlessly.
+pub mod octree_pin;
+// r-async-mesh-design: pure in-flight slot lifecycle for a future pipelined
+// mesher dispatch (docs/speculative/async-mesher-dispatch.md). NOT wired —
+// the dispatcher stays synchronous until the memo's hardware gate passes.
+pub mod mesh_dispatch_ring;
 pub mod octree_probe_pipeline;
 // r301: neural deferred shading (forward-ported from the r67 integration; compile-only,
 // not yet wired into the render loop — the live-context wiring is M2-side per RUST_INTEGRATION.md).
