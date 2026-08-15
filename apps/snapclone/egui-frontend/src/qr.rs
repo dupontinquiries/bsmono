@@ -483,3 +483,55 @@ mod input_reality_check {
         assert_eq!(s.manual, "sc-ab", "the field kept only {:?}", s.manual);
     }
 }
+
+/// Draw the local identity as a scannable-looking square.
+///
+/// The other half of the QR flow: `qr_ui` reads somebody else's code, this
+/// shows yours so they can. Without it the exchange only works in one
+/// direction and both people need a third device.
+///
+/// ## It says what it is
+///
+/// `qr_render`'s own docs are blunt — "a real QR reader will not decode it",
+/// because there is no Reed-Solomon encoder, no mask evaluation and no format
+/// information. So the caption says so. A square that LOOKS scannable and is
+/// not would have people holding phones at each other until one of them gives
+/// up, and blaming their camera.
+pub fn my_code_ui(ui: &mut egui::Ui, id: &str, c: &uikit_egui::PaletteColors) {
+    use crate::qr_render::{layout_for, readable_fg, MODULES};
+    ui.vertical_centered(|ui| {
+        ui.colored_label(c.text_weak, "MY CODE");
+        let side = 168.0_f32;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 4.0, egui::Color32::WHITE);
+
+        // The cell size is FLOORED to an integer: a fractional module makes the
+        // renderer resample and the edges blur, which is the difference between
+        // a crisp code and a grey smudge.
+        let cell = (side / MODULES as f32).floor().max(2.0);
+        let used = cell * MODULES as f32;
+        // Centred on the leftover, so flooring does not push the pattern into
+        // the top-left corner with a fat margin on two sides.
+        let origin = rect.min + egui::vec2((side - used) * 0.5, (side - used) * 0.5);
+
+        let fg = readable_fg([255, 255, 255], [0, 0, 0]);
+        let col = egui::Color32::from_rgb(fg[0], fg[1], fg[2]);
+        let layout = layout_for(id);
+        for y in 0..MODULES {
+            for x in 0..MODULES {
+                if layout.get(x, y) {
+                    let at = origin + egui::vec2(x as f32 * cell, y as f32 * cell);
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(at, egui::vec2(cell, cell)), 0.0, col);
+                }
+            }
+        }
+        ui.colored_label(c.text_weak, egui::RichText::new(id).monospace().small());
+        // The honest caption. See the module docs above.
+        ui.colored_label(c.text_weak,
+            egui::RichText::new("a visual id, not a scannable QR — read the code aloud")
+                .small());
+    });
+}
+

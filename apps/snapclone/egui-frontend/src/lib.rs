@@ -126,6 +126,12 @@ pub struct Snapclone {
     /// toast system: this app has none, and adding one to report a duration
     /// would be the tail wagging the dog.
     pub shutter_note: String,
+    /// This device's sc-ID, for the code somebody else scans.
+    ///
+    /// Held rather than derived: the identity belongs to the crypto layer and
+    /// the view should display what it is TOLD, not compute a second answer
+    /// that could disagree with the one the handshake uses.
+    pub local_id: String,
     /// Latest-frame-wins slot between the capture thread and the paint.
     pub frames: crate::frame_pump::FrameSlot,
     /// The uploaded texture, kept across frames so an unchanged frame is not
@@ -328,6 +334,7 @@ impl Snapclone {
             cam_selection: None,
             shutter: Default::default(),
             shutter_note: String::new(),
+            local_id: String::new(),
             frames: Default::default(),
             cam_texture: None,
             last_frame_ms: None,
@@ -1039,6 +1046,49 @@ impl Snapclone {
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
+        // THE QR DIALOG'S BODY. present_default put it on the stack and
+        // nothing ever drew it, so "scan a code" opened an invisible modal that
+        // blocked input — which reads as the app freezing rather than as a
+        // missing render.
+        //
+        // In ui(), not swipe_page: my first attempt put this in a state method
+        // with no `ui` in scope at all — a reminder that "where the modal is
+        // dismissed" and "where it is drawn" are different places.
+        if self.qr.is_some() {
+            let r = self.modal.topmost(crate::modal::Layer::Dialog)
+                .filter(|p| p.id == "qr")
+                .map(|p| p.rect.clone());
+            if let Some(r) = r {
+                let area = egui::Rect::from_min_size(
+                    egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+                let painter = ui.painter();
+                painter.rect_filled(area, 8.0, colors.bg_base);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+                let mut scanned = None;
+                if let Some(q) = self.qr.as_mut() {
+                    scanned = crate::qr::qr_ui(&mut child, q, &colors);
+                }
+                // BOTH HALVES. qr_ui reads somebody else's code; my_code_ui
+                // shows yours so they can read it back. With only the scanner,
+                // an exchange needs a third device.
+                child.separator();
+                crate::qr::my_code_ui(&mut child, &self.local_id, &colors);
+                if child.button("close").clicked() {
+                    self.qr = None;
+                    self.modal.dismiss("qr");
+                }
+                // apply_scan is the EXISTING path — it adds the peer the same
+                // way a typed address does and dismisses the dialog itself. I
+                // had written on_scanned_contact(), which does not exist;
+                // adding a second entry point would have made a scanned contact
+                // a different kind of contact from a typed one, which is
+                // exactly what apply_scan's doc says it exists to prevent.
+                if let Some(sc) = scanned {
+                    self.apply_scan(sc);
+                }
+            }
+        }
+
 
         // The voice bar sits above the page content while a session is live, so
         // the floor holder, the mic level and the talk button are reachable
