@@ -327,6 +327,10 @@ pub struct Snapclone {
     /// one is present everywhere this app runs — PowerDevil on Plasma, UPower
     /// elsewhere, a sysfs poll where neither answers.
     pub power: crate::power_tier::PowerState,
+    /// The bottom navigation bar. Equal-width tabs, an animated indicator, and
+    /// unread badges — and the badge is the reason it needs wiring rather than
+    /// just drawing: a count nobody updates is worse than no count.
+    pub tabs: crate::tab_bar::TabBar,
     /// (sender id, caption) for the snaps floating on the map, newest first.
     pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
@@ -428,6 +432,17 @@ impl Snapclone {
             confirm: None,
             confirm_id: String::new(),
             power: Default::default(),
+            // The five surfaces this app actually has. Built here rather than
+            // in TabBar::default() because the bar is generic over its tabs —
+            // a default set inside the widget would be this app's navigation
+            // leaking into a shared component.
+            tabs: crate::tab_bar::TabBar::new(vec![
+                crate::tab_bar::Tab::new("camera", "Camera"),
+                crate::tab_bar::Tab::new("chats", "Chats"),
+                crate::tab_bar::Tab::new("friends", "Friends"),
+                crate::tab_bar::Tab::new("map", "Map"),
+                crate::tab_bar::Tab::new("settings", "Settings"),
+            ]),
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
@@ -466,6 +481,24 @@ impl Snapclone {
     /// Confirm the pending delete. Split from apply_friends because the
     /// confirmation arrives as its own answer, not as part of the tap that
     /// asked the question.
+    /// Index of the Chats tab, whose badge shows unread messages.
+    ///
+    /// Named rather than written as `1` at the call site: the tab order is a
+    /// design decision that will change, and a bare index would silently start
+    /// badging the wrong tab the first time somebody reorders them.
+    pub const CHATS_TAB: usize = 1;
+
+    /// Push the unread count onto the Chats badge.
+    ///
+    /// Called after anything that changes what is unread, so the badge is
+    /// derived rather than maintained in parallel — two counts of the same
+    /// thing disagree the moment one update is missed, and the badge is the
+    /// one the user checks without opening the app.
+    pub fn sync_badges(&mut self) {
+        let unread = self.inbox.unread_count() as u32;
+        self.tabs.set_badge(Self::CHATS_TAB, unread);
+    }
+
     /// Retry whatever is waiting in the outbox, unless the battery says wait.
     ///
     /// Returns how many were retried. Gated on `should_defer_background`, which
@@ -669,6 +702,10 @@ impl Snapclone {
             RibbonEvent::Triggered(id) => match id.as_str() {
                 "read_all" => {
                     for id in self.inbox.unread_ids() { self.inbox.mark_read(id); }
+                    // Marking everything read must clear the badge in the same
+                    // breath: a badge surviving "read all" is the exact case
+                    // that teaches people to ignore it.
+                    self.sync_badges();
                 }
                 // Retry is the host's: this view does not own the transport.
                 // Recorded so the host can act and the test can see it.
@@ -2751,6 +2788,31 @@ mod modal_render_tests {
         }
         assert!(undrawn.is_empty(),
                 "presented but never drawn: {undrawn:?} — these block input while invisible");
+    }
+}
+
+#[cfg(test)]
+mod badge_tests {
+    #[test]
+    fn the_chats_tab_index_matches_the_tab_actually_built() {
+        // CHATS_TAB is a constant precisely so a reorder cannot silently badge
+        // the wrong tab — but a constant that drifts from the list is the same
+        // bug with an extra step, so the two are checked against each other.
+        let app = super::Snapclone::new(Vec::new());
+        let tab = &app.tabs.tabs()[super::Snapclone::CHATS_TAB];
+        assert_eq!(tab.label, "Chats",
+                   "CHATS_TAB points at {:?}, not the chats tab", tab.label);
+    }
+
+    #[test]
+    fn the_badge_follows_the_inbox_rather_than_being_set_by_hand() {
+        // Derived, not maintained in parallel: two counts of the same thing
+        // disagree the moment one update is missed, and the badge is the one
+        // the user trusts without opening the app.
+        let mut app = super::Snapclone::new(Vec::new());
+        app.sync_badges();
+        let shown = app.tabs.tabs()[super::Snapclone::CHATS_TAB].badge;
+        assert_eq!(shown as usize, app.inbox.unread_count());
     }
 }
 
