@@ -1031,7 +1031,8 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         }
     }
     let coding = ["gitmind", "logscope", "bot-arena"];
-    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound"];
+    // snapshot-cam is a simple entry: bare name, package == bin, no features.
+    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "snapshot-cam"];
     // beatspace is a CUSTOM entry below (it needs run_flags), so it is not in
     // this simple list — being in both would put it in the group twice.
     let music = ["krapper", "bo-suite", "fao-codec"];

@@ -671,3 +671,10 @@ kind = "cargo"
 role = "library"
 notes = "Headless freehand-ink engine: stroke capture with pressure, one-euro smoothing, RDP simplification, an f64 infinite canvas camera, spatial-indexed undo, and a pointer router that partitions contacts between inking and touchkit navigation without changing touchkit's frame-driven contract. std-only, no deps — same rationale as touchkit, so it cross-compiles to the phone targets."
 
+[apps.snapshot-cam]
+path = "apps/snapshot-cam"
+kind = "cargo"
+role = "app"
+daemon = false
+notes = "A local camera. Captures land on this device and go nowhere until the user picks a target: photosync (their own machines, content-addressed) or a snapclone contact (a person, not recallable). The two are kept distinct in the type system because collapsing them is how a backup becomes a disclosure. Headless core + eframe shell, so the sharing rules test without a camera."
+

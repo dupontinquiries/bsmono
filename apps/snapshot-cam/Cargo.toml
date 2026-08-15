@@ -1,0 +1,21 @@
+[package]
+name = "snapshot-cam"
+version = "0.1.0"
+edition = "2021"
+description = "A local camera: take a photo, keep it on this device, and hand it to photosync or a snapclone contact when you choose to."
+
+[[bin]]
+name = "snapshot-cam"
+path = "src/main.rs"
+required-features = ["app"]
+
+[features]
+# Default-on so `cargo build --release` produces the deployable binary, the
+# convention the rest of the fleet uses. The LIBRARY is feature-free, so
+# `--no-default-features` gives a headless core that tests without a display.
+default = ["app"]
+app = ["dep:eframe", "dep:egui"]
+
+[dependencies]
+eframe = { version = "0.34", optional = true }
+egui = { version = "0.34", optional = true }
