@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_racer_quickfire.iqm",
+ "foldview": {
+  "category": "racer",
+  "poses": 5,
+  "prims": 43,
+  "vertices": 175393,
+  "triangles": 137573,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.95,
+   "grounded": 0.25
+  }
+ }
+}

@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_c_130j_super_hercules.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 47,
+  "vertices": 27901,
+  "triangles": 39613,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.91,
+   "grounded": 0.3
+  }
+ }
+}

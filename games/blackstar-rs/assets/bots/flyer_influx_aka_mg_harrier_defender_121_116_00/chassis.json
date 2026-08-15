@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_influx_aka_mg_harrier_defender_121_116_00.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 44,
+  "vertices": 10220,
+  "triangles": 12876,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.87,
+   "grounded": 0.28
+  }
+ }
+}

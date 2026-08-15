@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_spaceship_warpzone_aka_military_troop_ship.iqm",
+ "foldview": {
+  "category": "spaceship",
+  "poses": 5,
+  "prims": 43,
+  "vertices": 21462,
+  "triangles": 40321,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.68,
+   "grounded": 0.31
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.68)"
+ }
+}

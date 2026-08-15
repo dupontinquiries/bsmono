@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>blackstar — fold viewer</title>
+<style>
+  :root { --bg:#0b0d12; --ink:#dfe6f2; --dim:#7d879b; --ok:#5fd39a; --bad:#ff6b6b; --accent:#8ab4ff; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink); overflow:hidden;
+       font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  #cv { position:fixed; inset:0; display:block; }
+  #panel { position:fixed; top:0; left:0; width:322px; height:100%; overflow-y:auto;
+           background:rgba(21,25,34,.95); border-right:1px solid #232937; padding:14px; z-index:2; }
+  h1 { font-size:14px; margin:0 0 2px; letter-spacing:.08em; }
+  h2 { font-size:11px; color:var(--dim); margin:15px 0 6px; letter-spacing:.12em; text-transform:uppercase;
+       border-bottom:1px solid #232937; padding-bottom:4px; }
+  .sub { color:var(--dim); font-size:11px; margin-bottom:8px; }
+  label { display:block; margin:8px 0 2px; font-size:11px; color:var(--dim); }
+  input[type=range] { width:100%; }
+  select { width:100%; background:#1d2331; color:var(--ink); border:1px solid #2c3446;
+           padding:6px; border-radius:4px; font:inherit; margin-top:4px; }
+  .val { float:right; color:var(--accent); }
+  .chk { display:flex; align-items:center; gap:6px; margin:6px 0; font-size:12px; }
+  .chk label { margin:0; color:var(--ink); }
+  #selftest,#fault,#stats { font-size:11px; padding:8px; border-radius:4px;
+       background:#11151d; border:1px solid #232937; white-space:pre-line; }
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .dim{color:var(--dim)}
+  #err { position:fixed; left:340px; top:14px; right:14px; z-index:3; padding:10px;
+         background:#2a1417; border:1px solid var(--bad); color:#ffd7d7; border-radius:5px;
+         font-size:12px; display:none; white-space:pre-wrap; }
+  .paneLabel { position:fixed; z-index:2; font-size:10px; letter-spacing:.14em;
+       color:#9fb0cc; background:rgba(11,13,18,.72); border:1px solid #232937;
+       padding:2px 7px; border-radius:3px; pointer-events:none; }
+  .row2 { display:flex; gap:6px; margin-top:4px; }
+  .row2 button { width:50%; background:#1d2331; color:var(--ink); border:1px solid #2c3446;
+       padding:5px; border-radius:4px; font:inherit; cursor:pointer; }
+  .row2 button:hover { border-color:var(--accent); }
+  #rig { cursor:pointer; }
+  #hint { position:fixed; right:14px; bottom:12px; color:var(--dim); font-size:11px; z-index:2; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="labels">
+  <div id="lbFold" class="paneLabel">FOLD <span class="dim" id="lbT">t=0.00</span></div>
+  <div id="lbVeh"  class="paneLabel">VEHICLE <span class="dim">t=0</span></div>
+  <div id="lbBot"  class="paneLabel">ROBOT <span class="dim">t=1</span></div>
+</div>
+<div id="err"></div>
+<div id="hint">drag to orbit · wheel to zoom · ← → change example · space play/pause</div>
+<div id="panel">
+  <h1>FOLD VIEWER</h1>
+  <div class="sub">blackstar-rs · vehicle&rarr;robot transformation</div>
+
+  <h2>Engine parity</h2>
+  <div id="selftest">running&hellip;</div>
+
+  <h2>Example</h2>
+  <select id="rig"></select>
+  <div class="row2">
+    <button id="prev" title="previous (←)">‹ prev</button>
+    <button id="next" title="next (→)">next ›</button>
+  </div>
+  <div class="dim" id="rigdesc" style="margin-top:6px;font-size:11px"></div>
+  <div class="dim" style="margin-top:4px;font-size:10px">scroll over this box or use ← →</div>
+
+  <h2>Fold</h2>
+  <label>t <span class="val" id="tv">0.00</span><span class="dim"> 0 vehicle &rarr; 1 robot</span></label>
+  <input type="range" id="t" min="0" max="1" step="0.001" value="0">
+  <div class="chk"><input type="checkbox" id="play" checked><label for="play">auto-play</label></div>
+  <label>mode</label>
+  <select id="mode">
+    <option value="blend">Blend &mdash; what Morph does when it works</option>
+    <option value="step">Step &mdash; what actually ships today (flipbook)</option>
+  </select>
+
+  <h2>Compaction <span class="dim">compact.rs</span></h2>
+  <div class="chk"><input type="checkbox" id="con"><label for="con">enabled</label></div>
+  <label>style</label>
+  <select id="style">
+    <option value="shrink">Shrink &mdash; panels fold inward</option>
+    <option value="grow">Grow &mdash; mass appears outward</option>
+  </select>
+  <label>cell <span class="val" id="cellv">0.35</span></label>
+  <input type="range" id="cell" min="0.02" max="1.20" step="0.01" value="0.35">
+  <label>strength <span class="val" id="strv">0.55</span></label>
+  <input type="range" id="str" min="0" max="1" step="0.01" value="0.55">
+
+  <h2>Audit <span class="dim">foldaudit.rs</span></h2>
+  <div class="chk"><input type="checkbox" id="showfault" checked><label for="showfault">highlight intersections</label></div>
+  <div id="fault">&mdash;</div>
+
+  <h2>Dynamics</h2>
+  <label>damage <span class="val" id="dmgv">0.19</span><span class="dim"> settles → snaps</span></label>
+  <input type="range" id="dmg" min="0" max="1" step="0.01" value="0.19">
+  <label>gravity <span class="val" id="gravv">0.40</span><span class="dim"> suspension load</span></label>
+  <input type="range" id="grav" min="0" max="2" step="0.01" value="0.40">
+  <label>part stagger <span class="val" id="stagv">0.22</span><span class="dim"> snap-together</span></label>
+  <div class="dim" style="font-size:10px;margin:2px 0 0">parts animate in LOCAL space under a parent, so a
+  lagging child rides its parent instead of drifting off. Past ~0.5 a part with a long
+  journey relative to its parent still separates — that is travel distance, not a
+  missing hierarchy.</div>
+  <input type="range" id="stag" min="0" max="0.8" step="0.01" value="0.22">
+  <div class="chk"><input type="checkbox" id="drift"><label for="drift">auto-drift with hold points</label></div>
+
+  <h2>Balance</h2>
+  <div id="balance">&mdash;</div>
+
+  <h2>Concealment</h2>
+  <div id="conceal">&mdash;</div>
+
+  <h2>Mass conservation</h2>
+  <div id="mass">&mdash;</div>
+
+  <h2>Readout</h2>
+  <div id="stats">&mdash;</div>
+</div>
+
+<script>
+/* Dependency-free on purpose. The first version imported three.js from
+   a CDN; the sandbox that renders this page has no network, so the
+   module threw on its first line and the viewport stayed black with the
+   parity panel stuck on "running...". A viewer that only works with a
+   network is not a viewer. Raw WebGL, no imports, no fetches. */
+(function () {
+"use strict";
+var errBox = document.getElementById('err');
+function fatal(m){ errBox.style.display='block'; errBox.textContent=m; }
+window.addEventListener('error', function(e){
+  fatal('ERROR: '+(e.message||e)+'\n'+(e.filename||'')+':'+(e.lineno||''));
+});
+
+/* ============ PORT OF compact.rs ============
+   Golden values from `skydribble --fold golden`, which runs the real
+   engine code. The parity panel rechecks them at load, so drift between
+   this port and the engine is reported rather than hidden. */
+var GOLDEN = {
+  curve:[0.000000,0.051396,0.152747,0.282667,0.427317,0.574349,0.712414,0.831399,
+         0.922848,0.980374,1.000000,0.980374,0.922848,0.831399,0.712414,0.574349,
+         0.427317,0.282667,0.152747,0.051396,0.000000],
+  displace:{
+    shrink:[[0.370000,-1.240000,2.900000],[0.349629,-1.231320,2.854631],[0.302745,-1.164386,2.660151],
+            [0.240101,-1.025078,2.304637],[0.184739,-0.876632,1.941861],[0.162500,-0.812500,1.787500],
+            [0.184739,-0.876632,1.941862],[0.240101,-1.025078,2.304637],[0.302745,-1.164386,2.660151],
+            [0.349629,-1.231320,2.854631],[0.370000,-1.240000,2.900000]],
+    grow:  [[0.370000,-1.240000,2.900000],[0.351670,-1.235695,2.877088],[0.318722,-1.198623,2.835902],
+            [0.284510,-1.120241,2.793138],[0.259258,-1.036316,2.761573],[0.250000,-1.000000,2.750000],
+            [0.259258,-1.036317,2.761573],[0.284510,-1.120241,2.793138],[0.318722,-1.198623,2.835902],
+            [0.351670,-1.235695,2.877088],[0.370000,-1.240000,2.900000]]
+  }
+};
+/* max(0) before pow is load-bearing: sin(PI) is slightly negative in
+   f32 and a negative base to a fractional power is NaN, which would
+   blank every vertex on the frame a fold completes. */
+function curve(t){ t=Math.min(1,Math.max(0,t)); return Math.pow(Math.max(0,Math.sin(Math.PI*t)),1.6); }
+function cellCentre(p,cell){ var c=Math.max(1e-4,cell);
+  return [Math.floor(p[0]/c)*c+c*0.5, Math.floor(p[1]/c)*c+c*0.5, Math.floor(p[2]/c)*c+c*0.5]; }
+function displace(pos,nrm,centre,t,P){
+  var c=curve(t)*Math.min(1,Math.max(0,P.strength));
+  if(c<=1e-5) return pos;
+  var q=cellCentre(pos,P.cell), target, L, n, k;
+  if(P.style==='shrink'){ var pull=0.35*c;
+    target=[q[0]+(centre[0]-q[0])*pull, q[1]+(centre[1]-q[1])*pull, q[2]+(centre[2]-q[2])*pull];
+  } else {
+    L=Math.sqrt(nrm[0]*nrm[0]+nrm[1]*nrm[1]+nrm[2]*nrm[2]);
+    n = L>1e-6 ? [nrm[0]/L,nrm[1]/L,nrm[2]/L] : [0,1,0];
+    k=P.cell*0.5*c; target=[q[0]+n[0]*k, q[1]+n[1]*k, q[2]+n[2]*k];
+  }
+  if(P.minThickness>1e-5 && P.cell<P.minThickness){
+    L=Math.sqrt(nrm[0]*nrm[0]+nrm[1]*nrm[1]+nrm[2]*nrm[2]);
+    n = L>1e-6 ? [nrm[0]/L,nrm[1]/L,nrm[2]/L] : [0,1,0];
+    k=P.minThickness*0.5*c;
+    target=[target[0]+n[0]*k, target[1]+n[1]*k, target[2]+n[2]*k];
+  }
+  return [pos[0]+(target[0]-pos[0])*c, pos[1]+(target[1]-pos[1])*c, pos[2]+(target[2]-pos[2])*c];
+}
+
+/* ============ parity self-test ============ */
+(function(){
+  var rows=[], pass=true, TOL=2e-5, w=0, i, k, style, d, P, g, e, ep=0, t;
+  for(i=0;i<=20;i++) w=Math.max(w,Math.abs(curve(i/20)-GOLDEN.curve[i]));
+  rows.push(['curve',w]); if(!(w<TOL)) pass=false;
+  var styles=['shrink','grow'];
+  for(var s=0;s<styles.length;s++){
+    style=styles[s]; d=0; P={style:style,cell:0.5,strength:1.0,minThickness:0.0};
+    for(i=0;i<=10;i++){
+      g=displace([0.37,-1.24,2.9],[0,1,0],[0,0,0],i/10,P);
+      e=GOLDEN.displace[style][i];
+      for(k=0;k<3;k++) d=Math.max(d,Math.abs(g[k]-e[k]));
+    }
+    rows.push(['displace '+style,d]); if(!(d<TOL)) pass=false;
+  }
+  for(var s2=0;s2<styles.length;s2++){
+    var ts=[0,1];
+    for(var ti=0;ti<2;ti++){ t=ts[ti];
+      var o=displace([1,2,3],[0,1,0],[0,0,0],t,{style:styles[s2],cell:0.22,strength:0.85,minThickness:0.04});
+      ep=Math.max(ep,Math.abs(o[0]-1),Math.abs(o[1]-2),Math.abs(o[2]-3));
+    }
+  }
+  rows.push(['endpoints exact',ep]); if(!(ep<1e-9)) pass=false;
+  var html='<div class="'+(pass?'ok':'bad')+'"><b>'+(pass?'JS matches engine':'DIVERGED FROM ENGINE')+'</b></div>';
+  for(i=0;i<rows.length;i++){
+    var okk=rows[i][1]<TOL;
+    html+='<div><span class="'+(okk?'ok':'bad')+'">'+(okk?'\u2713':'\u2717')+'</span> '+rows[i][0]+
+          ' <span class="dim">\u0394'+rows[i][1].toExponential(1)+'</span></div>';
+  }
+  html+='<div class="dim" style="margin-top:4px">golden from --fold golden</div>';
+  document.getElementById('selftest').innerHTML=html;
+})();
+
+/* ============ tiny matrix math ============ */
+function mul(a,b){ var o=new Float32Array(16),i,j,k,s;
+  for(i=0;i<4;i++)for(j=0;j<4;j++){s=0;for(k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s;} return o; }
+function persp(fov,asp,n,f){ var t=1/Math.tan(fov/2), o=new Float32Array(16);
+  o[0]=t/asp;o[5]=t;o[10]=(f+n)/(n-f);o[11]=-1;o[14]=2*f*n/(n-f); return o; }
+function lookAt(e,c,u){
+  var z=[e[0]-c[0],e[1]-c[1],e[2]-c[2]], L=Math.sqrt(z[0]*z[0]+z[1]*z[1]+z[2]*z[2]);
+  z=[z[0]/L,z[1]/L,z[2]/L];
+  var x=[u[1]*z[2]-u[2]*z[1], u[2]*z[0]-u[0]*z[2], u[0]*z[1]-u[1]*z[0]];
+  L=Math.sqrt(x[0]*x[0]+x[1]*x[1]+x[2]*x[2])||1; x=[x[0]/L,x[1]/L,x[2]/L];
+  var y=[z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]];
+  return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+    -(x[0]*e[0]+x[1]*e[1]+x[2]*e[2]), -(y[0]*e[0]+y[1]*e[1]+y[2]*e[2]), -(z[0]*e[0]+z[1]*e[1]+z[2]*e[2]), 1]);
+}
+
+/* ============ GL ============ */
+var cv=document.getElementById('cv');
+var gl=cv.getContext('webgl')||cv.getContext('experimental-webgl');
+if(!gl){ fatal('WebGL is not available here.'); return; }
+function sh(type,src){ var s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) fatal('shader: '+gl.getShaderInfoLog(s)); return s; }
+var prog=gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER,
+  'attribute vec3 aPos; attribute vec3 aNrm; uniform mat4 uMVP; varying vec3 vN;'+
+  'void main(){ vN=aNrm; gl_Position=uMVP*vec4(aPos,1.0); }'));
+gl.attachShader(prog, sh(gl.FRAGMENT_SHADER,
+  'precision mediump float; varying vec3 vN; uniform vec3 uColor;'+
+  'void main(){ vec3 n=normalize(vN);'+
+  ' float key=max(dot(n,normalize(vec3(0.5,0.9,0.6))),0.0);'+
+  ' float rim=pow(1.0-max(dot(n,normalize(vec3(0.0,0.25,1.0))),0.0),2.0)*0.30;'+
+  ' vec3 c=uColor*(0.30+0.85*key)+vec3(0.42,0.60,1.0)*rim;'+
+  ' gl_FragColor=vec4(c,1.0); }'));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) fatal('link: '+gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+var aPos=gl.getAttribLocation(prog,'aPos'), aNrm=gl.getAttribLocation(prog,'aNrm');
+var uMVP=gl.getUniformLocation(prog,'uMVP'), uColor=gl.getUniformLocation(prog,'uColor');
+gl.enable(gl.DEPTH_TEST);
+
+/* ============ the rig ============ */
+/* A canonical unit cube, built once. Parts are POSED by a transform
+   rather than authored as pre-placed vertices, because vertex lerp
+   cannot express rotation: interpolating the corners of a box toward
+   the corners of its rotated self walks them along chords, and the
+   part visibly SHRINKS through the middle of the turn. That is the
+   "things grow and shrink strangely" failure, and it is not a tuning
+   problem -- it is what linear vertex interpolation does.
+
+   xform.rs::Morph::sample has exactly this shape (it lerps vertex i of
+   pose k toward vertex i of pose k+1), so the engine inherits the same
+   limit wherever a part rotates during a fold. Interpolating the
+   TRANSFORM instead -- position, euler, half-extents, applied to
+   canonical geometry -- keeps a rotating part rigid the whole way
+   through, which is what a real hinge does. */
+var UNIT=(function(){
+  var F=[
+    [[-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1],[0,0,1]],
+    [[ 1,-1,-1],[-1,-1,-1],[-1, 1,-1],[ 1, 1,-1],[0,0,-1]],
+    [[-1, 1, 1],[ 1, 1, 1],[ 1, 1,-1],[-1, 1,-1],[0,1,0]],
+    [[-1,-1,-1],[ 1,-1,-1],[ 1,-1, 1],[-1,-1, 1],[0,-1,0]],
+    [[ 1,-1, 1],[ 1,-1,-1],[ 1, 1,-1],[ 1, 1, 1],[1,0,0]],
+    [[-1,-1,-1],[-1,-1, 1],[-1, 1, 1],[-1, 1,-1],[-1,0,0]]
+  ];
+  var P=[],N=[],i,j,f,o,v;
+  for(i=0;i<6;i++){ f=F[i]; o=[f[0],f[1],f[2], f[0],f[2],f[3]];
+    for(j=0;j<6;j++){ v=o[j]; P.push(v[0],v[1],v[2]); N.push(f[4][0],f[4][1],f[4][2]); } }
+  return { pos:new Float32Array(P), nrm:new Float32Array(N) };
+})();
+
+/* euler XYZ -> 3x3, row-major triples */
+function eulerMat(r){
+  var cx=Math.cos(r[0]),sx=Math.sin(r[0]),cy=Math.cos(r[1]),sy=Math.sin(r[1]),
+      cz=Math.cos(r[2]),sz=Math.sin(r[2]);
+  return [ cy*cz, cy*sz, -sy,
+           sx*sy*cz-cx*sz, sx*sy*sz+cx*cz, sx*cy,
+           cx*sy*cz+sx*sz, cx*sy*sz-sx*cz, cx*cy ];
+}
+function xf(m,v){ return [ m[0]*v[0]+m[3]*v[1]+m[6]*v[2],
+                           m[1]*v[0]+m[4]*v[1]+m[7]*v[2],
+                           m[2]*v[0]+m[5]*v[1]+m[8]*v[2] ]; }
+var D=Math.PI/180;
+function m3mul(a,b){ /* row-major triples, a then b applied as a*b */
+  var o=new Array(9),i,j,k,s2;
+  for(i=0;i<3;i++)for(j=0;j<3;j++){ s2=0; for(k=0;k<3;k++) s2+=a[i*3+k]*b[k*3+j]; o[i*3+j]=s2; }
+  return o; }
+function m3T(m){ return [m[0],m[3],m[6], m[1],m[4],m[7], m[2],m[5],m[8]]; }
+function quatFromM3(m){
+  var tr=m[0]+m[4]+m[8], q, s2;
+  if(tr>0){ s2=Math.sqrt(tr+1)*2; q=[(m[7]-m[5])/s2,(m[2]-m[6])/s2,(m[3]-m[1])/s2,0.25*s2]; }
+  else if(m[0]>m[4]&&m[0]>m[8]){ s2=Math.sqrt(1+m[0]-m[4]-m[8])*2;
+    q=[0.25*s2,(m[1]+m[3])/s2,(m[2]+m[6])/s2,(m[7]-m[5])/s2]; }
+  else if(m[4]>m[8]){ s2=Math.sqrt(1+m[4]-m[0]-m[8])*2;
+    q=[(m[1]+m[3])/s2,0.25*s2,(m[5]+m[7])/s2,(m[2]-m[6])/s2]; }
+  else { s2=Math.sqrt(1+m[8]-m[0]-m[4])*2;
+    q=[(m[2]+m[6])/s2,(m[5]+m[7])/s2,0.25*s2,(m[3]-m[1])/s2]; }
+  var L=Math.hypot(q[0],q[1],q[2],q[3])||1; return [q[0]/L,q[1]/L,q[2]/L,q[3]/L]; }
+function m3FromQuat(q){
+  var x=q[0],y=q[1],z=q[2],w=q[3];
+  return [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w),
+          2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w),
+          2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]; }
+function qnlerp(a,b,t){ /* shortest arc, normalised -- rigid all the way */
+  var d=a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3], s2=d<0?-1:1, o=[0,0,0,0], i;
+  for(i=0;i<4;i++) o[i]=a[i]+(b[i]*s2-a[i])*t;
+  var L=Math.hypot(o[0],o[1],o[2],o[3])||1;
+  return [o[0]/L,o[1]/L,o[2]/L,o[3]/L]; }
+/* pose helper: position, half-extents, euler degrees */
+function P3(px,py,pz, hx,hy,hz, rx,ry,rz){
+  return { p:[px,py,pz], s:[hx,hy,hz], r:[(rx||0)*D,(ry||0)*D,(rz||0)*D] };
+}
+
+/* THE EXAMPLE LIBRARY.
+
+   Rewritten after review against two rules that came out of looking at
+   the first version, both of which the first version broke:
+
+   1. MASS CONSERVATION. A part may not grow into something it has no
+      volume to become. The jet's back fins were 0.06 x 0.34 x 0.34 and
+      became 0.24 x 0.64 x 0.26 weight-bearing legs -- a 24x volume
+      increase, matter from nowhere, and it read as exactly that. The
+      rule now: STRUCTURE comes from the bulkiest parts (fuselage,
+      hull, trailer, intakes), and small distinctive parts (fins,
+      wingtips, stacks) stay DETAIL -- forearm blades, backpack
+      hardware, shoulder vents. The audit measures this now (see
+      volume-ratio reporting) rather than leaving it to eye.
+
+   2. ROTATION IS PART OF THE FOLD. A wheel that becomes a shoulder
+      must TWIST -- its axle points across the bike when rolling and
+      along the arm when mounted. Poses therefore carry euler angles,
+      and the sample interpolates the transform, so the turn is rigid
+      instead of a shrinking box.
+
+   Each pose is P3(x,y,z, halfX,halfY,halfZ, rotX,rotY,rotZ) in degrees. */
+var RIGS=[
+ { name:'Skiff \u2192 Humanoid',
+   spin:[0,0,0],
+   desc:'The baseline. Chassis becomes the torso; wheels twist 90\u00b0 onto the shoulders. Mass-conserved and collision-clean throughout.',
+   attach:[['chassis','cabin'],['chassis','armL'],['chassis','armR'],['chassis','legL'],['chassis','legR'],['chassis','wheelL'],['chassis','wheelR'],['cabin','armL'],['cabin','armR'],['armL','wheelL'],['armR','wheelR'],['chassis','wheelL'],['chassis','wheelR']],
+   parts:[
+  ['chassis', P3(0,.42,.18,  .92,.22,1.30),      P3(0,1.95,0,   .70,.62,.42),        [0.54,0.70,1.00]],
+  ['cabin',   P3(0,.60,-.52, .40,.16,.40),       P3(0,2.95,0,   .30,.28,.30),        [0.62,0.78,1.00], {soft:true}],
+  ['armL',    P3(-1.24,.44,.42,.22,.16,.62),     P3(-1.18,1.92,0,.20,.66,.20),       [0.37,0.83,0.60]],
+  ['armR',    P3( 1.24,.44,.42,.22,.16,.62),     P3( 1.18,1.92,0,.20,.66,.20),       [0.37,0.83,0.60]],
+  ['legL',    P3(-.52,.34,-1.70,.30,.28,.36),    P3(-.42,.66,0, .26,.66,.28),        [1.00,0.72,0.42]],
+  ['legR',    P3( .52,.34,-1.70,.30,.28,.36),    P3( .42,.66,0, .26,.66,.28),        [1.00,0.72,0.42]],
+  ['wheelL',  P3(-1.26,.30,1.34,.16,.28,.28,0,0,0),  P3(-1.20,2.60,0,.26,.16,.26,0,0,90), [0.78,0.57,0.92], {parent:'armL'}],
+  ['wheelR',  P3( 1.26,.30,1.34,.16,.28,.28,0,0,0),  P3( 1.20,2.60,0,.26,.16,.26,0,0,-90),[0.78,0.57,0.92], {parent:'armR'}]
+ ]},
+
+ { name:'Tank \u2192 Bruiser',
+   spin:[-8,0,0],
+   desc:'Track pods rotate upright into the legs \u2014 they already have the mass, so nothing has to grow. The barrel folds back as a forearm cannon, not a limb.',
+   attach:[['hull','turret'],['hull','skirt'],['hull','barrel'],['turret','barrel'],['hull','trackL'],['hull','trackR'],['trackL','skirt'],['trackR','skirt'],['hull','armL'],['hull','armR'],['turret','armL'],['turret','armR'],['armR','barrel']],
+   parts:[
+  ['hull',    P3(0,.46,0,     1.05,.30,1.45),     P3(0,1.86,0,   .92,.66,.52),        [0.52,0.60,0.72]],
+  ['turret',  P3(0,.66,-.20,  .46,.18,.46),       P3(0,2.70,0,   .34,.30,.34),        [0.66,0.74,0.88], {soft:true}],
+  ['barrel',  P3(0,.92,1.30,  .09,.09,.85),       P3(1.30,2.20,.30,.09,.09,.55,0,-24,0),[0.80,0.80,0.86]],
+  ['trackL',  P3(-1.34,.34,0, .26,.34,1.40,0,0,0),P3(-.56,.74,0, .30,.74,.34,0,0,0),  [0.44,0.46,0.54]],
+  ['trackR',  P3( 1.34,.34,0, .26,.34,1.40,0,0,0),P3( .56,.74,0, .30,.74,.34,0,0,0),  [0.44,0.46,0.54]],
+  ['armL',    P3(-1.05,.86,-.85,.20,.16,.42),     P3(-1.30,1.82,0,.24,.60,.24),       [0.90,0.66,0.40]],
+  ['armR',    P3( 1.05,.86,-.85,.20,.16,.42),     P3( 1.30,1.82,0,.24,.60,.24),       [0.90,0.66,0.40]],
+  ['skirt',   P3(0,.20,0,     1.16,.10,1.30),     P3(0,1.20,.30, .82,.20,.34,-16,0,0),[0.38,0.42,0.50]]
+ ]},
+
+ { name:'Jet \u2192 Flyer',
+   spin:[0,180,0],
+   desc:'FIXED: the legs used to grow out of two tiny tail fins. Now the INTAKES become the legs (they already carry the volume) and the fins stay detail \u2014 forearm blades that rotate flat against the arms.',
+   attach:[['fuse','nose'],['fuse','wingL'],['fuse','wingR'],['fuse','finL'],['fuse','finR'],['fuse','intakeL'],['fuse','intakeR'],['wingL','intakeL'],['wingR','intakeR'],['nose','wingL'],['nose','wingR'],['wingL','finL'],['wingR','finR'],['intakeL','finL'],['intakeR','finR']],
+   parts:[
+  ['fuse',    P3(0,.62,0,     .34,.30,1.85),      P3(0,1.98,0,   .54,.70,.40),        [0.60,0.68,0.86]],
+  ['nose',    P3(0,.58,1.62,  .22,.20,.48),       P3(0,2.92,.05, .28,.26,.30,20,0,0), [0.72,0.80,0.94], {soft:true}],
+  ['wingL',   P3(-1.55,.60,-.20,1.25,.07,.55),    P3(-1.02,1.94,-.10,.20,.62,.20,0,0,8),[0.42,0.80,0.72]],
+  ['wingR',   P3( 1.55,.60,-.20,1.25,.07,.55),    P3( 1.02,1.94,-.10,.20,.62,.20,0,0,-8),[0.42,0.80,0.72]],
+  /* intakes are the only bulky pair left, so they are the legs */
+  ['intakeL', P3(-.60,.40,.30,.24,.24,.78,0,0,0), P3(-.40,.70,0, .28,.70,.32,0,0,0),  [1.00,0.72,0.42]],
+  ['intakeR', P3( .60,.40,.30,.24,.24,.78,0,0,0), P3( .40,.70,0, .28,.70,.32,0,0,0),  [1.00,0.72,0.42]],
+  /* fins stay fins: thin detail, rotated flat onto the forearms */
+  ['finL',    P3(-.62,.80,-.62,.05,.30,.34),     P3(-1.02,1.70,-.14,.05,.28,.20,0,0,10),[0.86,0.90,0.98], {parent:'wingL'}],
+  ['finR',    P3( .62,.80,-.62,.05,.30,.34),     P3( 1.02,1.70,-.14,.05,.28,.20,0,0,-10),[0.86,0.90,0.98], {parent:'wingR'}]
+ ]},
+
+ { name:'Hauler \u2192 Titan',
+   spin:[0,0,0],
+   desc:'FIXED again: tyres now swing OUTBOARD clear of the arms, the head STOWS inside the cab instead of riding the roof, and the legs break at the knee as they plant.',
+   attach:[['cab','head'],['cab','trailer'],['trailer','legL'],['trailer','legR'],['cab','armL'],['cab','armR'],['cab','wheelL'],['cab','wheelR'],['trailer','wheelL'],['trailer','wheelR'],['head','armL'],['head','armR'],['cab','backL'],['cab','backR'],['trailer','backL'],['trailer','backR'],['armL','wheelL'],['armR','wheelR'],['backL','legL'],['backR','legR'],['backL','backR'],['cab','legL'],['cab','legR']],
+   parts:[
+  ['cab',     P3(0,.80,1.55,  .88,.52,.72),       P3(0,2.05,0,   .92,.76,.50),        [0.56,0.66,0.96]],
+  ['backL',   P3(-.62,.74,-.95,.30,.44,1.70),     P3(-.66,2.10,-.44,.36,.62,.44,0,0,0),[0.46,0.52,0.66]],
+  ['backR',   P3( .62,.74,-.95,.30,.44,1.70),     P3( .66,2.10,-.44,.36,.62,.44,0,0,0),[0.46,0.52,0.66]],
+  /* the head STOWS: in vehicle mode it is sunk inside the cab, not
+     riding on the roof. "No exposed soft parts in vehicle mode." */
+  ['head',    P3(0,.74,1.42,  .26,.26,.26),       P3(0,3.06,0,   .30,.30,.30),        [0.70,0.78,0.92], {soft:true}],
+  ['armL',    P3(-1.02,.86,1.42,.22,.34,.58),      P3(-1.42,1.98,0,.26,.72,.26),       [0.36,0.82,0.62]],
+  ['armR',    P3( 1.02,.86,1.42,.22,.34,.58),      P3( 1.42,1.98,0,.26,.72,.26),       [0.36,0.82,0.62]],
+  ['legL',    P3(-.62,.32,-2.34,.34,.28,.34),     P3(-.52,.74,-.06,.32,.74,.34,-14,0,0),[1.00,0.70,0.40], {parent:'backL'}],
+  ['legR',    P3( .62,.32,-2.34,.34,.28,.34),     P3( .52,.74,-.06,.32,.74,.34,-14,0,0),[1.00,0.70,0.40], {parent:'backR'}],
+  ['wheelL',  P3(-1.06,.30,.55,.16,.30,.30,0,0,0),P3(-1.86,2.34,0,.30,.16,.30,0,0,90),[0.78,0.56,0.90], {parent:'armL'}],
+  ['wheelR',  P3( 1.06,.30,.55,.16,.30,.30,0,0,0),P3( 1.86,2.34,0,.30,.16,.30,0,0,-90),[0.78,0.56,0.90], {parent:'armR'}]
+ ]},
+
+ { name:'Crawler \u2192 Spider',
+   desc:'REDESIGNED: the six legs fold onto the BACK as a rack \u2014 a walking boost the robot carries \u2014 and the humanoid that was tucked inside the shell stands up out of it. Two readable bodies, not a shuffle.',
+   spin:[0,0,0],
+   attach:[['core','torso'],['core','head'],['torso','head'],['torso','armL'],['torso','armR'],
+           ['torso','legL'],['torso','legR'],['core','legL'],['core','legR'],
+           ['core','rackFL'],['core','rackFR'],['core','rackML'],['core','rackMR'],['core','rackBL'],['core','rackBR'],
+           ['torso','rackFL'],['torso','rackFR'],['torso','rackML'],['torso','rackMR'],['torso','rackBL'],['torso','rackBR'],
+           ['rackFL','rackML'],['rackML','rackBL'],['rackFR','rackMR'],['rackMR','rackBR'],
+           ['core','armL'],['core','armR'],['armL','legL'],['armR','legR'],['armL','rackML'],['armR','rackMR'],
+           ['armL','rackFL'],['armR','rackFR'],['legL','rackBL'],['legR','rackBR'],['legL','legR'],
+           ['armL','armR'],['head','armL'],['head','armR'],['torso','core'],['legL','rackML'],['legR','rackMR']],
+   parts:[
+  /* the shell: a low carapace on the ground, then a backplate the
+     humanoid wears once it is out */
+  ['core',    P3(0,.30,0,     .84,.22,1.00),      P3(0,1.98,-.34,.62,.44,.26,-12,0,0),  [0.50,0.66,0.78]],
+  /* the humanoid, tucked INSIDE the shell in crawler mode -- soft, so
+     the concealment check has something to hold it to */
+  ['torso',   P3(0,.26,-.10,  .40,.14,.52),       P3(0,1.72,0,   .48,.52,.30),          [0.58,0.74,0.92], {soft:true}],
+  ['head',    P3(0,.24,.34,   .22,.16,.22),       P3(0,2.42,0,   .24,.24,.24),          [0.66,0.82,0.96], {soft:true,parent:'torso'}],
+  ['armL',    P3(-.44,.24,.10,.16,.10,.34),       P3(-.68,1.66,0,.17,.50,.18),          [0.40,0.84,0.64], {parent:'torso'}],
+  ['armR',    P3( .44,.24,.10,.16,.10,.34),       P3( .68,1.66,0,.17,.50,.18),          [0.40,0.84,0.64], {parent:'torso'}],
+  ['legL',    P3(-.26,.20,-.50,.24,.22,.44),      P3(-.26,.62,0, .22,.62,.26),          [1.00,0.74,0.44], {parent:'torso'}],
+  ['legR',    P3( .26,.20,-.50,.24,.22,.44),      P3( .26,.62,0, .22,.62,.26),          [1.00,0.74,0.44], {parent:'torso'}],
+  /* the six crawler legs: splayed and load-bearing on the ground,
+     folded flat against the backplate in robot mode */
+  ['rackFL',  P3(-.94,.18,.74,.46,.09,.15,0,0,0), P3(-.40,2.24,-.52,.13,.42,.11,-64,0,-10),[0.94,0.68,0.44]],
+  ['rackFR',  P3( .94,.18,.74,.46,.09,.15,0,0,0), P3( .40,2.24,-.52,.13,.42,.11,-64,0,10), [0.94,0.68,0.44]],
+  ['rackML',  P3(-1.02,.18,0, .50,.09,.15,0,0,0), P3(-.58,2.02,-.56,.13,.44,.11,-70,0,-14),[0.90,0.64,0.42]],
+  ['rackMR',  P3( 1.02,.18,0, .50,.09,.15,0,0,0), P3( .58,2.02,-.56,.13,.44,.11,-70,0,14), [0.90,0.64,0.42]],
+  ['rackBL',  P3(-.94,.18,-.74,.46,.09,.15,0,0,0),P3(-.40,1.78,-.58,.13,.42,.11,-76,0,-10),[0.86,0.60,0.40]],
+  ['rackBR',  P3( .94,.18,-.74,.46,.09,.15,0,0,0),P3( .40,1.78,-.58,.13,.42,.11,-76,0,10), [0.86,0.60,0.40]]
+ ]},
+ { name:'Cycle \u2192 Scout',
+   spin:[0,0,0],
+   desc:'FIXED: the tyres are shoulders, so they now TWIST 90\u00b0 onto the arms instead of sliding flat. Watch the wheel faces turn as they rise. 5 of 21 samples collide on the way.',
+   attach:[['spine','fairing'],['spine','wheelF'],['spine','wheelB'],['spine','armL'],['spine','armR'],['spine','legL'],['spine','legR'],['fairing','wheelF'],['fairing','armL'],['fairing','armR'],['armL','wheelF'],['armR','wheelB'],['wheelF','armL'],['wheelB','armR']],
+   parts:[
+  ['spine',   P3(0,.56,0,     .16,.16,1.10),      P3(0,1.72,0,   .40,.58,.28),        [0.58,0.72,1.00]],
+  ['fairing', P3(0,.54,.78,   .20,.16,.34),       P3(0,2.46,0,   .26,.26,.26),        [0.66,0.80,0.98], {soft:true}],
+  /* the whole point: axle across the bike -> along the arm */
+  ['wheelF',  P3(0,.40,1.42,  .10,.40,.40,0,0,0), P3(-.80,2.16,0,.34,.10,.34,0,0,90), [0.80,0.58,0.92], {parent:'armL'}],
+  ['wheelB',  P3(0,.40,-1.28, .10,.40,.40,0,0,0), P3( .80,2.16,0,.34,.10,.34,0,0,-90),[0.80,0.58,0.92], {parent:'armR'}],
+  ['armL',    P3(-.42,.62,.30,.14,.12,.42),       P3(-.74,1.66,0,.16,.54,.16),        [0.40,0.84,0.64]],
+  ['armR',    P3( .42,.62,.30,.14,.12,.42),       P3( .74,1.66,0,.16,.54,.16),        [0.40,0.84,0.64]],
+  ['legL',    P3(-.30,.32,-.84,.20,.24,.42),      P3(-.30,.58,0, .20,.58,.24),        [1.00,0.74,0.44]],
+  ['legR',    P3( .30,.32,-.84,.20,.24,.42),      P3( .30,.58,0, .20,.58,.24),        [1.00,0.74,0.44]]
+ ]}
+];
+var rigIndex=0;
+var PARTS=RIGS[0].parts;
+var prims=[];
+function buildRig(idx){
+  rigIndex=((idx%RIGS.length)+RIGS.length)%RIGS.length;
+  PARTS=RIGS[rigIndex].parts;
+  for(var d=0; d<prims.length; d++){ gl.deleteBuffer(prims[d].pbuf); gl.deleteBuffer(prims[d].nbuf); }
+  prims=[];
+  var byName={}, i;
+  for(i=0;i<PARTS.length;i++) byName[PARTS[i][0]]=i;
+  for(i=0;i<PARTS.length;i++){
+    var nm=PARTS[i][0], A=PARTS[i][1], B=PARTS[i][2], col=PARTS[i][3], opt=PARTS[i][4]||{};
+    /* PARENTING. Stagger used to move every part in WORLD space, so a
+       part that lagged behind its neighbours visibly detached and the
+       fold read as a Lego build rather than a transformation. Parts now
+       hang off a parent (default: part 0, the bulk) and are animated in
+       LOCAL space, so a child rides whatever its parent is doing and
+       stays attached no matter how the timing is staggered.
+       joints.rs already carries `parent` per joint for the fitted rigs;
+       this is the same idea, and the viewer simply was not using it. */
+    var par = (opt.parent!==undefined && byName[opt.parent]!==undefined) ? byName[opt.parent] : (i===0?-1:0);
+    if(par>=i) par = (i===0?-1:0);        /* parents must precede children */
+    var localA, localB;
+    if(par<0){
+      localA={ p:A.p.slice(), q:quatFromM3(eulerMat(A.r)), s:A.s.slice() };
+      localB={ p:B.p.slice(), q:quatFromM3(eulerMat(B.r)), s:B.s.slice() };
+    } else {
+      var PA=PARTS[par][1], PB=PARTS[par][2];
+      var RAi=m3T(eulerMat(PA.r)), RBi=m3T(eulerMat(PB.r));
+      var dA=[A.p[0]-PA.p[0], A.p[1]-PA.p[1], A.p[2]-PA.p[2]];
+      var dB=[B.p[0]-PB.p[0], B.p[1]-PB.p[1], B.p[2]-PB.p[2]];
+      localA={ p:xf(RAi,dA), q:quatFromM3(m3mul(RAi, eulerMat(A.r))), s:A.s.slice() };
+      localB={ p:xf(RBi,dB), q:quatFromM3(m3mul(RBi, eulerMat(B.r))), s:B.s.slice() };
+    }
+    var va=8*A.s[0]*A.s[1]*A.s[2], vb=8*B.s[0]*B.s[1]*B.s[2];
+    prims.push({ name:nm, A:A, B:B, la:localA, lb:localB, parent:par, color:col,
+      vratio:vb/Math.max(1e-6,va),
+      live:new Float32Array(UNIT.pos.length), lnrm:new Float32Array(UNIT.nrm.length),
+      pbuf:gl.createBuffer(), nbuf:gl.createBuffer(), hit:false, bb:null,
+      wp:[0,0,0], wr:[1,0,0, 0,1,0, 0,0,1],
+      centre:[(A.p[0]+B.p[0])/2,(A.p[1]+B.p[1])/2,(A.p[2]+B.p[2])/2] });
+  }
+  var sel=document.getElementById('rig'); if(sel) sel.selectedIndex=rigIndex;
+  var dsc=document.getElementById('rigdesc'); if(dsc) dsc.textContent=RIGS[rigIndex].desc;
+  var mv=document.getElementById('mass'); if(mv) mv.innerHTML=massReport();
+  var cvp=document.getElementById('conceal'); if(cvp) cvp.innerHTML=concealReport();
+}
+
+/* MASS CONSERVATION -- the rule that came out of review: structure must
+   come from parts that already have the volume, and small distinctive
+   parts stay detail. Anything growing past GROW_MAX is matter from
+   nowhere; anything below SHRINK_MIN has vanished into a sliver. */
+var GROW_MAX=3.0, SHRINK_MIN=0.28;
+
+/* CONCEALMENT -- "don't leave exposed soft parts in vehicle mode."
+   A cockpit or a head sitting proud on the hull is the tell that a
+   vehicle is a robot wearing a costume. Measurable as containment: at
+   t=0, a part marked soft must have most of its volume inside some
+   other part's box. Reported per rig, same as mass. */
+function containFrac(inner, outer){
+  var ix=Math.min(inner.hi[0],outer.hi[0])-Math.max(inner.lo[0],outer.lo[0]);
+  var iy=Math.min(inner.hi[1],outer.hi[1])-Math.max(inner.lo[1],outer.lo[1]);
+  var iz=Math.min(inner.hi[2],outer.hi[2])-Math.max(inner.lo[2],outer.lo[2]);
+  if(ix<=0||iy<=0||iz<=0) return 0;
+  var vi=(inner.hi[0]-inner.lo[0])*(inner.hi[1]-inner.lo[1])*(inner.hi[2]-inner.lo[2]);
+  return vi>1e-9 ? (ix*iy*iz)/vi : 0;
+}
+function boxOf(pose){
+  return { lo:[pose.p[0]-pose.s[0],pose.p[1]-pose.s[1],pose.p[2]-pose.s[2]],
+           hi:[pose.p[0]+pose.s[0],pose.p[1]+pose.s[1],pose.p[2]+pose.s[2]] };
+}
+var CONCEAL_MIN=0.55;
+function concealReport(){
+  var soft=[], i, j, best, nm;
+  for(i=0;i<PARTS.length;i++) if(PARTS[i][4] && PARTS[i][4].soft) soft.push(i);
+  if(!soft.length) return '<span class="dim">no soft parts declared</span>';
+  var bad=[];
+  for(var k=0;k<soft.length;k++){
+    i=soft[k]; best=0; nm=PARTS[i][0];
+    var inner=boxOf(PARTS[i][1]);
+    for(j=0;j<PARTS.length;j++){
+      if(j===i || (PARTS[j][4]&&PARTS[j][4].soft)) continue;
+      best=Math.max(best, containFrac(inner, boxOf(PARTS[j][1])));
+    }
+    if(best<CONCEAL_MIN) bad.push(nm+' '+Math.round(best*100)+'% enclosed');
+  }
+  if(!bad.length) return '<span class="ok">stowed</span> <span class="dim">'+soft.length+
+    ' soft part(s), all \u2265'+Math.round(CONCEAL_MIN*100)+'% enclosed at t=0</span>';
+  return '<span class="bad">exposed in vehicle mode</span>\n<span class="dim">'+bad.join('\n')+'</span>';
+}
+
+/* THE GYMNAST AXIS. A fold that only translates parts reads as a
+   machine unpacking itself on a table. Real transformations carry the
+   whole body through a rotation -- a twist about the spine, a pitch
+   like a kip-up, a roll on landing -- and the limbs move relative to a
+   body that is itself turning. Each rig declares its own spin, and the
+   damage and gravity sliders bend how it is spent. */
+function bodySpin(t, rig){
+  var b=rig.spin||[0,0,0];
+  var e=tuckSpin(t);
+  return [b[0]*D*e, b[1]*D*e, b[2]*D*e];
+}
+
+/* TUCK AND SPIN.
+   Angular momentum is conserved while a body is unsupported: you cannot
+   change how much you have, only how fast it expresses, by changing
+   moment of inertia. A gymnast pulls into a tuck to rotate quickly and
+   opens to slow down and land. That is not a stylistic flourish -- it
+   is why a somersault looks the way it does, and it is the difference
+   between a body that turns and a body that is being turned.
+
+   compact.rs IS a tuck: its curve pulls mass toward the body centre,
+   peaking mid-fold and returning to zero at both ends. So the spin rate
+   should peak where the compaction peaks. Before this the two were
+   independent, which read as a body rotating at a constant rate while
+   separately happening to compress -- physically backwards, and it is
+   the reason the spins looked like a turntable.
+
+   Implemented as a rate curve integrated to an angle, rather than
+   easing the angle directly: rate = 1 + tuck*GAIN, normalised so the
+   total rotation still lands exactly on the authored value. The body
+   therefore hangs at the start, whips through the middle while it is
+   small, and arrives settled. */
+var TUCK_GAIN=2.2;
+function tuckSpin(t){
+  var s=Math.min(1,Math.max(0,t));
+  var useC=conC.checked, str=+strS.value;
+  var dmg=+dmgS.value;
+  /* a damaged body tucks harder and later -- it collapses rather than
+     folds, which is xform.rs Profile's whole point */
+  var gain=TUCK_GAIN*(useC?str:0.55)*(1+0.5*dmg);
+  var N=24, i, x, rate, acc=0, cum=[0];
+  for(i=1;i<=N;i++){
+    x=(i-0.5)/N;
+    rate=1+gain*curve(x);            /* curve() is compact.rs's own tuck */
+    acc+=rate/N; cum.push(acc);
+  }
+  if(acc<1e-6) return s;
+  var f=s*N, k=Math.floor(f), fr=f-k;
+  if(k>=N) return 1;
+  var v=cum[k]+(cum[k+1]-cum[k])*fr;
+  return v/acc;                       /* normalised: ends still land exactly */
+}
+
+/* damage picks the personality, matching xform.rs Profile::from_health:
+   unhurt settles, hurt snaps and overshoots. */
+function spinEase(t){
+  var dmg=+dmgS.value;
+  var s=Math.min(1,Math.max(0,t));
+  var settled=s*s*(3-2*s);                       /* smoothstep */
+  var c=1.70158*(1+1.4*dmg);
+  var snap=1+(c+1)*Math.pow(s-1,3)+c*Math.pow(s-1,2);
+  return settled+(snap-settled)*dmg;
+}
+/* per-part stagger: parts do not all move at once. Order is array
+   order, which is authored bulk-first, so the chassis commits before
+   the greebles follow -- the "snapping together" read. */
+function partT(t, i, n){
+  var spread=+stagS.value;
+  if(spread<=0.001 || n<2) return t;
+  var w=1-spread, st=spread/(n-1);
+  return Math.min(1,Math.max(0,(t-i*st)/Math.max(0.05,w)));
+}
+/* THE SUPPORT TRANSITION.
+   A transformation is a change of base of support: a vehicle rests on
+   wheels, a robot on feet, and the fold is the handover. Real moves are
+   organised around that -- a kip-up drives the hips over the feet, a
+   roll keeps a rolling contact so the pivot travels along the body.
+   Rotating about a fixed waist (what this did before) is the one thing
+   no support transition does; it reads as a model on a turntable.
+
+   So the pivot MOVES: it starts at the vehicle's contact patch (front
+   of the wheelbase), travels back to where the feet will plant, and the
+   body turns about that instead of its own middle. */
+function pivotAt(t, rig){
+  var a=(rig.pivotA!==undefined)?rig.pivotA:[0,0.10,0.55];
+  var b=(rig.pivotB!==undefined)?rig.pivotB:[0,0.10,0.00];
+  var e=curve(t)>0?tuckSpin(t):t;
+  return [a[0]+(b[0]-a[0])*e, a[1]+(b[1]-a[1])*e, a[2]+(b[2]-a[2])*e];
+}
+
+/* gravity: a settle dip as the body takes its own weight at the end of
+   the fold, and a sag when hanging mid-fold. Suspension, basically. */
+function settleDrop(t){
+  var g=+gravS.value;
+  if(g<=0.001) return 0;
+  var s=Math.min(1,Math.max(0,t));
+  var bounce=Math.sin(Math.PI*Math.min(1,s*1.15))*0.06
+           - Math.max(0,Math.sin(Math.PI*(s-0.82)/0.36))*0.05;
+  return -g*bounce;
+}
+function massReport(){
+  var bad=[], i, p, r;
+  for(i=0;i<prims.length;i++){
+    p=prims[i]; r=p.vratio;
+    if(r>GROW_MAX)      bad.push([p.name, r, 'grows']);
+    else if(r<SHRINK_MIN) bad.push([p.name, r, 'shrinks']);
+  }
+  if(!bad.length) return '<span class="ok">conserved</span> <span class="dim">all '+prims.length+
+    ' parts within '+SHRINK_MIN+'\u2013'+GROW_MAX+'x volume</span>';
+  var out='<span class="bad">'+bad.length+' part(s) out of budget</span>\n<span class="dim">';
+  for(i=0;i<bad.length && i<4;i++) out+=bad[i][0]+' '+bad[i][2]+' '+bad[i][1].toFixed(1)+'x\n';
+  return out+'</span>';
+}
+
+var gp=[]; for(var gi=-12; gi<=12; gi++){ gp.push(-12,0,gi, 12,0,gi, gi,0,-12, gi,0,12); }
+var gridPos=new Float32Array(gp);
+var gridBuf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,gridBuf);
+gl.bufferData(gl.ARRAY_BUFFER,gridPos,gl.STATIC_DRAW);
+var gridNrmBuf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,gridNrmBuf);
+var gn=new Float32Array(gridPos.length); for(var k2=1;k2<gn.length;k2+=3) gn[k2]=1;
+gl.bufferData(gl.ARRAY_BUFFER,gn,gl.STATIC_DRAW);
+
+/* ============ fold + audit ============ */
+var OVERLAP_TOL=0.35;
+/* Structurally joined parts overlap by construction and are not
+   faults. Mirrors joints.rs's `interior` flag. */
+function isJoined(a,b){
+  var L=RIGS[rigIndex].attach||[];
+  for(var i=0;i<L.length;i++){
+    if((L[i][0]===a&&L[i][1]===b)||(L[i][0]===b&&L[i][1]===a)) return true;
+  }
+  return false;
+}
+var tS,tv,play,conC,styleSel,cellS,strS,modeSel,showF,dmgS,gravS,stagS,driftC;
+function sampleGeom(t){
+  var P={style:styleSel.value, cell:+cellS.value, strength:+strS.value, minThickness:0.04};
+  var useC=conC.checked, stepping=(modeSel.value==='step');
+  var rig=RIGS[rigIndex];
+  var spin=eulerMat(bodySpin(t, rig));
+  var piv=pivotAt(t, rig);
+  var drop=settleDrop(t);
+  var i,p,f,o,d,nd,lo,hi,j,v,n,tp;
+  for(i=0;i<prims.length;i++){
+    p=prims[i];
+    tp = stepping ? ((t<0.5)?0:1) : partT(t, i, prims.length);
+    f  = stepping ? tp : spinEase(tp);
+    /* LOCAL interpolation, then compose onto the parent's ALREADY
+       animated frame -- this is what keeps a staggered child attached */
+    var lp=[p.la.p[0]+(p.lb.p[0]-p.la.p[0])*f,
+            p.la.p[1]+(p.lb.p[1]-p.la.p[1])*f,
+            p.la.p[2]+(p.lb.p[2]-p.la.p[2])*f];
+    var ls=[p.la.s[0]+(p.lb.s[0]-p.la.s[0])*f,
+            p.la.s[1]+(p.lb.s[1]-p.la.s[1])*f,
+            p.la.s[2]+(p.lb.s[2]-p.la.s[2])*f];
+    var lr=m3FromQuat(qnlerp(p.la.q, p.lb.q, f));
+    if(p.parent<0){ p.wr=lr; p.wp=lp.slice(); }
+    else {
+      var par=prims[p.parent];
+      p.wr=m3mul(par.wr, lr);
+      var off=xf(par.wr, lp);
+      p.wp=[par.wp[0]+off[0], par.wp[1]+off[1], par.wp[2]+off[2]];
+    }
+    d=p.live; nd=p.lnrm; lo=[1e9,1e9,1e9]; hi=[-1e9,-1e9,-1e9];
+    for(j=0;j<d.length;j+=3){
+      v=xf(p.wr,[UNIT.pos[j]*ls[0], UNIT.pos[j+1]*ls[1], UNIT.pos[j+2]*ls[2]]);
+      n=xf(p.wr,[UNIT.nrm[j],UNIT.nrm[j+1],UNIT.nrm[j+2]]);
+      var x=v[0]+p.wp[0], y=v[1]+p.wp[1], z=v[2]+p.wp[2];
+      var w=xf(spin,[x-piv[0], y-piv[1], z-piv[2]]);
+      x=w[0]+piv[0]; y=w[1]+piv[1]+drop; z=w[2]+piv[2];
+      n=xf(spin,n);
+      if(useC){ o=displace([x,y,z],n,p.centre,t,P); x=o[0]; y=o[1]; z=o[2]; }
+      d[j]=x; d[j+1]=y; d[j+2]=z;
+      nd[j]=n[0]; nd[j+1]=n[1]; nd[j+2]=n[2];
+      if(x<lo[0])lo[0]=x; if(y<lo[1])lo[1]=y; if(z<lo[2])lo[2]=z;
+      if(x>hi[0])hi[0]=x; if(y>hi[1])hi[1]=y; if(z>hi[2])hi[2]=z;
+    }
+    p.bb={lo:lo,hi:hi}; p.hit=false;
+    gl.bindBuffer(gl.ARRAY_BUFFER,p.pbuf); gl.bufferData(gl.ARRAY_BUFFER,d,gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER,p.nbuf); gl.bufferData(gl.ARRAY_BUFFER,nd,gl.DYNAMIC_DRAW);
+  }
+}
+function sample(t){
+  sampleGeom(t);
+  /* `i` is declared here on purpose: this function was split out of
+     sampleGeom and inherited its loop variable, which was still
+     declared in the other half. The headless harness caught it as a
+     ReferenceError before it ever reached a browser. */
+  var i, hits=[], worst=0, joined=0;
+  /* BALANCE. A gymnast's move is legible because the centre of mass
+     stays in a believable relationship to the base of support: over it
+     when balanced, deliberately outside it when falling or driving
+     into the next phase. A transformation that ignores this reads as
+     animation rather than motion, however smooth the curves are.
+     Approximated per part by box centre weighted by box volume, and
+     the support base by the footprint of whatever is near the floor. */
+  var cx=0, cz=0, cy=0, mass=0, minY=1e9;
+  for(i=0;i<prims.length;i++){
+    var bb=prims[i].bb; if(!bb) continue;
+    var vx=(bb.hi[0]-bb.lo[0]), vy=(bb.hi[1]-bb.lo[1]), vz=(bb.hi[2]-bb.lo[2]);
+    var m=Math.max(1e-6, vx*vy*vz);
+    cx+=(bb.lo[0]+bb.hi[0])*0.5*m; cy+=(bb.lo[1]+bb.hi[1])*0.5*m; cz+=(bb.lo[2]+bb.hi[2])*0.5*m;
+    mass+=m; if(bb.lo[1]<minY) minY=bb.lo[1];
+  }
+  cx/=Math.max(1e-6,mass); cy/=Math.max(1e-6,mass); cz/=Math.max(1e-6,mass);
+  /* support polygon = XZ extent of parts within a foot-height of the floor */
+  var sxlo=1e9,sxhi=-1e9,szlo=1e9,szhi=-1e9,grounded=0;
+  for(i=0;i<prims.length;i++){
+    var b2=prims[i].bb; if(!b2) continue;
+    if(b2.lo[1] <= minY+0.18){ grounded++;
+      if(b2.lo[0]<sxlo)sxlo=b2.lo[0]; if(b2.hi[0]>sxhi)sxhi=b2.hi[0];
+      if(b2.lo[2]<szlo)szlo=b2.lo[2]; if(b2.hi[2]>szhi)szhi=b2.hi[2]; }
+  }
+  var outX=0,outZ=0;
+  if(grounded>0){
+    outX = cx<sxlo ? (sxlo-cx) : (cx>sxhi ? cx-sxhi : 0);
+    outZ = cz<szlo ? (szlo-cz) : (cz>szhi ? cz-szhi : 0);
+  }
+  var lean=Math.hypot(outX,outZ);
+  window.__balance={com:[cx,cy,cz], lean:lean, floor:minY, grounded:grounded};
+  if(showF.checked){
+    for(i=0;i<prims.length;i++) for(var jj=i+1;jj<prims.length;jj++){
+      var A=prims[i].bb, B=prims[jj].bb; if(!A||!B) continue;
+      var dx=Math.min(A.hi[0],B.hi[0])-Math.max(A.lo[0],B.lo[0]);
+      var dy=Math.min(A.hi[1],B.hi[1])-Math.max(A.lo[1],B.lo[1]);
+      var dz=Math.min(A.hi[2],B.hi[2])-Math.max(A.lo[2],B.lo[2]);
+      var dep=Math.min(Math.max(dx,0),Math.max(dy,0),Math.max(dz,0));
+      if(dep<=0) continue;
+      var sa=Math.min(A.hi[0]-A.lo[0],A.hi[1]-A.lo[1],A.hi[2]-A.lo[2]);
+      var sb=Math.min(B.hi[0]-B.lo[0],B.hi[1]-B.lo[1],B.hi[2]-B.lo[2]);
+      var rel=dep/Math.max(1e-6,Math.min(sa,sb));
+      if(isJoined(prims[i].name,prims[jj].name)){ joined++; continue; }
+      if(rel>worst) worst=rel;
+      if(rel>OVERLAP_TOL){ hits.push(prims[i].name+'\u00d7'+prims[jj].name+' '+rel.toFixed(2)+'x');
+        prims[i].hit=true; prims[jj].hit=true; }
+    }
+  }
+  document.getElementById('fault').innerHTML = !showF.checked ? '<span class="dim">off</span>'
+    : (hits.length ? '<span class="bad">'+hits.length+' intersection(s)</span> <span class="dim">('+joined+' joints ok)</span>\n<span class="dim">'+hits.slice(0,4).join('\n')+'</span>'
+                   : '<span class="ok">clean</span> <span class="dim">worst '+worst.toFixed(2)+'x / tol '+OVERLAP_TOL+' \u00b7 '+joined+' joints ok</span>');
+  var bl=window.__balance||{lean:0,floor:0,com:[0,0,0],grounded:0};
+  var bel=document.getElementById('balance');
+  if(bel){
+    var st = bl.lean<=0.02 ? '<span class="ok">balanced</span>'
+           : (bl.lean<0.28 ? '<span style="color:#e8c46a">leaning</span>'
+                           : '<span class="bad">falling</span>');
+    bel.innerHTML = st+' <span class="dim">CoM '+bl.lean.toFixed(2)+
+      ' outside support \u00b7 floor '+bl.floor.toFixed(2)+
+      ' \u00b7 '+bl.grounded+' part(s) down</span>';
+  }
+  document.getElementById('stats').textContent =
+    'prims        '+prims.length+'\nposes        2 (transform-interpolated)'+
+    '\nt            '+t.toFixed(3)+'\ncurve(t)     '+curve(t).toFixed(4)+
+    (conC.checked?'   compaction ON':'   compaction off')+
+    '\nmode         '+(modeSel.value==='step'?'STEP \u2014 ships today':'BLEND \u2014 needs aligned strips');
+}
+
+/* ============ camera ============ */
+var yaw=0.72, pitch=0.28, dist=9.5, drag=false, lx=0, ly=0;
+cv.addEventListener('mousedown',function(e){ drag=true; lx=e.clientX; ly=e.clientY; });
+window.addEventListener('mouseup',function(){ drag=false; });
+window.addEventListener('mousemove',function(e){ if(!drag) return;
+  yaw-=(e.clientX-lx)*0.008;
+  pitch=Math.max(-1.15,Math.min(1.35,pitch+(e.clientY-ly)*0.006));
+  lx=e.clientX; ly=e.clientY; });
+cv.addEventListener('wheel',function(e){
+  dist=Math.max(3.5,Math.min(26,dist+(e.deltaY>0?0.7:-0.7))); e.preventDefault(); },{passive:false});
+function resize(){ var dpr=Math.min(window.devicePixelRatio||1,2);
+  cv.width=Math.floor(window.innerWidth*dpr); cv.height=Math.floor(window.innerHeight*dpr);
+  cv.style.width=window.innerWidth+'px'; cv.style.height=window.innerHeight+'px';
+  gl.viewport(0,0,cv.width,cv.height); }
+window.addEventListener('resize',resize); resize();
+
+/* Three panes in one canvas via viewport+scissor: the animated fold on
+   the left, and static t=0 / t=1 references stacked on the right. The
+   references are what "vehicle" and "robot" actually mean for this rig,
+   so the fold in the big pane can be read against its own endpoints
+   instead of from memory. Each pane re-samples, which costs three
+   passes over a few hundred verts -- nothing, at this size. */
+function paneRects(){
+  var dpr=Math.min(window.devicePixelRatio||1,2);
+  var L=336*dpr, W=cv.width-L, H=cv.height;
+  var refW=Math.max(150*dpr, Math.min(280*dpr, W*0.30));
+  var mainW=Math.max(120*dpr, W-refW-10*dpr);
+  return {
+    dpr:dpr,
+    main:[L, 0, mainW, H],
+    veh :[L+mainW+10*dpr, Math.floor(H/2)+4*dpr, refW, Math.floor(H/2)-4*dpr],
+    bot :[L+mainW+10*dpr, 0, refW, Math.floor(H/2)-4*dpr]
+  };
+}
+function drawPane(rect, t, isRef){
+  gl.enable(gl.SCISSOR_TEST);
+  gl.viewport(rect[0],rect[1],rect[2],rect[3]);
+  gl.scissor(rect[0],rect[1],rect[2],rect[3]);
+  gl.clearColor(isRef?0.055:0.043, isRef?0.064:0.051, isRef?0.086:0.071, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  sampleGeom(t);
+  var d = isRef ? dist*1.16 : dist;
+  var cyr=Math.cos(pitch)*d;
+  var eye=[Math.sin(yaw)*cyr, 1.5+Math.sin(pitch)*d, Math.cos(yaw)*cyr];
+  var V=lookAt(eye,[0,1.30,0],[0,1,0]);
+  var Pm=persp(48*Math.PI/180, rect[2]/Math.max(1,rect[3]), 0.1, 200);
+  var MVP=mul(Pm,V);
+  gl.uniformMatrix4fv(uMVP,false,MVP);
+  gl.enableVertexAttribArray(aPos); gl.enableVertexAttribArray(aNrm);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gridBuf); gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gridNrmBuf); gl.vertexAttribPointer(aNrm,3,gl.FLOAT,false,0,0);
+  gl.uniform3f(uColor,0.11,0.14,0.20);
+  gl.drawArrays(gl.LINES,0,gridPos.length/3);
+  for(var i=0;i<prims.length;i++){
+    var p=prims[i];
+    gl.bindBuffer(gl.ARRAY_BUFFER,p.pbuf); gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER,p.nbuf); gl.vertexAttribPointer(aNrm,3,gl.FLOAT,false,0,0);
+    // the reference panes never flag faults -- they are what the rig IS,
+    // not a frame under test, and colouring them red would be a lie
+    var c=(p.hit && !isRef)?[1.0,0.30,0.30]:p.color;
+    if(isRef){ c=[c[0]*0.82+0.05, c[1]*0.82+0.05, c[2]*0.82+0.07]; }
+    gl.uniform3f(uColor,c[0],c[1],c[2]);
+    gl.drawArrays(gl.TRIANGLES,0,p.live.length/3);
+  }
+  gl.disable(gl.SCISSOR_TEST);
+}
+function placeLabels(R){
+  var dpr=R.dpr;
+  function put(el,rect){
+    el.style.left=(rect[0]/dpr+8)+'px';
+    el.style.top=((cv.height-rect[1]-rect[3])/dpr+8)+'px';
+  }
+  put(document.getElementById('lbFold'),R.main);
+  put(document.getElementById('lbVeh'),R.veh);
+  put(document.getElementById('lbBot'),R.bot);
+}
+function draw(tAnim){
+  var R=paneRects();
+  // references first, animated pane LAST so the readout and the fault
+  // list describe the frame the player is actually watching
+  drawPane(R.veh, 0.0, true);
+  drawPane(R.bot, 1.0, true);
+  drawPane(R.main, tAnim, false);
+  sample(tAnim);            // recompute with reporting for the panels
+  placeLabels(R);
+  document.getElementById('lbT').textContent='t='+tAnim.toFixed(2);
+}
+
+/* ============ wiring ============ */
+tS=document.getElementById('t'); tv=document.getElementById('tv');
+play=document.getElementById('play'); conC=document.getElementById('con');
+styleSel=document.getElementById('style'); cellS=document.getElementById('cell');
+strS=document.getElementById('str'); modeSel=document.getElementById('mode');
+showF=document.getElementById('showfault');
+dmgS=document.getElementById('dmg'); gravS=document.getElementById('grav');
+stagS=document.getElementById('stag'); driftC=document.getElementById('drift');
+
+/* the example picker: dropdown, prev/next, arrow keys, and wheel over
+   the picker itself. Wheel over the CANVAS still zooms -- two different
+   meanings for one gesture, separated by where the pointer is. */
+var rigSel=document.getElementById('rig');
+for(var ri=0; ri<RIGS.length; ri++){
+  var op=document.createElement('option');
+  op.value=String(ri); op.textContent=(ri+1)+'/'+RIGS.length+'  '+RIGS[ri].name;
+  rigSel.appendChild(op);
+}
+function pickRig(i){ buildRig(i); sample(+tS.value); }
+rigSel.addEventListener('change',function(){ pickRig(+rigSel.value); });
+document.getElementById('prev').addEventListener('click',function(){ pickRig(rigIndex-1); });
+document.getElementById('next').addEventListener('click',function(){ pickRig(rigIndex+1); });
+rigSel.addEventListener('wheel',function(e){ pickRig(rigIndex+(e.deltaY>0?1:-1)); e.preventDefault(); },{passive:false});
+document.getElementById('rigdesc').addEventListener('wheel',function(e){
+  pickRig(rigIndex+(e.deltaY>0?1:-1)); e.preventDefault(); },{passive:false});
+window.addEventListener('keydown',function(e){
+  if(e.key==='ArrowLeft'){ pickRig(rigIndex-1); e.preventDefault(); }
+  else if(e.key==='ArrowRight'){ pickRig(rigIndex+1); e.preventDefault(); }
+  else if(e.key===' '){ play.checked=!play.checked; e.preventDefault(); }
+});
+
+var ctrls=[tS,conC,styleSel,cellS,strS,modeSel,showF,dmgS,gravS,stagS];
+for(var ci=0; ci<ctrls.length; ci++){
+  (function(el){
+    el.addEventListener('input',function(){
+      document.getElementById('cellv').textContent=(+cellS.value).toFixed(2);
+      document.getElementById('strv').textContent=(+strS.value).toFixed(2);
+      document.getElementById('dmgv').textContent=(+dmgS.value).toFixed(2);
+      document.getElementById('gravv').textContent=(+gravS.value).toFixed(2);
+      document.getElementById('stagv').textContent=(+stagS.value).toFixed(2);
+      if(el===tS) play.checked=false;
+      sample(+tS.value);
+    });
+  })(ctrls[ci]);
+}
+
+buildRig(0);
+var last=performance.now(), tt=0, dir=1;
+sample(0);
+function loop(now){
+  var dt=Math.min(0.05,(now-last)/1000); last=now;
+  if(play.checked){
+    tt+=dir*dt/1.3;                     /* xform.rs BLEND_SEC = 1.3 */
+    if(tt>1.28){ tt=1.28; dir=-1; }
+    if(tt<-0.28){ tt=-0.28; dir=1; }
+    var tc=Math.min(1,Math.max(0,tt));
+    tS.value=tc;
+  }
+  tv.textContent=(+tS.value).toFixed(2);
+  draw(+tS.value);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

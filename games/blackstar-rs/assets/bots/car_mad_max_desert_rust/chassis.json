@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_mad_max_desert_rust.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 57,
+  "vertices": 30480,
+  "triangles": 44420,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 3,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.75,
+   "grounded": 0.24
+  },
+  "caveat": "mid-fold scatter (3 blobs during the burst) even though it lands whole"
+ }
+}

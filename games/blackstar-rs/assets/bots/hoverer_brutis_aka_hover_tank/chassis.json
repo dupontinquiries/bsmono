@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_brutis_aka_hover_tank.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 63,
+  "vertices": 32367,
+  "triangles": 45793,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.96,
+   "grounded": 0.55
+  }
+ }
+}

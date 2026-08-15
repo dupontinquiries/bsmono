@@ -127,6 +127,38 @@ def walk_cmd(iqm, d, k):
             "--gait", f"{phase:.4f}", "--t", "1.0"]
 
 
+def strip_signature(gj):
+    """What must match between poses for `xform::Morph` to blend a strip.
+
+    THIS USED TO BE A TOTAL, and a total cannot see the fault that
+    actually occurs. Measured across the roster (skydribble
+    `--fold shapes <bot>`): every pose of a strip has the SAME primitive
+    count and the SAME total vertex count, but emits its primitives in a
+    DIFFERENT ORDER. blackstar is 34 prims / 31973 verts in all five
+    poses, and its per-prim counts still read [.., 24, 16] in f00 and
+    [.., 8, 24] in f01.
+
+    Morph::build compares poses positionally -- poses[k][p].len() against
+    poses[0][p].len() -- so a permutation fails it, build returns None,
+    and the engine silently falls back to STEPPING the strip. That is
+    the flipbook xform.rs believes it replaced, and it is what every
+    chassis currently ships. The old guard summed all VEC3 accessors,
+    which is exactly the quantity that stays equal under a permutation,
+    so it passed every time and reported nothing.
+
+    So the signature is the ORDERED tuple of per-primitive vertex
+    counts, which is precisely what Morph checks.
+    """
+    out = []
+    for mesh in gj.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            ai = prim.get("attributes", {}).get("POSITION")
+            if ai is None:
+                continue
+            out.append(gj["accessors"][ai]["count"])
+    return tuple(out)
+
+
 def base_cmd(iqm, d, k, t):
     """The export command for one pose, so the parity retry can reuse it."""
     c = [os.path.join(FV, "target", "release", "foldview"), "--data", DATA, "--content", os.path.join(BS, "content"),
@@ -385,15 +417,33 @@ def main():
                 sg = os.path.join(d, f"f{k:02d}", "scene.gltf")
                 try:
                     gj = json.load(open(sg))
-                    counts.append(sum(a["count"] for a in gj["accessors"] if a.get("type") == "VEC3"))
+                    counts.append(strip_signature(gj))
                 except Exception:
-                    counts.append(-1)
+                    counts.append(None)
             if len(set(counts)) > 1:
-                for k in range(POSES):
-                    t = k / max(POSES - 1, 1)
-                    c2 = [x for x in base_cmd(iqm, d, k, t) if x != "--group"]
-                    subprocess.run(c2, capture_output=True, text=True, timeout=180)
-                tag = (tag + ", ungrouped") if tag else "ungrouped"
+                # THE RETRY IS DELIBERATELY GONE. It re-ran the export
+                # with --group filtered out, which made sense when
+                # --group was the suspected cause; --group is not in
+                # base_cmd at all any more (see its note above), so the
+                # retry re-ran an IDENTICAL command five times and then
+                # tagged the chassis "ungrouped" whether or not anything
+                # changed. With the signature above actually detecting
+                # the permutation -- which it does, on every chassis
+                # measured -- that dead retry would burn five exports
+                # per bot across the whole roster and still emit a
+                # mismatched strip.
+                #
+                # The honest response to a fault this tool cannot fix is
+                # to say so. The permutation comes from --gltf-merge
+                # grouping by colour and emitting the groups in an order
+                # that is not stable between poses; fixing it means
+                # making that order deterministic inside foldview, not
+                # re-running foldview differently from here.
+                widths = ", ".join(str(len(c)) if c else "?" for c in counts)
+                tag = (tag + ", STRIP PERMUTED") if tag else "STRIP PERMUTED"
+                print(f"    {name}: strip poses disagree on primitive ORDER "
+                      f"(prims per pose: {widths}) -- Morph will refuse this "
+                      f"strip and the fold will STEP, not blend")
 
         # THE WALK CYCLE, four phases at the robot end. Written beside the
         # fold strip rather than inside it: a fold is indexed by t and a walk

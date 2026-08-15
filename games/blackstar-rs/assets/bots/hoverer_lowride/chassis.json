@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_lowride.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 56,
+  "vertices": 16988,
+  "triangles": 23752,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.9,
+   "grounded": 0.86
+  }
+ }
+}

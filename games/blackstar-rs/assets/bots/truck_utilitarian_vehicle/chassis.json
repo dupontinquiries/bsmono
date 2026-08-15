@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_truck_utilitarian_vehicle.iqm",
+ "foldview": {
+  "category": "truck",
+  "poses": 5,
+  "prims": 60,
+  "vertices": 64569,
+  "triangles": 43582,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.83,
+   "grounded": 0.26
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.83)"
+ }
+}

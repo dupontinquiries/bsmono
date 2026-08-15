@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_unitus_aka_free_sci_fi_vehicle_001_public_domain_cc0.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 62,
+  "vertices": 18132,
+  "triangles": 23037,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.88,
+   "grounded": 0.58
+  }
+ }
+}

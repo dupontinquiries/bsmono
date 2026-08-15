@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_beetlejuice.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 66,
+  "vertices": 21345,
+  "triangles": 34401,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.92,
+   "grounded": 0.53
+  }
+ }
+}

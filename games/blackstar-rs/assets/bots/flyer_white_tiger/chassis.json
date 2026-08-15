@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_white_tiger.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 42,
+  "vertices": 26169,
+  "triangles": 36126,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.94,
+   "grounded": 0.32
+  }
+ }
+}

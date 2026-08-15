@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_lonestar_aka_bronze_space_age_combat_jet_animation.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 45,
+  "vertices": 28154,
+  "triangles": 42780,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.94,
+   "grounded": 0.49
+  }
+ }
+}

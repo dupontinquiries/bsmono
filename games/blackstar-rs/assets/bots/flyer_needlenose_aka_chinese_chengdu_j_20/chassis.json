@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_needlenose_aka_chinese_chengdu_j_20.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 55,
+  "vertices": 24158,
+  "triangles": 42418,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.93,
+   "grounded": 0.36
+  }
+ }
+}

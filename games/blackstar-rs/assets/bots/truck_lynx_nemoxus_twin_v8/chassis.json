@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_truck_lynx_nemoxus_twin_v8.iqm",
+ "foldview": {
+  "category": "truck",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 59561,
+  "triangles": 66019,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.97,
+   "grounded": 0.21
+  }
+ }
+}

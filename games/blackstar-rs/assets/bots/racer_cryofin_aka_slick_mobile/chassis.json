@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_racer_cryofin_aka_slick_mobile.iqm",
+ "foldview": {
+  "category": "racer",
+  "poses": 5,
+  "prims": 58,
+  "vertices": 9729,
+  "triangles": 16239,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.88,
+   "grounded": 0.35
+  }
+ }
+}

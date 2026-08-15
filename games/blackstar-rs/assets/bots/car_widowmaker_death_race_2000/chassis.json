@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_widowmaker_death_race_2000.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 40,
+  "vertices": 24988,
+  "triangles": 41006,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.53,
+   "grounded": 0.23
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.53)"
+ }
+}

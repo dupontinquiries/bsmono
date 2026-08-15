@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_lynx_crabronix_dash_v.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 52,
+  "vertices": 41092,
+  "triangles": 50624,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 2,
+   "symmetry": 0.87,
+   "grounded": 0.21
+  },
+  "caveat": "2 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

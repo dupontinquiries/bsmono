@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_truck_mad_car_8k_resolution.iqm",
+ "foldview": {
+  "category": "truck",
+  "poses": 5,
+  "prims": 61,
+  "vertices": 14398,
+  "triangles": 21826,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.79,
+   "grounded": 0.23
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.79)"
+ }
+}

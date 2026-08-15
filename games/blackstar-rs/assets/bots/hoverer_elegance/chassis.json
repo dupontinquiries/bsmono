@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_elegance.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 45,
+  "vertices": 24842,
+  "triangles": 33134,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.91,
+   "grounded": 0.56
+  }
+ }
+}

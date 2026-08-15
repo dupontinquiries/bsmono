@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_analog_aka_weaponless_scout.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 27057,
+  "triangles": 42440,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.87,
+   "grounded": 0.24
+  }
+ }
+}

@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_tank_hawkeye_aka_modern_t_i_k_battle_tank.iqm",
+ "foldview": {
+  "category": "tank",
+  "poses": 5,
+  "prims": 63,
+  "vertices": 31741,
+  "triangles": 47619,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.95,
+   "grounded": 0.32
+  }
+ }
+}

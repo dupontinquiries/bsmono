@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hovertank_whistlewind_aka_hover_ifv_pbr.iqm",
+ "foldview": {
+  "category": "hovertank",
+  "poses": 5,
+  "prims": 58,
+  "vertices": 16276,
+  "triangles": 23246,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.67,
+   "grounded": 0.32
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.67)"
+ }
+}

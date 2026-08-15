@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_dawnshade.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 21907,
+  "triangles": 29792,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 3,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.49,
+   "grounded": 0.4
+  },
+  "caveat": "mid-fold scatter (3 blobs during the burst) even though it lands whole"
+ }
+}

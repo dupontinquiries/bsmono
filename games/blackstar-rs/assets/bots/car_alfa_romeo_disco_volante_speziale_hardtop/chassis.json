@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_alfa_romeo_disco_volante_speziale_hardtop.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 37,
+  "vertices": 4161,
+  "triangles": 7360,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.93,
+   "grounded": 0.26
+  }
+ }
+}

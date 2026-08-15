@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_hunter_manhattan_custom.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 57,
+  "vertices": 39409,
+  "triangles": 32718,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 2,
+   "symmetry": 0.89,
+   "grounded": 0.3
+  },
+  "caveat": "2 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

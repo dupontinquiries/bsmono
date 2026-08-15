@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_racing_2004_ferrari_f2004.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 60,
+  "vertices": 30042,
+  "triangles": 42671,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.87,
+   "grounded": 0.24
+  }
+ }
+}

@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_hull.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 61,
+  "vertices": 18793,
+  "triangles": 26135,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.56,
+   "grounded": 0.26
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.56)"
+ }
+}

@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_boat_mistral_class_lhd.iqm",
+ "foldview": {
+  "category": "boat",
+  "poses": 5,
+  "prims": 42,
+  "vertices": 25035,
+  "triangles": 34294,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.69,
+   "grounded": 0.37
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.69)"
+ }
+}

@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_skytower.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 43,
+  "vertices": 21973,
+  "triangles": 36460,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.91,
+   "grounded": 0.44
+  }
+ }
+}

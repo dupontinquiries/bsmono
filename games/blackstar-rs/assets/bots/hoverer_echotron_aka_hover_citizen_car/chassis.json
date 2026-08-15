@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_echotron_aka_hover_citizen_car.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 37,
+  "vertices": 8118,
+  "triangles": 12321,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.37,
+   "grounded": 0.3
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.37)"
+ }
+}

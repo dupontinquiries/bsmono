@@ -93,6 +93,71 @@ pub fn ring(ui: &mut Vec<UiVert>, cx: f32, cy: f32, r: f32, w: f32, aspect: f32,
     }
 }
 
+/// THE ACTION BAR, drawn — nine slots along the bottom edge, Minecraft's
+/// own layout because it is the one players already read without being
+/// taught: a row of equal cells, the active one lifted and outlined.
+///
+/// Only the active slot's label is written out. Nine simultaneous labels
+/// is the clutter this project's own art bible warns against ("one
+/// enormous readable idea beats twenty greebles"), and in a driving game
+/// the bar is read peripherally — the slot NUMBER is the thing the hand
+/// needs, the name is the thing the eye wants only for what it just
+/// pressed.
+pub fn draw_hotbar(ui: &mut Vec<UiVert>, a: f32, hb: &crate::hotbar::Hotbar) {
+    if hb.is_empty() {
+        return; // nothing armed: no furniture on screen
+    }
+    let cells = crate::hotbar::SLOTS;
+    let cw = 0.072;
+    let gap = 0.008;
+    let total = cells as f32 * cw + (cells - 1) as f32 * gap;
+    let x0 = -total * 0.5;
+    let y = -0.90;
+    let h = 0.062;
+    for i in 0..cells {
+        let cx = x0 + i as f32 * (cw + gap);
+        let active = i == hb.active_index();
+        let filled = hb.slot(i).is_some();
+        // the active cell sits slightly proud and brighter — the lift is
+        // what makes the row readable at a glance without reading text
+        let lift = if active { 0.010 } else { 0.0 };
+        let bg = if active {
+            [0.10, 0.13, 0.18, 0.88]
+        } else if filled {
+            [0.05, 0.06, 0.09, 0.66]
+        } else {
+            [0.03, 0.03, 0.05, 0.42]
+        };
+        quad(ui, cx, y + lift, cx + cw, y + h + lift, bg);
+        if active {
+            // outline, drawn as four thin quads (no line primitive here)
+            let t = 0.004;
+            let c = [0.55, 0.78, 1.0, 0.95];
+            quad(ui, cx, y + h + lift - t, cx + cw, y + h + lift, c);
+            quad(ui, cx, y + lift, cx + cw, y + lift + t, c);
+            quad(ui, cx, y + lift, cx + t, y + h + lift, c);
+            quad(ui, cx + cw - t, y + lift, cx + cw, y + h + lift, c);
+        }
+        // the slot number, always — this is what the hand actually uses
+        let num = [b'1' + i as u8];
+        let s = std::str::from_utf8(&num).unwrap_or("?");
+        let ncol = if filled { [0.86, 0.90, 0.96, 0.95] } else { [0.45, 0.47, 0.52, 0.70] };
+        label(ui, cx + 0.006, y + lift + 0.006, 0.0052, a, ncol, s);
+    }
+    // the active slot's name, centred under the bar
+    if let Some(slot) = hb.active() {
+        let name = match &slot.item {
+            crate::gear::Item::Weapon { verb, element, .. } => {
+                format!("{} {}", element.name(), crate::gear::verb_name(*verb))
+            }
+            crate::gear::Item::Armor(m) => m.name.to_string(),
+        };
+        let px = 0.0060;
+        let w = font::width(&name, px, a);
+        label(ui, -w * 0.5, y - 0.036, px, a, [0.78, 0.84, 0.92, 0.92], &name);
+    }
+}
+
 pub fn label(ui: &mut Vec<UiVert>, x: f32, y: f32, px: f32, a: f32, c: [f32; 4], s: &str) {
     font::text(ui, x + px * 0.16 / a, y - px * 0.16, px, a, SHADOW, s);
     font::text(ui, x, y, px, a, c, s);

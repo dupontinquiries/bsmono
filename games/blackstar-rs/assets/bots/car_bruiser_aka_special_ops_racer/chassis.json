@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_bruiser_aka_special_ops_racer.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 59,
+  "vertices": 29119,
+  "triangles": 43018,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.75,
+   "grounded": 0.25
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.75)"
+ }
+}

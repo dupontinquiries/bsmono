@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_tank_colossus_aka_halo_scorpion_style_tank.iqm",
+ "foldview": {
+  "category": "tank",
+  "poses": 5,
+  "prims": 48,
+  "vertices": 35443,
+  "triangles": 47296,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.94,
+   "grounded": 0.59
+  }
+ }
+}

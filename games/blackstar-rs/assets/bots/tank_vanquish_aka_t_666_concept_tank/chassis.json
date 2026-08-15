@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_tank_vanquish_aka_t_666_concept_tank.iqm",
+ "foldview": {
+  "category": "tank",
+  "poses": 5,
+  "prims": 57,
+  "vertices": 50995,
+  "triangles": 51399,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.95,
+   "grounded": 0.4
+  }
+ }
+}

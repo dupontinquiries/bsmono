@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_spaceship_pax_wind.iqm",
+ "foldview": {
+  "category": "spaceship",
+  "poses": 5,
+  "prims": 52,
+  "vertices": 32396,
+  "triangles": 40170,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.41,
+   "grounded": 0.42
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.41)"
+ }
+}

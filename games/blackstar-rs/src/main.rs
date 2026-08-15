@@ -17,6 +17,8 @@ mod damage;
 mod dispatch;
 mod drop;
 mod duel;
+mod foldaudit;
+mod foldsim;
 mod font;
 mod foothold;
 mod fx;
@@ -54,6 +56,7 @@ mod posture;
 mod procars;
 mod procgen;
 mod pulse;
+mod compact;
 mod campaign;
 mod campsim;
 mod chi;
@@ -679,6 +682,10 @@ struct Game {
     /// assumed Cruise phase — the phase gate is real and tested in
     /// `deck.rs`; wiring a hull into the loop is its own seam.
     deck: Option<deck::Deck>,
+    /// the player's own per-section damage (`sections.rs`). Bots carry
+    /// theirs on `Bot`; the player's lives here for the same reason —
+    /// so a body and its wounds cannot drift apart.
+    body: sections::Body,
     /// the action bar, live during play — loaded once at boot rather
     /// than through a Deck console, since quick-select has to work
     /// without opening a menu. Firing whatever the active slot holds
@@ -954,6 +961,11 @@ fn main() {
     if argv.iter().any(|a| a == "--gear") {
         // the bearer's sheet, the ship's vault, the clone gallery
         gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--fold") {
+        // audit a transformation: self-intersection, collapse, pops
+        foldsim::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--orient") {
@@ -1540,6 +1552,7 @@ fn main() {
         menu_from_pause: false,
         deck: None,
         hotbar,
+        body: sections::Body::default(),
         held: HashSet::new(),
         held_mouse: HashSet::new(),
         jump_edge: false,
@@ -2283,6 +2296,31 @@ impl Game {
         for e in &out.fx {
             self.fx.ring_burst(e.pos, e.color, e.scale > 1.5);
         }
+
+        // SECTION DAMAGE. `hits_on` carries (target id, delta-v), which is
+        // where and how hard — everything `sections::Body::hit` needs once
+        // the world-space impact is expressed in the target's own body
+        // space. The verb decides the KIND, because a sabre and a rifle
+        // are not the same event however similar their damage numbers.
+        let kind = sections::kind_for(self.wep.profile().verb);
+        let radius = if kind == sections::Kind::Blast { self.wep.effective().reach.min(3.0) } else { 0.0 };
+        for (id, dv) in &out.hits_on {
+            let Some(bot) = self.bots.get_mut(*id as usize) else { continue };
+            let amount = dv.length() * 0.02;
+            if amount <= 0.0 {
+                continue;
+            }
+            // world -> body space: the bot's own rotation, inverted
+            let local = bot.car.rot.inverse() * (origin - bot.car.pos);
+            let dir_local = (bot.car.rot.inverse() * dv.normalize_or(Vec3::Z)).normalize_or(Vec3::Z);
+            let res = bot.body.hit(kind, local, dir_local, amount, radius);
+            for s in &res.severed {
+                self.toastf(&format!("{} torn off", s.name()));
+            }
+            if res.killed {
+                self.toastf("bot down");
+            }
+        }
     }
 
     /// Drive the gait, and put its body motion somewhere the renderer
@@ -2308,6 +2346,20 @@ impl Game {
             .update(dt, horiz, vert, self.car.on_ground, boosting);
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
+
+        // DAMAGE SHOWS IN THE WALK. `sections.rs` owns where the body is
+        // hurt; the gait owns what a stride looks like; this is the only
+        // place the two meet. A limp is an asymmetry on channels the pose
+        // already has, not a new animation.
+        let limp = self.body.limp();
+        if limp.abs() > 0.02 {
+            // the hurt leg swings less and the body rolls away from it —
+            // sign convention: limp<0 means the LEFT side is the hurt one
+            let (hurt_l, hurt_r) = if limp < 0.0 { (1.0 + limp, 1.0) } else { (1.0, 1.0 - limp) };
+            self.loco_pose.leg_l *= hurt_l;
+            self.loco_pose.leg_r *= hurt_r;
+            self.loco_pose.roll += limp * 0.12;
+        }
         self.car.susp = (self.loco_pose.squash * self.loco_pose.weight).clamp(0.0, 1.0);
     }
 
@@ -3299,6 +3351,22 @@ impl Game {
                                 },
                                 None => "-- empty --".to_string(),
                             };
+                            // the slot actually arms the weapon. Two separate
+                            // requests, because form and element are separate
+                            // systems: the form is set directly, but the
+                            // element goes through Watch::switch so arming a
+                            // slot cannot dodge the attune delay a manual
+                            // element change costs.
+                            if let Some(slot) = self.hotbar.slot(i) {
+                                let item = slot.item.clone();
+                                if let Some(form) = hotbar::form_for(&item) {
+                                    self.wep.form = form;
+                                    self.wep.cool = 0.0;
+                                }
+                                if let Some(elem) = hotbar::element_for(&item) {
+                                    self.wep.watch.switch(elem);
+                                }
+                            }
                             self.toastf(&format!("[{}] {label}", d));
                             return;
                         }
@@ -4996,6 +5064,8 @@ impl Game {
         };
         let bot_dots: Vec<(Vec3, u8)> = self.bots.iter().map(|b| (b.car.pos, b.team)).collect();
         hud::hud(ui, &info, &self.world, &self.car, &self.ball, &bot_dots);
+        // the action bar sits over the HUD, drawn last so nothing overlaps it
+        hud::draw_hotbar(ui, aspect, &self.hotbar);
     }
 
     /// Floating name tags over remote cars.

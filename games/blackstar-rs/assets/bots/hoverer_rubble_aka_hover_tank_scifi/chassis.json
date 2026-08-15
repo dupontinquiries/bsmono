@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_rubble_aka_hover_tank_scifi.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 46,
+  "vertices": 15952,
+  "triangles": 28077,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.85,
+   "grounded": 0.4
+  }
+ }
+}

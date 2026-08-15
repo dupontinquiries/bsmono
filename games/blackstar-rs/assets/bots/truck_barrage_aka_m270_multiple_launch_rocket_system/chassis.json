@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_truck_barrage_aka_m270_multiple_launch_rocket_system.iqm",
+ "foldview": {
+  "category": "truck",
+  "poses": 5,
+  "prims": 58,
+  "vertices": 38946,
+  "triangles": 39129,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.82,
+   "grounded": 0.22
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.82)"
+ }
+}

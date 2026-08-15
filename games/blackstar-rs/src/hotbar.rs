@@ -201,6 +201,35 @@ fn defaults_for(item: &Item) -> (Side, AmmoType) {
     }
 }
 
+/// What arming a hotbar slot actually means. `weapons::Form` is the
+/// WEAPON (a name and a verb); `weapons::Element` is a separate,
+/// orthogonal attunement the Watch holds and applies at fire time. An
+/// `Item::Weapon` carries both, so arming a slot is two distinct
+/// requests, not one lookup:
+/// * the form, matched by VERB alone (TABLE has no element field — an
+///   earlier version of this function assumed it did and failed to
+///   compile, which is the correct outcome for a wrong mental model);
+/// * the element, which must go through `Watch::switch` rather than
+///   being written directly, because switching attunement costs a real
+///   delay (`ATTUNE_SEC`) and is refused mid-attune. Arming a slot
+///   should not be a way to dodge that cost.
+///
+/// Returns the form index if the verb has a TABLE entry. An empty slot
+/// or an armor item returns None, and the caller leaves the current
+/// weapon alone rather than disarming the player mid-fight.
+pub fn form_for(item: &Item) -> Option<usize> {
+    let Item::Weapon { verb, .. } = item else { return None };
+    crate::weapons::TABLE.iter().position(|f| f.verb == *verb)
+}
+
+/// The element a slot wants the Watch attuned to, if it names one.
+pub fn element_for(item: &Item) -> Option<crate::weapons::Element> {
+    match item {
+        Item::Weapon { element, .. } if *element != crate::weapons::Element::None => Some(*element),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +298,27 @@ mod tests {
         hb.select(2).unwrap();
         hb.cycle(1);
         assert_eq!(hb.active_index(), 2, "cycling moved with nothing to land on");
+    }
+
+    #[test]
+    fn arming_a_slot_resolves_a_form_by_verb_and_an_element_separately() {
+        // the distinction this locks in: TABLE forms carry a verb, NOT an
+        // element -- element is the Watch's orthogonal attunement. Every
+        // armory weapon must resolve to a real form.
+        for w in &gear::WEAPONS {
+            let item = gear::weapon_item(w);
+            let form = form_for(&item).unwrap_or_else(|| panic!("{} has no TABLE form for its verb", w.name));
+            assert_eq!(crate::weapons::TABLE[form].verb, w.verb);
+            // and the element comes back separately, when it names one
+            match w.element {
+                Element::None => assert_eq!(element_for(&item), None, "{} named an element it does not have", w.name),
+                e => assert_eq!(element_for(&item), Some(e), "{}", w.name),
+            }
+        }
+        // armor arms nothing at all
+        let armor = Item::Armor(crate::loadout::MODS.iter().find(|m| m.name == "AEROGEL LINER").unwrap());
+        assert_eq!(form_for(&armor), None);
+        assert_eq!(element_for(&armor), None);
     }
 
     #[test]

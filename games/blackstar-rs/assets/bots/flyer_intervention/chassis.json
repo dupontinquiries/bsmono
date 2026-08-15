@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_intervention.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 20756,
+  "triangles": 26745,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.83,
+   "grounded": 0.43
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.83)"
+ }
+}

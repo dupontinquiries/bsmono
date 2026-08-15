@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_tank_alpine_doom.iqm",
+ "foldview": {
+  "category": "tank",
+  "poses": 5,
+  "prims": 61,
+  "vertices": 27402,
+  "triangles": 40930,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 2,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.88,
+   "grounded": 0.74
+  }
+ }
+}

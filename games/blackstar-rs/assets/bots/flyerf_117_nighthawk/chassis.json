@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyerf_117_nighthawk.iqm",
+ "foldview": {
+  "category": "flyerf",
+  "poses": 5,
+  "prims": 39,
+  "vertices": 7085,
+  "triangles": 9427,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.49,
+   "grounded": 0.3
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.49)"
+ }
+}

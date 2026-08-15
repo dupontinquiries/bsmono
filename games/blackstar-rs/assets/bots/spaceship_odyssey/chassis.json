@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_spaceship_odyssey.iqm",
+ "foldview": {
+  "category": "spaceship",
+  "poses": 5,
+  "prims": 52,
+  "vertices": 26669,
+  "triangles": 40932,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.75,
+   "grounded": 0.22
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.75)"
+ }
+}

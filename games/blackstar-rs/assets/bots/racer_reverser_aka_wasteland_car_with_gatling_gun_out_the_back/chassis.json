@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_racer_reverser_aka_wasteland_car_with_gatling_gun_out_the_back.iqm",
+ "foldview": {
+  "category": "racer",
+  "poses": 5,
+  "prims": 43,
+  "vertices": 24307,
+  "triangles": 37452,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.92,
+   "grounded": 0.24
+  }
+ }
+}

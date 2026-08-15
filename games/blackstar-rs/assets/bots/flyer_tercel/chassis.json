@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_tercel.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 44,
+  "vertices": 13858,
+  "triangles": 17846,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.91,
+   "grounded": 0.36
+  }
+ }
+}

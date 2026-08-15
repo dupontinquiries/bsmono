@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_prowler.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 59,
+  "vertices": 32644,
+  "triangles": 46094,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.7,
+   "grounded": 0.26
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.70)"
+ }
+}

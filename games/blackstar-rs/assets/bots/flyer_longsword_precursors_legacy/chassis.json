@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_longsword_precursors_legacy.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 42,
+  "vertices": 8862,
+  "triangles": 10532,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.95,
+   "grounded": 0.28
+  }
+ }
+}

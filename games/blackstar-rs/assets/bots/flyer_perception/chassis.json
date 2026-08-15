@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_perception.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 58,
+  "vertices": 17937,
+  "triangles": 26174,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 3,
+   "symmetry": 0.9,
+   "grounded": 0.68
+  },
+  "caveat": "3 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

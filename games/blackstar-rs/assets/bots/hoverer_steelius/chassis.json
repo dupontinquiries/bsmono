@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_steelius.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 49,
+  "vertices": 5498,
+  "triangles": 8628,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 3,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.7,
+   "grounded": 0.36
+  },
+  "caveat": "mid-fold scatter (3 blobs during the burst) even though it lands whole"
+ }
+}

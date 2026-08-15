@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_sea_harrier_fa2_with_aim_9l_aim_120b.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 55,
+  "vertices": 29882,
+  "triangles": 41336,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 4,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.91,
+   "grounded": 0.39
+  },
+  "caveat": "mid-fold scatter (4 blobs during the burst) even though it lands whole"
+ }
+}

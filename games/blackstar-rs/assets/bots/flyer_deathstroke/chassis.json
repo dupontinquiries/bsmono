@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_deathstroke.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 34,
+  "vertices": 3999,
+  "triangles": 6704,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.26,
+   "grounded": 0.41
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.26)"
+ }
+}

@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_tank_embermane_aka_tank_02_sci_fi_lp.iqm",
+ "foldview": {
+  "category": "tank",
+  "poses": 5,
+  "prims": 57,
+  "vertices": 17198,
+  "triangles": 21345,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.82,
+   "grounded": 0.42
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.82)"
+ }
+}

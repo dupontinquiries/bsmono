@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hovertank_tempest.iqm",
+ "foldview": {
+  "category": "hovertank",
+  "poses": 5,
+  "prims": 43,
+  "vertices": 25332,
+  "triangles": 38820,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 3,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.74,
+   "grounded": 0.5
+  },
+  "caveat": "mid-fold scatter (3 blobs during the burst) even though it lands whole"
+ }
+}

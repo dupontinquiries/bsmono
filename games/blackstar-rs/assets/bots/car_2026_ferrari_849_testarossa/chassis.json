@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_2026_ferrari_849_testarossa.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 35188,
+  "triangles": 48004,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.94,
+   "grounded": 0.31
+  }
+ }
+}

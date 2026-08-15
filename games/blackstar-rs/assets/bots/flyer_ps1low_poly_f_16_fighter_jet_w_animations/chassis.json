@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_ps1low_poly_f_16_fighter_jet_w_animations.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 39,
+  "vertices": 5727,
+  "triangles": 7894,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 3,
+   "symmetry": 0.87,
+   "grounded": 0.33
+  },
+  "caveat": "3 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

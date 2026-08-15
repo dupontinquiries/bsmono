@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_1970_dodge_charger_rt_fast_furious.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 59,
+  "vertices": 34710,
+  "triangles": 46278,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 2,
+   "symmetry": 0.95,
+   "grounded": 0.25
+  },
+  "caveat": "2 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

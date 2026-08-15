@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_ventride.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 51,
+  "vertices": 14887,
+  "triangles": 20199,
+  "morph": "accepted",
+  "already_shipped": true,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.88,
+   "grounded": 0.16
+  }
+ }
+}

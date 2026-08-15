@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_truck_dino_truck_tonton.iqm",
+ "foldview": {
+  "category": "truck",
+  "poses": 5,
+  "prims": 60,
+  "vertices": 27546,
+  "triangles": 25006,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 2,
+   "symmetry": 0.95,
+   "grounded": 0.23
+  },
+  "caveat": "2 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

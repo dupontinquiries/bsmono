@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_tank_t_35.iqm",
+ "foldview": {
+  "category": "tank",
+  "poses": 5,
+  "prims": 60,
+  "vertices": 10960,
+  "triangles": 14275,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.95,
+   "grounded": 0.5
+  }
+ }
+}

@@ -219,6 +219,14 @@ pub struct Morph {
     idx: Vec<Vec<u32>>,
     /// scratch, reused every frame so a 60 Hz morph does not allocate
     scratch: Vec<Vertex>,
+    /// AllSpark-style geometric compaction layered over the lerp (see
+    /// `compact.rs`). `None` keeps the original straight-lerp behaviour
+    /// bit-for-bit, so this is opt-in per chassis rather than a change
+    /// to how every already-shipped body folds.
+    pub compaction: Option<crate::compact::Params>,
+    /// per-prim centroid of the vehicle pose, cached at build time —
+    /// `Style::Shrink` compacts toward it
+    centres: Vec<Vec3>,
 }
 
 impl Morph {
@@ -237,7 +245,18 @@ impl Morph {
                 }
             }
         }
-        Some(Morph { poses, idx, scratch: Vec::new() })
+        // per-prim centroid of pose 0 (the vehicle), for Shrink
+        let centres: Vec<Vec3> = poses[0]
+            .iter()
+            .map(|prim| {
+                if prim.is_empty() {
+                    return Vec3::ZERO;
+                }
+                let sum: Vec3 = prim.iter().fold(Vec3::ZERO, |acc, v| acc + Vec3::from_array(v.pos));
+                sum / prim.len() as f32
+            })
+            .collect();
+        Some(Morph { poses, idx, scratch: Vec::new(), compaction: None, centres })
     }
 
     pub fn prims(&self) -> usize {
@@ -258,11 +277,20 @@ impl Morph {
         let b = &self.poses[(k + 1).min(n - 1)][p];
         self.scratch.clear();
         self.scratch.reserve(a.len());
+        let compaction = self.compaction;
+        let centre = self.centres.get(p).copied().unwrap_or(Vec3::ZERO);
         for (va, vb) in a.iter().zip(b.iter()) {
-            let pa = Vec3::from_array(va.pos).lerp(Vec3::from_array(vb.pos), f);
+            let mut pa = Vec3::from_array(va.pos).lerp(Vec3::from_array(vb.pos), f);
             let na = Vec3::from_array(va.nrm)
                 .lerp(Vec3::from_array(vb.nrm), f)
                 .normalize_or(Vec3::Y);
+            // compaction runs AFTER the lerp so the two compose: the
+            // lerp decides where the vertex is going, compaction
+            // decides how the matter gets there. `t`, not `f` -- the
+            // curve spans the whole fold, not each pose segment.
+            if let Some(params) = &compaction {
+                pa = crate::compact::displace(pa, na, centre, t, params);
+            }
             self.scratch.push(Vertex {
                 pos: pa.to_array(),
                 nrm: na.to_array(),
@@ -295,6 +323,53 @@ mod tests {
 
     fn vtx(x: f32) -> Vertex {
         Vertex { pos: [x, 0.0, 0.0], nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] }
+    }
+
+    #[test]
+    fn compaction_composes_with_the_lerp_without_disturbing_either_end() {
+        // three vertices spread far enough apart to land in different
+        // voxel cells, so quantisation has something to actually do
+        let pose_a = vec![vec![vtx(0.0), vtx(1.0), vtx(2.0)]];
+        let pose_b = vec![vec![vtx(4.0), vtx(5.0), vtx(6.0)]];
+        let idx = vec![vec![0u32, 1, 2]];
+
+        let mut plain = Morph::build(vec![pose_a.clone(), pose_b.clone()], idx.clone()).unwrap();
+        let mut compacted = Morph::build(vec![pose_a, pose_b], idx).unwrap();
+        compacted.compaction = Some(crate::compact::Params {
+            style: crate::compact::Style::Shrink,
+            cell: 0.5,
+            strength: 1.0,
+            min_thickness: 0.0,
+        });
+
+        // the endpoints must be bit-identical: this is the property that
+        // makes compaction safe to switch on for a shipped chassis
+        for t in [0.0f32, 1.0] {
+            let p = plain.sample(0, t);
+            let c = compacted.sample(0, t);
+            for (vp, vc) in p.verts.iter().zip(c.verts.iter()) {
+                let d = Vec3::from_array(vp.pos) - Vec3::from_array(vc.pos);
+                assert!(d.length() < 1e-5, "endpoint t={t} diverged by {}", d.length());
+            }
+        }
+
+        // mid-fold they must genuinely differ, or the effect is inert
+        let p = plain.sample(0, 0.5);
+        let c = compacted.sample(0, 0.5);
+        let moved: f32 = p
+            .verts
+            .iter()
+            .zip(c.verts.iter())
+            .map(|(vp, vc)| (Vec3::from_array(vp.pos) - Vec3::from_array(vc.pos)).length())
+            .sum();
+        assert!(moved > 0.05, "compaction changed nothing mid-fold (total {moved})");
+
+        // and nothing became NaN on the way -- the f32 sin(PI) trap
+        for t in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            for v in compacted.sample(0, t).verts {
+                assert!(v.pos.iter().all(|x| x.is_finite()), "NaN/inf at t={t}: {:?}", v.pos);
+            }
+        }
     }
 
     #[test]

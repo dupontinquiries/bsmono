@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_car_madmax_sports_car.iqm",
+ "foldview": {
+  "category": "car",
+  "poses": 5,
+  "prims": 58,
+  "vertices": 28679,
+  "triangles": 41605,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.88,
+   "grounded": 0.21
+  }
+ }
+}

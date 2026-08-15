@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_tank_nightprowl_aka_the_m98a3_behomoth_concept.iqm",
+ "foldview": {
+  "category": "tank",
+  "poses": 5,
+  "prims": 56,
+  "vertices": 33949,
+  "triangles": 45514,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.85,
+   "grounded": 0.44
+  }
+ }
+}

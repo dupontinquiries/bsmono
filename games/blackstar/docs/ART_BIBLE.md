@@ -127,6 +127,10 @@ Rules:
 
 ---
 
+---
+
+---
+
 ## 4. VERIFICATION DISCIPLINE
 
 Every art pass in this bible ships only with:
@@ -135,3 +139,94 @@ Every art pass in this bible ships only with:
   must NOT move collider scores; a moved score means a leaked collider)
 - full ctest green
 - an honest note in SIGNATURES.md for anything eyeballs-only
+
+---
+
+## 5. THE HUMAN FOREGROUND — near-field detail, and what breaks it
+
+Section 1.2 already names this register: human-scale, waist-height detail
+against which the geological forms are measured. This section is the
+discipline for building it, sourced from a separate production-knowledge
+document (`aaabench`'s world-building guidance — GTA-scale open-world
+practice, not this project's own material) and adapted hard rather than
+imported whole, because that source's default posture is maximalist density
+("thousands of unique things") and this bible's own guiding rule is the
+opposite: **"Minimal dialogue. Maximum gravity."** The two are not actually
+in conflict once the register is kept straight — gravity governs the
+geological read, this section governs the eight feet around the player's
+own boots, and only the second one needs density at all.
+
+### 5.1 What "fake" actually means, mechanically
+
+Not a matter of taste. A prop reads as fake for specific, fixable reasons,
+in order of how fast they register:
+
+- **No contact.** Anything not touching the ground believably — floating,
+  clipped, no shadow at the contact point, no dirt gathering at a
+  wall/floor join — reads as pasted-on before a player consciously notices
+  why.
+- **Flat edges.** Kerbs, thresholds, window reveals, panel seams — a hard
+  edge with no chamfer, no wear, no shadow line reads as a box, faster than
+  a wrong shape does.
+- **No wear where wear happens.** Grime low on a wall, rust at a fixing,
+  paint worn at a handle, scorch under an exhaust vent. An object with
+  uniform material everywhere has no history, and no history reads as no
+  weight.
+- **Empty vertical space.** Cables, conduit, drainpipes, aerials, mast
+  rigging. A tall clean surface is the loudest "unfinished" signal there
+  is — it is also the cheapest fix, since a cable is a thin non-colliding
+  line, not a modeled object.
+- **One axis of variation.** A repeated asset that only varies in position
+  still reads as a clone. It needs at least two of: scale, tint, rotation,
+  wear state, orientation, or partial occlusion.
+
+### 5.2 The vocabulary is this fiction's, not a generic city's
+
+`aaabench`'s own catalogue (street furniture, shopfronts, utility poles,
+parked cars in dealership rows) is built for a peacetime, functioning,
+commercial city — most of it is the wrong content for Earth after the
+Array's reach, and dropping it in unfiltered would read as fake for a
+different reason: tonally wrong, a game-store city standing in for a
+besieged one. Translate the CATEGORIES, not the CONTENTS:
+
+| aaabench category | this fiction's equivalent |
+|---|---|
+| storefronts, signage, retail clutter | boarded storefronts, evacuation notices, ration/shelter signage, hand-painted directional signs to relay points |
+| parked cars, dealership rows | abandoned vehicles (some looted, some just left with the doors open), military transport staged at checkpoints |
+| street furniture (bins, benches, planters) | the SAME real objects, but aged by the event — scorched, overturned, repurposed as barricade material |
+| utility infrastructure (poles, cabling, substations) | the same, but some visibly Blackstar-touched — a junction box with a pale-blue Chicago-event shard socketed into it, cabling rerouted crudely to a relay node |
+| "ownership is realism" (repeated fleet liveries) | repeated MILITARY/coalition liveries — the same evac-response unit's trucks recur citywide, reading as one functioning response effort, not fifty unrelated props |
+| crowds going about their day | evacuation behavior: queueing at relay points, loading a truck, a family with everything they own in one bag — motion with a reason, same as the source doc's own rule, aimed at this fiction's actual human traffic |
+
+This is the "throw out the shopping stuff" instinct, stated as a rule
+rather than a feeling: **if a near-field object's only justification is
+"a real city has one," check it against what THIS city is doing right
+now.** A hydrant belongs on a corner regardless. A boutique window display
+does not, on a street the beach-scene seam has just torn open.
+
+### 5.3 Placement, not scatter
+
+Straight from the source material because it is genuinely engine-agnostic:
+**everything belongs to a system, or it reads as decoration and costs
+realism instead of adding it.** Cables run from a source to a load. Debris
+piles against the leeward side of a wall, not scattered evenly. Wear is
+newer near evacuation routes (recent, panicked) and older at the map's
+edges (long abandoned). A checkpoint barrier is where a road actually
+narrows, not wherever looks good in the viewport.
+
+### 5.4 Verify it (extends Section 4's discipline)
+
+At human eye-height, in the actual maps, not the editor's overview camera:
+1. Does anything float, clip, or cast no contact shadow?
+2. Is there a flat, undetailed surface bigger than a few units? (a wall
+   panel, a road segment, a hull plate)
+3. Is any vertical surface empty — no cabling, no conduit, no mast rigging?
+4. Can the same prop be seen twice, unvaried, in one frame?
+5. Does every near-field object have a reason to be exactly where it is —
+   and does that reason belong to THIS Earth, not a generic one?
+
+Ship near-field passes under the same rule as everything else in this
+bible: regenerate, re-run `map_score.py` (visual/non-colliding layers must
+not move collider scores), full ctest green, an honest note in
+SIGNATURES.md for anything eyeballs-only.
+

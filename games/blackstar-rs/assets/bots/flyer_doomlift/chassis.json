@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_flyer_doomlift.iqm",
+ "foldview": {
+  "category": "flyer",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 23470,
+  "triangles": 36332,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.81,
+   "grounded": 0.54
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.81)"
+ }
+}

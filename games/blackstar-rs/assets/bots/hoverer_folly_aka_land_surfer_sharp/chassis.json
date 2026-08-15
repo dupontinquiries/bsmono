@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverer_folly_aka_land_surfer_sharp.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 46,
+  "vertices": 14166,
+  "triangles": 17209,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "tuned",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.88,
+   "grounded": 0.46
+  }
+ }
+}

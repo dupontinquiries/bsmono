@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_spaceship_unionizer.iqm",
+ "foldview": {
+  "category": "spaceship",
+  "poses": 5,
+  "prims": 49,
+  "vertices": 6695,
+  "triangles": 12017,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.68,
+   "grounded": 0.41
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.68)"
+ }
+}

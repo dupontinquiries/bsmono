@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_spaceship_praetor_aka_spaceship_with_partial_interior.iqm",
+ "foldview": {
+  "category": "spaceship",
+  "poses": 5,
+  "prims": 58,
+  "vertices": 26407,
+  "triangles": 40098,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 2,
+   "blobs_mid_burst": 3,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.7,
+   "grounded": 0.23
+  },
+  "caveat": "mid-fold scatter (3 blobs during the burst) even though it lands whole"
+ }
+}
