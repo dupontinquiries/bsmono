@@ -8,6 +8,7 @@ mod analog;
 mod ballistics;
 mod bigbody;
 mod bots;
+mod sections;
 mod camera;
 mod chord;
 mod clinch;
