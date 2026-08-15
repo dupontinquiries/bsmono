@@ -282,6 +282,132 @@ floating overlay (mirroring `palette_overlay`'s existing shape) showing
 the query, match position, and — in replace mode — the replacement text
 with the currently-focused field visually distinct from the other.
 
+## Frame the graph (G) — logscope's camera-fit vocabulary
+
+A seventh logscope theme, and a practical one: the graph has always sat at
+a fixed vestibule anchor with no way to reliably SEE it — a person's orbit
+habits might never point the camera there. `centroid`/`bounding_radius`/
+`fit_distance` (`scene_kit::spatial`) are logscope's own "look at this"
+vocabulary; `Viewer::frame_points` is a thin, general wrapper (any point
+cluster, not graph-specific) that sets the SAME `tx/ty/tz` target fields
+`jump` already retargets for stations — so pressing `G` glides the camera
+exactly the way every other camera move in the corridor already does, not
+a special-cased snap. `dist.target` pulls back by `fit_distance`'s own
+radius-to-distance curve, so a tight two-commit graph and a sprawling
+fifty-commit one each get a camera distance that actually fits them.
+
+Deliberately general rather than graph-only: `frame_points` takes any
+`&[Vec3]`, because "fly the camera to see this cluster of things" is a
+reusable camera action, not a one-off tied to the history graph — a future
+"frame all touched stations" or similar could reuse it without new camera
+code.
+
+Tests confirm both real properties, not just that the fields changed: the
+camera target lands on the actual centroid (not just "somewhere near the
+points"), and a WIDER cluster produces a measurably LARGER `dist.target`
+than a tight one — the property that makes this useful rather than
+decorative.
+
+## The commit graph gets real layout — logscope's flow(), closing both named gaps
+
+Two gaps I explicitly deferred when the commit graph first shipped: single
+lane, uniform spacing. `scene_kit::spatial::flow` — the ACTUAL layout
+logscope uses for its own conversation graph — closes both at once. Its
+`bond_rest` reasoning ("a 1-second gap and a 1-hour gap both read on
+screen... a long pause stretches the backbone") applies to a commit
+history exactly as well as a conversation thread: `graph::layout` now
+reorders `Rev`s oldest-first (`flow`'s contract — parent before child,
+each referenced by an earlier index), builds one flow-parent per node from
+the first in-window parent oid, and maps the result back to `revs`' own
+newest-first indices so nothing downstream (`World.graph_node_ix`,
+`active`, `rev_ix`) had to change.
+
+**A merge commit's second parent still renders**: `flow` only takes ONE
+parent per node for POSITIONING (it needs a single lane-parent to fan
+siblings into channels); this module's own `edges` list is built
+separately from every real parent oid, so a merge draws both lines even
+though `flow` only used one of them to decide where the node sits. Two
+systems agreeing on what exists, allowed to disagree slightly on why a
+node sits where it does.
+
+**A real, subtler-than-expected behavior found by the first test run**:
+`flow`'s own comment claims its relaxation pass keeps "the time axis x
+anchored," but that's only true for the pairwise near-neighbor repulsion
+term — a SEPARATE center-clearing push (for keeping the flow line clear of
+whatever centerpiece sits at a scene's origin) perturbs x too, whenever a
+node's radius from the origin is inside `clear_r`. A small graph sitting
+near the vestibule's anchor point is exactly the case where that applies.
+My first version of the equal-time-gap test assumed x was untouched and
+failed with genuinely unequal steps; fixed by testing the core time-stretch
+math in isolation via `LOGSCOPE_TUNE_BREATHE=0`, the same documented
+env-knob pattern already used for `SCENE_KIT_HOUR` earlier this session —
+not a workaround, the actual intended way to isolate one concern from
+another in a function that deliberately layers several.
+
+Five tests total (two new, three rewritten to test what's actually true
+rather than an assumption about it): oldest-to-newest ordering with
+provably equal steps at equal time gaps (isolated from relaxation), a
+*longer* time gap provably producing a *larger* step (the property that
+matters most, exercised end to end rather than trusted from reading the
+formula), edge correctness including the window-trimming and merge cases
+carried over unchanged, and the empty/active-node cases.
+
+## The margin note's length limit has a reason now (logscope's textsurface)
+
+A fifth logscope theme: `textsurface.rs` — `Surface`, `char_budget()`,
+`overflow()` — is logscope's vocabulary for "does this text fit the thing
+it's inscribed on," built around a real observation (its module doc,
+worth reading in full): a sphere can't carry a paragraph past ~30° of arc
+before glyphs foreshorten to nothing, so different objects get different,
+REASONED legibility budgets rather than one global truncation number.
+
+The AI margin note in both shells had exactly the kind of number that
+observation argues against: `.chars().take(160)`, chosen for no stated
+reason. Replaced with `textsurface::Surface::StreetSign.char_budget()`
+(60) — "flat, vertical, and already a text object in the world," which is
+a more honest description of a short status-line note than "a paragraph on
+a sphere" ever was of 160. The shape of the constraint (how much a person
+can read at a glance) doesn't care whether the text sits on a rendered
+object or drawn chrome.
+
+**Respected the crate boundary rather than reaching for convenience**:
+`aperture-scene` already depends on `scene-kit` and calls the real
+function directly. `aperture-egui` (the flat 2D editor) does not and
+should not gain a 3D-rendering dependency chain just to name a constant —
+its copy is a plain `60` with a comment pointing at where the number
+really comes from and a note to keep the two in sync if that budget ever
+changes.
+
+Tested end to end in both shells with a 200-character note from a real
+`echo` subprocess, confirming truncation lands at exactly the real budget
+— and the viewer's test specifically reads `Surface::StreetSign.
+char_budget()` itself rather than hardcoding `60`, so it fails honestly if
+that number ever changes without a matching intentional update.
+
+## Graph nodes are clickable now — the gap named last commit, closed
+
+Named as deliberately deferred last time: "plaques hit-test against flat
+quad corners; a sphere needs its own convention, not a forced reuse of the
+existing one." Built that convention rather than letting the gap sit.
+
+`World` gains `graph_node_ix: Vec<(usize, Vec3)>` — a revision index paired
+with its world-space center, populated by `push_history_graph` (which now
+returns this mapping instead of only mutating the mesh list). The hit test
+itself is deliberately NOT a reuse of the plaque convention: plaques
+project their four corners and check `Rect::contains`; a sphere doesn't
+have corners, so this projects the ONE center point and checks screen-pixel
+DISTANCE to the click, with a flat 22px radius rather than one that shrinks
+with camera distance — more forgiving to click when zoomed out, which is
+exactly when a small graph node most needs forgiveness.
+
+`Viewer::jump_to_graph_node` is a thin public wrapper around the existing
+private `jump_to_rev` — the same engine `enter_homecoming` already walks
+through, not a parallel implementation. Out-of-range indices clamp rather
+than panic (tested directly, alongside the real end-to-end case: clicking
+the graph node for a specific named commit moves the revision preview to
+exactly that commit, verified by checking `revs[rev_ix].subject` after the
+jump, not just that *some* index changed).
+
 ## Rooms shaped by real signal — logscope's region_plan, done for real
 
 logscope's `region_plan` gives each conversation branch a room TYPE —

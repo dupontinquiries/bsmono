@@ -235,6 +235,34 @@ impl Viewer {
     /// Jump the revision preview directly to `self.revs[ix]` — the piece
     /// `rev_step` doesn't expose on its own (it only steps by ±1 from
     /// wherever it currently is).
+    /// Fly the camera to frame an arbitrary point cluster — `centroid` +
+    /// `bounding_radius` + `fit_distance`, logscope's own vocabulary for
+    /// "look at this," reused here for the commit graph specifically
+    /// (`G` in the app layer). `tx/ty/tz` become the orbit target (the
+    /// SAME fields `jump` already retargets for stations, so this camera
+    /// move glides exactly like every other one in the corridor); `dist`
+    /// is the orbit distance, pulled back far enough that
+    /// `bounding_radius` says the whole cluster fits.
+    pub fn frame_points(&mut self, points: &[scene_kit::spatial::Vec3]) {
+        if points.is_empty() {
+            return;
+        }
+        let c = scene_kit::spatial::centroid(points);
+        let r = scene_kit::spatial::bounding_radius(points, c);
+        self.tx.target = c.x;
+        self.ty.target = c.y;
+        self.tz.target = c.z;
+        self.dist.target = scene_kit::spatial::fit_distance(r);
+    }
+
+    /// Jump the revision preview directly to `revs[ix]` — the click-a-
+    /// graph-node entry point. Public because the app layer needs to reach
+    /// it from a screen click; `jump_to_rev` stays the shared internal
+    /// engine both this and `enter_homecoming` walk through.
+    pub fn jump_to_graph_node(&mut self, ix: usize) {
+        self.jump_to_rev(ix.min(self.revs.len().saturating_sub(1)));
+    }
+
     fn jump_to_rev(&mut self, ix: usize) {
         let cur = self.rev_ix.map(|i| i as isize).unwrap_or(-1);
         let target = ix as isize;
@@ -565,7 +593,19 @@ impl Viewer {
         while let Some(out) = engine.poll() {
             if out.generation == self.note_generation {
                 if let Ok(text) = out.result {
-                    self.rev_note = text.trim().lines().next().unwrap_or("").chars().take(160).collect();
+                    // The margin note reads as a small legible sign in the
+                    // chrome, not a full page — `textsurface`'s vocabulary
+                    // for exactly that shape of thing is `StreetSign`
+                    // ("flat, vertical, and already a text object in the
+                    // world"), budgeted at 60 characters. That number isn't
+                    // arbitrary the way a bare `.take(160)` was: it's the
+                    // same legibility reasoning logscope already worked out
+                    // for a small in-world sign, applied to a small
+                    // in-chrome one — the SHAPE of the constraint (how much
+                    // a person can read at a glance) doesn't care whether
+                    // the text sits on a rendered object or drawn chrome.
+                    let budget = scene_kit::textsurface::Surface::StreetSign.char_budget();
+                    self.rev_note = text.trim().lines().next().unwrap_or("").chars().take(budget).collect();
                 }
             }
         }
@@ -1103,6 +1143,108 @@ mod tests {
         let h = v.current_hour();
         assert!((h - 3.25).abs() < 0.02, "expected ~3.25 (03:15 UTC), got {h}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jump_to_graph_node_moves_the_preview_to_that_exact_revision() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-scene-graphclick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("g.rs");
+        for (i, msg) in ["one", "two", "three"].iter().enumerate() {
+            std::fs::write(&f, format!("fn n{i}() {{}}\n")).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", msg]);
+        }
+        let live = std::fs::read_to_string(&f).unwrap();
+        let mut v = Viewer::from_text(&live, Language::Rust, Some(f));
+        assert_eq!(v.revs.len(), 3);
+        assert!(v.rev_ix.is_none(), "starts live");
+
+        let target = v.revs.iter().position(|r| r.subject == "two").unwrap();
+        v.jump_to_graph_node(target);
+        assert_eq!(v.rev_ix, Some(target));
+        assert_eq!(v.revs[v.rev_ix.unwrap()].subject, "two");
+
+        // Clicking an out-of-range index clamps rather than panicking.
+        v.jump_to_graph_node(9999);
+        assert_eq!(v.rev_ix, Some(v.revs.len() - 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn margin_note_truncates_to_the_real_textsurface_streetsign_budget() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-scene-margin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("m.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+
+        let mut v = Viewer::from_text("fn one() {}\n", Language::Rust, Some(f));
+        let long = "y".repeat(200);
+        v.describe = Some(Engine::new(Box::new(CommandProvider::new(vec!["echo".into(), "-n".into(), long]))));
+
+        v.rev_step(1);
+        let mut got = false;
+        for _ in 0..200 {
+            v.poll_note();
+            if !v.rev_note.is_empty() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got, "note arrived");
+        // Not a hardcoded expectation of 60 — reads the SAME real function
+        // the production code calls, so this fails if that budget ever
+        // changes without the intent behind it changing too.
+        let expected = scene_kit::textsurface::Surface::StreetSign.char_budget();
+        assert_eq!(v.rev_note.chars().count(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frame_points_centers_the_target_and_pulls_back_for_a_wider_cluster() {
+        use scene_kit::spatial::Vec3;
+        let mut v = Viewer::from_text("fn a() {}\n", Language::Rust, None);
+        let tight = vec![Vec3::new(0.0, 5.0, 0.0), Vec3::new(1.0, 5.0, 0.0)];
+        v.frame_points(&tight);
+        // Centroid of the two points.
+        assert!((v.tx.target - 0.5).abs() < 1e-4);
+        assert!((v.ty.target - 5.0).abs() < 1e-4);
+        assert!((v.tz.target - 0.0).abs() < 1e-4);
+        let dist_tight = v.dist.target;
+
+        let wide = vec![Vec3::new(-20.0, 5.0, 0.0), Vec3::new(20.0, 5.0, 0.0)];
+        v.frame_points(&wide);
+        assert!((v.tx.target - 0.0).abs() < 1e-4, "still centered, now on a wider spread");
+        assert!(v.dist.target > dist_tight, "a wider cluster needs a farther camera to fit it");
+    }
+
+    #[test]
+    fn frame_points_is_a_noop_on_empty_input() {
+        let mut v = Viewer::from_text("fn a() {}\n", Language::Rust, None);
+        let before = (v.tx.target, v.ty.target, v.tz.target, v.dist.target);
+        v.frame_points(&[]);
+        assert_eq!((v.tx.target, v.ty.target, v.tz.target, v.dist.target), before);
     }
 
 }

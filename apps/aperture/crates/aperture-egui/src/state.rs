@@ -466,7 +466,19 @@ impl AppState {
         while let Some(out) = engine.poll() {
             if out.generation == self.note_generation {
                 if let Ok(text) = out.result {
-                    self.rev_note = text.trim().lines().next().unwrap_or("").chars().take(160).collect();
+                    // Same budget, same reasoning, as aperture-view's margin
+                    // note (see viewer.rs) — a literal 60 here rather than a
+                    // scene-kit dependency, since the flat editor has no 3D
+                    // rendering and shouldn't gain that dependency chain
+                    // just to name a constant. `scene_kit::textsurface::
+                    // Surface::StreetSign.char_budget()` is where the
+                    // number actually comes from: a small legible sign in
+                    // the world, budgeted at 60 characters — the same shape
+                    // of constraint whether the text sits on a rendered
+                    // object or drawn chrome, which is what this status
+                    // line is. Keep the two in sync if that budget changes.
+                    const MARGIN_NOTE_CHARS: usize = 60;
+                    self.rev_note = text.trim().lines().next().unwrap_or("").chars().take(MARGIN_NOTE_CHARS).collect();
                 }
             }
         }
@@ -2116,6 +2128,49 @@ mod tests {
         s.open_find();
         s.handle(Ev::Key { key: K::Up, ctrl: true, shift: false, alt: false }, 0);
         assert_eq!(s.find.as_ref().unwrap().query, "");
+    }
+
+    #[test]
+    fn margin_note_truncates_to_the_streetsign_budget_not_an_arbitrary_number() {
+        let mut s = AppState::new(None, false);
+        let long = "x".repeat(200);
+        s.describe = Some(aperture_complete::engine::Engine::new(Box::new(
+            aperture_complete::providers::CommandProvider::new(vec!["echo".into(), "-n".into(), long.clone()]),
+        )));
+        // request_describe needs git+rev_ix context to fire; drive it the
+        // same way the other describe test does — a real repo, a real
+        // revision landed on.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-margin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("m.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        let mut s2 = AppState::new(Some(f), false);
+        s2.describe = s.describe.take();
+
+        s2.rev_step(1, 0);
+        let mut got = false;
+        for _ in 0..200 {
+            s2.poll_note();
+            if !s2.rev_note.is_empty() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got, "note arrived");
+        assert_eq!(s2.rev_note.chars().count(), 60, "truncated to the StreetSign budget, not 160 or the full 200");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

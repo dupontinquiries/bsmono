@@ -29,6 +29,12 @@ pub struct World {
     pub page_h: f32,
     /// Screen-clickable plaques: (station index, mesh index).
     pub plaque_ix: Vec<(usize, usize)>,
+    /// Screen-clickable commit-graph nodes: (`revs` index, world center).
+    /// Spheres don't have quad corners the way plaques do, so this carries
+    /// a raw point for a DISTANCE-based hit test (project it, measure
+    /// screen-pixel distance to the click) rather than a contains-test —
+    /// its own convention, not a forced reuse of the plaque one.
+    pub graph_node_ix: Vec<(usize, Vec3)>,
 }
 
 const V: fn(f32, f32, f32) -> Vec3 = Vec3::new;
@@ -97,11 +103,12 @@ fn push_lectern(
 /// first thing visible on entering, before walking a single station. Empty
 /// or single-node history renders nothing (a lone dot with no edges isn't
 /// informative, and an empty graph is just noise).
-fn push_history_graph(meshes: &mut Vec<Mesh3>, revs: &[Rev], rev_ix: Option<usize>) {
+fn push_history_graph(meshes: &mut Vec<Mesh3>, revs: &[Rev], rev_ix: Option<usize>) -> Vec<(usize, Vec3)> {
     if revs.len() < 2 {
-        return;
+        return Vec::new();
     }
-    let g = graph::layout(revs, rev_ix, V(-9.5, 9.0, 8.5), 1.6, V(1.0, 0.0, 0.0));
+    let g = graph::layout(revs, rev_ix, V(-9.5, 9.0, 8.5));
+    let node_ix: Vec<(usize, Vec3)> = g.centers.iter().enumerate().map(|(i, c)| (i, *c)).collect();
     meshes.extend(graph_scene(
         &g.centers,
         &g.colors,
@@ -112,6 +119,7 @@ fn push_history_graph(meshes: &mut Vec<Mesh3>, revs: &[Rev], rev_ix: Option<usiz
         Color32::from_rgb(226, 196, 108),
         Color32::from_rgb(120, 118, 112),
     ));
+    node_ix
 }
 
 /// The classic single room (no outline): lectern at the origin, the four
@@ -129,7 +137,7 @@ pub fn build_with_history(aspect: f32, revs: &[Rev], rev_ix: Option<usize>) -> W
         cuboid(V(0.0, -0.6, 0.0), V(46.0, 0.6, 40.0), Color32::from_rgb(126, 124, 120)),
         2.0,
     ));
-    push_history_graph(&mut meshes, revs, rev_ix);
+    let graph_node_ix = push_history_graph(&mut meshes, revs, rev_ix);
     let (page_ix, page_center, page_right, page_up, page_w, page_h) =
         push_lectern(&mut meshes, V(0.0, 0.0, 0.0), aspect);
 
@@ -147,7 +155,7 @@ pub fn build_with_history(aspect: f32, revs: &[Rev], rev_ix: Option<usize>) -> W
         meshes.push(cap);
     }
 
-    World { meshes, page_ix, page_center, page_right, page_up, page_w, page_h, plaque_ix: Vec::new() }
+    World { meshes, page_ix, page_center, page_right, page_up, page_w, page_h, plaque_ix: Vec::new(), graph_node_ix }
 }
 
 /// Per-station plaque V window in the label atlas: the atlas is `inscribe`'s
@@ -172,7 +180,7 @@ pub fn build_rooms(
         return build_with_history(aspect, revs, rev_ix);
     }
     let mut meshes = Vec::new();
-    push_history_graph(&mut meshes, revs, rev_ix);
+    let graph_node_ix = push_history_graph(&mut meshes, revs, rev_ix);
     let len = 20.0 + stations.len() as f32 * STATION_SPACING;
 
     // Corridor floor: one long slab down −z.
@@ -276,7 +284,7 @@ pub fn build_rooms(
     let (page_ix, page_center, page_right, page_up, page_w, page_h) =
         push_lectern(&mut meshes, anchor, aspect);
 
-    World { meshes, page_ix, page_center, page_right, page_up, page_w, page_h, plaque_ix }
+    World { meshes, page_ix, page_center, page_right, page_up, page_w, page_h, plaque_ix, graph_node_ix }
 }
 
 /// Slide the page quad's V window: `v0..v1` in texture space (0 = top row of
@@ -423,6 +431,34 @@ mod tests {
         let w_ordinary = build_rooms(std::slice::from_ref(&ordinary), 0, 2.2, 16.0, 64.0, &[], None);
         assert_eq!(w_sealed.meshes.len(), w_ordinary.meshes.len() + 1, "capstone adds exactly one mesh");
         assert_eq!(w_sealed.meshes[1].emissive, 0.0, "sealed rooms don't glow");
+    }
+
+    #[test]
+    fn graph_node_ix_has_one_entry_per_node_matching_graph_layout() {
+        let rev = |oid: &str, parents: &[&str]| Rev {
+            oid: oid.into(), time: 0, subject: oid.into(),
+            kind: aperture_core::gitspace::RevKind::Commit,
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+        };
+        let revs = vec![rev("c", &["b"]), rev("b", &["a"]), rev("a", &[])];
+        let w = build_with_history(2.2, &revs, Some(1));
+        assert_eq!(w.graph_node_ix.len(), 3, "one clickable node per revision");
+        // Indices match revs' own indices — jump_to_graph_node(ix) needs
+        // this to line up directly with Viewer::revs.
+        let ixs: Vec<usize> = w.graph_node_ix.iter().map(|(i, _)| *i).collect();
+        assert_eq!(ixs, vec![0, 1, 2]);
+        // Centers match graph::layout's own placement exactly (same math).
+        let g = graph::layout(&revs, Some(1), V(-9.5, 9.0, 8.5));
+        for ((_, wc), gc) in w.graph_node_ix.iter().zip(&g.centers) {
+            assert_eq!(wc, gc);
+        }
+    }
+
+    #[test]
+    fn graph_node_ix_is_empty_below_two_commits() {
+        assert!(build(2.2).graph_node_ix.is_empty());
+        let rev = Rev { oid: "a".into(), time: 0, subject: "a".into(), kind: aperture_core::gitspace::RevKind::Commit, parents: vec![] };
+        assert!(build_with_history(2.2, &[rev], None).graph_node_ix.is_empty());
     }
 
 }

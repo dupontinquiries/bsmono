@@ -106,6 +106,13 @@ pub fn frame(root: &mut Ui, app: &mut App) {
         if i.key_pressed(Key::H) {
             app.viewer.enter_homecoming(); // step into the gap; then , / . wind forward/back
         }
+        if i.key_pressed(Key::G) {
+            // logscope's own camera-fit vocabulary (centroid + bounding_radius
+            // + fit_distance): fly to frame the WHOLE commit graph, not just
+            // whatever the reading camera happens to be pointed at.
+            let pts: Vec<scene_kit::spatial::Vec3> = app.world.graph_node_ix.iter().map(|(_, p)| *p).collect();
+            app.viewer.frame_points(&pts);
+        }
         if i.key_pressed(Key::CloseBracket) {
             app.viewer.jump_rel(1);
         }
@@ -220,23 +227,41 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     // ── touch: click the page, the page answers ─────────────────────────────
     if response.clicked() {
         if let Some(click) = response.interact_pointer_pos() {
-            let mut jumped = None;
-            for (station_ix, mesh_ix) in &app.world.plaque_ix {
-                let pts: Vec<Pos2> = scene::plaque_corners(&app.world, *mesh_ix)
-                    .iter()
-                    .filter_map(|c| project(&cam, rect, *c))
-                    .collect();
-                if pts.len() == 4 && Rect::from_points(&pts).contains(click) {
-                    jumped = Some(*station_ix);
-                    break;
+            // Graph nodes first: they're spheres, not quads, so this is a
+            // screen-space DISTANCE test — project the world center, check
+            // pixel distance to the click — rather than the plaques' own
+            // contains-a-rect convention. A small fixed pixel radius (not
+            // scaled by camera distance): the graph sits at a fairly
+            // constant distance from the usual viewing angles, and a
+            // generous flat radius is more forgiving to click than a
+            // radius that shrinks as you zoom out.
+            const NODE_CLICK_PX: f32 = 22.0;
+            let mut jumped = false;
+            for (rev_ix, center) in &app.world.graph_node_ix {
+                if let Some(p) = project(&cam, rect, *center) {
+                    if p.distance(click) < NODE_CLICK_PX {
+                        app.viewer.jump_to_graph_node(*rev_ix);
+                        jumped = true;
+                        break;
+                    }
                 }
             }
-            if let Some(to) = jumped {
-                app.viewer.jump(to);
+            if !jumped {
+                for (station_ix, mesh_ix) in &app.world.plaque_ix {
+                    let pts: Vec<Pos2> = scene::plaque_corners(&app.world, *mesh_ix)
+                        .iter()
+                        .filter_map(|c| project(&cam, rect, *c))
+                        .collect();
+                    if pts.len() == 4 && Rect::from_points(&pts).contains(click) {
+                        app.viewer.jump(*station_ix);
+                        jumped = true;
+                        break;
+                    }
+                }
             }
             let corners = scene::page_corners(&app.world);
             let pts: Vec<Pos2> = corners.iter().filter_map(|c| project(&cam, rect, *c)).collect();
-            if jumped.is_none() && pts.len() == 4 {
+            if !jumped && pts.len() == 4 {
                 let page_rect = Rect::from_points(&pts);
                 if page_rect.contains(click) {
                     app.viewer.touch_at([
@@ -265,7 +290,7 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     } else if !app.viewer.rev_note.is_empty() {
         format!("✎ {}", app.viewer.rev_note)
     } else {
-        "wheel scroll · drag orbit · [ ] rooms · , . revisions · b branch · m worktree · v mark · h homecoming · click plaques".to_string()
+        "wheel scroll · drag orbit · [ ] rooms · , . revisions · b branch · m worktree · v mark · h homecoming · g graph · click plaques".to_string()
     };
     p.text(
         rect.left_bottom() + Vec2::new(12.0, -10.0),

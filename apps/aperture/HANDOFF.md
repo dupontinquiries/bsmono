@@ -6,9 +6,32 @@ territory (it's long — ~50KB, one section per commit below, each with its
 own "honest ledger" of what's tested vs. compiled-only vs. deliberately not
 built) and `TODO.md`'s aperture section has the standing backlog.
 
+## If you fetched a bundle before commit `1fd64e91`, re-fetch
+
+A real bug in my own git workflow (not the code): commit `c89c9f3b`
+("the sun follows the clock") edited `shared/scene-kit/src/mesh3d.rs` but
+was committed via `cd apps/aperture && git add .`, which never staged that
+file — it sat modified-but-uncommitted locally through 10 subsequent
+commits. Every bundle regenerated in that window would build fine here
+(the local working tree still had the uncommitted file) but would FAIL TO
+COMPILE for anyone who actually fetched and merged it, since
+`aperture-scene` calls `sun_dir_3d_at`/`sun_clock_at`, which didn't exist
+in the committed `mesh3d.rs`. Fixed in `1fd64e91`, found by running a
+plain `git status` at the repo root instead of only inside `apps/aperture`.
+If in doubt, `git log --stat 1fd64e91` shows exactly what was missing.
+
+Audited afterward: iterated every single commit's actual changed paths
+(not commit-message text, which mentions "shared/scene-kit" often enough
+to produce false positives on a naive grep) to confirm this was the ONLY
+instance of the bug. Exactly three commits genuinely touch
+`shared/scene-kit`: `ec32b292` (initial lift, 11 files), `418bd23c` (the
+`u_page2` channel, 2 files), `1fd64e91` (this fix, 2 files). A full
+`git status --short --untracked-files=all` at the repo root, filtered only
+for build-artifact `target/` noise, comes back completely empty.
+
 ## What this is
 
-24 commits on `session/aperture-editor`, branched from `main`, building
+31 commits on `session/aperture-editor`, branched from `main`, building
 **aperture** (a Rust/egui code editor with an AI ghost-completion loop) and
 **aperture-view** (a physical/spatial 3D file viewer — "syntax tree in
 space," rooms per code item, git history you can walk through). Both live
@@ -17,15 +40,17 @@ from `logscope-egui` early in the session and both apps' git integration
 (`gitspace`) lives in `aperture-core` so both shells share it.
 
 Started from an empty `apps/aperture/` (the repo's `manifest/projects.toml`
-didn't know about it yet). By the last commit: 208 tests (153 in the
+didn't know about it yet). By the last commit: 216 tests (161 in the
 aperture workspace + 55 in `scene-kit`), zero compiler warnings anywhere in
-the touched crates, `verify.sh` clean.
+the touched crates, `verify.sh` clean for both `aperture` and `logscope`
+(the latter confirmed by an actual build, not just by argument — see
+commit #30).
 
 ## Merging this
 
 ```
 git fetch /path/to/aperture-session.bundle session/aperture-editor
-git log main..FETCH_HEAD --oneline   # the 24 commits, newest last above
+git log main..FETCH_HEAD --oneline   # the 30 commits, newest last above
 git merge FETCH_HEAD                 # or rebase/cherry-pick as you prefer
 ```
 
@@ -99,6 +124,12 @@ file picker (editor).
 24. `104292e3` rooms shaped by real signal (logscope's `region_plan`) —
     **two real bugs** in the dormancy threshold, both caught by the first
     test run before shipping
+25. `8f18b184` `HANDOFF.md` (this file)
+26. `d8031d00` graph-node click-to-jump — closes the gap #23/#24 left open
+27. `9c37dbc1` the AI margin note's length limit now has a reason (logscope's `textsurface`)
+28. `59f27b4f` the commit graph uses logscope's real `flow()` layout (time-stretch + lanes), not a placeholder single-lane one
+29. `8eae21d1` `G` frames the commit graph (logscope's camera-fit vocabulary: `centroid`/`bounding_radius`/`fit_distance`), so it's reliably reachable regardless of a person's orbit habits
+30. `edd17325` (no code change) verified logscope-egui itself still builds clean — real build, not assumed, after seven commits touching the shared kit it does NOT depend on
 
 **Pattern worth knowing**: roughly a third of these commits found a real,
 previously-existing bug or gap while building something else — not
@@ -115,12 +146,13 @@ this branch, that's where to look first.
 - **`batch_by_day`** (groups revisions into day-buckets, in `gitspace`,
   tested) exists but isn't wired into any UI — no "welcome back, here's
   Tuesday's batch and Wednesday's batch" overview yet.
-- **Graph-node click-to-jump**: the commit graph renders but isn't
-  clickable — needs a sphere hit-test convention, plaques use flat quad
-  corners which doesn't transfer directly.
-- **Multi-lane graph layout**: the commit graph is single-lane (pure time
-  order); real DAG lane-packing (parallel branches drawn parallel) is a
-  harder, separate problem.
+- ~~Graph-node click-to-jump~~ DONE (commit 26, `d8031d00`):
+  `World.graph_node_ix` + a distance-based screen-space hit test (spheres
+  don't have quad corners the way plaques do — a deliberately separate
+  convention, not a forced reuse).
+- ~~Multi-lane graph layout~~ DONE (commit 28, `59f27b4f`): the commit
+  graph uses `scene_kit::spatial::flow` — logscope's own river-with-lanes
+  layout, real time-stretch and real fork lanes, not pure time order.
 - **Cloud provider** (`ureq`/TLS) and **infer-kit extraction** (lifting
   `aperture-complete`'s Ollama client into a crate shared with
   `logscope-fan`) were both explicitly *declined*, not forgotten — the
@@ -129,10 +161,15 @@ this branch, that's where to look first.
   reconsidering if a real need shows up, but don't do either casually.
 - **Multi-cursor, IME preedit, streaming ghosts, LSP**: named in
   `TODO.md`, untouched, larger than anything tackled solo this session.
-- **`logscope-egui` itself was never modified.** Every scene-kit change
-  this session was checked (by `grep`, not assumption) to confirm
-  logscope's own separate, unmigrated copy of the shared files was
-  unaffected. If you migrate logscope onto the shared kit later, re-check
+- **`logscope-egui` itself was never modified — confirmed by actually
+  building it**, not just by argument. It has NO Cargo dependency on
+  `shared/scene-kit` at all (checked `Cargo.toml` directly): its own copies
+  of `mesh3d.rs`/`glow_scene.rs` under `crates/logscope-egui/src/` are
+  fully separate files, so nothing this session did to the shared kit could
+  reach it structurally. Verified anyway with a real
+  `cargo build -p logscope-egui` (clean, 2m54s, only its own 24 pre-existing
+  warnings) and a full-repo `verify.sh` (both `aperture` and `logscope`
+  clean). If you migrate logscope onto the shared kit later, re-check
   `TODO.md`'s scene-kit migration section — it has a running list of what
   diverged (the `u_page2` inscription channel, the parameterized sun
   functions, at minimum).
