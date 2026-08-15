@@ -345,6 +345,11 @@ pub struct Snapclone {
     /// takes on the colour of what is in it. `None` until enough pixels have
     /// been sampled, and `None` is a real answer — see `ambient()`.
     pub ambient: Option<(crate::ambient_palette::Rgb, crate::ambient_palette::Rgb)>,
+    /// The manual. Closed unless asked for, and it dismisses itself after a
+    /// period of no activity — where "activity" deliberately means scrolling
+    /// OR any other input, so a reader pausing on a short section is not
+    /// dismissed mid-read.
+    pub help: crate::help_manual::HelpManual,
     /// Running edge-pixel samples. Kept across snaps rather than recomputed:
     /// the palette should settle as the inbox fills, not lurch to whatever
     /// arrived last.
@@ -458,6 +463,39 @@ impl Snapclone {
             // leaking into a shared component.
             swipe: None,
             ambient: None,
+            // Written here rather than in HelpManual::default(): the widget is
+            // generic over its sections, and this app's manual living inside it
+            // would be snapclone's copy leaking into a reusable component.
+            //
+            // The four things a new user actually needs, in the order they hit
+            // them — not a feature list. A manual that documents the settings
+            // panel before it explains what a snap IS has been written for the
+            // person who wrote the app.
+            help: crate::help_manual::HelpManual::new(vec![
+                crate::help_manual::Section::new(
+                    "snaps", "Sending a snap",
+                    "Take a photo on the Camera tab and pick who it goes to. \
+                     It is sent directly to them — there is no server holding a \
+                     copy, so both of you need to be online, or it waits in your \
+                     outbox until they are."),
+                crate::help_manual::Section::new(
+                    "expiry", "When snaps disappear",
+                    "Text and photos are kept for 24 hours by default and media \
+                     for 30 days. Keeping a snap stops the clock for that one \
+                     only. Expiry is per-device: yours going does not take \
+                     theirs with it."),
+                crate::help_manual::Section::new(
+                    "adding", "Adding someone",
+                    "Show them your code on the Friends tab, or scan theirs. \
+                     The code is your sc-ID — it identifies you, so it is safe \
+                     to show a stranger and pointless to keep secret."),
+                crate::help_manual::Section::new(
+                    "privacy", "What leaves this device",
+                    "Snaps go to the people you send them to and nowhere else. \
+                     Timestamps are stored in UTC and last-seen is rounded to \
+                     five minutes, so neither your timezone nor your exact \
+                     habits are readable from the data."),
+            ]),
             ambient_samples: Default::default(),
             tabs: crate::tab_bar::TabBar::new(vec![
                 crate::tab_bar::Tab::new("camera", "Camera"),
@@ -504,6 +542,26 @@ impl Snapclone {
     /// Confirm the pending delete. Split from apply_friends because the
     /// confirmation arrives as its own answer, not as part of the tap that
     /// asked the question.
+    /// Advance the manual's idle countdown.
+    ///
+    /// Returns true on the frame it dismisses itself. Fed rather than owning a
+    /// timer, so the caller decides what a frame is — a manual that ran its own
+    /// clock would keep counting while the app was suspended and be gone when
+    /// the phone came back.
+    pub fn tick_help(&mut self, dt_ms: f32) -> bool {
+        self.help.tick(dt_ms)
+    }
+
+    /// Any input at all while the manual is open resets the countdown.
+    ///
+    /// Distinct from `scrolled`, and keeping the two apart is the feature: a
+    /// reader who pauses on a short section that does not move the scrollbar
+    /// must not be dismissed mid-read. Collapsing them into "did the offset
+    /// change" is the tidier-looking thing that reintroduces the bug.
+    pub fn help_interacted(&mut self) {
+        if self.help.is_open() { self.help.interacted(); }
+    }
+
     /// Feed a decoded snap into the ambient palette.
     ///
     /// `pixels` is the DOWNSCALED image — the deriver samples an edge band, and
@@ -3028,6 +3086,57 @@ mod modal_render_tests {
         }
         assert!(undrawn.is_empty(),
                 "presented but never drawn: {undrawn:?} — these block input while invisible");
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use crate::help_manual::IDLE_DISMISS_MS;
+    fn app() -> super::Snapclone { super::Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn a_reader_who_pauses_on_a_short_section_is_not_dismissed() {
+        // The whole feature. A short page does not move the scrollbar, so an
+        // idle rule watching only scroll offset would close on exactly the
+        // careful reader — worse than never closing at all.
+        let mut a = app();
+        a.help.open();
+        // Nearly out of time, then a keypress that scrolls nothing.
+        a.tick_help(IDLE_DISMISS_MS - 1.0);
+        a.help_interacted();
+        assert!(!a.tick_help(2.0), "dismissed a reader who had just interacted");
+        assert!(a.help.is_open());
+    }
+
+    #[test]
+    fn an_untouched_manual_does_close() {
+        // The countdown still has to work, or the rule above is just "never
+        // dismiss".
+        let mut a = app();
+        a.help.open();
+        assert!(a.tick_help(IDLE_DISMISS_MS));
+        assert!(!a.help.is_open());
+    }
+
+    #[test]
+    fn interaction_while_closed_does_nothing() {
+        // Input elsewhere in the app must not resurrect or arm a manual nobody
+        // opened.
+        let mut a = app();
+        a.help_interacted();
+        assert!(!a.help.is_open());
+    }
+
+    #[test]
+    fn the_manual_starts_closed_and_has_content() {
+        // A help button that opens an empty scroller is worse than no button:
+        // it answers the question with silence.
+        let a = app();
+        assert!(!a.help.is_open());
+        // visible(), not the private field: it applies the filter, so this
+        // asserts what a reader would actually SEE rather than what was loaded.
+        assert!(a.help.visible().len() >= 4);
+        assert!(a.help.visible().iter().all(|s| !s.body.trim().is_empty()));
     }
 }
 
