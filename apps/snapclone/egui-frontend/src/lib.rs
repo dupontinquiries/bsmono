@@ -314,6 +314,11 @@ pub struct Snapclone {
     pub landmarks: Vec<crate::landmark::Landmark>,
     /// The add-landmark form, open only while naming somewhere.
     pub add_landmark: Option<crate::landmark::AddLandmark>,
+    /// The risk-scored confirmation, open only while asking. Its mode — tap or
+    /// press-and-hold — comes from how bad the mistake would be, which is the
+    /// reason one component can serve both "clear this filter" and "delete this
+    /// conversation" without either feeling wrong.
+    pub confirm: Option<crate::chevron_confirm::ChevronConfirm>,
     /// (sender id, caption) for the snaps floating on the map, newest first.
     pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
@@ -412,6 +417,7 @@ impl Snapclone {
             wayfinder_contacts: Vec::new(),
             landmarks: Vec::new(),
             add_landmark: None,
+            confirm: None,
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
@@ -450,7 +456,37 @@ impl Snapclone {
     /// Confirm the pending delete. Split from apply_friends because the
     /// confirmation arrives as its own answer, not as part of the tap that
     /// asked the question.
+    /// Risk score for deleting a contact.
+    ///
+    /// Above HOLD_THRESHOLD, so it demands a press-and-hold. Removing someone
+    /// discards the conversation and the shared key with them: there is no
+    /// undo, and re-adding is a new pairing rather than a restore. A tap for
+    /// that is a tap away from losing a relationship's history.
+    ///
+    /// Scored rather than hardcoded to Hold, so the same component keeps
+    /// answering the question the same way everywhere.
+    pub const DELETE_CONTACT_RISK: u32 = 70;
+
+    /// Ask before deleting a contact, at the mode the risk demands.
+    ///
+    /// `familiar` comes from the caller's use record: a confirmation answered
+    /// fifty times "has stopped being a safety net and become a tax". But it
+    /// can only skip a TAP — a hold-level action still asks, because
+    /// familiarity with a dangerous action is exactly when a slip happens.
+    pub fn ask_delete(&mut self, familiar: bool) -> bool {
+        use crate::chevron_confirm::{ChevronConfirm, Mode};
+        let mode = Mode::for_score(Self::DELETE_CONTACT_RISK);
+        if familiar && mode == Mode::Tap {
+            return false; // no panel; the caller proceeds
+        }
+        self.confirm = Some(ChevronConfirm::new(Self::DELETE_CONTACT_RISK));
+        true
+    }
+
     pub fn confirm_delete(&mut self, id: &str) {
+        // The panel closes whichever way the answer went: leaving it open after
+        // a confirmed delete would ask about a contact that no longer exists.
+        self.confirm = None;
         self.peers.retain(|p| p.name != id);
         self.cards.close(id);
         self.sync_roster();
