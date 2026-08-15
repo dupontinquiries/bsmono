@@ -1187,6 +1187,30 @@ impl Snapclone {
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
+        // THE SNAP VIEWER. Fourth modal to get a body — and the one whose
+        // absence actually destroyed data: close_snap's own note says "the
+        // countdown is NOT stopped", so an undrawn snap expired on schedule.
+        // The event fired, storage marked it gone, and the user never saw the
+        // photo they had been told they had.
+        if self.viewer.is_open() {
+            let want = self.viewer.current().map(|s| format!("snap:{}", s.id));
+            let r = want.as_ref().and_then(|w| self.modal.topmost(crate::modal::Layer::Dialog)
+                .filter(|p| &p.id == w)
+                .map(|p| p.rect.clone()));
+            if let Some(r) = r {
+                let area = egui::Rect::from_min_size(
+                    egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+                ui.painter().rect_filled(area, 8.0, colors.bg_base);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+                let evs = crate::snaps::viewer_ui(&mut child, &mut self.viewer, &colors);
+                if child.button("close").clicked() { self.close_snap(); }
+                // Events go through the SAME handler open_snap uses, so a snap
+                // viewed and one expired reach storage by one path.
+                for ev in evs { self.apply_snap_event(ev); }
+            }
+        }
+
         // THE DELETE CONFIRMATION. Third of the six modals to get a body.
         if self.confirm.is_some() {
             let want = format!("confirm-delete:{}", self.confirm_id);
@@ -2770,7 +2794,7 @@ mod modal_render_tests {
         // Listing them keeps the test GREEN and the debt VISIBLE: a new modal
         // is a failure, and clearing one of these is deleting a line from here.
         // Removing the check instead would lose both properties.
-        let known_undrawn = ["snap:", "video:", "editor:"];
+        let known_undrawn = ["video:", "editor:"];
         let mut undrawn = Vec::new();
         for id in presented {
             // A renderer is a `topmost(...)` filtered on the id. Anything else
@@ -2780,8 +2804,23 @@ mod modal_render_tests {
             // bare string. My first version only checked literals and rejected
             // the delete confirmation the moment I wired it — a check that
             // fails on a correct fix trains people to delete the check.
-            let drawn = src.split("topmost(").skip(1).any(|after| {
-                let window = &after[..after.len().min(600)];
+            // A WINDOW AROUND topmost(, not just after it.
+            //
+            // The id can be built BEFORE the call — `let want = format!("snap:
+            // {}", ..); ... topmost(..).filter(|p| &p.id == want)` — so looking
+            // only forward missed the snap viewer the moment I wired it. That
+            // is twice this check has failed on a correct fix, which is a
+            // property of the check rather than of the code: matching source
+            // text cannot see intent, so the window has to be generous enough
+            // to cover the shapes people actually write.
+            //
+            // Generous in the false-NEGATIVE direction on purpose. Missing a
+            // genuinely undrawn modal costs one more bug of a kind we now know
+            // how to find; failing on correct code costs the check itself.
+            let drawn = src.match_indices("topmost(").any(|(i, _)| {
+                let lo = i.saturating_sub(400);
+                let hi = (i + 600).min(src.len());
+                let window = &src[lo..hi];
                 window.contains(&format!("\"{id}\"")) || window.contains(&format!("\"{id}{{"))
             });
             if !drawn && !known_undrawn.contains(&id) { undrawn.push(id); }

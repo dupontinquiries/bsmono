@@ -718,3 +718,80 @@ mod tests {
         assert!(p.ends_with("_01234567.jpg"));
     }
 }
+
+/// Draw the open snap, with its countdown.
+///
+/// The viewer was ported with `open`, `tick`, `countdown` and `next`/`prev` and
+/// no way to see any of it. The modal that presents it had no body, and the
+/// note on `close_snap` — "the countdown is NOT stopped" — meant a snap could
+/// expire while invisible: the event fires, storage marks it gone, and the user
+/// never saw the photo they were told they had.
+///
+/// ## The countdown is drawn because it is the contract
+///
+/// An ephemeral photo whose timer is invisible is just a photo that vanishes.
+/// The bar is what makes the disappearance a promise the user can watch being
+/// kept rather than a bug they report.
+///
+/// ## Playlist mode shows no bar, and that is not an omission
+///
+/// `remaining_ms` is None when browsing, because "browsing must not expire
+/// anything". Drawing a full-but-frozen bar there would say the opposite of
+/// what is happening, so there is no bar at all — the position counter takes
+/// its place.
+pub fn viewer_ui(ui: &mut egui::Ui, v: &mut Viewer, c: &uikit_egui::PaletteColors)
+    -> Vec<ViewerEvent> {
+    if !v.is_open() { return Vec::new(); }
+    // Ticked here rather than by the caller: the countdown is the whole
+    // feature, and a viewer drawn without being ticked shows a frozen timer on
+    // a snap that is silently still expiring.
+    let mut events = v.tick(ui.input(|i| i.stable_dt) * 1000.0);
+
+    let (who, caption) = match v.current() {
+        // No caption on Snap — that lives on FeedEntry. What a Snap knows
+        // about itself is its MEDIA KIND and duration, which is the more useful
+        // thing to show anyway: whether this is a photo or a video changes what
+        // the countdown means.
+        Some(s) => (s.sender_name.clone(),
+                    format!("{} · {}s", s.media.label(), s.duration_secs)),
+        // Open with nothing to show is a real state — the last snap in a
+        // playlist was consumed — and saying so beats an empty rectangle.
+        None => {
+            ui.colored_label(c.text_weak, "nothing left to view");
+            return events;
+        }
+    };
+
+    ui.vertical_centered(|ui| {
+        ui.colored_label(c.text, &who);
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().min(300.0), 220.0), egui::Sense::hover());
+        // The image itself belongs to the media layer; this owns the frame,
+        // the timer and the controls.
+        ui.painter().rect_filled(rect, 6.0, c.bg_base);
+        if !caption.trim().is_empty() {
+            ui.colored_label(c.text_weak, &caption);
+        }
+
+        if v.is_playlist() {
+            let (at, of) = v.position();
+            ui.colored_label(c.text_weak, format!("{at} / {of}"));
+            ui.horizontal(|ui| {
+                if ui.button("prev").clicked() { events.extend(v.prev()); }
+                if ui.button("next").clicked() { events.extend(v.next()); }
+            });
+        } else {
+            let left = v.countdown();
+            let (bar, _) = ui.allocate_exact_size(egui::vec2(200.0, 4.0), egui::Sense::hover());
+            ui.painter().rect_filled(bar, 2.0, c.bg_base);
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * left, bar.height())),
+                2.0, c.warning);
+            // Repaint while it runs: a countdown that only advances when
+            // something else causes a frame would sit still and then jump.
+            if left > 0.0 { ui.ctx().request_repaint(); }
+        }
+    });
+    events
+}
+
