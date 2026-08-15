@@ -208,6 +208,15 @@ pub struct Snapclone {
     /// live now — the previous commit took them off the Wayfinder page, where
     /// they never belonged, and left them with no home.
     pub voicebar: crate::voicebar::VoiceBar,
+    /// The room. voicebar is the CONTROL — press to talk, the lock, your own
+    /// level — and this is who else is here and who is speaking. The control
+    /// was wired and the room was not, so you could talk into a call without
+    /// being able to see who was in it.
+    /// Named voice_room, not roster: `roster` is already the FRIENDS list
+    /// (crate::friends::Roster) and these are different sets — everyone you
+    /// know versus everyone in this call. Two fields of the same name would not
+    /// compile, and two of similar name would be confused forever.
+    pub voice_room: crate::roster::Roster,
     /// Monthly export-reminder bookkeeping. Host-persisted in Qt (QSettings);
     /// held here so the decision stays a pure function of state + clock.
     pub reminder: crate::export_reminder::ReminderState,
@@ -336,6 +345,7 @@ impl Snapclone {
             missed_calls: Vec::new(),
             qr: None,
             voicebar: crate::voicebar::VoiceBar::new(),
+            voice_room: Default::default(),
             reminder: Default::default(),
             now_month: None,
             recent_snaps: Vec::new(),
@@ -564,8 +574,23 @@ impl Snapclone {
             // Reflect the press locally AND ask the session. A talk button that
             // waits for the round trip before lighting feels broken on a slow
             // link, which is exactly when you are pressing it hardest.
-            Event::TalkPressed => self.voicebar.set_on_air(true),
-            Event::TalkReleased => self.voicebar.set_on_air(false),
+            // Both sides of the same fact. Taking the floor locally must show
+            // in the room too, or your own row stays silent while you are
+            // talking — the one row the user can verify against reality, and
+            // the one that would make them distrust the rest.
+            Event::TalkPressed => {
+                self.voicebar.set_on_air(true);
+                if let Some(me) = self.voice_room.people().iter().find(|p| p.is_self) {
+                    let id = me.id.clone();
+                    self.voice_room.set_active_speaker(&id);
+                }
+            }
+            Event::TalkReleased => {
+                self.voicebar.set_on_air(false);
+                // Empty id opens the floor rather than naming a speaker who is
+                // not talking.
+                self.voice_room.set_active_speaker("");
+            }
             // The request is ours to record; the TIER is the negotiation's to
             // report, so this does not set Private itself.
             Event::PrivateRequested(want) => {
