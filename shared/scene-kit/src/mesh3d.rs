@@ -733,7 +733,7 @@ pub fn disc(center: Vec3, r: f32, segs: usize, color: Color32) -> Mesh3 {
 /// `LOGSCOPE_HOUR`) overrides for deterministic renders. KIT CHANGE: std-only, so this is UTC —
 /// the kit does not drag a timezone dependency for one sun angle. A consumer that wants local
 /// solar time sets `SCENE_KIT_HOUR` itself (logscope's shell can keep chrono and do exactly that).
-fn local_hour() -> f32 {
+pub fn local_hour() -> f32 {
     for k in ["SCENE_KIT_HOUR", "LOGSCOPE_HOUR"] {
         if let Ok(h) = std::env::var(k) { if let Ok(v) = h.trim().parse::<f32>() { return v.rem_euclid(24.0); } }
     }
@@ -747,7 +747,20 @@ fn local_hour() -> f32 {
 /// A 3D sun direction from the real LOCAL clock: a low sun at dawn/dusk arcing overhead at noon, dipping
 /// below at night. Returns a unit direction pointing TOWARD the sun.
 pub fn sun_dir_3d() -> Vec3 {
-    let h = local_hour();
+    sun_dir_3d_at(local_hour())
+}
+
+/// The same sun direction, at an hour the CALLER chooses.
+///
+/// Split out because a scene that animates the day cycle — or scrubs it on a
+/// slider — needs the angle for an arbitrary hour, and the no-arg version reads
+/// the clock on every call. The clock-reading and the geometry are two
+/// decisions, and only one of them belongs to the kit.
+///
+/// `sun_dir_3d()` now delegates here, so the two cannot drift: a change to the
+/// arc is a change to both, which is not true of a copied body.
+pub fn sun_dir_3d_at(h: f32) -> Vec3 {
+    let h = h.rem_euclid(24.0);
     let elev = (std::f32::consts::PI * ((h - 6.0) / 12.0)).sin(); // <0 at night
     let az = std::f32::consts::TAU * ((h - 6.0) / 24.0);
     norm(v(az.cos() * 0.7, elev.max(0.05) + 0.30, az.sin() * 0.7)) // keep a little fill at night
@@ -757,7 +770,14 @@ pub fn sun_dir_3d() -> Vec3 {
 /// `warmth` -1..1 (warm orange near sunrise/sunset, neutral at noon, cool blue at night), and `ambient` mul.
 /// Lets the scene's sun colour, exposure and fill track the real time of day on top of the per-theme grade.
 pub fn sun_clock() -> (f32, f32, f32) {
-    let h = local_hour();
+    sun_clock_at(local_hour())
+}
+
+/// The same day-cycle lighting, at a caller-chosen hour.
+pub fn sun_clock_at(h: f32) -> (f32, f32, f32) {
+    // Wrapped, not clamped: hour 25 is 1am, and an animator stepping past
+    // midnight should roll over rather than stick at dusk.
+    let h = h.rem_euclid(24.0);
     // elevation 0..1 over the day; smooth, with civil-twilight tails
     let elev = (std::f32::consts::PI * ((h - 6.0) / 12.0)).sin();
     let day = elev.max(0.0);                       // 0 at/under horizon, 1 at noon
@@ -1737,3 +1757,55 @@ mod tests {
         assert_ne!(rune_cells(1, 5), rune_cells(2, 5), "different ids → different runes");
     }
 }
+
+#[cfg(test)]
+mod sun_at_tests {
+    use super::*;
+
+    #[test]
+    fn the_no_arg_versions_delegate_rather_than_duplicate() {
+        // The point of the split: a change to the arc must reach both. If
+        // sun_dir_3d kept its own copy of the maths these would drift silently.
+        let h = local_hour();
+        let a = sun_dir_3d();
+        let b = sun_dir_3d_at(h);
+        assert!((a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6 && (a.z - b.z).abs() < 1e-6,
+                "{a:?} vs {b:?}");
+        assert_eq!(sun_clock(), sun_clock_at(h));
+    }
+
+    #[test]
+    fn midday_is_brighter_than_midnight() {
+        let (noon, _, _) = sun_clock_at(12.0);
+        let (night, _, _) = sun_clock_at(0.0);
+        assert!(noon > night, "noon {noon} vs midnight {night}");
+    }
+
+    #[test]
+    fn dawn_is_warm_and_night_is_cool() {
+        // warmth is "hottest when the sun is low but up", negative at night.
+        let (_, dawn, _) = sun_clock_at(6.5);
+        let (_, night, _) = sun_clock_at(1.0);
+        assert!(dawn > 0.0, "dawn should be warm: {dawn}");
+        assert!(night < 0.0, "night should be cool: {night}");
+    }
+
+    #[test]
+    fn the_hour_wraps_rather_than_clamping() {
+        // Hour 25 is 1am. An animator stepping past midnight should roll over,
+        // not stick at dusk — clamping would freeze the sun at 24:00 forever.
+        assert_eq!(sun_clock_at(25.0), sun_clock_at(1.0));
+        assert_eq!(sun_clock_at(-1.0), sun_clock_at(23.0));
+    }
+
+    #[test]
+    fn the_sun_never_drops_to_zero_fill() {
+        // "keep a little fill at night" — a scene lit to exactly zero is a
+        // black frame, which reads as a broken renderer rather than as night.
+        for h in 0..24 {
+            let d = sun_dir_3d_at(h as f32);
+            assert!(d.y > 0.0, "hour {h} put the sun at or below y=0: {d:?}");
+        }
+    }
+}
+
