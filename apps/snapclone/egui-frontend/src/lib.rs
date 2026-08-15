@@ -342,6 +342,14 @@ pub struct Snapclone {
     pub local_hosts: Vec<String>,
     /// Our public address, when something has told us one.
     pub public_host: Option<String>,
+    /// Rows for snaps in flight.
+    ///
+    /// The type is send_state::Outbox, and there is ALSO a crate::outbox — two
+    /// different things sharing a name. This one owns what the SENDER SEES; the
+    /// other owns a snap's lifetime in storage. Fully qualified at every use
+    /// because the short name would be ambiguous to a reader even where the
+    /// compiler is satisfied.
+    pub sends: crate::send_state::Outbox,
     /// Battery and power state. Three sources for one fact because no single
     /// one is present everywhere this app runs — PowerDevil on Plasma, UPower
     /// elsewhere, a sysfs poll where neither answers.
@@ -474,6 +482,7 @@ impl Snapclone {
             last_prune_ms: 0,
             local_hosts: Vec::new(),
             public_host: None,
+            sends: Default::default(),
             power: Default::default(),
             // The five surfaces this app actually has. Built here rather than
             // in TabBar::default() because the bar is generic over its tabs —
@@ -1500,7 +1509,13 @@ impl Snapclone {
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
         // Discovery ages on its own schedule. Driven from the frame because
         // this app has no timer thread — the guard inside makes that cheap.
-        self.tick_gossip((ui.input(|i| i.time) * 1000.0) as u64);
+        let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+        self.tick_gossip(now_ms);
+        // Pending rows time out on their own clock. Without this a send that
+        // never gets an ack stays "Pending" for the life of the process — the
+        // spinner that never stops, which is worse than a failure because it
+        // never prompts a retry.
+        self.sends.tick(now_ms);
         // THE CONTACT EDITOR. Last of the six modals to get a body.
         //
         // It renames only. The Peer this app holds carries a name and an online
@@ -1929,6 +1944,31 @@ impl Snapclone {
         for id in ids {
             let sel = self.picker.selected().iter().any(|s| s == &id);
             if ui.selectable_label(sel, &id).clicked() { self.picker.toggle(&id); }
+        }
+        // SEND, and the row that watches it. The picker could select people and
+        // nothing consumed the selection — and send_state, "the row the sender
+        // watches", had no caller at all. Between them the app could choose
+        // recipients and never tell you whether anything arrived.
+        let chosen: Vec<String> = self.picker.selected().to_vec();
+        if !chosen.is_empty() {
+            let label = format!("send to {}", chosen.len());
+            if ui.button(label).clicked() {
+                let now = (ui.input(|i| i.time) * 1000.0) as u64;
+                for who in &chosen {
+                    // One row PER RECIPIENT. A single row for a multi-send
+                    // cannot express the normal case — one person offline, the
+                    // rest fine — and would have to report the whole thing
+                    // failed or the whole thing sent.
+                    self.sends.push(&format!("{who}:{now}"), now);
+                }
+            }
+        }
+        // Failures surface without being hunted for. needs_attention exists
+        // because a send that failed silently is indistinguishable from one
+        // that worked, and the sender is the last person to find out.
+        let stuck = self.sends.needs_attention().len();
+        if stuck > 0 {
+            ui.colored_label(c.warning, format!("{stuck} send(s) failed — tap to retry"));
         }
         ui.separator();
         if let Some(sel) = self.nav.subpage() {
