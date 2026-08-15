@@ -338,3 +338,60 @@ mod tests {
         assert_eq!(c.chevron_side(700.0, 200.0, 800.0), ChevronSide::Above);
     }
 }
+
+/// Draw the confirmation panel.
+///
+/// The widget was ported state-only, so the modal that presents it had nothing
+/// to render — the third unwired half of one feature, alongside `Snapclone::
+/// confirm` and the `confirm-delete:` modal id.
+///
+/// The MODE drives the interaction, not a style flag: a Tap panel gets a
+/// button, a Hold panel gets a progress bar that fills while pressed. Rendering
+/// a hold-mode panel as a button would silently downgrade the protection the
+/// score asked for, which is the one failure this component exists to prevent.
+pub fn chevron_confirm_ui(ui: &mut egui::Ui, cc: &mut ChevronConfirm, what: &str,
+                          c: &uikit_egui::PaletteColors) -> Option<Outcome> {
+    if !cc.is_open() { return cc.outcome(); }
+    let mut out = None;
+    // Ticked every frame: both the hold progress and the withdraw timeout are
+    // clocks, so a panel nobody touches must still be able to time out.
+    if let Some(o) = cc.tick(ui.input(|i| i.stable_dt) * 1000.0) {
+        return Some(o);
+    }
+    ui.vertical(|ui| {
+        ui.colored_label(c.text, what);
+        match cc.mode() {
+            Mode::Tap => {
+                ui.horizontal(|ui| {
+                    if ui.button("confirm").clicked() { out = cc.tap(); }
+                    if ui.button("cancel").clicked() { cc.cancel(); out = cc.outcome(); }
+                });
+            }
+            Mode::Hold => {
+                // Says what it wants BEFORE the finger goes down. A bar that
+                // only appears once pressed teaches the gesture by failure —
+                // the user taps, nothing happens, and they conclude the button
+                // is broken rather than that it wanted a hold.
+                ui.colored_label(c.text_weak, "hold to confirm");
+                let r = ui.add(egui::Button::new("hold"));
+                if r.is_pointer_button_down_on() { cc.press(); } else { cc.release(); }
+                let p = cc.progress();
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(120.0, 4.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 1.0, c.bg_base);
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * p, rect.height())),
+                    1.0, c.warning);
+                if p > 0.0 && p < 1.0 {
+                    // Repaint while filling, or the bar advances only when
+                    // something else causes a frame and a still finger looks
+                    // like a stuck control.
+                    ui.ctx().request_repaint();
+                }
+                if ui.button("cancel").clicked() { cc.cancel(); out = cc.outcome(); }
+            }
+        }
+    });
+    out
+}
+

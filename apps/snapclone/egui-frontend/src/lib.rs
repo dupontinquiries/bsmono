@@ -319,6 +319,10 @@ pub struct Snapclone {
     /// reason one component can serve both "clear this filter" and "delete this
     /// conversation" without either feeling wrong.
     pub confirm: Option<crate::chevron_confirm::ChevronConfirm>,
+    /// Which contact the open confirm panel is about. Held separately because
+    /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
+    /// risk score, not a subject.
+    pub confirm_id: String,
     /// Battery and power state. Three sources for one fact because no single
     /// one is present everywhere this app runs — PowerDevil on Plasma, UPower
     /// elsewhere, a sysfs poll where neither answers.
@@ -422,6 +426,7 @@ impl Snapclone {
             landmarks: Vec::new(),
             add_landmark: None,
             confirm: None,
+            confirm_id: String::new(),
             power: Default::default(),
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
@@ -559,9 +564,29 @@ impl Snapclone {
                 // Delete asks first, in the Confirm layer above the dialog
                 // layer — removing a contact on a single tap of a menu item
                 // that sits one row below "Message" is how people lose people.
-                "delete" => self.modal.present_default(
-                    &format!("confirm-delete:{id}"), crate::modal::Layer::Confirm,
-                    crate::modal::Rect::new(40.0, 200.0, 300.0, 140.0)),
+                "delete" => {
+                    // ask_delete builds the panel AND decides whether one is
+                    // needed at all. Presenting the modal without calling it
+                    // left `confirm` as None, so the dialog had no state to
+                    // render even once it had a renderer — three unwired halves
+                    // of one feature.
+                    //
+                    // familiar=false for now: UxGuide's use counter is not
+                    // ported, and claiming familiarity we have not measured
+                    // would skip a confirmation on the strength of a guess.
+                    // Erring toward asking is the safe direction for a delete.
+                    if self.ask_delete(false) {
+                        self.confirm_id = id.clone();
+                        self.modal.present_default(
+                            &format!("confirm-delete:{id}"), crate::modal::Layer::Confirm,
+                            crate::modal::Rect::new(40.0, 200.0, 300.0, 140.0));
+                    } else {
+                        // No panel wanted — a familiar, low-risk action goes
+                        // straight through, which is the whole point of
+                        // ask_delete returning a bool.
+                        self.confirm_delete(&id);
+                    }
+                }
                 "edit" => self.modal.present_default(
                     &format!("editor:{id}"), crate::modal::Layer::Dialog,
                     crate::modal::Rect::new(20.0, 80.0, 340.0, 400.0)),
@@ -1125,6 +1150,40 @@ impl Snapclone {
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
+        // THE DELETE CONFIRMATION. Third of the six modals to get a body.
+        if self.confirm.is_some() {
+            let want = format!("confirm-delete:{}", self.confirm_id);
+            let r = self.modal.topmost(crate::modal::Layer::Confirm)
+                .filter(|p| p.id == want)
+                .map(|p| p.rect.clone());
+            if let Some(r) = r {
+                let area = egui::Rect::from_min_size(
+                    egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+                ui.painter().rect_filled(area, 8.0, colors.bg_base);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+                let id = self.confirm_id.clone();
+                let what = format!("delete {id}?");
+                let outcome = self.confirm.as_mut()
+                    .and_then(|cc| crate::chevron_confirm::chevron_confirm_ui(
+                        &mut child, cc, &what, &colors));
+                match outcome {
+                    Some(crate::chevron_confirm::Outcome::Confirmed) => {
+                        self.confirm_delete(&id);
+                    }
+                    // Cancelled and TimedOut both close WITHOUT deleting, and
+                    // they stay distinct in the enum for the caller's benefit —
+                    // but here they mean the same thing, and conflating them at
+                    // the point of action would be the one place it is safe to.
+                    Some(_) => {
+                        self.confirm = None;
+                        self.modal.dismiss(&want);
+                    }
+                    None => {}
+                }
+            }
+        }
+
         // THE INCOMING-CALL SHEET. Presented on the Confirm layer and never
         // drawn, while `tick` kept running — so a call could ring, time out and
         // be recorded as missed WITHOUT EVER APPEARING. That is worse than a
@@ -2674,14 +2733,19 @@ mod modal_render_tests {
         // Listing them keeps the test GREEN and the debt VISIBLE: a new modal
         // is a failure, and clearing one of these is deleting a line from here.
         // Removing the check instead would lose both properties.
-        let known_undrawn = ["snap:", "video:", "confirm-delete:", "editor:"];
+        let known_undrawn = ["snap:", "video:", "editor:"];
         let mut undrawn = Vec::new();
         for id in presented {
             // A renderer is a `topmost(...)` filtered on the id. Anything else
             // — a dismiss, a present — does not put pixels on screen.
+            // Matches the id as a LITERAL or as the prefix of a format!, because
+            // a parameterised modal ("confirm-delete:{id}") cannot appear as a
+            // bare string. My first version only checked literals and rejected
+            // the delete confirmation the moment I wired it — a check that
+            // fails on a correct fix trains people to delete the check.
             let drawn = src.split("topmost(").skip(1).any(|after| {
-                let window = &after[..after.len().min(400)];
-                window.contains(&format!("\"{id}\""))
+                let window = &after[..after.len().min(600)];
+                window.contains(&format!("\"{id}\"")) || window.contains(&format!("\"{id}{{"))
             });
             if !drawn && !known_undrawn.contains(&id) { undrawn.push(id); }
         }
