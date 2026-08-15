@@ -134,6 +134,47 @@ pub fn page_count(all: &[Chassis], budget: usize) -> usize {
     pages
 }
 
+/// Read chassis tiers out of `assets/bots/fleet.json`.
+///
+/// A two-field scan rather than a JSON parser, because this crate has NO json
+/// dependency and adding one to read `name` and `confidence` would be a new
+/// dependency for two strings. The file is generator output with a stable
+/// shape, not user input.
+///
+/// A missing or unreadable file is not an error: the original 48 hand-made bots
+/// predate the confidence sweep entirely, and a tree without the fleet drop
+/// should load exactly as it did before.
+pub fn load_tiers(bots_dir: &std::path::Path) -> std::collections::HashMap<String, Tier> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(bots_dir.join("fleet.json")) else {
+        return out;
+    };
+    // Entries are objects with "name" before "confidence". Tracking the most
+    // recent name and attaching the next confidence to it survives whitespace
+    // and key order changes within an entry, which a line-offset scan would
+    // not.
+    let mut name: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim().trim_end_matches(',');
+        if let Some(v) = field(line, "\"name\"") {
+            name = Some(v);
+        } else if let Some(v) = field(line, "\"confidence\"") {
+            if let (Some(n), Some(t)) = (name.take(), Tier::parse(&v)) {
+                out.insert(n, t);
+            }
+        }
+    }
+    out
+}
+
+/// `"key": "value"` -> value, for the one shape fleet.json uses.
+fn field(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim_start().strip_prefix(':')?.trim();
+    let inner = rest.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
+}
+
 /// Parse `--bots` into a pick.
 ///
 /// Accepts a tier name, `page:N`, a comma list of chassis names, or `all`.
@@ -274,3 +315,60 @@ mod tests {
         assert_eq!(fit(&all, &Pick::OnlyTier(Tier::High), SDF_BUDGET).len(), 1);
     }
 }
+
+#[cfg(test)]
+mod tier_file_tests {
+    use super::*;
+
+    #[test]
+    fn tiers_are_read_from_the_generators_own_file() {
+        let dir = std::env::temp_dir().join("roster-tier-test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("fleet.json"), r#"{
+ "fleet": [
+  {"name": "boat_mistral", "category": "boat", "poses": 5, "confidence": "low"},
+  {"name": "car_charger", "poses": 5, "confidence": "high"}
+ ]
+}"#).unwrap();
+        let t = load_tiers(&dir);
+        assert_eq!(t.get("boat_mistral"), Some(&Tier::Low));
+        assert_eq!(t.get("car_charger"), Some(&Tier::High));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_is_not_an_error() {
+        // The original 48 predate the sweep, and a tree without the fleet drop
+        // must load exactly as it did before.
+        let t = load_tiers(std::path::Path::new("/nonexistent-roster-dir"));
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn keys_between_name_and_confidence_do_not_break_the_pairing() {
+        // The real file has eight keys between them, which is why this tracks
+        // the most recent name rather than reading a fixed offset.
+        let dir = std::env::temp_dir().join("roster-tier-test2");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("fleet.json"), r#"{"fleet":[
+  {"name": "x",
+   "source": "a.iqm",
+   "poses": 5,
+   "morph": "accepted",
+   "confidence": "broken"}
+]}"#).unwrap();
+        assert_eq!(load_tiers(&dir).get("x"), Some(&Tier::Broken));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_tier_is_skipped_rather_than_guessed() {
+        let dir = std::env::temp_dir().join("roster-tier-test3");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("fleet.json"),
+                       r#"{"fleet":[{"name":"y","confidence":"probably"}]}"#).unwrap();
+        assert!(load_tiers(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

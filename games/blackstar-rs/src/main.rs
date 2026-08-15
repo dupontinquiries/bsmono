@@ -428,6 +428,9 @@ struct Opts {
     join: Option<String>,
     mobile: bool,
     desktop_ui: bool,
+    /// Which chassis to load. `None` means all-that-fit, which is what the
+    /// game did before there were more chassis than SDF slots.
+    bots: Option<crate::roster::Pick>,
 }
 
 fn parse_args() -> Opts {
@@ -443,6 +446,7 @@ fn parse_args() -> Opts {
         join: None,
             mobile: false,
         desktop_ui: false,
+        bots: None,
 };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -450,6 +454,22 @@ fn parse_args() -> Opts {
             "--gfx" => o.gfx = Some(args.next().as_deref() != Some("classic")),
             "--seed" => o.seed = args.next().and_then(|v| v.parse().ok()),
             "--map" => o.map = args.next().and_then(|v| v.parse().ok()),
+            // --bots all | high | medium | low | broken | page:N | name,name
+            //
+            // An unparseable value EXITS rather than falling back to all: the
+            // fallback loads 126 arbitrary chassis, which looks like the flag
+            // worked and is the exact confusion roster::parse_pick refuses.
+            "--bots" => {
+                let v = args.next().unwrap_or_default();
+                match crate::roster::parse_pick(&v) {
+                    Some(p) => o.bots = Some(p),
+                    None => {
+                        eprintln!("--bots: don't understand {v:?}");
+                        eprintln!("  try: all | high | medium | low | broken | page:N | name,name");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--fullscreen" => o.fullscreen = Some(true),
             "--windowed" => o.fullscreen = Some(false),
             "--mute" => o.mute = true,
@@ -1312,6 +1332,40 @@ fn main() {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         bots.sort();
+
+        // CHASSIS SELECTION. Every pose is a model and the SDF bake holds
+        // CSDF_MAXM (126) of them, so 222 chassis at ~5 poses cannot all load.
+        // Without this the bake silently truncates mid-chassis and some bots
+        // fold into a pose the renderer cannot sample.
+        //
+        // Counting poses per chassis costs a readdir each, which is why it
+        // happens ONCE here rather than inside roster::fit — the selector is
+        // pure so it can be tested without a filesystem.
+        let tiers = roster::load_tiers(&bots_dir);
+        let inventory: Vec<roster::Chassis> = bots.iter().map(|name| {
+            let n = std::fs::read_dir(bots_dir.join(name))
+                .into_iter().flatten().flatten()
+                .filter(|e| e.path().is_dir() && e.path().join("scene.gltf").is_file())
+                .count();
+            roster::Chassis { name: name.clone(), poses: n,
+                              tier: tiers.get(name).copied() }
+        }).collect();
+
+        let pick = opts.bots.clone().unwrap_or(roster::Pick::All);
+        let chosen = roster::fit(&inventory, &pick, roster::SDF_BUDGET);
+        let dropped = inventory.len() - chosen.len();
+        if dropped > 0 {
+            // Said out loud, with the way to see the rest. A roster that
+            // quietly shows a third of the fleet is indistinguishable from a
+            // broken asset drop.
+            let pages = roster::page_count(&inventory, roster::SDF_BUDGET);
+            eprintln!("bots: loaded {} of {} chassis ({dropped} over the {} SDF budget)",
+                      chosen.len(), inventory.len(), roster::SDF_BUDGET);
+            eprintln!("      --bots page:0..{} to step through, or --bots high|broken",
+                      pages.saturating_sub(1));
+        }
+        let bots: Vec<String> = chosen.into_iter().map(|c| c.name).collect();
+
         for bot in bots {
             let bdir = bots_dir.join(&bot);
             let mut poses: Vec<PathBuf> = std::fs::read_dir(&bdir)
