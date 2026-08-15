@@ -55,11 +55,19 @@ pub struct Session {
     /// Finished calls, oldest first. The shell drains these into the store.
     pending_history: Vec<HistoryEntry>,
     pub modem: ModemStatus,
+    /// Registered operator MCC+MNC, once a backend reports one — the setup
+    /// wizard's suggestion key.
+    pub operator: Option<String>,
 }
 
 impl Default for Session {
     fn default() -> Self {
-        Session { calls: BTreeMap::new(), pending_history: Vec::new(), modem: ModemStatus::Probing }
+        Session {
+            calls: BTreeMap::new(),
+            pending_history: Vec::new(),
+            modem: ModemStatus::Probing,
+            operator: None,
+        }
     }
 }
 
@@ -96,7 +104,9 @@ impl Session {
                     self.finish(&id, now);
                 }
             }
-            Event::Error(_) => {} // surfaced by the shell, not state
+            Event::Operator { mccmnc } => self.operator = Some(mccmnc),
+            // Toast material, not state — surfaced by the shell.
+            Event::Info(_) | Event::Error(_) => {}
         }
     }
 

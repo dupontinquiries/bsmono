@@ -18,6 +18,8 @@
 //! ([`Command::Dtmf`] instead of the entry buffer), which is the actual
 //! semantics of a phone keypad and cheaper than a second widget.
 
+pub mod wizard;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dialer_core::history::HistoryStore;
@@ -87,6 +89,13 @@ fn now_unix() -> u64 {
 /// The whole app state. Public so a future tablet/desktop shell can embed it.
 pub struct Shell {
     link: Link,
+    /// The Matrix signalling link, when signed in. Its calls carry
+    /// "matrix/"-prefixed ids; the shell routes commands on that prefix.
+    matrix_link: Option<Link>,
+    /// Matrix connection status, kept out of `session.modem` so the two
+    /// transports don't clobber each other's status line.
+    matrix_status: Option<String>,
+    wizard: Option<wizard::Wizard>,
     /// Why we fell back to the mock, if we did — shown once as a toast.
     fallback_reason: Option<String>,
     session: Session,
@@ -107,8 +116,27 @@ impl Shell {
         if let Some(w) = warn {
             toasts.warning(w, 0.0);
         }
+        // A saved Matrix session comes up on launch; failure is a toast,
+        // not a launch blocker.
+        #[cfg(feature = "matrix")]
+        let (matrix_link, matrix_err) = match dialer_core::matrix::Creds::load() {
+            Some(creds) => match dialer_core::matrix::spawn(creds) {
+                Ok(l) => (Some(l), None),
+                Err(e) => (None, Some(e)),
+            },
+            None => (None, None),
+        };
+        #[cfg(not(feature = "matrix"))]
+        let (matrix_link, matrix_err): (Option<Link>, Option<String>) = (None, None);
+        if let Some(e) = matrix_err {
+            toasts.warning(e, 0.0);
+        }
+
         Shell {
             link,
+            matrix_link,
+            matrix_status: None,
+            wizard: if wizard::setup_was_completed() { None } else { Some(wizard::Wizard::new(None)) },
             fallback_reason,
             session: Session::default(),
             history,
@@ -122,9 +150,25 @@ impl Shell {
     }
 
     fn send(&mut self, cmd: Command, now: f64) {
+        // Route by call id: "matrix/…" belongs to the matrix link, everything
+        // else (including id-less commands like Dial/ApplyApn) to the modem.
+        let is_matrix = matches!(&cmd,
+            Command::Accept(id) | Command::Hangup(id) | Command::Dtmf(id, _)
+                if id.starts_with("matrix/"));
+        let tx = if is_matrix {
+            match &self.matrix_link {
+                Some(l) => &l.tx,
+                None => {
+                    self.toasts.error("matrix backend not running", now);
+                    return;
+                }
+            }
+        } else {
+            &self.link.tx
+        };
         // A dead backend thread must be loud, not silent: every press after
         // it dies would otherwise just do nothing.
-        if self.link.tx.send(cmd).is_err() {
+        if tx.send(cmd).is_err() {
             self.toasts.error("backend stopped — restart the app", now);
         }
     }
@@ -133,6 +177,13 @@ impl Shell {
         loop {
             match self.link.rx.try_recv() {
                 Ok(Event::Error(e)) => self.toasts.error(e, now),
+                Ok(Event::Info(msg)) => {
+                    // APN feedback belongs next to the Apply button too.
+                    if let Some(w) = &mut self.wizard {
+                        w.note_apply_result(&msg);
+                    }
+                    self.toasts.success(msg, now);
+                }
                 Ok(ev) => {
                     if let Event::ModemDown { detail } = &ev {
                         self.toasts.warning(format!("modem lost: {detail}"), now);
@@ -140,6 +191,21 @@ impl Shell {
                     self.session.apply(ev, epoch);
                 }
                 Err(_) => break,
+            }
+        }
+        if let Some(mx) = &self.matrix_link {
+            loop {
+                match mx.rx.try_recv() {
+                    // Matrix up/down is its own status, not the modem's.
+                    Ok(Event::ModemUp { label }) => self.matrix_status = Some(label),
+                    Ok(Event::ModemDown { detail }) => {
+                        self.matrix_status = Some(format!("offline: {detail}"))
+                    }
+                    Ok(Event::Error(e)) => self.toasts.error(e, now),
+                    Ok(Event::Info(msg)) => self.toasts.success(msg, now),
+                    Ok(ev) => self.session.apply(ev, epoch),
+                    Err(_) => break,
+                }
             }
         }
         for entry in self.session.take_history() {
@@ -309,18 +375,31 @@ impl Shell {
         ui.add_space(20.0);
 
         if call.state.is_ringing_in() {
+            let is_matrix = call.id.starts_with("matrix/");
+            if is_matrix {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("Matrix call — answering needs a media engine (not in yet)")
+                            .small()
+                            .color(self.colors.text_weak),
+                    );
+                });
+                ui.add_space(6.0);
+            }
             ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(ui.available_width() / 2.0 - 165.0);
-                    let accept = egui::Button::new(
-                        egui::RichText::new("Accept").size(18.0).color(egui::Color32::WHITE),
-                    )
-                    .fill(self.colors.success)
-                    .min_size(egui::vec2(150.0, 56.0));
-                    if ui.add(accept).clicked() {
-                        self.send(Command::Accept(call.id.clone()), now);
+                    ui.add_space(ui.available_width() / 2.0 - if is_matrix { 75.0 } else { 165.0 });
+                    if !is_matrix {
+                        let accept = egui::Button::new(
+                            egui::RichText::new("Accept").size(18.0).color(egui::Color32::WHITE),
+                        )
+                        .fill(self.colors.success)
+                        .min_size(egui::vec2(150.0, 56.0));
+                        if ui.add(accept).clicked() {
+                            self.send(Command::Accept(call.id.clone()), now);
+                        }
+                        ui.add_space(12.0);
                     }
-                    ui.add_space(12.0);
                     let decline = egui::Button::new(
                         egui::RichText::new("Decline").size(18.0).color(egui::Color32::WHITE),
                     )
@@ -407,6 +486,17 @@ impl Shell {
                 ModemStatus::Down(d) => (format!("no modem: {d}"), self.colors.warning),
             };
             ui.label(egui::RichText::new(txt).small().color(col));
+            if let Some(mx) = &self.matrix_status {
+                ui.label(
+                    egui::RichText::new(format!("· matrix {mx}"))
+                        .small()
+                        .color(self.colors.text_weak),
+                );
+            }
+            if self.wizard.is_none() && ui.small_button("setup").clicked() {
+                let user = self.matrix_status.clone().filter(|s| !s.starts_with("offline:"));
+                self.wizard = Some(wizard::Wizard::new(user));
+            }
             if self.link.kind == "mock" {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // The demo affordance, only where the modem is simulated.
@@ -416,6 +506,38 @@ impl Shell {
                 });
             }
         });
+    }
+
+    fn handle_wizard(&mut self, outs: Vec<wizard::WizardOut>, now: f64) {
+        for out in outs {
+            match out {
+                wizard::WizardOut::ApplyApn(s) => self.send(Command::ApplyApn(s), now),
+                wizard::WizardOut::MatrixSignedIn(creds) => {
+                    if let Err(e) = creds.save() {
+                        self.toasts.error(e, now);
+                    }
+                    #[cfg(feature = "matrix")]
+                    match dialer_core::matrix::spawn(creds) {
+                        Ok(l) => {
+                            self.matrix_link = Some(l);
+                            self.toasts.success("Matrix signed in", now);
+                        }
+                        Err(e) => self.toasts.error(e, now),
+                    }
+                    #[cfg(not(feature = "matrix"))]
+                    let _ = creds; // sign-in UI is gated; arm kept total
+                }
+                wizard::WizardOut::MatrixForgotten => {
+                    dialer_core::matrix::Creds::forget();
+                    if let Some(l) = self.matrix_link.take() {
+                        let _ = l.tx.send(Command::Quit);
+                    }
+                    self.matrix_status = None;
+                    self.toasts.success("Matrix session forgotten", now);
+                }
+                wizard::WizardOut::Close => self.wizard = None,
+            }
+        }
     }
 
     /// One frame. Split from `eframe::App` so a host can drive it in tests
@@ -448,7 +570,19 @@ impl Shell {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(self.colors.bg_base).inner_margin(10.0))
             .show(ctx, |ui| match &foreground {
+                // A ringing/active call outranks the wizard: the phone part
+                // of the phone is never behind setup.
                 Some(call) => self.in_call(ui, call.clone(), &adaptive, epoch, now),
+                None if self.wizard.is_some() => {
+                    let mut w = self.wizard.take().expect("checked is_some");
+                    let operator = self.session.operator.clone();
+                    let mut outs = Vec::new();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        outs = w.ui(ui, &self.colors, operator.as_deref());
+                    });
+                    self.wizard = Some(w);
+                    self.handle_wizard(outs, now);
+                }
                 None => match self.nav.page() {
                     PAGE_RECENTS => self.recents_page(ui, epoch, now),
                     _ => self.keypad_page(ui, &adaptive, now),

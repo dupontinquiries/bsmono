@@ -37,6 +37,8 @@ pub fn spawn() -> Link {
         .name("dialer-mock".into())
         .spawn(move || {
             let _ = ev_tx.send(Event::ModemUp { label: "simulated modem".into() });
+            // A plausible operator so the wizard's suggestion path is demoable.
+            let _ = ev_tx.send(Event::Operator { mccmnc: "310260".into() });
             let mut calls: Vec<MockCall> = Vec::new();
             let mut next_id = 0u32;
 
@@ -85,6 +87,11 @@ pub fn spawn() -> Link {
                         }
                     }
                     Ok(Command::Dtmf(_, _)) => { /* a real modem plays the tone; nothing to do */ }
+                    Ok(Command::ApplyApn(s)) => {
+                        let _ = ev_tx.send(Event::Info(format!(
+                            "APN '{}' for {} applied (simulated)", s.apn, s.carrier
+                        )));
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return, // shell dropped the link
                 }

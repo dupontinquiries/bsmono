@@ -11,6 +11,17 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use crate::types::{CallId, CallInfo, CallState};
 
+/// What the setup wizard applies: enough to write a NetworkManager GSM
+/// connection. Not the whole [`crate::providers::Apn`] — the network-id list
+/// is a matching concern, not a configuration one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApnSetting {
+    pub carrier: String,
+    pub apn: String,
+    pub username: String,
+    pub password: String,
+}
+
 /// UI → backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -25,6 +36,10 @@ pub enum Command {
     /// Mock backend only: fake an incoming call (demo affordance). The mm
     /// backend ignores it — a real modem's incoming calls come from the tower.
     SimulateIncoming(String),
+    /// Configure cellular data for a carrier. The mm backend writes a
+    /// NetworkManager GSM connection; the mock pretends. Answered by
+    /// `Event::Info` or `Event::Error`.
+    ApplyApn(ApnSetting),
     /// Stop the backend thread.
     Quit,
 }
@@ -42,6 +57,12 @@ pub enum Event {
     CallState { id: CallId, state: CallState },
     /// A call object was removed by the backend/modem.
     CallRemoved { id: CallId },
+    /// The registered operator's MCC+MNC ("310260"), once known — drives the
+    /// wizard's carrier suggestion. May never arrive (no SIM, no registration).
+    Operator { mccmnc: String },
+    /// A success worth telling the user about (APN applied, account signed
+    /// in). The Info/Error pair keeps backends out of the toast business.
+    Info(String),
     /// Something failed; the shell toasts it and moves on.
     Error(String),
 }

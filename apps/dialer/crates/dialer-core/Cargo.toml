@@ -21,8 +21,14 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# serviceproviders.xml (mobile-broadband-provider-info) parsing; tiny, pure Rust
+roxmltree = "0.20"
 zbus = { version = "4.4", optional = true }
+# matrix HTTP; blocking, fits the visible-loop style. The pure JSON layer of
+# matrix.rs compiles and tests without it.
+ureq = { version = "2", optional = true }
 
 [features]
 default = []
 mm = ["dep:zbus"]
+matrix = ["dep:ureq"]

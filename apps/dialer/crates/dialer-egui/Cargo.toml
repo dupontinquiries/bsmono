@@ -20,8 +20,9 @@ eframe = { version = "0.34", default-features = false, features = ["glow", "wayl
 
 [features]
 # `app` default-on per the house convention for every -egui port; `mm` pulls
-# zbus into dialer-core. Turn `mm` off for a bus-free build (the shell then
-# always runs the simulated modem).
-default = ["app", "mm"]
+# zbus into dialer-core, `matrix` pulls ureq. Turn either off for a slimmer
+# build (the shell degrades gracefully: mock modem / no matrix sign-in).
+default = ["app", "mm", "matrix"]
 app = ["dep:eframe"]
 mm = ["dialer-core/mm"]
+matrix = ["dialer-core/matrix"]

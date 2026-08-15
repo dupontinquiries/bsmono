@@ -22,8 +22,10 @@
 
 pub mod history;
 pub mod link;
+pub mod matrix;
 pub mod mock;
 pub mod number;
+pub mod providers;
 pub mod session;
 pub mod types;
 

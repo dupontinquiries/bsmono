@@ -37,7 +37,7 @@ use zbus::blocking::Connection;
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
-use crate::link::{Command, Event, Link};
+use crate::link::{ApnSetting, Command, Event, Link};
 use crate::types::{CallDirection, CallInfo, CallState};
 
 const MM_SERVICE: &str = "org.freedesktop.ModemManager1";
@@ -53,6 +53,31 @@ trait ModemVoice {
     fn create_call(&self, properties: HashMap<&str, Value<'_>>) -> zbus::Result<OwnedObjectPath>;
     fn list_calls(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
     fn delete_call(&self, path: &ObjectPath<'_>) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.ModemManager1.Modem.Modem3gpp",
+    default_service = "org.freedesktop.ModemManager1"
+)]
+trait Modem3gpp {
+    /// MCC+MNC of the registered operator, e.g. "310260". Empty until
+    /// registered.
+    #[zbus(property)]
+    fn operator_code(&self) -> zbus::Result<String>;
+}
+
+/// NetworkManager's connection store — the place an APN actually lives on a
+/// ModemManager system. One method is all the wizard needs.
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.Settings",
+    default_service = "org.freedesktop.NetworkManager",
+    default_path = "/org/freedesktop/NetworkManager/Settings"
+)]
+trait NmSettings {
+    fn add_connection(
+        &self,
+        connection: HashMap<&str, HashMap<&str, Value<'_>>>,
+    ) -> zbus::Result<OwnedObjectPath>;
 }
 
 #[zbus::proxy(
@@ -127,6 +152,21 @@ pub fn spawn() -> Result<Link, String> {
             };
             let _ = ev_tx.send(Event::ModemUp { label: modem_label(&modem_str) });
 
+            // Operator code, best-effort: absent SIM/registration is normal,
+            // not an error — the wizard just falls back to the full list.
+            if let Ok(g) = (|| -> zbus::Result<Modem3gppProxyBlocking<'_>> {
+                Ok(Modem3gppProxyBlocking::builder(&conn)
+                    .path(modem_str.clone())?
+                    .cache_properties(CacheProperties::No)
+                    .build()?)
+            })() {
+                if let Ok(code) = g.operator_code() {
+                    if !code.is_empty() {
+                        let _ = ev_tx.send(Event::Operator { mccmnc: code });
+                    }
+                }
+            }
+
             // What we believe about each live call (keyed by object path).
             let mut known: HashMap<String, CallState> = HashMap::new();
 
@@ -169,6 +209,15 @@ pub fn spawn() -> Result<Link, String> {
                         }
                     }
                     Ok(Command::SimulateIncoming(_)) => { /* real modems only ring for real */ }
+                    Ok(Command::ApplyApn(setting)) => {
+                        let _ = ev_tx.send(match apply_apn_nm(&conn, &setting) {
+                            Ok(()) => Event::Info(format!(
+                                "NetworkManager connection created for {} (APN {})",
+                                setting.carrier, setting.apn
+                            )),
+                            Err(e) => Event::Error(format!("apply APN: {e}")),
+                        });
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -238,6 +287,40 @@ pub fn spawn() -> Result<Link, String> {
         .map_err(|e| format!("spawn mm thread: {e}"))?;
 
     Ok(Link { tx: cmd_tx, rx: ev_rx, kind: "modemmanager" })
+}
+
+/// Write a GSM connection profile carrying the APN. `autoconnect=true` so
+/// NetworkManager brings data up on its own once the profile exists; the
+/// wizard's job ends at creating it. Empty username/password are omitted
+/// entirely — NM treats an empty string as a credential, not as "none".
+fn apply_apn_nm(conn: &Connection, s: &ApnSetting) -> zbus::Result<()> {
+    let nm = NmSettingsProxyBlocking::new(conn)?;
+    let mut connection: HashMap<&str, HashMap<&str, Value<'_>>> = HashMap::new();
+
+    let mut c: HashMap<&str, Value<'_>> = HashMap::new();
+    c.insert("id", Value::from(format!("{} (dialer)", s.carrier)));
+    c.insert("type", Value::from("gsm"));
+    c.insert("autoconnect", Value::from(true));
+    connection.insert("connection", c);
+
+    let mut gsm: HashMap<&str, Value<'_>> = HashMap::new();
+    gsm.insert("apn", Value::from(s.apn.as_str()));
+    if !s.username.is_empty() {
+        gsm.insert("username", Value::from(s.username.as_str()));
+    }
+    if !s.password.is_empty() {
+        gsm.insert("password", Value::from(s.password.as_str()));
+    }
+    connection.insert("gsm", gsm);
+
+    let mut ipv4: HashMap<&str, Value<'_>> = HashMap::new();
+    ipv4.insert("method", Value::from("auto"));
+    connection.insert("ipv4", ipv4);
+    let mut ipv6: HashMap<&str, Value<'_>> = HashMap::new();
+    ipv6.insert("method", Value::from("auto"));
+    connection.insert("ipv6", ipv6);
+
+    nm.add_connection(connection).map(|_| ())
 }
 
 /// "/org/freedesktop/ModemManager1/Modem/0" → "modem 0".
