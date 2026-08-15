@@ -678,3 +678,14 @@ role = "app"
 daemon = false
 notes = "A local camera. Captures land on this device and go nowhere until the user picks a target: photosync (their own machines, content-addressed) or a snapclone contact (a person, not recallable). The two are kept distinct in the type system because collapsing them is how a backup becomes a disclosure. Headless core + eframe shell, so the sharing rules test without a camera."
 
+
+[apps.dialer]
+path = "apps/dialer"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false             # a phone app wants the system bus + modem; Flatpak later if ever
+runtime = "none"            # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop", "phone"]
+primary = true              # egui-first from birth; no Qt/GTK surface exists to archive
+notes = "phone calls over ModemManager (zbus blocking, poll loop) with a simulated-modem fallback for desktop/demo, plus a Matrix signalling backend (incoming m.call.invite rings, decline sends m.call.hangup; no media engine yet) on the same Command/Event link. Setup wizard: carrier APN suggestion from mobile-broadband-provider-info (system XML > downloaded XML > builtin snapshot) keyed by the modem's OperatorCode, applied as a NetworkManager GSM connection over D-Bus; Matrix sign-in with .well-known discovery. Headless dialer-core (19 unit tests) under crates/, dialer-egui on uikit-egui. `cargo build --release -p dialer-egui` = deployable bin (`app`+`mm`+`matrix` default-on); features peel off individually."
