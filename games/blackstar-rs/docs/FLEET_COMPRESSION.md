@@ -136,3 +136,58 @@ unchanged (`git status` clean, 217 packs and 204 exception files present),
 **This rewrites history**, so every clone must re-fetch rather than pull. The
 repo had been through this once before — filter-repo's own `already_ran` marker
 was dated a week earlier — which is why it asked to confirm continuation.
+
+## Where the remaining 521 MB is — measured by PACKED size
+
+The first attempt at this measured RAW blob sizes and got the wrong answer:
+`apps/logscope` looked like 414 MB, the largest thing in the repo, because
+`gpu-gemm/src/lib.rs` is ~0.9 MB and has 388 revisions. Git deltas those to
+almost nothing — **logscope is 11 MB packed**. Raw size is not a bill anyone
+pays.
+
+By packed size:
+
+```
+ 209.6 MB  games/blackstar-rs/assets/bots
+  91.0 MB  games/blackstar/engine_src/data
+  34.8 MB  games/blackstar/catalog/parts_web_full.bin.gz
+  10.5 MB  games/blackstar/catalog/importedcat
+   8.4 MB  games/blackstar-rs/assets/cars
+```
+
+and inside the bots:
+
+```
+ 122.4 MB   217 blobs  bots.pack     the quantised fleet, on disk now
+  78.0 MB   204 blobs  scene.bin     the 4 unpackable chassis — but only 15 MB
+                                     of that is current; the rest is their
+                                     pre-rewrite revisions
+   6.6 MB  1516 blobs  scene.gltf
+```
+
+## So what is worth doing next
+
+**Not runtime pose synthesis.** It is the largest single idea but the packs are
+already only 122 MB, and dropping to two poses per chassis saves maybe 70 MB of
+that — for a feature that needs joint-driven reconstruction, has a real risk of
+looking wrong mid-fold, and cannot be verified without a display. It is the
+right long-term direction and the wrong next step.
+
+**Four cheaper wins, in order of MB per unit of risk:**
+
+1. **`parts_web_full.bin.gz`, 34.8 MB.** There is also a `parts_web.bin.gz` at
+   7.7 MB. If the full one is a superset kept for provenance rather than a
+   runtime input, it is 35 MB for a file nothing loads.
+2. **The 63 MB of superseded `scene.bin` revisions** for the four unpackable
+   chassis. Their current 15 MB must stay; their history need not. A targeted
+   filter-repo on those four paths, keeping only the tip.
+3. **`engine_src/data`, 91 MB** — the C engine's textures and models. The Rust
+   port has its own assets; if the C engine is reference rather than something
+   that still gets built, this is the single biggest item and it is not code.
+4. **`assets/cars` and `assets/fennec`, 14 MB combined** — these are float32
+   glTF like the bots were, and `pack_bots.py` would work on them unchanged if
+   they are fold strips.
+
+1, 2 and 4 together are ~110 MB with no behaviour change, which lands the bundle
+around 410 MB. Item 3 alone would take it under 350 MB but is a judgement about
+whether the C engine is still live, which is not mine to make.
