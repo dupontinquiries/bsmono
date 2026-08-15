@@ -336,6 +336,14 @@ pub struct Snapclone {
     /// nowhere" render differently — the second holds the page a pixel off
     /// centre and never springs back.
     pub swipe: Option<crate::swipe_physics::Swipe>,
+    /// Accent and background derived from the photos in the inbox, so the app
+    /// takes on the colour of what is in it. `None` until enough pixels have
+    /// been sampled, and `None` is a real answer — see `ambient()`.
+    pub ambient: Option<(crate::ambient_palette::Rgb, crate::ambient_palette::Rgb)>,
+    /// Running edge-pixel samples. Kept across snaps rather than recomputed:
+    /// the palette should settle as the inbox fills, not lurch to whatever
+    /// arrived last.
+    ambient_samples: crate::ambient_palette::Samples,
     /// (sender id, caption) for the snaps floating on the map, newest first.
     pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
@@ -442,6 +450,8 @@ impl Snapclone {
             // a default set inside the widget would be this app's navigation
             // leaking into a shared component.
             swipe: None,
+            ambient: None,
+            ambient_samples: Default::default(),
             tabs: crate::tab_bar::TabBar::new(vec![
                 crate::tab_bar::Tab::new("camera", "Camera"),
                 crate::tab_bar::Tab::new("chats", "Chats"),
@@ -487,6 +497,51 @@ impl Snapclone {
     /// Confirm the pending delete. Split from apply_friends because the
     /// confirmation arrives as its own answer, not as part of the tap that
     /// asked the question.
+    /// Feed a decoded snap into the ambient palette.
+    ///
+    /// `pixels` is the DOWNSCALED image — the deriver samples an edge band, and
+    /// handing it a full-resolution photo would walk millions of pixels for a
+    /// colour that a thumbnail answers identically.
+    ///
+    /// Samples accumulate rather than reset, so the palette settles as the
+    /// inbox fills instead of lurching to whatever arrived last. One loud photo
+    /// should tint the app, not repaint it.
+    pub fn sample_ambient(&mut self, pixels: &[crate::ambient_palette::Rgb], side: u32) {
+        self.ambient_samples.add_image(pixels, side);
+        // The two are INDEPENDENT, and my first version required both. A
+        // vivid photo with no near-neutral edge pixels yields an accent and no
+        // background — the test caught it — and refusing the accent because the
+        // background was missing would drop a colour the deriver had correctly
+        // found. Each is taken when it is available.
+        if let Some(a) = self.ambient_samples.accent() {
+            let bg = self.ambient_samples.background();
+            self.ambient = Some((crate::ambient_palette::cap_tint(a),
+                                 // No neutral pixels: keep the accent, and let
+                                 // the caller's base background stand rather
+                                 // than inventing one from the accent.
+                                 bg.unwrap_or(a)));
+        }
+    }
+
+    /// The derived accent, if the photos gave one.
+    ///
+    /// `None` is legitimate and the caller must keep its base palette: an inbox
+    /// of greyscale photos qualifies no accent pixel, and rendering black there
+    /// would make a monochrome inbox look broken rather than monochrome.
+    pub fn ambient_accent(&self) -> Option<crate::ambient_palette::Rgb> {
+        self.ambient.map(|(a, _)| a)
+    }
+
+    /// The derived background, only when real neutral pixels supplied one.
+    ///
+    /// Separate from the accent because they can arrive apart: a vivid photo
+    /// with no near-neutral edge yields an accent and no background, and
+    /// synthesising one from the accent would tint the whole app a colour no
+    /// photo contained.
+    pub fn ambient_background(&self) -> Option<crate::ambient_palette::Rgb> {
+        self.ambient_samples.background()
+    }
+
     /// Start a horizontal page swipe.
     ///
     /// The BOUNDS come from where we are in the tab list, and they are the
@@ -2908,6 +2963,52 @@ mod modal_render_tests {
         }
         assert!(undrawn.is_empty(),
                 "presented but never drawn: {undrawn:?} — these block input while invisible");
+    }
+}
+
+#[cfg(test)]
+mod ambient_tests {
+    fn app() -> super::Snapclone { super::Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn a_greyscale_inbox_derives_no_accent() {
+        // The module is explicit that None is a real answer rather than a
+        // failure: an inbox of black-and-white photos qualifies no accent
+        // pixel, and painting black there makes a monochrome inbox look BROKEN
+        // rather than monochrome.
+        let mut a = app();
+        let grey: Vec<[u8; 3]> = (0..64 * 64).map(|_| [128, 128, 128]).collect();
+        a.sample_ambient(&grey, 64);
+        assert_eq!(a.ambient_accent(), None);
+    }
+
+    #[test]
+    fn a_colourful_photo_gives_an_accent() {
+        let mut a = app();
+        let warm: Vec<[u8; 3]> = (0..64 * 64).map(|_| [200, 90, 40]).collect();
+        a.sample_ambient(&warm, 64);
+        assert!(a.ambient_accent().is_some());
+    }
+
+    #[test]
+    fn samples_accumulate_rather_than_reset() {
+        // The palette should settle as the inbox fills, not lurch to whatever
+        // arrived last — one loud photo tints the app, it does not repaint it.
+        let mut a = app();
+        let warm: Vec<[u8; 3]> = (0..64 * 64).map(|_| [200, 90, 40]).collect();
+        a.sample_ambient(&warm, 64);
+        let first = a.ambient_accent().expect("an accent");
+        let cool: Vec<[u8; 3]> = (0..64 * 64).map(|_| [40, 90, 200]).collect();
+        a.sample_ambient(&cool, 64);
+        let second = a.ambient_accent().expect("an accent");
+        assert_ne!(first, second, "the second photo had no effect at all");
+        // ...but it did not simply become the new photo's colour either.
+        assert_ne!(second, [40, 90, 200], "the palette lurched to the last photo");
+    }
+
+    #[test]
+    fn nothing_sampled_means_no_ambient() {
+        assert_eq!(app().ambient_accent(), None);
     }
 }
 
