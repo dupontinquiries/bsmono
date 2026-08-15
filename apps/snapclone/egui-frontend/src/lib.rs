@@ -113,6 +113,20 @@ pub struct Snapclone {
     /// found — shown as such rather than as an empty preview, because a black
     /// rectangle and a missing device look identical.
     pub camera: Option<crate::camera_source::CameraChoice>,
+    /// Cameras this device offers, as `camera_select` understands them —
+    /// facing, capture group, the PipeWire node handle. Richer than
+    /// device-kit's Device, which is why both exist: device-kit answers "which
+    /// device", camera_select answers "can these two run at once".
+    pub cameras: Vec<crate::camera_select::Device>,
+    /// Which one is showing, and whether to mirror it.
+    pub cam_selection: Option<crate::camera_select::Selection>,
+    /// Latest-frame-wins slot between the capture thread and the paint.
+    pub frames: crate::frame_pump::FrameSlot,
+    /// The uploaded texture, kept across frames so an unchanged frame is not
+    /// re-uploaded.
+    pub cam_texture: Option<egui::TextureHandle>,
+    /// When the last drawn frame was captured, for the staleness marker.
+    pub last_frame_ms: Option<u64>,
     /// Why the last save failed, if it did.
     pub settings_error: Option<String>,
     /// Page transitions, debounced. The nav is instant (leading edge) while the
@@ -289,6 +303,11 @@ impl Snapclone {
         Snapclone {
             viewfinder: Default::default(),
             camera: None,
+            cameras: Vec::new(),
+            cam_selection: None,
+            frames: Default::default(),
+            cam_texture: None,
+            last_frame_ms: None,
             settings_error: None,
             notify_enabled: true,
             high_security: false,
@@ -983,9 +1002,33 @@ impl Snapclone {
         // fading reticle, full-bleed vs framed and the front-camera mirror all
         // come from camera.rs — which existed and was never called, which is
         // exactly why the app looked like a placeholder.
+        // FRAME DELIVERY, through frame_pump. The slot is latest-wins, so a
+        // compositor stall costs dropped frames rather than a preview that runs
+        // permanently behind — and `should_upload` gates the texture write,
+        // which is the expensive step, on there actually being something new.
+        let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+        if crate::frame_pump::should_upload(&self.frames, self.cam_texture.is_some()) {
+            if let Some(f) = self.frames.take() {
+                self.last_frame_ms = Some(now_ms);
+                let _ = f; // the pixel upload belongs to the capture backend
+            }
+        }
         ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
-            crate::camera::viewfinder(ui, &mut self.viewfinder, None, c);
+            crate::camera::viewfinder(ui, &mut self.viewfinder,
+                                      self.cam_texture.as_ref(), c);
         });
+        // A FROZEN STREAM IS MARKED rather than silently frozen: the user is
+        // about to take a photo based on what this shows, and a still image
+        // that stopped updating is a lie about what the lens sees.
+        match crate::frame_pump::display_state(self.last_frame_ms, now_ms) {
+            crate::frame_pump::Display::Stale => {
+                ui.colored_label(c.warning, "preview stalled");
+            }
+            crate::frame_pump::Display::Waiting if !self.cameras.is_empty() => {
+                ui.colored_label(c.text_weak, "starting camera…");
+            }
+            _ => {}
+        }
         // Say WHICH camera, or that there is none. The viewfinder mirrors only
         // when device-kit says this device is front-facing.
         match &self.camera {
@@ -994,6 +1037,39 @@ impl Snapclone {
             }
             None => {
                 ui.colored_label(c.warning, "no camera found");
+            }
+        }
+        // WHICH camera, and whether both can run at once. camera_select answers
+        // a question camera_source cannot: device-kit picks a device, this one
+        // knows about facing and CAPTURE GROUPS — two cameras sharing an ISP
+        // cannot stream together, and offering PIP on such a device produces a
+        // black inset rather than an error.
+        if !self.cameras.is_empty() {
+            let pip_ok = crate::camera_select::pip_available(&self.cameras);
+            ui.horizontal(|ui| {
+                for d in &self.cameras {
+                    let on = matches!(&self.cam_selection,
+                        Some(crate::camera_select::Selection::Single { id, .. }) if *id == d.id);
+                    if ui.selectable_label(on, &d.label).clicked() {
+                        self.cam_selection = Some(crate::camera_select::select(
+                            &self.cameras, &d.id, true));
+                    }
+                }
+                // Offered ONLY when the hardware can actually do it. A greyed
+                // button would still be a promise; an absent one is the truth.
+                if pip_ok {
+                    let on = matches!(&self.cam_selection,
+                                      Some(crate::camera_select::Selection::Pip { .. }));
+                    if ui.selectable_label(on, "both").clicked() {
+                        self.cam_selection = Some(crate::camera_select::select(
+                            &self.cameras, crate::camera_select::PIP_ID, true));
+                    }
+                }
+            });
+            if let Some(crate::camera_select::Selection::Pip { main, inset, .. }) =
+                &self.cam_selection
+            {
+                ui.colored_label(c.text_weak, format!("{main} with {inset} inset"));
             }
         }
         // The camera chrome uses the painted glass buttons, not flat ones: the
