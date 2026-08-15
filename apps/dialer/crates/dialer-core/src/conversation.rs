@@ -12,9 +12,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::message::Payload;
+use crate::message::{Payload, Tapback};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dir {
     In,
     Out,
@@ -31,6 +31,20 @@ pub struct Message {
     /// Whether the local user has seen it (outbound is always true).
     #[serde(default)]
     pub read: bool,
+    /// The local user's Tapback on this message, if any (iMessage: one per
+    /// side; a new one replaces, the same one again clears).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<Tapback>,
+}
+
+impl Message {
+    /// Identity for overlay/dedup: a reaction re-appends the message line and
+    /// load keeps the last occurrence for this key. (peer, dir, ts) can in
+    /// theory collide for two messages in the same second and direction; that
+    /// is rare and only affects which one a late reaction lands on.
+    pub fn key(&self) -> (String, Dir, u64) {
+        (self.peer.clone(), self.dir, self.ts)
+    }
 }
 
 /// A thread: the peer and its messages, oldest-first.
@@ -72,19 +86,35 @@ impl Conversations {
         let mut warn = None;
         match fs::read_to_string(path) {
             Ok(text) => {
+                // Collect with last-write-wins per key so a re-appended line
+                // (a reaction update) supersedes the original, while first-seen
+                // order is preserved for display.
+                use std::collections::HashMap as Map;
+                let mut order: Vec<(String, Dir, u64)> = Vec::new();
+                let mut latest: Map<(String, Dir, u64), Message> = Map::new();
                 for line in text.lines() {
                     let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
                     match serde_json::from_str::<Message>(line) {
-                        Ok(m) => threads
-                            .entry(m.peer.clone())
-                            .or_insert_with(|| Thread { peer: m.peer.clone(), messages: Vec::new() })
-                            .messages
-                            .push(m),
+                        Ok(m) => {
+                            let k = m.key();
+                            if !latest.contains_key(&k) {
+                                order.push(k.clone());
+                            }
+                            latest.insert(k, m);
+                        }
                         Err(_) => warn = Some("messages had unreadable lines (skipped)".into()),
                     }
+                }
+                for k in order {
+                    let m = latest.remove(&k).expect("keyed above");
+                    threads
+                        .entry(m.peer.clone())
+                        .or_insert_with(|| Thread { peer: m.peer.clone(), messages: Vec::new() })
+                        .messages
+                        .push(m);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -100,11 +130,14 @@ impl Conversations {
     /// Append a message to memory and disk. Disk failure returns a message;
     /// memory stays consistent so the UI still shows it.
     pub fn append(&mut self, m: Message) -> Result<(), String> {
-        self.threads
+        let t = self
+            .threads
             .entry(m.peer.clone())
-            .or_insert_with(|| Thread { peer: m.peer.clone(), messages: Vec::new() })
-            .messages
-            .push(m.clone());
+            .or_insert_with(|| Thread { peer: m.peer.clone(), messages: Vec::new() });
+        match t.messages.iter_mut().find(|e| e.key() == m.key()) {
+            Some(existing) => *existing = m.clone(), // reaction/read update in place
+            None => t.messages.push(m.clone()),
+        }
         let res = (|| -> std::io::Result<()> {
             if let Some(dir) = self.path.parent() {
                 fs::create_dir_all(dir)?;
@@ -128,6 +161,28 @@ impl Conversations {
 
     pub fn total_unread(&self) -> usize {
         self.threads.values().map(|t| t.unread()).sum()
+    }
+
+    /// Toggle a Tapback on a message identified by (peer, dir, ts). Same
+    /// reaction again clears it (iMessage behaviour). Persists by re-appending
+    /// the updated message; load keeps last-per-key. Returns Ok even if the
+    /// message isn't found (nothing to do).
+    pub fn set_reaction(
+        &mut self,
+        peer: &str,
+        dir: Dir,
+        ts: u64,
+        reaction: Tapback,
+    ) -> Result<(), String> {
+        let key = (peer.to_string(), dir, ts);
+        let updated = {
+            let Some(t) = self.threads.get(peer) else { return Ok(()) };
+            let Some(m) = t.messages.iter().find(|m| m.key() == key) else { return Ok(()) };
+            let mut m = m.clone();
+            m.reaction = if m.reaction == Some(reaction) { None } else { Some(reaction) };
+            m
+        };
+        self.append(updated)
     }
 
     /// Mark a thread's inbound messages read (memory only — the read flag is
@@ -154,7 +209,7 @@ mod tests {
     }
 
     fn msg(peer: &str, dir: Dir, body: &str, ts: u64) -> Message {
-        Message { peer: peer.into(), dir, payload: Payload::text(body), ts, read: dir == Dir::Out }
+        Message { peer: peer.into(), dir, payload: Payload::text(body), ts, read: dir == Dir::Out, reaction: None }
     }
 
     #[test]
@@ -183,6 +238,34 @@ mod tests {
         assert_eq!(c.total_unread(), 2);
         c.mark_read("tel:+1");
         assert_eq!(c.total_unread(), 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reaction_toggles_and_survives_reload_as_last_write_wins() {
+        use crate::message::Tapback;
+        let path = tmp("react");
+        let _ = fs::remove_file(&path);
+        {
+            let (mut c, _) = Conversations::open(&path);
+            c.append(msg("tel:+1", Dir::In, "hey", 100)).unwrap();
+            c.set_reaction("tel:+1", Dir::In, 100, Tapback::Heart).unwrap();
+            // in-memory reflects the reaction, not a duplicate
+            let t = c.thread("tel:+1").unwrap();
+            assert_eq!(t.messages.len(), 1);
+            assert_eq!(t.messages[0].reaction, Some(Tapback::Heart));
+            // same tapback again clears it
+            c.set_reaction("tel:+1", Dir::In, 100, Tapback::Heart).unwrap();
+            assert_eq!(c.thread("tel:+1").unwrap().messages[0].reaction, None);
+            // a different one sets it
+            c.set_reaction("tel:+1", Dir::In, 100, Tapback::Haha).unwrap();
+        }
+        // reload: the re-appended lines collapse to one message with the last
+        // reaction, in original position.
+        let (c, _) = Conversations::open(&path);
+        let t = c.thread("tel:+1").unwrap();
+        assert_eq!(t.messages.len(), 1, "reaction re-appends must not duplicate on reload");
+        assert_eq!(t.messages[0].reaction, Some(Tapback::Haha));
         let _ = fs::remove_file(&path);
     }
 

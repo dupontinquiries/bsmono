@@ -22,6 +22,7 @@
 
 pub mod command_guard;
 pub mod conversation;
+pub mod gesture;
 pub mod history;
 pub mod link;
 pub mod matrix;

@@ -66,7 +66,34 @@ First launch (or the status-bar `setup` button) opens a two-step wizard:
    deliberately not used — four HTTP endpoints via `ureq` in the house
    visible-loop style, with every JSON parser a pure tested function.
 
-## Messaging & gesture nav
+## iOS-style interaction model
+
+The gesture/interaction feel targets modern iOS, not Material. The *physics
+and commit decisions* are headless in `dialer-core/src/gesture.rs` (pure,
+tested); the shell only paints the offsets it returns.
+
+- **Interactive edge-pop** — drag from the left edge of an open thread and the
+  whole conversation tracks your finger 1:1, revealing "‹ Messages" behind it;
+  release past half-width *or* a flick commits the back, otherwise it springs
+  home (UIKit's interactive `popViewController`). A drag that starts mid-screen
+  scrolls instead of popping.
+- **Rubber-banding** — the UIScrollView elastic curve (`1 − 1/(x·0.55/d + 1)`)
+  on overscroll and on a pop dragged the wrong way, rather than Android's
+  stretch/glow.
+- **Swipe-to-peek timestamps** — drag the conversation left to slide each
+  bubble aside and reveal its time (iMessage), rubber-banding past the reveal.
+- **Long-press Tapback + menu** — press-and-hold a bubble (or right-click on
+  desktop) for the six-reaction bar (❤ 👍 👎 😂 ‼ ❓) and a Copy / Reply / Close
+  menu. A reaction shows on the bubble corner; the same tapback again clears it,
+  a different one replaces it — iMessage semantics.
+
+Reactions persist without rewriting the append-only log: a Tapback re-appends
+the message line, and `Conversations::open` keeps the last record per
+`(peer, dir, ts)` key. (That key can collide only for two messages to the same
+peer, same direction, in the same second — rare, and it only affects which one
+a late reaction lands on.)
+
+## Messaging & page nav
 
 **Gestures:** swipe left/right pages across Keypad ↔ Recents ↔ Messages using
 the shared `uikit_egui::GestureLayer` (the FP5-tuned `TwoTierGesture`), so the

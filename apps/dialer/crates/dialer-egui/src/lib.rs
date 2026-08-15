@@ -202,7 +202,7 @@ impl Shell {
         let read = matches!(&self.msg.view, messages::MessagesView::Thread(p) if *p == peer)
             && self.nav.page() == PAGE_MESSAGES
             && self.wizard.is_none();
-        let m = Message { peer: peer.clone(), dir: Dir::In, payload, ts, read };
+        let m = Message { peer: peer.clone(), dir: Dir::In, payload, ts, read, reaction: None };
         if let Err(e) = self.convs.append(m) {
             self.toasts.error(e, now);
         }
@@ -218,6 +218,7 @@ impl Shell {
             payload,
             ts: now_unix(),
             read: true,
+            reaction: None,
         };
         if let Err(e) = self.convs.append(m) {
             self.toasts.error(e, now);
@@ -257,6 +258,24 @@ impl Shell {
                 }
                 MsgAction::ViewDenied(path) => {
                     self.toasts.error(format!("view denied (outside allowed roots): {path}"), now);
+                }
+                MsgAction::React { peer, dir, ts, tapback } => {
+                    if let Err(e) = self.convs.set_reaction(&peer, dir, ts, tapback) {
+                        self.toasts.error(e, now);
+                    }
+                }
+                MsgAction::PopToList => {
+                    self.msg.view = messages::MessagesView::List;
+                    self.msg.pop = None;
+                    self.msg.menu_for = None;
+                    self.msg.peek = 0.0;
+                }
+                MsgAction::Reply(quote) => {
+                    // iMessage-style quote prefix; the composer keeps focus.
+                    if !self.msg.compose.is_empty() && !self.msg.compose.ends_with(' ') {
+                        self.msg.compose.push(' ');
+                    }
+                    self.msg.compose.push_str(&format!("> {quote}\n"));
                 }
                 MsgAction::RunConfirmed { command } => {
                     // Never run straight from a card: always stage a modal that
@@ -750,6 +769,9 @@ This executes on your device."),
                         // Opening a thread clears its unread.
                         if let messages::MessagesView::Thread(peer) = self.msg.view.clone() {
                             self.convs.mark_read(&peer);
+                        } else {
+                            // On the list: no pop in flight.
+                            self.msg.pop = None;
                         }
                         msg_actions = messages::messages_page(
                             ui, &self.convs, &mut self.msg, &self.guard, &self.colors, epoch,

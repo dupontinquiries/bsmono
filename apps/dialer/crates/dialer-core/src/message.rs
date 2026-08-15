@@ -19,6 +19,46 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The iMessage "Tapback" set: the six reactions long-press offers. One per
+/// message (per side) — a new one replaces the old, tapping the same one again
+/// clears it, exactly like iMessage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tapback {
+    Heart,
+    ThumbsUp,
+    ThumbsDown,
+    Haha,
+    Exclaim,
+    Question,
+}
+
+impl Tapback {
+    /// The glyph shown on the bubble corner.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Tapback::Heart => "❤",
+            Tapback::ThumbsUp => "👍",
+            Tapback::ThumbsDown => "👎",
+            Tapback::Haha => "😂",
+            Tapback::Exclaim => "‼",
+            Tapback::Question => "❓",
+        }
+    }
+
+    /// The bar order, left→right, matching iMessage.
+    pub fn bar() -> [Tapback; 6] {
+        [
+            Tapback::Heart,
+            Tapback::ThumbsUp,
+            Tapback::ThumbsDown,
+            Tapback::Haha,
+            Tapback::Exclaim,
+            Tapback::Question,
+        ]
+    }
+}
+
 /// One message's content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
