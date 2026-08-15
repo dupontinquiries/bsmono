@@ -402,6 +402,13 @@ impl Gesture {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Add(AddPeer),
+    /// Give a contact a local nickname: (current id, new name).
+    ///
+    /// A first-class action rather than the editor mutating `peers` directly,
+    /// so a rename goes through the same path every other change does — the
+    /// roster resync and the card update come free, and a caller cannot forget
+    /// half of them.
+    Rename(String, String),
     Selected(String),
     /// A submenu button: (contact id, action id).
     Invoke(String, String),

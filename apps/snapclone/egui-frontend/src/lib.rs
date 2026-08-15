@@ -323,6 +323,11 @@ pub struct Snapclone {
     /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
     /// risk score, not a subject.
     pub confirm_id: String,
+    /// Which contact the editor is renaming, empty when closed.
+    pub editor_id: String,
+    /// The name being typed. Seeded from the current one so the dialog opens
+    /// showing what it is about to change rather than a blank box.
+    pub editor_name: String,
     /// Battery and power state. Three sources for one fact because no single
     /// one is present everywhere this app runs — PowerDevil on Plasma, UPower
     /// elsewhere, a sysfs poll where neither answers.
@@ -444,6 +449,8 @@ impl Snapclone {
             add_landmark: None,
             confirm: None,
             confirm_id: String::new(),
+            editor_id: String::new(),
+            editor_name: String::new(),
             power: Default::default(),
             // The five surfaces this app actually has. Built here rather than
             // in TabBar::default() because the bar is generic over its tabs —
@@ -690,6 +697,22 @@ impl Snapclone {
                 }
                 self.sync_roster();
             }
+            // A LOCAL nickname: it renames the row, not the peer. The other
+            // side keeps whatever it calls itself, because this app cannot
+            // change a name on someone else's device and pretending otherwise
+            // would have two people disagreeing about who they are talking to.
+            Action::Rename(id, to) => {
+                let to = to.trim().to_string();
+                // An empty rename is a DELETE of the only label the user has
+                // for this contact, so it is refused rather than applied — the
+                // row would become unidentifiable and unfindable.
+                if !to.is_empty() {
+                    if let Some(p) = self.peers.iter_mut().find(|p| p.name == id) {
+                        p.name = to;
+                    }
+                    self.sync_roster();
+                }
+            }
             Action::Selected(id) => {
                 if let Some(i) = self.peers.iter().position(|p| p.name == id) {
                     self.nav.push_subpage(i);
@@ -722,9 +745,13 @@ impl Snapclone {
                         self.confirm_delete(&id);
                     }
                 }
-                "edit" => self.modal.present_default(
-                    &format!("editor:{id}"), crate::modal::Layer::Dialog,
-                    crate::modal::Rect::new(20.0, 80.0, 340.0, 400.0)),
+                "edit" => {
+                    self.editor_id = id.clone();
+                    self.editor_name = id.clone();
+                    self.modal.present_default(
+                        &format!("editor:{id}"), crate::modal::Layer::Dialog,
+                        crate::modal::Rect::new(20.0, 80.0, 340.0, 400.0));
+                }
                 _ => {}
             },
             Action::ImportVCard => {}
@@ -1289,6 +1316,43 @@ impl Snapclone {
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
         crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
+        // THE CONTACT EDITOR. Last of the six modals to get a body.
+        //
+        // It renames only. The Peer this app holds carries a name and an online
+        // flag, and the flag is OBSERVED rather than chosen — offering to edit
+        // it would be offering to lie about whether someone is reachable.
+        if !self.editor_id.is_empty() {
+            let want = format!("editor:{}", self.editor_id);
+            let r = self.modal.topmost(crate::modal::Layer::Dialog)
+                .filter(|p| p.id == want)
+                .map(|p| p.rect.clone());
+            if let Some(r) = r {
+                let area = egui::Rect::from_min_size(
+                    egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+                ui.painter().rect_filled(area, 8.0, colors.bg_base);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+                child.colored_label(colors.text, format!("rename {}", self.editor_id));
+                child.text_edit_singleline(&mut self.editor_name);
+                let ok = !self.editor_name.trim().is_empty();
+                child.horizontal(|ui| {
+                    // Disabled on empty rather than accepting and silently
+                    // ignoring: a save button that does nothing is the same
+                    // dead control the video scrubber avoided.
+                    if ui.add_enabled(ok, egui::Button::new("save")).clicked() {
+                        let (id, to) = (self.editor_id.clone(), self.editor_name.clone());
+                        self.apply_friends(crate::friends::Action::Rename(id, to));
+                        self.editor_id.clear();
+                        self.modal.dismiss(&want);
+                    }
+                    if ui.button("cancel").clicked() {
+                        self.editor_id.clear();
+                        self.modal.dismiss(&want);
+                    }
+                });
+            }
+        }
+
         // THE VIDEO VIEWER. Fifth modal, and the contract is the OPPOSITE of
         // the snap viewer beside it: a video snap is PERSISTENT. snaps.rs wipes
         // an image's bytes on close; this deliberately does not, and the
@@ -2930,7 +2994,8 @@ mod modal_render_tests {
         // Listing them keeps the test GREEN and the debt VISIBLE: a new modal
         // is a failure, and clearing one of these is deleting a line from here.
         // Removing the check instead would lose both properties.
-        let known_undrawn = ["editor:"];
+        // EMPTY. All six modals now have a body.
+        let known_undrawn: [&str; 0] = [];
         let mut undrawn = Vec::new();
         for id in presented {
             // A renderer is a `topmost(...)` filtered on the id. Anything else
