@@ -302,6 +302,12 @@ pub struct Snapclone {
     pub self_fix: Option<crate::wayfinder::Fix>,
     /// Contacts as the wayfinder sees them — id, name, online, position.
     pub wayfinder_contacts: Vec<crate::wayfinder::Contact>,
+    /// Named places you can be resolved to — "my apartment", "the studio" — so
+    /// a contact can be matched to a place WITHOUT either of you sharing a live
+    /// position. The other half of the wayfinder, and it had no surface.
+    pub landmarks: Vec<crate::landmark::Landmark>,
+    /// The add-landmark form, open only while naming somewhere.
+    pub add_landmark: Option<crate::landmark::AddLandmark>,
     /// (sender id, caption) for the snaps floating on the map, newest first.
     pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
@@ -397,6 +403,8 @@ impl Snapclone {
             },
             self_fix: None,
             wayfinder_contacts: Vec::new(),
+            landmarks: Vec::new(),
+            add_landmark: None,
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
@@ -576,6 +584,45 @@ impl Snapclone {
 
     /// Carry out what the voice bar asked for. The bar owns no audio and no
     /// sockets; this is where its events meet the session.
+    /// Start naming the place you are standing in.
+    ///
+    /// Seeded from the wayfinder's own fix rather than a fresh read: the two
+    /// must agree about where "here" is, and a second GPS read seconds later
+    /// would put the landmark somewhere the map does not show you.
+    ///
+    /// The two Fix types are deliberately not the same — wayfinder's is
+    /// {lat, lon} and a landmark also records accuracy_m, because a landmark
+    /// SAVED at 500 m accuracy is a different claim from one saved at 5 m and
+    /// the record has to carry which. Accuracy the wayfinder does not track is
+    /// passed in by the caller.
+    pub fn begin_landmark(&mut self, accuracy_m: f64) {
+        let fix = self.self_fix.map(|f| crate::landmark::Fix {
+            lat: f.lat, lon: f.lon, accuracy_m,
+        });
+        self.add_landmark = Some(crate::landmark::AddLandmark::new(fix));
+    }
+
+    /// Save the landmark being named, if it is complete.
+    ///
+    /// Returns whether one was added. The form CLOSES only on success — an
+    /// error means the name was blank or there is no fix, and closing would
+    /// discard what the user typed along with the reason it failed.
+    /// `creator_id` is passed in rather than read from the app: this struct
+    /// holds no identity of its own, and inventing one here would put a
+    /// placeholder in a field that outlives the session — a landmark records
+    /// WHO named it, and "unknown" is not recoverable later.
+    pub fn commit_landmark(&mut self, creator_id: &str, id: &str, now_ms: i64) -> bool {
+        let Some(form) = self.add_landmark.as_mut() else { return false };
+        match form.save(creator_id, id, now_ms) {
+            Some(l) => {
+                self.landmarks.push(l);
+                self.add_landmark = None;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn apply_voice(&mut self, ev: crate::voicebar::Event) {
         use crate::voicebar::Event;
         match ev {
