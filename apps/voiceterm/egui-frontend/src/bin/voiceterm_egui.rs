@@ -45,6 +45,15 @@ impl VoicetermApp {
                 kind: cg::NodeKind::Page,
                 title: b.title.clone(),
                 subtitle: b.url.clone(),
+                // preview() truncates on a word boundary, so a long title does
+                // not end mid-word in the graph. Built from the title because a
+                // bookmark is all the app stored — an empty preview would be
+                // honest but leaves the node unreadable at a glance.
+                preview: cg::preview(&b.title),
+                // No tags: the app records none for a bookmark, and inventing
+                // one ("web", "saved") would be a facet nobody can filter on
+                // meaningfully.
+                tags: Vec::new(),
             });
         }
         for t in &self.mail.threads {
@@ -53,6 +62,8 @@ impl VoicetermApp {
                 kind: cg::NodeKind::ChatThread,
                 title: t.subject.clone(),
                 subtitle: t.participants.join(", "),
+                preview: cg::preview(&t.subject),
+                tags: Vec::new(),
             });
         }
 
@@ -237,6 +248,11 @@ struct VoicetermApp {
     docs: voiceterm_egui::manpage_view::ManpageView,
     /// The spoken mail phrase, parsed by the selector grammar.
     mail_phrase: String,
+    /// A spoken date question — "how many days until christmas". Answered
+    /// locally rather than shelled out to `date`, because the arithmetic is
+    /// where naive implementations go quietly wrong and date_phrase already
+    /// got it right.
+    date_phrase: String,
     /// Bytes destined for a PTY: the encoded control keys plus any submitted
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
@@ -368,6 +384,35 @@ impl eframe::App for VoicetermApp {
                     }
                 }
             });
+            // The date question, beside the terminal it answers into. A voice
+            // terminal is exactly where "how long until christmas" gets asked,
+            // and the answer is a line of text — the same shape as any other
+            // command's output.
+            ui.horizontal(|ui| {
+                ui.label("date:");
+                ui.text_edit_singleline(&mut self.date_phrase);
+                let q = self.date_phrase.trim().to_string();
+                if !q.is_empty() && ui.small_button("ask").clicked() {
+                    // TODAY is passed in, not read here: date_phrase is pure so
+                    // it can be tested across a leap day and a year roll, and a
+                    // function that reads the clock cannot be.
+                    let today = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0) / 86_400) as i64;
+                    let line = match voiceterm_egui::date_phrase::resolve(&q, today) {
+                        Some(target) => voiceterm_egui::date_phrase::phrase_days(
+                            q.trim(), target - today),
+                        // A phrase it does not know says so rather than
+                        // guessing a date: a wrong answer to "when is diwali"
+                        // is worse than "I do not know that one", because the
+                        // user acts on it.
+                        None => format!("I do not know the date of {q}"),
+                    };
+                    self.app.terminal.feed(&format!("{line}\r\n"));
+                    self.date_phrase.clear();
+                }
+            });
+
             // Above the keycaps, below the grid: a build's progress belongs
             // where the output is, not in a status bar the user is not looking
             // at while watching a compile.
@@ -1117,6 +1162,7 @@ fn main() -> eframe::Result<()> {
                 // transform" while sitting on four rows. The constructor takes
                 // the flag precisely because it cannot be inferred from here.
                 mail_phrase: String::new(),
+                date_phrase: String::new(),
                 table: voiceterm_egui::table_view::TableView::new(true),
                 docs: {
                     let mut v = voiceterm_egui::manpage_view::ManpageView::default();
