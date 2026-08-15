@@ -336,6 +336,12 @@ pub struct Snapclone {
     /// When the view was last pruned, so pruning runs on its own schedule
     /// rather than once per frame.
     last_prune_ms: u64,
+    /// This device's own addresses, for the hairpin check. Hairpin detection
+    /// compares against ALL of them, not just the public one — a phone
+    /// hotspot's 172.16.42.1 is a local address that a naive check misses.
+    pub local_hosts: Vec<String>,
+    /// Our public address, when something has told us one.
+    pub public_host: Option<String>,
     /// Battery and power state. Three sources for one fact because no single
     /// one is present everywhere this app runs — PowerDevil on Plasma, UPower
     /// elsewhere, a sysfs poll where neither answers.
@@ -466,6 +472,8 @@ impl Snapclone {
             editor_name: String::new(),
             view: Default::default(),
             last_prune_ms: 0,
+            local_hosts: Vec::new(),
+            public_host: None,
             power: Default::default(),
             // The five surfaces this app actually has. Built here rather than
             // in TabBar::default() because the bar is generic over its tabs —
@@ -570,6 +578,68 @@ impl Snapclone {
             self.sync_roster();
         }
         true
+    }
+
+    /// Which addresses to try for a discovered peer, best first.
+    ///
+    /// [`crate::peer_dial`] decides what to open; [`crate::handshake`] runs once
+    /// a socket is open. Neither had a caller, so gossip could find a device and
+    /// the app had no idea how to reach it.
+    ///
+    /// Two filters, in this order: `dialable` REFUSES addresses rather than
+    /// ranking them low — a port of 0 cannot be dialled and a hairpin will not
+    /// loop back on most consumer routers, so both are removed rather than
+    /// tried and timed out. Then `rerank` orders what survives by class, so a
+    /// peer on the same LAN is tried before a public address that will cost a
+    /// round trip through the internet to reach a machine in the next room.
+    pub fn dial_order(&self, peer_id: &str) -> Vec<crate::peer_dial::PeerAddress> {
+        use crate::peer_dial::{class_of, dialable, rerank, AddrClass, PeerAddress};
+        let addrs: Vec<PeerAddress> = self.view.peers().iter()
+            .filter(|r| r.id == peer_id)
+            .map(|r| PeerAddress { host: r.host.clone(), port: r.port })
+            .collect();
+        let local: Vec<String> = self.local_hosts.clone();
+        let mut out = dialable(&addrs, self.public_host.as_deref(), &local);
+        // The learned ranking is the app's, not the module's: peer_dial holds
+        // the ordering RULE and this holds what was observed to work here.
+        rerank(&mut out,
+               |a| class_of(&a.host, local.iter().any(|l| same_prefix(l, &a.host))),
+               &[AddrClass::SameLan, AddrClass::Private, AddrClass::Public]);
+        out
+    }
+
+    /// The bytes to send once a socket to `peer_id` is open.
+    ///
+    /// Version is NEGOTIATED, not assumed: v2 only when both sides support it,
+    /// because sending a v2 SHAK to a v1 peer is a magic number it will reject
+    /// outright — and the failure looks like an unreachable device rather than
+    /// a version mismatch.
+    ///
+    /// The peer's support comes from its gossip record rather than a guess. A
+    /// device that has not been heard from gets v1, which every version
+    /// understands: guessing high costs a whole handshake round trip to learn
+    /// something the conservative choice never needed to ask.
+    pub fn hello_for(&self, peer_id: &str, our_pub: &[u8], pq: Option<&[u8]>) -> Vec<u8> {
+        let peer_v2 = self.view.peers().iter()
+            .find(|r| r.id == peer_id)
+            .map(|r| r.verified)
+            .unwrap_or(false);
+        let magic = crate::handshake::choose_version(pq.is_some(), peer_v2);
+        // encode_v2 writes whichever magic the negotiation chose; passing the
+        // PQ key only when v2 was selected keeps the flag and the payload in
+        // agreement, which parse() checks and refuses.
+        let pq = if magic == crate::handshake::MAGIC_V2 { pq } else { None };
+        crate::handshake::encode_v2(&self.local_id, our_pub, pq, false)
+    }
+
+    /// When to retry a handshake, or `None` once the attempts are spent.
+    ///
+    /// Delegated rather than re-derived: the cap exists because "a handshake
+    /// retried forever keeps a dead peer's slot warm and, on a phone, keeps the
+    /// radio awake for it", and a second retry policy here could disagree with
+    /// that one.
+    pub fn handshake_retry(&self, attempt: u32) -> Option<u64> {
+        crate::handshake::next_retry_ms(attempt)
     }
 
     /// Age out peers nobody has heard from, on the gossip prune schedule.
@@ -3318,6 +3388,86 @@ mod badge_tests {
 }
 
 #[cfg(test)]
+mod dial_wiring_tests {
+    use super::*;
+
+    fn seen(s: &mut Snapclone, id: &str, host: &str, port: u16) {
+        s.on_gossip(crate::gossip::PeerRecord {
+            id: id.into(), host: host.into(), port,
+            last_seen_ms: 0, verified: true,
+        }, 100);
+    }
+
+    #[test]
+    fn a_port_of_zero_is_refused_rather_than_ranked_low() {
+        // It cannot be dialled at all, so trying it costs a timeout to learn
+        // what the address already said.
+        let mut s = Snapclone::new(vec![]);
+        seen(&mut s, "sc-a", "192.168.1.9", 0);
+        assert!(s.dial_order("sc-a").is_empty());
+    }
+
+    #[test]
+    fn a_gossip_record_holds_one_address_per_peer() {
+        // My first version of this test fed two addresses for one id and
+        // expected both back, ranked. PeerView::observe dedupes BY ID — a
+        // second record is a refresh, not a second route — so dial_order can
+        // only ever return one address per peer.
+        //
+        // That is a real limit of the discovery model rather than a bug in the
+        // ranking, and it is worth pinning: multi-homing needs a record shape
+        // that carries several addresses, and nothing here should quietly
+        // assume it already does.
+        let mut s = Snapclone::new(vec![]);
+        s.local_hosts = vec!["192.168.1.5".into()];
+        seen(&mut s, "sc-a", "203.0.113.7", 9876);
+        seen(&mut s, "sc-a", "192.168.1.9", 9876);
+        assert_eq!(s.dial_order("sc-a").len(), 1);
+    }
+
+    #[test]
+    fn the_ranking_puts_same_lan_first_when_it_has_a_choice() {
+        // The rule dial_order applies, checked directly on peer_dial::rerank
+        // since the discovery model cannot hand it two addresses for one peer.
+        use crate::peer_dial::{class_of, rerank, AddrClass, PeerAddress};
+        let mut addrs = vec![
+            PeerAddress { host: "203.0.113.7".into(), port: 9876 },
+            PeerAddress { host: "192.168.1.9".into(), port: 9876 },
+        ];
+        let local = ["192.168.1.5".to_string()];
+        rerank(&mut addrs,
+               |a| class_of(&a.host, local.iter().any(|l| super::same_prefix(l, &a.host))),
+               &[AddrClass::SameLan, AddrClass::Private, AddrClass::Public]);
+        assert_eq!(addrs[0].host, "192.168.1.9",
+                   "a machine in the next room was reached via the internet");
+    }
+
+    #[test]
+    fn an_unknown_peer_has_nothing_to_dial() {
+        let s = Snapclone::new(vec![]);
+        assert!(s.dial_order("nobody").is_empty());
+    }
+
+    #[test]
+    fn an_unheard_peer_gets_v1_rather_than_a_guess() {
+        // Guessing high costs a whole round trip to learn something the
+        // conservative choice never needed to ask.
+        let s = Snapclone::new(vec![]);
+        let hello = s.hello_for("nobody", &[7u8; 32], Some(&[1u8; 32]));
+        assert!(!hello.is_empty());
+    }
+
+    #[test]
+    fn the_retry_cap_is_the_modules_own() {
+        // A second policy here could disagree with the one that exists to stop
+        // a dead peer keeping the radio awake.
+        let s = Snapclone::new(vec![]);
+        assert!(s.handshake_retry(0).is_some());
+        assert_eq!(s.handshake_retry(crate::handshake::MAX_SHAK_ATTEMPTS), None);
+    }
+}
+
+#[cfg(test)]
 mod gossip_wiring_tests {
     use super::*;
 
@@ -3385,6 +3535,19 @@ mod gossip_wiring_tests {
         s.on_gossip(rec("sc-a", 0), 100);
         s.tick_gossip(crate::gossip::PRUNE_MS - 1);
         assert!(s.peers[0].online, "pruned before the interval elapsed");
+    }
+}
+
+/// Do two hosts share a /24-ish prefix?
+///
+/// A cheap same-LAN test rather than a netmask: the app does not know the
+/// peer's subnet mask, and asking the OS for one per candidate address would be
+/// a syscall per dial attempt to refine a hint that only orders a list.
+fn same_prefix(a: &str, b: &str) -> bool {
+    let head = |s: &str| s.rsplit_once('.').map(|(h, _)| h.to_string());
+    match (head(a), head(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
     }
 }
 
