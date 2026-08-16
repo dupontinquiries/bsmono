@@ -298,6 +298,13 @@ pub struct Snapclone {
     /// The receive half's scheduling. Decode and the audio sink stay with the
     /// host; this decides play / conceal / silence per sender per interval.
     pub playout: crate::voice_playout::VoicePlayout,
+    /// The layer BELOW playout: how many frames to hand the audio sink each
+    /// tick. voice_playout decides play/conceal/silence per sender; this
+    /// decides how much buffer the sink is holding, which is a different
+    /// question and had a different bug.
+    pub sink: crate::sink_cushion::Playout,
+    /// Cushion depth and frame size, from the call's settings.
+    pub sink_latency: crate::sink_cushion::Latency,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -454,6 +461,9 @@ impl Snapclone {
             camera_policy: Default::default(),
             camera_health: Default::default(),
             playout: Default::default(),
+            sink: Default::default(),
+            // 20 ms frames, the value snap_frame_ms normalises toward.
+            sink_latency: crate::sink_cushion::Latency::from_settings(2, 8, 20),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -649,6 +659,38 @@ impl Snapclone {
     /// that one.
     pub fn handshake_retry(&self, attempt: u32) -> Option<u64> {
         crate::handshake::next_retry_ms(attempt)
+    }
+
+    /// Hand the audio sink its frames for this tick.
+    ///
+    /// The layer below voice_playout, and the bug it fixes is worth stating
+    /// because the obvious diagnosis is wrong: the old design "wrote exactly
+    /// one 20 ms frame per 20 ms timer tick into the sink with no buffer
+    /// headroom", and crackled. Not because the CPU was slow — "a software
+    /// timer can't stay phase-locked to the device's sample clock", so one
+    /// frame per tick has ZERO margin however fast the machine is. A governor
+    /// change would not have fixed it and neither would a faster phone.
+    ///
+    /// The fix is a cushion topped up every tick, with the tick running at half
+    /// a frame so it refills well before the cushion drains. `sink_depth` is
+    /// what the device still holds; the returned frames are what to write.
+    pub fn sink_tick(&mut self, sink_depth: usize) -> Vec<Vec<f32>> {
+        let l = self.sink_latency;
+        self.sink.fill(sink_depth, &l)
+    }
+
+    /// Queue a decoded frame for the sink.
+    pub fn sink_push(&mut self, frame: Vec<f32>) {
+        let l = self.sink_latency;
+        self.sink.push(frame, &l);
+    }
+
+    /// How often to call `sink_tick`, in ms.
+    ///
+    /// Half a frame, from the module: refill well before the cushion drains
+    /// rather than exactly as it empties.
+    pub fn sink_tick_ms(&self) -> u32 {
+        crate::sink_cushion::tick_interval_ms(self.sink_latency.frame_ms)
     }
 
     /// The peer view as it should be WRITTEN TO DISK.
@@ -1247,6 +1289,13 @@ impl Snapclone {
         } else {
             self.group_voice.leave();
             self.playout.stop();
+            // The sink primes itself: push() flips `started` once the queue
+            // reaches jitter_target, which is prime-then-play rather than an
+            // explicit start. Leaving the call would have been inventing an
+            // API — it has no start/stop, and resetting it here means the
+            // NEXT call primes from empty rather than replaying this one's
+            // tail into it.
+            self.sink = Default::default();
         }
     }
 
@@ -3624,6 +3673,47 @@ mod gossip_wiring_tests {
             let got = s.view_for_storage()[0].last_seen_ms;
             assert!(got <= t, "{t} bucketed forward to {got}");
         }
+    }
+
+    #[test]
+    fn the_sink_primes_before_it_plays() {
+        // push() flips `started` at jitter_target rather than on the first
+        // frame — playing from one frame is the zero-margin design that
+        // crackled.
+        let mut s = Snapclone::new(vec![]);
+        assert!(s.sink_tick(0).is_empty(), "played before priming");
+        s.sink_push(vec![0.0; 960]);
+        s.sink_push(vec![0.0; 960]);
+        assert!(!s.sink_tick(0).is_empty(), "primed but still silent");
+    }
+
+    #[test]
+    fn the_tick_runs_at_half_a_frame() {
+        // "run the tick at half a frame so it refills well before the cushion
+        // drains". A tick equal to the frame is the original bug.
+        let s = Snapclone::new(vec![]);
+        assert_eq!(s.sink_tick_ms(), 10, "20 ms frames want a 10 ms tick");
+        assert!(s.sink_tick_ms() < s.sink_latency.frame_ms);
+    }
+
+    #[test]
+    fn a_full_sink_is_not_topped_up() {
+        // The cushion is a target, not a floor to add to: writing every tick
+        // regardless would grow latency without bound.
+        let mut s = Snapclone::new(vec![]);
+        for _ in 0..6 { s.sink_push(vec![0.0; 960]); }
+        assert!(s.sink_tick(99).is_empty(), "topped up an already-full sink");
+    }
+
+    #[test]
+    fn leaving_a_call_resets_the_sink() {
+        // Otherwise the previous call's queued frames play into the next one,
+        // which is the same failure set_in_call already guards for playout.
+        let mut s = Snapclone::new(vec![]);
+        s.sink_push(vec![0.0; 960]);
+        s.sink_push(vec![0.0; 960]);
+        s.set_in_call(false);
+        assert_eq!(s.sink.depth(), 0, "the old call's audio survived");
     }
 
     #[test]
