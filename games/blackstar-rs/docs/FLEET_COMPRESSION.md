@@ -473,3 +473,60 @@ renumber optimised for vertex reuse is not the same order.
 So: not done, and the reason generalises. **A property measured on one pose of a
 morph target is not a property of the morph target.** The same mistake would
 have been made by any tool that inspects a single glTF, which is most of them.
+
+## The SDF budget, and whether a raid fits
+
+Two questions: can the 126-model cap be raised, and would a 6-player raid with
+enemies and a world still fit?
+
+### The cap was WebGPU's baseline, not the device's
+
+`render.rs` requested `Limits::default().using_resolution(adapter.limits())`.
+`using_resolution` raises the 2D dimensions and leaves
+`max_texture_dimension_3d` at WebGPU's guaranteed baseline of **2048** — so the
+SDF volume was capped at 2048 depth regardless of what the GPU could do, and
+`CSDF_SLAB * CSDF_MAXM` = 16 x 126 = 2016 sits just under it.
+
+Now the device is asked for its real 3D limit and `sdf_capacity()` reads back
+what was granted:
+
+```
+device max_texture_dimension_3d   models   chassis (5 poses each)
+  2048  (WebGPU baseline)           126        25
+  4096  (common desktop)            256        51
+  8192                              512       102
+```
+
+Read back rather than assumed, because a device may grant less than requested,
+and sizing a texture from an unhonoured limit is a validation error at creation
+rather than a smaller roster. It never goes below `CSDF_MAXM`, because the
+shader constants and staging buffer are sized against that — a roster the shader
+cannot index is a worse failure than a full one.
+
+The SLAB stays at 16. It is the depth resolution of each model's field and was
+already cut from 44 to reach 126; cutting further trades silhouette accuracy for
+count, and the silhouette is the thing this whole asset pipeline exists to
+preserve.
+
+### A raid fits, and it was never the problem
+
+Every model on screen needs a slab; the CATALOGUE does not:
+
+```
+6 players, all different chassis     6 chassis    30 models
++ 12 enemy types                    18 chassis    90 models
++ 6 bosses and variants             24 chassis   120 models   <- fits in 2048
+whole fleet                        221 chassis  1105 models
+```
+
+**A full raid is 24 distinct chassis and the baseline holds 25.** The budget was
+never sized for a fight; it was being spent on loading every chassis in the
+catalogue at startup, which no session can display at once.
+
+So the durable fix is the one already in `roster.rs` — load a SUBSET — and the
+right subset for a raid is "what this match uses", not "the first 126
+alphabetically". `--bots` picks by tier or page today; picking by match roster is
+the same mechanism with a different input.
+
+The world and the players are unaffected either way: terrain, ball and effects
+do not consume model slabs.

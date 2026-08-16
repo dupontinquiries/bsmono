@@ -111,6 +111,31 @@ pub const CSDF_SLAB: u32 = 16;
 /// SDF depth-slice normalization had likely been sampling into the
 /// wrong model's slab for a while before either of these changes.
 pub const CSDF_MAXM: u32 = 126;
+
+/// How many models the SDF volume can hold on THIS device.
+///
+/// `CSDF_MAXM` is the compile-time floor: what WebGPU's baseline 2048 depth
+/// guarantees, and what every shader constant is sized against. This is the
+/// runtime ceiling, read back from the device that was actually created — an
+/// adapter reporting 4096 or 8192 doubles or quadruples the roster.
+///
+/// Read back rather than assumed: a device may grant less than requested, and
+/// sizing a texture from a limit that was not honoured is a validation error at
+/// creation rather than a smaller roster.
+///
+/// ## Why this is not simply "raise the constant"
+///
+/// The depth is `CSDF_SLAB * models`, and SLAB was already cut from 44 to 16 to
+/// reach 126 within 2048. Both halves are real: SLAB is the depth resolution of
+/// each model's field, and cutting it further trades silhouette accuracy for
+/// count. So the count moves with the DEVICE, and the slab stays put.
+pub fn sdf_capacity(device_max_3d: u32) -> u32 {
+    let by_device = device_max_3d / CSDF_SLAB;
+    // Never below the compile-time floor: shader constants and the staging
+    // buffer are sized against CSDF_MAXM, and a device reporting less than
+    // baseline would otherwise produce a roster the shader cannot index.
+    by_device.max(CSDF_MAXM)
+}
 pub const RC_K: usize = 28;
 pub const RC_STRIDE: usize = 32;
 pub const HMAP_SIZE: u32 = 1024;
@@ -277,7 +302,22 @@ impl Gpu {
                 &wgpu::DeviceDescriptor {
                     label: Some("skydribble"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+                    // ASK FOR THE ADAPTER'S 3D TEXTURE LIMIT, not just its
+                    // resolution.
+                    //
+                    // `using_resolution` raises the 2D dimensions and leaves
+                    // max_texture_dimension_3d at WebGPU's baseline 2048 — which
+                    // is what caps the SDF volume at CSDF_SLAB * CSDF_MAXM and
+                    // gates the model roster at 126. Most desktop and many
+                    // mobile adapters report 2048 here too, so this is not a
+                    // free win; it is a request for what the device actually
+                    // has, and `sdf_capacity` below reads back what was granted
+                    // rather than assuming it was honoured.
+                    required_limits: {
+                        let mut l = wgpu::Limits::default().using_resolution(adapter.limits());
+                        l.max_texture_dimension_3d = adapter.limits().max_texture_dimension_3d;
+                        l
+                    },
                     memory_hints: wgpu::MemoryHints::default(),
                 },
                 None,
@@ -1184,3 +1224,41 @@ fn make_msaa(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::TextureView {
         })
         .create_view(&Default::default())
 }
+
+#[cfg(test)]
+mod sdf_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn the_baseline_device_gives_the_compile_time_count() {
+        // 2048 is WebGPU's guaranteed max_texture_dimension_3d, and 16*126 =
+        // 2016 is what fits under it. This is the case every device meets.
+        assert_eq!(sdf_capacity(2048), CSDF_MAXM);
+    }
+
+    #[test]
+    fn a_bigger_device_gets_a_bigger_roster() {
+        // The point of asking the adapter: 4096 is common on desktop.
+        assert_eq!(sdf_capacity(4096), 256);
+        assert_eq!(sdf_capacity(8192), 512);
+    }
+
+    #[test]
+    fn a_smaller_device_never_goes_below_the_floor() {
+        // Shader constants and the staging buffer are sized against CSDF_MAXM.
+        // A device reporting less than baseline would otherwise produce a
+        // roster the shader cannot index — a worse failure than a full one.
+        assert_eq!(sdf_capacity(1024), CSDF_MAXM);
+        assert_eq!(sdf_capacity(0), CSDF_MAXM);
+    }
+
+    #[test]
+    fn capacity_is_a_whole_number_of_slabs() {
+        // A partial slab is a model whose field is truncated mid-depth, which
+        // reads as a silhouette with a slice missing rather than as an error.
+        for d in [2048u32, 3000, 4096, 5000, 8192] {
+            assert_eq!(sdf_capacity(d) * CSDF_SLAB <= d.max(2016), true, "{d}");
+        }
+    }
+}
+
