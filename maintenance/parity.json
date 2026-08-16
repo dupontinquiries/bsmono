@@ -2,65 +2,62 @@
  {
   "app": "bo-suite",
   "surfaces": 47,
-  "covered": 1,
-  "pct": 2,
-  "bin": true,
-  "app_default": true,
-  "manifest": true,
-  "primary": false,
-  "role": "app",
-  "missing": [
-   "AddToPlaylistDialog",
-   "AlbumDetailPage",
-   "AlbumsPage",
-   "AllTracksPage",
-   "AnticipationDot",
-   "ArtistDetailPage",
-   "ArtistsPage",
-   "BandSlider"
-  ]
- },
- {
-  "app": "bot-arena",
-  "surfaces": 2,
-  "covered": 1,
-  "pct": 50,
-  "bin": true,
-  "app_default": true,
-  "manifest": true,
-  "primary": false,
-  "role": "app",
-  "missing": [
-   "CorpusStudio"
-  ]
- },
- {
-  "app": "fao-codec",
-  "surfaces": 3,
-  "covered": 1,
-  "pct": 33,
-  "bin": true,
-  "app_default": true,
-  "manifest": true,
-  "primary": false,
-  "role": "app",
-  "missing": [
-   "V2Encoder",
-   "V8GpuRasterizer"
-  ]
- },
- {
-  "app": "rusty-board",
-  "surfaces": 8,
-  "covered": 4,
-  "pct": 50,
+  "covered": 46,
+  "pct": 98,
+  "wired": 32,
+  "wired_pct": 68,
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
   "missing": [
-   "Dbus",
+   "LyricsTranscriber"
+  ]
+ },
+ {
+  "app": "bot-arena",
+  "surfaces": 2,
+  "covered": 2,
+  "pct": 100,
+  "wired": 1,
+  "wired_pct": 50,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": []
+ },
+ {
+  "app": "fao-codec",
+  "surfaces": 3,
+  "covered": 2,
+  "pct": 67,
+  "wired": 2,
+  "wired_pct": 67,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [
+   "V8GpuRasterizer"
+  ]
+ },
+ {
+  "app": "rusty-board",
+  "surfaces": 8,
+  "covered": 5,
+  "pct": 62,
+  "wired": 5,
+  "wired_pct": 62,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [
    "KeyboardBehaviorsTests",
    "MicrotermView",
    "RustyBoardTestHarness"
@@ -68,44 +65,100 @@
  },
  {
   "app": "snapclone",
-  "surfaces": 38,
-  "covered": 5,
-  "pct": 13,
-  "bin": true,
-  "app_default": true,
-  "manifest": true,
-  "primary": false,
-  "role": "app",
-  "missing": [
-   "AddLandmarkDialog",
-   "CameraWidget",
-   "ComposerView",
-   "ContactEditorDialog",
-   "ContactPickerDialog",
-   "ConversationDetailDialog",
-   "ConversationSecurityBar",
-   "DiagnosticsDialog"
-  ]
- },
- {
-  "app": "voiceterm",
-  "surfaces": 32,
-  "covered": 8,
-  "pct": 25,
+  "surfaces": 51,
+  "covered": 49,
+  "pct": 96,
+  "wired": 25,
+  "wired_pct": 49,
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
   "missing": [
-   "ArchivedPage",
-   "BottomBar",
-   "DetectedBar",
-   "EntityExtract",
-   "Manpages",
-   "MessageView",
-   "NoteCards",
-   "PtyTerm"
+   "ComponentTestWindow",
+   "ModalLayerTestPanel"
+  ]
+ },
+ {
+  "app": "voiceterm",
+  "surfaces": 22,
+  "covered": 22,
+  "pct": 100,
+  "wired": 19,
+  "wired_pct": 86,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": []
+ },
+ {
+  "app": "krapper",
+  "surfaces": 1,
+  "covered": 1,
+  "pct": 100,
+  "wired": 1,
+  "wired_pct": 100,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": []
+ },
+ {
+  "app": "ambient-learner",
+  "surfaces": 18,
+  "covered": 17,
+  "pct": 94,
+  "wired": 12,
+  "wired_pct": 67,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [
+   "AmbientLearnerApp"
+  ]
+ },
+ {
+  "app": "gitmind",
+  "surfaces": 25,
+  "covered": 21,
+  "pct": 84,
+  "wired": 20,
+  "wired_pct": 80,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [
+   "DevicePicker",
+   "FileRow",
+   "GestureHost",
+   "PeekViewer"
+  ]
+ },
+ {
+  "app": "logscope",
+  "surfaces": 40,
+  "covered": 37,
+  "pct": 92,
+  "wired": 30,
+  "wired_pct": 75,
+  "bin": true,
+  "app_default": false,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [
+   "CargoTab",
+   "Fanassemble",
+   "Simconvo"
   ]
  }
 ]

@@ -39,6 +39,11 @@ PORTS = [
     # why it was missing from this list AND from the discovery below. An app
     # with no row looks like an app with nothing to do.
     ("ambient-learner", "apps/ambient-learner"),
+    # Workspaces whose port is its own crate (crates/<x>-egui beside crates/<x>).
+    # Both were absent from this list AND undiscoverable by port_dirs, so two
+    # real ports went unmeasured for the same reason ambient-learner did.
+    ("gitmind",     "apps/gitmind"),
+    ("logscope",    "apps/logscope"),
 ]
 
 def surfaces(app_dir):
@@ -149,6 +154,18 @@ def port_dirs(app_dir):
     Returns every directory that exists, so a hybrid is counted once."""
     candidates = [os.path.join(app_dir, 'egui-frontend'),
                   os.path.join(app_dir, 'src', 'ui', 'egui')]
+    # A third shape: a workspace whose port is its own crate, `crates/<x>-egui`
+    # beside the original `crates/<x>`. gitmind and logscope both do this, and
+    # both were invisible for the same reason ambient-learner was — the audit
+    # walked conventions rather than looking. Discovered rather than listed, so
+    # the next workspace to do it is counted without an edit here.
+    crates = os.path.join(app_dir, 'crates')
+    if os.path.isdir(crates):
+        for name in sorted(os.listdir(crates)):
+            if name.endswith('-egui'):
+                p = os.path.join(crates, name)
+                if os.path.isdir(p):
+                    candidates.append(p)
     return [c for c in candidates if os.path.isdir(c)]
 
 def port_text(app_dir):
@@ -241,10 +258,21 @@ def manifest_state(app_id):
     return (True, 'primary = true' in body, role)
 
 def cargo_state(app_dir):
-    tm = os.path.join(app_dir, 'egui-frontend', 'Cargo.toml')
-    try: t = open(tm, encoding='utf8').read()
-    except Exception: return (False, False)
-    return ('[[bin]]' in t, 'default = ["app"]' in t)
+    """Does the port build a runnable binary, and does it default to one?
+
+    Checks the manifest of EVERY port dir rather than only
+    `egui-frontend/Cargo.toml`. The hardcoded path reported "no bin" for
+    gitmind and logscope, which both ship one — a false alarm on a column
+    people scan for missing binaries is worse than the column being absent,
+    because it sends someone to fix what is not broken.
+    """
+    for src in port_dirs(app_dir):
+        tm = os.path.join(src, 'Cargo.toml')
+        try: t = open(tm, encoding='utf8').read()
+        except Exception: continue
+        if '[[bin]]' in t:
+            return (True, 'default = ["app"]' in t)
+    return (False, False)
 
 def main():
     rows = []
