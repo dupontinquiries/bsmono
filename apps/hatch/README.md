@@ -48,6 +48,22 @@ debugging on a desktop). Config in `~/.config/hatch/config.ini`
 (columns/icon_px/opacity/icon_theme/system_actions/terminal_wrap),
 favorites and recents next to it, all plain text.
 
+## Favorites across the two shells
+
+The plasmoid uses kicker's favorites model (stored in Plasma's
+`plasma-org.kde.plasma.desktop-appletsrc`); hatch-egui uses
+`~/.config/hatch/favorites`. On first run — and only while hatch has no
+favorites of its own — hatch reads the Plasma list and adopts it, so a
+curated dash carries over instead of greeting you with an alphabetical
+wall.
+
+It is a seed, not a sync, and deliberately one-directional. plasmashell
+holds its config open and rewrites it wholesale on its own schedule, so an
+outside writer loses races it cannot see: reading is safe, writing is not.
+After the seed the two lists can diverge, which is at least honest and
+both are plain text. `cargo run --example probe` prints what each side
+currently thinks.
+
 ## Verified / not verified
 
 Verified here: `cargo test` green for hatch-core and hatch-egui

@@ -31,6 +31,15 @@ fn main() {
         cfg.columns, cfg.icon_px, cfg.icon_theme, cfg.system_actions
     );
 
+    // What the plasmoid side thinks the favorites are. Printed rather than
+    // adopted here: the probe must not mutate the config it is reporting on.
+    let appletsrc = hatch_core::plasma::appletsrc_path();
+    match hatch_core::plasma::read_favorites(&appletsrc) {
+        Some(f) if !f.is_empty() => println!("plasma favorites ({}): {:?}", f.len(), f),
+        Some(_) => println!("plasma favorites: appletsrc present, none set"),
+        None => println!("plasma favorites: no appletsrc at {}", appletsrc.display()),
+    }
+
     let t0 = std::time::Instant::now();
     let mut l = Launcher::new(cfg);
     let scan_ms = t0.elapsed().as_millis();

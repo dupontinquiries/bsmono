@@ -10,6 +10,7 @@
 pub mod entry;
 pub mod exec;
 pub mod icons;
+pub mod plasma;
 pub mod rank;
 pub mod store;
 
@@ -36,6 +37,47 @@ pub const SYSTEM_ACTIONS: &[SystemAction] = &[
     SystemAction { id: "reboot", label: "Restart", icon: "system-reboot", argv: &["systemctl", "reboot"] },
     SystemAction { id: "poweroff", label: "Shut down", icon: "system-shutdown", argv: &["systemctl", "poweroff"] },
 ];
+
+/// Test support for anything that reads or writes the user's config.
+///
+/// `XDG_CONFIG_HOME` is process-global and cargo runs tests in parallel, so
+/// three modules each pointing it at their own temp dir is a race that
+/// happens to pass — until it doesn't, at 2am, on one machine. Every test
+/// that touches config takes this guard: it serialises them, redirects config
+/// at a private directory, and cleans up on drop even if the test panics.
+#[cfg(test)]
+pub(crate) mod testenv {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub struct ConfigHome {
+        pub path: PathBuf,
+        // Held for the lifetime of the guard; poisoning is irrelevant here
+        // because the data protected is the environment, not a value.
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    pub fn scoped_config_home(tag: &str) -> ConfigHome {
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = std::env::temp_dir().join(format!("hatch-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("temp config home");
+        std::env::set_var("XDG_CONFIG_HOME", &path);
+        ConfigHome { path, _lock: lock }
+    }
+
+    impl Drop for ConfigHome {
+        fn drop(&mut self) {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 pub struct Launcher {
     pub config: Config,
@@ -220,28 +262,29 @@ mod tests {
         }
     }
 
-    fn fresh() -> Launcher {
-        // Isolate persistence: launcher tests must not read a dev machine's
-        // real favorites (they would change ordering assertions).
-        let tmp = std::env::temp_dir().join(format!("hatch-lib-{}", std::process::id()));
-        std::env::set_var("XDG_CONFIG_HOME", &tmp);
-        let _ = std::fs::remove_dir_all(&tmp);
-        Launcher::with_entries(
+    /// A launcher over fixed entries with config redirected at a private
+    /// directory — these tests must not read a dev machine's real favorites,
+    /// which would change the ordering assertions. The returned guard must be
+    /// held for the duration of the test.
+    fn fresh() -> (Launcher, crate::testenv::ConfigHome) {
+        let guard = crate::testenv::scoped_config_home("lib");
+        let l = Launcher::with_entries(
             Config::default(),
             vec![e("Files"), e("Firefox"), e("Terminal"), e("Camera")],
-        )
+        );
+        (l, guard)
     }
 
     #[test]
     fn an_empty_query_lists_everything_alphabetically() {
-        let l = fresh();
+        let (l, _guard) = fresh();
         let names: Vec<_> = l.results().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Camera", "Files", "Firefox", "Terminal"]);
     }
 
     #[test]
     fn typing_narrows_and_ranks() {
-        let mut l = fresh();
+        let (mut l, _guard) = fresh();
         l.set_query("fi");
         let names: Vec<_> = l.results().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Files", "Firefox"], "prefix hits only, alpha tie-break");
@@ -251,7 +294,7 @@ mod tests {
 
     #[test]
     fn a_favorite_floats_to_the_front_but_only_once_the_grid_settles() {
-        let mut l = fresh();
+        let (mut l, _guard) = fresh();
         l.toggle_favorite("terminal");
         assert_eq!(
             l.result_at(0).unwrap().name,
@@ -270,7 +313,7 @@ mod tests {
 
     #[test]
     fn activating_records_a_recent_and_floats_it() {
-        let mut l = fresh();
+        let (mut l, _guard) = fresh();
         l.activate("camera").unwrap(); // Exec=true — spawns harmlessly
         // Camera was already first alphabetically; launch Firefox to see a move.
         l.activate("firefox").unwrap();
@@ -279,6 +322,9 @@ mod tests {
 
     #[test]
     fn system_actions_resolve_in_configured_order() {
+        // Guarded even though this test ignores favorites: `with_entries`
+        // loads them, and an unguarded read races the guarded writers.
+        let _guard = crate::testenv::scoped_config_home("sysactions");
         let mut cfg = Config::default();
         cfg.system_actions = vec!["poweroff".into(), "lock".into(), "bogus".into()];
         let l = Launcher::with_entries(cfg, vec![]);

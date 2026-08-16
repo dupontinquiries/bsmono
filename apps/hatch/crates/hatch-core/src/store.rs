@@ -123,14 +123,12 @@ pub fn record_recent(id: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    // Store tests run against a private XDG_CONFIG_HOME so they cannot touch a
-    // real user's launcher state. Env is process-global, so they share one
-    // serialised test to avoid racing other tests' config-kit reads.
+    // Store tests run against a private XDG_CONFIG_HOME so they cannot touch
+    // a real user's launcher state; the guard also serialises them against
+    // the other modules that redirect the same variable.
     #[test]
     fn config_and_favorites_and_recents_round_trip() {
-        let tmp = std::env::temp_dir().join(format!("hatch-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let _guard = crate::testenv::scoped_config_home("store");
 
         let mut c = Config::default();
         c.columns = 5;
@@ -151,8 +149,5 @@ mod tests {
         let rec = load_recents();
         let ids: Vec<_> = rec.iter().map(|(i, _)| i.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
-
-        std::env::remove_var("XDG_CONFIG_HOME");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

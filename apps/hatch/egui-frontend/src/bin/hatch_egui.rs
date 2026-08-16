@@ -137,6 +137,15 @@ fn main() -> eframe::Result<()> {
 
     let cfg = hatch_core::Config::load();
     let opacity = cfg.opacity.clamp(0.0, 1.0);
+
+    // First run on a phone that already has a curated Plasma dash should show
+    // that curation rather than an alphabetical wall. Once hatch has any
+    // favorites of its own this is a no-op forever after — see plasma.rs for
+    // why it seeds instead of syncing.
+    let seeded = hatch_core::plasma::seed_favorites_if_empty();
+    if !seeded.is_empty() {
+        eprintln!("hatch: adopted {} favorites from Plasma", seeded.len());
+    }
     let size = if has("--windowed") { [480.0, 640.0] } else { [420.0, 900.0] };
     let opts = eframe::NativeOptions {
         viewport: uikit_egui::desktop::viewport(APP_ID, "Hatch", size)
