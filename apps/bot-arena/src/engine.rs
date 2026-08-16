@@ -110,7 +110,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotStatus {
     Idle,
     Provisioning,

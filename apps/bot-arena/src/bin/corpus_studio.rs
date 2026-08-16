@@ -26,8 +26,7 @@ use gtk::prelude::*;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-#[path = "../registry.rs"]
-mod registry;
+use bot_arena::registry;
 
 const APP_ID: &str = "org.example.CorpusStudio";
 

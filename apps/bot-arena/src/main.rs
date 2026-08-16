@@ -10,16 +10,14 @@
 //! over an async-channel; the GUI drains it with glib::spawn_future_local. Widgets
 //! never leave the main thread; the engine only ever sees the plain Config struct.
 
-mod engine;
-#[path = "fsm.rs"]
-mod fsm;
+// The core moved into the lib (src/lib.rs); re-exported at the bin root so
+// every existing `crate::engine::…` path in heroes/inspect/replays keeps
+// resolving unchanged.
+pub use bot_arena::{engine, fsm, llama_backend, models, registry};
 mod heroes;
 mod inspect;
-mod models;
-mod llama_backend;
-mod registry;
 mod replays;
-use engine::{BackendKind, BotStatus, Config, EngineMsg};
+use bot_arena::engine::{BackendKind, BotStatus, Config, EngineMsg};
 
 use std::cell::RefCell;
 use std::path::PathBuf;

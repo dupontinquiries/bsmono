@@ -2,19 +2,46 @@
 name = "bot-arena"
 version = "0.1.0"
 edition = "2021"
-description = "Population-based code-agent arena with a GTK4/libadwaita GUI"
+description = "Population-based code-agent arena: GTK-free core (engine/fsm/registry/models/llama_backend) as a lib, GTK4/libadwaita GUI behind the default `gtk-ui` feature"
+
+# The core is a lib so other front-ends (egui-frontend) can drive the real
+# engine instead of carrying a view-model copy. The GTK bins keep building
+# exactly as before via the default feature.
+[lib]
+name = "bot_arena"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bot-arena"
+path = "src/main.rs"
+required-features = ["gtk-ui"]
+
+[[bin]]
+name = "corpus_studio"
+path = "src/bin/corpus_studio.rs"
+required-features = ["gtk-ui"]
+
+# corpus_md is dependency-free Rust; it builds with or without GTK.
+[[bin]]
+name = "corpus_md"
+path = "src/bin/corpus_md.rs"
 
 [dependencies]
 # Pinned to the 0.8 generation so it builds on distro rustc 1.75.
 # On rustc >= 1.80 you can bump to gtk4 0.9 / libadwaita 0.7 and drop the pins below.
-gtk = { version = "0.8", package = "gtk4", features = ["v4_10"] }
-adw = { version = "0.6", package = "libadwaita", features = ["v1_4"] }
+gtk = { version = "0.8", package = "gtk4", features = ["v4_10"], optional = true }
+adw = { version = "0.6", package = "libadwaita", features = ["v1_4"], optional = true }
 async-channel = "2"
 rand = { version = "0.8", features = ["small_rng"] }
 
-# Transitive pins to keep the graph pre-edition2024 for old cargo (1.75).
-hashbrown = "=0.14.5"
-indexmap = "=2.2.6"
+# Transitive floors. The pre-edition2024 guarantee for old cargo (1.75) now
+# lives in the COMMITTED Cargo.lock (hashbrown 0.14.5 / indexmap 2.2.6) —
+# build with `cargo build --locked` on a distro toolchain. Exact `=` pins had
+# to go because egui-frontend shares a resolution with eframe, whose
+# transitive wgpu-core wants indexmap >= 2.11 (never built, but version
+# resolution spans optional deps).
+hashbrown = ">=0.14.5"
+indexmap = ">=2.2.6"
 
 # Optional in-process llama.cpp agent. OFF by default so the project builds on
 # distro rustc 1.75 with no extra system deps. To enable on a newer toolchain
@@ -23,4 +50,6 @@ indexmap = "=2.2.6"
 # then change the feature below to: llamacpp = ["dep:llama-cpp-2"]
 # and build with: cargo build --release --features llamacpp
 [features]
+default = ["gtk-ui"]
+gtk-ui = ["dep:gtk", "dep:adw"]
 llamacpp = []
