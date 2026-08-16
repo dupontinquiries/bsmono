@@ -236,3 +236,44 @@ of each joint by fitting f00 to f04, and that is upstream of this repo.
 
 Until then the intermediate poses ARE the angle data, in the least compact
 possible form, and they have to be stored.
+
+## Can the angles be solved for locally? No — the parts are not rigid
+
+Unpermuting the strips removed the obvious objection: part *i* is now the same
+part in both poses for 215 chassis, so a per-part fit is finally meaningful.
+Ran it.
+
+A joint-driven fold assumes each part ROTATES: its shape is preserved and only
+its placement changes. That is testable without solving anything — under a rigid
+motion, every vertex keeps its distance from the part's centroid. Measured that
+drift from f00 to f04, per part, across 12 chassis and 451 parts:
+
+```
+rigid      (<2% radius drift):   37 of 451     8%
+near-rigid (<10%):               82 of 451    18%
+median drift:                    38%
+worst (analog):                 108%
+```
+
+**The parts deform, they do not rotate.** A door does not swing on a hinge here
+— it changes shape on the way. So there is no set of joint angles that
+reproduces these poses, however well the hinge tree is known, and
+`joints.json`'s 95% zero angles are not an oversight in the generator so much as
+an admission: there was no angle to write, because the motion is not a rotation.
+
+This settles three things at once:
+
+* **Runtime synthesis cannot recover the intermediates**, and not for want of
+  angle data. The earlier finding that they deviate 63% from an endpoint lerp is
+  the same fact seen from outside.
+* **The C engine's fold is a different technique, not an earlier version of this
+  one.** `game.c:545` rotates hand-split `_partN` models about derived hinges and
+  says so — "38 of them, covering 442 model entries". It works because those
+  models were AUTHORED as rigid parts. The fleet's 173 were harvested, and
+  harvested parts deform.
+* **The storage floor is the poses.** 196 MB of packs is not a step on the way
+  to something smaller; it is the size of the information.
+
+What would change this is a foldview that emits rigid parts — segmenting the
+mesh so each piece moves rigidly, rather than fitting hinges to pieces that do
+not. That is a different generator, not a missing field in this one.
