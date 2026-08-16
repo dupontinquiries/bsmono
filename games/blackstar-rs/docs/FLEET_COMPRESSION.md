@@ -585,3 +585,63 @@ silhouette assembled from other models' fields, which renders and is wrong.
 The shader's own comment records that "three numbers had to agree ... and two of
 the three were already wrong" before. Raising the cap means pushing CSDF_D in as
 a uniform so there is ONE number, rather than adding a fourth place to disagree.
+
+## Better utilisation: the atlas stacks on one axis of three
+
+You were right that LOD does not solve this and utilisation is the key. Here is
+where the waste actually is.
+
+### The budget is 1.7 MB, not a memory problem
+
+One slab is 36 x 24 x 16 = 13,824 voxels at one byte each. The whole 126-model
+atlas is **1.7 MB of GPU texture.** Nothing here is constrained by memory. It is
+constrained by a single number: `max_texture_dimension_3d`, 2048.
+
+### And that limit applies to all three axes, while only one is being used
+
+```
+current   1 model per 36 x 24 x 16 column, stacked on DEPTH only
+          depth per model 16, ceiling 2048  ->  128 models
+```
+
+Width is 36 and height is 24. Both have the same 2048 ceiling and both are
+sitting nearly empty. Tiling models across W and H instead of only stacking them
+on D:
+
+```
+tile 2x2   texture  72 x  48 x D    4 models per depth-slab   ->   512 models
+tile 4x4   texture 144 x  96 x D   16 models per depth-slab   ->  2,048 models
+tile 8x8   texture 288 x 192 x D   64 models per depth-slab   ->  8,192 models
+```
+
+All three fit every axis limit. At 4x4 with 512 depth that is **512 models for
+7.1 MB** — four times the current roster, at a quarter of the depth ceiling,
+with **no change to SLAB and therefore no quality loss**.
+
+This is the answer to "better utilisation": the atlas is a 3D texture being used
+as a 1D stack.
+
+### What it costs to do
+
+The shader's slab lookup becomes a 3D tile index rather than a depth offset:
+`w = base + uvw.z` becomes a (u, v, w) offset from the model's tile origin. That
+is a handful of lines, and it is the same place `CSDF_D` needs to become a
+uniform — which the previous entry already flagged as the prerequisite for
+raising capacity at all. Both changes land in the same function.
+
+### Why this matters for the cases you raised
+
+* **Transforming capital ships with interiors** are fold strips like anything
+  else — five slabs — and an interior is more surface in the same box, so it
+  wants MORE slab depth, not less. Tiling frees the count so SLAB can go back up
+  toward its original 44 for the models that need it.
+* **Combiner bosses** are the sharpest case: Devastator is six bots that are also
+  one bot, so a single encounter is 7 chassis and 35 slabs under the current
+  scheme. Four combiner bosses would exhaust a third of the whole budget.
+* **Procgen raids** cannot be planned around a fixed roster at all, which is
+  exactly why a 4x-to-16x headroom matters more than a smarter subset.
+
+LOD does not help any of these, and it is worth saying why: LOD reduces
+TRIANGLES for distant things, and the SDF budget is indexed by MODEL COUNT. A
+prop at 5% screen size consumes exactly the slab a hero asset does. Utilisation
+is the right lever and the atlas layout is where it lives.
