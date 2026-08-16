@@ -71,6 +71,17 @@ targets = ["desktop"]
 primary = true            # THE default keyboard: gitmind selects this, not the GTK build
 notes = "the egui port of rusty-board (GTK4 keyboard), and now the default build. Shares the engine's own Config AND voice stack via #[path] rather than reimplementing them, so the two front ends cannot drift. Dictation drives the streaming partials directly (see dictation.rs): partials REPLACE rather than accumulate and the last one is committed, which removes the double-transcription and the wait for a second inference pass. `cargo build --release` gives the deployable bin; add `--features voice` for dictation (whisper-rs is a native build and wants a model). Still GTK-only: the LLM assistant, the minimised tray and the microterm."
 
+[apps.launcher-egui]
+path = "apps/launcher/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop", "phone"]  # phone (FP5) is the actual target; cross build unverified in this sandbox (x86_64, no aarch64-musl cross toolchain)
+primary = true            # the egui port is the intended build
+notes = "the egui-primary port of the tile launcher (Plasma kickerdash-fork plasmoid) — see UI_STRATEGY.md. Fullscreen fuzzy-searchable app grid; a headless tick-based Board (src/anim.rs) drives the plasmoid's slide-in + restack tile animation, so the whole visible behaviour — filtering, restack convergence, tap-vs-close — runs under `cargo test` with no display. Reads `[launcher]` prefs (palette id, slide pattern, timings) from config-kit. `cargo build --release` produces the deployable `launcher-egui` bin directly (the `app` feature is default-on). The on-screen-keyboard inset (`Shell::kb_inset_px`) is a layout seam that nothing feeds yet: winit/egui 0.34 don't surface the compositor's input-panel rect, so a maliit/zwp_input_panel listener is an open on-device task, same shape as snapclone-egui's keyboard_inset.rs. Icon rendering is an initial-letter glyph placeholder; freedesktop icon-theme rasterisation is a view-only follow-up."
+
 [apps.bo-suite]
 path = "apps/bo-suite"
 kind = "cargo"

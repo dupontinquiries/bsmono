@@ -1,0 +1,30 @@
+[package]
+name = "launcher-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The tile launcher's egui-primary port: fullscreen fuzzy-searchable app grid with the plasmoid's tile geometry (slide-in patterns + restack) driven by a headless, tick-based board the tests can steer. Desktop-entry scanning, launch, and the on-screen-keyboard inset are seams; the view is a painter over Board poses."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "launcher-egui"
+path = "src/bin/launcher_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+# Default-on so `cargo build --release` (what the build orchestrator runs, no extra
+# flags — see manifest/projects.toml) produces the deploy binary directly, same
+# convention as the other -egui apps.
+app = ["dep:eframe"]
+
+[dependencies]
+config-kit = { path = "../../../shared/config-kit" }
+egui = "0.34"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[workspace]
