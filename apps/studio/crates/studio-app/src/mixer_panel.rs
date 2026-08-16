@@ -24,6 +24,12 @@ use uikit_egui::PaletteColors;
 use crate::Studio;
 
 pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| show_inner(ui, s, c));
+}
+
+fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
     let tracks: Vec<studio_core::Track> = s.session.doc.project.tracks.clone();
     if tracks.is_empty() {
         ui.colored_label(c.text_weak, "No tracks.");

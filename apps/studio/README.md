@@ -189,9 +189,14 @@ material only as far as the source actually has it. An ambiguous grab on a
 tiny clip goes to the preferred side, and `alt-;` (`FlipTrimSide` — a key
 the map minted before the drag existed) finally flips it. A left trim
 lands as its two true facts, TrimClip then MoveClip: two ops, two undos,
-the precedent a bounce set. Also still named: streaming pattern playback
-inside `DeviceEngine`'s realtime render, and the Program panel, which says
-so on screen instead of showing nothing.
+the precedent a bounce set. The Rack panel scrolls on both axes (a 64-step pattern is ~1.5k px of
+grid, and the stated targets include phone-sized viewports) and the Mixer
+scrolls vertically. Also still named: streaming pattern playback inside
+`DeviceEngine`'s realtime render, group-undo for multi-op gestures (a
+left-trim is TrimClip+MoveClip — two undo presses for one gesture; the
+core has `History::apply_group`, the shell's op-log undo has no grouping
+yet), and the Program panel, which says so on screen instead of showing
+nothing.
 
 ## Realtime collaboration, concretely
 

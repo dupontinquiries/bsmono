@@ -18,6 +18,17 @@ use crate::Studio;
 /// One frame of the rack panel. `playhead` is the loop column the audition
 /// sink reports (already wrapped), or `None` when stopped.
 pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Option<u32>) {
+    // Both axes scroll: a 64-step pattern is ~1.5k px of grid, and this
+    // repo's stated targets include phone-sized viewports where even the
+    // 16-step kit plus the channel strip overruns the height. auto_shrink
+    // off so the scroll region is the panel, not the content — otherwise
+    // the area collapses to fit and nothing scrolls at all.
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| show_inner(ui, s, c, playhead));
+}
+
+fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Option<u32>) {
     let before = s.rack.clone();
 
     // ── transport & pattern row ─────────────────────────────────────────
