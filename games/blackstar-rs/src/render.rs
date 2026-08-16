@@ -129,6 +129,18 @@ pub const CSDF_MAXM: u32 = 126;
 /// reach 126 within 2048. Both halves are real: SLAB is the depth resolution of
 /// each model's field, and cutting it further trades silhouette accuracy for
 /// count. So the count moves with the DEVICE, and the slab stays put.
+/// NOT YET USED TO SIZE THE TEXTURE, and that is deliberate.
+///
+/// `shader.wgsl` hardcodes `CSDF_D = 2016.0` and divides by it to find a
+/// model's slab. Sizing the texture from this function without changing that
+/// constant would make every sample read the wrong depth — a silhouette
+/// assembled from other models' fields, which renders and is wrong.
+///
+/// The shader comment already records that "three numbers had to agree ... and
+/// two of the three were already wrong" once before. Raising capacity means
+/// pushing CSDF_D in as a uniform so there is ONE number, not a fourth place to
+/// disagree. Until then this reports what the device could hold and the roster
+/// stays at CSDF_MAXM.
 pub fn sdf_capacity(device_max_3d: u32) -> u32 {
     let by_device = device_max_3d / CSDF_SLAB;
     // Never below the compile-time floor: shader constants and the staging

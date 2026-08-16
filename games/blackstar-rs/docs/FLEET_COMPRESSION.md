@@ -530,3 +530,58 @@ the same mechanism with a different input.
 
 The world and the players are unaffected either way: terrain, ball and effects
 do not consume model slabs.
+
+## Capital ships, 12+ players, procgen patrol space
+
+### A big ship on screen costs pixels, not slabs
+
+The SDF budget is indexed by MODEL, not by screen area or vertex count. A
+capital ship filling the viewport is one chassis and consumes exactly as much of
+the budget as a compact car. What it costs instead is fill rate and draw
+distance, which are different resources with a different fix.
+
+### Counting a patrol scenario
+
+```
+12 players, all distinct       12 chassis    60 models   depth   960   fits
++ 1 capital ship               13 chassis    65 models   depth  1040   fits
++ 8 fighter types              21 chassis   105 models   depth  1680   fits
++ 6 world props                27 chassis   135 models   depth  2160   over 2048
++ 4 boss variants              31 chassis   155 models   depth  2480   over 2048
+```
+
+Twelve players with a capital ship and eight enemy types fits the WebGPU
+baseline. It is the world props and boss variants that push past it — and on a
+4096 device all of it fits with room to spare.
+
+### The lever nobody has pulled: static things need one pose
+
+A chassis costs a slab PER POSE, and a fold strip is five. But a capital ship
+that never transforms into a robot does not need a strip:
+
+```
+31 chassis as fold strips        155 models   depth 2480   over
+31 chassis as static props        31 models   depth  496   fits easily
+20 folders + 11 static           111 models   depth 1776   fits
+```
+
+**5x, for anything that does not fold.** Most of a patrol space is scenery,
+capital ships and structures — things with no robot mode — and the loader
+currently gives each of them five slabs because the fleet's format has five
+poses. A single-pose asset already loads (the loader skips strips with fewer
+than two poses only for MORPH purposes); what is missing is the roster treating
+those as one model rather than five.
+
+That is the cheapest capacity win available and it does not touch the renderer.
+
+### What raising the cap actually requires
+
+`sdf_capacity()` reports what the device could hold, and the roster still uses
+`CSDF_MAXM`. That gap is deliberate: `shader.wgsl` hardcodes `CSDF_D = 2016.0`
+and divides by it to locate a model's slab. Sizing the texture from the device
+without changing that constant makes every sample read the wrong depth — a
+silhouette assembled from other models' fields, which renders and is wrong.
+
+The shader's own comment records that "three numbers had to agree ... and two of
+the three were already wrong" before. Raising the cap means pushing CSDF_D in as
+a uniform so there is ONE number, rather than adding a fourth place to disagree.
