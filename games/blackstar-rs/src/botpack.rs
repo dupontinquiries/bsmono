@@ -1,4 +1,4 @@
-//! botpack — read `bots.pack`, the quantised fold strip.
+//! botpack — read the quantised strips: `bots.pack` and `walk.pack`.
 //!
 //! Written by `games/blackstar/tools/pack_bots.py`. The measurement is in
 //! `docs/FLEET_COMPRESSION.md`: 770 MB of float32 vertex buffers to 130 MB, at
@@ -37,16 +37,42 @@ pub const MAGIC: &[u8; 4] = b"BSPK";
 /// storage change rather than a format change.
 pub fn pose_buffer(dir: &Path) -> Option<Vec<u8>> {
     let chassis = dir.parent()?;
-    let idx = pose_index(dir)?;
-    let blob = std::fs::read(chassis.join("bots.pack")).ok()?;
+    let (kind, idx) = pose_index(dir)?;
+    // WHICH PACK depends on the pose prefix. A chassis has two independent
+    // strips — f00.. is the fold, w00.. the walk cycle — packed separately
+    // because they have separate quantisation boxes and nothing ever lerps a
+    // fold pose toward a walk pose.
+    //
+    // The first version hardcoded "bots.pack" and pose_index only accepted 'f',
+    // so a walk pose failed both checks and the loader panicked with
+    // "no scene.bin and no bots.pack for assets/bots/analog/w00".
+    let file = match kind {
+        Strip::Fold => "bots.pack",
+        Strip::Walk => "walk.pack",
+    };
+    let blob = std::fs::read(chassis.join(file)).ok()?;
     decode_pose(&blob, idx)
 }
 
-/// `f03` -> 3. The directory name IS the pose order — the packer sorts by it,
-/// so a mismatch here would silently return the wrong pose rather than fail.
-fn pose_index(dir: &Path) -> Option<usize> {
+/// Which strip a pose directory belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Strip { Fold, Walk }
+
+/// `f03` -> (Fold, 3), `w01` -> (Walk, 1).
+///
+/// The directory name IS the pose order within its strip — the packer sorts by
+/// it — so a mismatch here would silently return the wrong pose rather than
+/// fail. Both prefixes are handled explicitly rather than "strip one char",
+/// because an unknown prefix should return None and let the caller fall back to
+/// scene.bin, not index into whichever pack it guessed.
+fn pose_index(dir: &Path) -> Option<(Strip, usize)> {
     let name = dir.file_name()?.to_str()?;
-    name.strip_prefix('f')?.parse::<usize>().ok()
+    let (kind, rest) = match name.as_bytes().first()? {
+        b'f' => (Strip::Fold, &name[1..]),
+        b'w' => (Strip::Walk, &name[1..]),
+        _ => return None,
+    };
+    Some((kind, rest.parse::<usize>().ok()?))
 }
 
 /// Pull one pose out of a pack blob.
@@ -373,9 +399,27 @@ mod tests {
         // The packer sorts pose directories by name, so f03 must decode chunk
         // 3 — an off-by-one here returns the WRONG POSE, which renders fine and
         // folds wrong.
-        assert_eq!(pose_index(Path::new("/x/quickfire/f03")), Some(3));
-        assert_eq!(pose_index(Path::new("/x/quickfire/f00")), Some(0));
+        assert_eq!(pose_index(Path::new("/x/quickfire/f03")), Some((Strip::Fold, 3)));
+        assert_eq!(pose_index(Path::new("/x/quickfire/f00")), Some((Strip::Fold, 0)));
         assert_eq!(pose_index(Path::new("/x/quickfire/notapose")), None);
+    }
+
+    #[test]
+    fn a_walk_pose_resolves_to_the_walk_strip() {
+        // The bug this fixes: pose_index accepted only 'f' and pose_buffer
+        // hardcoded "bots.pack", so w00 failed both and the loader panicked
+        // with "no scene.bin and no bots.pack for .../analog/w00".
+        assert_eq!(pose_index(Path::new("/x/analog/w00")), Some((Strip::Walk, 0)));
+        assert_eq!(pose_index(Path::new("/x/analog/w03")), Some((Strip::Walk, 3)));
+    }
+
+    #[test]
+    fn an_unknown_prefix_is_none_rather_than_a_guess() {
+        // None lets the caller fall back to scene.bin. Guessing a strip would
+        // index into whichever pack it picked and return real geometry from
+        // the wrong animation.
+        assert_eq!(pose_index(Path::new("/x/analog/q00")), None);
+        assert_eq!(pose_index(Path::new("/x/analog/f")), None);
     }
 }
 
