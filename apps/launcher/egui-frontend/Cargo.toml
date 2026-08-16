@@ -18,7 +18,7 @@ default = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs, no extra
 # flags — see manifest/projects.toml) produces the deploy binary directly, same
 # convention as the other -egui apps.
-app = ["dep:eframe"]
+app = ["dep:eframe", "dep:image"]
 
 [dependencies]
 config-kit = { path = "../../../shared/config-kit" }
@@ -26,5 +26,9 @@ egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+# Icon decoding only. Already a transitive dep via eframe/egui_extras for
+# eframe's own icon loading — declaring it explicitly (rather than reaching
+# for the transitive copy) is what lets shell.rs decode icon files itself.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [workspace]

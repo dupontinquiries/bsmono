@@ -1137,6 +1137,7 @@ dependencies = [
  "config-kit",
  "eframe",
  "egui",
+ "image",
  "snapclone-theme",
  "uikit-egui",
 ]

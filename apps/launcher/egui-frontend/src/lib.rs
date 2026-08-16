@@ -19,6 +19,7 @@
 pub mod anim;
 pub mod desktop;
 pub mod grid;
+pub mod icontheme;
 pub mod shell;
 
 use anim::{Board, BoardConfig};
@@ -139,13 +140,16 @@ impl Launcher {
 /// The XDG app namespace this launcher's own prefs live under — deliberately
 /// its own id, distinct from the reverse-DNS `APP_ID` used for the window/
 /// `.desktop` matching below.
+#[cfg(feature = "app")]
 const CONFIG_APP: &str = "launcher-egui";
 /// Reverse-DNS id for window/.desktop matching (see `uikit_egui::desktop`).
+#[cfg(feature = "app")]
 const APP_ID: &str = "org.c4.launcher-egui";
 
 /// Board timings + pattern + palette, loaded from `config-kit`'s flat INI
 /// under `[launcher]`. Any missing/unparsable key falls back to the default —
 /// deleting the file (or a key) is always a safe reset.
+#[cfg(feature = "app")]
 fn board_config_from_prefs(ini: &config_kit::Ini) -> BoardConfig {
     let mut c = BoardConfig::default();
     if let Some(v) = ini.get("launcher", "slide_pattern").and_then(|s| s.parse::<usize>().ok()) {
@@ -179,7 +183,8 @@ pub fn run() -> eframe::Result<()> {
     let palette = uikit_egui::PaletteColors::from_palette(snapclone_theme::palette_by_id(palette_id));
     let board_config = board_config_from_prefs(&ini);
 
-    let shell = shell::Shell::new(Launcher::from_system(board_config), palette);
+    let shell = shell::Shell::new(Launcher::from_system(board_config), palette)
+        .with_icon_theme(ini.get("launcher", "icon_theme").unwrap_or("hicolor"));
 
     let viewport = uikit_egui::desktop::viewport(APP_ID, "Launcher", [1080.0, 2340.0])
         .with_fullscreen(true)

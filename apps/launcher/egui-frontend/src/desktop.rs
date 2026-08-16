@@ -214,6 +214,19 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<AppEntry> {
     apps
 }
 
+/// XDG icon theme roots, precedence order: `$XDG_DATA_HOME/icons` first, then
+/// each of `$XDG_DATA_DIRS/icons`, then `/usr/share/pixmaps`'s sibling
+/// convention is handled by [`crate::icontheme::find_icon`]'s unthemed
+/// fallback (it looks at each root's `pixmaps/` sibling), not listed here.
+pub fn icon_theme_dirs() -> Vec<PathBuf> {
+    let mut dirs = application_dirs()
+        .into_iter()
+        .filter_map(|d| d.parent().map(|p| p.join("icons")))
+        .collect::<Vec<_>>();
+    dirs.dedup();
+    dirs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

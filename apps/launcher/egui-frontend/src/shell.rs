@@ -26,7 +26,7 @@
 use crate::anim::TilePose;
 use crate::grid::GridSpec;
 use crate::{tap_outcome, LaunchSpec, Launcher, TapOutcome};
-use egui::{Align2, CornerRadius, FontId, Frame as EguiFrame, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Frame as EguiFrame, Pos2, Rect, Sense, Stroke, Vec2};
 use uikit_egui::motion::{PressFeedback, PressFeel};
 use uikit_egui::PaletteColors;
 
@@ -67,6 +67,27 @@ pub fn hit_tile(p: Pos2, spec: &GridSpec, count: usize, inset: f32) -> Option<us
     Some(idx)
 }
 
+/// Decode an icon file's bytes into something `egui::Context::load_texture`
+/// accepts. Only formats the `image` crate can decode work — this build only
+/// enables its `png` codec, so a theme entry that resolved to an `.svg` (the
+/// common case for modern themes' scalable dirs) decodes to `None` here and
+/// [`Shell::icon_texture`] falls back to the glyph. Rasterizing SVG is a
+/// real follow-up (needs `resvg` or similar), not something to fold into
+/// this pass.
+#[cfg(feature = "app")]
+fn decode_icon(path: &std::path::Path) -> Option<egui::ColorImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw()))
+}
+
+#[cfg(not(feature = "app"))]
+fn decode_icon(_path: &std::path::Path) -> Option<egui::ColorImage> {
+    None
+}
+
 struct PressState {
     moved: f32,
     hit: Option<usize>,
@@ -77,6 +98,16 @@ pub struct Shell {
     pub palette: PaletteColors,
     /// See the module doc: honored, not yet fed.
     pub kb_inset_px: f32,
+    /// Icon theme to search (see [`crate::icontheme`]); "hicolor" is always
+    /// resolvable per spec, so it's the safe default when nothing better is
+    /// configured. Change with [`Shell::with_icon_theme`].
+    icon_theme: String,
+    icon_dirs: Vec<std::path::PathBuf>,
+    /// Resolved+decoded textures, keyed by app id. `None` means "looked and
+    /// found nothing decodable" (missing icon, or the theme only has an SVG
+    /// — this build has no rasterizer) so a repeated miss doesn't re-walk
+    /// the icon theme tree every frame; the glyph fallback paints instead.
+    icon_cache: std::collections::HashMap<String, Option<egui::TextureHandle>>,
     spec: Option<GridSpec>,
     scroll_y: f32,
     fling_vy: f32,
@@ -99,6 +130,9 @@ impl Shell {
             launcher,
             palette,
             kb_inset_px: 0.0,
+            icon_theme: "hicolor".to_string(),
+            icon_dirs: crate::desktop::icon_theme_dirs(),
+            icon_cache: std::collections::HashMap::new(),
             spec: None,
             scroll_y: 0.0,
             fling_vy: 0.0,
@@ -112,6 +146,34 @@ impl Shell {
             close_requested: false,
             last_error: None,
         }
+    }
+
+    /// Override the icon theme to search (e.g. from `[launcher] icon_theme`
+    /// in config-kit prefs — see `lib.rs::run`). Takes effect on the next
+    /// icon lookup; already-cached textures aren't invalidated, so changing
+    /// theme mid-session needs a restart (an acceptable seam: this isn't a
+    /// live settings panel yet).
+    pub fn with_icon_theme(mut self, theme: impl Into<String>) -> Shell {
+        self.icon_theme = theme.into();
+        self
+    }
+
+    /// Resolve + decode + upload an app's icon, memoized. `size_px` only
+    /// affects which on-disk directory freedesktop lookup prefers; the
+    /// texture itself is whatever resolution that directory has.
+    fn icon_texture(&mut self, ctx: &egui::Context, app_id: &str, icon_name: &str, size_px: f32) -> Option<egui::TextureHandle> {
+        if icon_name.is_empty() {
+            return None;
+        }
+        if let Some(cached) = self.icon_cache.get(app_id) {
+            return cached.clone();
+        }
+        let size = (size_px.round() as u32).max(16);
+        let tex = crate::icontheme::find_icon(&self.icon_dirs, &self.icon_theme, icon_name, size, 1)
+            .and_then(|path| decode_icon(&path))
+            .map(|img| ctx.load_texture(app_id.to_string(), img, egui::TextureOptions::LINEAR));
+        self.icon_cache.insert(app_id.to_string(), tex.clone());
+        tex
     }
 
     fn now_ms(&self) -> f64 {
@@ -257,19 +319,27 @@ impl Shell {
     fn paint_grid(&mut self, ui: &mut egui::Ui, rect: Rect, spec: GridSpec, now: f64) {
         self.launcher.board.tick(now);
         let painter = ui.painter_at(rect);
+        let ctx = ui.ctx().clone();
         let inset = spec.cell * 0.08;
 
         // Board poses are keyed by app id; label/glyph come from the entry.
-        // Positional lookup: display pos for pressed-tile check.
-        let pos_of: std::collections::HashMap<&str, usize> = self
+        // Positional lookup: display pos for pressed-tile check. Owned
+        // copies (not &AppEntry borrows) so the loop below is free to call
+        // `&mut self` methods (icon_texture) without fighting the borrow
+        // checker over `self.launcher.apps`.
+        let pos_of: std::collections::HashMap<String, usize> = self
             .launcher
             .filtered
             .iter()
             .enumerate()
-            .map(|(pos, &i)| (self.launcher.apps[i].id.as_str(), pos))
+            .map(|(pos, &i)| (self.launcher.apps[i].id.clone(), pos))
             .collect();
-        let by_id: std::collections::HashMap<&str, &crate::desktop::AppEntry> =
-            self.launcher.apps.iter().map(|a| (a.id.as_str(), a)).collect();
+        let by_id: std::collections::HashMap<String, (String, String)> = self
+            .launcher
+            .apps
+            .iter()
+            .map(|a| (a.id.clone(), (a.name.clone(), a.icon.clone())))
+            .collect();
 
         let poses: Vec<(String, TilePose)> = self
             .launcher
@@ -279,7 +349,7 @@ impl Shell {
             .collect();
 
         for (key, pose) in poses {
-            let Some(app) = by_id.get(key.as_str()) else { continue };
+            let Some((name, icon_name)) = by_id.get(&key).cloned() else { continue };
             let pressed = pos_of.get(key.as_str()).copied() == self.pressed_tile
                 && self.pressed_tile.is_some();
             let scale = pose.scale * if pressed { self.feedback.scale() } else { 1.0 };
@@ -307,23 +377,37 @@ impl Shell {
                 egui::StrokeKind::Inside,
             );
 
-            // Icon: initial-letter glyph for now. Freedesktop icon-theme
-            // rasterisation is a view-only follow-up behind `app.icon`.
             let glyph_c = face.center() - Vec2::new(0.0, face.height() * 0.12);
-            let r = face.width() * 0.22;
-            painter.circle_filled(glyph_c, r, self.palette.accent_soft.gamma_multiply(pose.alpha));
-            let initial = app.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-            painter.text(
-                glyph_c,
-                Align2::CENTER_CENTER,
-                initial,
-                FontId::proportional(r * 1.2),
-                self.palette.text.gamma_multiply(pose.alpha),
-            );
+            let tex = self.icon_texture(&ctx, &key, &icon_name, face.width());
+            if let Some(tex) = tex {
+                // Real icon: draw it in the same footprint the glyph would
+                // have used, so swapping a placeholder for a real icon later
+                // (once a theme actually resolves) doesn't reflow the tile.
+                let icon_rect = Rect::from_center_size(glyph_c, Vec2::splat(face.width() * 0.5));
+                painter.image(
+                    tex.id(),
+                    icon_rect,
+                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                    Color32::WHITE.gamma_multiply(pose.alpha),
+                );
+            } else {
+                // No decodable icon (missing, or theme-only-has-SVG — see
+                // decode_icon's doc comment): initial-letter glyph fallback.
+                let r = face.width() * 0.22;
+                painter.circle_filled(glyph_c, r, self.palette.accent_soft.gamma_multiply(pose.alpha));
+                let initial = name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                painter.text(
+                    glyph_c,
+                    Align2::CENTER_CENTER,
+                    initial,
+                    FontId::proportional(r * 1.2),
+                    self.palette.text.gamma_multiply(pose.alpha),
+                );
+            }
             painter.text(
                 Pos2::new(face.center().x, face.max.y - face.height() * 0.14),
                 Align2::CENTER_CENTER,
-                truncate(&app.name, 16),
+                truncate(&name, 16),
                 FontId::proportional(13.0),
                 self.palette.text_weak.gamma_multiply(pose.alpha),
             );
