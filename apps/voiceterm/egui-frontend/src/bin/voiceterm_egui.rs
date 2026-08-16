@@ -374,6 +374,15 @@ struct VoicetermApp {
     model_budget_gib: f32,
     /// Token events, for the accounting readout.
     tokens: Vec<voiceterm_egui::token_log::TokenEvent>,
+    /// tldr-style pages the command search scores against.
+    ///
+    /// A small built-in set rather than a disk index: command_search says the
+    /// indexing and the cache "belong to the shell" and the SCORING is the
+    /// judgement it ports. Shipping a handful of real pages exercises the
+    /// scoring honestly; shipping a fake index would exercise nothing.
+    cmd_docs: Vec<voiceterm_egui::command_search::CommandDoc>,
+    /// Candidates from the last phrase that matched no editor action.
+    cmd_hits: Vec<voiceterm_egui::command_search::CommandMatch>,
     /// The terminal screen the PTY's output paints onto.
     ///
     /// The app has always had pty_out — bytes going TO the shell — and no
@@ -617,12 +626,54 @@ impl eframe::App for VoicetermApp {
                         // Unrecognised phrases are NOT sent as literal text. A
                         // modal editor in normal mode reads stray letters as
                         // commands, so "umm delete that" would run d, e, l...
-                        None => self.toasts.info(
-                            format!("no editor action for {:?}", self.editor_phrase),
-                            ui.input(|i| i.time)),
+                        //
+                        // Instead they fall through to command_search, which is
+                        // what it was written for: "when spoken text matches
+                        // none of the structured intents, it is scored against
+                        // an index of tldr pages". A phrase that is not an
+                        // editor action may well be a shell command.
+                        None => {
+                            self.cmd_hits = voiceterm_egui::command_search::search(
+                                &phrase, &self.cmd_docs, 3);
+                            if self.cmd_hits.is_empty() {
+                                self.toasts.info(
+                                    format!("nothing matches {phrase:?}"),
+                                    ui.input(|i| i.time));
+                            }
+                        }
                     }
                 }
             });
+            // CANDIDATES, WITH THEIR REASONS. CommandMatch carries why it
+            // matched, and showing that is what makes a suggestion checkable —
+            // the module's own worry is whether "delete the old logs" surfaces
+            // `rm` or something alarming, and a bare command name gives the
+            // user no way to tell which they got.
+            //
+            // Nothing is run from here. A voice phrase that becomes a shell
+            // command without a deliberate second act is the failure this whole
+            // path is careful about; these are offered, and the user types or
+            // taps.
+            if !self.cmd_hits.is_empty() {
+                ui.colored_label(self.colors.text_weak, "did you mean:");
+                let mut chosen: Option<String> = None;
+                for m in &self.cmd_hits {
+                    ui.horizontal(|ui| {
+                        if ui.small_button(&m.name).clicked() {
+                            chosen = Some(m.name.clone());
+                        }
+                        ui.colored_label(self.colors.text_weak,
+                            format!("{:.2}  {}", m.score, m.reasons.join(", ")));
+                    });
+                }
+                if let Some(name) = chosen {
+                    // Placed in the phrase box, not the PTY. One more
+                    // deliberate act before anything executes.
+                    self.editor_phrase = name;
+                    self.cmd_hits.clear();
+                }
+                if ui.small_button("dismiss").clicked() { self.cmd_hits.clear(); }
+            }
             if let Some(a) = self.editor_pending.clone() {
                 ui.horizontal(|ui| {
                     ui.colored_label(self.colors.warning, "this discards changes:");
@@ -1604,6 +1655,8 @@ fn main() -> eframe::Result<()> {
                 model_params_b: 7.0,
                 model_budget_gib: 4.0,
                 tokens: Vec::new(),
+                cmd_docs: default_command_docs(),
+                cmd_hits: Vec::new(),
                 // 80x24 until a resize: the classic default, and every program
                 // that queries COLUMNS gets a plausible answer rather than 0.
                 grid: voiceterm_egui::term_grid::TermGrid::new(80, 24),
@@ -1639,3 +1692,55 @@ fn main() -> eframe::Result<()> {
         }),
     )
 }
+
+/// A small set of real tldr-style pages for the command search.
+///
+/// command_search deliberately leaves indexing and caching to the shell — the
+/// scoring is what it ports. So this ships a handful of genuine summaries
+/// rather than a fake index: enough for the scorer to be exercised against real
+/// wording, and honest about being a subset.
+///
+/// `on_path` is CHECKED, not assumed. The field exists so an uninstalled
+/// command ranks below an installed one, and hardcoding `true` would make the
+/// search confidently recommend something the machine cannot run — which is
+/// worse than not suggesting it, because the user tries it first.
+fn default_command_docs() -> Vec<voiceterm_egui::command_search::CommandDoc> {
+    fn on_path(name: &str) -> bool {
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+            .unwrap_or(false)
+    }
+    let mk = |name: &str, summary: &str, examples: &[&str]| {
+        voiceterm_egui::command_search::CommandDoc {
+            name: name.to_string(),
+            summary: summary.to_string(),
+            examples: examples.iter().map(|s| s.to_string()).collect(),
+            on_path: on_path(name),
+        }
+    };
+    vec![
+        mk("rm", "remove files or directories",
+           &["rm file.txt", "rm -r old_logs", "rm -f stale"]),
+        mk("find", "search for files in a directory hierarchy",
+           &["find . -name '*.log'", "find . -mtime +30 -delete"]),
+        mk("grep", "search text for a pattern",
+           &["grep -r pattern .", "grep -n error log.txt"]),
+        mk("ls", "list directory contents",
+           &["ls -la", "ls -lh /var/log"]),
+        mk("du", "estimate file space usage",
+           &["du -sh *", "du -h --max-depth=1"]),
+        mk("df", "report file system disk space usage", &["df -h"]),
+        mk("tar", "archive files",
+           &["tar czf out.tar.gz dir", "tar xzf in.tar.gz"]),
+        mk("git", "the stupid content tracker",
+           &["git status", "git log --oneline", "git diff"]),
+        mk("ps", "report running processes", &["ps aux", "ps -ef"]),
+        mk("kill", "send a signal to a process", &["kill -9 1234"]),
+        mk("cp", "copy files and directories", &["cp a b", "cp -r dir dest"]),
+        mk("mv", "move or rename files", &["mv old new"]),
+        mk("cat", "concatenate and print files", &["cat file.txt"]),
+        mk("less", "page through a file", &["less log.txt"]),
+        mk("chmod", "change file mode bits", &["chmod +x script.sh"]),
+    ]
+}
+
