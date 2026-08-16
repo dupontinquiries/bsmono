@@ -12,6 +12,7 @@
 //! something that runs, or `None` if this build does not know the kind.
 
 pub mod analysis;
+pub mod playrate;
 pub mod saturation;
 pub mod multiband;
 pub mod imager;
@@ -443,6 +444,10 @@ pub enum Instance {
     Transform(Transform),
     Color(Color),
     Retime(Retime),
+    /// The trap pair — see `playrate`'s module docs for why they carry
+    /// their own per-channel buffers inside a per-sample interface.
+    TapeStop(playrate::TapeStop),
+    Halftime(playrate::Halftime),
 }
 
 impl Instance {
@@ -460,6 +465,8 @@ impl Instance {
             Instance::Multiband(m) => m.process(x),
             Instance::Saturator(s) => s.process(x),
             Instance::Gain(db) => x * from_db_pub(*db),
+            Instance::TapeStop(t) => t.process(x),
+            Instance::Halftime(h) => h.process(x),
             Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => x,
         }
     }
@@ -556,6 +563,14 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
             opacity: p(q, "opacity", 1.0),
             crop: (p(q, "crop_l", 0.0), p(q, "crop_t", 0.0), p(q, "crop_r", 0.0), p(q, "crop_b", 0.0)),
         }),
+        // The playrate pair. `channels` defaults to 2 because that is what
+        // mixdown feeds (L then R into one instance); a mono caller says so.
+        "tapestop" => Instance::TapeStop(playrate::TapeStop::new(
+            rate, p(q, "start", 0.0), p(q, "length", 1.0),
+            p(q, "channels", 2.0).max(1.0) as usize)),
+        "halftime" => Instance::Halftime(playrate::Halftime::new(
+            rate, p(q, "window", 0.5),
+            p(q, "channels", 2.0).max(1.0) as usize)),
         "color" => Instance::Color(Color {
             lift: [p(q, "lift_r", 0.0), p(q, "lift_g", 0.0), p(q, "lift_b", 0.0)],
             gamma: [p(q, "gamma_r", 1.0), p(q, "gamma_g", 1.0), p(q, "gamma_b", 1.0)],
@@ -901,5 +916,39 @@ mod tests {
         let effect = studio_core::Effect { kind: "gain".into(), params: Default::default(), enabled: true };
         let mut inst = instantiate(&effect, RATE).unwrap();
         assert_eq!(inst.process_audio(0.37), 0.37);
+    }
+}
+
+#[cfg(test)]
+mod playrate_registry_tests {
+    use super::*;
+
+    fn fx(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
+        studio_core::Effect {
+            kind: kind.into(),
+            params: params.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn tapestop_and_halftime_are_reachable_from_a_project_chain() {
+        // DSP that instantiate() does not know is DSP no bus, clip, or UI
+        // can ever use — the state these two were in until now.
+        let mut ts = instantiate(&fx("tapestop", &[("start", 0.0), ("length", 0.25)]), 48_000.0)
+            .expect("tapestop instantiates");
+        let mut ht = instantiate(&fx("halftime", &[("window", 0.25)]), 48_000.0)
+            .expect("halftime instantiates");
+        // And they are AUDIO effects in the dispatch, not passthroughs: a
+        // constant fed through a completed tape stop comes out silent.
+        let out: Vec<f32> = (0..2 * 24_000).map(|_| ts.process_audio(0.8)).collect();
+        assert!(out[2 * 20_000..].iter().all(|s| *s == 0.0), "tapestop stopped the tape");
+        // Halftime's first window is a wire (nothing to replay yet), so
+        // check it is at least wired to the audio path by feeding a ramp
+        // and seeing the second window differ from the input.
+        let input: Vec<f32> = (0..2 * 48_000).map(|i| (i / 2) as f32 / 48_000.0).collect();
+        let out: Vec<f32> = input.iter().map(|&s| ht.process_audio(s)).collect();
+        assert_ne!(&out[2 * 24_000..2 * 30_000], &input[2 * 24_000..2 * 30_000],
+                   "the second window is replayed, not passed through");
     }
 }

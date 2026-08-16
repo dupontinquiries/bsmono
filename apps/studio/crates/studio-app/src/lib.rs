@@ -16,6 +16,7 @@ use studio_egui::touch::{Panel, ViewMode};
 use studio_live::transport::Transport;
 
 pub mod audition;
+pub mod library;
 pub mod mixer_panel;
 pub mod rack_panel;
 
@@ -82,6 +83,8 @@ pub struct Studio {
     /// A fader mid-drag: (track, previewed value). Local by design — one
     /// `SetTrackGain` op lands when the drag ends.
     pub mixer_drag: Option<(studio_core::TrackId, f32)>,
+    /// The bus faders' twin of `mixer_drag`.
+    pub bus_drag: Option<(studio_core::BusId, f32)>,
     /// Which edge an ambiguous timeline grab prefers; `alt-;` flips it.
     pub trim_side: studio_egui::TrimSide,
     /// Set by the panel's bounce button; the shell performs it.
@@ -117,6 +120,7 @@ impl Studio {
             arrangement_dirty: true,
             solo: Vec::new(),
             mixer_drag: None,
+            bus_drag: None,
             trim_side: studio_egui::TrimSide::default(),
             pending_bounce: false,
         }
@@ -540,8 +544,15 @@ impl Studio {
         sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
         dir: &std::path::Path,
         format: ExportFormat,
+        rate: u32,
     ) -> Result<std::path::PathBuf, String> {
-        let samples = self.render_arrangement(48_000, sources);
+        // Opus is a 48k codec by contract (studio-media refuses anything
+        // else, loudly); WAV renders at whatever was asked — mixdown is
+        // rate-parametric end to end, and since the source-rate fix it
+        // resamples sources correctly at ANY render rate rather than only
+        // happening to be right at 48k.
+        let rate = match format { ExportFormat::Opus => 48_000, ExportFormat::Wav => rate };
+        let samples = self.render_arrangement(rate, sources);
         if samples.is_empty() {
             self.status = "export refused: the arrangement is empty".into();
             return Err(self.status.clone());
@@ -551,11 +562,19 @@ impl Studio {
             .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
             .collect();
         let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let path = dir.join(format!("{name}-{stamp}.{}", format.ext()));
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        // Milliseconds, AND an exists check: second-granularity stamps let
+        // two exports in one second silently overwrite each other — found
+        // when the 48k and 96k test exports turned out to be one file.
+        let mut path = dir.join(format!("{name}-{stamp}.{}", format.ext()));
+        let mut n = 1u32;
+        while path.exists() {
+            path = dir.join(format!("{name}-{stamp}-{n}.{}", format.ext()));
+            n += 1;
+        }
         match format {
             ExportFormat::Wav => {
-                studio_audio::export::export_wav_dithered(&samples, 2, 48_000, stamp, &path)
+                studio_audio::export::export_wav_dithered(&samples, 2, rate, stamp, &path)
                     .map_err(|e| format!("wav write: {e}"))?;
             }
             ExportFormat::Opus => {
@@ -566,7 +585,7 @@ impl Studio {
                     planes[0].push(fr[0]);
                     planes[1].push(fr[1]);
                 }
-                let audio = studio_audio::SourceAudio { sample_rate: 48_000, channels: planes };
+                let audio = studio_audio::SourceAudio { sample_rate: rate, channels: planes };
                 let bytes = studio_media::encode_opus(&audio, 128_000)
                     .map_err(|e| e.to_string())?;
                 std::fs::write(&path, bytes).map_err(|e| format!("write {path:?}: {e}"))?;
@@ -837,6 +856,13 @@ pub struct App {
     carrier: Option<studio_collab::stream::StreamPeer>,
     /// Where Ctrl+S writes: STUDIO_PROJECT if set, else ./project.studio.
     project_path: std::path::PathBuf,
+    /// The sound library root and its scan — rescanned only on demand (the
+    /// refresh button), not per frame: a directory walk per frame on a
+    /// phone's flash is how battery dies.
+    library_root: std::path::PathBuf,
+    library: Vec<library::LibraryEntry>,
+    library_open: bool,
+    export_rate: u32,
     /// What the sink's buffer currently holds, so a mode switch (loop ↔
     /// arrangement) knows to reload even when nothing is dirty.
     loaded: SinkContent,
@@ -887,8 +913,14 @@ impl Default for App {
         } else {
             None
         };
+        let library_root = std::env::var("STUDIO_LIBRARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "library".into());
+        let library = library::scan(&library_root);
         App { studio, peaks: Default::default(), audio: Default::default(), sink,
-              carrier, project_path, loaded: SinkContent::Nothing }
+              carrier, project_path, library_root, library, library_open: true,
+              export_rate: 48_000,
+              loaded: SinkContent::Nothing }
     }
 }
 
@@ -932,13 +964,24 @@ impl eframe::App for App {
                     let path = self.project_path.clone();
                     let _ = self.studio.save_to(&path);
                 }
+                egui::ComboBox::from_id_salt("export-rate")
+                    .selected_text(format!("{} Hz", self.export_rate))
+                    .width(84.0)
+                    .show_ui(ui, |ui| {
+                        for r in [44_100u32, 48_000, 96_000, 192_000] {
+                            ui.selectable_value(&mut self.export_rate, r, format!("{r} Hz"));
+                        }
+                    });
                 if ui.button("export wav").clicked() {
                     let _ = self.studio.export_arrangement(
-                        &self.audio, std::path::Path::new("exports"), ExportFormat::Wav);
+                        &self.audio, std::path::Path::new("exports"),
+                        ExportFormat::Wav, self.export_rate);
                 }
-                if ui.button("export opus").clicked() {
+                if ui.button("export opus").on_hover_text("always 48000 Hz — the codec's contract")
+                    .clicked() {
                     let _ = self.studio.export_arrangement(
-                        &self.audio, std::path::Path::new("exports"), ExportFormat::Opus);
+                        &self.audio, std::path::Path::new("exports"),
+                        ExportFormat::Opus, self.export_rate);
                 }
             });
         });
@@ -1137,6 +1180,53 @@ impl eframe::App for App {
             // The playhead column is a read recomputed each frame (grid's own
             // rule), so the frames have to keep coming while anything runs.
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
+        let mut lib_action = None;
+        if self.library_open {
+            egui::SidePanel::left("library").default_width(210.0).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button("⟳").on_hover_text("rescan").clicked() {
+                        self.library = library::scan(&self.library_root);
+                    }
+                    if ui.small_button("hide").clicked() {
+                        self.library_open = false;
+                    }
+                });
+                lib_action = library::show(ui, &self.library_root, &self.library, &colors);
+            });
+        }
+        if let Some(action) = lib_action {
+            // The sidebar's two buttons are the two import doors drops
+            // already use, minus the panel-guessing: the button says which.
+            let (path, to_rack) = match action {
+                library::LibraryAction::ToRack(p) => (p, true),
+                library::LibraryAction::ToTimeline(p) => (p, false),
+            };
+            let name = path.file_stem().and_then(|s| s.to_str())
+                .unwrap_or("sample").to_owned();
+            match std::fs::read(&path) {
+                Ok(raw) => {
+                    let hint = path.extension().and_then(|e| e.to_str());
+                    match studio_media::decode_bytes(raw.clone(), hint) {
+                        Ok(audio) => {
+                            let label = path.display().to_string();
+                            let id = if to_rack {
+                                Some(self.studio.import_audio(&name, &label, &audio))
+                            } else {
+                                self.studio.import_clip(&name, &label, &audio)
+                            };
+                            if let Some(id) = id {
+                                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                                self.audio.insert(id, audio);
+                                self.studio.register_asset(id, &raw);
+                            }
+                        }
+                        Err(e) => self.studio.status = format!("'{name}' failed: {e}"),
+                    }
+                }
+                Err(e) => self.studio.status = format!("read {}: {e}", path.display()),
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1453,7 +1543,7 @@ mod export_tests {
         let expect_frames = s.render_arrangement(48_000, &sources).len() / 2;
 
         for fmt in [ExportFormat::Wav, ExportFormat::Opus] {
-            let path = s.export_arrangement(&sources, &dir, fmt).expect("exports");
+            let path = s.export_arrangement(&sources, &dir, fmt, 48_000).expect("exports");
             assert!(s.status.contains("exported"), "status names it: {:?}", s.status);
             let back = studio_media::decode_file(&path).expect("our decoder reads it");
             assert_eq!(back.channels.len(), 2, "{fmt:?} kept stereo");
@@ -1472,8 +1562,8 @@ mod export_tests {
         // check: opus at 128k must land well under half the 16-bit WAV.
         let (mut s, sources) = bounced_studio();
         let dir = std::env::temp_dir().join("studio-export-size");
-        let wav = s.export_arrangement(&sources, &dir, ExportFormat::Wav).unwrap();
-        let opus = s.export_arrangement(&sources, &dir, ExportFormat::Opus).unwrap();
+        let wav = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 48_000).unwrap();
+        let opus = s.export_arrangement(&sources, &dir, ExportFormat::Opus, 48_000).unwrap();
         let (w, o) = (std::fs::metadata(&wav).unwrap().len(),
                       std::fs::metadata(&opus).unwrap().len());
         assert!(o * 2 < w, "opus {o} bytes vs wav {w} bytes");
@@ -1484,7 +1574,7 @@ mod export_tests {
         let p = Project { name: "empty".into(), ..Default::default() };
         let mut s = Studio::new(p, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]));
         let err = s.export_arrangement(&Default::default(),
-                                       &std::env::temp_dir(), ExportFormat::Wav);
+                                       &std::env::temp_dir(), ExportFormat::Wav, 48_000);
         assert!(err.is_err());
         assert!(s.status.contains("refused"), "status was {:?}", s.status);
     }
@@ -1999,5 +2089,85 @@ mod trim_shell_tests {
         s.key(Key::c('u'));
         s.key(Key::c('u'));
         assert_eq!(s.session.doc.project.clips[&id], clip, "two undos, whole gesture back");
+    }
+}
+
+#[cfg(test)]
+mod bus_routing_tests {
+    use super::*;
+
+    #[test]
+    fn the_drum_bus_shape_track_into_saturated_bus_into_master() {
+        // The user-facing claim behind the Mixer's bus section, at the op
+        // level the UI drives: route a track into a bus carrying tape
+        // saturation, and the render CHANGES; mute the bus, and everything
+        // through it is gone.
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let track = s.session.doc.project.clips.values()
+            .find(|c| c.source == id).unwrap().track;
+
+        let dry = s.render_arrangement(48_000, &sources);
+
+        let bus = studio_core::BusId(1);
+        s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
+            id: bus, name: "Drums".into(), parent: None, gain: 1.0,
+            chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+        s.edit(studio_core::Op::SetRoute { track, bus: Some(bus) }, "routed");
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("profile".to_string(), 1.0); // tape
+        params.insert("drive".to_string(), 0.8);
+        s.edit(studio_core::Op::SetBusChain { id: bus, chain: vec![
+            studio_core::Effect { kind: "saturation".into(), params, enabled: true }
+        ] }, "chain");
+
+        let wet = s.render_arrangement(48_000, &sources);
+        assert_eq!(dry.len(), wet.len());
+        let diff: f32 = dry.iter().zip(&wet).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1.0, "the bus chain shaped the sound (diff {diff})");
+        let wet_e: f32 = wet[..9600].iter().map(|v| v.abs()).sum();
+        assert!(wet_e > 5.0, "and the drums still come through it ({wet_e})");
+
+        s.edit(studio_core::Op::SetBusFlags { id: bus, muted: true }, "bus muted");
+        let muted = s.render_arrangement(48_000, &sources);
+        let muted_e: f32 = muted[..9600].iter().map(|v| v.abs()).sum();
+        assert!(muted_e < wet_e * 0.02,
+                "a muted bus takes its whole tree out of the mix ({muted_e})");
+        // Four ops, four undos, and the dry render comes back exactly.
+        for _ in 0..4 { s.key(studio_egui::keys::Key::c('u')); }
+        assert_eq!(s.render_arrangement(48_000, &sources), dry,
+                   "the whole routing story is undoable");
+    }
+}
+
+#[cfg(test)]
+mod export_rate_tests {
+    use super::*;
+
+    #[test]
+    fn a_96k_wav_export_is_the_same_music_at_twice_the_frames() {
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let dir = std::env::temp_dir().join("studio-export-rate");
+        let p48 = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 48_000).unwrap();
+        let p96 = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 96_000).unwrap();
+        let a = studio_media::decode_file(&p48).unwrap();
+        let b = studio_media::decode_file(&p96).unwrap();
+        assert_eq!(a.sample_rate, 48_000);
+        assert_eq!(b.sample_rate, 96_000);
+        let ratio = b.frames() as f64 / a.frames() as f64;
+        assert!((ratio - 2.0).abs() < 0.01, "same duration, double the frames ({ratio})");
+        // Same music: the bounced 48k source is resampled INTO the 96k
+        // render (the mixdown source-rate fix), not pitch-shifted.
+        let e = |x: &studio_audio::SourceAudio, upto: f64|
+            x.channels[0][..(x.sample_rate as f64 * upto) as usize]
+                .iter().map(|v| v.abs()).sum::<f32>() / x.sample_rate as f32;
+        let (ea, eb) = (e(&a, 0.2), e(&b, 0.2));
+        assert!((ea - eb).abs() < ea * 0.1,
+                "the first 200ms carry the same energy per second: {ea} vs {eb}");
     }
 }

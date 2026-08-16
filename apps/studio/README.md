@@ -198,6 +198,29 @@ core has `History::apply_group`, the shell's op-log undo has no grouping
 yet), and the Program panel, which says so on screen instead of showing
 nothing.
 
+**Toward the full studio shape.** mixdown had the sampler's old chipmunk
+bug hiding one layer up — sources were indexed at the RENDER rate, so a
+44.1k file on the timeline played ~9% sharp; fixed with the same
+fractional-position interpolation, pinned by a 24k-ramp test, which is
+what makes render rates a real parameter: WAV exports at 44.1/48/96/192
+(a 96k export is the same music at twice the frames, tested), Opus stays
+48k by codec contract. The Mixer shows the BUS half the model always had:
+create busses, route tracks (SetRoute), per-bus gain/mute, and effect
+chains built from the studio-fx registry (saturation/eq/compressor/
+limiter/color) — the track→saturated-drum-bus→master shape is one test,
+including its four-op undo. A library sidebar (STUDIO_LIBRARY, default
+./library; two-level scan, audio-only, sorted) offers every sample the
+two doors drops already had: rack channel or timeline clip. Tape stop and halftime are native effects now
+(`studio-fx::playrate`) and addable from any bus chain. Named, not built,
+from the same wishlist: bus SENDS in the UI (the model has them),
+clip-level chain editing, surround/downmix formats (mixdown is stereo
+end-to-end today), 
+audition-on-click (needs a live one-shot voice over the sink), a playing
+mode for keys (same dependency), Wooting analog input, and VST/CLAP
+hosting — studio-fx::retune is the native autotune seed; for external
+FOSS instruments (Surge XT, Dexed, sfizz + Salamander for piano) a plugin
+host is its own project.
+
 ## Realtime collaboration, concretely
 
 `Doc` is one replica. A local edit is stamped `(lamport, site)`, applied
