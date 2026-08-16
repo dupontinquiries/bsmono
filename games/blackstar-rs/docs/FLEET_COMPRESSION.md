@@ -191,3 +191,48 @@ right long-term direction and the wrong next step.
 1, 2 and 4 together are ~110 MB with no behaviour change, which lands the bundle
 around 410 MB. Item 3 alone would take it under 350 MB but is a judgement about
 whether the C engine is still live, which is not mine to make.
+
+## The C engine already folds — and what that tells us about joints
+
+`game.c:545` has a SINGLE-MODEL FOLD that does exactly what runtime synthesis
+would need: it rotates each `_partN` about a hinge, with the pivot from the
+part's offset from its group centre and the axis from `model_analysis.h`. Its
+own comment is worth keeping:
+
+> That needs no vertex access and no shader change: separate ex_model_t's each
+> take their own rotation, and the parts are already on disk.
+
+It also eases (`t*t*(3-2t)`, because "a linear blend reads as a slideshow rather
+than a mechanism") and staggers parts by slot, "which is what makes a fold look
+like an explosion" if you don't.
+
+So the C side is AHEAD of the Rust side conceptually: it folds by rotation,
+where `xform::Morph` lerps vertices.
+
+### But the fleet's joints are not yet the input it needs
+
+Every fleet chassis ships `joints.json` with pivot, axis, angle and parent — 220
+files, 88,641 joints. Measured across all of them:
+
+```
+joints with a non-zero angle:  4,732 of 88,641   (5.3%)
+pyrachnid specifically:           13 of 474
+```
+
+The hinge STRUCTURE was detected — 402 distinct axes on one chassis — but the
+rotation ANGLES are almost all zero. The generator found where the joints are
+and not how far each one turns.
+
+That is why the poses deviate 63% from an endpoint lerp and cannot be rebuilt:
+the information that would rebuild them is exactly the 95% of angles that are
+zero. `joints.json` is a skeleton without a pose.
+
+### Consequence for storage
+
+Runtime synthesis is blocked on the GENERATOR, not on either engine. Both
+engines could consume angles today — the C one already does, for its 38
+hand-split models. What is missing is a foldview pass that solves for the angle
+of each joint by fitting f00 to f04, and that is upstream of this repo.
+
+Until then the intermediate poses ARE the angle data, in the least compact
+possible form, and they have to be stored.
