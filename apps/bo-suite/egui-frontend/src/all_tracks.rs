@@ -199,6 +199,7 @@ impl AllTracksPage {
 
 /// Draw the page.
 pub fn all_tracks_ui(ui: &mut egui::Ui, p: &mut AllTracksPage,
+                     kin: &mut crate::scrollfeel::KineticScroll,
                      c: &uikit_egui::PaletteColors) -> Option<TracksAction> {
     let mut act = None;
     ui.horizontal(|ui| {
@@ -221,32 +222,73 @@ pub fn all_tracks_ui(ui: &mut egui::Ui, p: &mut AllTracksPage,
     }
 
     let rows: Vec<Track> = p.tracks().to_vec();
-    egui::ScrollArea::vertical().id_salt("all_tracks").show(ui, |ui| {
-        for t in &rows {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    if ui.add(egui::Button::new(t.title_text()).frame(false)).clicked() {
-                        act = Some(TracksAction::Play(t.id));
-                    }
-                    ui.colored_label(c.text_weak,
-                        egui::RichText::new(t.artist_text()).small());
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("+").on_hover_text("Add to queue").clicked() {
-                        act = Some(TracksAction::Enqueue(t.id));
-                    }
-                });
+
+    // The kinetic list: scrollfeel's four values driving a fixed-row window.
+    // A music library is the one genuinely large list in this app, so only
+    // visible rows are built — paging in the model, windowing in the view.
+    // egui's own ScrollArea has its fling feel hardcoded; this list is where
+    // the QML's tuning (coast far, no press delay, one clean rebound, flick
+    // stops at the edge) actually applies.
+    const ROW_H: f32 = 44.0;
+    const FOOTER_H: f32 = 28.0;
+    let avail = ui.available_rect_before_wrap();
+    let viewport = avail.height().max(1.0);
+    let content_h = rows.len() as f32 * ROW_H + FOOTER_H;
+    let limit = (content_h - viewport).max(0.0);
+
+    let resp = ui.allocate_rect(avail, egui::Sense::drag());
+    if resp.dragged() {
+        kin.dragging(resp.drag_delta().y, limit, viewport);
+    }
+    if resp.drag_stopped() {
+        kin.release(ui.input(|i| i.pointer.velocity()).y, limit);
+    }
+    if kin.tick(ui.input(|i| i.stable_dt).min(0.05), limit) {
+        ui.ctx().request_repaint();
+    }
+    let off = kin.clamped(limit, viewport);
+
+    let first = (off / ROW_H).floor().max(0.0) as usize;
+    let last = (((off + viewport) / ROW_H).ceil() as usize).min(rows.len());
+    for (i, t) in rows.iter().enumerate().take(last).skip(first) {
+        let r = egui::Rect::from_min_size(
+            egui::pos2(avail.left(), avail.top() - off + i as f32 * ROW_H),
+            egui::vec2(avail.width(), ROW_H),
+        );
+        let mut row = ui.new_child(egui::UiBuilder::new().max_rect(r));
+        row.set_clip_rect(avail);
+        row.horizontal(|ui| {
+            ui.vertical(|ui| {
+                if ui.add(egui::Button::new(t.title_text()).frame(false)).clicked() {
+                    act = Some(TracksAction::Play(t.id));
+                }
+                ui.colored_label(c.text_weak,
+                    egui::RichText::new(t.artist_text()).small());
             });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("+").on_hover_text("Add to queue").clicked() {
+                    act = Some(TracksAction::Enqueue(t.id));
+                }
+            });
+        });
+    }
+
+    // Ask ahead of the visible edge rather than on a scroll fraction: the
+    // fraction is meaningless while the list is still growing.
+    if !p.complete() {
+        if !rows.is_empty() {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(avail.left(), avail.top() - off + rows.len() as f32 * ROW_H),
+                egui::vec2(avail.width(), FOOTER_H),
+            );
+            let mut foot = ui.new_child(egui::UiBuilder::new().max_rect(r));
+            foot.set_clip_rect(avail);
+            foot.colored_label(c.text_weak, if p.loading() { "Loading…" } else { "" });
         }
-        // Asking at the bottom of what is drawn, rather than on a scroll
-        // fraction: the fraction is meaningless while the list is still growing.
-        if !p.complete() {
-            ui.colored_label(c.text_weak, if p.loading() { "Loading…" } else { "" });
-            if !p.loading() {
-                if let Some(a) = p.load_more() { act = Some(a); }
-            }
+        if !p.loading() && last + PAGE_SIZE / 2 >= rows.len() {
+            if let Some(a) = p.load_more() { act = Some(a); }
         }
-    });
+    }
     act
 }
 

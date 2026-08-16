@@ -69,9 +69,114 @@ pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundsca
 /// a six-page swipe with three more pages inside it is a maze — but the pages,
 /// their modes and their detail drill-downs are the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibraryTab { Tracks, Albums, Artists, Tags }
+pub enum LibraryTab { Tracks, AllTracks, Albums, Artists, Tags }
 
 /// Move the view index by a swipe sign, clamped to the ends.
+/// Paint a product silhouette badge: thin strokes (the module pins 1.0–1.2px),
+/// an opacity reveal, and the accent halo blooming behind a change.
+fn silhouette_paint(ui: &Ui, s: &crate::product_silhouette::ProductSilhouette,
+                    rect: egui::Rect, c: &PaletteColors) {
+    use crate::product_silhouette::Shape;
+    let p = ui.painter().with_clip_rect(rect);
+    let a = (s.reveal() * 255.0) as u8;
+    let line = egui::Color32::from_rgba_unmultiplied(
+        c.text.r(), c.text.g(), c.text.b(), a);
+    if s.halo() > 0.0 {
+        let ha = (s.halo() * 90.0) as u8;
+        p.circle_filled(rect.center(), rect.width() * 0.62,
+            egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), ha));
+    }
+    let strokes = s.shape().strokes();
+    let (w0, w1) = (strokes[0], strokes.get(1).copied().unwrap_or(strokes[0]));
+    let cx = rect.center();
+    match s.shape() {
+        Shape::Disc => {
+            p.circle_stroke(cx, rect.width() * 0.38, egui::Stroke::new(w0, line));
+            p.circle_stroke(cx, rect.width() * 0.16, egui::Stroke::new(w1, line));
+        }
+        Shape::Bar => {
+            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.82, rect.height() * 0.3));
+            p.rect_stroke(r, 4.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
+            p.line_segment([r.left_center() + egui::vec2(3.0, 0.0), r.right_center() - egui::vec2(3.0, 0.0)],
+                egui::Stroke::new(w1, line));
+        }
+        Shape::Tower => {
+            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.34, rect.height() * 0.84));
+            p.rect_stroke(r, 3.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
+            p.line_segment([r.center_top() + egui::vec2(0.0, 4.0), r.center_bottom() - egui::vec2(0.0, 4.0)],
+                egui::Stroke::new(w1, line));
+        }
+        Shape::Cube => {
+            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.6, rect.height() * 0.6));
+            p.rect_stroke(r, 3.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
+            p.circle_stroke(cx, rect.width() * 0.14, egui::Stroke::new(w1, line));
+        }
+    }
+}
+
+/// Paint the dial watermark: a dashed circle, upper-left half only (the 45°
+/// cut through the midpoint), dash phase advancing at the module's pace. No
+/// blur here — egui's painter has none, and the module's opacity already
+/// degraded for that (`set_blur_available(false)`), which is the QML's own
+/// "still shows un-blurred so nothing breaks" rule.
+fn watermark_paint(ui: &Ui, wm: &crate::dial_watermark::DialWatermark,
+                   center: egui::Pos2, radius: f32, c: &PaletteColors) {
+    use crate::dial_watermark::DASH_MODULO;
+    let alpha = (wm.opacity() * 255.0).clamp(0.0, 255.0) as u8;
+    let col = egui::Color32::from_rgba_unmultiplied(c.text_weak.r(), c.text_weak.g(), c.text_weak.b(), alpha);
+    let stroke = egui::Stroke::new(1.1, col);
+    let p = ui.painter();
+    let circumference = 2.0 * std::f32::consts::PI * radius;
+    let step_px = 2.0;
+    let dash_px = DASH_MODULO * 0.55; // dash : gap within the 18px pattern
+    let (w, h) = (radius * 2.0, radius * 2.0);
+    let mut s = 0.0f32;
+    let mut run: Vec<egui::Pos2> = Vec::new();
+    while s < circumference {
+        let ang = s / radius;
+        let pt = center + egui::vec2(ang.cos() * radius, ang.sin() * radius);
+        let local = pt - (center - egui::vec2(radius, radius));
+        let on_dash = ((s + wm.dash_offset()) % DASH_MODULO) < dash_px;
+        let in_cut = wm.in_cut(local.x, local.y, w, h);
+        if on_dash && in_cut {
+            run.push(pt);
+        } else if run.len() > 1 {
+            p.add(egui::Shape::line(std::mem::take(&mut run), stroke));
+        } else {
+            run.clear();
+        }
+        s += step_px;
+    }
+    if run.len() > 1 { p.add(egui::Shape::line(run, stroke)); }
+}
+
+/// One page of the catalogue, in the All-tracks channel shape.
+///
+/// The adapter between `catalog_source` (the host data contract) and
+/// `all_tracks` (the paged window): sorted by the backend via `Sort::tag`,
+/// context stamped so the page's own channel guard applies, primary artist
+/// reduced the way the Qt delegate does.
+pub fn page_from_source(
+    src: &dyn crate::catalog_source::CatalogSource,
+    offset: usize,
+    sort: crate::all_tracks::Sort,
+) -> crate::all_tracks::PageResult {
+    let rows = src.page(offset as i64, crate::all_tracks::PAGE_SIZE as i64, sort.tag());
+    crate::all_tracks::PageResult {
+        context: "all_tracks".into(),
+        offset,
+        total: src.total().max(0) as usize,
+        tracks: rows
+            .into_iter()
+            .map(|t| crate::all_tracks::Track {
+                id: t.id,
+                title: t.title,
+                primary_artist: t.artists.first().cloned().unwrap_or_default(),
+            })
+            .collect(),
+    }
+}
+
 pub fn page(idx: usize, sign: i32, n: usize) -> usize {
     (idx as i32 + sign).clamp(0, n as i32 - 1) as usize
 }
@@ -103,8 +208,19 @@ pub struct Controller {
     /// supplies them, which is why `Browse::loaded` exists: an unread library
     /// and an empty one are not the same message.
     pub browse_tracks: Vec<crate::browse::BrowseTrack>,
-    /// Which of the three library surfaces is showing.
+    /// Which of the library surfaces is showing.
     pub library_tab: LibraryTab,
+    /// The whole library, a hundred rows at a time — the Qt AllTracksPage.
+    /// Distinct from `search` (which filters what is here): this is a paged
+    /// WINDOW into a server-side ordering, with the offset guard that makes
+    /// two in-flight requests safe.
+    pub all_tracks: crate::all_tracks::AllTracksPage,
+    /// The flick physics for that list, held across the frames they animate.
+    pub tracks_kinetic: crate::scrollfeel::KineticScroll,
+    /// A page the view asked for and no source has answered. The host either
+    /// calls `answer_tracks_from` with its CatalogSource or builds a
+    /// PageResult itself and calls `supply_tracks`.
+    pub pending_tracks: Option<crate::all_tracks::TracksAction>,
     /// The play queue. When browse was ported, "play all" had nowhere to put
     /// the tracks and reported them instead; this is that somewhere.
     pub queue: crate::queue::Queue,
@@ -112,6 +228,13 @@ pub struct Controller {
     /// The hero volume wheel. Held across frames so a flick keeps coasting
     /// through the redraws it is animating.
     pub dial: crate::dial::VolumeDial,
+    /// The product silhouette peeking from behind the dial: half-cut, soft,
+    /// dashed outline flowing at the pace playback sets.
+    pub watermark: crate::dial_watermark::DialWatermark,
+    /// One badge per device row, keyed by index; recreated when the device
+    /// list changes length. A per-row struct because the halo is per-row
+    /// state — one shared badge would bloom every row on any change.
+    pub silhouettes: Vec<crate::product_silhouette::ProductSilhouette>,
     /// The volume the dial last reported, waiting for the host to debounce and
     /// push. `None` once it has been sent.
     pub pending_volume: Option<f32>,
@@ -189,9 +312,14 @@ impl Controller {
             browse: Default::default(),
             browse_tracks: Vec::new(),
             library_tab: LibraryTab::Tracks,
+            all_tracks: crate::all_tracks::AllTracksPage::default(),
+            tracks_kinetic: crate::scrollfeel::KineticScroll::default(),
+            pending_tracks: None,
             queue: Default::default(),
             now_playing: Default::default(),
             dial: crate::dial::VolumeDial::new(0.0),
+            watermark: crate::dial_watermark::DialWatermark::default(),
+            silhouettes: Vec::new(),
             pending_volume: None,
             tags: Vec::new(),
             tag_editor: Default::default(),
@@ -256,6 +384,54 @@ impl Controller {
     }
 
     /// Render the controller.
+    /// Handle an action from the All-tracks page.
+    ///
+    /// Play and Enqueue resolve here — the row is on screen, so its title and
+    /// artist are too. Load is the one thing the view cannot do (the catalogue
+    /// lives with the host), so it is stashed like `pending_volume` is.
+    pub fn tracks_action(&mut self, act: crate::all_tracks::TracksAction) {
+        use crate::all_tracks::TracksAction;
+        match act {
+            TracksAction::Load { .. } => self.pending_tracks = Some(act),
+            TracksAction::Play(id) => {
+                if let Some(t) = self.all_tracks.tracks().iter().find(|t| t.id == id) {
+                    self.now.title = t.title_text();
+                    self.now.artist = t.artist_text();
+                    self.transport.title = t.title_text();
+                    self.transport.artist = t.artist_text();
+                    self.transport.playing = true;
+                }
+            }
+            TracksAction::Enqueue(id) => {
+                if let Some(t) = self.all_tracks.tracks().iter().find(|t| t.id == id) {
+                    let (title, artist) = (t.title_text(), t.artist_text());
+                    if let Some(note) = self.queue.add(id, &title, &artist) {
+                        self.toast.show(note);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Accept a page the host fetched. Forwards to the page's own guard —
+    /// a mismatched offset is discarded there, not here.
+    pub fn supply_tracks(&mut self, p: &crate::all_tracks::PageResult) -> bool {
+        self.pending_tracks = None;
+        self.all_tracks.accept(p)
+    }
+
+    /// Answer any pending load from a `CatalogSource` — the adapter that
+    /// composes the two library modules while keeping them ignorant of each
+    /// other: `all_tracks` owns the window and its guards, `catalog_source`
+    /// owns the channel contract. A host with an in-process source calls this
+    /// once per frame; a host with an async one uses `supply_tracks`.
+    pub fn answer_tracks_from(&mut self, src: &dyn crate::catalog_source::CatalogSource) {
+        if let Some(crate::all_tracks::TracksAction::Load { offset }) = self.pending_tracks {
+            let page = page_from_source(src, offset, self.all_tracks.sort());
+            self.supply_tracks(&page);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
         let colors = uikit_egui::palette_colors(&self.palette);
         self.a11y.begin_frame();
@@ -362,8 +538,21 @@ impl Controller {
         ui.heading("Devices");
         // collect edits to avoid borrow issues while iterating
         let mut vol_edits: Vec<(usize, i32)> = Vec::new();
+        // A badge per row. The shape is parsed from the device name each
+        // frame; set_shape only blooms the halo when it actually changed, so a
+        // list refresh cannot flash every badge — the module's own guard.
+        self.silhouettes.resize_with(self.devices.len(),
+            crate::product_silhouette::ProductSilhouette::default);
+        let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
         for (i, d) in self.devices.iter_mut().enumerate() {
             ui.horizontal(|ui| {
+                let s = &mut self.silhouettes[i];
+                s.set_shape(crate::product_silhouette::Shape::parse(
+                    &d.name.to_lowercase().split_whitespace().last().unwrap_or_default()));
+                s.tick(dt_ms);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+                silhouette_paint(ui, s, rect, c);
+                if s.reveal() < 1.0 || s.halo() > 0.0 { ui.ctx().request_repaint(); }
                 ui.colored_label(c.text, &d.name);
                 let mut v = d.volume as i32;
                 if ui.add(egui::Slider::new(&mut v, 0..=100).text("vol")).changed() {
@@ -540,6 +729,7 @@ impl Controller {
         // you can only leave by one control is where a touch user gets stuck.
         ui.horizontal(|ui| {
             for (tab, label) in [(LibraryTab::Tracks, "Tracks"),
+                                 (LibraryTab::AllTracks, "All tracks"),
                                  (LibraryTab::Albums, "Albums"),
                                  (LibraryTab::Artists, "Artists"),
                                  (LibraryTab::Tags, "Tags")] {
@@ -557,6 +747,14 @@ impl Controller {
                 }
             }
         });
+        if self.library_tab == LibraryTab::AllTracks {
+            if let Some(act) = crate::all_tracks::all_tracks_ui(
+                ui, &mut self.all_tracks, &mut self.tracks_kinetic, c,
+            ) {
+                self.tracks_action(act);
+            }
+            return;
+        }
         if self.library_tab == LibraryTab::Tags {
             // Drilled into a tag, or the grid.
             match self.open_tag {
@@ -712,6 +910,16 @@ impl Controller {
         // The hero control. It reports continuously; the parent debounces
         // before pushing to the device, so a flick sends one command rather
         // than a hundred.
+        // The watermark peeks from behind the dial: activity follows what is
+        // actually playing, and the module maps it to pace, brightness and
+        // (where a platform can blur — egui cannot) sharpness. Painted before
+        // the dial so the dial sits on top.
+        self.watermark.set_blur_available(false);
+        self.watermark.set_activity(
+            if self.transport.playing { (self.dial.value / 100.0).clamp(0.0, 1.0) } else { 0.0 });
+        self.watermark.tick(ui.input(|i| i.stable_dt).min(0.1) * 1000.0);
+        watermark_paint(ui, &self.watermark, ui.cursor().min + egui::vec2(70.0, 70.0), 100.0, c);
+        ui.ctx().request_repaint(); // the stroke lives — it advances every frame
         if let Some(v) = crate::dial::dial_ui(ui, &mut self.dial, 140.0, c) {
             self.pending_volume = Some(v);
         }
@@ -1093,5 +1301,108 @@ mod tests {
         // snappy detent animation → short takeover lock reached the gesture layer
         assert_eq!(c.gesture.config_mut().takeover_lock_ms, 60.0);
         assert_eq!(c.current(), "Devices");
+    }
+
+    // ── all_tracks wiring: the paged window fed through the CatalogSource seam ──
+
+    struct FakeCatalog;
+    impl crate::catalog_source::CatalogSource for FakeCatalog {
+        fn page(&self, offset: i64, limit: i64, sort: &str) -> Vec<crate::catalog_source::CatalogTrack> {
+            (offset..(offset + limit).min(250))
+                .map(|i| crate::catalog_source::CatalogTrack {
+                    id: i,
+                    title: if sort == "artist" { format!("A{i}") } else { format!("T{i}") },
+                    album: None,
+                    artists: vec!["Ada".into()],
+                    tags: vec![],
+                    bpm: None,
+                    key_text: None,
+                })
+                .collect()
+        }
+        fn total(&self) -> i64 { 250 }
+    }
+
+    #[test]
+    fn the_all_tracks_tab_pages_plays_and_enqueues_through_the_controller() {
+        let mut c = Controller::new(vec![], vec![]);
+        // The view's first request, answered by the host's source.
+        let first = c.all_tracks.reload();
+        c.tracks_action(first);
+        assert!(matches!(c.pending_tracks,
+            Some(crate::all_tracks::TracksAction::Load { offset: 0 })));
+        c.answer_tracks_from(&FakeCatalog);
+        assert!(c.pending_tracks.is_none(), "the load was answered");
+        assert_eq!(c.all_tracks.count_text(), "100 of 250");
+
+        // The prefetch appends the next window.
+        let more = c.all_tracks.load_more().expect("not complete yet");
+        c.tracks_action(more);
+        c.answer_tracks_from(&FakeCatalog);
+        assert_eq!(c.all_tracks.tracks().len(), 200);
+
+        // Play resolves from the visible row; the transport picks it up.
+        c.tracks_action(crate::all_tracks::TracksAction::Play(5));
+        assert_eq!(c.transport.title, "T5");
+        assert!(c.transport.playing);
+
+        // Enqueue lands in the queue with the row's text.
+        c.tracks_action(crate::all_tracks::TracksAction::Enqueue(7));
+        assert_eq!(c.queue.entries().len(), 1);
+        assert_eq!(c.queue.entries()[0].title, "T7");
+
+        // A sort change resets to a fresh window in the NEW server ordering —
+        // re-sorting the visible two hundred would be a lie about the rest.
+        let resort = c.all_tracks.set_sort(crate::all_tracks::Sort::Artist).unwrap();
+        c.tracks_action(resort);
+        c.answer_tracks_from(&FakeCatalog);
+        assert_eq!(c.all_tracks.tracks().len(), 100);
+        assert!(c.all_tracks.tracks()[0].title.starts_with('A'));
+    }
+
+    #[test]
+    fn a_stale_page_is_discarded_at_the_controller_boundary() {
+        let mut c = Controller::new(vec![], vec![]);
+        let stale = crate::all_tracks::PageResult {
+            context: "all_tracks".into(), offset: 50, total: 250, tracks: vec![],
+        };
+        assert!(!c.supply_tracks(&stale), "offset 50 into an empty window is a stale reply");
+        assert!(c.all_tracks.tracks().is_empty());
+        assert!(!c.all_tracks.loading(), "the guard cleared loading so the right request can land");
+    }
+
+    // ── silhouette + watermark wiring ──
+
+    #[test]
+    fn device_badges_track_the_list_and_bloom_only_on_real_change() {
+        let mut c = Controller::new(
+            vec![Device { name: "Level bar".into(), volume: 10, playing: false }],
+            vec![],
+        );
+        c.silhouettes.resize_with(c.devices.len(),
+            crate::product_silhouette::ProductSilhouette::default);
+        let s = &mut c.silhouettes[0];
+        // Default is Disc; "bar" is a change → halo blooms.
+        assert!(s.set_shape(crate::product_silhouette::Shape::parse("bar")));
+        s.tick(50.0);
+        assert!(s.halo() > 0.0, "a real change bloomed");
+        // Same shape again — a refresh — must NOT restart the halo.
+        assert!(!s.set_shape(crate::product_silhouette::Shape::parse("bar")));
+    }
+
+    #[test]
+    fn the_watermark_paces_itself_by_what_is_playing() {
+        let mut c = Controller::new(vec![], vec![]);
+        c.watermark.set_blur_available(false);
+        c.transport.playing = false;
+        c.watermark.set_activity(0.0);
+        let quiet = c.watermark.loop_ms();
+        c.transport.playing = true;
+        c.dial.value = 100.0;
+        c.watermark.set_activity(1.0);
+        let active = c.watermark.loop_ms();
+        assert!(active < quiet, "fully active flows faster ({active} < {quiet})");
+        assert!(c.watermark.blur().is_none(), "egui cannot blur; the module degrades");
+        assert!(c.watermark.opacity() > 0.0);
     }
 }

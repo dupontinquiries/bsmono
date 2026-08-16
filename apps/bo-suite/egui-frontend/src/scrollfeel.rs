@@ -89,6 +89,88 @@ pub fn rebound_at(from: f32, to: f32, elapsed: f32) -> f32 {
 /// Is the rebound finished?
 pub fn rebound_done(elapsed: f32) -> bool { elapsed >= REBOUND_SECS }
 
+/// The four values assembled into a scroller a list can hold across frames.
+///
+/// The functions above are the physics; this is the state machine a view
+/// actually needs: track the finger during a drag (allowed past the edge),
+/// glide on release (stopping AT the edge), and settle back with one clean
+/// rebound when released past it. Conventions: `offset` is pixels of content
+/// scrolled off the top, `limit` is `content_height - viewport` (≥ 0),
+/// finger deltas are screen-space (down = positive).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KineticScroll {
+    pub offset: f32,
+    /// Glide velocity in offset px/s. Zero when idle or rebounding.
+    vel: f32,
+    /// A settle in progress: (from, to, elapsed).
+    rebound: Option<(f32, f32, f32)>,
+}
+
+impl KineticScroll {
+    /// The finger moved `dy` screen pixels while down. Content follows the
+    /// finger — no press delay is the point (`pressDelay 0`) — and may pass
+    /// the edge by the drag slack.
+    pub fn dragging(&mut self, dy: f32, limit: f32, viewport: f32) {
+        self.vel = 0.0;
+        self.rebound = None;
+        self.offset = clamp_drag(self.offset - dy, limit, viewport);
+    }
+
+    /// The finger lifted with this screen-space velocity (px/s).
+    ///
+    /// Released past an edge: one rebound to it, regardless of speed — a
+    /// fling from overshoot would fight the settle. Released in range: glide,
+    /// with the velocity cap applied here so the integration never sees an
+    /// unusable trackpad number.
+    pub fn release(&mut self, velocity_dy: f32, limit: f32) {
+        let limit = limit.max(0.0);
+        if self.offset < 0.0 || self.offset > limit {
+            self.vel = 0.0;
+            self.rebound = Some((self.offset, self.offset.clamp(0.0, limit), 0.0));
+        } else {
+            self.vel = (-velocity_dy).clamp(-FLICK_MAX_VEL, FLICK_MAX_VEL);
+        }
+    }
+
+    /// Advance the animation. Returns true while still moving, so a caller
+    /// knows to keep repainting.
+    pub fn tick(&mut self, dt: f32, limit: f32) -> bool {
+        let limit = limit.max(0.0);
+        if let Some((from, to, elapsed)) = &mut self.rebound {
+            *elapsed += dt;
+            self.offset = rebound_at(*from, *to, *elapsed);
+            if rebound_done(*elapsed) {
+                self.offset = *to;
+                self.rebound = None;
+            }
+            return self.rebound.is_some();
+        }
+        if self.vel != 0.0 {
+            let before = self.offset;
+            self.offset = clamp_flick(self.offset + self.vel * dt, limit);
+            // A flick stops AT the bound: if the clamp bit, the glide is over.
+            if self.offset != before + self.vel * dt {
+                self.vel = 0.0;
+                return false;
+            }
+            let brake = FLICK_DECEL * dt;
+            self.vel = if self.vel.abs() <= brake { 0.0 } else { self.vel - self.vel.signum() * brake };
+            return self.vel != 0.0;
+        }
+        false
+    }
+
+    /// Still gliding or settling?
+    pub fn animating(&self) -> bool {
+        self.vel != 0.0 || self.rebound.is_some()
+    }
+
+    /// The offset a row-painter should draw at (never past the drag slack).
+    pub fn clamped(&self, limit: f32, viewport: f32) -> f32 {
+        clamp_drag(self.offset, limit, viewport)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +247,49 @@ mod tests {
     fn a_released_flick_at_rest_goes_nowhere() {
         assert_eq!(fling_distance(0.0), 0.0);
         assert_eq!(rebound_at(0.0, 0.0, 0.5), 0.0);
+    }
+
+    // ── the assembled scroller ──
+
+    #[test]
+    fn a_flick_glides_and_stops_at_the_bound() {
+        let mut k = KineticScroll::default();
+        k.offset = 900.0;
+        k.release(-8000.0, 1000.0); // fast upward finger → content scrolls down
+        let mut guard = 0;
+        while k.tick(1.0 / 60.0, 1000.0) { guard += 1; assert!(guard < 600); }
+        assert_eq!(k.offset, 1000.0, "the flick STOPPED at the edge — no elastic fling");
+        assert!(!k.animating());
+    }
+
+    #[test]
+    fn a_drag_may_overshoot_and_release_settles_in_one_rebound() {
+        let mut k = KineticScroll::default();
+        // Drag down hard at the very top: content follows past the edge.
+        k.dragging(60.0, 1000.0, 400.0);
+        assert!(k.offset < 0.0, "the drag passed the edge");
+        assert!(k.offset >= -400.0 * DRAG_OVERSHOOT - 0.01, "…but only by the slack");
+        let over = k.offset;
+        k.release(-3000.0, 1000.0);
+        // Velocity is ignored from overshoot: one clean settle, monotonic.
+        let mut prev = k.offset;
+        let mut t = 0.0;
+        while k.tick(1.0 / 120.0, 1000.0) {
+            t += 1.0 / 120.0;
+            assert!(k.offset >= prev - 0.001, "settling never reverses");
+            prev = k.offset;
+            assert!(t < 1.0);
+        }
+        assert_eq!(k.offset, 0.0);
+        assert!(over < 0.0 && t >= REBOUND_SECS - 0.05, "the settle took the QML's 380ms");
+    }
+
+    #[test]
+    fn dragging_mid_glide_hands_control_back_to_the_finger() {
+        let mut k = KineticScroll::default();
+        k.release(-2000.0, 1000.0);
+        assert!(k.tick(1.0 / 60.0, 1000.0), "gliding");
+        k.dragging(5.0, 1000.0, 400.0);
+        assert!(!k.animating(), "the finger owns the content again, immediately");
     }
 }
