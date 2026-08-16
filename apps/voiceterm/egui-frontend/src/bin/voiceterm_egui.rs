@@ -444,7 +444,16 @@ struct VoicetermApp {
     mail: voiceterm_egui::mail_view::MailView,
     browser: voiceterm_egui::browser::Browser,
     graph: voiceterm_egui::graph_view::GraphView,
-    archive: voiceterm_egui::bars::ArchiveView,
+    // The real archive surface (archived_view), replacing a bars::ArchiveView
+    // that was only ever fed an empty vec — a connected placeholder the
+    // wiring checker counted as done.
+    archive: voiceterm_egui::archived_view::ArchiveView,
+    /// The raw messages beside the MailView: threads hold message IDS, and
+    /// the inbox list draws Message rows, so both live here and are set
+    /// together.
+    mail_messages: Vec<voiceterm_egui::mail_view::Message>,
+    /// The open message id on the Mail view, if any.
+    mail_open: Option<String>,
     bar_state: voiceterm_egui::bars::BarState,
     /// The graph's SOURCE, not a prebuilt topology.
     ///
@@ -924,6 +933,34 @@ impl eframe::App for VoicetermApp {
                         if let Some(conv) = voiceterm_egui::mail_view::list_ui(ui, &mut self.mail, &c) {
                             self.toasts.info(format!("opened {conv}"), ui.input(|i| i.time));
                         }
+                        ui.separator();
+                        // The inbox proper (mail_panes, ported): rows over the
+                        // real Message model, message pane below on open.
+                        use voiceterm_egui::mail as mp;
+                        if let Some(act) = mp::inbox_ui(ui, &self.mail_messages, false, &c) {
+                            match act {
+                                mp::MailAction::Open(id) => self.mail_open = Some(id),
+                                mp::MailAction::Search(q) => self.mail.query = q,
+                                _ => {}
+                            }
+                        }
+                        if let Some(id) = self.mail_open.clone() {
+                            if let Some(m) = self.mail_messages.iter().find(|m| m.id == id) {
+                                let body = self.mail.bodies.get(&id)
+                                    .map(|b| b.text().to_string()).unwrap_or_default();
+                                let view = mp::MessageView {
+                                    id: m.id.clone(),
+                                    from_name: mp::sender_of(m).to_string(),
+                                    from_addr: String::new(),
+                                    to: String::new(),
+                                    subject: mp::subject_of(m).to_string(),
+                                    date: m.time.to_string(),
+                                    body_text: body,
+                                };
+                                mp::message_ui(ui, &view, &c);
+                                if ui.small_button("close").clicked() { self.mail_open = None; }
+                            }
+                        }
                     }
                     CentralView::Browser => {
                         ui.horizontal(|ui| {
@@ -998,6 +1035,45 @@ impl eframe::App for VoicetermApp {
                         // draws a diagram the user wrote. Neither replaces the
                         // other.
                         let cg = self.connections_nodes();
+                        // THE DRAWN GRAPH: layered_graph positions the nodes
+                        // (Sugiyama — back edges cut, layers assigned, two
+                        // crossing-reduction sweeps), viz renders the Scene.
+                        // "Lay out once into a Scene; render any Scene each
+                        // frame" is that module's whole design.
+                        if !cg.0.is_empty() {
+                            use voiceterm_egui::{layered_graph as lg, viz};
+                            let idx: std::collections::HashMap<&str, usize> = cg.0.iter()
+                                .enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+                            let n = cg.0.len();
+                            let mut succ = vec![Vec::new(); n];
+                            let mut pred = vec![Vec::new(); n];
+                            for e in &cg.1 {
+                                if let (Some(&a), Some(&b)) = (idx.get(e.from.as_str()),
+                                                               idx.get(e.to.as_str())) {
+                                    if a != b { succ[a].push(b); pred[b].push(a); }
+                                }
+                            }
+                            let back = lg::back_edges(&succ);
+                            let layer = lg::assign_layers(&succ, &back);
+                            let mut order = lg::layers_of(&layer);
+                            lg::sweep(&mut order, &succ, &pred, true);
+                            lg::sweep(&mut order, &succ, &pred, false);
+                            let placed = lg::place(&order, n, lg::FlowDirection::Down);
+                            let gnodes: Vec<viz::GNode> = cg.0.iter().zip(&placed)
+                                .map(|(node, p)| viz::GNode {
+                                    id: node.id.clone(),
+                                    label: voiceterm_egui::archived_view::safe_trunc(&node.title, 18).to_string(),
+                                    pos: (p.x, p.y),
+                                    size: (110.0, 26.0),
+                                }).collect();
+                            let gedges: Vec<viz::GEdge> = cg.1.iter()
+                                .map(|e| viz::GEdge { from: e.from.clone(), to: e.to.clone() })
+                                .collect();
+                            let scene = viz::graph_scene(&gnodes, &gedges);
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 220.0), egui::Sense::hover());
+                            viz::render_scene(ui, &scene, rect, &c);
+                        }
                         ui.label(egui::RichText::new(format!(
                             "connections: {} node(s), {} edge(s)", cg.0.len(), cg.1.len()))
                             .weak().size(11.0));
@@ -1220,12 +1296,28 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     CentralView::Archive => {
-                        ui.text_edit_singleline(&mut self.archive.query);
-                        let pages: Vec<voiceterm_egui::bars::PageEntry> = Vec::new();
-                        for p in self.archive.results(&pages) {
-                            ui.label(p.label());
+                        // Built from the browser's OWN saved pages, the same
+                        // source the explore grouping uses — an archive of
+                        // nothing would be the placeholder this replaces.
+                        use voiceterm_egui::archived_view as av;
+                        let pages: Vec<av::ArchivedPage> = self.browser.bookmarks.all()
+                            .iter().map(|b| av::ArchivedPage {
+                                url: b.url.clone(),
+                                title: b.title.clone(),
+                                domain: b.url.split('/').nth(2).unwrap_or("").to_string(),
+                                archived_at: String::new(),
+                                key_points: Vec::new(),
+                                text_snippet: String::new(),
+                                html_size: 0,
+                            }).collect();
+                        if pages.is_empty() {
+                            ui.colored_label(c.text_weak, "nothing archived yet — save pages from the Web tab");
+                        } else if let Some(url) = av::archive_ui(ui, &mut self.archive, &pages, &c) {
+                            // Same contract as the Models tab's open button:
+                            // this crate has no HTTP client, so opening means
+                            // surfacing the URL.
+                            self.toasts.info(url, ui.input(|i| i.time));
                         }
-                        if pages.is_empty() { ui.colored_label(c.text_weak, "nothing archived yet"); }
                     }
                     CentralView::Terminal => {}
                 }
@@ -1751,6 +1843,8 @@ fn main() -> eframe::Result<()> {
                 browser: Default::default(),
                 graph: Default::default(),
                 archive: Default::default(),
+                mail_messages: Vec::new(),
+                mail_open: None,
                 bar_state: Default::default(),
                 graph_source: String::new(),
                 settings_open: false,
