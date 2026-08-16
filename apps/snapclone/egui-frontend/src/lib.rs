@@ -400,6 +400,26 @@ pub struct Snapclone {
     /// a watchdog — a pointer-up lost to a system gesture would otherwise
     /// leave the machine Held forever.
     pub press: crate::press_gesture::PressGesture,
+    /// Horizontal scroll for the tile strip, with edge pass-through: at the
+    /// end of the strip the wheel stops being ours and reaches the page
+    /// navigator behind it. Without that the carousel silently swallows the
+    /// wheel at its edge and the page never turns.
+    pub strip_scroll: crate::scroll_passthrough::HScroll,
+    /// Decides WHEN a snap's arrival is worth re-deriving the ambient
+    /// palette. Without it every arrival walks the sampler, which is the
+    /// burst case the throttle was written for.
+    pub ambient_driver: crate::ambient_inbox::AmbientInboxDriver,
+    /// Which synthetic palette is in charge, if any. The driver refuses to
+    /// stomp a palette that is not its own.
+    pub active_synthetic: Option<String>,
+    /// Fingerprints for the landmarks above, keyed by the SAME id: two lossy
+    /// one-way transforms per place. This is landmark_hash's half of the
+    /// feature — the photo a user took to mark a place never leaves the
+    /// device, and this pair is what gets published to the DHT instead.
+    pub landmark_prints:
+        std::collections::HashMap<String, crate::landmark_hash::Fingerprint>,
+    /// Diagnostic channels the user can switch on.
+    pub trace: crate::trace_channels::TraceControl,
     /// Which contact the open confirm panel is about. Held separately because
     /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
     /// risk score, not a subject.
@@ -582,6 +602,13 @@ impl Snapclone {
             // Re-set from Adaptive each frame in `ui`.
             feedback: crate::touch_feedback::TouchFeedback::new(false),
             press: Default::default(),
+            // Bounds are set from the tile count each frame; a strip that has
+            // not been drawn yet scrolls nowhere rather than pretending to.
+            strip_scroll: crate::scroll_passthrough::HScroll::new(0.0, 0.0),
+            ambient_driver: Default::default(),
+            active_synthetic: None,
+            landmark_prints: std::collections::HashMap::new(),
+            trace: Default::default(),
             confirm_id: String::new(),
             editor_id: String::new(),
             editor_name: String::new(),
@@ -1020,6 +1047,27 @@ impl Snapclone {
     /// should tint the app, not repaint it.
     pub fn sample_ambient(&mut self, pixels: &[crate::ambient_palette::Rgb], side: u32) {
         self.ambient_samples.add_image(pixels, side);
+        self.rederive_ambient();
+    }
+
+    /// A snap arrived: ask the driver whether this is worth a derivation.
+    ///
+    /// Sampling is cheap (it accumulates into a histogram); DERIVING walks
+    /// that histogram, and doing it per arrival during a burst is the cost
+    /// the throttle exists to prevent. The driver also refuses when another
+    /// palette is in charge — a user's explicit pick is not ours to stomp,
+    /// checked at trigger time because a queued arrival can outlive the
+    /// switch.
+    pub fn ambient_snap_arrived(&mut self, now_ms: u64) -> crate::ambient_inbox::Outcome {
+        let out = self.ambient_driver.on_snap(now_ms, self.active_synthetic.as_deref());
+        if out == crate::ambient_inbox::Outcome::Derive {
+            self.rederive_ambient();
+        }
+        out
+    }
+
+    /// Walk the accumulated samples into a palette pair.
+    fn rederive_ambient(&mut self) {
         // The two are INDEPENDENT, and my first version required both. A
         // vivid photo with no near-neutral edge pixels yields an accent and no
         // background — the test caught it — and refusing the accent because the
@@ -2576,6 +2624,22 @@ impl Snapclone {
     }
 
     fn settings_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        // DIAGNOSTIC CHANNELS, one toggle each. Individually, which is the
+        // whole point of the module: the C++ it replaces used setFilterRules,
+        // so switching one channel on silently switched every other off —
+        // including one enabled from the command line a moment earlier.
+        ui.collapsing("diagnostics", |ui| {
+            use crate::trace_channels::Channel;
+            for ch in Channel::ALL {
+                let mut on = self.trace.is_enabled(ch);
+                if ui.checkbox(&mut on, ch.key()).on_hover_text(ch.description()).changed() {
+                    self.trace.set_channel(ch, on);
+                }
+            }
+            if self.trace.enabled().is_empty() {
+                ui.colored_label(c.text_weak, "all channels quiet");
+            }
+        });
         self.nav.title_bar(ui, "Settings");
         // The five real tab bodies from settings_page.rs, not one row of
         // background styles. The background picker stays as an appearance
@@ -2664,6 +2728,33 @@ impl Snapclone {
     /// The inbox, on its own page. Was absent entirely: the app had a Peers
     /// list and no way to see a message, which is the gap that made a
     /// messaging app read as a demo.
+    /// Record a landmark fingerprint under `id`.
+    ///
+    /// Refuses an invalid one rather than storing it. A wrong-length hash
+    /// reaching the matcher silently never matches anything, which reads as
+    /// "the landmark is not there" instead of "the data is corrupt" — the
+    /// module's own reason for having `is_valid`.
+    pub fn publish_landmark(&mut self, id: &str,
+                            fp: crate::landmark_hash::Fingerprint) -> bool {
+        if !fp.is_valid() { return false; }
+        self.landmark_prints.insert(id.to_string(), fp);
+        true
+    }
+
+    /// Which known landmark this fingerprint is, and how strong the claim is.
+    ///
+    /// Ranked rather than first-match: Both is stronger evidence than either
+    /// hash alone, and a BlurOnly hit found first would otherwise beat a Both
+    /// hit found later. Unknown/Neither never returns an id — no claim is the
+    /// correct answer when the evidence does not support one.
+    pub fn identify_landmark(&self, fp: &crate::landmark_hash::Fingerprint)
+        -> Option<(String, crate::landmark_hash::Match)> {
+        self.landmark_prints.iter()
+            .map(|(id, known)| (id.clone(), crate::landmark_hash::compare(fp, known)))
+            .filter(|(_, m)| m.is_match())
+            .max_by_key(|(_, m)| m.rank())
+    }
+
     /// The roster, over real reachability.
     ///
     /// This is where gossip and peer_source meet, and they compose rather than
@@ -2767,6 +2858,37 @@ impl Snapclone {
                 }
             }
             let _ = pending;
+            // THE WHEEL, with the edge rule. One notch is one tile; at either
+            // end the event is NOT consumed, so the page navigator gets it and
+            // the user keeps scrolling out of the strip instead of hitting a
+            // wall they cannot see.
+            let strip_rect = ui.min_rect();
+            let n = composer.len() as f32;
+            self.strip_scroll.max = (n - 1.0).max(0.0);
+            self.strip_scroll.value = active as f32;
+            if ui.rect_contains_pointer(strip_rect) {
+                // smooth_scroll_delta is egui 0.34's accumulated wheel; the
+                // module wants a per-notch figure, hence the divisor below.
+                let d = ui.input(|i| i.smooth_scroll_delta);
+                let (px, py) = (d.x, d.y);
+                if px != 0.0 || py != 0.0 {
+                    let w = crate::scroll_passthrough::Wheel {
+                        pixel: Some((px / 40.0, py / 40.0)),
+                        angle: (0.0, 0.0),
+                    };
+                    match self.strip_scroll.wheel(&w) {
+                        crate::scroll_passthrough::Handled::Consumed => {
+                            self.strip_active = self.strip_scroll.value.round() as usize;
+                        }
+                        // Past the end: the swipe layer owns it now.
+                        crate::scroll_passthrough::Handled::PassThrough => {
+                            let dir = if py + px > 0.0 { -1 } else { 1 };
+                            let next = (self.nav.page() as i32 + dir).clamp(0, 4);
+                            self.nav.go_page(next as usize);
+                        }
+                    }
+                }
+            }
             if let Some(act) = crate::tile_strip::tile_strip_ui(ui, &view, c) {
                 self.strip_action(act);
             }
@@ -4693,6 +4815,83 @@ mod gossip_wiring_tests {
         assert!(!app.export_requested);
         assert!(app.export_note.as_deref().unwrap_or("").contains("3 snaps"));
     }
+    // ── scroll_passthrough / ambient_inbox / landmark_hash / trace_channels ──
+
+    #[test]
+    fn the_strip_wheel_passes_through_at_the_edge() {
+        use crate::scroll_passthrough::{Handled, Wheel};
+        let mut h = crate::scroll_passthrough::HScroll::new(0.0, 3.0);
+        let one = |d: f32| Wheel { pixel: Some((0.0, d)), angle: (0.0, 0.0) };
+        // Moving is ours.
+        assert_eq!(h.wheel(&one(-1.0)), Handled::Consumed);
+        assert_eq!(h.value, 1.0);
+        // At the end and still pushing: the page navigator gets it, which is
+        // the bug the module exists for — a carousel that swallows the wheel
+        // at its edge leaves the user pushing against nothing.
+        h.value = 3.0;
+        assert_eq!(h.wheel(&one(-1.0)), Handled::PassThrough);
+        // A zero delta is a real touchpad event mid-reversal and must NOT
+        // flip a page.
+        assert_eq!(h.wheel(&one(0.0)), Handled::Consumed);
+    }
+
+    #[test]
+    fn ambient_derivation_is_throttled_but_never_on_the_first_snap() {
+        use crate::ambient_inbox::Outcome;
+        let mut app = Snapclone::new_with_login(vec![], false);
+        // Not running yet.
+        assert_eq!(app.ambient_snap_arrived(1_000), Outcome::Inactive);
+        app.ambient_driver.start(crate::ambient_inbox::SYNTHETIC_ID);
+        app.active_synthetic = Some(crate::ambient_inbox::SYNTHETIC_ID.to_string());
+        // First arrival derives immediately — waiting thirty seconds for any
+        // ambience at all reads as the feature being broken.
+        assert_eq!(app.ambient_snap_arrived(1_000), Outcome::Derive);
+        // A burst inside the window does not.
+        assert_eq!(app.ambient_snap_arrived(1_500), Outcome::Throttled);
+        // Another palette in charge: the user's pick is not ours to stomp,
+        // checked at trigger time because a queued arrival outlives the switch.
+        app.active_synthetic = Some("user-chosen".into());
+        assert_eq!(app.ambient_snap_arrived(600_000), Outcome::NotOurPalette);
+    }
+
+    #[test]
+    fn a_landmark_is_identified_by_its_strongest_match_only() {
+        use crate::landmark_hash::{Fingerprint, HashKind, Match};
+        let mut app = Snapclone::new_with_login(vec![], false);
+        let blur = |b: u8| vec![b; HashKind::Blur.len()];
+        let edge = |b: u8| vec![b; HashKind::Edge.len()];
+        // A corrupt fingerprint is refused rather than stored: a wrong-length
+        // hash silently never matches, which reads as "not there" instead of
+        // "corrupt".
+        assert!(!app.publish_landmark("bad", Fingerprint { blur: Some(vec![0u8; 3]), edge: None }));
+        assert!(app.publish_landmark("studio",
+            Fingerprint { blur: Some(blur(0)), edge: Some(edge(0)) }));
+        // An exact pair matches on both — the strongest claim available.
+        let seen = Fingerprint { blur: Some(blur(0)), edge: Some(edge(0)) };
+        let (id, m) = app.identify_landmark(&seen).expect("a known place");
+        assert_eq!(id, "studio");
+        assert_eq!(m, Match::Both);
+        // Nothing like it makes NO claim, rather than naming the nearest.
+        let elsewhere = Fingerprint { blur: Some(blur(0xff)), edge: Some(edge(0xff)) };
+        assert!(app.identify_landmark(&elsewhere).is_none());
+    }
+
+    #[test]
+    fn enabling_one_trace_channel_leaves_the_others_alone() {
+        use crate::trace_channels::Channel;
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.trace.set_channel(Channel::Layout, true);
+        let second = Channel::ALL.iter().find(|c| **c != Channel::Layout).copied().unwrap();
+        app.trace.set_channel(second, true);
+        // The whole point: setFilterRules replaced the entire rule set, so
+        // enabling one channel silently disabled every other.
+        assert!(app.trace.is_enabled(Channel::Layout), "the first channel survived");
+        assert!(app.trace.is_enabled(second));
+        // And the legacy flag maps onto Layout so a Qt-written settings file
+        // keeps working.
+        assert!(app.trace.mobile_display_debug());
+    }
+
     // ── the interaction layer: blobs, press, ripples ──
 
     #[test]
