@@ -645,3 +645,58 @@ LOD does not help any of these, and it is worth saying why: LOD reduces
 TRIANGLES for distant things, and the SDF budget is indexed by MODEL COUNT. A
 prop at 5% screen size consumes exactly the slab a hero asset does. Utilisation
 is the right lever and the atlas layout is where it lives.
+
+## Classifying walkers vs ships: the geometry cannot answer it yet
+
+The case: a ship with four-fold wing symmetry reads like a quadruped, so a
+classifier needs to check for thrusters, and to tell a load-bearing leg from an
+aerodynamic fin. Tried to build that from geometry. It does not work on this
+data, and the reason is worth recording before anyone tries again.
+
+### What was measured
+
+**Ground contact and slenderness look promising and are not enough.** Taking
+prims that reach the lowest 15% of the body and scoring vertical/horizontal
+extent, 45 of 221 chassis have "leg-like" ground prims — but the top of that
+list is `jet_vertigo` and `flyer_resonator`. Slenderness alone cannot separate a
+landing strut from a leg, which is exactly the objection.
+
+**The thruster test found nothing, correctly.** Rear prims that do not reach the
+ground: median 0 across every category, including spaceship. My first attempt
+also measured the wrong axis — `analog` declares forward as +Y in ASSET space,
+so a raw-coordinate rear test is meaningless; redoing it in engine space via the
+strip's orientation gave the same zero.
+
+### Why: prims are materials, not parts
+
+```
+analog f04:  39 prims,  39 materials,  39 distinct materials referenced
+             57% of prim pairs overlap spatially
+```
+
+A prim is a MATERIAL GROUP that spans the whole body — every red-painted surface
+in one prim, every dark metal in another. They interpenetrate. There is no prim
+that is "the left leg" or "the port thruster", so no per-prim test can find one,
+however clever the metric.
+
+This is the same wall three earlier findings hit from different sides: the parts
+deform rather than rotate (median 38% radius drift), `joints.json` has 95% zero
+angles, and the fleet's 46 part names are robot anatomy with exactly one
+locomotion word. All four are the same fact — **the harvest preserved surfaces,
+not structure.**
+
+### What would actually work
+
+Segmentation, not classification. A connected-component pass over the triangle
+graph would give real parts — a leg is a component that touches the ground and
+carries load; a thruster is one that does not and sits aft. Every metric
+proposed here becomes computable the moment parts exist, and none of them are
+computable before.
+
+That is a mesh-processing pass over 221 chassis, and it belongs upstream in
+foldview beside the rigidity segmentation the runtime-synthesis finding also
+asked for. The two want the same thing and should be built once.
+
+Until then `chassis_traits` seeds from the harvester's own category, which is
+imperfect but is real evidence, and the vector can be corrected per chassis by
+hand where it is wrong.
