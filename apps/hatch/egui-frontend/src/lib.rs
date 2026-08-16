@@ -61,6 +61,11 @@ pub struct HatchUi {
     /// Cleared wholesale when the scan changes; see `on_shown`.
     icon_cache: HashMap<String, Option<egui::TextureHandle>>,
     // Long-press bookkeeping (egui has clicks and drags, not holds).
+    /// The tile whose context menu is open, and where to draw it. Long-press
+    /// (and right-click) open it; it is the touch path to everything that
+    /// isn't "launch": favorites, and the entry's own [Desktop Action] items
+    /// like New Window — the same contents the plasmoid's menu offers.
+    menu: Option<(String, egui::Pos2)>,
     press: Option<PressTrack>,
     /// Set when the current press has already done its job (a long-press
     /// fired, or it turned into a scroll). Scoped to the press, not to a
@@ -94,6 +99,7 @@ impl HatchUi {
             focus_search: true,
             scroll_gen: 0,
             icon_cache: HashMap::new(),
+            menu: None,
             press: None,
             swallow_click: false,
             grabber_drag: 0.0,
@@ -135,6 +141,12 @@ impl HatchUi {
         self.scroll_gen += 1;
         self.focus_search = true;
         self.grabber_drag = 0.0;
+        self.menu = None;
+    }
+
+    /// Whether a tile context menu is currently open.
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
     }
 
     // ---- pure helpers, tested below -------------------------------------
@@ -240,6 +252,85 @@ impl HatchUi {
             }
         });
 
+        // Last, so it paints over everything and gets first refusal on the
+        // click that dismisses it.
+        let menu_event = self.tile_menu(ui);
+        if menu_event != UiEvent::None {
+            event = menu_event;
+        }
+
+        event
+    }
+
+    /// Draw the open tile menu, if any. Returns an event when it launched
+    /// something. Drawn last, in a foreground Area, so it sits over the grid;
+    /// a click anywhere else dismisses it without also hitting a tile
+    /// (the grid skips launching while `menu` is set).
+    fn tile_menu(&mut self, ui: &mut egui::Ui) -> UiEvent {
+        let Some((id, at)) = self.menu.clone() else { return UiEvent::None };
+        let mut event = UiEvent::None;
+        let mut close = false;
+
+        let is_fav = self.core.is_favorite(&id);
+        // Cloned: the menu mutates core while iterating what core lends it.
+        let actions: Vec<(String, String)> = self
+            .core
+            .actions_for(&id)
+            .iter()
+            .map(|a| (a.id.clone(), a.name.clone()))
+            .collect();
+        let name = self
+            .core
+            .results()
+            .find(|e| e.id == id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| id.clone());
+
+        // Keep the menu on screen when the tile is near an edge.
+        let screen = ui.ctx().screen_rect();
+        let pos = egui::pos2(
+            at.x.min(screen.right() - 190.0).max(screen.left() + 8.0),
+            at.y.min(screen.bottom() - 60.0 - 26.0 * (actions.len() as f32 + 1.0)),
+        );
+
+        let resp = egui::Area::new(egui::Id::new("hatch-tile-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(170.0);
+                    ui.label(egui::RichText::new(&name).strong());
+                    ui.separator();
+                    let fav_label = if is_fav { "Remove from favorites" } else { "Add to favorites" };
+                    if ui.button(fav_label).clicked() {
+                        self.core.toggle_favorite(&id);
+                        close = true;
+                    }
+                    for (action_id, label) in &actions {
+                        if ui.button(label).clicked() {
+                            match self.core.activate_action(&id, action_id) {
+                                Ok(_) => event = UiEvent::Launched,
+                                Err(e) => {
+                                    self.last_error = Some((format!("{label}: {e}"), Instant::now()))
+                                }
+                            }
+                            close = true;
+                        }
+                    }
+                });
+            })
+            .response;
+
+        // Anywhere else: dismiss the menu, and only the menu.
+        if ui.input(|i| i.pointer.any_click()) && !resp.contains_pointer() {
+            close = true;
+        }
+        if ui.input(|i| i.key_pressed(Key::Escape)) {
+            close = true;
+        }
+        if close {
+            self.menu = None;
+        }
         event
     }
 
@@ -269,7 +360,9 @@ impl HatchUi {
                 }
             }
             if i.key_pressed(Key::Escape) {
-                if self.query.is_empty() {
+                if self.menu.is_some() {
+                    // Handled by tile_menu; the launcher stays put.
+                } else if self.query.is_empty() {
                     *event = UiEvent::Dismiss;
                 } else {
                     self.query.clear();
@@ -295,11 +388,12 @@ impl HatchUi {
             ui.vertical_centered(|ui| ui.weak("No matches"));
             return;
         }
+        let menu_open = self.menu.is_some();
         let mut decode_budget = 3usize; // icons decoded per frame; keeps first paint under a frame
         let side = (ui.available_width() - cols as f32 * cell.x).max(0.0) / 2.0;
         let rows = count.div_ceil(cols);
         let mut launch: Option<String> = None;
-        let mut fav_toggle: Option<String> = None;
+        let mut fav_toggle: Option<(String, egui::Pos2)> = None;
         self.tile_rects.clear();
 
         for row in 0..rows {
@@ -323,10 +417,12 @@ impl HatchUi {
                     self.tile(ui, rect, &resp, &name, tex, fav, selected, colors);
 
                     match self.hold(&resp, &id) {
-                        Hold::Fired => fav_toggle = Some(id),
+                        Hold::Fired => fav_toggle = Some((id, rect.center())),
                         Hold::SwallowClick => {}
                         Hold::Free => {
-                            if resp.clicked() {
+                            if resp.secondary_clicked() {
+                                fav_toggle = Some((id.clone(), rect.center()));
+                            } else if resp.clicked() && !menu_open {
                                 launch = Some(id);
                             }
                         }
@@ -345,8 +441,8 @@ impl HatchUi {
             self.press = None;
             self.swallow_click = false;
         }
-        if let Some(id) = fav_toggle {
-            self.core.toggle_favorite(&id);
+        if let Some((id, at)) = fav_toggle {
+            self.menu = Some((id, at));
         }
         if let Some(id) = launch {
             match self.core.activate(&id) {
@@ -642,7 +738,6 @@ enum Hold {
 mod tests {
     use super::*;
     use hatch_core::AppEntry;
-    use std::path::PathBuf;
 
     // ---- headless frame driver -------------------------------------------
     //
@@ -737,7 +832,17 @@ mod tests {
             icon: String::new(), // no icon file → letter-tile path gets exercised
             exec: "true".into(), // activate() spawns /bin/true
             terminal: false,
-            path: PathBuf::new(),
+            // One entry carries an action so the menu has something to list.
+            actions: if name == "Maps" {
+                vec![hatch_core::entry::DesktopAction {
+                    id: "new-window".into(),
+                    name: "New Window".into(),
+                    exec: "true".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
         }
     }
 
@@ -802,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_press_favorites_the_tile_and_swallows_the_release_click() {
+    fn a_long_press_opens_the_menu_and_swallows_the_release_click() {
         // The hold machine is the fiddliest thing in the file: it has to fire
         // once, and then eat exactly the click that ends the same press —
         // otherwise every favorite toggle also launches the app.
@@ -827,7 +932,8 @@ mod tests {
         // that nothing else needs.
         std::thread::sleep(LONG_PRESS + Duration::from_millis(60));
         h.frame(vec![]); // a frame with the finger still down: the hold fires
-        assert!(h.app.core.is_favorite("maps"), "long press toggled the favorite");
+        assert!(h.app.menu_open(), "long press opens the tile menu");
+        assert!(!h.app.core.is_favorite("maps"), "the menu asks; it does not act");
 
         let released = h.frame(vec![egui::Event::PointerButton {
             pos,
@@ -836,6 +942,101 @@ mod tests {
             modifiers: Default::default(),
         }]);
         assert_eq!(released, UiEvent::None, "the release must not also launch");
+    }
+
+    /// Long-press `entry_id` and leave the menu open.
+    fn open_menu(h: &mut Harness, entry_id: &str) -> egui::Pos2 {
+        h.frame(vec![]);
+        let rect = h.app.tile_rect(entry_id).expect("tile painted");
+        let pos = rect.center();
+        h.frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        std::thread::sleep(LONG_PRESS + Duration::from_millis(60));
+        h.frame(vec![]);
+        h.frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        assert!(h.app.menu_open(), "menu is open");
+        pos
+    }
+
+    #[test]
+    fn the_menu_favorites_from_its_first_item() {
+        let mut h = Harness::new(some_apps());
+        open_menu(&mut h, "camera");
+        h.frame(vec![]); // the menu needs a frame to lay its buttons out
+
+        // The favorite item sits under the title and separator; aim inside
+        // the popup rather than at a guessed offset from the tile.
+        let btn = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("hatch-tile-menu")))
+            .expect("the menu area was laid out");
+        let target = egui::pos2(btn.center().x, btn.top() + btn.height() * 0.72);
+
+        h.click(target);
+        assert!(h.app.core.is_favorite("camera"), "the menu's first item toggles the favorite");
+        assert!(!h.app.menu_open(), "and closes the menu");
+    }
+
+    #[test]
+    fn a_click_outside_dismisses_the_menu_without_launching() {
+        let mut h = Harness::new(some_apps());
+        open_menu(&mut h, "camera");
+        h.frame(vec![]);
+
+        // Bottom-left corner: away from the menu and from every tile.
+        let away = egui::pos2(14.0, h.size.y - 140.0);
+        assert_eq!(h.click(away), UiEvent::None, "dismissal is not a launch");
+        assert!(!h.app.menu_open());
+        assert!(!h.app.core.is_favorite("camera"), "and nothing was toggled");
+    }
+
+    #[test]
+    fn a_menu_lists_the_entry_s_desktop_actions() {
+        // Maps is the fixture carrying a [Desktop Action]; the others don't,
+        // so this also checks the menu isn't inventing items.
+        let mut h = Harness::new(some_apps());
+        assert_eq!(h.app.core.actions_for("maps").len(), 1);
+        assert!(h.app.core.actions_for("camera").is_empty());
+
+        open_menu(&mut h, "maps");
+        h.frame(vec![]);
+        let with_action = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("hatch-tile-menu")))
+            .expect("laid out")
+            .height();
+
+        h.app.on_shown();
+        open_menu(&mut h, "camera");
+        h.frame(vec![]);
+        let without = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("hatch-tile-menu")))
+            .expect("laid out")
+            .height();
+
+        assert!(with_action > without, "the action adds a row: {with_action} vs {without}");
+    }
+
+    #[test]
+    fn escape_closes_the_menu_before_it_closes_the_launcher() {
+        let mut h = Harness::new(some_apps());
+        open_menu(&mut h, "camera");
+        assert_eq!(h.key(Key::Escape), UiEvent::None, "the launcher stays put");
+        assert!(!h.app.menu_open());
+        assert_eq!(h.key(Key::Escape), UiEvent::Dismiss, "a second Escape dismisses");
     }
 
     #[test]

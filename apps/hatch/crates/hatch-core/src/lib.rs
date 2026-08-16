@@ -226,11 +226,42 @@ impl Launcher {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown entry"))?
             .clone();
         let argv = exec::split_exec(&e.exec);
-        let pid = exec::spawn(&argv, e.terminal, &self.config.terminal_wrap)?;
+        let pid = exec::spawn_in(&argv, e.terminal, &self.config.terminal_wrap, e.workdir.as_deref())?;
         let _ = store::record_recent(id);
         self.recents = store::load_recents();
         self.rerank();
         Ok(pid)
+    }
+
+    /// Launch one of an entry's `[Desktop Action …]` items ("New Window").
+    /// Recorded as a recent like a normal launch: from the user's side they
+    /// opened the app, and it should float accordingly.
+    pub fn activate_action(&mut self, id: &str, action_id: &str) -> std::io::Result<u32> {
+        let e = self
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown entry"))?
+            .clone();
+        let a = e
+            .actions
+            .iter()
+            .find(|a| a.id == action_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown action"))?;
+        let argv = exec::split_exec(&a.exec);
+        let pid = exec::spawn_in(&argv, e.terminal, &self.config.terminal_wrap, e.workdir.as_deref())?;
+        let _ = store::record_recent(id);
+        self.recents = store::load_recents();
+        Ok(pid)
+    }
+
+    /// The actions an entry declares, for a context menu.
+    pub fn actions_for(&self, id: &str) -> &[entry::DesktopAction] {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.actions.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The configured system actions, resolved against the built-in table.
@@ -271,7 +302,6 @@ impl Launcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn e(name: &str) -> AppEntry {
         AppEntry {
@@ -281,7 +311,7 @@ mod tests {
             icon: String::new(),
             exec: "true".into(),
             terminal: false,
-            path: PathBuf::new(),
+            ..Default::default()
         }
     }
 

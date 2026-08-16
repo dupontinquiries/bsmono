@@ -80,6 +80,19 @@ pub fn split_exec(exec: &str) -> Vec<String> {
 /// entry demands a terminal (e.g. `["konsole", "-e"]`); pass `&[]` to run it
 /// bare anyway.
 pub fn spawn(argv: &[String], terminal: bool, terminal_wrap: &[String]) -> io::Result<u32> {
+    spawn_in(argv, terminal, terminal_wrap, None)
+}
+
+/// As [`spawn`], in `workdir` when the entry declares `Path=`. A missing or
+/// unreadable working directory would make `spawn` fail outright, which would
+/// turn a cosmetic packaging error into an app that cannot be launched at
+/// all — so a directory that isn't there is ignored rather than fatal.
+pub fn spawn_in(
+    argv: &[String],
+    terminal: bool,
+    terminal_wrap: &[String],
+    workdir: Option<&std::path::Path>,
+) -> io::Result<u32> {
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty Exec"));
     }
@@ -90,6 +103,9 @@ pub fn spawn(argv: &[String], terminal: bool, terminal_wrap: &[String]) -> io::R
     full.extend(argv.iter().map(String::as_str));
 
     let mut cmd = Command::new(full[0]);
+    if let Some(dir) = workdir.filter(|d| d.is_dir()) {
+        cmd.current_dir(dir);
+    }
     cmd.args(&full[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -148,5 +164,31 @@ mod tests {
         // `true` exists everywhere we run tests.
         let pid = spawn(&["true".to_string()], false, &[]).unwrap();
         assert!(pid > 0);
+    }
+
+    #[test]
+    fn a_declared_working_directory_is_used_and_a_missing_one_is_survivable() {
+        let dir = std::env::temp_dir().join(format!("hatch-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("proof");
+
+        // `sh -c 'touch proof'` only lands in `dir` if cwd was honoured.
+        let argv: Vec<String> = ["sh", "-c", "touch proof"].iter().map(|s| s.to_string()).collect();
+        assert!(spawn_in(&argv, false, &[], Some(&dir)).unwrap() > 0);
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the child ran in the declared directory");
+
+        // A packaging error (Path= pointing nowhere) must not make an app
+        // unlaunchable; it falls back to the launcher's own cwd.
+        let gone = dir.join("does-not-exist");
+        assert!(spawn_in(&["true".to_string()], false, &[], Some(&gone)).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -59,6 +59,10 @@ window was hidden. `cargo run --example probe -- --watch` runs that same
 check in a loop, so if a newly installed app doesn't show up on the phone
 you can see whether detection or scanning is at fault.
 
+Long-press (or right-click) a tile for its context menu: favorites, plus
+the entry's own `[Desktop Action]` items — "New Window", LibreOffice's
+Writer/Calc/Impress. Same contents the plasmoid's menu offers.
+
 Launcher lifecycle: one instance; a second launch (or `hatch-egui
 --toggle`) pokes the running one to show/hide — bind a global shortcut to
 exactly that. Dismissal hides rather than quits so the next summon is

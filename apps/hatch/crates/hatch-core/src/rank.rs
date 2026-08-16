@@ -71,7 +71,6 @@ pub fn score(query: &str, entry: &AppEntry, standing: Standing) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn e(name: &str, desc: &str) -> AppEntry {
         AppEntry {
@@ -81,7 +80,7 @@ mod tests {
             icon: String::new(),
             exec: "x".into(),
             terminal: false,
-            path: PathBuf::new(),
+            ..Default::default()
         }
     }
 

@@ -56,6 +56,12 @@ fn main() {
     for (n, e) in l.results().take(40).enumerate() {
         let fav = if l.is_favorite(&e.id) { "*" } else { " " };
         println!("{n:>3}{fav} {:<32} {}", trunc(&e.name, 32), trunc(&e.id, 40));
+        for a in l.actions_for(&e.id) {
+            println!("       action {:<22} {}", a.id, a.exec);
+        }
+        if let Some(dir) = &e.workdir {
+            println!("       workdir {}", dir.display());
+        }
         if show_icons {
             match l.icon_path(e) {
                 Some(p) => println!("       icon {:?} → {}", e.icon, p.display()),

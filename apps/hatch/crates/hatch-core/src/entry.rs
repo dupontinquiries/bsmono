@@ -5,7 +5,8 @@
 //! churned their APIs twice in two years, and a visible parse loop is a
 //! debuggable parse loop. What we implement, deliberately:
 //!
-//! * `[Desktop Entry]` group only — `[Desktop Action …]` groups are skipped.
+//! * `[Desktop Entry]` plus the `[Desktop Action …]` groups it names, which
+//!   are the "New Window" / "New Private Window" items a context menu offers.
 //! * `Name[ll_CC]` / `Name[ll]` localisation from `$LC_MESSAGES`/`$LANG`.
 //! * `NoDisplay` / `Hidden` honoured (both mean "not in a launcher").
 //! * Later data dirs are SHADOWED by earlier ones, per the XDG precedence:
@@ -14,8 +15,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// A secondary way to launch an app, from a `[Desktop Action …]` group.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DesktopAction {
+    /// The action id as listed in `Actions=`.
+    pub id: String,
+    pub name: String,
+    pub exec: String,
+}
+
 /// One launchable application.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AppEntry {
     /// The desktop-file id: relative path under `applications/` with `/`
     /// flattened to `-` and `.desktop` stripped. This is the id compositors
@@ -27,6 +37,12 @@ pub struct AppEntry {
     pub icon: String,
     pub exec: String,
     pub terminal: bool,
+    /// `Path=`: the working directory to launch in. Ignoring this is a quiet
+    /// way to break apps that expect to start somewhere specific — a game
+    /// that loads assets relatively, a script wrapper.
+    pub workdir: Option<PathBuf>,
+    /// `Actions=` entries, in declared order.
+    pub actions: Vec<DesktopAction>,
     /// The file this came from, for debugging "why is this entry weird".
     pub path: PathBuf,
 }
@@ -53,27 +69,54 @@ fn locale_keys() -> Vec<String> {
 
 /// Parse one .desktop file's `[Desktop Entry]` group into a key→value map,
 /// with localised keys stored under `key[locale]` verbatim.
-fn parse_group(text: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let mut in_entry = false;
+fn parse_groups(text: &str) -> Vec<(String, HashMap<String, String>)> {
+    let mut groups: Vec<(String, HashMap<String, String>)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Some(group) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_entry = group == "Desktop Entry";
+            groups.push((group.to_string(), HashMap::new()));
             continue;
         }
-        if !in_entry {
-            continue;
-        }
+        let Some((_, map)) = groups.last_mut() else { continue }; // keys before any group
         if let Some(eq) = line.find('=') {
             let (k, v) = line.split_at(eq);
             map.insert(k.trim().to_string(), v[1..].trim().to_string());
         }
     }
-    map
+    groups
+}
+
+fn parse_group(text: &str) -> HashMap<String, String> {
+    parse_groups(text)
+        .into_iter()
+        .find(|(name, _)| name == "Desktop Entry")
+        .map(|(_, map)| map)
+        .unwrap_or_default()
+}
+
+/// The actions an entry declares, in `Actions=` order. An action missing its
+/// group, its Name, or its Exec is skipped rather than shown as a dead menu
+/// item — half-written action groups are common in the wild.
+fn parse_actions(text: &str, map: &HashMap<String, String>, locales: &[String]) -> Vec<DesktopAction> {
+    let Some(list) = map.get("Actions") else { return Vec::new() };
+    let groups = parse_groups(text);
+    let mut out = Vec::new();
+    for id in list.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((_, g)) = groups.iter().find(|(n, _)| n == &format!("Desktop Action {id}")) else {
+            continue;
+        };
+        if parse_bool(g.get("NoDisplay")) {
+            continue;
+        }
+        let (Some(name), Some(exec)) = (localized(g, "Name", locales), g.get("Exec")) else {
+            continue;
+        };
+        out.push(DesktopAction { id: id.to_string(), name: name.to_string(), exec: exec.clone() });
+    }
+    out
 }
 
 /// Localised lookup: `Name[de_DE]` → `Name[de]` → `Name`.
@@ -113,6 +156,8 @@ pub fn parse_entry(id: &str, path: &Path, text: &str, locales: &[String]) -> Opt
         icon: map.get("Icon").cloned().unwrap_or_default(),
         exec,
         terminal: parse_bool(map.get("Terminal")),
+        workdir: map.get("Path").filter(|p| !p.is_empty()).map(PathBuf::from),
+        actions: parse_actions(text, &map, locales),
         path: path.to_path_buf(),
     })
 }
@@ -218,6 +263,87 @@ mod tests {
         assert_eq!(e.name, "Files");
         assert_eq!(e.icon, "org.gnome.Nautilus");
         assert!(!e.terminal);
+    }
+
+    #[test]
+    fn desktop_actions_are_parsed_in_declared_order() {
+        let text = "\
+[Desktop Entry]
+Type=Application
+Name=Firefox
+Exec=firefox %u
+Actions=new-window;new-private-window;broken;
+
+[Desktop Action new-private-window]
+Name=New Private Window
+Exec=firefox --private-window
+
+[Desktop Action new-window]
+Name=New Window
+Exec=firefox --new-window
+
+[Desktop Action broken]
+Name=No Exec Here
+";
+        let e = parse_entry("firefox", Path::new("/x"), text, &[]).unwrap();
+        let ids: Vec<&str> = e.actions.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["new-window", "new-private-window"],
+            "Actions= order wins over group order, and an action with no Exec is dropped"
+        );
+        assert_eq!(e.actions[0].name, "New Window");
+        assert_eq!(e.actions[1].exec, "firefox --private-window");
+    }
+
+    #[test]
+    fn an_action_can_be_hidden_and_a_missing_group_is_not_a_dead_menu_item() {
+        let text = "\
+[Desktop Entry]
+Type=Application
+Name=App
+Exec=app
+Actions=hidden;absent
+
+[Desktop Action hidden]
+Name=Hidden
+Exec=app --hidden
+NoDisplay=true
+";
+        let e = parse_entry("app", Path::new("/x"), text, &[]).unwrap();
+        assert!(e.actions.is_empty());
+    }
+
+    #[test]
+    fn the_working_directory_is_kept_when_declared() {
+        let with = "[Desktop Entry]\nType=Application\nName=Game\nExec=game\nPath=/opt/game\n";
+        let e = parse_entry("game", Path::new("/x"), with, &[]).unwrap();
+        assert_eq!(e.workdir.as_deref(), Some(Path::new("/opt/game")));
+
+        let without = "[Desktop Entry]\nType=Application\nName=Game\nExec=game\nPath=\n";
+        let e = parse_entry("game", Path::new("/x"), without, &[]).unwrap();
+        assert_eq!(e.workdir, None, "an empty Path= is no Path= at all");
+    }
+
+    #[test]
+    fn keys_outside_the_desktop_entry_group_stay_outside_it() {
+        // The regression risk in parsing all groups instead of one: an action
+        // group's Name must not overwrite the entry's.
+        let text = "\
+[Desktop Entry]
+Type=Application
+Name=Real Name
+Exec=app
+Actions=alt
+
+[Desktop Action alt]
+Name=Alternate
+Exec=app --alt
+Icon=other-icon
+";
+        let e = parse_entry("app", Path::new("/x"), text, &[]).unwrap();
+        assert_eq!(e.name, "Real Name");
+        assert_eq!(e.icon, "", "the action's Icon is not the entry's");
     }
 
     #[test]
