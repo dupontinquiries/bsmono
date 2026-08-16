@@ -21,7 +21,14 @@ def modules_of(src):
     return re.findall(r'^pub mod (\w+);', t, re.M)
 
 def reached(src, mod):
-    """Is `mod` referenced anywhere outside its own file?"""
+    """Is `mod` referenced anywhere outside its own file?
+
+    Aliases count. `use voiceterm_egui::mail as mp;` followed by `mp::inbox_ui`
+    is a use of `mail`, and matching only `mail::` reported four wired modules
+    as dead — the mirror of the re-export blind spot noted below. The alias is
+    resolved per file, because two files may bind the same short name to
+    different modules.
+    """
     for root, dirs, files in os.walk(src):
         dirs[:] = [d for d in dirs if d != 'target']
         for f in files:
@@ -31,6 +38,15 @@ def reached(src, mod):
             except Exception: continue
             # a use, a path call, or a field of that type
             if re.search(rf'\b{re.escape(mod)}::', t): return True
+            # …or the same thing under a local alias, in either form:
+            #   use crate::mail as mp;            → mp::
+            #   use crate::{mail as mp, viz};     → mp::
+            for alias in re.findall(rf'\b{re.escape(mod)}\s+as\s+(\w+)', t):
+                if re.search(rf'\b{re.escape(alias)}::', t): return True
+            # A #[macro_use] module is reached through its macros, which carry
+            # no path at all. Its declaration in lib.rs IS the wiring.
+            if re.search(rf'#\[macro_use\][^\n]*\n(?:#\[[^\]]*\]\n)*pub mod {re.escape(mod)};', t):
+                return True
     return False
 
 # Patterns that make a view LOOK wired while showing nothing. Every one of these

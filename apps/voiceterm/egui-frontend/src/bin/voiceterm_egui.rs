@@ -328,6 +328,11 @@ struct VoicetermApp {
     table: voiceterm_egui::table_view::TableView,
     /// The table being transformed. Demo data until a command's output is
     /// routed here; the view is generic over where the rows came from.
+    /// The ENGINE's table: base data plus the op stack. table_view tracks
+    /// only the stack DEPTH (it is generic over op types by design), so the
+    /// ops themselves live here — and the rendered rows come from
+    /// `apply()`, which is what makes a sort or filter actually do something.
+    table_engine: voiceterm_egui::table_ops::TableView,
     table_headers: Vec<String>,
     table_rows: Vec<Vec<String>>,
     /// The bundled-document reader. The view takes documents rather than
@@ -502,6 +507,33 @@ struct VoicetermApp {
     build_input: String,
     /// The workspaces page: saved workspaces + the live session.
     workspaces: voiceterm_egui::workspaces_view::WorkspacesView,
+    /// Document frequencies over the captured notes, for tag suggestion.
+    /// Rebuilt with the deck: TF-IDF against a corpus that no longer matches
+    /// the notes would suggest tags for text that is gone.
+    doc_freq: voiceterm_egui::nlp::DocFreq,
+    /// Suggested tags for the selected card.
+    tag_suggestions: Vec<String>,
+    /// Tags the user accepted, excluded from future suggestions.
+    accepted_tags: Vec<String>,
+    /// Block-summary scheduling: debounce, backoff, and yielding to voice.
+    summaries: voiceterm_egui::summary_queue::SummaryQueue,
+    /// Summaries the queue has produced, by block id.
+    summary_text: std::collections::HashMap<u64, String>,
+    /// Is the mic live? One flag, read by both the halo and the summary
+    /// queue's yield rule, so they cannot disagree.
+    /// The ambient light sensor, when the device has one. Discovered once:
+    /// a sensor does not appear mid-session, and re-scanning sysfs every
+    /// frame to learn the same answer is a syscall storm on a phone.
+    light: Option<voiceterm_egui::iio_light::IioSensor>,
+    /// The last usable reading, so a transient read error shows the previous
+    /// value rather than blanking the row.
+    light_value: Option<f64>,
+    /// Learned voice fingerprints — the LEARNING half of the same path
+    /// acoustic_cache decides with. The cache asks "is this close enough to
+    /// promote"; this is what it is close TO, and it has the caps and the
+    /// eviction rule that keep the index from growing without bound.
+    phonetics: voiceterm_egui::phonetic_store::Store,
+    glow_active: bool,
     workspaces_open: bool,
     workspaces_filter: String,
     bar_state: voiceterm_egui::bars::BarState,
@@ -684,6 +716,29 @@ impl eframe::App for VoicetermApp {
             // and the other was not.
             ui.horizontal(|ui| {
                 ui.label("summaries:");
+                // AMBIENT LIGHT. Reported as a capability, not a dead
+                // control: the module mirrors hover_kit::capability so a
+                // settings page can EXPLAIN a missing sensor instead of
+                // showing a slider that does nothing.
+                {
+                    use voiceterm_egui::iio_light::{Sample, Unit};
+                    match self.light.as_ref() {
+                        Some(s) => {
+                            if let Sample::Value(v) = s.read() { self.light_value = Some(v); }
+                            let unit = match s.unit {
+                                // Counts are RELATIVE — labelling them lux
+                                // would invite comparing two phones' numbers.
+                                Unit::Illuminance => "lux",
+                                Unit::Counts => "counts (relative)",
+                            };
+                            ui.label(match self.light_value {
+                                Some(v) => format!("ambient light: {v:.0} {unit}  [{}]", s.channel),
+                                None => format!("ambient light: sensor found, no reading  [{}]", s.channel),
+                            });
+                        }
+                        None => { ui.label("ambient light: no sensor on this device"); }
+                    }
+                }
                 for sc in voiceterm_egui::summary_scope::Scope::ALL {
                     if ui.selectable_label(self.summary_scope == sc, sc.label()).clicked() {
                         self.summary_scope = sc;
@@ -888,6 +943,53 @@ impl eframe::App for VoicetermApp {
                     });
                 });
                 ui.separator();
+                // BLOCK SUMMARIES, scheduled rather than fired. The queue
+                // debounces (a block that is still producing output is not
+                // worth summarising yet), backs off on failure, and YIELDS TO
+                // VOICE — the mic and the summariser want the same model, and
+                // the user talking wins. Gated by summary_scope, so turning
+                // summaries off means the queue is never fed rather than fed
+                // and ignored.
+                {
+                    use voiceterm_egui::summary_queue::{Action, Wait};
+                    let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+                    if self.summary_scope.terminal_enabled() {
+                        for b in &self.blocks.blocks {
+                            let id = b.id as u64;
+                            if !self.summary_text.contains_key(&id) {
+                                self.summaries.request(id, now_ms);
+                            }
+                        }
+                    }
+                    // Voice wins: the router's own state decides, so the queue
+                    // cannot disagree with what is actually listening.
+                    let voice_active = self.glow_active;
+                    match self.summaries.next_action(now_ms, voice_active) {
+                        Action::Run { block_id } => {
+                            // No summariser attached in this build. Completing
+                            // with an explicit notice keeps the queue draining
+                            // — leaving it Running forever would make the
+                            // backoff logic untestable in the app it serves.
+                            self.summary_text.insert(block_id,
+                                "(no summariser attached in this build)".into());
+                            self.summaries.complete(block_id);
+                        }
+                        Action::Wait(w) => {
+                            // The three waits are three different situations
+                            // and the drawer says which: Idle is nothing to
+                            // do, NotYet is patience, YieldToVoice is a
+                            // deliberate concession the user should see.
+                            if w != Wait::Idle {
+                                ui.colored_label(self.colors.text_weak, match w {
+                                    Wait::NotYet => format!(
+                                        "summaries: {} queued", self.summaries.len()),
+                                    Wait::YieldToVoice => "summaries paused — voice has the model".into(),
+                                    Wait::Idle => String::new(),
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some((id, action)) = blocks_drawer_ui(ui, &self.blocks.blocks, &self.colors) {
                     match action {
                         BlockAction::Rerun => {
@@ -1259,12 +1361,39 @@ impl eframe::App for VoicetermApp {
                         // what it means. Routing it through submit_with_engine
                         // rather than parsing here is what keeps table_nlp the
                         // single place a command is understood.
-                        if let Some(_line) = voiceterm_egui::table_view::table_view_ui(
-                            ui, &mut self.table, &self.table_headers, &self.table_rows, &c)
+                        // The base data lives in the engine; seed it once from
+                        // the demo rows so a fresh session has something to
+                        // transform.
+                        if self.table_engine.base.rows.is_empty() && !self.table_rows.is_empty() {
+                            self.table_engine.base = voiceterm_egui::table_ops::TableData::new(
+                                self.table_headers.clone(), self.table_rows.clone());
+                        }
+                        // RENDER THE RESULT, not the base. apply() walks the op
+                        // stack; showing base rows under a "sorted by size"
+                        // status is the exact lie this tab used to tell.
+                        let shown = self.table_engine.apply();
+                        let line = self.table.input.clone();
+                        if voiceterm_egui::table_view::table_view_ui(
+                            ui, &mut self.table, &shown.headers, &shown.rows, &c).is_some()
                         {
-                            let out = voiceterm_egui::table_view::submit_with_engine(
-                                &mut self.table);
-                            let _ = out;
+                            use voiceterm_egui::table_view::Submitted;
+                            match voiceterm_egui::table_view::submit_with_engine(&mut self.table) {
+                                // submit() is generic over op types and throws
+                                // the parsed op away, so the engine stack is
+                                // fed by re-parsing the same line. One extra
+                                // parse of a short command is the price of
+                                // that genericity — and keeping BOTH stacks in
+                                // step here is what stops the depth counter
+                                // from disagreeing with the data.
+                                Submitted::Pushed => {
+                                    if let Ok(op) = voiceterm_egui::table_nlp::parse_command(&line) {
+                                        self.table_engine.push_op(op);
+                                    }
+                                }
+                                Submitted::Undone => { self.table_engine.pop_op(); }
+                                Submitted::Reset => self.table_engine.clear_ops(),
+                                Submitted::NotUnderstood(_) => {}
+                            }
                         }
                     }
                     CentralView::Docs => {
@@ -1293,6 +1422,27 @@ impl eframe::App for VoicetermApp {
                                         self.tape_note = format!(
                                             "kept {:.1}s for {:?}",
                                             r.duration_s(), ct::sanitize_id(&r.reference));
+                                        // A KEPT TAKE IS A LEARNED FINGERPRINT.
+                                        // The store's caps and eviction rule
+                                        // apply here rather than at some later
+                                        // import step — that is what stops the
+                                        // index growing without bound, and it
+                                        // is why worth_keeping gates this and
+                                        // not the other way round.
+                                        use voiceterm_egui::phonetic_store as ps;
+                                        let today = (ui.input(|i| i.time) / 86_400.0) as u64;
+                                        self.phonetics.add(ps::Entry {
+                                            label: ct::sanitize_id(&r.reference),
+                                            style: ps::Style::Normal,
+                                            // No pitch estimator attached, so
+                                            // the sentinel bin — NOT bin 0,
+                                            // which would file every unvoiced
+                                            // capture with the deepest voices.
+                                            pitch_bin: ps::pitch_bin(None),
+                                            match_count: 0,
+                                            created_day: today,
+                                            last_matched_day: today,
+                                        });
                                     }
                                     // A take that is too short is DISCARDED and
                                     // said so. Silently keeping it would put a
@@ -1364,6 +1514,33 @@ impl eframe::App for VoicetermApp {
                             let v = ac::decide(Some(&cand), &self.acoustic);
                             let col = if v == ac::Verdict::Promote { c.success } else { c.text_weak };
                             ui.colored_label(col, format!("{v:?}"));
+                        });
+                        // THE OTHER HALF: what the cache matches AGAINST. A
+                        // kept take learns a fingerprint here; the promotion
+                        // panel above decides whether a later capture is close
+                        // enough to reuse it.
+                        ui.collapsing(format!("voice fingerprints ({})", self.phonetics.len()), |ui| {
+                            use voiceterm_egui::phonetic_store as ps;
+                            if self.phonetics.is_empty() {
+                                ui.colored_label(c.text_weak,
+                                    "nothing learned yet — a kept take adds one");
+                            }
+                            for e in self.phonetics.entries() {
+                                ui.colored_label(c.text_weak, egui::RichText::new(format!(
+                                    "{} · {:?} · bin {} · {} match(es)",
+                                    e.label, e.style, e.pitch_bin, e.match_count)).size(11.0));
+                            }
+                            // Pruning is offered rather than automatic: an
+                            // index that silently forgot a phrase between two
+                            // uses would look like the recogniser regressing.
+                            let today = (ui.input(|i| i.time) / 86_400.0) as u64;
+                            if !self.phonetics.is_empty()
+                                && ui.small_button("prune stale").clicked()
+                            {
+                                let n = self.phonetics.prune_stale(today);
+                                self.tape_note = format!("pruned {n} stale fingerprint(s)");
+                            }
+                            let _ = ps::pitch_bin(None);
                         });
                         // THE AUDIT CHAIN. Every command hashed into the
                         // previous one's hash, so an edited history fails
@@ -1575,12 +1752,48 @@ impl eframe::App for VoicetermApp {
                             let notes: Vec<(String, String)> = self.deck.cards.iter()
                                 .map(|c| (c.title.clone(), c.body.clone())).collect();
                             self.backlinks.rebuild(&notes);
+                            // The DF table is rebuilt WITH the deck, not
+                            // accumulated: TF-IDF against a corpus that no
+                            // longer matches the notes suggests tags for text
+                            // that is gone.
+                            let mut df = voiceterm_egui::nlp::DocFreq::new();
+                            for (_, body) in &notes { df.add_document(body); }
+                            self.doc_freq = df;
                         }
                         ui.separator();
                         if let Some(title) = cv::deck_ui(ui, &mut self.deck, &c) {
                             // Opening a card sets the backlink context: the
                             // panel below answers about THAT note.
                             self.backlinks.set_current(&title);
+                            // …and re-suggests tags for it. Suggestions are
+                            // per-card, so they must be recomputed on
+                            // selection rather than left showing the previous
+                            // card's terms.
+                            if let Some(card) = self.deck.selected() {
+                                self.tag_suggestions = voiceterm_egui::nlp::suggest_tags(
+                                    &card.body, &self.doc_freq, &self.accepted_tags, 6);
+                            }
+                        }
+                        if !self.tag_suggestions.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.colored_label(c.text_weak, "tags:");
+                                let mut taken = None;
+                                for tag in &self.tag_suggestions {
+                                    if ui.small_button(tag).clicked() { taken = Some(tag.clone()); }
+                                }
+                                if let Some(tag) = taken {
+                                    // Accepting a tag REMOVES it from future
+                                    // suggestions (the exclude list is the
+                                    // module's own parameter) — re-offering a
+                                    // tag the user already applied is noise.
+                                    self.tag_suggestions.retain(|t| t != &tag);
+                                    self.accepted_tags.push(tag);
+                                }
+                            });
+                        }
+                        if !self.accepted_tags.is_empty() {
+                            ui.colored_label(c.text_weak,
+                                format!("applied: {}", self.accepted_tags.join(", ")));
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -2177,6 +2390,8 @@ fn main() -> eframe::Result<()> {
                 // /sys/bus/iio/devices every repaint is a directory walk at 60
                 // Hz for a device that does not appear mid-session.
                 accel: voiceterm_egui::iio_accel::IioAccel::discover(),
+                light: voiceterm_egui::iio_light::ambient_light(),
+                light_value: None,
                 flicks: Default::default(),
                 orientation: voiceterm_egui::iio_accel::OrientationUp::Undefined,
                 progress: Default::default(),
@@ -2207,6 +2422,10 @@ fn main() -> eframe::Result<()> {
                     ]);
                     v
                 },
+                table_engine: voiceterm_egui::table_ops::TableView::new(
+                    voiceterm_egui::table_ops::TableData::new(
+                        vec!["name".into(), "size".into(), "modified".into()],
+                        Vec::new())),
                 table_headers: vec!["name".into(), "size".into(), "modified".into()],
                 table_rows: vec![
                     vec!["Cargo.toml".into(), "1204".into(), "10:19".into()],
@@ -2280,6 +2499,13 @@ fn main() -> eframe::Result<()> {
                 build: Default::default(),
                 build_input: String::new(),
                 workspaces: Default::default(),
+                doc_freq: voiceterm_egui::nlp::DocFreq::new(),
+                tag_suggestions: Vec::new(),
+                accepted_tags: Vec::new(),
+                summaries: Default::default(),
+                summary_text: std::collections::HashMap::new(),
+                phonetics: Default::default(),
+                glow_active: false,
                 workspaces_open: false,
                 workspaces_filter: String::new(),
                 bar_state: Default::default(),
