@@ -432,6 +432,14 @@ pub struct Snapclone {
     pub heard: crate::punch_addrs::Gossip,
     /// An in-flight DHT lookup: values accumulate until the search completes.
     pub dht_lookup: crate::dht_bootstrap::Lookup,
+    /// The transport half of group voice: envelopes outbound packets to every
+    /// peer and routes inbound ones back. Sits beside `group_voice`, which is
+    /// the coordinator — one decides WHO holds the floor, this one carries
+    /// the bytes and enforces that identity comes from the transport.
+    pub voice_bridge: crate::voice_bridge::VoiceBridge,
+    /// Derives the theme from the live viewfinder on a slow tick, so the
+    /// chrome tracks what the camera is pointed at without deriving at 30Hz.
+    pub ambient_camera: crate::ambient_camera::AmbientCameraDriver,
     /// Which contact the open confirm panel is about. Held separately because
     /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
     /// risk score, not a subject.
@@ -625,6 +633,8 @@ impl Snapclone {
             punch: Default::default(),
             heard: Default::default(),
             dht_lookup: Default::default(),
+            voice_bridge: Default::default(),
+            ambient_camera: crate::ambient_camera::AmbientCameraDriver::new(),
             confirm_id: String::new(),
             editor_id: String::new(),
             editor_name: String::new(),
@@ -2183,6 +2193,13 @@ impl Snapclone {
             ui.separator();
         }
 
+        // The viewfinder only exists on the camera page. Off it, the ambient
+        // driver stops rather than sampling frames nobody can see — the
+        // Backgrounded case it was written to refuse. Stated plainly here
+        // rather than hidden in a match guard's side effect.
+        if self.nav.page() != 0 {
+            self.ambient_camera.stop();
+        }
         match self.nav.page() {
             // The nav has always declared five pages — Camera, Inbox, Friends,
             // Wayfinder, Settings — and the shell routed three of them, so two
@@ -2269,8 +2286,24 @@ impl Snapclone {
         if crate::frame_pump::should_upload(&self.frames, self.cam_texture.is_some()) {
             if let Some(f) = self.frames.take() {
                 self.last_frame_ms = Some(now_ms);
+                // The ambient driver is told a frame EXISTS; it does not get
+                // the pixels. Frames arrive at ~30Hz and derivation runs on a
+                // slow tick, so the driver's job is deciding when to spend
+                // one — not holding them.
+                self.ambient_camera.on_frame();
                 let _ = f; // the pixel upload belongs to the capture backend
             }
+        }
+        // The camera page is on screen, so the driver may run; leaving it
+        // started when the page is not visible is the Backgrounded case it
+        // exists to refuse.
+        self.ambient_camera.start();
+        self.ambient_camera.set_app_active(true);
+        if self.ambient_camera_tick(now_ms) == crate::ambient_camera::Tick::Derive {
+            // No pixel access in this build: complete with nothing usable,
+            // which still clears the in-flight flag. Leaving it set would
+            // wedge the driver on Busy forever.
+            self.ambient_camera_done(None);
         }
         let vf_rect = {
             let r = ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
@@ -2780,6 +2813,67 @@ impl Snapclone {
     /// The inbox, on its own page. Was absent entirely: the app had a Peers
     /// list and no way to see a message, which is the gap that made a
     /// messaging app read as a demo.
+    /// Send a voice packet to every peer in the call.
+    ///
+    /// One encode, many sends — encoding per peer would multiply a voice
+    /// frame's cost by the group size at fifty packets a second. The peer
+    /// list comes from the coordinator, so a participant who left cannot
+    /// still be receiving audio.
+    pub fn voice_send(&mut self, p: &crate::voice_bridge::Packet)
+        -> Vec<(String, Vec<u8>)> {
+        let peers: Vec<String> = self.group_voice.participants.iter()
+            .filter(|x| !x.is_self)
+            .map(|x| x.id.clone())
+            .collect();
+        self.voice_bridge.set_peers(peers);
+        self.voice_bridge.outbound(p)
+    }
+
+    /// Route an inbound payload, applying floor changes to the coordinator.
+    ///
+    /// `sender` is the TRANSPORT's identity and the only one trusted: a
+    /// FloorAssert carries a timestamp and nothing else precisely so a peer
+    /// cannot claim the floor on someone else's behalf.
+    pub fn voice_receive(&mut self, sender: &str, payload: &[u8])
+        -> crate::voice_bridge::Inbound {
+        let out = self.voice_bridge.inbound(sender, payload);
+        if let crate::voice_bridge::Inbound::Handled { from, packet } = &out {
+            match packet {
+                crate::voice_bridge::Packet::FloorAssert { claim_ts } => {
+                    self.group_voice.floor_assert(from, *claim_ts);
+                }
+                crate::voice_bridge::Packet::FloorRelease => {
+                    self.group_voice.floor_release(from);
+                }
+                crate::voice_bridge::Packet::VoiceFrame(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Should the viewfinder's colours be re-derived this frame?
+    ///
+    /// The tick answers with a REASON, and the reasons are not
+    /// interchangeable: TooSoon is the rate limit doing its job, Busy means
+    /// the last derive has not returned (deriving again would queue work
+    /// behind work), Backgrounded means the app is off screen and sampling a
+    /// frame nobody can see is pure battery cost.
+    pub fn ambient_camera_tick(&mut self, now_ms: u64) -> crate::ambient_camera::Tick {
+        self.ambient_camera.tick(now_ms)
+    }
+
+    /// A derivation finished. `None` means it produced nothing usable, which
+    /// must still clear the in-flight flag or the driver never derives again.
+    pub fn ambient_camera_done(&mut self, sample: Option<(crate::ambient_palette::Rgb,
+                                                          crate::ambient_palette::Rgb)>) {
+        self.ambient_camera.complete(sample);
+        if let Some(pair) = self.ambient_camera.smoothed() {
+            // Smoothed, not raw: the viewfinder swings wildly as the camera
+            // moves, and an unsmoothed theme would strobe.
+            self.ambient = Some(pair);
+        }
+    }
+
     /// May a face crop with this provenance be kept?
     ///
     /// BOTH gates, and the order is not decoration: consent decides whether
@@ -4929,6 +5023,81 @@ mod gossip_wiring_tests {
         assert!(!app.export_requested);
         assert!(app.export_note.as_deref().unwrap_or("").contains("3 snaps"));
     }
+    // ── voice_bridge + ambient_camera ──
+
+    fn part(id: &str, is_self: bool) -> crate::group_voice::Participant {
+        crate::group_voice::Participant { id: id.into(), name: id.into(), is_self }
+    }
+
+    #[test]
+    fn voice_goes_to_every_peer_but_never_back_to_me() {
+        use crate::voice_bridge::Packet;
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.group_voice.set_participants(vec![part("me", true), part("bob", false),
+                                              part("carol", false)]);
+        let out = app.voice_send(&Packet::VoiceFrame(vec![1, 2, 3]));
+        assert_eq!(out.len(), 2, "both peers, not myself");
+        assert!(out.iter().all(|(_, bytes)| bytes == &out[0].1),
+                "one encode, many sends");
+        // A participant who left stops receiving audio, because the peer list
+        // is taken from the coordinator each send rather than cached.
+        app.group_voice.set_participants(vec![part("me", true), part("bob", false)]);
+        assert_eq!(app.voice_send(&Packet::VoiceFrame(vec![1])).len(), 1);
+    }
+
+    #[test]
+    fn an_inbound_floor_claim_is_credited_to_the_transports_sender() {
+        use crate::voice_bridge::{encode, Inbound, Packet};
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.group_voice.set_participants(vec![part("me", true), part("bob", false)]);
+        // Floor claims only mean anything in push-to-talk: in open mode the
+        // coordinator decides by LEVEL, and honouring a claim there would let
+        // a peer mute the room by asserting.
+        app.group_voice.mode = crate::group_voice::TalkMode::PushToTalk;
+        app.voice_bridge.set_connected(true);
+        let claim = encode(&Packet::FloorAssert { claim_ts: 42 });
+        // The packet carries only a timestamp: identity comes from the
+        // transport, so a peer cannot claim the floor for someone else.
+        let out = app.voice_receive("bob", &claim);
+        assert!(matches!(out, Inbound::Handled { .. }));
+        assert_eq!(app.group_voice.active_speaker(), Some("bob"));
+        // A non-voice payload is NOT ours — the caller must still offer it to
+        // other handlers, so it cannot be silently eaten.
+        assert_eq!(app.voice_receive("bob", b"http/1.1"), Inbound::NotOurs);
+        // A voice packet we cannot parse IS consumed: passing it on would
+        // have another subsystem parse a packet already known broken.
+        assert_eq!(app.voice_receive("bob", b"SCV1garbage"), Inbound::Malformed);
+    }
+
+    #[test]
+    fn the_camera_driver_refuses_for_distinguishable_reasons() {
+        use crate::ambient_camera::Tick;
+        let mut app = Snapclone::new_with_login(vec![], false);
+        // Stopped: nothing to sample.
+        assert_eq!(app.ambient_camera_tick(1_000), Tick::Idle);
+        app.ambient_camera.start();
+        app.ambient_camera.set_app_active(true);
+        // Started but no frame has arrived yet — still Idle, not "derive
+        // whatever is in the buffer".
+        assert_eq!(app.ambient_camera_tick(1_000), Tick::Idle);
+        app.ambient_camera.on_frame();
+        assert_eq!(app.ambient_camera_tick(1_000), Tick::Derive);
+        // In flight: deriving again would queue work behind work.
+        app.ambient_camera.on_frame();
+        assert_eq!(app.ambient_camera_tick(9_000), Tick::Busy);
+        // A derive that produced nothing usable STILL clears the flag, or the
+        // driver never derives again.
+        app.ambient_camera_done(None);
+        assert!(!app.ambient_camera.is_deriving());
+        // …and the rate limit is a separate, nameable refusal.
+        app.ambient_camera.on_frame();
+        assert_eq!(app.ambient_camera_tick(1_001), Tick::TooSoon);
+        // Off screen is its own reason: sampling a frame nobody can see is
+        // pure battery cost.
+        app.ambient_camera.set_app_active(false);
+        assert_eq!(app.ambient_camera_tick(999_000), Tick::Backgrounded);
+    }
+
     // ── decision layers: consent, firewall, bootstrap, punch addresses ──
 
     #[test]
