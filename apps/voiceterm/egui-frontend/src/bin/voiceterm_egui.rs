@@ -383,6 +383,15 @@ struct VoicetermApp {
     grid: voiceterm_egui::term_grid::TermGrid,
     /// How much of `pty_out` has already been echoed to the screen.
     pty_echoed: usize,
+    /// Which grid rows changed, fed from the grid's own dirty range.
+    row_dirty: voiceterm_egui::row_cache::RowCache,
+    /// Shaped galleys, one per row, reused while the row is unchanged.
+    ///
+    /// This caches TEXT LAYOUT, not painting. Immediate mode repaints every
+    /// visible row every frame by definition — skipping the paint is not
+    /// available and row_render's docs say so. Shaping a row into a galley is
+    /// what costs, and it is what this keeps.
+    row_galleys: voiceterm_egui::row_render::RowLayoutCache<String>,
     colors: PaletteColors,
     /// The toolbar gesture menus (QML `_pipePopup` / `_bracePopup`): press-drag-release on the
     /// `|⋯` / `{⋯}` chips at the left of the keycap bar.
@@ -1221,9 +1230,29 @@ impl eframe::App for VoicetermApp {
             // session shows the block log rather than 24 blank rows.
             if self.grid.is_dirty() || self.grid.cursor() != (0, 0) {
                 let (cx, cy) = self.grid.cursor();
+                // The grid reports WHICH rows changed; RowCache turns that into
+                // the minimal set to re-shape. take_dirty rather than
+                // dirty_rows, so the range is consumed once — reading it
+                // without clearing would mark the same rows every frame and
+                // the cache would never hit.
+                if let Some((lo, hi)) = self.grid.take_dirty() {
+                    self.row_dirty.mark_range(lo, hi);
+                }
+                let width = ui.available_width();
+                // frame_plan flushes the dirty set and INVALIDATES those
+                // slots, returning which rows need rebuilding. The return value
+                // is not iterated here — get_or_build below does the work,
+                // building exactly the invalidated rows and reusing the rest.
+                // Calling it for its effect is the point.
+                let _plan = voiceterm_egui::row_render::frame_plan(
+                    &mut self.row_dirty, &mut self.row_galleys, width);
                 egui::Frame::NONE.show(ui, |ui| {
                     for y in 0..24 {
-                        let row = self.grid.row_text(y);
+                        // A hit returns the cached string; a miss shapes it
+                        // once. row_text is the expensive part on a wide grid,
+                        // and the closure means an unchanged row never calls it.
+                        let Some(row) = self.row_galleys
+                            .get_or_build(y, || self.grid.row_text(y)) else { continue };
                         if row.trim().is_empty() && y > cy { continue; }
                         // The cursor row is marked rather than drawn as a
                         // block: this is a monospace label, not a canvas, and a
@@ -1233,7 +1262,6 @@ impl eframe::App for VoicetermApp {
                         ui.label(egui::RichText::new(txt).monospace().small());
                     }
                 });
-                self.grid.take_dirty();
             }
             if let Some(line) = submitted {
                 // A submitted line goes to the same place, newline included: a
@@ -1580,6 +1608,8 @@ fn main() -> eframe::Result<()> {
                 // that queries COLUMNS gets a plausible answer rather than 0.
                 grid: voiceterm_egui::term_grid::TermGrid::new(80, 24),
                 pty_echoed: 0,
+                row_dirty: voiceterm_egui::row_cache::RowCache::new(24),
+                row_galleys: voiceterm_egui::row_render::RowLayoutCache::new(),
                 colors,
                 pipe_menu: pipe_slide_menu("voiceterm-pipe-menu"),
                 // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
