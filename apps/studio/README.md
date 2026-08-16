@@ -1172,3 +1172,23 @@ bus into a reverb replaces the drums with reverb, while SENDING gives it a
 copy — two tests pin exactly that distinction (a send raises the mix's
 energy over the dry path; muting the return brings the dry mix back
 unchanged; level scales the copy).
+
+
+**Autotune, print-side — where its own docs say it belongs.** `studio-fx::
+autotune` (retune's brain + psola's hands) has been complete and unwired;
+the tempting move was a chain effect kind, and it would have been wrong:
+the module is explicitly a whole-buffer pass — epoch continuity and the
+ratio track both need more context than a realtime callback has — so a
+chain effect that silently required the whole take would be a lie about
+what chains are. Instead the shell exposes it as a take-bounce: select a
+clip, pick a key and mode, "tune take", and the corrected version lands as
+a NEW source and clip beside the dry one (a new recording, not an edit in
+place: the dry take stays on disk, stays undoable, stays audible to a peer,
+and A/B is a mute away). It goes to the first audio track with room, the
+same rule import follows. Tests pin a 452 Hz take pulled home toward A440
+in A minor, identical length so it still lines up with the beat, both ops
+undoable, and refusals said out loud for no-selection and for a clip whose
+media has not arrived yet — tuning an absent source would land a silent
+'take' you would only discover later. Live-monitor autotune remains what
+the module says it is: separate work needing a streaming wrapper that
+carries epoch and ratio state across calls.

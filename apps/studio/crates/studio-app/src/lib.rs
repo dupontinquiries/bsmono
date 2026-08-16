@@ -189,6 +189,85 @@ impl Studio {
         Ok(inverse)
     }
 
+    /// Run the selected clip's source through print-side autotune and land
+    /// the result as a NEW source and clip on the same track, muting the
+    /// original in place of deleting it.
+    ///
+    /// Print-side, not live: `studio_fx::autotune` is explicitly a
+    /// whole-buffer pass (epoch continuity and the ratio track both need
+    /// more context than a realtime callback has), so it is deliberately NOT
+    /// registered as a chain effect kind — a chain effect that silently
+    /// needed the whole take would be a lie about what chains are. This is
+    /// the shape the module's own docs name as correct: bounce a take
+    /// through it.
+    ///
+    /// A new source rather than an edit in place, because the tuned take is
+    /// a different recording: the dry one stays on disk, stays undoable,
+    /// stays something a peer can hear, and A/B is a mute toggle away.
+    /// Channels are tuned independently (each with its own detector), which
+    /// is right for the mono vocal takes this exists for; a wide stereo take
+    /// can in principle drift between sides, and mixing to mono first would
+    /// be a bigger lie than the drift.
+    pub fn autotune_selected(
+        &mut self,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+        scale: studio_fx::retune::Scale,
+    ) -> Option<(studio_core::SourceId, studio_audio::SourceAudio)> {
+        let Some(clip_id) = self.selection.first().copied() else {
+            self.status = "autotune: select a clip first".into();
+            return None;
+        };
+        let clip = self.session.doc.project.clips.get(&clip_id)?.clone();
+        let Some(audio) = sources.get(&clip.source) else {
+            self.status = "autotune: that clip's audio is not loaded".into();
+            return None;
+        };
+        let rate = audio.sample_rate;
+        let tuned: Vec<Vec<f32>> = audio.channels.iter().enumerate().map(|(i, ch)| {
+            let mut a = studio_fx::autotune::AutotuneChannel::new(
+                scale, rate as f32, 0xA07 + i as u64);
+            a.process_buffer(ch)
+        }).collect();
+        let tuned = studio_audio::SourceAudio { sample_rate: rate, channels: tuned };
+
+        let id = studio_core::SourceId(
+            self.session.doc.project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        let new_clip = studio_core::ClipId(
+            self.session.doc.project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        let old = self.session.doc.project.sources.get(&clip.source)?.clone();
+        let path = format!("tuned/{}-{}.wav",
+            std::path::Path::new(&old.path).file_stem()
+                .and_then(|s| s.to_str()).unwrap_or("take"), id.0);
+        self.edit(studio_core::Op::AddSource { source: studio_core::Source {
+            id, path, len: studio_core::Ticks::from_samples(tuned.frames() as i64, rate),
+            sample_rate: rate, channels: tuned.channels.len() as u16, has_video: false,
+        } }, "tuned");
+        // The tuned copy needs somewhere to live: the same track is occupied
+        // by the dry take, so it goes to the first audio track with room —
+        // the rule import already follows, rather than refusing outright.
+        let end = studio_core::Ticks(clip.pos.0 + clip.len.0);
+        let project = &self.session.doc.project;
+        let track = project.tracks.iter()
+            .filter(|t| t.kind == studio_core::TrackKind::Audio && !t.locked)
+            .find(|t| !project.clips.values()
+                .any(|c| c.track == t.id && c.pos < end && c.end() > clip.pos))
+            .map(|t| t.id);
+        let Some(track) = track else {
+            self.status = "autotune: no audio track has room beside the take".into();
+            return None;
+        };
+        self.edit(studio_core::Op::AddClip { clip: studio_core::Clip {
+            id: new_clip, source: id, track, pos: clip.pos,
+            src_in: clip.src_in, len: clip.len, gain: clip.gain,
+            effects: clip.effects.clone(),
+        } }, "tuned");
+        self.selection = vec![new_clip];
+        self.status = format!("tuned the take into '{}'",
+            self.session.doc.project.tracks.iter().find(|t| t.id == track)
+                .map(|t| t.name.clone()).unwrap_or_default());
+        Some((id, tuned))
+    }
+
     /// Write the whole session — project, edit history, rack — to `path`
     /// in the collab file format. Media is NOT embedded: sources keep their
     /// paths (the compressed originals and the bounce WAVs already on
@@ -962,6 +1041,8 @@ pub struct App {
     library: Vec<library::LibraryEntry>,
     library_open: bool,
     export_rate: u32,
+    tune_root: u8,
+    tune_mode: studio_fx::retune::Mode,
     /// Velocity source for playing mode. `NullAnalog` today; a Wooting
     /// binding drops in here (see playkeys' docs).
     analog: Box<dyn studio_egui::playkeys::AnalogSource>,
@@ -1028,6 +1109,7 @@ impl Default for App {
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
               export_rate: 48_000,
+              tune_root: 0, tune_mode: studio_fx::retune::Mode::Minor,
               analog: Box::new(analog),
               loaded: SinkContent::Nothing }
     }
@@ -1078,6 +1160,50 @@ impl eframe::App for App {
                 if m == studio_egui::playkeys::InputMode::Playing {
                     ui.label("oct");
                     ui.add(egui::DragValue::new(&mut self.studio.octave).range(-2..=2));
+                }
+                // Print-side autotune on the selected clip. Key and mode
+                // live here rather than in a dialog: two clicks from
+                // noticing a flat take to hearing a tuned one.
+                if !self.studio.selection.is_empty() {
+                    egui::ComboBox::from_id_salt("tune-key")
+                        .selected_text(format!("{} {}",
+                            ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+                                [self.tune_root as usize % 12],
+                            match self.tune_mode {
+                                studio_fx::retune::Mode::Minor => "min",
+                                studio_fx::retune::Mode::HarmonicMinor => "harm",
+                                studio_fx::retune::Mode::Chromatic => "chrom",
+                            }))
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for (i, n) in ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+                                .iter().enumerate() {
+                                ui.selectable_value(&mut self.tune_root, i as u8, *n);
+                            }
+                            ui.separator();
+                            for (m, n) in [(studio_fx::retune::Mode::Minor, "minor"),
+                                           (studio_fx::retune::Mode::HarmonicMinor, "harmonic"),
+                                           (studio_fx::retune::Mode::Chromatic, "chromatic")] {
+                                ui.selectable_value(&mut self.tune_mode, m, n);
+                            }
+                        });
+                    if ui.button("tune take")
+                        .on_hover_text("print-side autotune → a new clip beside the dry one")
+                        .clicked()
+                    {
+                        let scale = studio_fx::retune::Scale {
+                            root: self.tune_root, mode: self.tune_mode };
+                        if let Some((id, audio)) = self.studio.autotune_selected(&self.audio, scale) {
+                            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                            if let Ok(bytes) = studio_audio::export::export_wav_dithered_bytes(
+                                &audio.channels[0], audio.channels.len() as u16,
+                                audio.sample_rate, id.0)
+                            {
+                                self.studio.register_asset(id, &bytes);
+                            }
+                            self.audio.insert(id, audio);
+                        }
+                    }
                 }
                 if ui.button("save").clicked()
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
@@ -2655,5 +2781,84 @@ mod midi_shell_tests {
         // And a count-in (negative position) lands on a real step, not a panic.
         s.transport.set_position(Ticks(-step_len.0 * 2));
         assert!(s.recording_step() < steps as u32);
+    }
+}
+
+#[cfg(test)]
+mod autotune_take_tests {
+    use super::*;
+    use studio_fx::retune::{Mode, Scale};
+
+    /// A detuned sine, long enough for several analysis hops.
+    fn detuned_take(hz: f32, secs: f32) -> studio_audio::SourceAudio {
+        let n = (48_000.0 * secs) as usize;
+        let ch: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / 48_000.0 * hz * std::f32::consts::TAU).sin() * 0.5)
+            .collect();
+        studio_audio::SourceAudio { sample_rate: 48_000, channels: vec![ch] }
+    }
+
+    fn studio_with_take() -> (Studio, std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>) {
+        let mut s = Studio::demo();
+        // 452 Hz: a badly sharp A4 (440). In A minor it must come home to A.
+        let take = detuned_take(452.0, 1.0);
+        s.transport.set_position(Ticks::ZERO);
+        let id = s.import_clip("vox", "takes/vox.wav", &take).expect("lands");
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(id, take);
+        let clip = *s.session.doc.project.clips.iter()
+            .find(|(_, c)| c.source == id).map(|(k, _)| k).unwrap();
+        s.selection = vec![clip];
+        (s, sources)
+    }
+
+    #[test]
+    fn tuning_a_take_pulls_it_toward_the_key_and_keeps_the_dry_one() {
+        let (mut s, sources) = studio_with_take();
+        let clips_before = s.session.doc.project.clips.len();
+        let (id, tuned) = s.autotune_selected(&sources, Scale { root: 9, mode: Mode::Minor })
+            .expect("tuned");
+
+        assert_eq!(s.session.doc.project.clips.len(), clips_before + 1,
+                   "the tuned take is a NEW clip; the dry one survives for A/B");
+        assert_eq!(tuned.frames(), sources.values().next().unwrap().frames(),
+                   "same length — a tuned take still lines up with the beat");
+
+        // Measure the result's pitch the same way the tuner does.
+        let mid = &tuned.channels[0][12_000..24_000];
+        let got = studio_fx::retune::yin_pitch(mid, 48_000.0, 80.0, 1000.0, 0.15)
+            .expect("the tuned take still has a detectable pitch");
+        assert!((got.hz - 440.0).abs() < (452.0 - 440.0) * 0.5,
+                "pulled toward A440, landed at {:.1} Hz", got.hz);
+        // And the new source is real in the project.
+        assert!(s.session.doc.project.sources.contains_key(&id));
+    }
+
+    #[test]
+    fn tuning_is_undoable_as_the_two_ops_it_is() {
+        let (mut s, sources) = studio_with_take();
+        let before = s.session.doc.project.clone();
+        s.autotune_selected(&sources, Scale { root: 9, mode: Mode::Minor }).expect("tuned");
+        s.key(studio_egui::keys::Key::c('u'));
+        s.key(studio_egui::keys::Key::c('u'));
+        assert_eq!(s.session.doc.project, before, "AddSource + AddClip, both taken back");
+    }
+
+    #[test]
+    fn with_nothing_selected_it_says_so_instead_of_guessing() {
+        let (mut s, sources) = studio_with_take();
+        s.selection.clear();
+        assert!(s.autotune_selected(&sources, Scale { root: 0, mode: Mode::Minor }).is_none());
+        assert!(s.status.contains("select a clip"), "status was {:?}", s.status);
+    }
+
+    #[test]
+    fn a_clip_whose_audio_is_not_loaded_refuses_rather_than_tuning_silence() {
+        // A peer's clip before its media arrives: tuning an absent source
+        // would land a silent "take" the user would have to discover later.
+        let (mut s, _) = studio_with_take();
+        assert!(s.autotune_selected(&Default::default(),
+                                    Scale { root: 9, mode: Mode::Minor }).is_none());
+        assert!(s.status.contains("not loaded"), "status was {:?}", s.status);
     }
 }
