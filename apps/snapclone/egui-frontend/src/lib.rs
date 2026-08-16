@@ -420,6 +420,18 @@ pub struct Snapclone {
         std::collections::HashMap<String, crate::landmark_hash::Fingerprint>,
     /// Diagnostic channels the user can switch on.
     pub trace: crate::trace_channels::TraceControl,
+    /// Whether face detection may run at all. Revoked is distinct from
+    /// NotGiven because it means an erase is OWED — the app has to know it
+    /// once had crops to delete.
+    pub face_consent: crate::face_consent::Consent,
+    /// Where a peer was last reachable. The hole-punching half of the DHT:
+    /// entries expire, because an address nobody has confirmed in minutes is
+    /// a guess presented as a fact.
+    pub punch: crate::punch_addrs::PunchAddrs,
+    /// Who has been heard from lately, newest first.
+    pub heard: crate::punch_addrs::Gossip,
+    /// An in-flight DHT lookup: values accumulate until the search completes.
+    pub dht_lookup: crate::dht_bootstrap::Lookup,
     /// Which contact the open confirm panel is about. Held separately because
     /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
     /// risk score, not a subject.
@@ -609,6 +621,10 @@ impl Snapclone {
             active_synthetic: None,
             landmark_prints: std::collections::HashMap::new(),
             trace: Default::default(),
+            face_consent: crate::face_consent::Consent::NotGiven,
+            punch: Default::default(),
+            heard: Default::default(),
+            dht_lookup: Default::default(),
             confirm_id: String::new(),
             editor_id: String::new(),
             editor_name: String::new(),
@@ -2628,6 +2644,42 @@ impl Snapclone {
         // whole point of the module: the C++ it replaces used setFilterRules,
         // so switching one channel on silently switched every other off —
         // including one enabled from the command line a moment earlier.
+        // FACE DETECTION CONSENT. A control, not a notice: the module's
+        // argument is that consent decides whether the work HAPPENS, so the
+        // switch has to be reachable.
+        ui.collapsing("faces", |ui| {
+            use crate::face_consent::Consent;
+            let mut granted = self.face_consent.may_detect();
+            if ui.checkbox(&mut granted, "allow face detection").changed() {
+                let owes = self.set_face_consent(
+                    if granted { Consent::Granted } else { Consent::Revoked });
+                if owes {
+                    // Revoked is not NotGiven: crops already exist and are
+                    // owed an erase. Said in plain state, the pattern this
+                    // app already uses — it has no toast system, and adding
+                    // one to report this would be the tail wagging the dog.
+                    self.shutter_note = "face data will be erased".into();
+                }
+            }
+            ui.colored_label(c.text_weak, match self.face_consent {
+                Consent::NotGiven => "never asked — no detection runs",
+                Consent::Granted => "detection may run on your own and received photos",
+                Consent::Revoked => "revoked — erase owed",
+            });
+        });
+        // NETWORK REACH. Where peers were last seen, with the expiry that
+        // keeps a stale address from reading as a live one.
+        ui.collapsing(format!("network ({} heard)", self.heard.len()), |ui| {
+            if self.heard.is_empty() {
+                ui.colored_label(c.text_weak, "nobody heard from yet");
+            }
+            for p in self.heard.recent().iter().take(8) {
+                ui.colored_label(c.text_weak, egui::RichText::new(format!(
+                    "{} · {}.{}.{}.{}:{}", p.sc_id,
+                    p.addr.ip[0], p.addr.ip[1], p.addr.ip[2], p.addr.ip[3], p.addr.port))
+                    .size(11.0));
+            }
+        });
         ui.collapsing("diagnostics", |ui| {
             use crate::trace_channels::Channel;
             for ch in Channel::ALL {
@@ -2728,6 +2780,68 @@ impl Snapclone {
     /// The inbox, on its own page. Was absent entirely: the app had a Peers
     /// list and no way to see a message, which is the gap that made a
     /// messaging app read as a demo.
+    /// May a face crop with this provenance be kept?
+    ///
+    /// BOTH gates, and the order is not decoration: consent decides whether
+    /// detection runs AT ALL (not "runs and discards" — that is why revoking
+    /// saves battery rather than costing it), and provenance decides whether
+    /// a particular crop may be stored even when it does. A face in a photo
+    /// the user took is a stranger who never initiated the data flow.
+    pub fn may_store_face(&self, p: crate::face_consent::Provenance) -> bool {
+        self.face_consent.may_detect() && p.may_store()
+    }
+
+    /// Set consent, reporting whether an erase is now owed.
+    ///
+    /// Revoked is deliberately distinct from NotGiven: the app has to know it
+    /// once had crops to delete, and treating the two the same would leave
+    /// them on disk.
+    pub fn set_face_consent(&mut self, c: crate::face_consent::Consent) -> bool {
+        self.face_consent = c;
+        c.owes_erase()
+    }
+
+    /// Which firewall backend this machine can use, and whether it will
+    /// interrupt the user.
+    ///
+    /// Eight backends tried in order, first success wins, because the same
+    /// app ships to Fedora, Ubuntu, Alpine, a Flatpak sandbox and a container.
+    /// `None` is a real answer — no backend means say so rather than silently
+    /// not opening a port.
+    pub fn firewall_plan(&self, env: &crate::firewall_backend::Environment,
+                         port: u16)
+        -> Option<(crate::firewall_backend::Backend, bool)> {
+        let req = crate::firewall_backend::PortRequest { port, tcp: false };
+        // A privileged port is not something to ask about at all.
+        if !req.is_sane() { return None; }
+        let b = crate::firewall_backend::detect(env)?;
+        Some((b, b.is_silent()))
+    }
+
+    /// The bootstrap servers to try, in order.
+    ///
+    /// `dns_working` picks host or IP per server — the host survives an
+    /// address change, the IP survives a broken resolver, and a network that
+    /// breaks one usually leaves the other. `web_ports_only` is the hostile
+    /// case: a network that permits 80/443 and nothing else.
+    pub fn bootstrap_addresses(&self, dns_working: bool, web_ports_only: bool)
+        -> Vec<String> {
+        crate::dht_bootstrap::ordered_for(web_ports_only).into_iter()
+            .map(|s| crate::dht_bootstrap::address_for(s, dns_working))
+            .collect()
+    }
+
+    /// A peer was reached at this address. Expiring entries is the point: an
+    /// address nobody has confirmed in minutes is a guess wearing a fact's
+    /// clothes.
+    pub fn note_peer_addr(&mut self, id: &str, ip: [u8; 4], port: u16, now_ms: u64) {
+        let addr = crate::punch_addrs::PeerAddr::new(ip, port);
+        self.punch.set(id, addr, now_ms);
+        self.heard.insert(crate::punch_addrs::GossipPeer {
+            sc_id: id.to_string(), addr, seen_ms: now_ms,
+        });
+    }
+
     /// Record a landmark fingerprint under `id`.
     ///
     /// Refuses an invalid one rather than storing it. A wrong-length hash
@@ -4815,6 +4929,86 @@ mod gossip_wiring_tests {
         assert!(!app.export_requested);
         assert!(app.export_note.as_deref().unwrap_or("").contains("3 snaps"));
     }
+    // ── decision layers: consent, firewall, bootstrap, punch addresses ──
+
+    #[test]
+    fn face_storage_needs_both_consent_and_provenance() {
+        use crate::face_consent::{Consent, Provenance};
+        let mut app = Snapclone::new_with_login(vec![], false);
+        // No consent: nothing stores, whatever the provenance.
+        assert!(!app.may_store_face(Provenance::SelfCapture));
+        assert!(!app.set_face_consent(Consent::Granted), "granting owes no erase");
+        assert!(app.may_store_face(Provenance::SelfCapture));
+        assert!(app.may_store_face(Provenance::ReceivedFromContact));
+        // A stranger in a photo the user took never initiated the data flow,
+        // and consent does not speak for them.
+        assert!(!app.may_store_face(Provenance::ThirdPartyInCapture));
+        assert!(!app.may_store_face(Provenance::Unknown));
+        // Revoking is not the same as never asking: an erase is owed.
+        assert!(app.set_face_consent(Consent::Revoked));
+        assert!(!app.may_store_face(Provenance::SelfCapture));
+    }
+
+    #[test]
+    fn the_firewall_prefers_a_silent_backend_and_refuses_a_privileged_port() {
+        use crate::firewall_backend::{Backend, Environment};
+        let app = Snapclone::new_with_login(vec![], false);
+        let base = Environment {
+            has_firewalld_dbus: false, has_ufw_dbus: false, in_flatpak: false,
+            has_firewall_cmd: false, has_ufw_cli: false, has_iptables: true,
+            has_nft: false, has_pkexec: true, is_root: false,
+        };
+        // Only pkexec available: usable, but NOT silent — it shows a prompt,
+        // and the caller needs to know before it interrupts someone.
+        let (b, silent) = app.firewall_plan(&base, 7000).unwrap();
+        assert_eq!(b, Backend::Pkexec);
+        assert!(!silent);
+        // firewalld wins when present, and asks nobody.
+        let fd = Environment { has_firewalld_dbus: true, ..base };
+        let (b, silent) = app.firewall_plan(&fd, 7000).unwrap();
+        assert_eq!(b, Backend::Firewalld);
+        assert!(silent);
+        // A privileged port is not something to ask about at all.
+        assert!(app.firewall_plan(&fd, 80).is_none());
+        // No backend at all is a real answer, not a silent no-op.
+        let none = Environment { has_iptables: false, has_pkexec: false, ..base };
+        assert!(app.firewall_plan(&none, 7000).is_none());
+    }
+
+    #[test]
+    fn bootstrap_falls_back_to_ip_and_can_restrict_to_web_ports() {
+        let app = Snapclone::new_with_login(vec![], false);
+        let with_dns = app.bootstrap_addresses(true, false);
+        let no_dns = app.bootstrap_addresses(false, false);
+        assert!(!with_dns.is_empty());
+        assert_ne!(with_dns, no_dns, "a broken resolver takes the IP route");
+        // The hostile network REORDERS rather than filters: web-friendly
+        // ports are tried first, and the standard-port servers stay on the
+        // list as fallback. Dropping them would turn "this network is
+        // restrictive" into "this network has no DHT", which is a different
+        // and usually wrong claim.
+        let web = app.bootstrap_addresses(true, true);
+        assert_eq!(web.len(), with_dns.len(), "nothing is dropped, only reordered");
+        assert_ne!(web, with_dns, "but the order changed");
+        let first = &web[0];
+        assert!(!first.ends_with(&format!(":{}", crate::dht_bootstrap::PORT_STANDARD)),
+                "a web-port server leads");
+    }
+
+    #[test]
+    fn a_peer_address_expires_rather_than_being_believed_forever() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.note_peer_addr("sc-abc", [192, 168, 1, 9], 7000, 1_000);
+        assert!(app.punch.contains("sc-abc"));
+        assert_eq!(app.heard.len(), 1);
+        // Long enough later, the address is a guess wearing a fact's clothes.
+        let dropped = app.punch.expire(1_000 + 60 * 60 * 1000);
+        assert_eq!(dropped, 1);
+        assert!(!app.punch.contains("sc-abc"));
+        let purged = app.heard.purge_stale(1_000 + 60 * 60 * 1000, 60_000);
+        assert_eq!(purged, 1);
+    }
+
     // ── scroll_passthrough / ambient_inbox / landmark_hash / trace_channels ──
 
     #[test]
