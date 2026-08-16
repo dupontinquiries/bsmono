@@ -55,9 +55,14 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
         return None;
     }
     let version = u16::from_le_bytes(blob[4..6].try_into().ok()?);
-    if version != 1 {
-        // Refused rather than guessed: a future layout read as v1 would produce
-        // plausible-looking garbage geometry.
+    if version != 2 {
+        // Refused rather than guessed: a v1 pack read as v2 walks off the end
+        // of the buffer, and a future layout read as v2 would produce
+        // plausible-looking garbage geometry. Both are worse than an error.
+        //
+        // v1 packs are upgraded in place by tools/pack_upgrade.py, which
+        // transcodes the CODES rather than re-quantising the floats — so the
+        // upgrade is lossless by construction, not by measurement.
         return None;
     }
     let poses = u16::from_le_bytes(blob[6..8].try_into().ok()?) as usize;
@@ -68,6 +73,14 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
     let hi = f32::from_le_bytes(blob[12..16].try_into().ok()?);
 
     let mut off = 16usize;
+    // v2 writes a range table PER POSE, because the same strip can lay its
+    // parts out in a different order in each pose. Skipped rather than read:
+    // this decoder returns the whole buffer, and the ranges only matter to the
+    // packer, which uses them to decide what to quantise.
+    for _ in 0..poses {
+        let nr = u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize;
+        off += 4 + nr * 8;
+    }
     let mut lens = Vec::with_capacity(poses);
     for _ in 0..poses {
         lens.push(u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize);
@@ -89,17 +102,39 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
     None
 }
 
-/// u16 stream back to float32 bytes.
+/// v2 body back to float32 bytes.
+///
+/// Undoes three transforms in reverse: byte planes -> per-axis deltas -> codes.
+/// The layout exists because a ring of vertices varies smoothly along each
+/// axis, and interleaved xyz hides that from the compressor — consecutive bytes
+/// come from different axes, so a smooth run looks like noise.
 fn dequantise(q: &[u8], lo: f32, hi: f32, out_bytes: usize) -> Vec<u8> {
     // Span of zero is a degenerate model — every vertex at one coordinate. The
     // packer writes 1.0 in that case; matching it here keeps the two ends of
     // the format agreeing rather than producing NaN.
     let span = if hi > lo { hi - lo } else { 1.0 };
     let n = out_bytes / 4;
+    let half = q.len() / 2;
+    // High plane then low plane, so a code is assembled from two ends.
+    let code = |i: usize| -> u16 {
+        ((q[i] as u16) << 8) | (q[half + i] as u16)
+    };
+    let per = n / 3;
+    let mut vals = vec![0f32; n];
+    let mut at = 0usize;
+    for k in 0..3 {
+        let mut prev: u16 = 0;
+        for j in 0..per {
+            // Wrapping, matching the packer: deltas are stored mod 2^16 rather
+            // than signed, so a negative step arrives as a large positive one
+            // and wraps back here.
+            prev = if j == 0 { code(at) } else { prev.wrapping_add(code(at)) };
+            vals[j * 3 + k] = lo + prev as f32 / 65535.0 * span;
+            at += 1;
+        }
+    }
     let mut out = Vec::with_capacity(out_bytes);
-    for i in 0..n {
-        let u = u16::from_le_bytes([q[i * 2], q[i * 2 + 1]]) as f32;
-        let v = lo + u / 65535.0 * span;
+    for v in vals {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
@@ -118,25 +153,47 @@ fn inflate(data: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Build a v2 pack the way pack_bots.py does, so the tests exercise the
+    /// real layout rather than a convenient one.
     fn pack(lo: f32, hi: f32, poses: &[Vec<f32>]) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
-        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
         out.extend_from_slice(&(poses.len() as u16).to_le_bytes());
         out.extend_from_slice(&lo.to_le_bytes());
         out.extend_from_slice(&hi.to_le_bytes());
+        // A range table per pose. Empty here: these tests feed raw float
+        // vectors, and the decoder skips the tables anyway.
+        for _ in poses {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
         for p in poses {
             out.extend_from_slice(&((p.len() * 4) as u32).to_le_bytes());
         }
         let span = if hi > lo { hi - lo } else { 1.0 };
         for p in poses {
-            let mut q = Vec::new();
-            for v in p {
-                let u = (((v - lo) / span) * 65535.0).round() as u16;
-                q.extend_from_slice(&u.to_le_bytes());
+            let codes: Vec<u16> = p.iter()
+                .map(|v| (((v - lo) / span) * 65535.0).round() as u16)
+                .collect();
+            let n = codes.len() / 3;
+            let mut planes: Vec<u16> = Vec::new();
+            for k in 0..3 {
+                let ch: Vec<u16> = (0..n).map(|j| codes[j * 3 + k]).collect();
+                if ch.is_empty() { continue; }
+                planes.push(ch[0]);
+                let mut prev = ch[0];
+                for &v in &ch[1..] {
+                    planes.push(v.wrapping_sub(prev));
+                    prev = v;
+                }
             }
-            let c = miniz_oxide::deflate::compress_to_vec_zlib(&q, 6);
+            let mut body: Vec<u8> = planes.iter().map(|v| (v >> 8) as u8).collect();
+            body.extend(planes.iter().map(|v| (*v & 0xFF) as u8));
+            let c = miniz_oxide::deflate::compress_to_vec_zlib(&body, 6);
+            let rest = miniz_oxide::deflate::compress_to_vec_zlib(&[], 6);
             out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(rest.len() as u32).to_le_bytes());
             out.extend_from_slice(&c);
+            out.extend_from_slice(&rest);
         }
         out
     }
@@ -196,10 +253,11 @@ mod tests {
 
     #[test]
     fn a_future_version_is_refused_rather_than_guessed() {
-        // Read as v1, a new layout produces plausible-looking garbage geometry
-        // rather than an error — the worst outcome available.
+        // Read as the current version, a new layout produces plausible-looking
+        // garbage geometry rather than an error — the worst outcome available.
+        // The same guard is what makes a leftover v1 pack an error too.
         let mut blob = pack(0.0, 1.0, &[vec![0.0], vec![1.0]]);
-        blob[4] = 2;
+        blob[4] = 3;
         assert!(decode_pose(&blob, 0).is_none());
     }
 
