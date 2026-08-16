@@ -305,6 +305,10 @@ pub struct Snapclone {
     pub sink: crate::sink_cushion::Playout,
     /// Cushion depth and frame size, from the call's settings.
     pub sink_latency: crate::sink_cushion::Latency,
+    /// The transmit half. The Opus encoder, the mic and the socket stay with
+    /// the host; this owns WHEN a frame may leave and WHAT SEQUENCE it carries
+    /// — the two things the receiver depends on.
+    pub sender: crate::voice_send::VoiceSender,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -464,6 +468,7 @@ impl Snapclone {
             sink: Default::default(),
             // 20 ms frames, the value snap_frame_ms normalises toward.
             sink_latency: crate::sink_cushion::Latency::from_settings(2, 8, 20),
+            sender: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -659,6 +664,32 @@ impl Snapclone {
     /// that one.
     pub fn handshake_retry(&self, attempt: u32) -> Option<u64> {
         crate::handshake::next_retry_ms(attempt)
+    }
+
+    /// Ask whether this captured frame may go out, and with what sequence.
+    ///
+    /// The Qt contract the receiver relies on: sequence numbers restart at 0
+    /// each talk-spurt and the first frame is flagged TALKSPURT_START so the
+    /// receiver resets its jitter buffer cleanly.
+    ///
+    /// Worth stating why both halves being present matters. Porting the sender
+    /// found a bug in the receiver: its drop-late-frames rule made a second
+    /// spurt — restarting at 0 — look exactly like a flood of very late
+    /// packets, and it ate the whole spurt. The receiver had passed its tests
+    /// because every test fed it ONE spurt. The defect lived only in the
+    /// relationship between the two, so wiring one without the other leaves
+    /// exactly the gap that hid it.
+    pub fn voice_frame(&mut self) -> crate::voice_send::Emit {
+        self.sender.on_frame()
+    }
+
+    /// Start or stop a talk-spurt.
+    ///
+    /// Separate from the call state: joining a room is not the same as
+    /// speaking, and a sender that transmits from the moment of joining sends
+    /// silence at everyone for the length of the call.
+    pub fn set_transmitting(&mut self, on: bool) {
+        self.sender.set_transmitting(on);
     }
 
     /// Hand the audio sink its frames for this tick.
@@ -1289,6 +1320,13 @@ impl Snapclone {
         } else {
             self.group_voice.leave();
             self.playout.stop();
+            // Stop talking as well as listening. The reset happens on the way
+            // UP — set_transmitting(true) is what zeroes seq and arms
+            // spurt_pending — so a sender left `transmitting` across a call
+            // boundary never sees that edge, and the next spurt continues the
+            // old sequence instead of restarting at 0. The receiver then has no
+            // TALKSPURT_START to reset its jitter buffer on.
+            self.sender.set_transmitting(false);
             // The sink primes itself: push() flips `started` once the queue
             // reaches jitter_target, which is prime-then-play rather than an
             // explicit start. Leaving the call would have been inventing an
@@ -3673,6 +3711,75 @@ mod gossip_wiring_tests {
             let got = s.view_for_storage()[0].last_seen_ms;
             assert!(got <= t, "{t} bucketed forward to {got}");
         }
+    }
+
+    #[test]
+    fn nothing_leaves_before_the_user_speaks() {
+        // Joining a room is not speaking. A sender transmitting from the moment
+        // of joining sends silence at everyone for the length of the call.
+        use crate::voice_send::Emit;
+        let mut s = Snapclone::new(vec![]);
+        assert!(matches!(s.voice_frame(), Emit::Gated));
+    }
+
+    #[test]
+    fn each_spurt_restarts_at_zero_and_flags_its_first_frame() {
+        // The Qt contract the receiver depends on. Porting the sender is what
+        // exposed that the receiver ate a second spurt entirely, because
+        // restarting at 0 looked like a flood of very late packets.
+        use crate::voice_send::Emit;
+        let mut s = Snapclone::new(vec![]);
+        s.sender.set_encoder_ready(true);
+        s.set_transmitting(true);
+        match s.voice_frame() {
+            Emit::Send { seq, talkspurt_start } => {
+                assert_eq!(seq, 0);
+                assert!(talkspurt_start, "first frame must flag the spurt");
+            }
+            other => panic!("{other:?}"),
+        }
+        match s.voice_frame() {
+            Emit::Send { seq, talkspurt_start } => {
+                assert_eq!(seq, 1);
+                assert!(!talkspurt_start, "only the FIRST frame is flagged");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Second spurt: back to 0, flagged again.
+        s.set_transmitting(false);
+        s.set_transmitting(true);
+        assert!(matches!(s.voice_frame(),
+                         Emit::Send { seq: 0, talkspurt_start: true }));
+    }
+
+    #[test]
+    fn leaving_a_call_stops_transmission() {
+        // The reset happens on the way UP, so a sender left transmitting across
+        // a call boundary never sees that edge and the next spurt continues the
+        // old sequence — leaving the receiver with no TALKSPURT_START to reset
+        // its jitter buffer on.
+        let mut s = Snapclone::new(vec![]);
+        s.sender.set_encoder_ready(true);
+        s.set_transmitting(true);
+        s.voice_frame();
+        s.set_in_call(false);
+        assert!(!s.sender.is_transmitting(), "still talking after the call ended");
+    }
+
+    #[test]
+    fn a_missing_encoder_is_reported_once_not_fifty_times_a_second() {
+        use crate::voice_send::Emit;
+        let mut s = Snapclone::new(vec![]);
+        // encoder_ready DEFAULTS TO TRUE — an encoder is the normal case and
+        // the sender assumes it until told otherwise. My first version of this
+        // test assumed the opposite and failed, which is the default worth
+        // knowing: a missing encoder is the exception that has to be reported,
+        // not a state the sender starts in.
+        s.sender.set_encoder_ready(false);
+        s.set_transmitting(true);
+        assert!(matches!(s.voice_frame(), Emit::NoEncoder));
+        assert!(s.sender.note_no_encoder(), "first report");
+        assert!(!s.sender.note_no_encoder(), "and not again");
     }
 
     #[test]
