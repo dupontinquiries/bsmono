@@ -315,6 +315,9 @@ pub struct Snapclone {
     /// probe, and the whole classification rests on comparing TWO reflexive
     /// addresses seen from the SAME local port.
     pub nat: Option<crate::nat_punch::NatKind>,
+    /// Agreed wire version per peer, from negotiation. Absent means we have not
+    /// negotiated yet and must not send anything version-dependent.
+    pub wire: std::collections::HashMap<String, u8>,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -476,6 +479,7 @@ impl Snapclone {
             sink_latency: crate::sink_cushion::Latency::from_settings(2, 8, 20),
             sender: Default::default(),
             nat: None,
+            wire: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -671,6 +675,38 @@ impl Snapclone {
     /// that one.
     pub fn handshake_retry(&self, attempt: u32) -> Option<u64> {
         crate::handshake::next_retry_ms(attempt)
+    }
+
+    /// Agree a wire version with a peer.
+    ///
+    /// Returns false when there is no overlap, which is a real outcome rather
+    /// than an error to swallow: a peer too old to speak VERSION_MIN cannot be
+    /// talked to at all, and pretending otherwise sends frames it will
+    /// misparse.
+    pub fn negotiate_wire(&mut self, peer: &str, theirs_max: u8) -> bool {
+        match crate::wire_v3::negotiate(crate::wire_v3::VERSION_MAX, theirs_max) {
+            Some(v) => { self.wire.insert(peer.to_string(), v); true }
+            None => { self.wire.remove(peer); false }
+        }
+    }
+
+    /// The flags for one frame to `peer`, or None if we cannot send yet.
+    ///
+    /// The predictive rule the protocol is built on: announce AND send, rather
+    /// than announcing and waiting to be asked. "No HAVE/NEED ... no standalone
+    /// ACK: every message carries ack number", and both halves remove a ROUND
+    /// TRIP — which on a phone radio costs a wakeup, not just bytes.
+    ///
+    /// A delta is DOWNGRADED to a full payload for a peer below v3 rather than
+    /// refused. The module is explicit that sending one anyway "produces a
+    /// frame it parses as a full payload — silently corrupt data rather than a
+    /// protocol error", so the check has to happen at send time, and the honest
+    /// fallback is the whole thing rather than nothing.
+    pub fn frame_flags(&self, peer: &str, has_payload: bool, is_delta: bool,
+                       acking: bool) -> Option<u8> {
+        let v = *self.wire.get(peer)?;
+        let delta_ok = is_delta && crate::wire_v3::supports_delta(v);
+        Some(crate::wire_v3::predictive_flags(has_payload, delta_ok, acking))
     }
 
     /// Classify our NAT from two STUN responses.
@@ -3756,6 +3792,58 @@ mod gossip_wiring_tests {
 
     fn refl(ip: &str, port: u16, from: u16) -> crate::nat_punch::Reflexive {
         crate::nat_punch::Reflexive { ip: ip.into(), port, from_local_port: from }
+    }
+
+    #[test]
+    fn a_delta_to_an_old_peer_is_downgraded_not_sent() {
+        // "Sending one to a v2 peer produces a frame it parses as a FULL
+        // PAYLOAD — silently corrupt data rather than a protocol error." So the
+        // check is at send time, and the fallback is the whole payload.
+        use crate::wire_v3::{F_DELTA, F_DATA};
+        let mut s = Snapclone::new(vec![]);
+        s.negotiate_wire("old", 2);
+        let f = s.frame_flags("old", true, true, false).unwrap();
+        assert_eq!(f & F_DELTA, 0, "sent a delta to a v2 peer");
+        assert_ne!(f & F_DATA, 0, "and did not fall back to the full payload");
+    }
+
+    #[test]
+    fn a_v3_peer_gets_the_delta() {
+        use crate::wire_v3::F_DELTA;
+        let mut s = Snapclone::new(vec![]);
+        s.negotiate_wire("new", 3);
+        assert_ne!(s.frame_flags("new", true, true, false).unwrap() & F_DELTA, 0);
+    }
+
+    #[test]
+    fn nothing_is_sent_before_a_version_is_agreed() {
+        // Guessing a version sends frames the peer misparses, which is the same
+        // silent-corruption failure one step earlier.
+        let s = Snapclone::new(vec![]);
+        assert!(s.frame_flags("stranger", true, false, false).is_none());
+    }
+
+    #[test]
+    fn a_peer_too_old_to_speak_is_refused_and_forgotten() {
+        let mut s = Snapclone::new(vec![]);
+        s.negotiate_wire("ok", 3);
+        assert!(!s.negotiate_wire("ok", 0), "agreed a version below the minimum");
+        assert!(s.frame_flags("ok", true, false, false).is_none(),
+                "a failed renegotiation left the old version usable");
+    }
+
+    #[test]
+    fn one_frame_announces_sends_and_acks() {
+        // The point of flags over a type enum: "a type enum could not express
+        // ANNOUNCE|DATA|ACK in one frame". Each of those is a round trip saved,
+        // and on a phone radio a round trip is a wakeup.
+        use crate::wire_v3::{F_ACK, F_ANNOUNCE, F_DATA};
+        let mut s = Snapclone::new(vec![]);
+        s.negotiate_wire("p", 3);
+        let f = s.frame_flags("p", true, false, true).unwrap();
+        assert_ne!(f & F_ANNOUNCE, 0);
+        assert_ne!(f & F_DATA, 0);
+        assert_ne!(f & F_ACK, 0);
     }
 
     #[test]
