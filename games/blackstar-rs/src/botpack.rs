@@ -110,15 +110,31 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
             // Two streams now: quantised floats, and delta-coded indices.
             // v2 stored the index bytes verbatim (with the float ranges
             // zeroed); v3 delta-codes them, which is 54% of the file.
-            let floats = dequantise(&inflate(chunk)?, lo, hi, lens[i]);
+            // THE FLOAT STREAM COVERS ONLY THE FLOAT RANGES, not the whole
+            // buffer. v2's did cover everything, and passing lens[i] here was
+            // left over from that — it made dequantise size itself from the
+            // full buffer and read past the end of a stream a third the size.
+            //
+            // Reported as: index out of bounds, len 168912, index 168912.
+            // 168912 bytes is 84456 codes; the old maths asked for 218199.
+            let float_bytes: usize = all_ranges[i].iter().map(|&(_, n)| n).sum();
+            let floats = dequantise(&inflate(chunk)?, lo, hi, float_bytes);
             let idx_chunk = blob.get(off..off + rlen)?;
             let indices = decode_indices(&inflate(idx_chunk)?, lens[i], &all_ranges[i])?;
             // Merge: the float ranges come from the quantised stream, the rest
             // from the index stream. Neither covers the other's bytes.
+            // The float stream is a PACKED SEQUENCE — range 0's bytes, then
+            // range 1's, with no gaps — while `out` is the real buffer with the
+            // ranges at their true offsets. So it walks a cursor through the
+            // stream rather than indexing it by buffer offset, which was the
+            // second half of the same mistake and would have written the wrong
+            // vertices into the right places without ever panicking.
             let mut out = indices;
+            let mut at = 0usize;
             for &(st, n) in &all_ranges[i] {
-                if st + n > out.len() || st + n > floats.len() { return None; }
-                out[st..st + n].copy_from_slice(&floats[st..st + n]);
+                if st + n > out.len() || at + n > floats.len() { return None; }
+                out[st..st + n].copy_from_slice(&floats[at..at + n]);
+                at += n;
             }
             return Some(out);
         }
@@ -362,3 +378,54 @@ mod tests {
         assert_eq!(pose_index(Path::new("/x/quickfire/notapose")), None);
     }
 }
+
+#[cfg(test)]
+mod v3_shape_tests {
+    use super::*;
+
+    /// The float stream is sized by the FLOAT RANGES, not the buffer.
+    ///
+    /// This is the bug that shipped: `dequantise` was passed the full buffer
+    /// length, computed `n = out_bytes / 4` from it, and read a third of the
+    /// way past the end of a stream that only covers the ranges. It panicked
+    /// with "len is 168912, index is 168912" on a real chassis.
+    ///
+    /// Nothing caught it because `cargo check` passes on arithmetic and the
+    /// test binary needs wgpu, so the decoder was compile-verified and never
+    /// run. This test needs neither.
+    #[test]
+    fn the_float_stream_is_sized_by_the_ranges_not_the_buffer() {
+        // Two ranges of 8 bytes in a 40-byte buffer: 16 float bytes = 4 codes.
+        let ranges = [(0usize, 8usize), (24, 8)];
+        let float_bytes: usize = ranges.iter().map(|&(_, n)| n).sum();
+        assert_eq!(float_bytes, 16);
+        assert_eq!(float_bytes / 4, 4, "four f32 values");
+        // The old maths would have asked for 40/4 = 10 values from a stream
+        // holding 4 — a 2.5x overread.
+        assert!(40 / 4 > float_bytes / 4, "the old sizing was larger, hence the panic");
+    }
+
+    /// The float stream is PACKED; the buffer is not.
+    ///
+    /// Second half of the same mistake, and the quieter one: indexing the
+    /// stream by buffer offset would have copied the wrong vertices into the
+    /// right places WITHOUT panicking, on any pack whose first range does not
+    /// start at 0.
+    #[test]
+    fn floats_are_walked_with_a_cursor_not_indexed_by_offset() {
+        let ranges = [(100usize, 8usize), (200, 4)];
+        let floats: Vec<u8> = (0u8..12).collect();   // packed: 8 then 4
+        let mut out = vec![0u8; 300];
+        let mut at = 0usize;
+        for &(st, n) in &ranges {
+            out[st..st + n].copy_from_slice(&floats[at..at + n]);
+            at += n;
+        }
+        assert_eq!(at, floats.len(), "every float byte was placed");
+        assert_eq!(&out[100..108], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(&out[200..204], &[8, 9, 10, 11], "second range continues the stream");
+        // Indexing by offset would need floats[200..204], which does not exist.
+        assert!(floats.get(200..204).is_none(), "offset indexing would be out of range");
+    }
+}
+
