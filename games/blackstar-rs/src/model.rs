@@ -508,13 +508,64 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
     load_oriented(dir, gpu, target_len, false)
 }
 
+/// The orientation sidecar that speaks for the whole strip.
+///
+/// Prefers a pose whose sidecar says `foldview`, because that one was written
+/// by the exporter that knows the answer rather than guessed from geometry.
+/// Falls back to the FIRST pose — f00, the vehicle — where "long, low, wheels
+/// down" is a fair heuristic, and never to a mid-fold pose where it is not.
+///
+/// Returns None when `dir` is not inside a chassis directory, so a standalone
+/// model still reads its own sidecar.
+fn strip_orientation_text(pose_dir: &Path) -> Option<String> {
+    let chassis = pose_dir.parent()?;
+    let mut poses: Vec<std::path::PathBuf> = std::fs::read_dir(chassis)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("orient.json").is_file())
+        .collect();
+    if poses.len() < 2 {
+        return None; // not a strip; the caller reads the pose's own sidecar
+    }
+    poses.sort();
+    let mut first: Option<String> = None;
+    for p in &poses {
+        let txt = std::fs::read_to_string(p.join("orient.json")).ok()?;
+        if txt.contains("\"foldview\"") {
+            return Some(txt);
+        }
+        if first.is_none() {
+            first = Some(txt);
+        }
+    }
+    first
+}
+
 /// Read `orient.json` beside the geometry, if the asset ships one.
 ///
 /// Returns the rotation that carries the asset's declared frame onto the
 /// engine's: +Y up, nose at -Z. Malformed or degenerate files are ignored
 /// rather than fatal — a bad sidecar should cost the guess, not the load.
 fn declared_orientation(dir: &Path) -> Option<Quat> {
-    let txt = std::fs::read_to_string(dir.join("orient.json")).ok()?;
+    // ORIENTATION IS A CHASSIS PROPERTY, NOT A POSE PROPERTY.
+    //
+    // A fold strip is one body in several positions, so every pose must be
+    // rotated the SAME way — rotate them differently and the strip tumbles as
+    // it folds, which is what "the bots were turned sideways" looked like.
+    //
+    // 48 of 221 chassis disagree with themselves: analog declares five
+    // different orientations across its own poses, blackstar six. They are the
+    // ones whose sidecars say `orient_heuristic_v1` rather than `foldview` —
+    // the heuristic ran per pose and a mid-fold robot gives it nothing to work
+    // with ("a legless robot has no wheels to find, so the search picks
+    // whatever reads most car-like, which is the robot lying on its side").
+    //
+    // So the strip's answer is taken from ONE pose and applied to all of them.
+    let txt = match strip_orientation_text(dir) {
+        Some(t) => t,
+        None => std::fs::read_to_string(dir.join("orient.json")).ok()?,
+    };
     let num3 = |key: &str| -> Option<Vec3> {
         let i = txt.find(key)?;
         let open = txt[i..].find('[')? + i;
