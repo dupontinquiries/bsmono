@@ -368,3 +368,73 @@ zlib pass and reassembled after.
 This is a `bots.pack` v2: same quantisation, different byte layout. The decoder
 change is small and mechanical, and `botpack.rs` already refuses an unknown
 version rather than misreading it, so v1 and v2 can coexist.
+
+## Mesh and index compression — 70 MB left, and it is not in the vertices
+
+Asked about mesh/triangle compression, an internal volume tracker, and a neural
+upscaler. Measured all three framings.
+
+### The vertices are not where the bytes are
+
+**54% of every pack is INDICES**, not positions. Measured across 25 packs: 14.1
+MB of float stream against 16.5 MB of index stream. The quantiser spent all its
+effort on the smaller half.
+
+And the indices are stored the worst possible way — raw u32 through plain zlib.
+They are the easiest thing in the file to compress, because a triangle list
+references nearby vertices repeatedly:
+
+```
+one chassis, 40,557 indices:
+  raw u32                158 KB
+  zlib as-is              36 KB
+  u16 where it fits       33 KB   (all 39 prims fit)
+  + delta vs prev index    8 KB   20x, LOSSLESS
+```
+
+Across the packs' index streams: **48%, or ~70 MB off the 252 MB of packs.**
+This is the single largest remaining win and it changes nothing about the
+geometry — same indices, different encoding.
+
+### Vertex welding: 14%, and legal here
+
+14% of vertices are exact positional duplicates, and these meshes carry
+**POSITION only** — no normals, no UVs. That matters: welding is normally
+illegal because two vertices at the same point can carry different normals or
+texture coordinates, and merging them creases the shading. With position-only
+geometry there is nothing to disagree about. Worth doing after the index work,
+since welding renumbers indices.
+
+### An internal volume tracker: no
+
+The idea is to store a coarse volume and rebuild detail at runtime. Two
+measurements already rule it out. The parts DEFORM rather than rotate (median
+38% radius drift f00->f04), so a volume that tracks a part cannot place it. And
+the surface is not a surface of revolution or anything else parametric — the
+roundest part measured 15% radius spread. **The detail is not derivable from a
+volume, because the detail is the thing that was modelled.**
+
+### A neural upscaler: no, and the reason is the storage budget
+
+A net that predicts fine geometry from coarse would have to be either per-model
+or general.
+
+**Per-model** is a compression scheme where the weights ARE the data. A net that
+reproduces one 250 KB chassis to visual fidelity will not be much smaller than
+250 KB, and it would need training per chassis — 259 training runs to save less
+than the index fix saves for free.
+
+**General** — one net over the whole fleet — is the more interesting version and
+still fails on this data. It would have to hallucinate plausible detail rather
+than reproduce actual detail, and these are recognisable vehicles: a Charger
+with invented panel lines is a wrong Charger. That is acceptable for terrain and
+unacceptable for a licensed silhouette, which is what the whole harvest exists
+to preserve.
+
+There is also a plain engineering objection: it puts a neural inference in the
+model load path of a game that currently starts in 0.2s, to save less than
+delta-coding an integer array.
+
+**The honest ranking**: indices (~70 MB, lossless, mechanical), then welding
+(~14% of the float half, lossless), then nothing. Both are arithmetic, both are
+verifiable byte-for-byte, and neither risks the silhouette.
