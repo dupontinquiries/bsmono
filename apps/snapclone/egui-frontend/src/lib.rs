@@ -323,9 +323,14 @@ pub struct Snapclone {
     /// floating composer, a split-screen phone, a desktop window above the
     /// panel.
     pub keyboard: crate::keyboard_inset::KeyboardWatcher,
-    /// Agreed wire version per peer, from negotiation. Absent means we have not
-    /// negotiated yet and must not send anything version-dependent.
-    pub wire: std::collections::HashMap<String, u8>,
+    /// Per-peer send state: version, sequence, pending ack, what they know.
+    ///
+    /// ONE STRUCT IN ONE MAP, replacing the bare version map this used to be.
+    /// peer_session exists because the C++ spread this across seven parallel
+    /// maps — one marked "Bug 5 fix", another added later "otherwise it lingers
+    /// for every ever-connected peer" — and "a checklist grows a hole every
+    /// time somebody adds a map". My version map was that shape starting over.
+    pub sessions: crate::peer_session::Sessions,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -488,7 +493,7 @@ impl Snapclone {
             sender: Default::default(),
             nat: None,
             keyboard: Default::default(),
-            wire: Default::default(),
+            sessions: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -694,8 +699,12 @@ impl Snapclone {
     /// misparse.
     pub fn negotiate_wire(&mut self, peer: &str, theirs_max: u8) -> bool {
         match crate::wire_v3::negotiate(crate::wire_v3::VERSION_MAX, theirs_max) {
-            Some(v) => { self.wire.insert(peer.to_string(), v); true }
-            None => { self.wire.remove(peer); false }
+            Some(v) => { self.sessions.entry(peer).set_version(v); true }
+            // Forget the WHOLE session, not just the version. A peer that can
+            // no longer be spoken to should not keep a sequence number or a
+            // list of what it knows — that is the lingering state the source's
+            // own note warns about.
+            None => { self.sessions.forget(peer); false }
         }
     }
 
@@ -713,8 +722,10 @@ impl Snapclone {
     /// fallback is the whole thing rather than nothing.
     pub fn frame_flags(&self, peer: &str, has_payload: bool, is_delta: bool,
                        acking: bool) -> Option<u8> {
-        let v = *self.wire.get(peer)?;
-        let delta_ok = is_delta && crate::wire_v3::supports_delta(v);
+        let sess = self.sessions.get(peer)?;
+        // is_v3() rather than a version comparison here: the session already
+        // knows, and asking it keeps the delta rule in one place.
+        let delta_ok = is_delta && sess.is_v3();
         Some(crate::wire_v3::predictive_flags(has_payload, delta_ok, acking))
     }
 
@@ -741,6 +752,27 @@ impl Snapclone {
     pub fn scroll_for_keyboard(&self, field: crate::keyboard_inset::Rect,
                                margin: f32) -> f32 {
         self.keyboard.scroll_to_clear(field, margin)
+    }
+
+    /// Should the payload go out, or just the announcement?
+    ///
+    /// The predictive rule, and the source states its trade: "if we have no
+    /// record of what this peer knows, send data immediately. Better to spend
+    /// one extra transmission than to wait for a round trip."
+    ///
+    /// Right way round on a phone. An extra transmission costs bytes on a radio
+    /// that is ALREADY AWAKE; a round trip costs a second wakeup and the
+    /// sleeping radio has to come back up for it.
+    pub fn should_send_payload(&self, peer: &str, hash: &str) -> bool {
+        match self.sessions.get(peer) {
+            Some(s) => s.should_send_data(hash),
+            None => true,   // no record at all: send it
+        }
+    }
+
+    /// Note that a peer now has this snap, so the next frame can skip the body.
+    pub fn peer_learned(&mut self, peer: &str, hash: &str) {
+        self.sessions.entry(peer).learn(hash);
     }
 
     /// Classify our NAT from two STUN responses.
@@ -1083,6 +1115,12 @@ impl Snapclone {
         // The panel closes whichever way the answer went: leaving it open after
         // a confirmed delete would ask about a contact that no longer exists.
         self.confirm = None;
+        // Forget the transport session too. Deleting a contact and leaving
+        // their sequence number, negotiated version and known-snap list behind
+        // is precisely the "lingers for every ever-connected peer" leak
+        // peer_session was written to prevent — and re-adding them later would
+        // resume a sequence they have no memory of.
+        self.sessions.forget(&id);
         self.peers.retain(|p| p.name != id);
         self.cards.close(id);
         self.sync_roster();
@@ -3826,6 +3864,47 @@ mod gossip_wiring_tests {
 
     fn refl(ip: &str, port: u16, from: u16) -> crate::nat_punch::Reflexive {
         crate::nat_punch::Reflexive { ip: ip.into(), port, from_local_port: from }
+    }
+
+    #[test]
+    fn an_unknown_peer_gets_the_payload_immediately() {
+        // "Better to spend one extra transmission than to wait for a round
+        // trip." An extra send costs bytes on a radio already awake; a round
+        // trip costs a second wakeup.
+        let s = Snapclone::new(vec![]);
+        assert!(s.should_send_payload("nobody", "abc123"));
+    }
+
+    #[test]
+    fn a_peer_known_to_have_it_gets_only_the_announcement() {
+        let mut s = Snapclone::new(vec![]);
+        s.negotiate_wire("p", 3);
+        s.peer_learned("p", "abc123");
+        assert!(!s.should_send_payload("p", "abc123"));
+        assert!(s.should_send_payload("p", "different"), "one hash is not all of them");
+    }
+
+    #[test]
+    fn deleting_a_contact_forgets_their_whole_session() {
+        // The leak the source's own note names: state that "lingers for every
+        // ever-connected peer". Re-adding them later would otherwise resume a
+        // sequence they have no memory of.
+        let mut s = Snapclone::new(vec![Peer { name: "gone".into(), online: true }]);
+        s.negotiate_wire("gone", 3);
+        s.peer_learned("gone", "abc123");
+        s.confirm_delete("gone");
+        assert!(s.sessions.get("gone").is_none(), "session outlived the contact");
+        assert!(s.frame_flags("gone", true, false, false).is_none());
+    }
+
+    #[test]
+    fn a_failed_renegotiation_forgets_everything_not_just_the_version() {
+        let mut s = Snapclone::new(vec![]);
+        s.negotiate_wire("p", 3);
+        s.peer_learned("p", "abc123");
+        assert!(!s.negotiate_wire("p", 0));
+        assert!(s.sessions.get("p").is_none(),
+                "kept a sequence and a known-list for a peer we cannot speak to");
     }
 
     #[test]
