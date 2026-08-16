@@ -388,6 +388,18 @@ pub struct Snapclone {
     /// CONNECTED rather than showing a stored bool that means "was online
     /// once".
     pub broker: peermux_core::Broker,
+    /// The drifting colour field behind the camera page. Off by default: it
+    /// is decoration, and decoration that runs before anyone asks costs
+    /// battery on a phone.
+    pub blobs: crate::ambient_blobs::AmbientBlobs,
+    /// Tap ripples and the press-depth response. One layer, because
+    /// disabling feedback must stop BOTH — killing only the ripples leaves a
+    /// control stuck mid-scale.
+    pub feedback: crate::touch_feedback::TouchFeedback,
+    /// Tap vs long-press vs drag on the viewfinder, as a state machine with
+    /// a watchdog — a pointer-up lost to a system gesture would otherwise
+    /// leave the machine Held forever.
+    pub press: crate::press_gesture::PressGesture,
     /// Which contact the open confirm panel is about. Held separately because
     /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
     /// risk score, not a subject.
@@ -561,6 +573,15 @@ impl Snapclone {
             strip_voice: false,
             thumbs: crate::thumbnails::ThumbnailCache::new(),
             broker: peermux_core::Broker::new(),
+            // Default is an EMPTY field; `seeded` is the constructor. A fixed
+            // seed rather than entropy: the field is deterministic so a
+            // screenshot is reproducible.
+            blobs: crate::ambient_blobs::AmbientBlobs::seeded(5, 0x5eed_1234),
+            // Enabled per the module's own rule — on touch only; a ripple
+            // under a mouse cursor is a phone UI wearing a desktop's clothes.
+            // Re-set from Adaptive each frame in `ui`.
+            feedback: crate::touch_feedback::TouchFeedback::new(false),
+            press: Default::default(),
             confirm_id: String::new(),
             editor_id: String::new(),
             editor_name: String::new(),
@@ -1831,6 +1852,17 @@ impl Snapclone {
         let colors = uikit_egui::palette_colors(&self.palette);
         let surface = ui.available_rect_before_wrap();
 
+        // The interaction layer advances every frame, on every page: a ripple
+        // that stops because the user swiped away is a bug, not a saving. Touch
+        // feedback follows the adaptive layer's answer rather than a guess —
+        // the module's own rule is ripples on touch, not under a cursor.
+        self.feedback.set_enabled(adaptive.is_compact());
+        let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
+        let pointer_down = ui.input(|i| i.pointer.any_down());
+        if self.tick_feedback(dt_ms, pointer_down) {
+            ui.ctx().request_repaint();
+        }
+
         // live background painted behind everything
         self.bg.paint(ui.painter(), surface, &colors);
 
@@ -2100,8 +2132,67 @@ impl Snapclone {
         }
     }
 
+    /// Advance the interaction layer. Called once per frame from `ui` so the
+    /// animations run whichever page is showing — a ripple that stops because
+    /// the user swiped away is a bug, not a saving.
+    ///
+    /// `pointer_down` matters more than it looks. The watchdog measures
+    /// `held_ms`, and `tick` stops accumulating it the moment the machine
+    /// enters `Held` — so at 60fps a long press freezes at ~500ms and never
+    /// reaches the 1500ms threshold. The module's own recovery test passes
+    /// one big `tick(STUCK_MS)`, which is the suspend/resume case it was
+    /// written for; a pointer-up lost to a system gesture at frame rate is a
+    /// different one, and only the shell can see that the finger is gone.
+    /// So the release is issued HERE rather than by lowering the module's
+    /// threshold — the machine is right about what it can know.
+    pub fn tick_feedback(&mut self, dt_ms: f32, pointer_down: bool) -> bool {
+        self.blobs.tick(dt_ms / 1000.0);
+        self.feedback.tick(dt_ms);
+        // The gesture clock advances HERE, not only where taps are read: the
+        // watchdog measures held_ms, and a page the user swiped away from
+        // still has to be able to recover a press whose pointer-up was eaten
+        // by a system gesture. Without the tick the machine sits in Held
+        // forever and the next tap folds into the old gesture.
+        let long_press = self.press.tick(dt_ms);
+        if long_press == Some(crate::press_gesture::Event::LongPress) {
+            self.shutter_note = "exposure locked".into();
+        }
+        if !pointer_down && !self.press.is_idle() {
+            // The finger is gone. A release from Held emits nothing (the long
+            // press already fired), which is exactly right — this is cleanup,
+            // not a second event.
+            let _ = self.press.release();
+        }
+        // Still consulted: it is the suspend/resume path, where a single huge
+        // dt lands and no pointer state is trustworthy.
+        let recovered = self.press.watchdog().is_some();
+        recovered || self.feedback.is_animating() || self.blobs.is_active()
+    }
+
     fn camera_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Camera");
+        // THE AMBIENT FIELD, painted first so everything else sits on it. Its
+        // colours come from ambient_palette's sampling of the last frame, so
+        // the glow behind the camera is the camera's own light rather than a
+        // fixed gradient — and it only runs while the page is showing.
+        {
+            let area = ui.available_rect_before_wrap();
+            self.blobs.set_active(true);
+            let side = area.width().min(area.height());
+            // Rgb is [u8; 3]: the sampler's own representation, kept rather
+            // than wrapped so the palette and the painter agree byte for byte.
+            let (a, b) = self.ambient.unwrap_or(([40, 60, 120], [120, 40, 90]));
+            for (i, blob) in self.blobs.blobs().iter().enumerate() {
+                let (fx, fy) = blob.centre();
+                let p = if i % 2 == 0 { a } else { b };
+                let alpha = (blob.opacity() * 90.0).clamp(0.0, 255.0) as u8;
+                ui.painter().circle_filled(
+                    egui::pos2(area.left() + fx * area.width(),
+                               area.top() + fy * area.height()),
+                    blob.radius(side),
+                    egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], alpha));
+            }
+        }
         // The REAL viewfinder, not a labelled rectangle. Tap-to-focus, the
         // fading reticle, full-bleed vs framed and the front-camera mirror all
         // come from camera.rs — which existed and was never called, which is
@@ -2117,10 +2208,61 @@ impl Snapclone {
                 let _ = f; // the pixel upload belongs to the capture backend
             }
         }
-        ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
-            crate::camera::viewfinder(ui, &mut self.viewfinder,
-                                      self.cam_texture.as_ref(), c);
-        });
+        let vf_rect = {
+            let r = ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
+                crate::camera::viewfinder(ui, &mut self.viewfinder,
+                                          self.cam_texture.as_ref(), c);
+            });
+            r.response.rect
+        };
+        // TAP VS LONG-PRESS ON THE VIEWFINDER. The machine distinguishes them
+        // (and cancels to a drag past the slop), which matters because they
+        // mean different things here: a tap focuses, a hold locks exposure.
+        // Reading a raw click would make every focus tap a possible lock.
+        {
+            let resp = ui.interact(vf_rect, ui.id().with("vf_press"),
+                                   egui::Sense::click_and_drag());
+            let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let (lx, ly) = (pos.x - vf_rect.left(), pos.y - vf_rect.top());
+                if resp.drag_started() || resp.is_pointer_button_down_on() {
+                    if self.press.is_idle() { self.press.press(lx, ly); }
+                    else { let _ = self.press.move_to(lx, ly); }
+                }
+            }
+            let ev = self.press.tick(dt_ms).or_else(|| {
+                if ui.input(|i| i.pointer.any_released()) { self.press.release() } else { None }
+            });
+            match ev {
+                Some(crate::press_gesture::Event::Tap) => {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        // The viewfinder maps the tap to SENSOR coordinates
+                        // itself (and refuses one outside the image rect), so
+                        // it takes the screen point and the rect rather than
+                        // pre-computed local offsets.
+                        self.viewfinder.tap(pos, vf_rect);
+                        self.feedback.tap(pos.x - vf_rect.left(), pos.y - vf_rect.top(),
+                                          vf_rect.width(), vf_rect.height());
+                    }
+                }
+                Some(crate::press_gesture::Event::LongPress) => {
+                    self.shutter_note = "exposure locked".into();
+                }
+                // A drag is not a tap: any mid-gesture visual state is torn
+                // down rather than left on screen.
+                Some(crate::press_gesture::Event::DragCanceled) => {}
+                None => {}
+            }
+            // RIPPLES, over the viewfinder they belong to.
+            for r in self.feedback.ripples() {
+                let a = ((1.0 - r.progress()) * 70.0) as u8;
+                ui.painter().circle_stroke(
+                    egui::pos2(vf_rect.left() + r.x, vf_rect.top() + r.y),
+                    r.radius(),
+                    egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(
+                        c.accent.r(), c.accent.g(), c.accent.b(), a)));
+            }
+        }
         // A FROZEN STREAM IS MARKED rather than silently frozen: the user is
         // about to take a photo based on what this shows, and a still image
         // that stopped updating is a lie about what the lens sees.
@@ -4551,6 +4693,68 @@ mod gossip_wiring_tests {
         assert!(!app.export_requested);
         assert!(app.export_note.as_deref().unwrap_or("").contains("3 snaps"));
     }
+    // ── the interaction layer: blobs, press, ripples ──
+
+    #[test]
+    fn feedback_is_touch_only_and_disabling_it_stops_both_halves() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        // Off on a pointer device: a ripple under a mouse cursor is the tell
+        // of a phone UI wearing a desktop's clothes.
+        app.feedback.set_enabled(false);
+        app.feedback.tap(10.0, 10.0, 100.0, 100.0);
+        assert!(app.feedback.ripples().is_empty());
+        app.feedback.set_enabled(true);
+        app.feedback.tap(10.0, 10.0, 100.0, 100.0);
+        assert_eq!(app.feedback.ripples().len(), 1);
+        // The depth is an ANIMATION, not a state: at age zero the scale is
+        // still 1.0 and only departs once time passes. Asserting before the
+        // tick tests the clock, not the response.
+        app.feedback.tick(40.0);
+        assert!(app.feedback.scale() < 1.0, "the press depth engaged too");
+        // Disabling mid-press must reset the SCALE as well, or a control is
+        // left stuck at whatever depth it had reached.
+        app.feedback.set_enabled(false);
+        assert_eq!(app.feedback.scale(), 1.0, "both halves stop together");
+    }
+
+    #[test]
+    fn the_press_watchdog_recovers_a_lost_pointer_up() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.press.press(5.0, 5.0);
+        assert!(!app.press.is_idle());
+        // No release ever arrives — a system gesture ate it. Ticking past the
+        // watchdog window returns the machine to Idle rather than leaving it
+        // Held forever, which would fold the next tap into the old gesture.
+        // Frame-rate ticks WITH the finger still down: the long press fires
+        // and the machine sits in Held, which is correct.
+        for _ in 0..40 { app.tick_feedback(16.0, true); }
+        assert!(!app.press.is_idle(), "still held while the finger is down");
+        // Now the pointer-up is lost — the shell sees no finger and the
+        // machine is released rather than wedged. (The module's own watchdog
+        // cannot do this at 60fps: held_ms stops accumulating in Held, so it
+        // only covers the suspend/resume case.)
+        app.tick_feedback(16.0, false);
+        assert!(app.press.is_idle(), "a lost pointer-up is recovered");
+        // …and the long press fired on the way, which is the OTHER thing the
+        // clock is for: a hold that never emits is a hold nobody can use.
+        assert_eq!(app.shutter_note, "exposure locked");
+    }
+
+    #[test]
+    fn the_ambient_field_only_runs_when_it_is_asked_to() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        // Inactive by default: decoration that runs before anyone asks costs
+        // battery on a phone. blobs() returns nothing while inactive even
+        // though the field is seeded.
+        assert!(!app.blobs.is_active());
+        assert!(app.blobs.blobs().is_empty(), "inactive means no blobs to draw");
+        app.blobs.set_active(true);
+        assert!(!app.blobs.blobs().is_empty());
+        let before = app.blobs.blobs()[0].centre();
+        app.tick_feedback(500.0, false);
+        assert_ne!(app.blobs.blobs()[0].centre(), before, "the field drifts");
+    }
+
     // ── tile_strip + thumbnails + peer_source wiring ──
 
     #[test]
