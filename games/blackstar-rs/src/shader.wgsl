@@ -52,7 +52,11 @@ const CSDF_SLAB: f32 = 16.0; // was 32.0 -- already didn't match render.rs's
 // limit a genuine D3 texture has under this project's requested
 // limits; 16*126=2016. (This constant was independently wrong before
 // either change too: 384 vs. the true 44*12=528 at the original cap.)
-const CSDF_D: f32 = 2016.0; // SLAB(16) x MAXM(126)
+// Depth is now SLAB x (MAXM / TILES^2), because TILES^2 models share each
+// depth slab. All three must agree with render.rs; see the note above about
+// three numbers, two of which were once wrong.
+const CSDF_TILES: f32 = 4.0;   // 4x4 = 16 models per depth slab
+const CSDF_D: f32 = 512.0;     // SLAB(16) x 32 depth slabs = 512 models
 
 // baked candidate grid (must match render.rs RC_* consts)
 const RC_DIM: u32 = 40u;
@@ -198,8 +202,27 @@ fn shape_sdf(i: u32, p: vec3<f32>) -> f32 {
             return outside + 0.02; // conservative: true d >= box d
         }
         let uvw = clamp(q / (2.0 * h) + vec3(0.5), vec3(0.02), vec3(0.98));
-        let w = (s.b.w * CSDF_SLAB + 0.5 + uvw.z * (CSDF_SLAB - 1.0)) / CSDF_D;
-        let enc = textureSampleLevel(t_csdf, s_csdf, vec3(uvw.x, uvw.y, w), 0.0).r;
+        // TILED ATLAS. Models used to stack on depth alone: 2048 / SLAB = 126,
+        // while width (36) and height (24) sat nearly empty against the same
+        // 2048 limit on every axis.
+        //
+        // Now a model occupies one tile of a CSDF_TILES x CSDF_TILES grid in
+        // (u, v), and only the leftover index advances depth. Same slab
+        // resolution, same bytes per model — 16x the count.
+        //
+        // s.b.w is the model index, and it is split here rather than at the
+        // call site so every sampler agrees on the layout by construction.
+        let mi = s.b.w;
+        let tx = mi % CSDF_TILES;
+        let ty = floor(mi / CSDF_TILES) % CSDF_TILES;
+        let tz = floor(mi / (CSDF_TILES * CSDF_TILES));
+        // Inset by half a texel at both ends: a tile that samples its own edge
+        // bleeds into its neighbour, which reads as one model's silhouette
+        // leaking onto another's.
+        let u = (tx + clamp(uvw.x, 0.02, 0.98)) / CSDF_TILES;
+        let v = (ty + clamp(uvw.y, 0.02, 0.98)) / CSDF_TILES;
+        let w = (tz * CSDF_SLAB + 0.5 + uvw.z * (CSDF_SLAB - 1.0)) / CSDF_D;
+        let enc = textureSampleLevel(t_csdf, s_csdf, vec3(u, v, w), 0.0).r;
         return (enc * 2.4 - 0.6) * max(s.e.z, 0.05);
     }
     let a = abs(q) - s.b.xyz + vec3(s.b.w);             // rounded box

@@ -784,8 +784,9 @@ fn make_icon() -> Option<winit::window::Icon> {
 /// per-voxel distance to the nearest surface point, byte-encoded. This is
 /// what makes mirrors show the EXACT model instead of a box silhouette.
 fn bake_car_sdfs(models: &mut [model::Model]) -> Vec<u8> {
-    use render::{CSDF_H, CSDF_MAXM, CSDF_SLAB, CSDF_W};
-    let mut out = vec![255u8; (CSDF_W * CSDF_H * CSDF_SLAB * CSDF_MAXM) as usize];
+    use render::{csdf_extent, CSDF_H, CSDF_MAXM, CSDF_SLAB, CSDF_TILES, CSDF_W};
+    let (aw, ah, ad) = csdf_extent();
+    let mut out = vec![255u8; (aw * ah * ad) as usize];
     for (mi, m) in models.iter_mut().enumerate().take(CSDF_MAXM as usize) {
         if m.cloud.is_empty() {
             continue;
@@ -863,7 +864,20 @@ fn bake_car_sdfs(models: &mut [model::Model]) -> Vec<u8> {
                     // exactly the "bubble" in the mirror.
                     let dist = d2.sqrt();
                     let d = if (p - near_p).dot(near_n) < 0.0 { -dist } else { dist } - 0.012;
-                    let idx = (((mi as u32 * CSDF_SLAB + z) * CSDF_H + y) * CSDF_W + x) as usize;
+                    // TILED WRITE, matching shader.wgsl's tiled read. A model
+                    // occupies one tile of a TILES x TILES grid in (x, y) and
+                    // only the leftover index advances depth. Writing a depth
+                    // stack while the shader reads tiles would sample another
+                    // model's field — geometry that renders and is wrong.
+                    let m = mi as u32;
+                    let (tx, ty, tz) = (m % CSDF_TILES,
+                                        (m / CSDF_TILES) % CSDF_TILES,
+                                        m / (CSDF_TILES * CSDF_TILES));
+                    let ax = tx * CSDF_W + x;
+                    let ay = ty * CSDF_H + y;
+                    let az = tz * CSDF_SLAB + z;
+                    let idx = (((az * (CSDF_H * CSDF_TILES)) + ay) * (CSDF_W * CSDF_TILES)
+                               + ax) as usize;
                     out[idx] = (((d + 0.6) / 2.4).clamp(0.0, 1.0) * 255.0) as u8;
                 }
             }

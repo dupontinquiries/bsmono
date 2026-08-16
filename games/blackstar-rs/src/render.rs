@@ -110,7 +110,33 @@ pub const CSDF_SLAB: u32 = 16;
 /// bug fixed in the same pass that first touched this constant: the
 /// SDF depth-slice normalization had likely been sampling into the
 /// wrong model's slab for a while before either of these changes.
-pub const CSDF_MAXM: u32 = 126;
+pub const CSDF_MAXM: u32 = 512;
+
+/// Models per row and column of the atlas grid.
+///
+/// The atlas was a 3D texture used as a 1D stack: models advanced only depth,
+/// so 2048/SLAB = 126 was the whole roster, while width (36) and height (24)
+/// sat nearly empty against the SAME 2048 limit on every axis.
+///
+/// A model now occupies one tile of a TILES x TILES grid, and only the leftover
+/// index advances depth. 16 models per depth slab.
+///
+/// 512 rather than the 2,048 the layout allows: at 4x4 tiling a 2,048-model
+/// atlas is 144 x 96 x 2048 = 28 MB of GPU texture, which is a lot to ask of a
+/// phone for a roster no session displays. 512 is 7.1 MB, four times the old
+/// count, and the tiling means raising it later costs only depth.
+///
+/// MUST equal `CSDF_TILES` in shader.wgsl. The shader's own comment records
+/// that three numbers had to agree here once and two were wrong; this is a
+/// fourth, so it is asserted in a test rather than trusted.
+pub const CSDF_TILES: u32 = 4;
+
+/// Atlas dimensions, derived rather than written down twice.
+pub const fn csdf_extent() -> (u32, u32, u32) {
+    (CSDF_W * CSDF_TILES,
+     CSDF_H * CSDF_TILES,
+     CSDF_SLAB * CSDF_MAXM / (CSDF_TILES * CSDF_TILES))
+}
 
 /// How many models the SDF volume can hold on THIS device.
 ///
@@ -476,7 +502,10 @@ impl Gpu {
         });
         let csdf_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("car-sdf"),
-            size: wgpu::Extent3d { width: CSDF_W, height: CSDF_H, depth_or_array_layers: CSDF_SLAB * CSDF_MAXM },
+            size: {
+                let (w, h, d) = csdf_extent();
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: d }
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
@@ -963,12 +992,17 @@ impl Gpu {
     /// Upload the baked per-cell static candidate lists.
     /// Upload the car reflection SDF atlas (R8, encoded distances).
     pub fn set_car_sdfs(&self, data: &[u8]) {
-        assert_eq!(data.len(), (CSDF_W * CSDF_H * CSDF_SLAB * CSDF_MAXM) as usize);
+        // The atlas is TILED, so the row stride is the full atlas width — not
+        // one model's. Uploading with the untiled stride would shear every
+        // model across its neighbours' tiles.
+        let (aw, ah, ad) = csdf_extent();
+        assert_eq!(data.len(), (aw * ah * ad) as usize,
+                   "sdf upload is not the atlas size — bake and extent disagree");
         self.queue.write_texture(
             wgpu::ImageCopyTexture { texture: &self.csdf_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             data,
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(CSDF_W), rows_per_image: Some(CSDF_H) },
-            wgpu::Extent3d { width: CSDF_W, height: CSDF_H, depth_or_array_layers: CSDF_SLAB * CSDF_MAXM },
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(aw), rows_per_image: Some(ah) },
+            wgpu::Extent3d { width: aw, height: ah, depth_or_array_layers: ad },
         );
     }
 
@@ -1235,6 +1269,68 @@ fn make_msaa(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::TextureView {
             view_formats: &[],
         })
         .create_view(&Default::default())
+}
+
+#[cfg(test)]
+mod atlas_layout_tests {
+    use super::*;
+
+    /// The shader's constants must equal the Rust ones.
+    ///
+    /// shader.wgsl's own comment records that "three numbers had to agree ...
+    /// and two of the three were already wrong" — and tiling adds a fourth.
+    /// Read out of the .wgsl rather than restated, so the test fails when
+    /// either side moves instead of when someone remembers to update it.
+    #[test]
+    fn the_shader_agrees_with_render_rs() {
+        let src = include_str!("shader.wgsl");
+        let konst = |name: &str| -> f32 {
+            let i = src.find(&format!("const {name}: f32 =")).expect(name);
+            let rest = &src[i..];
+            let eq = rest.find('=').unwrap();
+            let end = rest[eq..].find(';').unwrap() + eq;
+            rest[eq + 1..end].trim().parse().expect(name)
+        };
+        assert_eq!(konst("CSDF_SLAB") as u32, CSDF_SLAB, "slab depth");
+        assert_eq!(konst("CSDF_TILES") as u32, CSDF_TILES, "tile grid");
+        // CSDF_D is the DEPTH in models, not voxels: SLAB x depth-slabs.
+        assert_eq!(konst("CSDF_D") as u32, CSDF_MAXM, "atlas model capacity");
+    }
+
+    #[test]
+    fn the_atlas_fits_every_axis_limit() {
+        // 2048 applies to width and height too, which is the whole reason
+        // tiling has room — but it is a limit, not free space.
+        let (w, h, d) = csdf_extent();
+        assert!(w <= 2048 && h <= 2048 && d <= 2048, "{w}x{h}x{d}");
+    }
+
+    #[test]
+    fn every_model_lands_in_a_distinct_tile() {
+        // The bug tiling could introduce: two models mapping to one tile
+        // renders one silhouette in place of another, and looks like a
+        // mismatched asset rather than an index collision.
+        let mut seen = std::collections::HashSet::new();
+        for m in 0..CSDF_MAXM {
+            let t = (m % CSDF_TILES,
+                     (m / CSDF_TILES) % CSDF_TILES,
+                     m / (CSDF_TILES * CSDF_TILES));
+            assert!(seen.insert(t), "model {m} collides at {t:?}");
+        }
+        assert_eq!(seen.len(), CSDF_MAXM as usize);
+    }
+
+    #[test]
+    fn the_last_model_stays_inside_the_texture() {
+        let (w, h, d) = csdf_extent();
+        let m = CSDF_MAXM - 1;
+        let (tx, ty, tz) = (m % CSDF_TILES,
+                            (m / CSDF_TILES) % CSDF_TILES,
+                            m / (CSDF_TILES * CSDF_TILES));
+        assert!(tx * CSDF_W + CSDF_W <= w);
+        assert!(ty * CSDF_H + CSDF_H <= h);
+        assert!(tz * CSDF_SLAB + CSDF_SLAB <= d, "depth overrun at model {m}");
+    }
 }
 
 #[cfg(test)]
