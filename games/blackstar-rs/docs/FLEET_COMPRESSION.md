@@ -277,3 +277,32 @@ This settles three things at once:
 What would change this is a foldview that emits rigid parts — segmenting the
 mesh so each piece moves rigidly, rather than fitting hinges to pieces that do
 not. That is a different generator, not a missing field in this one.
+
+## Cost of the history rewrite: incremental bundles from siblings stop applying
+
+Seven new dialer bundles arrived and none of them can be fetched. Every one
+names the same prerequisite:
+
+```
+error: Repository lacks these prerequisite commits:
+error: 76e2e7021168959964851b9edfbb51704432fdc7
+```
+
+That commit is **ours** — `snapclone-egui: the incoming-call sheet, and a test
+that found four more like it`. It is present, with identical content, at
+`874f8965`. The `filter-repo` run renumbered every commit in the repo, and an
+incremental bundle records its base by HASH.
+
+Git will not accept the substitution, and is right not to: `fetch`, `unbundle`
+and `verify` all refuse, because a bundle's prerequisite is a cryptographic
+claim about history, not a hint. There is no flag for "I have that content under
+a different name".
+
+**This is the real, recurring cost of rewriting shared history** — larger than
+the 42 chassis it cost the first time, because that was recoverable and this
+affects every sibling session that branched before the rewrite and has not
+re-cloned.
+
+The fix is on the producing side: re-cut those seven bundles against the current
+tip, or send them as `git format-patch` output, which records content rather
+than ancestry and applies regardless of renumbering.
