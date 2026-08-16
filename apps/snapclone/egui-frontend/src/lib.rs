@@ -371,6 +371,23 @@ pub struct Snapclone {
     pub freshness_policy: crate::freshness::FreshnessPolicy,
     /// The last export's one-line result, shown by the inbox card.
     pub export_note: Option<String>,
+    /// Which tile the strip has active. Held across frames because scrubbing
+    /// is a sequence of steps from the current position, not an absolute
+    /// jump — the engine's `scrub` takes a base index for exactly that.
+    pub strip_active: usize,
+    /// Is the active tile playing voice? Drives the engine's gating, which
+    /// DIMS and slows the neighbours rather than freezing them.
+    pub strip_voice: bool,
+    /// Decoded thumbnails, bounded. The strip asks for three tiles per frame
+    /// and scrubbing walks the window, so without a cache the same handful of
+    /// images decode over and over; without a BOUND, a long window decodes
+    /// them all into memory. The module has both.
+    pub thumbs: crate::thumbnails::ThumbnailCache,
+    /// The connection broker: one authenticated handshake per peer, streams
+    /// handed out per service. Held so the roster can ask what is actually
+    /// CONNECTED rather than showing a stored bool that means "was online
+    /// once".
+    pub broker: peermux_core::Broker,
     /// Which contact the open confirm panel is about. Held separately because
     /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
     /// risk score, not a subject.
@@ -540,6 +557,10 @@ impl Snapclone {
             contact_freshness: std::collections::HashMap::new(),
             freshness_policy: crate::freshness::FreshnessPolicy::default(),
             export_note: None,
+            strip_active: 0,
+            strip_voice: false,
+            thumbs: crate::thumbnails::ThumbnailCache::new(),
+            broker: peermux_core::Broker::new(),
             confirm_id: String::new(),
             editor_id: String::new(),
             editor_name: String::new(),
@@ -2334,6 +2355,24 @@ impl Snapclone {
                                        confirm_label: "Send".into() } };
             }
         });
+        // REACHABILITY, not a stored bool. Three states with three meanings:
+        // Connected sends now, Known queues, Unverified cannot be sent to at
+        // all — and the label says which so a queued message does not look
+        // like a delivered one.
+        let roster = self.peer_roster();
+        if !roster.is_empty() {
+            ui.colored_label(c.text_weak,
+                format!("{} of {} reachable now", self.sendable_peers(), roster.len()));
+            for rp in &roster {
+                let col = match rp.reach {
+                    crate::peer_source::Reach::Connected => c.success,
+                    crate::peer_source::Reach::Known => c.text,
+                    crate::peer_source::Reach::Unverified => c.text_weak,
+                };
+                ui.colored_label(col, rp.label());
+            }
+            ui.separator();
+        }
         let ids: Vec<String> = self.peers.iter().map(|p| p.name.clone()).collect();
         for id in ids {
             let sel = self.picker.selected().iter().any(|s| s == &id);
@@ -2483,8 +2522,114 @@ impl Snapclone {
     /// The inbox, on its own page. Was absent entirely: the app had a Peers
     /// list and no way to see a message, which is the gap that made a
     /// messaging app read as a demo.
+    /// The roster, over real reachability.
+    ///
+    /// This is where gossip and peer_source meet, and they compose rather than
+    /// duplicate: gossip DISCOVERS (who is on the network, and whether their
+    /// record's signature verified), the broker knows who has a SESSION, and
+    /// `roster` turns those two into the three states a bool cannot express —
+    /// Connected, Known, Unverified. A device that is merely seen is not
+    /// sendable, because queueing against an unverified identity is how a
+    /// message reaches whoever claims that name next.
+    ///
+    /// The id bridge is deliberate and lossy in one direction only: gossip
+    /// carries a string id, peermux a 32-byte key. Hashing the string into the
+    /// array would invent an identity, so a seen peer whose id is not a known
+    /// contact's is carried by its own bytes and matches nothing in the
+    /// broker — which is exactly the Unverified case.
+    pub fn peer_roster(&self) -> Vec<crate::peer_source::RosterPeer> {
+        let as_id = |s: &str| -> peermux_core::PeerId {
+            let mut id = [0u8; 32];
+            let b = s.as_bytes();
+            let n = b.len().min(32);
+            id[..n].copy_from_slice(&b[..n]);
+            id
+        };
+        let known: Vec<(peermux_core::PeerId, String)> = self.peers.iter()
+            .map(|p| (as_id(&p.name), p.name.clone())).collect();
+        // Only VERIFIED gossip records count as seen. An unverified record is
+        // a claim, and gossip::accept already refuses to trust it — carrying
+        // it into the roster would undo that at the last step.
+        let seen: Vec<peermux_core::PeerId> = self.view.peers().iter()
+            .filter(|r| r.verified)
+            .map(|r| as_id(&r.id)).collect();
+        crate::peer_source::roster(&self.broker, &known, &seen)
+    }
+
+    /// How many peers a compose screen can actually send to now.
+    pub fn sendable_peers(&self) -> usize {
+        crate::peer_source::sendable_count(&self.peer_roster())
+    }
+
+    /// The composer's 24-hour tile window, built from the inbox.
+    ///
+    /// The engine owns the window rule and the gating; this only says which
+    /// entries are tiles. Every inbox entry is one — a filter here would be a
+    /// second, disagreeing copy of "what is recent", and the engine already
+    /// has that in `Composer::new`.
+    pub fn strip_tiles(&self) -> Vec<crate::tile_strip::Tile> {
+        self.inbox.visible().iter().map(|e| crate::tile_strip::Tile {
+            id: e.id,
+            ts_ms: e.at.saturating_mul(1000),
+            // A received snap may carry a voice note; the engine still refuses
+            // to play audio on a still, so declaring the capability here is
+            // safe and declaring it false would silence real voice notes.
+            has_audio_track: true,
+        }).collect()
+    }
+
+    /// Apply a strip action. Scrub moves the window from where it is; a tap on
+    /// a neighbour makes it active.
+    pub fn strip_action(&mut self, act: crate::tile_strip::StripAction) {
+        use crate::tile_strip::StripAction;
+        let tiles = self.strip_tiles();
+        if tiles.is_empty() { return; }
+        let composer = crate::tile_strip::Composer::new(&tiles, self.now_secs * 1000);
+        let view = match act {
+            StripAction::Scrub(steps) =>
+                composer.scrub(self.strip_active, steps, self.strip_voice),
+            StripAction::Activate(id) => composer.activate_id(id, self.strip_voice),
+        };
+        if let Some(i) = view.active_index { self.strip_active = i; }
+    }
+
     fn inbox_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Messages");
+        // THE TILE STRIP, above the list. Three tiles — prev, active, next —
+        // because rendering the whole 24h window would decode dozens of
+        // thumbnails to show three.
+        {
+            let tiles = self.strip_tiles();
+            let composer = crate::tile_strip::Composer::new(&tiles, self.now_secs * 1000);
+            let active = self.strip_active.min(composer.len().saturating_sub(1));
+            let view = composer.view_at(active, self.strip_voice);
+            // ASK FOR ONLY WHAT IS VISIBLE. Three tiles, at one size — the
+            // cache coalesces a repeat request for a decode already in flight
+            // (scrubbing back and forth over the same tile is the common
+            // case) and defers past MAX_ACTIVE rather than queueing an
+            // unbounded pile of work a scrub has already moved past.
+            let mut pending = 0;
+            for t in &view.tiles {
+                let key = crate::thumbnails::Key::new(&format!("snap:{}", t.id), 128);
+                match self.thumbs.request(&key) {
+                    // No decoder attached in this build, so a queued request
+                    // completes as absent rather than being left in flight —
+                    // an in-flight entry that never completes would wedge the
+                    // MAX_ACTIVE gate against every later request.
+                    crate::thumbnails::Request::Queued => {
+                        self.thumbs.complete(&key, None);
+                        pending += 1;
+                    }
+                    crate::thumbnails::Request::Deferred => pending += 1,
+                    _ => {}
+                }
+            }
+            let _ = pending;
+            if let Some(act) = crate::tile_strip::tile_strip_ui(ui, &view, c) {
+                self.strip_action(act);
+            }
+            ui.separator();
+        }
         // The monthly card sits at the top of the Inbox, per the Qt page. It
         // gates itself: no month from the host means no card, rather than a
         // guess at what month it is.
@@ -4405,6 +4550,78 @@ mod gossip_wiring_tests {
             path: out.clone(), files: 3 });
         assert!(!app.export_requested);
         assert!(app.export_note.as_deref().unwrap_or("").contains("3 snaps"));
+    }
+    // ── tile_strip + thumbnails + peer_source wiring ──
+
+    #[test]
+    fn the_strip_shows_three_tiles_and_scrubbing_moves_from_where_it_is() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.now_secs = 10_000;
+        for i in 0..6u64 {
+            app.inbox.add(crate::inbox::Entry {
+                id: i, peer: format!("p{i}"), preview: String::new(),
+                at: app.now_secs - (i as i64 * 60), unread: false, outgoing: false,
+                kind: crate::inbox::Kind::Snap,
+            });
+        }
+        let tiles = app.strip_tiles();
+        assert_eq!(tiles.len(), 6);
+        let composer = crate::tile_strip::Composer::new(&tiles, app.now_secs * 1000);
+        let view = composer.view_at(2, false);
+        assert_eq!(view.tiles.len(), 3, "prev, active, next — never the whole window");
+        // Scrub is relative: from 2, one step lands adjacent, not at index 1
+        // of some absolute ordering.
+        app.strip_active = 2;
+        app.strip_action(crate::tile_strip::StripAction::Scrub(1));
+        let moved = app.strip_active;
+        assert_ne!(moved, 2, "the window moved");
+        app.strip_action(crate::tile_strip::StripAction::Scrub(-1));
+        assert_eq!(app.strip_active, 2, "and back again — scrub is relative");
+    }
+
+    #[test]
+    fn the_thumbnail_cache_coalesces_and_stays_bounded() {
+        use crate::thumbnails::{Key, Request, ThumbnailCache};
+        let mut c = ThumbnailCache::with_limits(2, 1);
+        let a = Key::new("snap:1", 128);
+        assert_eq!(c.request(&a), Request::Queued);
+        // A second ask while the first is in flight starts nothing — this is
+        // the scrub-back-and-forth case.
+        assert_eq!(c.request(&a), Request::Coalesced);
+        let b = Key::new("snap:2", 128);
+        assert_eq!(c.request(&b), Request::Deferred, "max_active gates the second decode");
+        c.complete(&a, Some(vec![1, 2, 3]));
+        assert_eq!(c.request(&a), Request::Hit);
+        // Capacity holds: a third entry evicts rather than growing.
+        c.complete(&b, Some(vec![4]));
+        c.complete(&Key::new("snap:3", 128), Some(vec![5]));
+        assert!(c.len() <= 2, "bounded — a long window cannot decode itself into memory");
+    }
+
+    #[test]
+    fn the_roster_separates_connected_known_and_unverified() {
+        use crate::peer_source::Reach;
+        let mut app = Snapclone::new_with_login(
+            vec![Peer { name: "alice".into(), online: false }], false);
+        // A verified gossip record for a stranger; an unverified one that must
+        // not appear at all.
+        app.view.observe(crate::gossip::PeerRecord {
+            id: "stranger".into(), host: "10.0.0.9".into(), port: 7000,
+            last_seen_ms: 1, verified: true,
+        });
+        app.view.observe(crate::gossip::PeerRecord {
+            id: "liar".into(), host: "10.0.0.10".into(), port: 7000,
+            last_seen_ms: 1, verified: false,
+        });
+        let roster = app.peer_roster();
+        assert!(roster.iter().any(|p| p.name == "alice" && p.reach == Reach::Known),
+                "a contact with no session is Known — queue, do not drop");
+        assert!(roster.iter().any(|p| p.reach == Reach::Unverified),
+                "a verified-record stranger is seen but not verified as an identity");
+        assert!(!roster.iter().any(|p| p.label().contains("liar")),
+                "an unverified gossip record never reaches the roster");
+        // Unverified is NOT sendable, so the count is contacts only.
+        assert_eq!(app.sendable_peers(), 1);
     }
 }
 
