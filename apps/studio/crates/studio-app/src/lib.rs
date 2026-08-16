@@ -2431,3 +2431,81 @@ mod voice_tests {
         assert!(sink.position().unwrap() >= before, "and did not rewind");
     }
 }
+
+#[cfg(test)]
+mod bus_sends_tests {
+    use super::*;
+
+    /// A send is a PARALLEL tap: the dry path survives it. That distinction
+    /// is the whole reason the Mixer needed a sends row beside routing —
+    /// routing a drum bus into a reverb bus replaces the drums with reverb,
+    /// which is not what "add reverb" means.
+    #[test]
+    fn a_send_adds_a_parallel_copy_without_removing_the_dry_signal() {
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let track = s.session.doc.project.clips.values()
+            .find(|c| c.source == id).unwrap().track;
+
+        // Drums -> their own bus; a second bus stands in for the effect
+        // return (its chain is irrelevant to the routing question).
+        let drums = studio_core::BusId(1);
+        let fx = studio_core::BusId(2);
+        for (id, name) in [(drums, "Drums"), (fx, "FX")] {
+            s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
+                id, name: name.into(), parent: None, gain: 1.0,
+                chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+        }
+        s.edit(studio_core::Op::SetRoute { track, bus: Some(drums) }, "routed");
+        let dry = s.render_arrangement(48_000, &sources);
+
+        s.edit(studio_core::Op::SetBusSends { id: drums, sends: vec![
+            studio_core::Send { to: fx, level: 0.5, pre_fader: false } ] }, "send");
+        let sent = s.render_arrangement(48_000, &sources);
+
+        let energy = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>();
+        assert!(energy(&sent) > energy(&dry) * 1.2,
+                "the copy arrives on top of the dry path ({} vs {})",
+                energy(&sent), energy(&dry));
+
+        // And muting the RETURN leaves the dry path standing — the proof it
+        // was parallel rather than in series.
+        s.edit(studio_core::Op::SetBusFlags { id: fx, muted: true }, "fx muted");
+        let muted_return = s.render_arrangement(48_000, &sources);
+        let diff: f32 = dry.iter().zip(&muted_return).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff < energy(&dry) * 0.01,
+                "with the return muted the mix is the dry mix again (diff {diff})");
+    }
+
+    #[test]
+    fn send_level_scales_the_copy() {
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let track = s.session.doc.project.clips.values()
+            .find(|c| c.source == id).unwrap().track;
+        let a = studio_core::BusId(1);
+        let b = studio_core::BusId(2);
+        for (id, name) in [(a, "A"), (b, "B")] {
+            s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
+                id, name: name.into(), parent: None, gain: 1.0,
+                chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+        }
+        s.edit(studio_core::Op::SetRoute { track, bus: Some(a) }, "routed");
+        let energy = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>();
+        let dry = energy(&s.render_arrangement(48_000, &sources));
+
+        let at = |s: &mut Studio, level: f32| {
+            s.edit(studio_core::Op::SetBusSends { id: a, sends: vec![
+                studio_core::Send { to: b, level, pre_fader: false } ] }, "send");
+            energy(&s.render_arrangement(48_000, &sources))
+        };
+        let quarter = at(&mut s, 0.25);
+        let full = at(&mut s, 1.0);
+        assert!(full - dry > (quarter - dry) * 3.0,
+                "a louder send is a louder copy: +{} vs +{}", full - dry, quarter - dry);
+    }
+}

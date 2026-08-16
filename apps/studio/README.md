@@ -223,7 +223,7 @@ floor is right for turning a car and wrong for playing quietly). It is
 factored from `games/skydribble/src/analog.rs`, which proved the approach;
 that game is deliberately NOT refactored onto it in the same breath.
 studio-app supplies it as the real backend for `studio_egui::playkeys`'s
-`AnalogSource` seam. Named, not built, from the same wishlist: bus SENDS in the UI (the model has them),
+`AnalogSource` seam. Named, not built, from the same wishlist: clip-level chain editing,
 clip-level chain editing, surround/downmix formats (mixdown is stereo
 end-to-end today), 
  a playing
@@ -1143,3 +1143,16 @@ stays soft in the pattern. The Wooting binding itself is NOT written here:
 feature with a no-op fallback, and lifting that into a shared crate (rather
 than copying 200 lines of FFI no test in this repo can exercise without the
 hardware) is the honest next step.
+
+
+**Sends: the parallel taps.** The Mixer's bus rows gained a sends line —
+add a send to any other bus, set its level (commit-on-release, like every
+fader here), flip pre/post-fader, remove it. Self-sends and duplicates are
+filtered out of the menu: a bus sending to itself is a feedback path the
+mixdown would have to defend against, and two sends down one path are two
+faders fighting. This closes the gap that made "a reverb bus" unbuildable
+in the UI even though `mixdown` implemented sends all along: ROUTING a drum
+bus into a reverb replaces the drums with reverb, while SENDING gives it a
+copy — two tests pin exactly that distinction (a send raises the mix's
+energy over the dry path; muting the return brings the dry mix back
+unchanged; level scales the copy).

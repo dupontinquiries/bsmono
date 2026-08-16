@@ -162,6 +162,62 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
                 .map(|x| x.name.clone()).unwrap_or_else(|| "master".into());
             ui.label(parent_label);
         });
+        // Sends: the parallel taps. A reverb bus is not something drums
+        // ROUTE into (that would replace the dry signal) — it is something
+        // they send a copy to, which is why the model has both and why the
+        // UI has to as well, or "reverb bus" is unbuildable here.
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(18.0);
+            ui.label("sends:");
+            let mut sends = b.sends.clone();
+            let mut changed = false;
+            let mut remove: Option<usize> = None;
+            for (i, send) in sends.iter_mut().enumerate() {
+                let to = busses.iter().find(|x| x.id == send.to)
+                    .map(|x| x.name.clone()).unwrap_or_else(|| format!("bus {}", send.to.0));
+                ui.label(format!("→ {to}"));
+                let mut lvl = send.level;
+                let resp = ui.add(egui::Slider::new(&mut lvl, 0.0..=1.0)
+                    .show_value(false).text(""));
+                // Sends commit on release like every other fader here; a
+                // value per drag frame would be an op per frame.
+                if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                    send.level = lvl;
+                    changed = true;
+                }
+                let mut pre = send.pre_fader;
+                if ui.checkbox(&mut pre, "pre").on_hover_text(
+                    "tap before this bus's own fader").changed() {
+                    send.pre_fader = pre;
+                    changed = true;
+                }
+                if ui.small_button("✕").clicked() { remove = Some(i); }
+            }
+            if let Some(i) = remove { sends.remove(i); changed = true; }
+            // Only busses that are not this one and do not already receive:
+            // a bus sending to itself is a feedback loop the mixdown would
+            // have to defend against, and a duplicate send is two faders
+            // fighting over one path.
+            let candidates: Vec<_> = busses.iter()
+                .filter(|x| x.id != b.id && !sends.iter().any(|s| s.to == x.id))
+                .collect();
+            if !candidates.is_empty() {
+                ui.menu_button("+ send", |ui| {
+                    for target in candidates {
+                        if ui.button(&target.name).clicked() {
+                            sends.push(studio_core::Send {
+                                to: target.id, level: 0.3, pre_fader: false });
+                            changed = true;
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            if changed {
+                s.edit(studio_core::Op::SetBusSends { id: b.id, sends }, "bus sends");
+            }
+        });
+
         // The chain: chips in order, each removable; whole-chain SetBusChain
         // is the op shape the model chose, so one click is one op.
         ui.horizontal_wrapped(|ui| {
