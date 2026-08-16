@@ -192,6 +192,54 @@ impl Studio {
         self.mode.effective_playhead(self.transport.position(), None)
     }
 
+    /// Write the arrangement to `dir` as a file worth sending: 16-bit
+    /// dithered WAV or 128kbps Ogg Opus — the format this project's own
+    /// sample libraries arrive in, at roughly a tenth of the WAV's size.
+    /// Renders at the PROJECT rate (48k), not the device's: an export must
+    /// not change length because of the sound card. Returns the path so the
+    /// status line can say where the file went — an export whose location
+    /// you have to guess is half an export.
+    pub fn export_arrangement(
+        &mut self,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+        dir: &std::path::Path,
+        format: ExportFormat,
+    ) -> Result<std::path::PathBuf, String> {
+        let samples = self.render_arrangement(48_000, sources);
+        if samples.is_empty() {
+            self.status = "export refused: the arrangement is empty".into();
+            return Err(self.status.clone());
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
+        let name: String = self.session.doc.project.name.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let path = dir.join(format!("{name}-{stamp}.{}", format.ext()));
+        match format {
+            ExportFormat::Wav => {
+                studio_audio::export::export_wav_dithered(&samples, 2, 48_000, stamp, &path)
+                    .map_err(|e| format!("wav write: {e}"))?;
+            }
+            ExportFormat::Opus => {
+                // De-interleave: the encoder speaks the same planar
+                // SourceAudio every other seam here does.
+                let mut planes = vec![Vec::with_capacity(samples.len() / 2); 2];
+                for fr in samples.chunks(2) {
+                    planes[0].push(fr[0]);
+                    planes[1].push(fr[1]);
+                }
+                let audio = studio_audio::SourceAudio { sample_rate: 48_000, channels: planes };
+                let bytes = studio_media::encode_opus(&audio, 128_000)
+                    .map_err(|e| e.to_string())?;
+                std::fs::write(&path, bytes).map_err(|e| format!("write {path:?}: {e}"))?;
+            }
+        }
+        self.status = format!("exported {}", path.display());
+        Ok(path)
+    }
+
     /// Render the whole arrangement at `rate` as interleaved stereo — what
     /// the sink plays when the TIMELINE transport rolls. `mixdown` is the
     /// tested pure function; this is a one-shot offline render of it, traded
@@ -348,7 +396,10 @@ impl Studio {
         let clip = studio_core::ClipId(
             self.session.doc.project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
         let at = self.playhead();
-        let path = format!("bounces/{}.wav", pattern.name);
+        // The source id in the name keeps every bounce's file distinct: two
+        // bounces of 'Trap A' are two sources, and the first must not be
+        // overwritten on disk while the project still points at it.
+        let path = format!("bounces/{}-{}.wav", pattern.name, source.0);
         let ops = studio_live::bounce_ops(&pattern, &self.rack.tempo(), rate,
                                           source, clip, track, at, &path);
         for op in ops {
@@ -491,6 +542,19 @@ impl eframe::App for App {
                 ui.label(studio_egui::format_timecode(self.studio.playhead()));
                 ui.separator();
                 ui.label(self.studio.mode.label());
+                ui.separator();
+                // Exports go to ./exports, named after the project; the
+                // status line prints the exact path. No dialog on purpose:
+                // predictable beats configurable for the ship-a-beat loop,
+                // and a picker can arrive later without moving this seam.
+                if ui.button("export wav").clicked() {
+                    let _ = self.studio.export_arrangement(
+                        &self.audio, std::path::Path::new("exports"), ExportFormat::Wav);
+                }
+                if ui.button("export opus").clicked() {
+                    let _ = self.studio.export_arrangement(
+                        &self.audio, std::path::Path::new("exports"), ExportFormat::Opus);
+                }
             });
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -583,6 +647,22 @@ impl eframe::App for App {
             // material and must not change length because of the sound card.
             if let Some((id, audio)) = self.studio.bounce_current_pattern(48_000, &self.audio) {
                 self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                // The op recorded a path; make it true on disk, so the
+                // project's reference points at a real file rather than a
+                // label. A failed write is a status note, not a lost bounce
+                // — the audio is already registered in memory either way.
+                if let Some(src) = self.studio.session.doc.project.sources.get(&id) {
+                    let path = std::path::PathBuf::from(&src.path);
+                    let write = path.parent()
+                        .map(|d| std::fs::create_dir_all(d)).unwrap_or(Ok(()))
+                        .and_then(|_| studio_audio::export::export_wav_dithered(
+                            &audio.channels[0], 1, 48_000, id.0, &path)
+                            .map_err(std::io::Error::other));
+                    if let Err(e) = write {
+                        self.studio.status = format!("{} (file not written: {e})",
+                                                     self.studio.status);
+                    }
+                }
                 self.audio.insert(id, audio);
             }
         }
@@ -833,5 +913,73 @@ mod arrangement_tests {
         s.key(Key::c('u'));
         s.key(Key::c('u'));
         assert_eq!(s.session.doc.project.clips.len(), clips_before);
+    }
+}
+
+/// What `Studio::export_arrangement` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat { Wav, Opus }
+impl ExportFormat {
+    pub fn ext(self) -> &'static str {
+        match self { ExportFormat::Wav => "wav", ExportFormat::Opus => "opus" }
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    fn bounced_studio() -> (Studio, std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>) {
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        (s, sources)
+    }
+
+    #[test]
+    fn both_export_formats_roundtrip_through_the_apps_own_decoder() {
+        // The exported file is read back by the same studio-media that reads
+        // the user's libraries — if the app can't eat its own exports,
+        // nothing else should be trusted to.
+        let (mut s, sources) = bounced_studio();
+        let dir = std::env::temp_dir().join("studio-export-test");
+        let expect_frames = s.render_arrangement(48_000, &sources).len() / 2;
+
+        for fmt in [ExportFormat::Wav, ExportFormat::Opus] {
+            let path = s.export_arrangement(&sources, &dir, fmt).expect("exports");
+            assert!(s.status.contains("exported"), "status names it: {:?}", s.status);
+            let back = studio_media::decode_file(&path).expect("our decoder reads it");
+            assert_eq!(back.channels.len(), 2, "{fmt:?} kept stereo");
+            assert_eq!(back.sample_rate, 48_000);
+            assert_eq!(back.frames(), expect_frames,
+                       "{fmt:?} came back the exact arrangement length");
+            // And it isn't silence: the bounced kick is in there.
+            let head: f32 = back.channels[0][..4800].iter().map(|v| v.abs()).sum();
+            assert!(head > 5.0, "{fmt:?} export is audible ({head})");
+        }
+    }
+
+    #[test]
+    fn the_opus_export_is_the_small_one() {
+        // The stated reason this format exists. Not a benchmark — an order
+        // check: opus at 128k must land well under half the 16-bit WAV.
+        let (mut s, sources) = bounced_studio();
+        let dir = std::env::temp_dir().join("studio-export-size");
+        let wav = s.export_arrangement(&sources, &dir, ExportFormat::Wav).unwrap();
+        let opus = s.export_arrangement(&sources, &dir, ExportFormat::Opus).unwrap();
+        let (w, o) = (std::fs::metadata(&wav).unwrap().len(),
+                      std::fs::metadata(&opus).unwrap().len());
+        assert!(o * 2 < w, "opus {o} bytes vs wav {w} bytes");
+    }
+
+    #[test]
+    fn an_empty_arrangement_refuses_to_export_out_loud() {
+        let p = Project { name: "empty".into(), ..Default::default() };
+        let mut s = Studio::new(p, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]));
+        let err = s.export_arrangement(&Default::default(),
+                                       &std::env::temp_dir(), ExportFormat::Wav);
+        assert!(err.is_err());
+        assert!(s.status.contains("refused"), "status was {:?}", s.status);
     }
 }

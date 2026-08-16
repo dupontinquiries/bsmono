@@ -95,7 +95,18 @@ choke_group`, wire v6): a group hit cuts the group's ringing voice with a
 panel-routed: a file dropped on the Rack becomes a sampler channel, dropped
 on the Timeline it becomes a clip at the playhead on the first audio track
 *with room* — a melody loop is arrangement material, not a truncated
-one-shot. Not built, named plainly: rack collaboration (the wire has
+one-shot. **Beats leave the building.** `studio-media` gained the encode half of its
+Opus support — Ogg Opus out (RFC 7845), pre-skip declared from the
+encoder's real lookahead, final granule marking the true end, and the
+encoder over-fed by one lookahead of silence so a frame-aligned input
+doesn't leave its last 312 samples inside libopus (a bug the unaligned test
+case couldn't see and the aligned one caught; both alignments are pinned
+now). Exports roundtrip sample-exact through this crate's own decoder and
+read correctly in ffprobe. The shell exports the arrangement as 16-bit
+dithered WAV or 128k Opus to `./exports/<project>-<stamp>.*` — no dialog,
+the status line prints the path — and a bounce now writes its WAV to the
+path its `AddSource` op records, so the project's references are real
+files. Not built, named plainly: rack collaboration (the wire has
 `Packet::Rack`; the shell doesn't broadcast it yet), streaming pattern
 playback inside `DeviceEngine`'s realtime render, and the Mixer/Program
 panels, which say so on screen instead of showing nothing.

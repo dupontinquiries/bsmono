@@ -33,6 +33,19 @@ fn main() {
 
     studio_audio::export::export_wav_dithered(&out, 1, rate, 0xBEA7, std::path::Path::new(&path))
         .expect("wav write");
+    // The same render as .opus beside it — the size difference is the whole
+    // argument for the format, so the demo shows it rather than claims it.
+    let opus_path = std::path::Path::new(&path).with_extension("opus");
+    let audio = studio_audio::SourceAudio { sample_rate: rate, channels: vec![out.clone()] };
+    match studio_media::encode_opus(&audio, 128_000) {
+        Ok(bytes) => {
+            std::fs::write(&opus_path, &bytes).expect("opus write");
+            eprintln!("wrote {}: {} bytes ({}x smaller than the wav)",
+                      opus_path.display(), bytes.len(),
+                      (out.len() * 2) / bytes.len().max(1));
+        }
+        Err(e) => eprintln!("no opus twin: {e}"),
+    }
     eprintln!(
         "wrote {path}: {bars} bars of '{}' at {} bpm, swing {:.0}%, {:.2}s, peak {:.1} dBFS",
         pattern.name, tempo.bpm, tempo.swing * 100.0,
