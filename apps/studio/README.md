@@ -116,10 +116,26 @@ per gesture — `Paint`'s rationale, one layer up; the drag preview is visual
 only, audio follows on release, and a live fader ride is honestly the
 streaming engine's job), mute as the existing `SetTrackFlags` op, and solo
 as deliberately-local monitoring state that shapes renders and exports but
-never the project. Not built, named plainly: rack collaboration (the wire
-has `Packet::Rack`; the shell doesn't broadcast it yet), streaming pattern
-playback inside `DeviceEngine`'s realtime render, and the Program panel,
-which says so on screen instead of showing nothing.
+never the project. **The shell is a peer now.** `Studio::edit` goes through the Doc's op log
+(`Doc::local` — stamped, replay-safe) instead of mutating the project
+directly; the old `History` wiring bypassed the log, which would have LOST
+every local edit on the first remote-conflict replay. Undo/redo are inverse
+ops routed back through the same door, so an undo travels to peers as the
+edit it is — and a refusal after remote conflict is said out loud. Local
+activity (ops and whole-rack LWW syncs, published from one per-frame choke
+point) lands in `Studio::drain_outbox()`; `Studio::integrate_packet()`
+accepts everything a peer sends, answers `Hello` with a log catch-up, and
+adopts the LWW winner's rack. Six two-peer tests exercise the seam headless:
+groove convergence both directions, concurrent project edits without a
+referee, undo-as-op, flaky-link catch-up, snapshot join (the documented
+broadcast()+rack_broadcast() flow — NOT snapshot+log, whose double-apply bug
+broadcast()'s own docs record), and simultaneous-edit LWW agreement. Not
+built, named plainly: the CARRIER — no socket drains the outbox yet (the
+dht module's network half is the named future), remote sources arrive
+without their audio bytes (asset transfer unwired, so a peer's bounce shows
+as a silent clip until assets move), streaming pattern playback inside
+`DeviceEngine`'s realtime render, and the Program panel, which says so on
+screen instead of showing nothing.
 
 ## Realtime collaboration, concretely
 

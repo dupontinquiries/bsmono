@@ -27,7 +27,20 @@ pub struct Studio {
     pub panel: Panel,
     pub mode: ViewMode,
     pub selection: Vec<studio_core::ClipId>,
-    pub history: studio_core::History,
+    /// Undo/redo as INVERSE OPS, not project snapshots — and routed back
+    /// through [`Studio::edit`]'s stamping path when used, so an undo is an
+    /// edit that travels to peers exactly like the edit it reverts. (The
+    /// previous `studio_core::History` wiring mutated the project directly,
+    /// bypassing the Doc's op log — which meant every local edit would have
+    /// been LOST on the first remote-conflict replay. Collab correctness is
+    /// why this shell exists on a `Doc` at all, so the log is now the only
+    /// door.)
+    undo_stack: Vec<studio_core::Op>,
+    redo_stack: Vec<studio_core::Op>,
+    /// Packets produced by local activity — stamped ops (including undos)
+    /// and rack syncs — waiting for whatever carrier exists to drain them.
+    /// The shell is transport-agnostic on purpose: this Vec IS the seam.
+    outbox: Vec<studio_collab::wire::Packet>,
     pub keys: studio_egui::keys::Keymap,
     /// Status line — what just happened, so an action never fails silently.
     pub status: String,
@@ -72,7 +85,9 @@ impl Studio {
             panel: Panel::Timeline,
             mode: ViewMode::Split,
             selection: Vec::new(),
-            history: studio_core::History::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            outbox: Vec::new(),
             keys: studio_egui::keys::Keymap::new(),
             status: "ready".into(),
             rack: studio_live::Rack::trap_kit(),
@@ -112,13 +127,114 @@ impl Studio {
         Studio::new(p, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]))
     }
 
-    /// Apply an edit through history, so undo works and the status line says so.
+    /// Apply an edit through the Doc's op log — stamped, undoable, and
+    /// pushed to the outbox — so undo works, peers converge, and the status
+    /// line says so.
     pub fn edit(&mut self, op: studio_core::Op, what: &str) {
-        match self.history.apply(&mut self.session.doc.project, &op) {
-            Ok(()) => { self.status = what.into(); self.arrangement_dirty = true; }
+        match self.edit_inner(op) {
+            Ok(inverse) => {
+                self.undo_stack.push(inverse);
+                self.redo_stack.clear();
+                self.status = what.into();
+                self.arrangement_dirty = true;
+            }
             // An edit that cannot apply must SAY so. A silently dropped edit is
             // the worst failure an editor has: the user believes it worked.
             Err(e) => self.status = format!("{what} refused: {e:?}"),
+        }
+    }
+
+    /// The one door to the project: pre-validate on a scratch copy (which is
+    /// also what yields the inverse op — `Doc::local` doesn't return one),
+    /// then stamp and log for real. Two applies and a clone per user
+    /// gesture, the same per-edit cost `studio-engine`'s snapshot swap
+    /// already accepts, bought here for the property that the log and the
+    /// project can never disagree about what happened.
+    fn edit_inner(&mut self, op: studio_core::Op)
+        -> Result<studio_core::Op, studio_core::EditError>
+    {
+        let mut probe = self.session.doc.project.clone();
+        let inverse = probe.apply(&op)?;
+        let stamped = self.session.doc.local(op)?;
+        self.outbox.push(studio_collab::wire::Packet::Op(stamped));
+        Ok(inverse)
+    }
+
+    /// Everything local since the last drain, for any carrier to ship.
+    pub fn drain_outbox(&mut self) -> Vec<studio_collab::wire::Packet> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// Publish the rack to the Doc's LWW register when it has drifted — the
+    /// one choke point between "the rack the panels mutate" and "the rack
+    /// peers see". Called every shell frame; a compare of a small value is
+    /// cheaper than being wrong once.
+    pub fn sync_rack_if_changed(&mut self) {
+        let differs = self.session.doc.rack.as_ref()
+            .map(|r| r.rack != self.rack)
+            .unwrap_or(true);
+        if differs {
+            let sync = self.session.doc.set_rack(self.rack.clone());
+            self.outbox.push(studio_collab::wire::Packet::Rack(sync));
+        }
+    }
+
+    /// Feed one packet from a peer. Returns any reply packets (a `Hello`
+    /// earns a catch-up; everything else is silent).
+    pub fn integrate_packet(&mut self, p: studio_collab::wire::Packet)
+        -> Vec<studio_collab::wire::Packet>
+    {
+        use studio_collab::wire::Packet;
+        match p {
+            Packet::Op(s) => {
+                // Idempotent and order-independent in the Doc; our only job
+                // is refreshing what the remote edit made stale. Remote ops
+                // never touch the LOCAL undo stack — you undo your own
+                // edits, not your collaborator's.
+                if self.session.doc.integrate(&s).is_ok() {
+                    self.arrangement_dirty = true;
+                }
+                Vec::new()
+            }
+            Packet::Catchup { ops } => {
+                for s in &ops {
+                    let _ = self.session.doc.integrate(s);
+                }
+                self.arrangement_dirty = true;
+                Vec::new()
+            }
+            Packet::Rack(sync) => {
+                self.session.doc.integrate_rack(sync);
+                // Adopt whichever value the LWW register now holds — ours,
+                // if ours was newer; theirs, if not. Reading the winner back
+                // (instead of keeping a local copy we believe in) is what
+                // makes both peers land on the SAME rack.
+                if let Some(rs) = &self.session.doc.rack {
+                    if rs.rack != self.rack {
+                        self.rack = rs.rack.clone();
+                        self.current_pattern = self.current_pattern
+                            .min(self.rack.patterns.len().saturating_sub(1));
+                        self.selected_channel = self.selected_channel
+                            .min(self.rack.channels.len().saturating_sub(1));
+                        self.loop_dirty = true;
+                        self.status = "rack updated by a peer".into();
+                    }
+                }
+                Vec::new()
+            }
+            Packet::Presence(pr) => {
+                self.session.doc.presence(pr);
+                Vec::new()
+            }
+            Packet::Hello { since, .. } => {
+                let ops: Vec<studio_collab::StampedOp> = self.session.doc.history()
+                    .iter().filter(|s| s.stamp.lamport > since).cloned().collect();
+                let mut replies = vec![Packet::Catchup { ops }];
+                if let Some(rack) = self.session.rack_broadcast() {
+                    replies.push(rack);
+                }
+                replies
+            }
         }
     }
 
@@ -148,14 +264,34 @@ impl Studio {
                         }
                     }
                     Action::Undo => {
-                        self.status = if self.history.undo(&mut self.session.doc.project).is_some()
-                            { self.arrangement_dirty = true; "undo".into() }
-                            else { "nothing to undo".into() };
+                        // The inverse goes back through the SAME stamping
+                        // door, so peers see the undo as the edit it is. If
+                        // the state has moved under it (a peer's conflicting
+                        // op), the refusal is said out loud, not swallowed.
+                        self.status = match self.undo_stack.pop() {
+                            None => "nothing to undo".into(),
+                            Some(inv) => match self.edit_inner(inv) {
+                                Ok(redo) => {
+                                    self.redo_stack.push(redo);
+                                    self.arrangement_dirty = true;
+                                    "undo".into()
+                                }
+                                Err(e) => format!("undo refused (state moved): {e:?}"),
+                            },
+                        };
                     }
                     Action::Redo => {
-                        self.status = if self.history.redo(&mut self.session.doc.project).is_some()
-                            { self.arrangement_dirty = true; "redo".into() }
-                            else { "nothing to redo".into() };
+                        self.status = match self.redo_stack.pop() {
+                            None => "nothing to redo".into(),
+                            Some(op) => match self.edit_inner(op) {
+                                Ok(undo) => {
+                                    self.undo_stack.push(undo);
+                                    self.arrangement_dirty = true;
+                                    "redo".into()
+                                }
+                                Err(e) => format!("redo refused (state moved): {e:?}"),
+                            },
+                        };
                     }
                     Action::Delete => {
                         let sel = std::mem::take(&mut self.selection);
@@ -617,6 +753,13 @@ impl eframe::App for App {
             }
         }
 
+        // ── keep the Doc's rack register current ──────────────────────────
+        // Every panel mutates `studio.rack` directly; this is the one choke
+        // point that turns those mutations into LWW syncs in the outbox. No
+        // carrier drains the outbox in this shell yet — named plainly: the
+        // packets are real and tested, the socket is not built.
+        self.studio.sync_rack_if_changed();
+
         // ── one sink, one owner ───────────────────────────────────────────
         // Priority is whoever the user pressed play on last (the key handler
         // enforces exclusivity); this block just keeps the sink's buffer
@@ -1045,5 +1188,142 @@ mod mixer_tests {
         assert!(s.arrangement_dirty, "the render knows the mix moved");
         s.key(Key::c('u'));
         assert_eq!(g(&s), 1.0, "one gesture, one undo step");
+    }
+}
+
+#[cfg(test)]
+mod collab_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+
+    /// Two peers on the same base project, different sites — and a wire
+    /// between them made of nothing but `drain_outbox` → `integrate_packet`,
+    /// which is exactly the seam any real carrier will occupy.
+    fn pair() -> (Studio, Studio) {
+        let a = Studio::demo();
+        let base = a.session.doc.project.clone();
+        let b = Studio::new(base, SiteId(2), Team::from_contacts("duo", &["sc-b".into()]));
+        (a, b)
+    }
+
+    fn pipe(from: &mut Studio, to: &mut Studio) {
+        for p in from.drain_outbox() {
+            to.integrate_packet(p);
+        }
+    }
+
+    #[test]
+    fn two_studios_converge_on_a_beat() {
+        let (mut a, mut b) = pair();
+        // A programs; the rack register carries it over.
+        a.rack.patterns[0].toggle(1, 3);
+        a.rack.swing = 0.22;
+        a.sync_rack_if_changed();
+        pipe(&mut a, &mut b);
+        assert_eq!(b.rack, a.rack, "B hears A's groove");
+        assert!(b.loop_dirty, "and knows to re-render it");
+        // B answers with a sound-design change; A adopts it.
+        if let studio_live::SynthKind::Sub { decay_ms, .. } = &mut b.rack.channels[0].kind {
+            *decay_ms = 500.0;
+        }
+        b.sync_rack_if_changed();
+        pipe(&mut b, &mut a);
+        assert_eq!(a.rack, b.rack, "A hears B's 808");
+        assert!(a.status.contains("peer"), "and was told: {:?}", a.status);
+    }
+
+    #[test]
+    fn concurrent_project_edits_converge_without_a_referee() {
+        let (mut a, mut b) = pair();
+        let clip = *a.session.doc.project.clips.keys().next().unwrap();
+        let track = a.session.doc.project.tracks.iter()
+            .find(|t| t.kind == studio_core::TrackKind::Audio).unwrap().id;
+        // Both edit BEFORE either hears the other — the order-independence
+        // the Doc promises, exercised through the shell's own door.
+        a.edit(studio_core::Op::RemoveClip { id: clip }, "deleted");
+        b.edit(studio_core::Op::SetTrackGain { id: track, gain: 0.6 }, "gain");
+        pipe(&mut a, &mut b);
+        pipe(&mut b, &mut a);
+        assert_eq!(a.session.doc.project, b.session.doc.project,
+                   "both peers hold the same project");
+        assert!(!a.session.doc.project.clips.contains_key(&clip));
+        assert_eq!(a.session.doc.project.tracks.iter()
+                   .find(|t| t.id == track).unwrap().gain, 0.6);
+    }
+
+    #[test]
+    fn an_undo_travels_as_the_edit_it_is() {
+        let (mut a, mut b) = pair();
+        let clips_before = a.session.doc.project.clips.len();
+        a.bounce_current_pattern(48_000, &Default::default()).expect("bounced");
+        pipe(&mut a, &mut b);
+        assert_eq!(b.session.doc.project.clips.len(), clips_before + 1,
+                   "B sees the bounce land");
+        a.key(Key::c('u'));
+        a.key(Key::c('u'));
+        pipe(&mut a, &mut b);
+        assert_eq!(b.session.doc.project.clips.len(), clips_before,
+                   "and sees it taken back — an undo is an op, not local time travel");
+        assert_eq!(a.session.doc.project, b.session.doc.project);
+    }
+
+    #[test]
+    fn a_hello_catches_up_a_peer_who_missed_the_wire() {
+        // The Hello/Catchup flow is for peers who SHARE the base and missed
+        // ops — a flaky link, not a new face.
+        let (mut a, mut b) = pair();
+        a.rack.swing = 0.3;
+        a.sync_rack_if_changed();
+        let clip = *a.session.doc.project.clips.keys().next().unwrap();
+        a.edit(studio_core::Op::RemoveClip { id: clip }, "deleted");
+        a.drain_outbox(); // lost in transit — B heard none of it
+
+        let replies = a.integrate_packet(
+            studio_collab::wire::Packet::Hello { site: SiteId(2), since: 0 });
+        assert!(!replies.is_empty(), "a Hello is answered");
+        for p in replies {
+            b.integrate_packet(p);
+        }
+        assert_eq!(b.session.doc.project, a.session.doc.project, "B caught up on the project");
+        assert_eq!(b.rack, a.rack, "and on the rack");
+    }
+
+    #[test]
+    fn a_true_newcomer_joins_from_the_snapshot_not_the_log() {
+        // Session::broadcast()'s own docs record the double-apply bug that
+        // snapshot+log replay caused; the shell must follow the documented
+        // join flow — broadcast() for the project, rack_broadcast() for the
+        // rack — and this pins that the two suffice.
+        let (mut a, _) = pair();
+        a.rack.patterns[0].toggle(4, 9);
+        a.sync_rack_if_changed();
+        a.drain_outbox();
+
+        let mut c = Studio::new(
+            Project { name: a.session.doc.project.name.clone(), ..Default::default() },
+            SiteId(3), Team::from_contacts("trio", &["sc-c".into()]));
+        c.integrate_packet(a.session.broadcast());
+        if let Some(rack) = a.session.rack_broadcast() {
+            c.integrate_packet(rack);
+        }
+        assert_eq!(c.session.doc.project, a.session.doc.project, "C holds the project");
+        assert_eq!(c.rack, a.rack, "and the rack");
+    }
+
+    #[test]
+    fn simultaneous_rack_edits_end_in_one_shared_rack() {
+        // Whole-value LWW: someone's version wins by (seq, site) — the point
+        // is not WHO wins but that both peers agree on it without a server.
+        let (mut a, mut b) = pair();
+        a.rack.swing = 0.10;
+        b.rack.swing = 0.40;
+        a.sync_rack_if_changed();
+        b.sync_rack_if_changed();
+        let from_a = a.drain_outbox();
+        let from_b = b.drain_outbox();
+        for p in from_a { b.integrate_packet(p); }
+        for p in from_b { a.integrate_packet(p); }
+        assert_eq!(a.rack, b.rack, "one rack, agreed without a referee");
+        assert!(a.rack.swing == 0.10 || a.rack.swing == 0.40);
     }
 }
