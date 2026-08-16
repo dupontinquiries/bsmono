@@ -53,17 +53,32 @@ pub fn export_wav_dithered(
     seed: u64,
     path: &Path,
 ) -> Result<(), hound::Error> {
+    let bytes = export_wav_dithered_bytes(samples, channels, sample_rate, seed)?;
+    std::fs::write(path, bytes).map_err(hound::Error::IoError)
+}
+
+/// The same dithered 16-bit WAV, as bytes — for callers whose destination is
+/// a content-addressed asset store or a wire rather than a filesystem. The
+/// path variant above delegates here so the two can never drift.
+pub fn export_wav_dithered_bytes(
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    seed: u64,
+) -> Result<Vec<u8>, hound::Error> {
     let spec = hound::WavSpec {
         channels,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(path, spec)?;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = hound::WavWriter::new(&mut cursor, spec)?;
     for s in tpdf_dither_and_quantize_i16(samples, seed) {
         writer.write_sample(s)?;
     }
-    writer.finalize()
+    writer.finalize()?;
+    Ok(cursor.into_inner())
 }
 
 #[cfg(test)]

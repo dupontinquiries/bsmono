@@ -41,6 +41,17 @@ pub struct Studio {
     /// and rack syncs — waiting for whatever carrier exists to drain them.
     /// The shell is transport-agnostic on purpose: this Vec IS the seam.
     outbox: Vec<studio_collab::wire::Packet>,
+    /// Manifests for sources whose bytes this peer can serve.
+    manifests: std::collections::BTreeMap<studio_core::SourceId, studio_collab::assets::Manifest>,
+    /// The content-addressed chunk store — shared across sources on purpose:
+    /// a re-bounce that changed one bar re-ships one bar.
+    chunk_store: std::collections::BTreeMap<studio_collab::assets::ChunkId, Vec<u8>>,
+    /// Manifests still collecting chunks.
+    pending_assets: std::collections::BTreeMap<studio_core::SourceId, studio_collab::assets::Manifest>,
+    /// Media that finished arriving and decoded — the shell drains this into
+    /// its audio/peaks maps. A queue rather than a callback so the headless
+    /// tests can watch the same door the GUI uses.
+    pub incoming_audio: Vec<(studio_core::SourceId, studio_audio::SourceAudio)>,
     pub keys: studio_egui::keys::Keymap,
     /// Status line — what just happened, so an action never fails silently.
     pub status: String,
@@ -88,6 +99,10 @@ impl Studio {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             outbox: Vec::new(),
+            manifests: Default::default(),
+            chunk_store: Default::default(),
+            pending_assets: Default::default(),
+            incoming_audio: Vec::new(),
             keys: studio_egui::keys::Keymap::new(),
             status: "ready".into(),
             rack: studio_live::Rack::trap_kit(),
@@ -179,8 +194,47 @@ impl Studio {
         }
     }
 
+    /// Make a source's media servable: chunk it into the content-addressed
+    /// store and announce the manifest, so peers who just saw the
+    /// `AddSource` op can fetch exactly the chunks they lack.
+    pub fn register_asset(&mut self, source: studio_core::SourceId, bytes: &[u8]) {
+        let (manifest, chunks) = studio_collab::assets::Manifest::build(bytes);
+        self.chunk_store.extend(chunks);
+        self.outbox.push(studio_collab::wire::Packet::AssetManifest {
+            source, manifest: manifest.clone(),
+        });
+        self.manifests.insert(source, manifest);
+    }
+
+    /// Ask the room for a source's media if we neither hold nor await it.
+    fn maybe_request_asset(&mut self, source: studio_core::SourceId) {
+        if !self.manifests.contains_key(&source) && !self.pending_assets.contains_key(&source) {
+            self.outbox.push(studio_collab::wire::Packet::AssetRequest { source });
+        }
+    }
+
+    /// A manifest's chunks are all here: assemble (verified), decode, queue.
+    /// The manifest is promoted to servable EVEN IF decode fails — the bytes
+    /// proved their integrity, so re-serving them is right; what they mean
+    /// is a media problem, said out loud in the status.
+    fn finish_asset(&mut self, source: studio_core::SourceId,
+                    manifest: studio_collab::assets::Manifest) {
+        let Ok(bytes) = manifest.assemble(&self.chunk_store) else { return };
+        self.pending_assets.remove(&source);
+        let hint = self.session.doc.project.sources.get(&source)
+            .and_then(|s| s.path.rsplit('.').next().map(str::to_owned));
+        match studio_media::decode_bytes(bytes, hint.as_deref()) {
+            Ok(audio) => {
+                self.incoming_audio.push((source, audio));
+                self.status = "media arrived from a peer".into();
+            }
+            Err(e) => self.status = format!("peer media for source {} undecodable: {e}", source.0),
+        }
+        self.manifests.insert(source, manifest);
+    }
+
     /// Feed one packet from a peer. Returns any reply packets (a `Hello`
-    /// earns a catch-up; everything else is silent).
+    /// earns a catch-up; assets earn their fetch steps; the rest is silent).
     pub fn integrate_packet(&mut self, p: studio_collab::wire::Packet)
         -> Vec<studio_collab::wire::Packet>
     {
@@ -194,13 +248,69 @@ impl Studio {
                 if self.session.doc.integrate(&s).is_ok() {
                     self.arrangement_dirty = true;
                 }
+                if let studio_core::Op::AddSource { source } = &s.op {
+                    // The op travels light; the media follows on request.
+                    self.maybe_request_asset(source.id);
+                }
                 Vec::new()
             }
             Packet::Catchup { ops } => {
                 for s in &ops {
                     let _ = self.session.doc.integrate(s);
+                    if let studio_core::Op::AddSource { source } = &s.op {
+                        self.maybe_request_asset(source.id);
+                    }
                 }
                 self.arrangement_dirty = true;
+                Vec::new()
+            }
+            Packet::AssetRequest { source } => {
+                match self.manifests.get(&source) {
+                    Some(m) => vec![Packet::AssetManifest { source, manifest: m.clone() }],
+                    None => Vec::new(), // not ours to serve — someone else may answer
+                }
+            }
+            Packet::AssetManifest { source, manifest } => {
+                if self.manifests.contains_key(&source) {
+                    return Vec::new(); // already held and servable
+                }
+                let have: std::collections::BTreeSet<_> =
+                    self.chunk_store.keys().copied().collect();
+                let need = manifest.need(&have);
+                if need.is_empty() {
+                    // Content-addressing paying off: every chunk was already
+                    // here (a re-bounce, or a shared sample) — no transfer.
+                    self.finish_asset(source, manifest);
+                    Vec::new()
+                } else {
+                    self.pending_assets.insert(source, manifest);
+                    vec![Packet::ChunkRequest { ids: need }]
+                }
+            }
+            Packet::ChunkRequest { ids } => {
+                ids.iter()
+                    .filter_map(|id| self.chunk_store.get(id)
+                        .map(|b| Packet::Chunk { id: *id, bytes: b.clone() }))
+                    .collect()
+            }
+            Packet::Chunk { id, bytes } => {
+                // The id IS the integrity check; a mismatch is dropped on
+                // the floor, and the pending manifest keeps waiting for the
+                // real thing rather than assembling a lie.
+                if studio_collab::assets::hash(&bytes) == id {
+                    self.chunk_store.insert(id, bytes);
+                    let done: Vec<_> = self.pending_assets.iter()
+                        .filter(|(_, m)| {
+                            let have: std::collections::BTreeSet<_> =
+                                self.chunk_store.keys().copied().collect();
+                            m.need(&have).is_empty()
+                        })
+                        .map(|(s, m)| (*s, m.clone()))
+                        .collect();
+                    for (s, m) in done {
+                        self.finish_asset(s, m);
+                    }
+                }
                 Vec::new()
             }
             Packet::Rack(sync) => {
@@ -718,18 +828,26 @@ impl eframe::App for App {
                 .and_then(|p| p.file_stem()).and_then(|s| s.to_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| f.name.clone());
+            // Keep the raw file bytes alongside the decode: they are what
+            // peers fetch (the compressed original — a .opus stays .opus on
+            // the wire, which is the whole size story).
             let decoded = match (&f.path, &f.bytes) {
-                (Some(p), _) => studio_media::decode_file(p)
-                    .map(|a| (a, p.display().to_string())),
+                (Some(p), _) => std::fs::read(p)
+                    .map_err(|e| studio_media::DecodeError::Io(e))
+                    .and_then(|raw| {
+                        let hint = p.extension().and_then(|e| e.to_str());
+                        studio_media::decode_bytes(raw.clone(), hint)
+                            .map(|a| (a, p.display().to_string(), raw))
+                    }),
                 (None, Some(b)) => {
                     let hint = f.name.rsplit('.').next();
                     studio_media::decode_bytes(b.to_vec(), hint)
-                        .map(|a| (a, f.name.clone()))
+                        .map(|a| (a, f.name.clone(), b.to_vec()))
                 }
                 (None, None) => continue,
             };
             match decoded {
-                Ok((audio, path)) => {
+                Ok((audio, path, raw)) => {
                     // The panel you're looking at names the import you meant:
                     // a file dropped on the Rack is a drum hit for a sampler
                     // channel; dropped anywhere else it's arrangement
@@ -745,12 +863,23 @@ impl eframe::App for App {
                     if let Some(id) = id {
                         self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
                         self.audio.insert(id, audio);
+                        self.studio.register_asset(id, &raw);
                     }
                 }
                 // A decode error is not a missing-plugin error (studio-media's
                 // own rule): say exactly what failed, keep editing.
                 Err(e) => self.studio.status = format!("import '{name}' failed: {e}"),
             }
+        }
+
+        // ── media that finished arriving from peers ──────────────────────
+        for (id, audio) in std::mem::take(&mut self.studio.incoming_audio) {
+            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.audio.insert(id, audio);
+            // Clips referencing this source were silent until now; racks
+            // sampling it were too.
+            self.studio.arrangement_dirty = true;
+            self.studio.loop_dirty = true;
         }
 
         // ── keep the Doc's rack register current ──────────────────────────
@@ -806,14 +935,24 @@ impl eframe::App for App {
                 // — the audio is already registered in memory either way.
                 if let Some(src) = self.studio.session.doc.project.sources.get(&id) {
                     let path = std::path::PathBuf::from(&src.path);
-                    let write = path.parent()
-                        .map(|d| std::fs::create_dir_all(d)).unwrap_or(Ok(()))
-                        .and_then(|_| studio_audio::export::export_wav_dithered(
-                            &audio.channels[0], 1, 48_000, id.0, &path)
-                            .map_err(std::io::Error::other));
-                    if let Err(e) = write {
-                        self.studio.status = format!("{} (file not written: {e})",
-                                                     self.studio.status);
+                    match studio_audio::export::export_wav_dithered_bytes(
+                        &audio.channels[0], 1, 48_000, id.0)
+                    {
+                        Ok(bytes) => {
+                            // One encode, two destinations: the file the op's
+                            // path promises, and the chunk store peers fetch
+                            // from.
+                            self.studio.register_asset(id, &bytes);
+                            let write = path.parent()
+                                .map(|d| std::fs::create_dir_all(d)).unwrap_or(Ok(()))
+                                .and_then(|_| std::fs::write(&path, &bytes));
+                            if let Err(e) = write {
+                                self.studio.status = format!("{} (file not written: {e})",
+                                                             self.studio.status);
+                            }
+                        }
+                        Err(e) => self.studio.status =
+                            format!("{} (wav encode failed: {e})", self.studio.status),
                     }
                 }
                 self.audio.insert(id, audio);
@@ -1325,5 +1464,131 @@ mod collab_tests {
         for p in from_b { a.integrate_packet(p); }
         assert_eq!(a.rack, b.rack, "one rack, agreed without a referee");
         assert!(a.rack.swing == 0.10 || a.rack.swing == 0.40);
+    }
+}
+
+#[cfg(test)]
+mod asset_transfer_tests {
+    use super::*;
+
+    /// Deliver packets both ways until nothing is in flight — outboxes AND
+    /// the reply chains integrate_packet produces. This loop is a stand-in
+    /// for any real carrier, which is exactly the claim under test.
+    fn pump(a: &mut Studio, b: &mut Studio) {
+        for _ in 0..10 {
+            let mut quiet = true;
+            let mut to_b: Vec<_> = a.drain_outbox();
+            let mut to_a: Vec<_> = b.drain_outbox();
+            while let Some(p) = to_b.pop() {
+                quiet = false;
+                to_a.extend(b.integrate_packet(p));
+            }
+            while let Some(p) = to_a.pop() {
+                quiet = false;
+                to_b.extend(a.integrate_packet(p));
+            }
+            while let Some(p) = to_b.pop() {
+                to_a.extend(b.integrate_packet(p));
+            }
+            for p in to_a {
+                a.integrate_packet(p);
+            }
+            if quiet && a.outbox.is_empty() && b.outbox.is_empty() {
+                break;
+            }
+        }
+    }
+
+    fn pair() -> (Studio, Studio) {
+        let a = Studio::demo();
+        let base = a.session.doc.project.clone();
+        let b = Studio::new(base, SiteId(2), Team::from_contacts("duo", &["sc-b".into()]));
+        (a, b)
+    }
+
+    #[test]
+    fn a_bounce_arrives_at_the_peer_as_sound_not_a_silent_clip() {
+        // The whole point of the asset layer, end to end: A makes a beat,
+        // B can RENDER it — op, manifest, chunks, reassembly, decode, mix.
+        let (mut a, mut b) = pair();
+        let (id, audio) = a.bounce_current_pattern(48_000, &Default::default()).expect("bounced");
+        let wav = studio_audio::export::export_wav_dithered_bytes(
+            &audio.channels[0], 1, 48_000, id.0).unwrap();
+        a.register_asset(id, &wav);
+
+        pump(&mut a, &mut b);
+
+        let arrived: std::collections::BTreeMap<_, _> =
+            std::mem::take(&mut b.incoming_audio).into_iter().collect();
+        let got = arrived.get(&id).expect("B holds the bounce's audio");
+        assert_eq!(got.frames(), audio.frames(), "sample-for-sample the same length");
+        let out = b.render_arrangement(48_000, &arrived);
+        let head: f32 = out[..9600].iter().map(|v| v.abs()).sum();
+        assert!(head > 5.0, "B's own mixdown plays A's kick ({head})");
+    }
+
+    #[test]
+    fn chunks_arriving_shuffled_still_assemble_verified() {
+        let (mut a, mut b) = pair();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2654435761) % 256) as u8).collect();
+        // A source op so B knows the id (path names a decodable type: none —
+        // deliberately raw; decode fails, transfer must still complete and
+        // say so, because bytes-integrity and media-meaning are different
+        // failures).
+        let src = studio_core::SourceId(99);
+        a.edit(studio_core::Op::AddSource { source: studio_core::Source {
+            id: src, path: "blob.bin".into(), len: Ticks::from_seconds(1.0),
+            sample_rate: 48_000, channels: 1, has_video: false } }, "seeded");
+        a.register_asset(src, &data);
+
+        // Hand-deliver: op+manifest to B, then B's chunk request to A, then
+        // A's chunk replies to B IN REVERSE ORDER.
+        let mut to_b = a.drain_outbox();
+        let mut req = Vec::new();
+        for p in to_b.drain(..) { req.extend(b.integrate_packet(p)); }
+        let mut chunks = Vec::new();
+        for p in req { chunks.extend(a.integrate_packet(p)); }
+        assert!(chunks.len() >= 2, "big enough to have several chunks: {}", chunks.len());
+        chunks.reverse();
+        for p in chunks { b.integrate_packet(p); }
+        assert!(b.pending_assets.is_empty(), "assembled despite the order");
+        assert!(b.manifests.contains_key(&src), "and B can now serve it onward");
+        assert!(b.status.contains("undecodable"), "the media failure was said: {:?}", b.status);
+    }
+
+    #[test]
+    fn a_corrupt_chunk_is_dropped_not_assembled() {
+        let (mut _a, mut b) = pair();
+        let real = vec![7u8; 20_000];
+        let id = studio_collab::assets::hash(&real);
+        b.integrate_packet(studio_collab::wire::Packet::Chunk {
+            id, bytes: vec![8u8; 20_000], // wrong content for that id
+        });
+        assert!(!b.chunk_store.contains_key(&id), "a lying chunk never enters the store");
+        b.integrate_packet(studio_collab::wire::Packet::Chunk { id, bytes: real });
+        assert!(b.chunk_store.contains_key(&id), "the honest one does");
+    }
+
+    #[test]
+    fn shared_content_transfers_nothing() {
+        // Content-addressing's promise: if B already holds every chunk (it
+        // imported the same sample), a manifest completes with zero chunk
+        // requests.
+        let (mut a, mut b) = pair();
+        let sample = vec![42u8; 100_000];
+        let src_a = studio_core::SourceId(50);
+        let src_b = studio_core::SourceId(60);
+        b.register_asset(src_b, &sample); // B has the bytes under its own id
+        b.drain_outbox();
+        a.edit(studio_core::Op::AddSource { source: studio_core::Source {
+            id: src_a, path: "kick.bin".into(), len: Ticks::from_seconds(1.0),
+            sample_rate: 48_000, channels: 1, has_video: false } }, "seeded");
+        a.register_asset(src_a, &sample);
+        let mut replies = Vec::new();
+        for p in a.drain_outbox() { replies.extend(b.integrate_packet(p)); }
+        assert!(replies.iter().all(|p| !matches!(p,
+            studio_collab::wire::Packet::ChunkRequest { .. })),
+            "no chunks were requested for bytes already held");
+        assert!(b.manifests.contains_key(&src_a), "yet the asset completed");
     }
 }

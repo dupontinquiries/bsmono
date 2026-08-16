@@ -129,13 +129,22 @@ adopts the LWW winner's rack. Six two-peer tests exercise the seam headless:
 groove convergence both directions, concurrent project edits without a
 referee, undo-as-op, flaky-link catch-up, snapshot join (the documented
 broadcast()+rack_broadcast() flow — NOT snapshot+log, whose double-apply bug
-broadcast()'s own docs record), and simultaneous-edit LWW agreement. Not
-built, named plainly: the CARRIER — no socket drains the outbox yet (the
-dht module's network half is the named future), remote sources arrive
-without their audio bytes (asset transfer unwired, so a peer's bounce shows
-as a silent clip until assets move), streaming pattern playback inside
-`DeviceEngine`'s realtime render, and the Program panel, which says so on
-screen instead of showing nothing.
+broadcast()'s own docs record), and simultaneous-edit LWW agreement. **Media follows its op.** The wire gained the asset quartet (v8):
+`AssetRequest`/`AssetManifest`/`ChunkRequest`/`Chunk`, built on the assets
+module's content-defined chunking — an `AddSource` travels light and the
+peer pulls exactly the chunks its content-addressed store lacks, so a
+shared sample or a re-bounce that changed one bar transfers one bar (or
+nothing — pinned by test). Chunks are verified by their id on arrival; a
+corrupt chunk is dropped, never assembled into a take that is subtly wrong
+at the mix. Bounces register their WAV bytes (one encode feeds both the
+file the op's path promises and the chunk store); imports register the
+COMPRESSED original — a .opus stays .opus on the wire, which is the whole
+size story. The flagship test is the point end to end: A bounces, and B's
+own `mixdown` renders A's kick. Still not built, named plainly: the CARRIER
+— no socket drains the outbox yet (the dht module's network half is the
+named future), streaming pattern playback inside `DeviceEngine`'s realtime
+render, and the Program panel, which says so on screen instead of showing
+nothing.
 
 ## Realtime collaboration, concretely
 

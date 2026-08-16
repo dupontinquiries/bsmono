@@ -41,6 +41,11 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// variants (`AddBus`/`RemoveBus`/`SetBusGain`/`SetBusChain`/`SetBusSends`/
 /// `SetRoute`).
 ///
+/// v8: `Packet` gained the asset quartet — `AssetRequest`(6) /
+/// `AssetManifest`(7) / `ChunkRequest`(8) / `Chunk`(9) — so a source's
+/// media can follow its `AddSource` op, content-addressed through
+/// `assets::Manifest`.
+///
 /// v7: `Track` gained `gain: f32` (the mixer fader) and `Op` gained
 /// `SetTrackGain` (tag 19).
 ///
@@ -58,7 +63,7 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 7;
+pub const WIRE_VERSION: u8 = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -72,6 +77,20 @@ pub enum Packet {
     Catchup { ops: Vec<StampedOp> },
     /// A rack sync — whole-value LWW, not an op. See [`RackSync`]'s docs.
     Rack(RackSync),
+    /// "Send me the manifest for this source's media." Sent by a peer whose
+    /// project references a source it has no bytes for — an `AddSource` op
+    /// travels light, and the media follows content-addressed.
+    AssetRequest { source: studio_core::SourceId },
+    /// The asset's shape: chunk ids only, so a receiver asks for exactly
+    /// what its content-addressed store lacks (a re-bounce that changed one
+    /// bar re-ships one bar).
+    AssetManifest { source: studio_core::SourceId, manifest: crate::assets::Manifest },
+    /// "Send these chunks" — first-appearance order, straight from
+    /// `Manifest::need`.
+    ChunkRequest { ids: Vec<crate::assets::ChunkId> },
+    /// One content-addressed chunk. The id IS the integrity check: a
+    /// receiver re-hashes and drops a mismatch on the floor.
+    Chunk { id: crate::assets::ChunkId, bytes: Vec<u8> },
 }
 
 // ── primitives ──────────────────────────────────────────────────────────────
@@ -527,6 +546,29 @@ impl Packet {
                 put_u64(&mut o, rs.site.0);
                 put_rack(&mut o, &rs.rack);
             }
+            Packet::AssetRequest { source } => {
+                put_u8(&mut o, 6);
+                put_u64(&mut o, source.0);
+            }
+            Packet::AssetManifest { source, manifest } => {
+                put_u8(&mut o, 7);
+                put_u64(&mut o, source.0);
+                put_u64(&mut o, manifest.asset);
+                put_u64(&mut o, manifest.total_len as u64);
+                put_u32(&mut o, manifest.chunks.len() as u32);
+                for c in &manifest.chunks { put_u64(&mut o, *c); }
+            }
+            Packet::ChunkRequest { ids } => {
+                put_u8(&mut o, 8);
+                put_u32(&mut o, ids.len() as u32);
+                for c in ids { put_u64(&mut o, *c); }
+            }
+            Packet::Chunk { id, bytes } => {
+                put_u8(&mut o, 9);
+                put_u64(&mut o, *id);
+                put_u32(&mut o, bytes.len() as u32);
+                o.extend_from_slice(bytes);
+            }
         }
         o
     }
@@ -568,6 +610,29 @@ impl Packet {
                 let site = SiteId(r.u64()?);
                 let rack = get_rack(&mut r)?;
                 Packet::Rack(RackSync { rack, seq, site })
+            }
+            6 => Packet::AssetRequest { source: SourceId(r.u64()?) },
+            7 => {
+                let source = SourceId(r.u64()?);
+                let asset = r.u64()?;
+                let total_len = r.u64()? as usize;
+                let n = r.u32()? as usize;
+                let mut chunks = Vec::with_capacity(n.min(1 << 20));
+                for _ in 0..n { chunks.push(r.u64()?); }
+                Packet::AssetManifest { source,
+                    manifest: crate::assets::Manifest { asset, total_len, chunks } }
+            }
+            8 => {
+                let n = r.u32()? as usize;
+                let mut ids = Vec::with_capacity(n.min(1 << 20));
+                for _ in 0..n { ids.push(r.u64()?); }
+                Packet::ChunkRequest { ids }
+            }
+            9 => {
+                let id = r.u64()?;
+                let n = r.u32()? as usize;
+                let bytes = r.take(n)?.to_vec();
+                Packet::Chunk { id, bytes }
             }
             _ => return None,
         };
@@ -633,6 +698,12 @@ impl super::Doc {
             Packet::Presence(pr) => { self.presence(pr); None }
             Packet::Rack(rs) => { self.integrate_rack(rs); None }
             Packet::Hello { since, .. } => Some(self.catchup_for(since)),
+            // Assets are bytes, and the Doc holds no bytes — media transfer
+            // is the SHELL's layer (it owns the chunk store and the decode
+            // path), so these fall through untouched rather than this struct
+            // growing a second job.
+            Packet::AssetRequest { .. } | Packet::AssetManifest { .. }
+            | Packet::ChunkRequest { .. } | Packet::Chunk { .. } => None,
         }
     }
 }
@@ -642,6 +713,26 @@ mod tests {
     use super::*;
     use crate::Doc;
     use studio_core::Project;
+
+    #[test]
+    fn the_asset_quartet_survives_the_wire() {
+        // Built through Manifest::build so the ids in flight are REAL
+        // content hashes, not fixture numbers a codec bug could permute
+        // without anyone noticing.
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let (manifest, store) = crate::assets::Manifest::build(&data);
+        let (first_id, first_bytes) = store.iter().next().map(|(k, v)| (*k, v.clone())).unwrap();
+        let packets = vec![
+            Packet::AssetRequest { source: SourceId(7) },
+            Packet::AssetManifest { source: SourceId(7), manifest: manifest.clone() },
+            Packet::ChunkRequest { ids: manifest.chunks.clone() },
+            Packet::Chunk { id: first_id, bytes: first_bytes },
+        ];
+        for p in packets {
+            let back = Packet::decode(&p.encode()).expect("decodes");
+            assert_eq!(back, p);
+        }
+    }
 
     fn effects() -> Vec<Effect> {
         let mut p = std::collections::BTreeMap::new();
@@ -863,7 +954,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 7, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 8, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
