@@ -146,6 +146,19 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
                 egui::Event::Paste(t) => Some(Ev::Paste(t)),
                 egui::Event::Copy => Some(Ev::Copy),
                 egui::Event::Cut => Some(Ev::Cut),
+                egui::Event::Ime(ime) => match ime {
+                    egui::ImeEvent::Preedit(s) => Some(Ev::Preedit(s)),
+                    // A commit IS a text insertion — the same thing a
+                    // keystroke does, so it goes through the exact same
+                    // path (auto-pairs, ghost-consumption, the works)
+                    // rather than a parallel "IME insert" code path.
+                    egui::ImeEvent::Commit(s) => Some(Ev::Text(s)),
+                    // Enabled/Disabled don't need a reaction here: nothing
+                    // in aperture's model depends on IME being "on," only
+                    // on what it's currently composing (Preedit) or has
+                    // finished composing (Commit).
+                    egui::ImeEvent::Enabled | egui::ImeEvent::Disabled => None,
+                },
                 egui::Event::Key { key, pressed: true, modifiers, .. } => map_key(key).map(|k| Ev::Key {
                     key: k,
                     ctrl: modifiers.command,
@@ -403,6 +416,29 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(530));
     }
 
+    // Tell the platform's IME candidate window where to appear — without
+    // this, composing still WORKS (Preedit/Commit events still arrive),
+    // but the OS's own popup would show up wherever it last was, not at
+    // this caret. A thin rect at the caret, same shape egui's own
+    // `TextEdit` reports.
+    let caret_screen_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(1.0, m.line_h));
+    ui.ctx().output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput { rect, cursor_rect: caret_screen_rect });
+    });
+
+    // The composing text itself: an underline at the caret, distinct from
+    // the ghost's low-alpha fill — this is real text about to exist, not
+    // a suggestion, and shouldn't be mistaken for one.
+    if !state.preedit.is_empty() {
+        let galley = painter.layout_no_wrap(state.preedit.clone(), m.font.clone(), colors.text);
+        let w = galley.size().x;
+        painter.galley(Pos2::new(cx, cy), galley, colors.text);
+        painter.line_segment(
+            [Pos2::new(cx, cy + m.line_h - 1.0), Pos2::new(cx + w, cy + m.line_h - 1.0)],
+            Stroke::new(1.5_f32, colors.accent),
+        );
+    }
+
     // Symbol popup: a compact list pinned under the caret. The selection
     // window shows at most eight rows; label bright, signature dim.
     if let Some(p) = &state.popup {
@@ -475,6 +511,25 @@ fn scrollbar(ui: &mut Ui, state: &mut AppState, painter: &egui::Painter, rect: R
         return;
     }
     let rail = Rect::from_min_max(Pos2::new(rect.right() - 8.0, rect.top()), rect.right_bottom());
+    let total_lines = state.editor.buffer.len_lines().max(1);
+
+    // Minimap marks: where in the WHOLE FILE (not the current scroll
+    // window) does something worth noticing sit? Uncommitted diff first —
+    // the same green the gutter bar already uses, so the two read as one
+    // signal at two zoom levels — then find matches on top, since a person
+    // actively searching cares about that more than yesterday's diff.
+    for (a, b) in &state.git_changed {
+        let (y0, y1) = mark_span(rail, *a, (*b).max(a + 1), total_lines);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(rail.left(), y0), Pos2::new(rail.right(), y1)), 0.0, Color32::from_rgb(94, 158, 76).gamma_multiply(0.55));
+    }
+    if let Some(f) = &state.find {
+        for &(a, _) in &f.matches {
+            let line = state.editor.buffer.char_to_pos(a).line;
+            let (y0, y1) = mark_span(rail, line, line + 1, total_lines);
+            painter.rect_filled(Rect::from_min_max(Pos2::new(rail.left(), y0), Pos2::new(rail.right(), y1.max(y0 + 1.5))), 0.0, accent.gamma_multiply(0.8));
+        }
+    }
+
     let frac = rect.height() / total_h;
     let thumb_h = (rail.height() * frac).max(28.0);
     let max_scroll = total_h - rect.height();
@@ -490,6 +545,18 @@ fn scrollbar(ui: &mut Ui, state: &mut AppState, painter: &egui::Painter, rect: R
     }
     let color = if resp.hovered() || resp.dragged() { accent } else { accent.gamma_multiply(0.45) };
     painter.rect_filled(thumb, 3.0, color);
+}
+
+/// Pure geometry: a line range's [y0, y1] span on the scrollbar rail,
+/// proportional to its position in the WHOLE file (`total_lines`), not the
+/// current scroll window — a minimap mark answers "where in the file,"
+/// the thumb answers "where in the current view." `line1` is exclusive,
+/// matching every other half-open line range this codebase already uses.
+fn mark_span(rail: Rect, line0: usize, line1: usize, total_lines: usize) -> (f32, f32) {
+    let n = total_lines.max(1) as f32;
+    let y0 = rail.top() + (line0 as f32 / n) * rail.height();
+    let y1 = rail.top() + (line1 as f32 / n) * rail.height();
+    (y0, y1.max(y0 + 1.0)) // never fully degenerate — a one-line mark still shows
 }
 
 
@@ -761,5 +828,95 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_span_positions_proportionally_within_the_whole_file() {
+        let rail = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(8.0, 1000.0));
+        // Line 0 of 100: top of the rail.
+        let (y0, _) = mark_span(rail, 0, 1, 100);
+        assert!((y0 - 0.0).abs() < 1e-3);
+        // Line 50 of 100: halfway down.
+        let (y0, _) = mark_span(rail, 50, 51, 100);
+        assert!((y0 - 500.0).abs() < 1e-3, "{y0}");
+        // Line 99 of 100 (the last line): near the bottom.
+        let (y0, _) = mark_span(rail, 99, 100, 100);
+        assert!((y0 - 990.0).abs() < 1e-3, "{y0}");
+    }
+
+    #[test]
+    fn mark_span_a_range_spans_its_full_extent() {
+        let rail = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(8.0, 1000.0));
+        let (y0, y1) = mark_span(rail, 10, 20, 100);
+        assert!((y0 - 100.0).abs() < 1e-3);
+        assert!((y1 - 200.0).abs() < 1e-3);
+        assert!(y1 > y0);
+    }
+
+    #[test]
+    fn mark_span_never_degenerates_to_zero_height() {
+        // A single line's mark must still be visible, not a 0px sliver.
+        let rail = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(8.0, 10.0)); // tiny rail, big file
+        let (y0, y1) = mark_span(rail, 5, 6, 100_000);
+        // f32 rounding can shave a hair off the guaranteed 1.0px minimum
+        // (e.g. 1.0005 - 0.0005 lands at 0.99999994, not exactly 1.0) —
+        // tolerate that rounding, not the actual property being tested.
+        assert!(y1 - y0 >= 0.999, "mark stays visible: {y0}..{y1}");
+    }
+
+    #[test]
+    fn scrollbar_marks_reflect_real_uncommitted_lines_and_find_matches() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-minimap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("m.rs");
+        let lines: Vec<String> = (0..200).map(|i| format!("let x{i} = {i};")).collect();
+        std::fs::write(&f, lines.join("
+") + "
+").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        // An uncommitted edit near the end of the file.
+        let mut edited = lines.clone();
+        edited[190] = "let x190 = NEEDLE;".to_string();
+        std::fs::write(&f, edited.join("
+") + "
+").unwrap();
+
+        let mut s = crate::state::AppState::new(Some(f), false);
+        assert!(!s.git_changed.is_empty(), "the uncommitted edit shows up");
+        let (a, b) = s.git_changed[0];
+        assert!(a >= 189 && b <= 192, "the change is where it really is: {a}..{b}");
+
+        // A find query locates the same needle independently.
+        s.editor.sel = crate::state::sel_range(0, 0);
+        s.open_find();
+        s.handle(crate::state::Ev::Text("NEEDLE".into()), 0);
+        let f = s.find.as_ref().unwrap();
+        assert!(!f.matches.is_empty(), "found it");
+        let match_line = s.editor.buffer.char_to_pos(f.matches[0].0).line;
+        assert_eq!(match_line, 190, "the match is really on line 190, not silently shifted earlier");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_span_handles_a_single_line_file_without_panicking() {
+        let rail = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(8.0, 100.0));
+        let (y0, y1) = mark_span(rail, 0, 1, 1);
+        assert!(y0.is_finite() && y1.is_finite());
+        assert!(y1 >= y0);
     }
 }

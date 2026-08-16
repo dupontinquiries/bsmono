@@ -101,8 +101,15 @@ impl FindState {
         }
         let sensitive = self.query.chars().any(|c| c.is_ascii_uppercase());
         let needle = if sensitive { self.query.clone() } else { self.query.to_ascii_lowercase() };
-        let mut line_start_char = 0usize;
         for li in 0..buffer.len_lines() {
+            // `buffer.line()` trims the line terminator; the buffer's real
+            // char-offset scheme (`pos_to_char`/`char_to_pos`, used
+            // everywhere else including `on_line` just below) counts it.
+            // Manually accumulating trimmed line lengths silently drops
+            // that terminator every line — asking the buffer directly for
+            // each line's true start avoids the whole bug class rather
+            // than patching the arithmetic.
+            let line_start_char = buffer.pos_to_char(aperture_core::Pos::new(li, 0));
             let line = buffer.line(li);
             let hay = if sensitive { line.to_string() } else { line.to_ascii_lowercase() };
             for (b, _) in hay.match_indices(&needle) {
@@ -110,7 +117,6 @@ impl FindState {
                 let c1 = c0 + needle.chars().count();
                 self.matches.push((line_start_char + c0, line_start_char + c1));
             }
-            line_start_char += line.chars().count();
         }
     }
 
@@ -160,6 +166,16 @@ pub enum Ev {
     Paste(String),
     Copy,
     Cut,
+    /// IME composition candidate text — not yet committed. `egui::Event::
+    /// Ime(ImeEvent::Preedit(s))` maps here directly; `ImeEvent::Commit(s)`
+    /// maps to plain `Text(s)` instead, since committing IS "insert this
+    /// text now," the same thing a keystroke does. An empty string clears
+    /// whatever's currently shown — the same signal `ImeEvent::Preedit("")`
+    /// and `ImeEvent::Commit("")` both use (different platforms emit
+    /// different ones of the pair on backspace-during-composition, per
+    /// egui's own `TextEdit` — handling `Text("")` as a no-op and
+    /// `Preedit("")` as "clear" covers both without caring which fired).
+    Preedit(String),
 }
 
 /// What the state asks the view to do with the platform.
@@ -210,6 +226,11 @@ pub struct AppState {
     /// mid-search doesn't clutter history the way committing per-keystroke
     /// would.
     pub find_history: Vec<String>,
+    /// IME composition candidate text, shown at the caret but never part
+    /// of the buffer — overlay-rendered, exactly like the ghost and the
+    /// popup, so it needs no interaction with undo/history/version at all.
+    /// Empty = nothing being composed.
+    pub preedit: String,
     /// The file's timeline: commits + gitmind checkpoints, newest first.
     pub revs: Vec<gitspace::Rev>,
     /// None = live and editable; Some(i) = READ-ONLY preview of revs[i].
@@ -280,6 +301,7 @@ impl AppState {
             git: None,
             git_changed: Vec::new(),
             find_history: Vec::new(),
+            preedit: String::new(),
             revs: Vec::new(),
             rev_ix: None,
             live_text: None,
@@ -807,7 +829,7 @@ impl AppState {
                 self.materialize_here(now_ms);
                 Some(Effects::default())
             }
-            Ev::Text(_) | Ev::Paste(_) | Ev::Cut => Some(Effects::default()), // swallow mutation
+            Ev::Text(_) | Ev::Paste(_) | Ev::Cut | Ev::Preedit(_) => Some(Effects::default()), // swallow mutation
             Ev::Key { key: K::Backspace | K::Delete | K::Tab | K::Enter, .. } => Some(Effects::default()),
             _ => None, // motion, copy, scroll, etc. — handle normally
         }
@@ -1068,11 +1090,31 @@ impl AppState {
                 }
             }
             Ev::Key { key, ctrl, shift, alt } => self.key(key, ctrl, shift, alt, now_ms, &mut fx),
+            Ev::Preedit(s) => {
+                // egui's own TextEdit ignores a literal "\n"/"\r" arriving
+                // as preedit text — a documented platform quirk (some IME
+                // integrations emit one on certain composition states) —
+                // kept here for the same reason: accidentally inserting a
+                // newline mid-composition would be a much worse failure
+                // than just not reacting to it.
+                if s != "\n" && s != "\r" {
+                    self.preedit = s;
+                    if !self.preedit.is_empty() {
+                        // Composing text and a speculative ghost suggestion
+                        // are both "text that isn't real yet" — showing
+                        // both at once at the caret is genuinely confusing,
+                        // not just visually busy.
+                        self.ghost.dismiss();
+                        self.popup = None;
+                    }
+                }
+            }
         }
         fx
     }
 
     fn type_text(&mut self, t: &str, now_ms: u64) {
+        self.preedit.clear(); // a real insertion always ends any pending composition
         if self.try_auto_pair(t, now_ms) {
             self.popup = None;
             return;
@@ -1321,9 +1363,18 @@ impl AppState {
 
     pub fn note_outcome(&mut self, out: &CompletionOutcome, now_ms: u64) {
         let was_shown = self.ghost.is_shown();
+        // Ghost text updates on EVERY outcome, partial or final — that's
+        // the whole point of streaming: the text grows on screen as it
+        // arrives, not just once at the end.
         self.ghost.on_outcome(out.generation, self.editor.version, &out.result);
         if self.ghost.is_shown() && !was_shown {
             self.ghost_since = Some(now_ms);
+        }
+        // The loop pane is a history of REQUESTS answered, not a firehose
+        // of fragments — a 20-delta streamed completion should read as one
+        // row, not twenty near-duplicates burying everything before it.
+        if !out.is_final {
+            return;
         }
         let (ok, brief) = match &out.result {
             Ok(t) => (true, first_line(t, 64)),
@@ -1416,6 +1467,7 @@ mod tests {
             provider: "test".into(),
             latency_ms: 12,
             result: Ok("() {}".into()),
+            is_final: true,
         }, 700);
         assert!(s.ghost.is_shown());
         key(&mut s, K::Tab, false, 1000);
@@ -1452,6 +1504,7 @@ mod tests {
             provider: "test".into(),
             latency_ms: 5,
             result: Ok("OLD".into()),
+            is_final: true,
         }, 100);
         assert!(!s.ghost.is_shown());
         assert_eq!(s.loop_log.len(), 1, "…but the loop pane still shows it happened");
@@ -2170,6 +2223,78 @@ mod tests {
         }
         assert!(got, "note arrived");
         assert_eq!(s2.rev_note.chars().count(), 60, "truncated to the StreetSign budget, not 160 or the full 200");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preedit_shows_composing_text_and_dismisses_ghost_and_popup() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "fn hello_world() {}\n", 0);
+        for ch in "hel".chars() {
+            s.handle(Ev::Text(ch.to_string()), 10);
+        }
+        assert!(s.popup.is_some(), "auto-triggered before composition starts");
+        s.handle(Ev::Preedit("あ".into()), 10); // hiragana 'a'
+        assert_eq!(s.preedit, "あ");
+        assert!(s.popup.is_none(), "composing text and a suggestion popup don't coexist");
+    }
+
+    #[test]
+    fn preedit_ignores_literal_newline_and_carriage_return() {
+        let mut s = AppState::new(None, false);
+        s.handle(Ev::Preedit("\n".into()), 0);
+        assert_eq!(s.preedit, "", "a literal newline in preedit text is a platform quirk, not real composition");
+        s.handle(Ev::Preedit("\r".into()), 0);
+        assert_eq!(s.preedit, "");
+        s.handle(Ev::Preedit("real".into()), 0);
+        assert_eq!(s.preedit, "real", "ordinary preedit text still works");
+    }
+
+    #[test]
+    fn preedit_empty_string_clears_it() {
+        let mut s = AppState::new(None, false);
+        s.handle(Ev::Preedit("composing".into()), 0);
+        assert_eq!(s.preedit, "composing");
+        s.handle(Ev::Preedit("".into()), 10);
+        assert_eq!(s.preedit, "", "an empty preedit clears the overlay (the 'composition cancelled' signal)");
+    }
+
+    #[test]
+    fn a_real_text_insertion_always_clears_any_pending_preedit() {
+        let mut s = AppState::new(None, false);
+        s.handle(Ev::Preedit("composing".into()), 0);
+        assert_eq!(s.preedit, "composing");
+        // The commit itself routes through plain Ev::Text (see view.rs's
+        // translation of ImeEvent::Commit) -- the SAME path a keystroke
+        // takes, and it must close out the composition either way.
+        s.handle(Ev::Text("finished".into()), 10);
+        assert_eq!(s.preedit, "", "committing (or just typing) always ends composition");
+        assert!(s.editor.buffer.to_string().contains("finished"));
+    }
+
+    #[test]
+    fn preedit_is_swallowed_while_previewing_a_revision() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-preedit-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("p.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+
+        let mut s = AppState::new(Some(f), false);
+        key(&mut s, K::Comma, true, 0); // enter preview
+        assert!(s.rev_ix.is_some());
+        s.handle(Ev::Preedit("composing".into()), 50);
+        assert_eq!(s.preedit, "", "composing into a read-only buffer is swallowed, same as typing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

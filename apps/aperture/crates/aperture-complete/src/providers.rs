@@ -20,7 +20,7 @@
 
 use crate::{CompletionRequest, Provider};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -153,13 +153,62 @@ impl Provider for OllamaProvider {
         let raw = http_roundtrip(&self.cfg.host, &http, self.timeout).map_err(|e| format!("io: {e}"))?;
         parse_response(&raw)
     }
+
+    fn complete_streaming(
+        &mut self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<String, String> {
+        let http = build_streaming_request(&self.cfg, &req.prefix, &req.suffix);
+        let mut stream = TcpStream::connect(&self.cfg.host).map_err(|e| format!("io: {e}"))?;
+        stream.set_read_timeout(Some(self.timeout)).ok();
+        stream.set_write_timeout(Some(self.timeout)).ok();
+        stream.write_all(http.as_bytes()).map_err(|e| format!("io: {e}"))?;
+
+        let mut acc = String::new();
+        let mut server_err: Option<String> = None;
+        let io_result = read_streaming_body(&mut stream, &mut |line: &str| {
+            if should_cancel() {
+                return false; // drop `stream` on return: abandons the connection, not just the answer
+            }
+            if let Some(e) = find_string_field(line, "error") {
+                server_err = Some(e);
+                return false;
+            }
+            if let Some(delta) = find_string_field(line, "response") {
+                if !delta.is_empty() {
+                    acc.push_str(&delta);
+                    on_delta(&delta);
+                }
+            }
+            true
+        });
+        if let Err(e) = io_result {
+            // A read timeout or connection drop mid-stream: report what
+            // arrived so far as an error DETAIL, not silently as success —
+            // but only if nothing came through at all; a stream that
+            // delivered real content before failing still handed the
+            // editor something worth keeping (ghost text just stops).
+            if acc.is_empty() {
+                return Err(format!("io: {e}"));
+            }
+        }
+        if let Some(e) = server_err {
+            return Err(format!("ollama error: {e}"));
+        }
+        Ok(acc)
+    }
 }
 
-/// Build the raw HTTP/1.1 POST for `/api/generate` (non-streaming).
-/// Pure — the tests below pin the wire shape.
-pub fn build_request(cfg: &OllamaConfig, prefix: &str, suffix: &str) -> String {
+/// Build the raw HTTP/1.1 POST for `/api/generate`. `stream` selects
+/// Ollama's `"stream":true`/`false` — the two public wrappers below exist
+/// so the non-streaming wire shape the tests pin stays pinned exactly,
+/// while `complete_streaming` gets the true-stream body without duplicating
+/// the whole builder.
+fn build_request_shaped(cfg: &OllamaConfig, prefix: &str, suffix: &str, stream: bool) -> String {
     let mut body = format!(
-        "{{\"model\":\"{}\",\"prompt\":\"{}\",\"stream\":false",
+        "{{\"model\":\"{}\",\"prompt\":\"{}\",\"stream\":{stream}",
         json_escape(&cfg.model),
         json_escape(prefix)
     );
@@ -176,6 +225,17 @@ pub fn build_request(cfg: &OllamaConfig, prefix: &str, suffix: &str) -> String {
         cfg.host,
         body.len()
     )
+}
+
+/// Build the raw HTTP/1.1 POST for `/api/generate` (non-streaming).
+/// Pure — the tests below pin the wire shape.
+pub fn build_request(cfg: &OllamaConfig, prefix: &str, suffix: &str) -> String {
+    build_request_shaped(cfg, prefix, suffix, false)
+}
+
+/// Same request, `"stream":true` — used by `complete_streaming` only.
+pub fn build_streaming_request(cfg: &OllamaConfig, prefix: &str, suffix: &str) -> String {
+    build_request_shaped(cfg, prefix, suffix, true)
 }
 
 /// JSON-escape for embedding in a request body. (logscope-fan's, verbatim.)
@@ -323,6 +383,88 @@ fn read_json_string(c: &[char], mut i: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Read a streaming HTTP response body incrementally, calling `on_line` for
+/// each complete newline-delimited fragment as it arrives — Ollama's
+/// `stream:true` protocol is one JSON object per line, but neither a raw
+/// TCP `read()` nor an HTTP chunk boundary (when `Transfer-Encoding:
+/// chunked`, which streaming servers typically use) has any obligation to
+/// land on a line boundary: a token can arrive split across either. This
+/// buffers until a real `\n` before ever handing a line to the caller —
+/// the same bug `split_body`'s own doc comment already named and fixed for
+/// the one-shot case, done again here for the incremental one.
+///
+/// `on_line` returns `false` to stop reading (the cancellation path: the
+/// caller's `should_cancel` decided to abandon this stream, and returning
+/// here means the connection gets dropped on the way out, not just its
+/// answer discarded).
+fn read_streaming_body(stream: &mut TcpStream, on_line: &mut dyn FnMut(&str) -> bool) -> std::io::Result<()> {
+    use std::io::BufReader;
+    let mut reader = BufReader::new(stream);
+    let mut chunked = false;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(()); // EOF before headers ended: nothing to stream
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break; // blank line: end of headers
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+            chunked = true;
+        }
+    }
+    let mut linebuf = String::new();
+    if chunked {
+        loop {
+            let mut size_line = String::new();
+            if reader.read_line(&mut size_line)? == 0 {
+                break;
+            }
+            let Ok(size) = usize::from_str_radix(size_line.trim(), 16) else { break };
+            if size == 0 {
+                break; // the terminating zero-length chunk
+            }
+            let mut chunk = vec![0u8; size];
+            reader.read_exact(&mut chunk)?;
+            let mut crlf = [0u8; 2];
+            let _ = reader.read_exact(&mut crlf); // the trailing CRLF after every chunk's data
+            if !feed_lines(&chunk, &mut linebuf, on_line) {
+                return Ok(());
+            }
+        }
+    } else {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if !feed_lines(&buf[..n], &mut linebuf, on_line) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Append `bytes` to `linebuf` and hand every complete line it now contains
+/// to `on_line`, in order, leaving any trailing partial line buffered for
+/// the next call. Returns `false` the moment `on_line` asks to stop.
+fn feed_lines(bytes: &[u8], linebuf: &mut String, on_line: &mut dyn FnMut(&str) -> bool) -> bool {
+    linebuf.push_str(&String::from_utf8_lossy(bytes));
+    loop {
+        let Some(pos) = linebuf.find('\n') else { break };
+        let line: String = linebuf.drain(..=pos).collect();
+        let line = line.trim_end_matches(['\r', '\n']);
+        if !line.is_empty() && !on_line(line) {
+            return false;
+        }
+    }
+    true
+}
+
 fn http_roundtrip(host: &str, req: &str, timeout: Duration) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(host)?;
     stream.set_read_timeout(Some(timeout))?;
@@ -407,4 +549,80 @@ mod tests {
         let tricky = r#"{"note":"the response: is elsewhere","response":"real"}"#;
         assert_eq!(parse_response(tricky).unwrap(), "real");
     }
+    /// A minimal fake Ollama server on a real local TCP socket: reads the
+    /// request, ignores it, writes back a chunked HTTP response whose
+    /// chunk boundaries are chosen to land in the MIDDLE of a JSON line —
+    /// splitting a streamed token across a chunk boundary on purpose,
+    /// which is exactly the case `read_streaming_body`/`feed_lines` exist
+    /// to survive. Returns the bound port.
+    fn fake_ollama_stream_server(body_chunks: Vec<&'static str>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            // Drain the request (don't care about its content for this test).
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let mut resp = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            for chunk in &body_chunks {
+                resp.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+            }
+            resp.push_str("0\r\n\r\n");
+            let _ = sock.write_all(resp.as_bytes());
+        });
+        port
+    }
+
+    #[test]
+    fn streaming_survives_a_token_split_across_a_chunk_boundary() {
+        // Two Ollama-shaped JSON lines, but the SECOND line's payload is
+        // split across two raw HTTP chunks mid-token ("wor" | "ld") — a
+        // naive per-chunk JSON parse would see two garbled fragments
+        // instead of one real word.
+        let port = fake_ollama_stream_server(vec![
+            "{\"response\":\"hello \",\"done\":false}\n{\"response\":\"wor",
+            "ld\",\"done\":false}\n{\"done\":true}\n",
+        ]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut lines = Vec::new();
+        read_streaming_body(&mut stream, &mut |line| {
+            lines.push(line.to_string());
+            true
+        })
+        .unwrap();
+        let responses: Vec<String> = lines.iter().filter_map(|l| find_string_field(l, "response")).collect();
+        assert_eq!(responses, vec!["hello ".to_string(), "world".to_string()], "the split token reassembled whole: {lines:?}");
+    }
+
+    #[test]
+    fn streaming_stops_reading_when_on_line_cancels() {
+        let port = fake_ollama_stream_server(vec![
+            "{\"response\":\"a\"}\n{\"response\":\"b\"}\n{\"response\":\"c\"}\n",
+        ]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut lines = Vec::new();
+        read_streaming_body(&mut stream, &mut |line| {
+            lines.push(line.to_string());
+            lines.len() < 1 // stop after the first line
+        })
+        .unwrap();
+        assert_eq!(lines.len(), 1, "reading stopped exactly when on_line said to");
+    }
+
+    #[test]
+    fn ollama_provider_complete_streaming_end_to_end_against_a_real_socket() {
+        let port = fake_ollama_stream_server(vec![
+            "{\"response\":\"fn \",\"done\":false}\n{\"response\":\"main\",\"done\":false}\n{\"response\":\"() {}\",\"done\":true}\n",
+        ]);
+        let cfg = OllamaConfig { host: format!("127.0.0.1:{port}"), model: "test".into(), use_suffix: false, num_predict: 32, temperature: 0.2 };
+        let mut provider = OllamaProvider::new(cfg);
+        let mut deltas = Vec::new();
+        let req = req("", "");
+        let result = provider.complete_streaming(&req, &mut |d| deltas.push(d.to_string()), &mut || false);
+        assert_eq!(deltas, vec!["fn ", "main", "() {}"]);
+        assert_eq!(result.unwrap(), "fn main() {}");
+    }
+
 }

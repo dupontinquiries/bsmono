@@ -29,9 +29,47 @@ instance of the bug. Exactly three commits genuinely touch
 `git status --short --untracked-files=all` at the repo root, filtered only
 for build-artifact `target/` noise, comes back completely empty.
 
+## IME preedit landed (TODO.md item, closed)
+
+`Ev::Preedit` overlay-rendered at the caret (never touches the buffer/
+undo/version, matching the ghost and popup's existing pattern); IME
+Commit routes through plain `Ev::Text` since committing IS a text
+insertion. Read egui's own reference `TextEdit` IME handling in full
+before designing this — kept its defensive "\n"/"\r" ignore rule (a
+documented real platform quirk, not guessed at) and deliberately diverged
+from its buffer-splicing approach (wrong fit for an editor with real undo
+history and a version counter other systems watch). See `DESIGN.md`'s
+matching section for the full reasoning.
+
+## A real find bug found and fixed (minimap work, TODO.md item)
+
+Building the scrollbar minimap surfaced a genuine pre-existing bug in
+`FindState::recompute`: a manual char-offset accumulator silently dropped
+each line's terminator character, so any find match past the first line
+landed at a systematically-too-low global offset — worse the further into
+the file. A 200-line-file end-to-end test caught a 12-line discrepancy;
+short test fixtures elsewhere in the crate never accumulated enough drift
+to trip an assertion, which is almost certainly why it sat undetected.
+Fixed by asking the buffer for each line's true start
+(`pos_to_char(Pos::new(li, 0))`) instead of accumulating manually. See
+`DESIGN.md`'s matching section for the full narrative.
+
+## Streaming ghosts landed (TODO.md item, closed)
+
+`Provider::complete_streaming` + a real `OllamaProvider` override with
+incremental chunked-HTTP reading and genuine mid-stream cancellation
+(`should_cancel`, checked between every delta — a cancelled stream drops
+its `TcpStream`, not just discards the eventual answer). `CompletionOutcome`
+gained `is_final: bool`. See `DESIGN.md`'s "Streaming ghosts" section for
+the design correction made mid-implementation (an early string-comparison
+heuristic for "is this a duplicate final send" was replaced with an
+explicit flag once it became clear it would make the loop pane's history
+unreliable). Tested against a real local `TcpListener`, including a token
+deliberately split across an HTTP chunk boundary.
+
 ## What this is
 
-31 commits on `session/aperture-editor`, branched from `main`, building
+41 commits on `session/aperture-editor`, branched from `main`, building
 **aperture** (a Rust/egui code editor with an AI ghost-completion loop) and
 **aperture-view** (a physical/spatial 3D file viewer — "syntax tree in
 space," rooms per code item, git history you can walk through). Both live
@@ -40,17 +78,17 @@ from `logscope-egui` early in the session and both apps' git integration
 (`gitspace`) lives in `aperture-core` so both shells share it.
 
 Started from an empty `apps/aperture/` (the repo's `manifest/projects.toml`
-didn't know about it yet). By the last commit: 216 tests (161 in the
+didn't know about it yet). By the last commit: 231 tests (176 in the
 aperture workspace + 55 in `scene-kit`), zero compiler warnings anywhere in
 the touched crates, `verify.sh` clean for both `aperture` and `logscope`
-(the latter confirmed by an actual build, not just by argument — see
-commit #30).
+(the latter confirmed by an actual build, not just by argument — see the
+missing-commit-audit section above).
 
 ## Merging this
 
 ```
 git fetch /path/to/aperture-session.bundle session/aperture-editor
-git log main..FETCH_HEAD --oneline   # the 30 commits, newest last above
+git log main..FETCH_HEAD --oneline   # the 41 commits, newest last above
 git merge FETCH_HEAD                 # or rebase/cherry-pick as you prefer
 ```
 
@@ -130,6 +168,28 @@ file picker (editor).
 28. `59f27b4f` the commit graph uses logscope's real `flow()` layout (time-stretch + lanes), not a placeholder single-lane one
 29. `8eae21d1` `G` frames the commit graph (logscope's camera-fit vocabulary: `centroid`/`bounding_radius`/`fit_distance`), so it's reliably reachable regardless of a person's orbit habits
 30. `edd17325` (no code change) verified logscope-egui itself still builds clean — real build, not assumed, after seven commits touching the shared kit it does NOT depend on
+31. `4323edeb` fixed stale references inside this very file (missing
+    commit hashes on items #26–30, a wrong commit number, and a deferred
+    item that a later commit had actually already closed) — checked
+    against `git log` directly rather than trusted from memory
+32. `1fd64e91` fixed a real gap: the sun-parameterization changes from
+    commit #22 never actually got committed (`cd apps/aperture && git add .`
+    silently missed `shared/scene-kit`) — every bundle handed off between
+    #22 and this one would have failed to compile for anyone who fetched
+    it. Also added the missing `scene-kit/Cargo.lock`.
+33. `b376177b` flagged the above prominently at the top of this file
+34. `cff43758` audited for other instances of the same bug (found none;
+    documented the audit method so it's checkable, not just asserted)
+35. `af90fdfe` **streaming ghosts** (`Provider::complete_streaming`,
+    Ollama `stream:true`, the cancellation path — a `TODO.md` item this
+    session had explicitly named as "larger, not tackled solo") — written
+    by a parallel instance of this assistant, not this thread; see the
+    authorship note above
+36. `81f379d7` that commit's own doc-count follow-up
+37. `675941c1` closed the SAME class of gap as #32, this time in
+    `TODO.md`: the parallel session's strikethrough for "streaming
+    ghosts" had the identical uncommitted-file problem, caught by the
+    same full-repo `git status` discipline while auditing #34–35
 
 **Pattern worth knowing**: roughly a third of these commits found a real,
 previously-existing bug or gap while building something else — not

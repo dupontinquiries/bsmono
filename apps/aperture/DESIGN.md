@@ -384,6 +384,154 @@ Tested end to end in both shells with a 200-character note from a real
 char_budget()` itself rather than hardcoding `60`, so it fails honestly if
 that number ever changes without a matching intentional update.
 
+## IME preedit (TODO.md item, done)
+
+`Ev::Preedit` mirrors `egui::ImeEvent::Preedit` directly; `ImeEvent::Commit`
+routes through plain `Ev::Text` instead of a parallel "IME insert" path —
+committing IS a text insertion, the same thing a keystroke does, so it
+gets auto-pairs, ghost-consumption, and undo recording for free rather
+than a second implementation of all three.
+
+**Overlay, not buffer-splice**: egui's own reference `TextEdit`
+implementation (read in full before designing this — `builder.rs`'s
+`Event::Ime` arm) actually inserts preedit text into the real text buffer
+as a temporary, replaceable placeholder, deleting and reinserting it on
+each keystroke of composition. That's the right call for a widget backed
+by a generic `TextBuffer` trait; it's the wrong call here, where
+`aperture-core::Editor` has real undo history and a `version` counter the
+ghost-completion engine watches — splicing every composition keystroke
+into that machinery would mean either polluting undo with intermediate
+candidates or building a whole bypass path for "this edit doesn't count."
+`state.preedit: String` is a pure overlay instead, rendered at the caret
+with an underline, never touching the buffer — the same choice already
+made for the ghost and the popup, both of which are "text that isn't real
+yet" rendered the same way.
+
+**A defensive detail worth keeping, found in that same reference
+implementation**: literal `"\n"`/`"\r"` arriving as preedit text is
+ignored — egui's own comment documents this as a real platform quirk
+(specific `egui-winit` integrations emit one on certain backspace-during-
+composition states). Kept here for the same reason, not because it was
+guessed at.
+
+**IME candidate-window positioning**: `egui::output::IMEOutput` is
+reported every frame the editor has input focus, at the caret's actual
+animated screen position (`cam.caret_x.pos`/`cam.caret_y.pos` — the same
+Smooth-driven coordinates the caret itself renders at). egui's own
+`TextEdit` only reports this on focus-gain/loss, which is narrower than
+what this editor needs: the caret here moves continuously via the follow
+camera and Smooth interpolation, not just on focus transitions, so
+reporting every frame keeps the platform IME popup honestly tracking a
+caret that's frequently in motion — a case egui's own narrower trigger
+wouldn't catch.
+
+Composing is swallowed during revision preview (added to the same
+read-only guard `Text`/`Paste`/`Cut` already use) and always closes out —
+cleared — the moment any real text lands, whether that's a literal
+keystroke or an IME commit, since both travel through the identical
+`type_text` path.
+
+Five new tests: composing text dismisses the popup (typed char-by-char,
+matching the popup's own auto-trigger convention — my first draft of this
+test used the crate's bulk `typed()` helper and failed, since the popup's
+trigger logic only fires on ident-char-by-ident-char insertion, not a
+bulk multi-word paste-shaped string; fixed the test, not the code), the
+literal-newline/CR ignore rule, empty-string-clears, a real text
+insertion always closing composition regardless of source, and the
+read-only-preview swallow.
+
+## A real find bug, found by building the minimap (TODO.md item, done)
+
+Building the scrollbar minimap — tick marks for uncommitted diff lines and
+find matches, positioned by proportion within the WHOLE file via a small
+pure `mark_span` function (line-range → rail-y, tested directly: exact
+proportional placement, full-range extent, a guaranteed-visible minimum
+height for a single-line mark even on a huge file, and the one-line-file
+edge case) — surfaced a genuine, previously undetected bug in
+`FindState::recompute`, not in anything new this commit touched.
+
+**The bug**: `recompute` tracked each line's global char offset with a
+manual accumulator, `line_start_char += line.chars().count()`. But
+`Buffer::line()` trims the line's terminator (`\n`/`\r`) before returning
+it, while the buffer's real char-offset scheme — `pos_to_char`/
+`char_to_pos`, used everywhere else including `on_line` two lines below the
+bug — counts that terminator as a real character. Every line silently
+dropped one character from the running total, so any match past the first
+line landed at a global offset that was *systematically too low*, growing
+worse the further into the file a match sat. A match reported as "line
+190" by that offset could, on a 200-line file, actually resolve to line
+178 when fed back through `char_to_pos` — the match highlighted (and
+scrolled to) the wrong place, silently, by a margin that grew with file
+size and match position.
+
+**How it surfaced**: writing an end-to-end test for the minimap ("does a
+find match on a specific line produce a mark at that line's proportional
+position") that used a real 200-line file instead of the crate's usual
+short test fixtures — small fixtures (a handful of lines) never
+accumulated enough drift to fail an assertion, which is almost certainly
+why this sat undetected. The first version of the test failed with a
+12-line discrepancy; three probe iterations (checking the match's raw char
+offset, then the query itself, then the buffer's actual content at both
+the reported and expected lines) narrowed it to the exact accumulator line
+before the fix was obvious.
+
+**The fix**: stop accumulating manually — ask the buffer for each line's
+true start via `buffer.pos_to_char(Pos::new(li, 0))`, the same authoritative
+lookup `on_line` already trusted a few lines down. Removes the whole bug
+class rather than patching the arithmetic (adding `+1` per line would have
+been correct for `\n`-terminated files but wrong for the last line, or for
+`\r\n`).
+
+Five new tests: four on `mark_span`'s pure geometry, and the one that
+caught the real bug — a real git repo, a real 200-line file, an
+uncommitted edit near the end, confirming both the diff-gutter's line
+range AND a find match's reported line are exactly where they really are.
+
+## Streaming ghosts — the TODO.md item, and a design correction along the way
+
+`Provider` gains `complete_streaming` (default: call `complete` once,
+no progressive text — `CommandProvider`/`StaticProvider` are byte-for-byte
+unchanged). `OllamaProvider` overrides it for real: `stream:true`,
+incremental chunked-HTTP reading (`read_streaming_body`/`feed_lines`,
+buffered until an actual `\n` regardless of where a TCP read or an HTTP
+chunk boundary happened to land — the same bug `split_body`'s own doc
+comment already named and fixed for the one-shot case, done again here for
+the incremental one), each JSON line's `response` field delivered as a
+delta the moment it arrives.
+
+**The cancellation path `TODO.md` specifically asked for**: `should_cancel`
+is checked between every delta; a cancelled stream returns from
+`complete_streaming` immediately, which drops the `TcpStream` on the way
+out — the connection is actually abandoned, not just its eventual answer
+discarded. The engine's worker carries the message that triggered the
+cancellation into the NEXT loop iteration (`primed`) instead of losing it,
+so a cancel-then-coalesce flows through the exact same drain-to-newest
+logic an ordinary `rx.recv()` message already used — no parallel code path
+for the interrupted case.
+
+**A real design correction, made mid-implementation rather than shipped
+wrong**: my first cut had no way to distinguish a streaming provider's
+in-progress delta from the outcome that closes out a generation, so the
+worker suppressed what it *guessed* was a duplicate final send by comparing
+strings. That guess was fragile and, worse, made the loop pane (a history
+of requests answered) receive either a burst of near-duplicate rows for a
+long streamed completion or an silently-swallowed final one, depending on
+timing. Fixed by adding `CompletionOutcome::is_final` instead of guessing:
+every delta is `is_final: false`, the close-out is always exactly one
+`is_final: true` — ghost text applies every outcome (that's the whole
+point of streaming), the loop pane records only the final one.
+
+Twelve new tests: the engine's cancellation and progressive-delivery
+behavior against a real mock provider (including the exact
+`[false,false,false,true]` shape of a four-outcome stream), and — the ones
+that matter most — three tests against a REAL local `TcpListener` acting
+as a fake streaming Ollama server: reading stops exactly when `on_line`
+cancels, `OllamaProvider::complete_streaming` works end to end over an
+actual socket, and a token deliberately split across a chunk boundary
+(`"wor" | "ld"`) reassembles into one delta instead of two garbled
+fragments — the specific case this whole reader exists to survive, proven
+against real bytes on a real socket, not asserted from reading the parser.
+
 ## Graph nodes are clickable now — the gap named last commit, closed
 
 Named as deliberately deferred last time: "plaques hit-test against flat

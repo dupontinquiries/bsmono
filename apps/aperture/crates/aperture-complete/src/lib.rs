@@ -37,6 +37,12 @@ pub struct CompletionOutcome {
     pub provider: String,
     pub latency_ms: u64,
     pub result: Result<String, String>,
+    /// `false` for a streaming provider's in-progress deltas (ghost text
+    /// should still show them — the text is real, just not the end of the
+    /// answer yet); `true` for the one outcome that closes out a
+    /// generation. History views (the loop pane) should record only the
+    /// final one per generation, not every intermediate fragment.
+    pub is_final: bool,
 }
 
 /// A completion backend. Blocking on purpose: it runs on the engine's worker
@@ -45,6 +51,28 @@ pub struct CompletionOutcome {
 pub trait Provider: Send {
     fn name(&self) -> &str;
     fn complete(&mut self, req: &CompletionRequest) -> Result<String, String>;
+
+    /// Streaming form: call `on_delta` as fragments arrive, checking
+    /// `should_cancel` between them — the worker uses this as the
+    /// cancellation path (drop the connection the moment a newer request
+    /// supersedes this one), no async runtime required.
+    ///
+    /// Default: call `complete` once and return it, WITHOUT calling
+    /// `on_delta` — a single-shot provider (`CommandProvider`,
+    /// `StaticProvider`) has no progressive text to show, so this emits
+    /// exactly the one outcome the worker sends after the call returns,
+    /// matching pre-streaming behavior byte for byte. `should_cancel` is
+    /// ignored: a subprocess or a lookup table has no meaningful mid-call
+    /// cancellation point to check anyway.
+    fn complete_streaming(
+        &mut self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<String, String> {
+        let _ = (on_delta, should_cancel);
+        self.complete(req)
+    }
 }
 
 /// Trim caret context to char-budgeted windows. Pure; boundary-safe.
