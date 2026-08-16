@@ -7,6 +7,18 @@ description = "Audio decode: turns a file on disk into a studio_audio::SourceAud
 [dependencies]
 studio-audio = { path = "../studio-audio" }
 symphonia = { version = "0.5", features = ["wav", "flac", "vorbis", "mp3", "aac", "isomp4", "pcm"] }
+# .opus: Symphonia has no Opus codec, so the ogg crate demuxes the container
+# and libopus (via the `opus` crate) decodes — the same pairing
+# apps/beatspace already ships and the same system dependency its README
+# already tells every platform to install. Optional so the crate's pure-Rust
+# story survives on a host without libopus: --no-default-features builds
+# everything Symphonia covers and reports .opus as unsupported instead.
+ogg = { version = "0.9", optional = true }
+opus = { version = "0.3", optional = true }
+
+[features]
+default = ["opus"]
+opus = ["dep:ogg", "dep:opus"]
 
 [dev-dependencies]
 hound = "3.5"

@@ -450,7 +450,7 @@ mod tests {
                 gain: 1.0, pan: 0.0, muted: false,
             }],
             patterns: vec![pattern],
-            tempo_bpm: 140.0,
+            tempo_bpm: 140.0, swing: 0.11,
         };
         s.doc.set_rack(rack.clone());
 

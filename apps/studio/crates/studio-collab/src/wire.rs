@@ -55,7 +55,7 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 4;
+pub const WIRE_VERSION: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -345,7 +345,28 @@ fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
             put_f32(o, *drive);
             put_f32(o, *decay_ms);
         }
+        SynthKind::Drum { voice, tone, decay_ms, tune } => {
+            put_u8(o, 4);
+            put_u8(o, drum_voice_tag(*voice));
+            put_f32(o, *tone);
+            put_f32(o, *decay_ms);
+            put_u8(o, *tune as u8);
+        }
     }
+}
+
+// The voice's wire tag is written out by hand rather than derived from the
+// enum's discriminant: `DrumVoice as u64` would silently renumber the wire
+// if someone reorders the enum, and this file's whole job is that bytes on
+// the wire never mean something different than they used to.
+fn drum_voice_tag(v: studio_live::DrumVoice) -> u8 {
+    use studio_live::DrumVoice::*;
+    match v { Kick => 0, Snare => 1, Clap => 2, HatClosed => 3, HatOpen => 4 }
+}
+fn drum_voice_from(tag: u8) -> Option<studio_live::DrumVoice> {
+    use studio_live::DrumVoice::*;
+    Some(match tag { 0 => Kick, 1 => Snare, 2 => Clap, 3 => HatClosed, 4 => HatOpen,
+                     _ => return None })
 }
 fn get_synthkind(r: &mut R) -> Option<SynthKind> {
     Some(match r.u8()? {
@@ -363,6 +384,13 @@ fn get_synthkind(r: &mut R) -> Option<SynthKind> {
             let drive = r.f32()?;
             let decay_ms = r.f32()?;
             SynthKind::Sub { note, glide_from: has_glide.then_some(glide_val), glide_ms, drive, decay_ms }
+        }
+        4 => {
+            let voice = drum_voice_from(r.u8()?)?;
+            let tone = r.f32()?;
+            let decay_ms = r.f32()?;
+            let tune = r.u8()? as i8;
+            SynthKind::Drum { voice, tone, decay_ms, tune }
         }
         _ => return None, // a synth kind from a newer build: refuse, don't guess
     })
@@ -437,6 +465,7 @@ fn put_rack(o: &mut Vec<u8>, rack: &Rack) {
     put_u16(o, rack.patterns.len().min(u16::MAX as usize) as u16);
     for p in &rack.patterns { put_pattern(o, p); }
     put_f32(o, rack.tempo_bpm);
+    put_f32(o, rack.swing);
 }
 fn get_rack(r: &mut R) -> Option<Rack> {
     let cn = r.u16()? as usize;
@@ -446,7 +475,8 @@ fn get_rack(r: &mut R) -> Option<Rack> {
     let mut patterns = Vec::with_capacity(pn.min(4096));
     for _ in 0..pn { patterns.push(get_pattern(r)?); }
     let tempo_bpm = r.f32()?;
-    Some(Rack { channels, patterns, tempo_bpm })
+    let swing = r.f32()?;
+    Some(Rack { channels, patterns, tempo_bpm, swing })
 }
 
 impl Packet {
@@ -687,7 +717,7 @@ mod tests {
                 Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true },
             ],
             patterns: vec![pattern],
-            tempo_bpm: 140.0,
+            tempo_bpm: 140.0, swing: 0.11,
         }
     }
 
@@ -815,7 +845,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 4, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 5, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

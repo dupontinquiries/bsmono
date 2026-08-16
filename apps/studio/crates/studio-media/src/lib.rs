@@ -46,6 +46,9 @@
 use std::fmt;
 use std::path::Path;
 
+#[cfg(feature = "opus")]
+mod opus;
+
 use studio_audio::SourceAudio;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -92,9 +95,46 @@ impl From<std::io::Error> for DecodeError {
 /// decoder, which matches how every other source (a recorded take, a
 /// bounced pattern) already reaches the mix.
 pub fn decode_file(path: &Path) -> Result<SourceAudio, DecodeError> {
+    if path.extension().and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("opus"))
+    {
+        return decode_opus_or_explain(|| opus_impl::decode_opus_file(path));
+    }
     let file = std::fs::File::open(path)?;
     let hint = extension_hint(path);
     decode_source(Box::new(file), hint)
+}
+
+// The two build flavours share one dispatch point, so the no-libopus build
+// FAILS a .opus with a sentence naming the fix rather than Symphonia's
+// generic "unrecognised container" — which would send someone debugging a
+// perfectly good file instead of a build flag.
+#[cfg(feature = "opus")]
+use opus as opus_impl;
+#[cfg(feature = "opus")]
+fn decode_opus_or_explain(
+    f: impl FnOnce() -> Result<SourceAudio, DecodeError>,
+) -> Result<SourceAudio, DecodeError> {
+    f()
+}
+#[cfg(not(feature = "opus"))]
+fn decode_opus_or_explain(
+    _f: impl FnOnce() -> Result<SourceAudio, DecodeError>,
+) -> Result<SourceAudio, DecodeError> {
+    Err(DecodeError::Decode(
+        "this is an Opus file, but studio-media was built without the `opus`          feature (needs system libopus)".into(),
+    ))
+}
+#[cfg(not(feature = "opus"))]
+mod opus_impl {
+    use super::*;
+    pub(crate) fn decode_opus_file(_: &Path) -> Result<SourceAudio, DecodeError> {
+        unreachable!("gated by decode_opus_or_explain")
+    }
+    pub(crate) fn decode_opus_bytes(_: Vec<u8>) -> Result<SourceAudio, DecodeError> {
+        unreachable!("gated by decode_opus_or_explain")
+    }
+    pub(crate) fn sniff_opus(_: &[u8]) -> bool { false }
 }
 
 /// Decode audio already in memory — e.g. a subprocess's captured stdout
@@ -102,6 +142,14 @@ pub fn decode_file(path: &Path) -> Result<SourceAudio, DecodeError> {
 /// rather than round-tripping through a temp file), or bytes fetched over
 /// the network. Same decode loop as `decode_file`, minus the filesystem.
 pub fn decode_bytes(bytes: Vec<u8>, extension_hint_str: Option<&str>) -> Result<SourceAudio, DecodeError> {
+    // Route Opus by hint OR by sniffing the first page: bytes arriving from
+    // `studio-video`'s extraction or a collab asset have no filename, and
+    // Symphonia would otherwise fail them as an unknown-codec ogg.
+    if extension_hint_str.is_some_and(|e| e.eq_ignore_ascii_case("opus"))
+        || opus_impl::sniff_opus(&bytes)
+    {
+        return decode_opus_or_explain(move || opus_impl::decode_opus_bytes(bytes));
+    }
     let mut hint = Hint::new();
     if let Some(ext) = extension_hint_str {
         hint.with_extension(ext);
@@ -389,5 +437,93 @@ mod tests {
         let format = probe_wav(&samples, 1, 48_000);
         let audio = decode_format(format).unwrap();
         assert_eq!(audio.frames(), n as usize, "every sample must survive, not just the first packet");
+    }
+}
+
+#[cfg(all(test, feature = "opus"))]
+mod opus_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Encode a lavfi-described signal to a temp .opus with the real ffmpeg,
+    /// the same convention `studio-video`'s tests set: fixtures from a real
+    /// encoder, not hand-built bytes a hand-built parser would tautologically
+    /// pass.
+    fn ffmpeg_opus(name: &str, filter: &str, channels: u32) -> std::path::PathBuf {
+        let out = std::env::temp_dir().join(format!("studio-media-{name}.opus"));
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", filter, "-ac", &channels.to_string(),
+                   "-c:a", "libopus", "-b:a", "96k"])
+            .arg(&out)
+            .output()
+            .expect("ffmpeg present (studio-video's tests already require it)");
+        assert!(status.status.success(), "ffmpeg failed: {}",
+                String::from_utf8_lossy(&status.stderr));
+        out
+    }
+
+    #[test]
+    fn a_stereo_opus_decodes_at_48k_stereo_and_exactly_its_length() {
+        let p = ffmpeg_opus("stereo-sine", "sine=frequency=440:duration=1:sample_rate=48000", 2);
+        let a = decode_file(&p).expect("decodes");
+        assert_eq!(a.sample_rate, 48_000, "opus is a 48k codec by contract");
+        assert_eq!(a.channels.len(), 2, "stereo stays stereo — this is a sampler, not a mel front-end");
+        // BOTH trims proven by one number: without the pre-skip trim this
+        // would be ~312 samples long; without the granule end-trim, up to a
+        // frame of padding long. 48_000 ± a muxer's rounding means both cut.
+        let n = a.frames();
+        assert!((47_900..=48_100).contains(&n), "1.0s should be ~48000 frames, got {n}");
+        // 440 Hz sine crosses zero ~880 times a second.
+        let zc = a.channels[0].windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        assert!((850..=910).contains(&zc), "440Hz sine, got {zc} crossings");
+    }
+
+    #[test]
+    fn the_loop_seam_is_audio_not_padding() {
+        // The reason the granule trim exists: a melody loop's last
+        // milliseconds must be the music, not codec padding, or the loop
+        // ticks at every bar line. A constant sine's tail RMS must match its
+        // overall RMS; trailing zeros would crater it.
+        let p = ffmpeg_opus("loop-tail", "sine=frequency=220:duration=1:sample_rate=48000", 1);
+        let a = decode_file(&p).expect("decodes");
+        let rms = |s: &[f32]| (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt();
+        let whole = rms(&a.channels[0]);
+        let tail = rms(&a.channels[0][a.channels[0].len() - 240..]);
+        assert!(tail > whole * 0.7, "tail rms {tail} vs whole {whole}: padding survived the trim");
+    }
+
+    #[test]
+    fn mono_stays_mono() {
+        let p = ffmpeg_opus("mono", "sine=frequency=330:duration=0.25:sample_rate=48000", 1);
+        let a = decode_file(&p).expect("decodes");
+        assert_eq!(a.channels.len(), 1);
+    }
+
+    #[test]
+    fn bytes_with_no_name_decode_the_same_as_the_file() {
+        // Bytes from a collab asset or a video's extracted track arrive
+        // nameless; the OggS/OpusHead sniff has to carry them to the same
+        // decoder the path took.
+        let p = ffmpeg_opus("sniff", "sine=frequency=550:duration=0.25:sample_rate=48000", 2);
+        let by_path = decode_file(&p).expect("file decodes");
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(super::opus::sniff_opus(&bytes), "first page carries OpusHead");
+        let by_bytes = decode_bytes(bytes, None).expect("bytes decode");
+        assert_eq!(by_path.channels, by_bytes.channels, "one decoder, one answer");
+    }
+
+    #[test]
+    fn a_vorbis_ogg_is_not_mistaken_for_opus() {
+        // Same container, different codec: the sniff must let Symphonia keep
+        // the .ogg files it already handles.
+        let out = std::env::temp_dir().join("studio-media-vorbis.ogg");
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.25:sample_rate=48000",
+                   "-c:a", "libvorbis"])
+            .arg(&out).output().expect("ffmpeg runs");
+        assert!(ok.status.success());
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(!super::opus::sniff_opus(&bytes));
+        assert!(decode_bytes(bytes, Some("ogg")).is_ok(), "vorbis still decodes via symphonia");
     }
 }
