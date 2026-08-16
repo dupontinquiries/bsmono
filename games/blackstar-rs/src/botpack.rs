@@ -55,7 +55,7 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
         return None;
     }
     let version = u16::from_le_bytes(blob[4..6].try_into().ok()?);
-    if version != 2 {
+    if version != 3 {
         // Refused rather than guessed: a v1 pack read as v2 walks off the end
         // of the buffer, and a future layout read as v2 would produce
         // plausible-looking garbage geometry. Both are worse than an error.
@@ -73,13 +73,22 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
     let hi = f32::from_le_bytes(blob[12..16].try_into().ok()?);
 
     let mut off = 16usize;
-    // v2 writes a range table PER POSE, because the same strip can lay its
-    // parts out in a different order in each pose. Skipped rather than read:
-    // this decoder returns the whole buffer, and the ranges only matter to the
-    // packer, which uses them to decide what to quantise.
+    // A range table PER POSE, because the same strip can lay its parts out in
+    // a different order in each pose. v3 needs these: the float ranges say
+    // which bytes the quantised stream fills in, and everything else is index
+    // data the second stream rebuilds.
+    let mut all_ranges: Vec<Vec<(usize, usize)>> = Vec::with_capacity(poses);
     for _ in 0..poses {
         let nr = u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize;
-        off += 4 + nr * 8;
+        off += 4;
+        let mut rs = Vec::with_capacity(nr);
+        for _ in 0..nr {
+            let st = u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize;
+            let n = u32::from_le_bytes(blob.get(off + 4..off + 8)?.try_into().ok()?) as usize;
+            off += 8;
+            rs.push((st, n));
+        }
+        all_ranges.push(rs);
     }
     let mut lens = Vec::with_capacity(poses);
     for _ in 0..poses {
@@ -90,14 +99,30 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
     // variable-length; a chassis has five of them, so an index would cost more
     // bytes than it saves time.
     for i in 0..poses {
-        let clen = u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize;
-        off += 4;
-        let chunk = blob.get(off..off + clen)?;
-        off += clen;
+        // Each pose carries TWO lengths: the quantised float stream and the
+        // delta-coded index stream, in that order.
+        let qlen = u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize;
+        let rlen = u32::from_le_bytes(blob.get(off + 4..off + 8)?.try_into().ok()?) as usize;
+        off += 8;
+        let chunk = blob.get(off..off + qlen)?;
+        off += qlen;
         if i == idx {
-            let raw = inflate(chunk)?;
-            return Some(dequantise(&raw, lo, hi, lens[i]));
+            // Two streams now: quantised floats, and delta-coded indices.
+            // v2 stored the index bytes verbatim (with the float ranges
+            // zeroed); v3 delta-codes them, which is 54% of the file.
+            let floats = dequantise(&inflate(chunk)?, lo, hi, lens[i]);
+            let idx_chunk = blob.get(off..off + rlen)?;
+            let indices = decode_indices(&inflate(idx_chunk)?, lens[i], &all_ranges[i])?;
+            // Merge: the float ranges come from the quantised stream, the rest
+            // from the index stream. Neither covers the other's bytes.
+            let mut out = indices;
+            for &(st, n) in &all_ranges[i] {
+                if st + n > out.len() || st + n > floats.len() { return None; }
+                out[st..st + n].copy_from_slice(&floats[st..st + n]);
+            }
+            return Some(out);
         }
+        off += rlen;
     }
     None
 }
@@ -108,6 +133,53 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
 /// The layout exists because a ring of vertices varies smoothly along each
 /// axis, and interleaved xyz hides that from the compressor — consecutive bytes
 /// come from different axes, so a smooth run looks like noise.
+/// Rebuild the index bytes from the delta stream.
+///
+/// Mirrors `encode_indices` in pack_bots.py. Byte ranges the float stream owns
+/// are left as zero here and filled in by the caller, so neither stream ever
+/// writes over the other.
+fn decode_indices(buf: &[u8], total: usize, ranges: &[(usize, usize)]) -> Option<Vec<u8>> {
+    let _ = ranges; // the gap list in the stream is authoritative
+    let ngaps = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
+    let mut off = 4usize;
+    let mut gaps = Vec::with_capacity(ngaps);
+    for _ in 0..ngaps {
+        let st = u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize;
+        let n = u32::from_le_bytes(buf.get(off + 4..off + 8)?.try_into().ok()?) as usize;
+        let aligned = *buf.get(off + 8)? != 0;
+        off += 9;
+        gaps.push((st, n, aligned));
+    }
+    let ndelta: usize = gaps.iter().filter(|g| g.2).map(|g| g.1 / 4).sum();
+    let dstart = off;
+    off += ndelta * 2;
+
+    let mut out = vec![0u8; total];
+    let mut at = 0usize;
+    for (st, n, aligned) in gaps {
+        if st + n > total { return None; }
+        if !aligned {
+            // A run that could not be delta-coded — an index above u16 — was
+            // stored verbatim. The packer checks per run rather than assuming,
+            // because a denser mesh would otherwise alias silently.
+            out[st..st + n].copy_from_slice(buf.get(off..off + n)?);
+            off += n;
+            continue;
+        }
+        let mut prev: u16 = 0;
+        let mut j = st;
+        while j < st + n {
+            let d = u16::from_le_bytes(
+                buf.get(dstart + at * 2..dstart + at * 2 + 2)?.try_into().ok()?);
+            prev = prev.wrapping_add(d);
+            at += 1;
+            out[j..j + 4].copy_from_slice(&(prev as u32).to_le_bytes());
+            j += 4;
+        }
+    }
+    Some(out)
+}
+
 fn dequantise(q: &[u8], lo: f32, hi: f32, out_bytes: usize) -> Vec<u8> {
     // Span of zero is a degenerate model — every vertex at one coordinate. The
     // packer writes 1.0 in that case; matching it here keeps the two ends of

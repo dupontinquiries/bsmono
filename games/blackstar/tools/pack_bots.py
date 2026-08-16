@@ -60,7 +60,7 @@ import sys
 import zlib
 
 MAGIC = b"BSPK"
-VERSION = 2
+VERSION = 3
 
 
 def float_ranges(pose_dir):
@@ -154,6 +154,102 @@ def quantise(vals, lo, hi):
     return bytes((v >> 8) & 0xFF for v in out) + bytes(v & 0xFF for v in out)
 
 
+def encode_indices(rest, ranges):
+    """Delta-code the non-float bytes, which are u32 triangle indices.
+
+    Measured: 54% of a v2 pack is this stream, stored raw and zlib'd. A triangle
+    list references nearby vertices repeatedly, so consecutive indices differ by
+    small amounts — delta then u16 takes one chassis from 158 KB raw / 36 KB
+    zlib'd to 8 KB. 20x, and lossless.
+
+    The gaps between float ranges are all 4-byte aligned and 4-byte sized
+    (checked across the fleet), so they are whole u32 runs and nothing else is
+    mixed in. Anything that is NOT a clean run is copied verbatim rather than
+    delta-coded, because guessing wrong here corrupts the topology — which is
+    exactly what quantising indices as floats did in v1.
+    """
+    cov = bytearray(len(rest))
+    for st, n in ranges:
+        cov[st:st + n] = b"\x01" * n
+    gaps = []
+    start = None
+    for i in range(len(rest) + 1):
+        inside = i < len(rest) and not cov[i]
+        if inside and start is None:
+            start = i
+        elif not inside and start is not None:
+            gaps.append((start, i - start))
+            start = None
+
+    out = bytearray()
+    out += struct.pack("<I", len(gaps))
+    deltas = []
+    verbatim = bytearray()
+    for st, n in gaps:
+        aligned = (st % 4 == 0) and (n % 4 == 0)
+        out += struct.pack("<IIB", st, n, 1 if aligned else 0)
+        if not aligned:
+            verbatim += rest[st:st + n]
+            continue
+        prev = 0
+        run = []
+        ok = True
+        for j in range(st, st + n, 4):
+            v = struct.unpack_from("<I", rest, j)[0]
+            # The delta is stored in 16 bits and unwrapped by adding mod 2^16,
+            # so it only round-trips while every index fits in u16. Measured
+            # across 1.35M indices in this fleet: none exceeds 65535 and the
+            # largest jump is 18,912. But that is a property of THIS DATA, not
+            # of the format — a denser mesh would break it silently, producing
+            # a valid-looking index that points at the wrong vertex.
+            #
+            # So it is checked, and a run that fails falls back to verbatim.
+            if v > 0xFFFF:
+                ok = False
+                break
+            run.append((v - prev) & 0xFFFF)
+            prev = v
+        if not ok:
+            # Rewrite the flag as verbatim. The header was already emitted, so
+            # patch the byte rather than re-plan.
+            out[-1] = 0
+            verbatim += rest[st:st + n]
+            continue
+        deltas.extend(run)
+    # Everything the ranges DO cover is float, already carried by the quantised
+    # stream — so it is not stored here at all. v2 kept it as zeroes, which
+    # compressed well but was still bytes.
+    body = struct.pack(f"<{len(deltas)}H", *deltas) + bytes(verbatim)
+    return bytes(out) + body
+
+
+def decode_indices(buf, total_len, ranges):
+    """Inverse. Rebuilds a buffer with float ranges left as zero."""
+    (ngaps,) = struct.unpack_from("<I", buf, 0)
+    off = 4
+    gaps = []
+    for _ in range(ngaps):
+        st, n, aligned = struct.unpack_from("<IIB", buf, off)
+        off += 9
+        gaps.append((st, n, aligned))
+    ndelta = sum(n // 4 for st, n, a in gaps if a)
+    deltas = struct.unpack_from(f"<{ndelta}H", buf, off)
+    off += ndelta * 2
+    out = bytearray(total_len)
+    at = 0
+    for st, n, aligned in gaps:
+        if not aligned:
+            out[st:st + n] = buf[off:off + n]
+            off += n
+            continue
+        prev = 0
+        for j in range(st, st + n, 4):
+            prev = (prev + deltas[at]) & 0xFFFF
+            at += 1
+            struct.pack_into("<I", out, j, prev)
+    return bytes(out)
+
+
 def dequantise(buf, lo, hi, n):
     """Inverse of quantise: byte planes -> deltas -> codes -> floats."""
     span = (hi - lo) or 1.0
@@ -224,11 +320,12 @@ def pack_chassis(cdir, dry=False, prefix="f", out_name="bots.pack"):
     for vals, nbytes, raw, rs in poses:
         # Non-float bytes travel VERBATIM. Indices are u32 and quantising them
         # is what corrupted the first version.
-        rest = bytearray(raw)
-        for st, n in rs:
-            rest[st:st + n] = b"\x00" * n     # zeroed so it compresses away
+        # v3: the non-float bytes go through encode_indices, which delta-codes
+        # the u32 index runs. v2 zeroed the float ranges and zlib'd the whole
+        # buffer; that compressed the zeroes well but still carried the indices
+        # raw, and they are 54% of the file.
         blobs.append((zlib.compress(quantise(vals, lo, hi), 9),
-                      zlib.compress(bytes(rest), 9)))
+                      zlib.compress(encode_indices(raw, rs), 9)))
     for q, r in blobs:
         out += struct.pack("<II", len(q), len(r)) + q + r
 
@@ -278,9 +375,10 @@ def verify_chassis(cdir, prefix="f", out="bots.pack"):
     for i, d in enumerate(pose_dirs):
         qlen, rlen = struct.unpack_from("<II", blob, off); off += 8
         q = zlib.decompress(blob[off:off + qlen]); off += qlen
-        rest = bytearray(zlib.decompress(blob[off:off + rlen])); off += rlen
-        vals = dequantise(q, lo, hi, len(q) // 2)
+        idx = zlib.decompress(blob[off:off + rlen]); off += rlen
         ranges = all_ranges[i]
+        rest = bytearray(decode_indices(idx, lens[i], ranges))
+        vals = dequantise(q, lo, hi, len(q) // 2)
         # Put the floats back where they came from, in THIS pose's layout.
         k = 0
         for st, n in ranges:

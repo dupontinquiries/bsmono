@@ -26,6 +26,40 @@ import zlib
 MAGIC = b"BSPK"
 
 
+def read_v2(blob):
+    """(lo, hi, per-pose ranges, lens, [(codes, rest_bytes)]) from a v2 pack.
+
+    v2 -> v3 changes only how the NON-FLOAT bytes are stored, so the codes and
+    the reconstructed rest buffer pass through untouched. Same lossless-by-
+    construction argument as v1 -> v2: nothing is re-quantised.
+    """
+    if blob[:4] != MAGIC:
+        return None
+    ver, npose = struct.unpack_from("<HH", blob, 4)
+    if ver != 2:
+        return None
+    lo, hi = struct.unpack_from("<ff", blob, 8)
+    off = 16
+    all_ranges = []
+    for _ in range(npose):
+        (nr,) = struct.unpack_from("<I", blob, off); off += 4
+        rs = []
+        for _ in range(nr):
+            st, n = struct.unpack_from("<II", blob, off); off += 8
+            rs.append((st, n))
+        all_ranges.append(rs)
+    lens = []
+    for _ in range(npose):
+        (n,) = struct.unpack_from("<I", blob, off); lens.append(n); off += 4
+    poses = []
+    for _ in range(npose):
+        qlen, rlen = struct.unpack_from("<II", blob, off); off += 8
+        q = zlib.decompress(blob[off:off + qlen]); off += qlen
+        rest = zlib.decompress(blob[off:off + rlen]); off += rlen
+        poses.append((q, rest))
+    return lo, hi, all_ranges, lens, poses
+
+
 def read_v1(blob):
     """(lo, hi, ranges, [(codes, rest_bytes)]) from a v1 pack."""
     if blob[:4] != MAGIC:
@@ -73,6 +107,41 @@ def encode_v2(codes):
 
 
 def upgrade(path, dry=False):
+    """v2 -> v3. (v1 -> v2 lives in read_v1 and is kept for old trees.)"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pb", os.path.join(os.path.dirname(__file__), "pack_bots.py"))
+    pb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pb)
+
+    blob = open(path, "rb").read()
+    got = read_v2(blob)
+    if got is None:
+        return None
+    lo, hi, all_ranges, lens, poses = got
+    out = bytearray(MAGIC)
+    out += struct.pack("<HH", 3, len(poses))
+    out += struct.pack("<ff", lo, hi)
+    for rs in all_ranges:
+        out += struct.pack("<I", len(rs))
+        for st, n in rs:
+            out += struct.pack("<II", st, n)
+    for n in lens:
+        out += struct.pack("<I", n)
+    for i, (qbody, rest) in enumerate(poses):
+        # The quantised stream is already v2's layout, which v3 keeps.
+        q = zlib.compress(qbody, 9)
+        r = zlib.compress(pb.encode_indices(rest, all_ranges[i]), 9)
+        out += struct.pack("<II", len(q), len(r)) + q + r
+    if not dry:
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(out)
+        os.replace(tmp, path)
+    return len(blob), len(out)
+
+
+def _unused_v1(path, dry=False):
     blob = open(path, "rb").read()
     got = read_v1(blob)
     if got is None:
