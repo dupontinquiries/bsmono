@@ -41,6 +41,9 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// variants (`AddBus`/`RemoveBus`/`SetBusGain`/`SetBusChain`/`SetBusSends`/
 /// `SetRoute`).
 ///
+/// v7: `Track` gained `gain: f32` (the mixer fader) and `Op` gained
+/// `SetTrackGain` (tag 19).
+///
 /// v3: `Bus` gained `muted: bool`, and `Op` gained `SetBusFlags`. A separate
 /// bump from v2 rather than folding it in, because v2 had already landed and
 /// been tested as its own shape before mute was designed — the "one bump per
@@ -55,7 +58,7 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 6;
+pub const WIRE_VERSION: u8 = 7;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -217,6 +220,7 @@ fn put_track(o: &mut Vec<u8>, t: &Track) {
     put_str(o, &t.name);
     put_u8(o, t.muted as u8);
     put_u8(o, t.locked as u8);
+    put_f32(o, t.gain);
     put_opt_bus_id(o, t.route);
 }
 fn get_track(r: &mut R) -> Option<Track> {
@@ -224,6 +228,7 @@ fn get_track(r: &mut R) -> Option<Track> {
         id: TrackId(r.u64()?),
         kind: if r.u8()? != 0 { TrackKind::Audio } else { TrackKind::Video },
         name: r.str()?, muted: r.u8()? != 0, locked: r.u8()? != 0,
+        gain: r.f32()?,
         route: get_opt_bus_id(r)?,
     })
 }
@@ -273,6 +278,7 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
         Op::RemoveSource { id } => { put_u8(o, 18); put_u64(o, id.0); }
+        Op::SetTrackGain { id, gain } => { put_u8(o, 19); put_u64(o, id.0); put_f32(o, *gain); }
     }
 }
 
@@ -311,6 +317,7 @@ fn get_op(r: &mut R) -> Option<Op> {
         15 => Op::SetBusSends { id: BusId(r.u64()?), sends: get_sends(r)? },
         16 => Op::SetRoute { track: TrackId(r.u64()?), bus: get_opt_bus_id(r)? },
         18 => Op::RemoveSource { id: SourceId(r.u64()?) },
+        19 => Op::SetTrackGain { id: TrackId(r.u64()?), gain: r.f32()? },
         _ => return None, // an op kind from a newer build: refuse, don't guess
     })
 }
@@ -651,7 +658,7 @@ mod tests {
         };
         vec![
             Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-                name: "A1 — vocals".into(), muted: true, locked: false, route: None }, at: 3 },
+                name: "A1 — vocals".into(), muted: true, locked: false, gain: 1.0, route: None }, at: 3 },
             Op::RemoveTrack { id: TrackId(2) },
             Op::SetTrackFlags { id: TrackId(2), muted: false, locked: true },
             Op::AddClip { clip: clip.clone() },
@@ -680,6 +687,7 @@ mod tests {
             Op::SetRoute { track: TrackId(2), bus: Some(BusId(1)) },
             Op::SetRoute { track: TrackId(2), bus: None },
             Op::RemoveSource { id: SourceId(3) },
+            Op::SetTrackGain { id: TrackId(2), gain: 0.7 },
         ]
     }
 
@@ -855,7 +863,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 6, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 7, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -899,7 +907,7 @@ mod tests {
         // on another that started cold.
         let mut host = Doc::new(SiteId(1), Project { name: "cut".into(), ..Default::default() });
         host.local(Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         host.local(Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         for i in 0..6u64 {

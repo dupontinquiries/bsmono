@@ -252,7 +252,7 @@ mod tests {
 
     fn add_track_cmd(id: u64) -> Command {
         Command::Edit(Op::AddTrack {
-            track: Track { id: TrackId(id), kind: TrackKind::Audio, name: format!("T{id}"), muted: false, locked: false, route: None },
+            track: Track { id: TrackId(id), kind: TrackKind::Audio, name: format!("T{id}"), muted: false, locked: false, gain: 1.0, route: None },
             at: 0,
         })
     }

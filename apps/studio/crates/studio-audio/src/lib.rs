@@ -587,7 +587,7 @@ pub fn mixdown_into(
                 let into_clip = at.saturating_sub(clip.pos);
                 let src_frame = (clip.src_in.saturating_add(into_clip)).to_samples(rate) as usize;
                 if src_frame >= src.frames() { break; }
-                let g = clip.gain * fade.gain_at(into_clip, clip.len);
+                let g = clip.gain * track.gain * fade.gain_at(into_clip, clip.len);
                 let oi = (out_off + i) * 2;
                 if oi + 1 >= dest.len() { break; }
                 // a mono source feeds both sides; a stereo one keeps its image
@@ -727,7 +727,7 @@ mod tests {
         let rate = 48_000;
         let mut p = Project { name: "mix".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "t.wav".into(),
             len: Ticks::from_seconds(len_s), sample_rate: rate, channels: 1, has_video: false } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
@@ -1494,7 +1494,7 @@ mod tests {
         let (mut p, audio) = project_with(0.5, 1.0);
         p.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(2), kind: studio_core::TrackKind::Audio, name: "A2".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 1 }).unwrap();
         let mut audio2 = audio.clone();
         audio2.insert(studio_core::SourceId(2), tone(24_000, 48_000, 660.0, 0.5));
@@ -1525,5 +1525,40 @@ mod tests {
             assert!((drums_only[i] - expected[i]).abs() < 1e-5,
                 "sample {i}: soloing Drums must equal muting Melody — Beat (their shared ancestor) must stay open either way");
         }
+    }
+}
+
+#[cfg(test)]
+mod track_fader_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn one_clip_project(track_gain: f32) -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: track_gain, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![vec![0.5; 48_000]] });
+        (p, audio)
+    }
+
+    #[test]
+    fn the_track_fader_scales_its_clips_like_the_clip_fader_does() {
+        // Half gain is 6 dB down — the same rule the clip-gain test pins,
+        // now one stage upstream, and multiplicative with it.
+        let (p_full, audio) = one_clip_project(1.0);
+        let (p_half, _) = one_clip_project(0.5);
+        let full = mixdown(&p_full, &audio, &BTreeMap::new(),
+                           Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        let half = mixdown(&p_half, &audio, &BTreeMap::new(),
+                           Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        let sum = |v: &[f32]| v.iter().map(|s| s.abs()).sum::<f32>();
+        let ratio = sum(&half) / sum(&full);
+        assert!((ratio - 0.5).abs() < 1e-4, "fader at 0.5 halves the level, ratio {ratio}");
     }
 }

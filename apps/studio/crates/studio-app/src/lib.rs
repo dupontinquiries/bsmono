@@ -16,6 +16,7 @@ use studio_egui::touch::{Panel, ViewMode};
 use studio_live::transport::Transport;
 
 pub mod audition;
+pub mod mixer_panel;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -50,6 +51,13 @@ pub struct Studio {
     /// Set by any PROJECT edit (including undo/redo and a bounce); the shell
     /// re-renders the arrangement buffer before the next timeline playback.
     pub arrangement_dirty: bool,
+    /// Solo'd tracks — monitoring state, deliberately NOT an op (see
+    /// `mixer_panel`'s docs): it shapes what you hear and what you export,
+    /// never what the project is.
+    pub solo: Vec<studio_core::TrackId>,
+    /// A fader mid-drag: (track, previewed value). Local by design — one
+    /// `SetTrackGain` op lands when the drag ends.
+    pub mixer_drag: Option<(studio_core::TrackId, f32)>,
     /// Set by the panel's bounce button; the shell performs it.
     pub pending_bounce: bool,
 }
@@ -75,6 +83,8 @@ impl Studio {
             rack_playing: false,
             loop_dirty: true,
             arrangement_dirty: true,
+            solo: Vec::new(),
+            mixer_drag: None,
             pending_bounce: false,
         }
     }
@@ -89,7 +99,7 @@ impl Studio {
         for (i, (kind, nm)) in [(TrackKind::Video, "V1"), (TrackKind::Audio, "A1"),
                                  (TrackKind::Audio, "A2")].iter().enumerate() {
             p.apply(&Op::AddTrack { track: Track { id: TrackId(i as u64 + 1), kind: *kind,
-                name: (*nm).into(), muted: false, locked: false, route: None }, at: i }).ok();
+                name: (*nm).into(), muted: false, locked: false, gain: 1.0, route: None }, at: i }).ok();
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "takes/demo.wav".into(),
             len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).ok();
@@ -256,7 +266,7 @@ impl Studio {
         if end <= Ticks::ZERO { return Vec::new(); }
         studio_audio::mixdown(
             &self.session.doc.project, sources, &std::collections::BTreeMap::new(),
-            Ticks::ZERO, end, rate, &[], &[],
+            Ticks::ZERO, end, rate, &self.solo, &[],
         )
     }
 
@@ -684,11 +694,13 @@ impl eframe::App for App {
                 Panel::Rack => {
                     rack_panel::show(ui, &mut self.studio, &colors, playhead_col);
                 }
-                Panel::Mixer | Panel::Program => {
+                Panel::Mixer => {
+                    mixer_panel::show(ui, &mut self.studio, &colors);
+                }
+                Panel::Program => {
                     // Honest placeholder beats a silent no-op: a tab that
                     // switches to nothing reads as a broken tab.
-                    ui.colored_label(colors.text_weak,
-                        format!("{} — not built yet.", self.studio.panel.label()));
+                    ui.colored_label(colors.text_weak, "Program — not built yet.");
                 }
                 Panel::Timeline => {
                     let ph = self.studio.playhead();
@@ -981,5 +993,57 @@ mod export_tests {
                                        &std::env::temp_dir(), ExportFormat::Wav);
         assert!(err.is_err());
         assert!(s.status.contains("refused"), "status was {:?}", s.status);
+    }
+}
+
+#[cfg(test)]
+mod mixer_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+
+    #[test]
+    fn solo_shapes_the_arrangement_render_without_touching_the_project() {
+        // Two tracks with distinct audio; solo one, the other vanishes from
+        // the render — while the project itself is byte-identical, because
+        // solo is monitoring, not an edit.
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("kick on A1");
+        sources.insert(id, audio);
+        let melody = studio_audio::SourceAudio {
+            sample_rate: 48_000, channels: vec![vec![0.3; 48_000], vec![0.3; 48_000]],
+        };
+        s.transport.set_position(Ticks::ZERO);
+        let mid = s.import_clip("pad", "loops/pad.opus", &melody).expect("lands on A2");
+        sources.insert(mid, melody);
+        let a2 = s.session.doc.project.clips.values()
+            .find(|c| c.source == mid).unwrap().track;
+
+        let before = s.session.doc.project.clone();
+        let both = s.render_arrangement(48_000, &sources);
+        s.solo = vec![a2];
+        let solo = s.render_arrangement(48_000, &sources);
+        assert_eq!(s.session.doc.project, before, "solo left the project untouched");
+
+        // The pad is a constant 0.3; the kick's transients push peaks well
+        // above it. Solo'd, the early window's peak collapses to pad level.
+        let peak = |v: &[f32]| v[..9600].iter().fold(0f32, |a, s| a.max(s.abs()));
+        assert!(peak(&both) > 0.5, "kick present unsolo'd: {}", peak(&both));
+        assert!(peak(&solo) < 0.35, "solo'd to the pad, kick gone: {}", peak(&solo));
+    }
+
+    #[test]
+    fn a_fader_op_lands_in_history_like_any_edit() {
+        let mut s = Studio::demo();
+        let t = s.session.doc.project.tracks.iter()
+            .find(|t| t.kind == studio_core::TrackKind::Audio).unwrap().id;
+        s.arrangement_dirty = false;
+        s.edit(studio_core::Op::SetTrackGain { id: t, gain: 0.4 }, "gain");
+        let g = |s: &Studio| s.session.doc.project.tracks.iter()
+            .find(|x| x.id == t).unwrap().gain;
+        assert_eq!(g(&s), 0.4);
+        assert!(s.arrangement_dirty, "the render knows the mix moved");
+        s.key(Key::c('u'));
+        assert_eq!(g(&s), 1.0, "one gesture, one undo step");
     }
 }

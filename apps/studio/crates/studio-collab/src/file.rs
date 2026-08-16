@@ -189,9 +189,9 @@ mod tests {
             sends: Vec::new(), muted: false,
         } }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-            name: "A1 — vocals".into(), muted: true, locked: false, route: Some(studio_core::BusId(1)) }, at: 1 }).unwrap();
+            name: "A1 — vocals".into(), muted: true, locked: false, gain: 1.0, route: Some(studio_core::BusId(1)) }, at: 1 }).unwrap();
         for i in 0..12u64 {
             let mut params = std::collections::BTreeMap::new();
             params.insert("gain".to_string(), 0.5 + i as f32 * 0.01);

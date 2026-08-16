@@ -1082,7 +1082,7 @@ mod tests {
         let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(2), kind: studio_core::TrackKind::Audio, name: "Vox".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 0 }).unwrap();
         let before = project.clone();
 
@@ -1318,7 +1318,7 @@ mod tests {
         let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(1), kind: studio_core::TrackKind::Audio, name: "Drums".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 0 }).unwrap();
 
         let ops = bounce_ops(&pattern, &tempo, 48_000, SourceId(1), ClipId(1), TrackId(1), Ticks::from_seconds(2.0), "bounce.wav");
@@ -1351,7 +1351,7 @@ mod tests {
         let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(1), kind: studio_core::TrackKind::Audio, name: "Drums".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 0 }).unwrap();
         for op in bounce_ops(&pattern, &tempo, rate, SourceId(1), ClipId(1), TrackId(1), Ticks::ZERO, "bounce.wav") {
             project.apply(&op).unwrap();

@@ -106,10 +106,20 @@ read correctly in ffprobe. The shell exports the arrangement as 16-bit
 dithered WAV or 128k Opus to `./exports/<project>-<stamp>.*` — no dialog,
 the status line prints the path — and a bounce now writes its WAV to the
 path its `AddSource` op records, so the project's references are real
-files. Not built, named plainly: rack collaboration (the wire has
-`Packet::Rack`; the shell doesn't broadcast it yet), streaming pattern
-playback inside `DeviceEngine`'s realtime render, and the Mixer/Program
-panels, which say so on screen instead of showing nothing.
+files. **The Mixer is a panel now, and the model paid its tax first.** `Track`
+gained `gain` (`Op::SetTrackGain`, wire v7, refused on a locked track,
+serde-defaulted to UNITY so a pre-fader project cannot load silent) and
+`mixdown` multiplies it with each clip's own gain — pinned at the usual
+half-gain-is-6dB. The panel: fader per track committing ONE op on drag
+release (a value per frame would be sixty undo entries and sixty packets
+per gesture — `Paint`'s rationale, one layer up; the drag preview is visual
+only, audio follows on release, and a live fader ride is honestly the
+streaming engine's job), mute as the existing `SetTrackFlags` op, and solo
+as deliberately-local monitoring state that shapes renders and exports but
+never the project. Not built, named plainly: rack collaboration (the wire
+has `Packet::Rack`; the shell doesn't broadcast it yet), streaming pattern
+playback inside `DeviceEngine`'s realtime render, and the Program panel,
+which says so on screen instead of showing nothing.
 
 ## Realtime collaboration, concretely
 

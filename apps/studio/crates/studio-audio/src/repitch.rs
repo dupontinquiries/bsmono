@@ -95,7 +95,7 @@ mod tests {
         // here should have removed or mutated them.
         let mut project = Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: studio_core::Track {
-            id: TrackId(1), kind: TrackKind::Audio, name: "Vox".into(), muted: false, locked: false, route: None,
+            id: TrackId(1), kind: TrackKind::Audio, name: "Vox".into(), muted: false, locked: false, gain: 1.0, route: None,
         }, at: 0 }).unwrap();
         project.apply(&Op::AddSource { source: Source {
             id: SourceId(1), path: "original.wav".into(), len: Ticks::from_seconds(2.0),

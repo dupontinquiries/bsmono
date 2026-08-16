@@ -259,7 +259,7 @@ mod tests {
     fn seeded_session() -> Session {
         let mut p = Project { name: "cut".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
             len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         Session::open(team(), "cut", Doc::new(SiteId(1), p))
@@ -405,7 +405,7 @@ mod tests {
         // track twice.
         let mut s = seeded_session(); // already has one track, added directly to the project, not via .local()
         s.doc.local(Op::AddTrack {
-            track: Track { id: TrackId(2), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, route: None },
+            track: Track { id: TrackId(2), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None },
             at: 1,
         }).unwrap();
         assert_eq!(s.doc.history().len(), 1, "exactly one op went through .local()");

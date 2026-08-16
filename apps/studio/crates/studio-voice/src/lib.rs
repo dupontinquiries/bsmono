@@ -357,7 +357,7 @@ mod tests {
     fn project() -> Project {
         let mut p = Project { name: "t".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "take.wav".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),

@@ -311,9 +311,9 @@ mod tests {
     fn project() -> Project {
         let mut p = Project { name: "t".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false, route: None }, at: 1 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "/media/take1.mov".into(),
             len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(10), source: SourceId(1), track: TrackId(1),
