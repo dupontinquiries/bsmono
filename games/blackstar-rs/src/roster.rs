@@ -26,12 +26,18 @@
 //! at folds is the right default for a test session and the wrong one for
 //! playing, so the tier is a parameter rather than a policy.
 
-/// How many models the SDF bake can hold. Mirrors `render::CSDF_MAXM`.
+/// How many models the SDF bake can hold.
 ///
-/// Duplicated as a named constant with this note rather than imported, so the
-/// selector can be tested without pulling in the renderer — and asserted equal
-/// in a test, which is what stops the copy going stale.
-pub const SDF_BUDGET: usize = 126;
+/// DERIVED from `render::CSDF_MAXM` rather than copied. It was a copy with a
+/// test asserting equality, which is a reasonable arrangement right up until
+/// the moment the renderer moves — tiling the atlas took CSDF_MAXM from 126 to
+/// 512 and this stayed at 126, so the loader kept refusing 400 chassis the GPU
+/// could now hold. The test passed nothing, because a test that guards a
+/// constant only fires when someone runs it.
+///
+/// A derived constant cannot go stale, which is worth more here than the
+/// independence the copy bought.
+pub const SDF_BUDGET: usize = crate::render::CSDF_MAXM as usize;
 
 /// One chassis and the poses it would cost.
 #[derive(Clone, PartialEq, Eq, Debug)]

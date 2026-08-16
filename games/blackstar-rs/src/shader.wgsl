@@ -56,7 +56,7 @@ const CSDF_SLAB: f32 = 16.0; // was 32.0 -- already didn't match render.rs's
 // depth slab. All three must agree with render.rs; see the note above about
 // three numbers, two of which were once wrong.
 const CSDF_TILES: f32 = 4.0;   // 4x4 = 16 models per depth slab
-const CSDF_D: f32 = 512.0;     // SLAB(16) x 32 depth slabs = 512 models
+const CSDF_D: f32 = 1344.0;    // SLAB(16) x 84 depth slabs = 1344 models
 
 // baked candidate grid (must match render.rs RC_* consts)
 const RC_DIM: u32 = 40u;

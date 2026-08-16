@@ -110,7 +110,7 @@ pub const CSDF_SLAB: u32 = 16;
 /// bug fixed in the same pass that first touched this constant: the
 /// SDF depth-slice normalization had likely been sampling into the
 /// wrong model's slab for a while before either of these changes.
-pub const CSDF_MAXM: u32 = 512;
+pub const CSDF_MAXM: u32 = 1344;
 
 /// Models per row and column of the atlas grid.
 ///
@@ -121,10 +121,16 @@ pub const CSDF_MAXM: u32 = 512;
 /// A model now occupies one tile of a TILES x TILES grid, and only the leftover
 /// index advances depth. 16 models per depth slab.
 ///
-/// 512 rather than the 2,048 the layout allows: at 4x4 tiling a 2,048-model
-/// atlas is 144 x 96 x 2048 = 28 MB of GPU texture, which is a lot to ask of a
-/// phone for a roster no session displays. 512 is 7.1 MB, four times the old
-/// count, and the tiling means raising it later costs only depth.
+/// 1,344 holds the ENTIRE shipped library: 221 chassis at their real pose
+/// counts is 1,289 slabs, and 1,344 is the next multiple of TILES^2 above it.
+///
+/// 144 x 96 x 1344 = 18.6 MB of GPU texture. Sized to the library rather than
+/// to a round number, because the alternative is a cap that quietly refuses
+/// assets the machine could hold — which is exactly what 126 was doing: it
+/// loaded 20 of 221 chassis and the other 201 were invisible without a flag.
+///
+/// The tiling is what makes 18.6 MB reachable at all. Stacked on depth alone
+/// this same roster needs 1,289 x 16 = 20,624 depth, ten times the 2048 limit.
 ///
 /// MUST equal `CSDF_TILES` in shader.wgsl. The shader's own comment records
 /// that three numbers had to agree here once and two were wrong; this is a
