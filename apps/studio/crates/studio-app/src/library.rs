@@ -8,9 +8,10 @@
 //! at the playhead (a melody loop). One scan function, pure and tested; the
 //! egui around it stays dumb.
 //!
-//! Audition-on-click (hear a sample before committing it) needs a live
-//! one-shot voice over the sink's buffer — named future work with the
-//! playing-mode keys, not faked by hijacking the loop buffer.
+//! Audition-on-click hears a sample before committing it: the sink grew
+//! additive one-shot voices for played notes, and previewing a file is the
+//! same operation, so the sidebar's ▶ button uses it rather than hijacking
+//! the loop buffer the way a lesser shortcut would.
 
 use std::path::{Path, PathBuf};
 
@@ -69,6 +70,8 @@ pub fn scan(root: &Path) -> Vec<LibraryEntry> {
 pub enum LibraryAction {
     ToRack(PathBuf),
     ToTimeline(PathBuf),
+    /// Hear it, commit to nothing.
+    Preview(PathBuf),
 }
 
 /// Draw the sidebar body. Returns at most one action — a person clicks one
@@ -90,6 +93,9 @@ pub fn show(
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for e in entries {
             ui.horizontal(|ui| {
+                if ui.small_button("▶").on_hover_text("preview").clicked() {
+                    action = Some(LibraryAction::Preview(e.path.clone()));
+                }
                 ui.label(&e.label);
                 if ui.small_button("rack").on_hover_text("add as a sampler channel").clicked() {
                     action = Some(LibraryAction::ToRack(e.path.clone()));

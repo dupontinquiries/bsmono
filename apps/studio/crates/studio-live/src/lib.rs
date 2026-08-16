@@ -618,7 +618,11 @@ fn render_drum(voice: DrumVoice, tone: f32, decay_ms: f32, tune: i8, rate: u32, 
 /// last played in this render (tracked by [`render_pattern`]'s own loop, not
 /// by the synth) — see `SynthKind::Sub::glide_from`'s docs on why glide
 /// state lives in the value passed to `render`, not in hidden state.
-fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> SynthKind {
+/// The step's modifiers folded into a voice. Public because a PLAYED note
+/// is the same operation a sequenced one is — tune and velocity applied to
+/// the channel's synth — and the shell must not grow a second, drifting copy
+/// of that rule for its keyboard.
+pub fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> SynthKind {
     match kind {
         SynthKind::Sub { note, glide_ms, drive, decay_ms, .. } => SynthKind::Sub {
             note: note.saturating_add(m.tune),

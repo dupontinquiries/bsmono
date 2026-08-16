@@ -211,11 +211,22 @@ limiter/color) — the track→saturated-drum-bus→master shape is one test,
 including its four-op undo. A library sidebar (STUDIO_LIBRARY, default
 ./library; two-level scan, audio-only, sorted) offers every sample the
 two doors drops already had: rack channel or timeline clip. Tape stop and halftime are native effects now
-(`studio-fx::playrate`) and addable from any bus chain. Named, not built,
-from the same wishlist: bus SENDS in the UI (the model has them),
+(`studio-fx::playrate`) and addable from any bus chain. **The keyboard plays.** The sink grew additive one-shot VOICES (an SPSC
+channel the audio callback drains, so triggering a note never locks and
+never disturbs the loop it mixes over, with an oldest-drops cap so a stuck
+key cannot grow unbounded work per buffer) — which is what both playing
+mode and the library's ▶ preview needed. `shared/analog-kit` is the
+Wooting Analog SDK behind a plain value: dlopen by documented name, HID
+usage → depth, digital fallback with no cfg at the call site, and a
+MUSICAL velocity curve rather than skydribble's steering curve (a high
+floor is right for turning a car and wrong for playing quietly). It is
+factored from `games/skydribble/src/analog.rs`, which proved the approach;
+that game is deliberately NOT refactored onto it in the same breath.
+studio-app supplies it as the real backend for `studio_egui::playkeys`'s
+`AnalogSource` seam. Named, not built, from the same wishlist: bus SENDS in the UI (the model has them),
 clip-level chain editing, surround/downmix formats (mixdown is stereo
 end-to-end today), 
-audition-on-click (needs a live one-shot voice over the sink), a playing
+ a playing
 mode for keys — now built, see below — Wooting analog input, and VST/CLAP
 hosting — studio-fx::retune is the native autotune seed; for external
 FOSS instruments (Surge XT, Dexed, sfizz + Salamander for piano) a plugin

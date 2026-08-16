@@ -962,10 +962,12 @@ impl Default for App {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| "library".into());
         let library = library::scan(&library_root);
+        let analog = WootingAnalog::default();
+        studio.status = format!("{} — {}", studio.status, analog.0.describe());
         App { studio, peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
               export_rate: 48_000,
-              analog: Box::new(studio_egui::playkeys::NullAnalog),
+              analog: Box::new(analog),
               loaded: SinkContent::Nothing }
     }
 }
@@ -999,6 +1001,7 @@ impl eframe::App for App {
                 ui.label(studio_egui::format_timecode(self.studio.playhead()));
                 ui.separator();
                 ui.label(self.studio.mode.label());
+                ui.separator();
                 ui.separator();
                 // Exports go to ./exports, named after the project; the
                 // status line prints the exact path. No dialog on purpose:
@@ -1286,6 +1289,23 @@ impl eframe::App for App {
             let (path, to_rack) = match action {
                 library::LibraryAction::ToRack(p) => (p, true),
                 library::LibraryAction::ToTimeline(p) => (p, false),
+                library::LibraryAction::Preview(p) => {
+                    match studio_media::decode_file(&p) {
+                        Ok(a) => {
+                            // Mono-summed, because a voice is mono; loud
+                            // samples are left alone rather than normalised,
+                            // since a preview that lies about level is worse
+                            // than a quiet one.
+                            let n = a.frames().min(self.sink.rate() as usize * 4);
+                            let mut mono = Vec::with_capacity(n);
+                            for i in 0..n { mono.push(a.mono(i)); }
+                            self.sink.trigger(std::sync::Arc::new(mono));
+                            self.studio.status = format!("previewing {}", p.display());
+                        }
+                        Err(e) => self.studio.status = format!("preview failed: {e}"),
+                    }
+                    return;
+                }
             };
             let name = path.file_stem().and_then(|s| s.to_str())
                 .unwrap_or("sample").to_owned();
@@ -1389,6 +1409,48 @@ pub fn run(title: &str) -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(title, opts, Box::new(|_cc| Ok(Box::<App>::default())))
+}
+
+/// The real analog backend behind `studio_egui::playkeys::AnalogSource`.
+///
+/// Two halves of one feature met here: the view crate defined the seam (a
+/// trait plus `NullAnalog`, so the layout and mode logic could be written
+/// and tested with no hardware anywhere), and `shared/analog-kit` is the
+/// Wooting SDK loader that fills it — factored out of
+/// `games/skydribble/src/analog.rs`, which proved the dlopen-and-fall-back
+/// approach first. The trait speaks egui `Key`s and the SDK speaks HID
+/// usage codes, so the translation lives here, in the one place that
+/// touches both.
+struct WootingAnalog(analog_kit::Analog);
+
+impl Default for WootingAnalog {
+    fn default() -> Self { WootingAnalog(analog_kit::Analog::new()) }
+}
+
+impl WootingAnalog {
+    /// `keys::Key` carries the PHYSICAL character playkeys resolved (its
+    /// docs explain why physical), so the HID mapping is a-z/0-9 plus the
+    /// punctuation the layout can reach — USB HID usage page 7.
+    fn hid_of(key: &studio_egui::keys::Key) -> Option<u16> {
+        let c = key.ch.to_ascii_lowercase();
+        Some(match c {
+            'a'..='z' => 0x04 + (c as u16 - 'a' as u16),
+            '1'..='9' => 0x1E + (c as u16 - '1' as u16),
+            '0' => 0x27,
+            ';' => 0x33, ',' => 0x36, '.' => 0x37, '/' => 0x38,
+            '[' => 0x2F, ']' => 0x30, '-' => 0x2D, '=' => 0x2E,
+            _ => return None,
+        })
+    }
+}
+
+impl studio_egui::playkeys::AnalogSource for WootingAnalog {
+    fn travel(&self, key: &studio_egui::keys::Key, held: bool) -> f32 {
+        // The musical curve, not skydribble's steering curve: see
+        // analog-kit's `velocity` docs on why those differ.
+        analog_kit::velocity(self.0.depth(Self::hid_of(key), held), 1.6)
+    }
+    fn active(&self) -> bool { self.0.active() }
 }
 
 #[cfg(test)]
@@ -2310,5 +2372,62 @@ mod playing_mode_tests {
         assert_eq!(s.input_mode, InputMode::Motions, "escape is always the way out");
         s.key(Key::c(' '));
         assert!(s.rack_playing || s.transport.playing, "and the keymap is back");
+    }
+}
+
+#[cfg(test)]
+mod analog_adapter_tests {
+    use super::*;
+    use studio_egui::playkeys::AnalogSource;
+
+    #[test]
+    fn without_the_sdk_every_played_key_is_full_velocity() {
+        // The property that lets playkeys have exactly one code path: no
+        // runtime, no branch — held is 1.0, up is 0.0.
+        let a = WootingAnalog::default();
+        if !a.active() {
+            assert_eq!(a.travel(&studio_egui::keys::Key::c('a'), true), 1.0);
+            assert_eq!(a.travel(&studio_egui::keys::Key::c('a'), false), 0.0);
+            // A key with no HID mapping still answers digitally rather than
+            // going silent — a note that vanishes on one keyboard and not
+            // another is the worst kind of input bug.
+            assert_eq!(a.travel(&studio_egui::keys::Key::c('§'), true), 1.0);
+        }
+    }
+
+    #[test]
+    fn every_letter_and_digit_maps_to_its_hid_usage() {
+        // Spot-check the arithmetic against the USB HID table: a is 0x04,
+        // z is 0x1D, 1 is 0x1E, 0 is 0x27 (not 0x28 — the zero key sits
+        // after nine, which is exactly the off-by-one worth pinning).
+        assert_eq!(WootingAnalog::hid_of(&studio_egui::keys::Key::c('a')), Some(0x04));
+        assert_eq!(WootingAnalog::hid_of(&studio_egui::keys::Key::c('z')), Some(0x1D));
+        assert_eq!(WootingAnalog::hid_of(&studio_egui::keys::Key::c('1')), Some(0x1E));
+        assert_eq!(WootingAnalog::hid_of(&studio_egui::keys::Key::c('9')), Some(0x26));
+        assert_eq!(WootingAnalog::hid_of(&studio_egui::keys::Key::c('0')), Some(0x27));
+        assert_eq!(WootingAnalog::hid_of(&studio_egui::keys::Key::c('Q')), Some(0x14),
+                   "shifted or not, it is the same physical key");
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+    use crate::audition::PlaybackSink;
+
+    #[test]
+    fn voices_are_additive_and_do_not_disturb_the_loop() {
+        // A played note must not stop, restart, or reposition the pattern
+        // the person is playing along to.
+        let mut sink = audition::NullSink::new(48_000);
+        sink.set_buffer(std::sync::Arc::new(vec![0.0; 48_000]), 1, true);
+        sink.set_playing(true);
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let before = sink.position().expect("looping");
+        sink.trigger(std::sync::Arc::new(vec![0.5; 4800]));
+        sink.trigger(std::sync::Arc::new(vec![0.5; 4800]));
+        assert_eq!(sink.voices(), 2, "both notes were taken");
+        assert!(sink.playing(), "the loop kept playing");
+        assert!(sink.position().unwrap() >= before, "and did not rewind");
     }
 }

@@ -29,6 +29,7 @@
 
 #[cfg(feature = "audio")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 /// One buffer, played looped (the rack's bar) or once (the arrangement).
@@ -49,6 +50,14 @@ pub trait PlaybackSink {
     fn playing(&self) -> bool;
     /// Jump to a frame (one-shot playback starting mid-arrangement).
     fn seek(&mut self, frame: usize);
+    /// Play a mono buffer NOW, mixed over whatever else is playing, without
+    /// disturbing it — a played note, a previewed sample. Voices are
+    /// additive and self-retiring; there is no handle to release, because a
+    /// one-shot's length is its own note-off and a handle would be a lock
+    /// the audio thread has to wait on.
+    fn trigger(&mut self, samples: Arc<Vec<f32>>);
+    /// How many voices are sounding (diagnostics and tests).
+    fn voices(&self) -> usize;
     /// Current position in FRAMES into the buffer, if playing.
     fn position(&self) -> Option<usize>;
     /// The sample rate buffers must be rendered at.
@@ -59,6 +68,9 @@ pub trait PlaybackSink {
 
 /// The device-less sink: silent, but the clock still runs.
 pub struct NullSink {
+    /// Voices are counted, not heard — the same bargain the whole NullSink
+    /// makes, so a deviceless machine still exercises the code path.
+    triggered: usize,
     rate: u32,
     frames: usize,
     looped: bool,
@@ -70,7 +82,7 @@ pub struct NullSink {
 
 impl NullSink {
     pub fn new(rate: u32) -> NullSink {
-        NullSink { rate, frames: 0, looped: true, playing: false, base: 0,
+        NullSink { triggered: 0, rate, frames: 0, looped: true, playing: false, base: 0,
                    epoch: std::time::Instant::now() }
     }
     fn elapsed_frames(&self) -> usize {
@@ -114,6 +126,8 @@ impl PlaybackSink for NullSink {
         if !self.playing() || self.frames == 0 { return None; }
         Some(self.raw_pos())
     }
+    fn trigger(&mut self, _samples: Arc<Vec<f32>>) { self.triggered += 1; }
+    fn voices(&self) -> usize { self.triggered }
     fn rate(&self) -> u32 { self.rate }
     fn describe(&self) -> String { "silent (no audio device)".into() }
 }
@@ -127,6 +141,8 @@ struct Shared {
     buf: arc_swap::ArcSwap<Buffer>,
     pos: AtomicUsize,
     playing: AtomicBool,
+    /// Live voices sounding right now, for the UI to read.
+    voices: AtomicUsize,
 }
 
 /// What the callback plays: one ArcSwap'd value, so interleave count and
@@ -145,6 +161,7 @@ impl Buffer {
 #[cfg(feature = "audio")]
 pub struct CpalSink {
     shared: Arc<Shared>,
+    voice_tx: mpsc::Sender<Arc<Vec<f32>>>,
     rate: u32,
     name: String,
     // Held for its Drop: the stream stops when the sink does. Dead code to
@@ -170,23 +187,60 @@ impl CpalSink {
             }),
             pos: AtomicUsize::new(0),
             playing: AtomicBool::new(false),
+            voices: AtomicUsize::new(0),
         });
+        // Voices reach the callback down an SPSC channel: try_recv is
+        // non-blocking and the callback OWNS the active list, so triggering
+        // a note never locks, never allocates on the audio thread beyond the
+        // Vec push, and cannot glitch the loop it mixes over.
+        let (voice_tx, voice_rx) = mpsc::channel::<Arc<Vec<f32>>>();
 
         fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
             device: &cpal::Device,
             config: &cpal::StreamConfig,
             channels: usize,
             shared: Arc<Shared>,
+            voice_rx: mpsc::Receiver<Arc<Vec<f32>>>,
         ) -> Result<cpal::Stream, cpal::BuildStreamError> {
             use cpal::traits::DeviceTrait;
+            // Owned by the callback alone: (samples, position).
+            let mut voices: Vec<(Arc<Vec<f32>>, usize)> = Vec::with_capacity(16);
             device.build_output_stream(
                 config,
                 move |data: &mut [T], _| {
                     let silence = T::from_sample(0.0f32);
+                    for v in voice_rx.try_iter() {
+                        // A cap, because a stuck key or a click-happy user
+                        // must not turn into unbounded work per buffer;
+                        // dropping the OLDEST keeps the newest note honest.
+                        if voices.len() >= 24 { voices.remove(0); }
+                        voices.push((v, 0));
+                    }
                     let buf = shared.buf.load();
                     let frames = buf.frames();
-                    if !shared.playing.load(Ordering::Relaxed) || frames == 0 {
+                    let looping_silent = !shared.playing.load(Ordering::Relaxed) || frames == 0;
+                    if looping_silent && voices.is_empty() {
+                        shared.voices.store(0, Ordering::Relaxed);
                         data.fill(silence);
+                        return;
+                    }
+                    if looping_silent {
+                        // Voices only: the transport is stopped but a note
+                        // was played, which is the whole point of playing
+                        // mode existing outside playback.
+                        for frame in data.chunks_mut(channels) {
+                            let mut v = 0.0f32;
+                            for (samples, pos) in voices.iter_mut() {
+                                if *pos < samples.len() {
+                                    v += samples[*pos];
+                                    *pos += 1;
+                                }
+                            }
+                            let s = T::from_sample(v.clamp(-1.0, 1.0));
+                            for out in frame.iter_mut() { *out = s; }
+                        }
+                        voices.retain(|(s, p)| *p < s.len());
+                        shared.voices.store(voices.len(), Ordering::Relaxed);
                         return;
                     }
                     let mut pos = shared.pos.load(Ordering::Relaxed);
@@ -199,17 +253,29 @@ impl CpalSink {
                             shared.playing.store(false, Ordering::Relaxed);
                             continue;
                         }
+                        // Voices sum into every channel equally — a played
+                        // note is mono until a synth says otherwise.
+                        let mut voice_sum = 0.0f32;
+                        for (samples, vp) in voices.iter_mut() {
+                            if *vp < samples.len() {
+                                voice_sum += samples[*vp];
+                                *vp += 1;
+                            }
+                        }
                         for (c, out) in frame.iter_mut().enumerate() {
                             // Device channel c takes buffer channel min(c,
                             // last): mono fans out, stereo maps 1:1, extra
                             // device channels mirror the last buffer channel.
                             let bc = c.min(buf.channels - 1);
-                            *out = T::from_sample(buf.samples[pos * buf.channels + bc]);
+                            let v = buf.samples[pos * buf.channels + bc] + voice_sum;
+                            *out = T::from_sample(v.clamp(-1.0, 1.0));
                         }
                         pos += 1;
                         if buf.looped && pos >= frames { pos = 0; }
                     }
                     shared.pos.store(pos, Ordering::Relaxed);
+                    voices.retain(|(s, p)| *p < s.len());
+                    shared.voices.store(voices.len(), Ordering::Relaxed);
                 },
                 |e| eprintln!("audition stream error: {e}"),
                 None,
@@ -218,15 +284,15 @@ impl CpalSink {
 
         let sc: cpal::StreamConfig = config.clone().into();
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => build::<f32>(&device, &sc, channels, Arc::clone(&shared)),
-            cpal::SampleFormat::I16 => build::<i16>(&device, &sc, channels, Arc::clone(&shared)),
-            cpal::SampleFormat::U16 => build::<u16>(&device, &sc, channels, Arc::clone(&shared)),
+            cpal::SampleFormat::F32 => build::<f32>(&device, &sc, channels, Arc::clone(&shared), voice_rx),
+            cpal::SampleFormat::I16 => build::<i16>(&device, &sc, channels, Arc::clone(&shared), voice_rx),
+            cpal::SampleFormat::U16 => build::<u16>(&device, &sc, channels, Arc::clone(&shared), voice_rx),
             _ => return None,
         }
         .ok()?;
         stream.play().ok()?;
         let name = device.name().unwrap_or_else(|_| "output".into());
-        Some(CpalSink { shared, rate, name: format!("{name} @ {rate}"), _stream: stream })
+        Some(CpalSink { shared, voice_tx, rate, name: format!("{name} @ {rate}"), _stream: stream })
     }
 }
 
@@ -252,6 +318,10 @@ impl PlaybackSink for CpalSink {
     fn seek(&mut self, frame: usize) {
         self.shared.pos.store(frame, Ordering::Relaxed);
     }
+    fn trigger(&mut self, samples: Arc<Vec<f32>>) {
+        let _ = self.voice_tx.send(samples);
+    }
+    fn voices(&self) -> usize { self.shared.voices.load(Ordering::Relaxed) }
     fn position(&self) -> Option<usize> {
         self.playing().then(|| self.shared.pos.load(Ordering::Relaxed))
     }

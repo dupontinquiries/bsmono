@@ -17,6 +17,7 @@ studio-live = { path = "../studio-live" }
 studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
 studio-media = { path = "../studio-media" }
+analog-kit = { path = "../../../../shared/analog-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
