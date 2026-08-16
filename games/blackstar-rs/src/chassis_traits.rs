@@ -135,6 +135,38 @@ impl Traits {
     /// traction rating and much less usable grip. Multiplying rather than
     /// branching is what lets one formula serve both.
     pub fn grip(&self) -> f32 { self.traction * (1.0 - self.hover * 0.8) }
+
+    /// How this chassis should compact through the fold.
+    ///
+    /// compact.rs is explicit that its two styles "should not be one knob", and my
+    /// first pass set one anyway — `Params::default()` for everything.
+    ///
+    /// * A body with real vehicle bodywork wants `Shrink`: "a door does not stretch
+    ///   into a shoulder, it compacts and re-emerges". Cars, trucks, tanks.
+    /// * A body whose robot mode has limbs with no vehicle-mode counterpart wants
+    ///   `Grow`, which makes "mass appear to be added rather than rearranged".
+    ///
+    /// Keyed off `armour`, which is the trait that tracks how much bodywork there
+    /// is to fold — a tank is panels all the way down, a racer is a shell over a
+    /// frame. Not off a category string, for the reason the whole trait vector
+    /// exists: a hovertank is both things and no word covers it.
+    ///
+    /// `strength` scales with armour too. The eye-tuned 0.55 was chosen across six
+    /// body types as the value that avoided "noise on the small ones and mush on
+    /// the large ones" — so a heavily panelled body can take more compaction than
+    /// a sparse one, and this stays inside the range that tuning covered rather
+    /// than reaching past it.
+    pub fn compaction(&self) -> crate::compact::Params {
+        let mut p = crate::compact::Params::default();
+        if self.armour < 0.35 {
+            // Little bodywork to fold: the robot's limbs are new mass, not
+            // rearranged panels.
+            p.style = crate::compact::Style::Grow;
+        }
+        // 0.45 at no armour to 0.65 at full, around the tuned 0.55.
+        p.strength = 0.45 + 0.20 * self.armour.clamp(0.0, 1.0);
+        p
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +259,29 @@ mod tests {
                   "spaceship", "hoverer", "hovertank", "boat"] {
             assert_ne!(Traits::from_category(c), Traits::default(),
                        "{c} fell through to the default");
+        }
+    }
+
+    #[test]
+    fn a_panelled_body_shrinks_and_a_sparse_one_grows() {
+        // compact.rs: Shrink is "the one for vehicle panels: a door does not
+        // stretch into a shoulder"; Grow is for "limbs and weapons that have no
+        // vehicle-mode counterpart to fold from".
+        use crate::compact::Style;
+        assert_eq!(Traits::from_category("tank").compaction().style, Style::Shrink);
+        assert_eq!(Traits::from_category("truck").compaction().style, Style::Shrink);
+        assert_eq!(Traits::from_category("racer").compaction().style, Style::Grow);
+        assert_eq!(Traits::from_category("car").compaction().style, Style::Grow);
+    }
+
+    #[test]
+    fn strength_stays_inside_the_range_someone_actually_tuned() {
+        // 0.55 was picked by eye across six body types. Scaling with armour is
+        // reasonable; reaching past what was looked at is not.
+        for c in ["car", "racer", "truck", "tank", "flyer", "spaceship",
+                  "hoverer", "hovertank", "boat", "unknown"] {
+            let s = Traits::from_category(c).compaction().strength;
+            assert!((0.45..=0.65).contains(&s), "{c} -> {s}");
         }
     }
 

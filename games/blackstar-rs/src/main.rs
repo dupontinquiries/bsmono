@@ -578,6 +578,11 @@ impl CarModels {
 }
 
 struct Game {
+    /// Chassis name -> fleet.json category, for the trait vector.
+    ///
+    /// Held rather than re-read: load_categories scans fleet.json, and the
+    /// morph is rebuilt every time the active car changes.
+    bot_categories: std::collections::HashMap<String, String>,
     gpu: render::Gpu,
     world: World,
     car: Car,
@@ -1339,6 +1344,10 @@ fn main() {
     // Every pose is a real model and gets a real SDF bake below, so poses
     // cost startup time: keep strips short (5-7) rather than smooth.
     let bots_dir = dir.join("bots");
+    // Declared out here so Game can keep it: the categories are read inside
+    // this block and the morph, rebuilt much later, needs them per chassis.
+    let mut bot_categories_loaded: std::collections::HashMap<String, String> =
+        Default::default();
     if bots_dir.is_dir() {
         let mut bots: Vec<String> = std::fs::read_dir(&bots_dir)
             .into_iter()
@@ -1360,6 +1369,7 @@ fn main() {
         let tiers = roster::load_tiers(&bots_dir);
         // Categories seed the trait vector; see chassis_traits.rs.
         let tiers_cat = roster::load_categories(&bots_dir);
+        bot_categories_loaded = tiers_cat.clone();
         let inventory: Vec<roster::Chassis> = bots.iter().map(|name| {
             let n = std::fs::read_dir(bots_dir.join(name))
                 .into_iter().flatten().flatten()
@@ -1548,6 +1558,7 @@ fn main() {
     let look0 = custom::Loadout::decode(&sv.look);
     let academy_passed0 = academy::Passed::decode(&sv.academy);
     let mut game = Game {
+        bot_categories: bot_categories_loaded,
         gpu,
         world,
         car,
@@ -2245,8 +2256,16 @@ impl Game {
         // large ones", across six body types. An earlier 0.22/0.85 pass was
         // picked before anything could be seen and was wrong in both
         // directions, so these are left alone.
+        // PER CHASSIS, not one global default. compact.rs says its two styles
+        // "should not be one knob" and my first pass set one anyway; the trait
+        // vector already knows how much bodywork a body has, which is exactly
+        // what decides whether panels fold inward or limbs push outward.
         if let Some(m) = self.morph.as_mut() {
-            m.compaction = Some(crate::compact::Params::default());
+            let traits = self.cars.names.get(self.cars.active)
+                .and_then(|n| self.bot_categories.get(*n))
+                .map(|c| crate::chassis_traits::Traits::from_category(c))
+                .unwrap_or_default();
+            m.compaction = Some(traits.compaction());
         }
         if self.morph.is_none() {
             // a strip whose poses disagree cannot be blended; stepping it is
