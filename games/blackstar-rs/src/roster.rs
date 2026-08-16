@@ -167,6 +167,34 @@ pub fn load_tiers(bots_dir: &std::path::Path) -> std::collections::HashMap<Strin
     out
 }
 
+/// Read chassis CATEGORIES out of `assets/bots/fleet.json`.
+///
+/// Same two-field scan as `load_tiers`, on `name` and `category`. Separate
+/// function rather than one that returns both, because the two are wanted in
+/// different places — the selector needs tiers, the loader needs categories —
+/// and a caller that takes a pair it half-uses invites the other half going
+/// stale.
+pub fn load_categories(bots_dir: &std::path::Path)
+    -> std::collections::HashMap<String, String>
+{
+    let mut out = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(bots_dir.join("fleet.json")) else {
+        return out;
+    };
+    let mut name: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim().trim_end_matches(',');
+        if let Some(v) = field(line, "\"name\"") {
+            name = Some(v);
+        } else if let Some(v) = field(line, "\"category\"") {
+            if let Some(n) = name.take() {
+                out.insert(n, v);
+            }
+        }
+    }
+    out
+}
+
 /// `"key": "value"` -> value, for the one shape fleet.json uses.
 fn field(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(key)?.trim_start().strip_prefix(':')?.trim();

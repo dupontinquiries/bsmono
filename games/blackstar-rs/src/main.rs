@@ -12,6 +12,7 @@ mod bots;
 mod roster;
 mod sections;
 mod camera;
+mod chassis_traits;
 mod chord;
 mod clinch;
 mod combine;
@@ -1343,6 +1344,8 @@ fn main() {
         // happens ONCE here rather than inside roster::fit — the selector is
         // pure so it can be tested without a filesystem.
         let tiers = roster::load_tiers(&bots_dir);
+        // Categories seed the trait vector; see chassis_traits.rs.
+        let tiers_cat = roster::load_categories(&bots_dir);
         let inventory: Vec<roster::Chassis> = bots.iter().map(|name| {
             let n = std::fs::read_dir(bots_dir.join(name))
                 .into_iter().flatten().flatten()
@@ -1381,7 +1384,17 @@ fn main() {
                 eprintln!("bots: {bot} has {} pose(s), need 2+ — skipped", poses.len());
                 continue;
             }
-            let flight = bot.starts_with("jet_");
+            // FLIGHT COMES FROM THE TRAIT VECTOR, not the filename.
+            //
+            // `jet_` still counts, because it is how the 48 hand-made bots were
+            // marked and nothing else records their type. But a fleet chassis
+            // gets its traits from fleet.json's category, so a `flyer` flies
+            // whether or not somebody remembered the prefix — and a hovertank
+            // can be armoured AND supported, which no prefix could say.
+            let traits = tiers_cat.get(&bot)
+                .map(|c| crate::chassis_traits::Traits::from_category(c))
+                .unwrap_or_else(crate::chassis_traits::Traits::default);
+            let flight = traits.flies() || bot.starts_with("jet_");
             let label = bot.trim_start_matches("jet_").to_string();
             let cid = cars.chassis.len();
             let mut strip = Vec::new();
