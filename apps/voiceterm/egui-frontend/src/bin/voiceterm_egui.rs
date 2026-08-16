@@ -28,6 +28,88 @@ use voiceterm_egui::App;
 enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models }
 
 impl VoicetermApp {
+    /// Feed PTY bytes to the screen.
+    ///
+    /// term_grid deliberately takes SEMANTIC operations — print, newline, sgr —
+    /// and leaves escape parsing to the caller, so it can be tested without a
+    /// terminal. This is the smallest parser that keeps that contract honest:
+    /// the printable characters, the four C0 controls that move the cursor, and
+    /// CSI sequences for the cases a shell prompt actually emits.
+    ///
+    /// Unknown escapes are SWALLOWED, not printed. A terminal that renders the
+    /// bytes of a sequence it does not understand fills the screen with
+    /// `[?2004h` — which looks like the shell is broken rather than the
+    /// emulator being incomplete.
+    fn feed_pty(&mut self, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let mut it = text.chars().peekable();
+        while let Some(c) = it.next() {
+            match c {
+                '\x1b' => {
+                    if it.peek() == Some(&'[') {
+                        it.next();
+                        let mut params = String::new();
+                        let mut final_byte = None;
+                        for c2 in it.by_ref() {
+                            if c2.is_ascii_alphabetic() {
+                                final_byte = Some(c2);
+                                break;
+                            }
+                            params.push(c2);
+                        }
+                        let n = |d: usize| params.split(';').next()
+                            .and_then(|x| x.parse::<usize>().ok()).unwrap_or(d);
+                        match final_byte {
+                            Some('H') => {
+                                // 1-based on the wire, 0-based in the grid.
+                                let mut p = params.split(';');
+                                let row = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
+                                let col = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
+                                self.grid.move_to(col.saturating_sub(1), row.saturating_sub(1));
+                            }
+                            Some('J') => self.grid.clear(),
+                            Some('K') => self.grid.erase_to_eol(),
+                            Some('m') => {
+                                for part in params.split(';') {
+                                    if let Ok(v) = part.parse::<u16>() { self.grid.sgr(v); }
+                                }
+                                if params.is_empty() { self.grid.sgr(0); }
+                            }
+                            // Cursor moves. Clamped by the grid, not here.
+                            Some('A') | Some('B') | Some('C') | Some('D') => {
+                                let (x, y) = self.grid.cursor();
+                                let d = n(1);
+                                let (nx, ny) = match final_byte {
+                                    Some('A') => (x, y.saturating_sub(d)),
+                                    Some('B') => (x, y + d),
+                                    Some('C') => (x + d, y),
+                                    _ => (x.saturating_sub(d), y),
+                                };
+                                self.grid.move_to(nx, ny);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A bare ESC or an unrecognised introducer: dropped.
+                }
+                '\r' => self.grid.carriage_return(),
+                '\n' => self.grid.newline(),
+                '\t' => {
+                    // Next 8-column stop. Printing spaces rather than moving,
+                    // so erase_to_eol still clears what a tab covered.
+                    let (x, _) = self.grid.cursor();
+                    for _ in 0..(8 - (x % 8)) { self.grid.print(' '); }
+                }
+                '\x08' => {
+                    let (x, y) = self.grid.cursor();
+                    self.grid.move_to(x.saturating_sub(1), y);
+                }
+                c if (c as u32) < 0x20 => {}   // other C0: ignored, not drawn
+                c => self.grid.print(c),
+            }
+        }
+    }
+
     /// The connections graph over what this app actually holds.
     ///
     /// Bookmarks become Pages and mail threads become ChatThreads, because
@@ -292,6 +374,15 @@ struct VoicetermApp {
     model_budget_gib: f32,
     /// Token events, for the accounting readout.
     tokens: Vec<voiceterm_egui::token_log::TokenEvent>,
+    /// The terminal screen the PTY's output paints onto.
+    ///
+    /// The app has always had pty_out — bytes going TO the shell — and no
+    /// return path, so nothing rendered what came back. uikit_term::blocks
+    /// models a command/output LOG, which is a different thing: it cannot show
+    /// a cursor, a redraw, or anything that repaints in place.
+    grid: voiceterm_egui::term_grid::TermGrid,
+    /// How much of `pty_out` has already been echoed to the screen.
+    pty_echoed: usize,
     colors: PaletteColors,
     /// The toolbar gesture menus (QML `_pipePopup` / `_bracePopup`): press-drag-release on the
     /// `|⋯` / `{⋯}` chips at the left of the keycap bar.
@@ -1090,12 +1181,48 @@ impl eframe::App for VoicetermApp {
             let submitted = if chorded { None } else { self.app.handle_input(ui) };
             let key_bytes = self.app.take_pending_bytes();
             self.pty_out.extend_from_slice(&key_bytes);
+            // THE SCREEN. Drawn only when there is something on it, so a fresh
+            // session shows the block log rather than 24 blank rows.
+            if self.grid.is_dirty() || self.grid.cursor() != (0, 0) {
+                let (cx, cy) = self.grid.cursor();
+                egui::Frame::NONE.show(ui, |ui| {
+                    for y in 0..24 {
+                        let row = self.grid.row_text(y);
+                        if row.trim().is_empty() && y > cy { continue; }
+                        // The cursor row is marked rather than drawn as a
+                        // block: this is a monospace label, not a canvas, and a
+                        // fake caret that sits in the wrong column is worse
+                        // than none.
+                        let txt = if y == cy { format!("{row}  <{cx}") } else { row };
+                        ui.label(egui::RichText::new(txt).monospace().small());
+                    }
+                });
+                self.grid.take_dirty();
+            }
             if let Some(line) = submitted {
                 // A submitted line goes to the same place, newline included: a
                 // PTY does not distinguish "the user typed a command" from "the
                 // user typed bytes", and having two paths is how they drift.
                 self.pty_out.extend_from_slice(line.as_bytes());
                 self.pty_out.push(b'\r');
+            }
+            // LOCAL ECHO INTO THE SCREEN, since there is no PTY here.
+            //
+            // The grid is fed from what was SENT rather than from a reply,
+            // which is exactly what a terminal does before the shell answers —
+            // and it is honest: no output is invented, only the keystrokes that
+            // really left. A host that attaches a real PTY calls feed_pty with
+            // what comes back and this line becomes redundant rather than
+            // wrong.
+            //
+            // ONLY THE NEW BYTES. pty_out is a buffer a host drains, not a
+            // queue this consumes, so it still holds everything sent — feeding
+            // all of it each frame would reprint the whole session sixty times
+            // a second. The high-water mark is what makes this idempotent.
+            if self.pty_out.len() > self.pty_echoed {
+                let fresh = self.pty_out[self.pty_echoed..].to_vec();
+                self.feed_pty(&fresh);
+                self.pty_echoed = self.pty_out.len();
             }
             // The demo has no PTY to write to. Rather than dropping the bytes
             // again, they are kept on the app where a host can drain them, and
@@ -1104,6 +1231,10 @@ impl eframe::App for VoicetermApp {
             if self.pty_out.len() > PTY_OUT_CAP {
                 let drop = self.pty_out.len() - PTY_OUT_CAP;
                 self.pty_out.drain(..drop);
+                // The cap drains from the FRONT, so the mark has to move with
+                // it or the next frame re-echoes everything the drain shifted
+                // down. Saturating because a large drain can pass the mark.
+                self.pty_echoed = self.pty_echoed.saturating_sub(drop);
             }
             let area = ui.available_rect_before_wrap();
             let colors = self.colors; // PaletteColors is Copy — keeps the borrows below simple
@@ -1409,6 +1540,10 @@ fn main() -> eframe::Result<()> {
                 model_params_b: 7.0,
                 model_budget_gib: 4.0,
                 tokens: Vec::new(),
+                // 80x24 until a resize: the classic default, and every program
+                // that queries COLUMNS gets a plausible answer rather than 0.
+                grid: voiceterm_egui::term_grid::TermGrid::new(80, 24),
+                pty_echoed: 0,
                 colors,
                 pipe_menu: pipe_slide_menu("voiceterm-pipe-menu"),
                 // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
