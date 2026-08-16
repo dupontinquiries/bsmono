@@ -21,16 +21,16 @@ CFLAGS  =$(FLAGS)
 CFLAGS +=-std=c99 -O2
 
 # -- Windows -- #
-ifeq ($(OS),Windows_NT)
-CC    =x86_64-w64-mingw32-gcc
-FLAGS   =-Wl,-Bstatic -g -lm -static -static-libgcc -static-libstdc++ -lstdc++ \
--Llib/win -lopengl32 -lmingw32 -Wl,-Bdynamic -lSDL2main -lSDL2 -I. $(IDIRS)
-FLAGS  +=-Llib/win/dll
+# -- Windows: removed --
 #
-CFLAGS  =$(FLAGS)
-CFLAGS +=-std=c99 -DAL_LIBTYPE_STATIC
-BNAME   =game.exe
-endif
+# The mingw cross-compile and its 17 MB of prebuilt SDL2 under lib/win are gone.
+# This targets Linux, with macOS as a bonus; both link SDL2 from the system
+# rather than from a vendored archive, so neither needed lib/win and nothing
+# outside this branch referenced it.
+#
+# Restoring it means: this branch back, `-Llib/win -lSDL2main -lSDL2`, an
+# x86_64-w64-mingw32 toolchain, and SDL2's own mingw development release —
+# which is a download, not something that has to live in this repo's history.
 
 # -- MacOS -- #
 UNAME   = $(shell uname -s)
@@ -149,9 +149,6 @@ files:
 	cp licence/* $(BDIR)/licence/
 	(cd $(EDATA); zip -ur ../build/data.ex $(DATA) || true)
 	(zip -ur build/data.ex $(DATA) || true)
-ifeq ($(OS),Windows_NT)
-	cp lib/win/dll/*.dll $(BDIR)/
-endif
 
 release-linux:
 	mkdir -p $(BDIR)/lib
