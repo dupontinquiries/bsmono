@@ -454,6 +454,23 @@ struct VoicetermApp {
     mail_messages: Vec<voiceterm_egui::mail_view::Message>,
     /// The open message id on the Mail view, if any.
     mail_open: Option<String>,
+    /// The command audit chain: every submitted line hashed into a tamper-
+    /// evident sequence. Held on the app because the chain's whole value is
+    /// continuity — a per-frame chain would verify nothing.
+    audit: voiceterm_egui::audit_chain::Chain,
+    /// The rendered audit records, newest last, shown on the Docs tab.
+    audit_lines: Vec<String>,
+    /// True while the foreground looks like it is asking for a secret.
+    /// Suppresses echo AND keeps the line out of the audit log.
+    password_mode: bool,
+    /// Promotion thresholds for the acoustic cache — the runtime knobs the
+    /// original exposes, here on the Docs tab beside the corpus tape that
+    /// feeds it.
+    acoustic: voiceterm_egui::acoustic_cache::Thresholds,
+    /// The distance of the nearest fingerprint, as a what-if for the sliders.
+    acoustic_distance: f32,
+    acoustic_confirms: u32,
+    acoustic_same_speaker: bool,
     bar_state: voiceterm_egui::bars::BarState,
     /// The graph's SOURCE, not a prebuilt topology.
     ///
@@ -1181,6 +1198,66 @@ impl eframe::App for VoicetermApp {
                         if !self.tape_note.is_empty() {
                             ui.colored_label(c.text_weak, &self.tape_note);
                         }
+                        // WHAT THE CORPUS IS FOR: the promotion policy the
+                        // tape's recordings feed. Shown here rather than
+                        // buried in settings because the tape's doc names
+                        // this as its consumer — a bad recording becomes a
+                        // bad fingerprint becomes wrongly promoted text.
+                        ui.collapsing("acoustic promotion", |ui| {
+                            use voiceterm_egui::acoustic_cache as ac;
+                            let (mut same, mut cross) = (self.acoustic.for_match(true),
+                                                         self.acoustic.for_match(false));
+                            ui.horizontal(|ui| {
+                                ui.label("same-speaker max distance");
+                                if ui.add(egui::Slider::new(&mut same, 0.0..=1.0)).changed() {
+                                    self.acoustic = ac::Thresholds::set(same, cross);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("cross-speaker max distance");
+                                if ui.add(egui::Slider::new(&mut cross, 0.0..=1.0)).changed() {
+                                    self.acoustic = ac::Thresholds::set(same, cross);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("nearest match");
+                                ui.add(egui::Slider::new(&mut self.acoustic_distance, 0.0..=1.0));
+                                ui.add(egui::DragValue::new(&mut self.acoustic_confirms)
+                                       .prefix("confirms "));
+                                ui.checkbox(&mut self.acoustic_same_speaker, "same speaker");
+                            });
+                            let cand = ac::Candidate {
+                                transcript: "…".into(),
+                                distance: self.acoustic_distance,
+                                same_speaker: self.acoustic_same_speaker,
+                                confirms: self.acoustic_confirms,
+                            };
+                            // The VERDICT, not a boolean: TooFar, Unconfirmed
+                            // and Disabled are three different reasons a
+                            // transcript was not reused, and collapsing them
+                            // is how a tuning session becomes guesswork.
+                            let v = ac::decide(Some(&cand), &self.acoustic);
+                            let col = if v == ac::Verdict::Promote { c.success } else { c.text_weak };
+                            ui.colored_label(col, format!("{v:?}"));
+                        });
+                        // THE AUDIT CHAIN. Every command hashed into the
+                        // previous one's hash, so an edited history fails
+                        // verification at the record that was changed.
+                        ui.collapsing(format!("command audit ({})", self.audit.len()), |ui| {
+                            if self.audit_lines.is_empty() {
+                                ui.colored_label(c.text_weak,
+                                    "no commands recorded yet (password prompts are never recorded)");
+                            }
+                            egui::ScrollArea::vertical().id_salt("audit").max_height(160.0)
+                                .stick_to_bottom(true).show(ui, |ui| {
+                                for line in &self.audit_lines {
+                                    ui.label(egui::RichText::new(line).monospace().size(10.0));
+                                }
+                            });
+                            ui.colored_label(c.text_weak,
+                                format!("chain tip {}", &self.audit.tail()
+                                        .chars().take(16).collect::<String>()));
+                        });
                         ui.separator();
                         if let Some(name) = voiceterm_egui::manpage_view::manpage_ui(
                             ui, &mut self.docs, &c)
@@ -1429,6 +1506,25 @@ impl eframe::App for VoicetermApp {
             }
             // A chord consumed the frame's keys; letting handle_input run too
             // would encode the same keystroke into the PTY behind the action.
+            // IS THE SHELL ASKING FOR A SECRET? Checked before the line is
+            // read, because the answer changes what happens to it: a password
+            // is not echoed into the block log and never enters the audit
+            // chain. The visible text is the last grid row; there is no PTY
+            // here to name a foreground process, so the heuristic runs on the
+            // prompt text alone — which is the case the module was written for
+            // (`foreground` is None rather than guessed).
+            self.password_mode = voiceterm_egui::password_prompt::is_password_prompt(
+                &voiceterm_egui::password_prompt::TermState {
+                    alt_screen: false,
+                    foreground: None,
+                    visible: Some(&self.grid.row_text(self.grid.cursor().1)),
+                });
+            if self.password_mode {
+                // SAID OUT LOUD. A terminal that silently stops echoing looks
+                // broken; one that says why looks careful — and this is also
+                // the only signal that the line will not be audited.
+                ui.colored_label(self.colors.warning, "password prompt — input hidden, not recorded");
+            }
             let submitted = if chorded { None } else { self.app.handle_input(ui) };
             let key_bytes = self.app.take_pending_bytes();
             self.pty_out.extend_from_slice(&key_bytes);
@@ -1470,6 +1566,26 @@ impl eframe::App for VoicetermApp {
                 });
             }
             if let Some(line) = submitted {
+                // AUDIT, before the bytes leave. Every command joins the hash
+                // chain — except one typed at a password prompt, which is the
+                // one line that must not be recorded anywhere. Skipping the
+                // append (rather than logging a redacted placeholder) keeps
+                // the chain's meaning exact: it records commands, and that
+                // was not one.
+                if !self.password_mode && !line.trim().is_empty() {
+                    let e = self.audit.append(voiceterm_egui::audit_chain::Entry {
+                        ts_ms: (ui.input(|i| i.time) * 1000.0) as u64,
+                        command: line.clone(),
+                        speaker: None,
+                        prev_hash: String::new(),
+                    });
+                    self.audit_lines.push(e.render());
+                    const AUDIT_CAP: usize = 2000;
+                    if self.audit_lines.len() > AUDIT_CAP {
+                        let cut = self.audit_lines.len() - AUDIT_CAP;
+                        self.audit_lines.drain(..cut);
+                    }
+                }
                 // A submitted line goes to the same place, newline included: a
                 // PTY does not distinguish "the user typed a command" from "the
                 // user typed bytes", and having two paths is how they drift.
@@ -1845,6 +1961,13 @@ fn main() -> eframe::Result<()> {
                 archive: Default::default(),
                 mail_messages: Vec::new(),
                 mail_open: None,
+                audit: Default::default(),
+                audit_lines: Vec::new(),
+                password_mode: false,
+                acoustic: Default::default(),
+                acoustic_distance: 0.20,
+                acoustic_confirms: 2,
+                acoustic_same_speaker: true,
                 bar_state: Default::default(),
                 graph_source: String::new(),
                 settings_open: false,
