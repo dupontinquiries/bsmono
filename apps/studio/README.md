@@ -154,7 +154,20 @@ lose their concurrent ops; the seen-set makes over-fetching free. The
 flagship now runs over 127.0.0.1: A bounces, and B — connected only by
 TCP — renders A's kick, holds A's groove, and the projects converge. One
 peer, no reconnect, no discovery, no encryption: stated in the module docs;
-the dht network half stays the named future. Also still named: streaming
+the dht network half stays the named future. **Beats survive restarts.** The collab file format grew a fourth,
+MANDATORY rack section (length 0 = no rack; a file cut at the boundary
+refuses like any other prefix — the tempting "tolerate a missing tail"
+reading was a truncation hole the damaged-file test's every-prefix sweep
+caught, since a truncated file loaded rack-less would overwrite a complete
+original on the next save). `Studio::save_to`/`load_from` write and open
+whole sessions: project, history, rack; media stays as path references
+resolved RELATIVE TO THE FILE, so a project folder moves as a unit, and
+reloaded sources arrive through `incoming_audio` — the same door peer
+media uses. A missing sample is counted out loud and its clip stays
+silent; garbage refuses to open rather than becoming an empty project.
+The shell opens `STUDIO_PROJECT` (default `./project.studio`) at startup
+— a load FAILURE starts a demo but warns that Ctrl+S will overwrite —
+and saves on Ctrl+S or the save button. Also still named: streaming
 pattern playback inside `DeviceEngine`'s realtime render, and the Program
 panel, which says so on screen instead of showing nothing.
 

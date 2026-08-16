@@ -175,6 +175,72 @@ impl Studio {
         Ok(inverse)
     }
 
+    /// Write the whole session — project, edit history, rack — to `path`
+    /// in the collab file format. Media is NOT embedded: sources keep their
+    /// paths (the compressed originals and the bounce WAVs already on
+    /// disk), which is what keeps a project file kilobytes while its
+    /// samples stay wherever the library lives.
+    pub fn save_to(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let file = studio_collab::file::SaveFile::from_project(
+            &self.session.doc.project,
+            self.session.doc.history().to_vec(),
+            Some(self.rack.clone()),
+        );
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
+        }
+        std::fs::write(path, file.encode()).map_err(|e| format!("write {path:?}: {e}"))?;
+        self.status = format!("saved {}", path.display());
+        Ok(())
+    }
+
+    /// Open a saved session. A constructor rather than a mutation: loading
+    /// replaces everything, and a half-replaced Studio is worse than none.
+    ///
+    /// Source media is re-decoded from the paths the file references,
+    /// resolved RELATIVE TO THE FILE — a project folder that moves as a
+    /// unit keeps working — and delivered through `incoming_audio`, the
+    /// same door peer media uses, so the shell drains one queue no matter
+    /// where sound comes from. Missing or undecodable files are counted in
+    /// the status and their clips stay silent: a beat with one lost sample
+    /// still opens.
+    pub fn load_from(path: &std::path::Path, site: SiteId, team: Team)
+        -> Result<Studio, String>
+    {
+        let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
+        let file = studio_collab::file::SaveFile::decode(&bytes)
+            .ok_or_else(|| format!("{} is not a studio file (or is damaged)", path.display()))?;
+        let mut s = Studio::new(file.to_project(), site, team);
+        if let Some(rack) = file.rack {
+            s.rack = rack;
+        }
+        let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let sources: Vec<_> = s.session.doc.project.sources.values().cloned().collect();
+        let mut missing = 0usize;
+        for src in sources {
+            let p = base.join(&src.path);
+            let Ok(raw) = std::fs::read(&p) else { missing += 1; continue };
+            let hint = p.extension().and_then(|e| e.to_str());
+            match studio_media::decode_bytes(raw.clone(), hint) {
+                Ok(audio) => {
+                    s.incoming_audio.push((src.id, audio));
+                    s.register_asset(src.id, &raw);
+                }
+                Err(_) => missing += 1,
+            }
+        }
+        s.outbox.clear(); // registration is local state, not news for peers yet
+        s.loop_dirty = true;
+        s.arrangement_dirty = true;
+        s.status = if missing == 0 {
+            format!("opened {}", path.display())
+        } else {
+            format!("opened {} — {missing} source file(s) missing or undecodable",
+                    path.display())
+        };
+        Ok(s)
+    }
+
     /// Everything local since the last drain, for any carrier to ship.
     pub fn drain_outbox(&mut self) -> Vec<studio_collab::wire::Packet> {
         std::mem::take(&mut self.outbox)
@@ -755,6 +821,8 @@ pub struct App {
     /// the same predictable-beats-configurable trade the export path makes,
     /// and this shell's whole collab stack works identically without it.
     carrier: Option<studio_collab::stream::StreamPeer>,
+    /// Where Ctrl+S writes: STUDIO_PROJECT if set, else ./project.studio.
+    project_path: std::path::PathBuf,
     /// What the sink's buffer currently holds, so a mode switch (loop ↔
     /// arrangement) knows to reload even when nothing is dirty.
     loaded: SinkContent,
@@ -767,8 +835,27 @@ enum SinkContent { Nothing, RackLoop, Arrangement }
 impl Default for App {
     fn default() -> Self {
         let sink = audition::open_sink();
-        let mut studio = Studio::demo();
-        studio.status = format!("ready — audition: {}", sink.describe());
+        let project_path = std::env::var("STUDIO_PROJECT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "project.studio".into());
+        // Open the named project when it exists; a demo otherwise. A load
+        // FAILURE is neither: overwriting a damaged-but-real file with a
+        // demo on the next Ctrl+S would finish what the damage started, so
+        // the shell starts demo'd but says exactly why.
+        let mut load_note = None;
+        let mut studio = if project_path.exists() {
+            match Studio::load_from(&project_path, SiteId(1),
+                                    Team::from_contacts("solo", &["sc-local".into()])) {
+                Ok(s) => s,
+                Err(e) => { load_note = Some(e); Studio::demo() }
+            }
+        } else {
+            Studio::demo()
+        };
+        studio.status = match load_note {
+            Some(e) => format!("{e} — started fresh (Ctrl+S will overwrite!)"),
+            None => format!("{} — audition: {}", studio.status, sink.describe()),
+        };
         let carrier = if let Ok(addr) = std::env::var("STUDIO_LISTEN") {
             match studio_collab::stream::StreamPeer::listen(&addr) {
                 Ok(p) => {
@@ -787,7 +874,7 @@ impl Default for App {
             None
         };
         App { studio, peaks: Default::default(), audio: Default::default(), sink,
-              carrier, loaded: SinkContent::Nothing }
+              carrier, project_path, loaded: SinkContent::Nothing }
     }
 }
 
@@ -825,6 +912,12 @@ impl eframe::App for App {
                 // status line prints the exact path. No dialog on purpose:
                 // predictable beats configurable for the ship-a-beat loop,
                 // and a picker can arrive later without moving this seam.
+                if ui.button("save").clicked()
+                    || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
+                {
+                    let path = self.project_path.clone();
+                    let _ = self.studio.save_to(&path);
+                }
                 if ui.button("export wav").clicked() {
                     let _ = self.studio.export_arrangement(
                         &self.audio, std::path::Path::new("exports"), ExportFormat::Wav);
@@ -1745,5 +1838,80 @@ mod tcp_carrier_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("projects never converged over the socket");
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn a_beat_survives_a_restart() {
+        // The whole feature in one arc: program, bounce, mix, save; then a
+        // FRESH Studio opens the file and holds the same project, the same
+        // groove, and — because the bounce's WAV sits next to the project —
+        // the same audible kick.
+        let dir = std::env::temp_dir().join(format!("studio-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = Studio::demo();
+        a.rack.patterns[0].toggle(2, 9);
+        a.rack.swing = 0.17;
+        let (id, audio) = a.bounce_current_pattern(48_000, &Default::default()).expect("bounced");
+        let track = a.session.doc.project.tracks.iter()
+            .find(|t| t.kind == studio_core::TrackKind::Audio).unwrap().id;
+        a.edit(studio_core::Op::SetTrackGain { id: track, gain: 0.8 }, "gain");
+        // Write the bounce's WAV where its op's path says, relative to the
+        // project — the same layout the shell produces.
+        let src_path = a.session.doc.project.sources.get(&id).unwrap().path.clone();
+        let wav = studio_audio::export::export_wav_dithered_bytes(
+            &audio.channels[0], 1, 48_000, id.0).unwrap();
+        let disk = dir.join(&src_path);
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        std::fs::write(&disk, &wav).unwrap();
+
+        let file = dir.join("beat.studio");
+        a.save_to(&file).expect("saves");
+        assert!(a.status.contains("saved"));
+
+        let mut b = Studio::load_from(&file, SiteId(1),
+            Team::from_contacts("solo", &["sc-local".into()])).expect("opens");
+        assert_eq!(b.session.doc.project, a.session.doc.project, "the arrangement survived");
+        assert_eq!(b.rack, a.rack, "the groove survived");
+        let arrived: std::collections::BTreeMap<_, _> =
+            std::mem::take(&mut b.incoming_audio).into_iter().collect();
+        assert!(arrived.contains_key(&id), "the bounce's media reloaded from disk");
+        let out = b.render_arrangement(48_000, &arrived);
+        let head: f32 = out[..9600].iter().map(|v| v.abs()).sum();
+        assert!(head > 4.0, "and it is audible after the restart ({head})");
+        // The demo project's placeholder "demo.wav" never existed on disk;
+        // exactly ONE missing source is therefore the correct report — the
+        // bounce (asserted arrived above) is not it.
+        assert!(b.status.contains("1 source file(s) missing"),
+                "status was {:?}", b.status);
+    }
+
+    #[test]
+    fn a_project_with_a_lost_sample_opens_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("studio-lost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = Studio::demo();
+        a.bounce_current_pattern(48_000, &Default::default()).expect("bounced");
+        // Deliberately do NOT write the bounce's WAV.
+        let file = dir.join("beat.studio");
+        a.save_to(&file).expect("saves");
+        let b = Studio::load_from(&file, SiteId(1),
+            Team::from_contacts("solo", &["sc-local".into()])).expect("still opens");
+        assert!(b.status.contains("missing"), "the loss is named: {:?}", b.status);
+    }
+
+    #[test]
+    fn garbage_refuses_to_open_rather_than_becoming_an_empty_project() {
+        let dir = std::env::temp_dir().join(format!("studio-garbage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-project.studio");
+        std::fs::write(&file, b"three chords and the truth").unwrap();
+        let err = Studio::load_from(&file, SiteId(1),
+            Team::from_contacts("solo", &["sc-local".into()]));
+        assert!(err.is_err(), "quietly loading empty over someone's work loses it");
     }
 }
