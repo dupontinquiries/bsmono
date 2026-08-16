@@ -438,3 +438,38 @@ delta-coding an integer array.
 **The honest ranking**: indices (~70 MB, lossless, mechanical), then welding
 (~14% of the float half, lossless), then nothing. Both are arithmetic, both are
 verifiable byte-for-byte, and neither risks the silhouette.
+
+## Vertex welding: 1.9%, not 14% — and not worth doing
+
+The earlier note said 14% of vertices are exact positional duplicates and
+welding is legal because these meshes are POSITION-only. Both halves are true
+and the conclusion was still wrong, because I measured duplicates **in one
+pose**.
+
+A weld has to hold in EVERY pose. `xform::Morph` lerps vertex *i* of pose *k*
+toward vertex *i* of pose *k+1*, so the poses must agree on what vertex *i* is.
+Merge two vertices that are coincident in the vehicle pose but separate during
+the fold, and the robot pose loses a vertex it needed — the surface tears
+exactly where the fold does the most work.
+
+Measured on `constructor_heavy_spider_animated`, prim 1: **776 duplicate groups
+in f00, and 716 of them split apart by f04.** Across four chassis and 93,935
+vertices:
+
+```
+duplicates in pose 0 alone : 12,989   13.8%   <- the misleading number
+weldable across ALL poses  :  1,774    1.9%
+```
+
+92% of the apparent duplicates are vertices that only *happen* to coincide when
+the vehicle is folded up — panels touching, wheels tucked into arches. They are
+distinct vertices doing distinct things and the fold proves it.
+
+**Worth ~1.6 MB** of the 86 MB float half, and it would renumber every index —
+disturbing the delta stream that v3 just used to save 78 MB, since delta
+compression depends on indices staying in a locality-preserving order. A
+renumber optimised for vertex reuse is not the same order.
+
+So: not done, and the reason generalises. **A property measured on one pose of a
+morph target is not a property of the morph target.** The same mistake would
+have been made by any tool that inspects a single glTF, which is most of them.
