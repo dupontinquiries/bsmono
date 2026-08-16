@@ -53,6 +53,12 @@ pub struct HatchUi {
     /// Bumping this resalts the ScrollArea, which resets its offset — the
     /// "re-opened launchers start at the top" rule.
     scroll_gen: u64,
+    /// Decoded icons by entry id; `None` records a resolve/decode failure so
+    /// a missing icon isn't retried every frame. Bounded in practice by the
+    /// number of installed apps whose tiles have been on screen — ~200 apps
+    /// at 128px RGBA is roughly 13 MB of GPU textures, which is acceptable
+    /// for a resident launcher and is the price of instant re-summon.
+    /// Cleared wholesale when the scan changes; see `on_shown`.
     icon_cache: HashMap<String, Option<egui::TextureHandle>>,
     // Long-press bookkeeping (egui has clicks and drags, not holds).
     press: Option<PressTrack>,
@@ -114,6 +120,14 @@ impl HatchUi {
     pub fn on_shown(&mut self) {
         self.query.clear();
         self.core.set_query("");
+        // Summoning is the moment to notice apps installed while hidden. The
+        // icon cache is keyed by entry id, so a changed entry set can leave
+        // it holding textures for apps that no longer exist (and, worse,
+        // stale art for an app whose icon the update replaced) — drop it and
+        // let the per-frame decode budget refill it.
+        if self.core.refresh_if_changed() {
+            self.icon_cache.clear();
+        }
         // A re-summoned launcher is the natural moment for favorites toggled
         // last time to take their new places.
         self.core.resettle();

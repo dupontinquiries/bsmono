@@ -78,6 +78,20 @@ fn main() {
             .unwrap_or_else(|| "UNRESOLVED".into());
         println!("  {:<9} {:?} → {icon}", a.id, a.argv);
     }
+
+    if args.iter().any(|a| a == "--watch") {
+        // Install or remove something in another terminal and watch this
+        // notice. Same call the running launcher makes when summoned, so if
+        // a new app doesn't appear on the phone, this says whether the
+        // detection or the scan is at fault.
+        println!("\nwatching application dirs (ctrl-c to stop)");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if l.refresh_if_changed() {
+                println!("  changed → {} entries", l.result_count());
+            }
+        }
+    }
 }
 
 fn trunc(s: &str, n: usize) -> String {

@@ -13,6 +13,7 @@ pub mod icons;
 pub mod plasma;
 pub mod rank;
 pub mod store;
+pub mod watch;
 
 pub use entry::AppEntry;
 pub use store::Config;
@@ -82,6 +83,9 @@ pub(crate) mod testenv {
 pub struct Launcher {
     pub config: Config,
     entries: Vec<AppEntry>,
+    /// Snapshot of the application directories as of the last scan, so a
+    /// re-summoned launcher can notice an app installed while it was hidden.
+    watch: watch::DirWatch,
     favorites: Vec<String>,
     recents: Vec<(String, u64)>,
     query: String,
@@ -106,6 +110,7 @@ impl Launcher {
         let mut l = Launcher {
             config,
             entries,
+            watch: watch::DirWatch::new(&entry::application_dirs()),
             favorites: store::load_favorites(),
             recents: store::load_recents(),
             query: String::new(),
@@ -115,10 +120,28 @@ impl Launcher {
         l
     }
 
-    /// Re-scan installed applications (e.g. after an install notification).
+    /// Re-scan installed applications unconditionally.
     pub fn refresh(&mut self) {
-        self.entries = entry::scan(&entry::application_dirs());
+        let dirs = entry::application_dirs();
+        self.entries = entry::scan(&dirs);
+        let _ = self.watch.changed(&dirs); // resynchronise, don't re-report
         self.rerank();
+    }
+
+    /// Re-scan only if the application directories changed since the last
+    /// scan. Returns true if a scan happened — the caller's icon cache is
+    /// then stale and should be dropped.
+    ///
+    /// Called when the window is summoned: it is the one moment the user is
+    /// already waiting, and the one moment a stale grid is visible.
+    pub fn refresh_if_changed(&mut self) -> bool {
+        let dirs = entry::application_dirs();
+        if !self.watch.changed(&dirs) {
+            return false;
+        }
+        self.entries = entry::scan(&dirs);
+        self.rerank();
+        true
     }
 
     pub fn query(&self) -> &str {
@@ -318,6 +341,40 @@ mod tests {
         // Camera was already first alphabetically; launch Firefox to see a move.
         l.activate("firefox").unwrap();
         assert_eq!(l.result_at(0).unwrap().name, "Firefox");
+    }
+
+    #[test]
+    fn a_summon_picks_up_an_app_installed_while_the_launcher_was_hidden() {
+        // The whole point of refresh_if_changed: hatch stays resident between
+        // summons, so without this an app installed at 10:00 is missing from
+        // the grid until the process restarts.
+        let guard = crate::testenv::scoped_config_home("refresh");
+        let apps = guard.path.join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("early.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Early\nExec=true\n",
+        )
+        .unwrap();
+        // application_dirs() reads XDG_DATA_HOME; point it at the same place.
+        std::env::set_var("XDG_DATA_HOME", &guard.path);
+        std::env::set_var("XDG_DATA_DIRS", guard.path.join("empty"));
+
+        let mut l = Launcher::new(Config::default());
+        assert_eq!(l.result_count(), 1);
+        assert!(!l.refresh_if_changed(), "nothing installed yet");
+
+        std::fs::write(
+            apps.join("late.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Late\nExec=true\n",
+        )
+        .unwrap();
+        assert!(l.refresh_if_changed(), "the install is noticed");
+        assert_eq!(l.result_count(), 2);
+        assert!(!l.refresh_if_changed(), "and only once");
+
+        std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("XDG_DATA_DIRS");
     }
 
     #[test]

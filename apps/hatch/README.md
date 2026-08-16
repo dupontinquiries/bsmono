@@ -52,6 +52,13 @@ cargo build --release            # bin: target/release/hatch-egui
 cargo test                       # core + shell logic, no display needed
 ```
 
+Because it stays resident, being summoned is also when it re-scans:
+`refresh_if_changed()` compares directory stamps and only re-scans (and
+drops the icon cache) if something was installed or removed while the
+window was hidden. `cargo run --example probe -- --watch` runs that same
+check in a loop, so if a newly installed app doesn't show up on the phone
+you can see whether detection or scanning is at fault.
+
 Launcher lifecycle: one instance; a second launch (or `hatch-egui
 --toggle`) pokes the running one to show/hide — bind a global shortcut to
 exactly that. Dismissal hides rather than quits so the next summon is
