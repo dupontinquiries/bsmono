@@ -240,8 +240,7 @@ that does nothing. MIDI clock is not parsed at all — syncing to an
 external clock means resampling against drifting wall time, which belongs
 with the streaming engine, not a 0xF8 match arm. Named, not built, from
 the same wishlist: clip-level chain editing,
-clip-level chain editing, surround/downmix formats (mixdown is stereo
-end-to-end today), 
+clip-level chain editing,  
  a playing
 mode for keys — now built, see below — Wooting analog input, and VST/CLAP
 hosting — studio-fx::retune is the native autotune seed; for external

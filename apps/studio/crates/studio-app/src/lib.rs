@@ -714,6 +714,7 @@ impl Studio {
         dir: &std::path::Path,
         format: ExportFormat,
         rate: u32,
+        layout: studio_audio::format::ChannelFormat,
     ) -> Result<std::path::PathBuf, String> {
         // Opus is a 48k codec by contract (studio-media refuses anything
         // else, loudly); WAV renders at whatever was asked — mixdown is
@@ -721,7 +722,17 @@ impl Studio {
         // resamples sources correctly at ANY render rate rather than only
         // happening to be right at 48k.
         let rate = match format { ExportFormat::Opus => 48_000, ExportFormat::Wav => rate };
-        let samples = self.render_arrangement(rate, sources);
+        // Opus's mapping family 0 is mono/stereo only (studio-media refuses
+        // wider, loudly), so a surround deliverable is a WAV — said here
+        // rather than discovered as a confusing encoder error.
+        let layout = match format {
+            ExportFormat::Opus => studio_audio::format::ChannelFormat::Stereo,
+            ExportFormat::Wav => layout,
+        };
+        let stereo = self.render_arrangement(rate, sources);
+        // The render is stereo (see studio_audio::format's scope note); the
+        // deliverable is whatever was asked for.
+        let samples = studio_audio::format::expand_from_stereo(&stereo, layout, rate);
         if samples.is_empty() {
             self.status = "export refused: the arrangement is empty".into();
             return Err(self.status.clone());
@@ -732,18 +743,27 @@ impl Studio {
             .collect();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        // The layout is in the NAME for anything but plain stereo: a folder
+        // of exports where the 5.1 and the 2.0 are told apart only by their
+        // byte size is a folder someone ships the wrong file from.
+        let suffix = if layout == studio_audio::format::ChannelFormat::Stereo {
+            String::new()
+        } else {
+            format!("-{}", layout.label())
+        };
         // Milliseconds, AND an exists check: second-granularity stamps let
         // two exports in one second silently overwrite each other — found
         // when the 48k and 96k test exports turned out to be one file.
-        let mut path = dir.join(format!("{name}-{stamp}.{}", format.ext()));
+        let mut path = dir.join(format!("{name}-{stamp}{suffix}.{}", format.ext()));
         let mut n = 1u32;
         while path.exists() {
-            path = dir.join(format!("{name}-{stamp}-{n}.{}", format.ext()));
+            path = dir.join(format!("{name}-{stamp}{suffix}-{n}.{}", format.ext()));
             n += 1;
         }
         match format {
             ExportFormat::Wav => {
-                studio_audio::export::export_wav_dithered(&samples, 2, rate, stamp, &path)
+                studio_audio::export::export_wav_dithered(
+                    &samples, layout.channels() as u16, rate, stamp, &path)
                     .map_err(|e| format!("wav write: {e}"))?;
             }
             ExportFormat::Opus => {
@@ -760,7 +780,7 @@ impl Studio {
                 std::fs::write(&path, bytes).map_err(|e| format!("write {path:?}: {e}"))?;
             }
         }
-        self.status = format!("exported {}", path.display());
+        self.status = format!("exported {} ({})", path.display(), layout.label());
         Ok(path)
     }
 
@@ -1041,6 +1061,7 @@ pub struct App {
     library: Vec<library::LibraryEntry>,
     library_open: bool,
     export_rate: u32,
+    export_layout: studio_audio::format::ChannelFormat,
     tune_root: u8,
     tune_mode: studio_fx::retune::Mode,
     /// Velocity source for playing mode. `NullAnalog` today; a Wooting
@@ -1109,6 +1130,7 @@ impl Default for App {
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
               export_rate: 48_000,
+              export_layout: studio_audio::format::ChannelFormat::Stereo,
               tune_root: 0, tune_mode: studio_fx::retune::Mode::Minor,
               analog: Box::new(analog),
               loaded: SinkContent::Nothing }
@@ -1219,16 +1241,25 @@ impl eframe::App for App {
                             ui.selectable_value(&mut self.export_rate, r, format!("{r} Hz"));
                         }
                     });
+                egui::ComboBox::from_id_salt("export-layout")
+                    .selected_text(self.export_layout.label())
+                    .width(64.0)
+                    .show_ui(ui, |ui| {
+                        for f in studio_audio::format::ChannelFormat::ALL {
+                            ui.selectable_value(&mut self.export_layout, f, f.label());
+                        }
+                    });
                 if ui.button("export wav").clicked() {
                     let _ = self.studio.export_arrangement(
                         &self.audio, std::path::Path::new("exports"),
-                        ExportFormat::Wav, self.export_rate);
+                        ExportFormat::Wav, self.export_rate, self.export_layout);
                 }
                 if ui.button("export opus").on_hover_text("always 48000 Hz — the codec's contract")
                     .clicked() {
                     let _ = self.studio.export_arrangement(
                         &self.audio, std::path::Path::new("exports"),
-                        ExportFormat::Opus, self.export_rate);
+                        ExportFormat::Opus, self.export_rate,
+                        studio_audio::format::ChannelFormat::Stereo);
                 }
             });
         });
@@ -1911,7 +1942,7 @@ mod export_tests {
         let expect_frames = s.render_arrangement(48_000, &sources).len() / 2;
 
         for fmt in [ExportFormat::Wav, ExportFormat::Opus] {
-            let path = s.export_arrangement(&sources, &dir, fmt, 48_000).expect("exports");
+            let path = s.export_arrangement(&sources, &dir, fmt, 48_000, studio_audio::format::ChannelFormat::Stereo).expect("exports");
             assert!(s.status.contains("exported"), "status names it: {:?}", s.status);
             let back = studio_media::decode_file(&path).expect("our decoder reads it");
             assert_eq!(back.channels.len(), 2, "{fmt:?} kept stereo");
@@ -1930,8 +1961,8 @@ mod export_tests {
         // check: opus at 128k must land well under half the 16-bit WAV.
         let (mut s, sources) = bounced_studio();
         let dir = std::env::temp_dir().join("studio-export-size");
-        let wav = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 48_000).unwrap();
-        let opus = s.export_arrangement(&sources, &dir, ExportFormat::Opus, 48_000).unwrap();
+        let wav = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 48_000, studio_audio::format::ChannelFormat::Stereo).unwrap();
+        let opus = s.export_arrangement(&sources, &dir, ExportFormat::Opus, 48_000, studio_audio::format::ChannelFormat::Stereo).unwrap();
         let (w, o) = (std::fs::metadata(&wav).unwrap().len(),
                       std::fs::metadata(&opus).unwrap().len());
         assert!(o * 2 < w, "opus {o} bytes vs wav {w} bytes");
@@ -1942,7 +1973,8 @@ mod export_tests {
         let p = Project { name: "empty".into(), ..Default::default() };
         let mut s = Studio::new(p, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]));
         let err = s.export_arrangement(&Default::default(),
-                                       &std::env::temp_dir(), ExportFormat::Wav, 48_000);
+                                       &std::env::temp_dir(), ExportFormat::Wav, 48_000,
+                                       studio_audio::format::ChannelFormat::Stereo);
         assert!(err.is_err());
         assert!(s.status.contains("refused"), "status was {:?}", s.status);
     }
@@ -2521,8 +2553,8 @@ mod export_rate_tests {
         let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
         sources.insert(id, audio);
         let dir = std::env::temp_dir().join("studio-export-rate");
-        let p48 = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 48_000).unwrap();
-        let p96 = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 96_000).unwrap();
+        let p48 = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 48_000, studio_audio::format::ChannelFormat::Stereo).unwrap();
+        let p96 = s.export_arrangement(&sources, &dir, ExportFormat::Wav, 96_000, studio_audio::format::ChannelFormat::Stereo).unwrap();
         let a = studio_media::decode_file(&p48).unwrap();
         let b = studio_media::decode_file(&p96).unwrap();
         assert_eq!(a.sample_rate, 48_000);
@@ -2860,5 +2892,66 @@ mod autotune_take_tests {
         assert!(s.autotune_selected(&Default::default(),
                                     Scale { root: 9, mode: Mode::Minor }).is_none());
         assert!(s.status.contains("not loaded"), "status was {:?}", s.status);
+    }
+}
+
+#[cfg(test)]
+mod surround_export_tests {
+    use super::*;
+    use studio_audio::format::ChannelFormat;
+
+    #[test]
+    fn a_five_one_export_is_six_real_channels_the_app_can_read_back() {
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let dir = std::env::temp_dir().join("studio-surround");
+        let path = s.export_arrangement(&sources, &dir, ExportFormat::Wav,
+                                        48_000, ChannelFormat::Surround51).expect("exports");
+        assert!(path.to_string_lossy().contains("5.1"),
+                "the layout is in the filename: {}", path.display());
+        let back = studio_media::decode_file(&path).expect("our decoder reads it");
+        assert_eq!(back.channels.len(), 6);
+        // The mains carry the music, the LFE carries bass, and the file is
+        // not just stereo padded with silence.
+        let e = |c: usize| back.channels[c].iter().map(|v| v.abs()).sum::<f32>();
+        assert!(e(0) > 1.0 && e(1) > 1.0, "mains are live");
+        assert!(e(2) > 0.0, "centre carries the correlated content");
+        assert!(e(3) > 0.0, "LFE carries the low end");
+    }
+
+    #[test]
+    fn opus_refuses_to_pretend_it_can_carry_surround() {
+        // Mapping family 0 is mono/stereo; an encoder error at the end of a
+        // long render is a worse way to learn that than a stereo file with
+        // a status line that says stereo.
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let dir = std::env::temp_dir().join("studio-surround-opus");
+        let path = s.export_arrangement(&sources, &dir, ExportFormat::Opus,
+                                        48_000, ChannelFormat::Surround51).expect("exports");
+        let back = studio_media::decode_file(&path).expect("decodes");
+        assert_eq!(back.channels.len(), 2);
+        assert!(s.status.contains("2.0"), "and it says so: {:?}", s.status);
+    }
+
+    #[test]
+    fn every_layout_writes_a_file_with_its_own_channel_count() {
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let dir = std::env::temp_dir().join("studio-layouts");
+        for layout in ChannelFormat::ALL {
+            if layout == ChannelFormat::Mono { continue } // expand has no mono target
+            let path = s.export_arrangement(&sources, &dir, ExportFormat::Wav,
+                                            48_000, layout).expect("exports");
+            let back = studio_media::decode_file(&path).expect("decodes");
+            assert_eq!(back.channels.len(), layout.channels(),
+                       "{layout} wrote {} channels", back.channels.len());
+        }
     }
 }
