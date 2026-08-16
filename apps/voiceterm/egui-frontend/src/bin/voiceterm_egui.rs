@@ -25,7 +25,7 @@ use voiceterm_egui::App;
 /// terminal first, and a switcher that made it a peer of the mail reader would
 /// be the wrong app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models, Chat }
+enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models, Chat, Notes, Build }
 
 impl VoicetermApp {
     /// Feed PTY bytes to the screen.
@@ -285,11 +285,12 @@ impl CentralView {
     // The array LENGTH is part of the type: adding a variant without widening
     // this is a compile error rather than a tab that silently never renders,
     // which is the failure mode a Vec here would have had.
-    const ALL: [CentralView; 9] = [CentralView::Terminal, CentralView::Mail,
+    const ALL: [CentralView; 11] = [CentralView::Terminal, CentralView::Mail,
                                    CentralView::Browser, CentralView::Graph,
                                    CentralView::Table, CentralView::Docs,
                                    CentralView::Archive, CentralView::Models,
-                                   CentralView::Chat];
+                                   CentralView::Chat, CentralView::Notes,
+                                   CentralView::Build];
     fn label(self) -> &'static str {
         match self {
             CentralView::Terminal => "Terminal", CentralView::Mail => "Mail",
@@ -298,6 +299,8 @@ impl CentralView {
             CentralView::Archive => "Archive",
             CentralView::Models => "Models",
             CentralView::Chat => "Chat",
+            CentralView::Notes => "Notes",
+            CentralView::Build => "Build",
         }
     }
 }
@@ -484,6 +487,23 @@ struct VoicetermApp {
     glow: voiceterm_egui::repl_voice_glow::ReplVoiceGlow,
     /// A destructive action awaiting confirmation (confirm_dialog).
     pending_confirm: Option<(String, voiceterm_egui::confirm_dialog::ConfirmDialog)>,
+    /// The note-card deck: captured text split into atomic cards.
+    deck: voiceterm_egui::cards_view::Deck,
+    /// What the user has captured so far, re-split on change. Held because
+    /// the splitter is the source of truth — cards are derived, not edited
+    /// in place.
+    captured: String,
+    /// "What links here", over the notes the deck has produced.
+    backlinks: voiceterm_egui::backlinks_view::BacklinksView,
+    /// Compiler output, parsed into navigable diagnostics.
+    build: voiceterm_egui::build_view::BuildView,
+    /// Pasted cargo output — this build shells out to nothing, so the input
+    /// is explicit rather than a fake invocation.
+    build_input: String,
+    /// The workspaces page: saved workspaces + the live session.
+    workspaces: voiceterm_egui::workspaces_view::WorkspacesView,
+    workspaces_open: bool,
+    workspaces_filter: String,
     bar_state: voiceterm_egui::bars::BarState,
     /// The graph's SOURCE, not a prebuilt topology.
     ///
@@ -539,6 +559,64 @@ impl eframe::App for VoicetermApp {
         // flag, so the glow cannot disagree with what is actually listening.
         self.glow.show(ctx);
 
+        // THE WORKSPACES PAGE, as a side panel. Rows come from the sidebar's
+        // real session list and the live tabs from the real workspace — a
+        // page fed demo rows would sort and filter convincingly over nothing.
+        if self.workspaces_open {
+            use voiceterm_egui::workspaces_view as wv;
+            let now_ms = (ctx.input(|i| i.time) * 1000.0) as u64;
+            let rows: Vec<wv::WorkspaceRow> = self.sidebar.sessions.iter()
+                .map(|s| wv::WorkspaceRow {
+                    name: s.name.clone(),
+                    speaker: String::new(),
+                    browser_tabs: self.browser.bookmarks.all().len(),
+                    terminal_sessions: s.count as usize,
+                    updated_ms: now_ms,
+                }).collect();
+            self.workspaces.set_rows(rows);
+            self.workspaces.set_filter(&self.workspaces_filter);
+            self.workspaces.live = Some(wv::LiveSession {
+                speaker_display: String::new(),
+                tabs: self.workspace.tabs.iter()
+                    .map(|t| (t.name.clone(), now_ms)).collect(),
+                active_tab: self.workspace.active,
+            });
+            let colors = self.colors.clone();
+            egui::SidePanel::right("workspaces").show(ctx, |ui| {
+                ui.heading("Workspaces");
+                ui.text_edit_singleline(&mut self.workspaces_filter);
+                // The live session only shows at two or more tabs, matching
+                // the tab strip's own rule — a page that showed a one-tab
+                // session while the strip hid it would look like one of the
+                // two was broken.
+                if let Some(live) = &self.workspaces.live {
+                    if live.is_showable() {
+                        ui.colored_label(colors.text_weak, "current session");
+                        for (i, (url, _)) in live.tabs.iter().enumerate() {
+                            let label = wv::tab_label(url);
+                            ui.colored_label(
+                                if i == live.active_tab { colors.accent } else { colors.text },
+                                label);
+                        }
+                        ui.separator();
+                    }
+                }
+                if self.workspaces.is_empty() {
+                    ui.colored_label(colors.text_weak, "no saved workspaces");
+                }
+                for r in self.workspaces.ordered() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(colors.text, &r.name);
+                        ui.colored_label(colors.text_weak, egui::RichText::new(format!(
+                            "{} tab(s) · {} session(s) · {}",
+                            r.browser_tabs, r.terminal_sessions,
+                            wv::age_label(now_ms, r.updated_ms))).size(11.0));
+                    });
+                }
+                if ui.small_button("close").clicked() { self.workspaces_open = false; }
+            });
+        }
+
         // The escape chord, checked before anything draws: if the recogniser
         // has stopped working, voice mode must not be a room with no door.
         if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift
@@ -552,7 +630,12 @@ impl eframe::App for VoicetermApp {
                 match action {
                     SidebarAction::SelectSession(_) => {} // on-device: switch the active PTY/session
                     SidebarAction::New => {} // on-device: spawn a new session
-                    SidebarAction::Graph => {} // on-device: open the session graph view
+                    SidebarAction::Graph => {
+                        // The workspaces page. The sidebar's Graph action was
+                        // a no-op with a TODO; this is the page the Qt app
+                        // puts behind it.
+                        self.workspaces_open = !self.workspaces_open;
+                    }
                     SidebarAction::Settings => self.settings_open = !self.settings_open,
                 }
             }
@@ -1468,6 +1551,129 @@ impl eframe::App for VoicetermApp {
                                 "user: {sent}\nassistant: (no local model attached in this build)"));
                         }
                     }
+                    CentralView::Notes => {
+                        // CAPTURE → CARDS → BACKLINKS, in that order, because
+                        // that is the dependency: the splitter produces the
+                        // notes the index links. Editing the capture re-splits
+                        // (the deck keeps its selection BY IDENTITY, which is
+                        // why a re-split does not silently move it).
+                        use voiceterm_egui::{backlinks_view as bl, cards_view as cv};
+                        ui.label(egui::RichText::new("captured text").weak().size(11.0));
+                        let changed = ui.add(
+                            egui::TextEdit::multiline(&mut self.captured)
+                                .desired_rows(4).desired_width(f32::INFINITY)).changed();
+                        if changed {
+                            let src = cv::CardSource {
+                                url: self.browser.url.clone(),
+                                paragraph_id: String::new(),
+                            };
+                            self.deck.set_cards(cv::note_cards::split_into_cards(
+                                &self.captured, &src));
+                            // The index is rebuilt from the SAME cards the
+                            // deck shows, so "what links here" can never
+                            // describe a note the deck does not have.
+                            let notes: Vec<(String, String)> = self.deck.cards.iter()
+                                .map(|c| (c.title.clone(), c.body.clone())).collect();
+                            self.backlinks.rebuild(&notes);
+                        }
+                        ui.separator();
+                        if let Some(title) = cv::deck_ui(ui, &mut self.deck, &c) {
+                            // Opening a card sets the backlink context: the
+                            // panel below answers about THAT note.
+                            self.backlinks.set_current(&title);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!(
+                                "backlinks — {} ({})",
+                                if self.backlinks.current.is_empty() { "no note selected" }
+                                else { &self.backlinks.current },
+                                self.backlinks.count_here())).weak().size(11.0));
+                            if ui.selectable_label(
+                                self.backlinks.listing == bl::Listing::Orphans, "orphans").clicked()
+                            {
+                                self.backlinks.listing = match self.backlinks.listing {
+                                    bl::Listing::Orphans => bl::Listing::Here,
+                                    bl::Listing::Here => bl::Listing::Orphans,
+                                };
+                            }
+                            ui.text_edit_singleline(&mut self.backlinks.query);
+                        });
+                        // The empty reason is SHOWN, not collapsed into "no
+                        // results": not-indexed, no-match and nothing-links
+                        // are three different problems with three different
+                        // fixes.
+                        match self.backlinks.empty_reason() {
+                            Some(why) => { ui.colored_label(c.text_weak, why); }
+                            None => {
+                                for (path, ctx) in self.backlinks.rows() {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button(&path).clicked() {
+                                            self.backlinks.set_current(&path);
+                                        }
+                                        ui.colored_label(c.text_weak,
+                                            egui::RichText::new(ctx).size(11.0));
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    CentralView::Build => {
+                        // Compiler output as a navigable list. No cargo is
+                        // invoked here — the output is pasted, which is the
+                        // same no-subprocess contract the Models tab keeps.
+                        ui.horizontal(|ui| {
+                            ui.label("paste cargo output:");
+                            if ui.button("parse").clicked() {
+                                self.build.set_output(&self.build_input);
+                            }
+                        });
+                        ui.add(egui::TextEdit::multiline(&mut self.build_input)
+                               .desired_rows(3).desired_width(f32::INFINITY));
+                        ui.colored_label(c.text, self.build.status());
+                        ui.horizontal(|ui| {
+                            use voiceterm_egui::build_view::Show;
+                            for (label, show) in [("errors", Show::Errors), ("all", Show::All)] {
+                                if ui.selectable_label(self.build.show == show, label).clicked() {
+                                    self.build.show = show;
+                                }
+                            }
+                            // Category chips carry their COUNT: "borrow
+                            // checker × 12" is a different situation from
+                            // "borrow checker × 1" and the chip should say so.
+                            for (cat, n) in self.build.categories() {
+                                if ui.selectable_label(
+                                    self.build.show == Show::Category(cat),
+                                    format!("{cat:?} × {n}")).clicked()
+                                {
+                                    self.build.show = Show::Category(cat);
+                                }
+                            }
+                            ui.text_edit_singleline(&mut self.build.query);
+                        });
+                        // rows() borrows the view; jump() mutates it (it
+                        // records the selection). Collect the labels first so
+                        // the click can act — the alternative is a clone of
+                        // every diagnostic per frame.
+                        let labels: Vec<(usize, String)> = self.build.rows().into_iter()
+                            .map(|(o, d)| (o, d.one_line())).collect();
+                        let mut jumped = None;
+                        egui::ScrollArea::vertical().id_salt("build").show(ui, |ui| {
+                            for (ordinal, line) in &labels {
+                                if ui.small_button(format!("{ordinal}. {line}")).clicked() {
+                                    jumped = Some(*ordinal);
+                                }
+                            }
+                        });
+                        if let Some(o) = jumped {
+                            // jump() returns the diagnostic to open; there is
+                            // no editor attached here, so the target is
+                            // surfaced rather than followed.
+                            if let Some(hit) = self.build.jump(o) {
+                                self.toasts.info(hit.one_line(), ui.input(|i| i.time));
+                            }
+                        }
+                    }
                     CentralView::Terminal => {}
                 }
                 return;
@@ -2068,6 +2274,14 @@ fn main() -> eframe::Result<()> {
                 chat: Default::default(),
                 glow: Default::default(),
                 pending_confirm: None,
+                deck: Default::default(),
+                captured: String::new(),
+                backlinks: Default::default(),
+                build: Default::default(),
+                build_input: String::new(),
+                workspaces: Default::default(),
+                workspaces_open: false,
+                workspaces_filter: String::new(),
                 bar_state: Default::default(),
                 graph_source: String::new(),
                 settings_open: false,
