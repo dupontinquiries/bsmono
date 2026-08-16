@@ -233,12 +233,26 @@ FocusScope {
             // and this handler cleanly gives up — taps and flicks can't blur.
             gesturePolicy: TapHandler.DragThreshold
 
+            // TapHandler still emits tapped on release after longPressed, so
+            // without this an opened context menu would ALSO launch the app.
+            // (The egui shell had the identical bug; its headless test is
+            // what caught it.)
+            property bool consumedByLongPress: false
+
             onPressedChanged: {
-                gridView.pressedIndex = pressed
-                    ? itemGrid.indexBeneath(point.pressPosition) : -1;
+                if (pressed) {
+                    consumedByLongPress = false;
+                    gridView.pressedIndex = itemGrid.indexBeneath(point.pressPosition);
+                } else {
+                    gridView.pressedIndex = -1;
+                }
             }
 
             onTapped: (eventPoint, button) => {
+                if (consumedByLongPress) {
+                    consumedByLongPress = false;
+                    return;
+                }
                 const idx = itemGrid.indexBeneath(eventPoint.position);
                 if (idx !== -1) {
                     itemGrid.activate(idx);
@@ -248,6 +262,7 @@ FocusScope {
             }
 
             onLongPressed: {
+                consumedByLongPress = true;
                 const idx = itemGrid.indexBeneath(point.position);
                 if (idx !== -1) {
                     gridView.currentIndex = idx;

@@ -131,6 +131,12 @@ impl Launcher {
         self.favorites.iter().any(|f| f == id)
     }
 
+    /// Add or remove a favorite. Deliberately does NOT reorder the current
+    /// results: favoriting happens by long-pressing a tile, and resorting the
+    /// grid under a finger that is still down moves the target mid-gesture —
+    /// visually jarring, and it makes the release land on a different app.
+    /// The new order takes effect at the next natural settling point (a query
+    /// change, a re-summon, a refresh) via [`Launcher::resettle`].
     pub fn toggle_favorite(&mut self, id: &str) {
         if let Some(pos) = self.favorites.iter().position(|f| f == id) {
             self.favorites.remove(pos);
@@ -138,6 +144,11 @@ impl Launcher {
             self.favorites.push(id.to_string());
         }
         let _ = store::save_favorites(&self.favorites);
+    }
+
+    /// Re-sort the results for the current query and standings. Call at a
+    /// moment when the grid may move without surprising anyone.
+    pub fn resettle(&mut self) {
         self.rerank();
     }
 
@@ -239,12 +250,21 @@ mod tests {
     }
 
     #[test]
-    fn a_favorite_floats_to_the_front_of_the_empty_query_grid() {
+    fn a_favorite_floats_to_the_front_but_only_once_the_grid_settles() {
         let mut l = fresh();
         l.toggle_favorite("terminal");
-        let first = l.result_at(0).unwrap();
-        assert_eq!(first.name, "Terminal");
+        assert_eq!(
+            l.result_at(0).unwrap().name,
+            "Camera",
+            "the grid must not move under the finger that just favorited"
+        );
+        assert!(l.is_favorite("terminal"), "though the star is on immediately");
+
+        l.resettle();
+        assert_eq!(l.result_at(0).unwrap().name, "Terminal");
+
         l.toggle_favorite("terminal");
+        l.resettle();
         assert_eq!(l.result_at(0).unwrap().name, "Camera", "untoggling restores alpha order");
     }
 

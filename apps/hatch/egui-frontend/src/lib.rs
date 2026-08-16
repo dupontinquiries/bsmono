@@ -56,8 +56,20 @@ pub struct HatchUi {
     icon_cache: HashMap<String, Option<egui::TextureHandle>>,
     // Long-press bookkeeping (egui has clicks and drags, not holds).
     press: Option<PressTrack>,
+    /// Set when the current press has already done its job (a long-press
+    /// fired, or it turned into a scroll). Scoped to the press, not to a
+    /// tile: the grid can restack between press and release, and a swallow
+    /// that matched on tile id would miss and launch whatever moved in.
+    swallow_click: bool,
     grabber_drag: f32,
     last_error: Option<(String, Instant)>,
+    /// Screen rects of the tiles painted last frame, in display order.
+    /// The grid is hand-laid-out, so this is the only record of where a tile
+    /// actually ended up — needed to answer "which tile is under this point"
+    /// from outside `ui()` (tests aim real taps with it today; a gesture
+    /// layer that has to know which tile a swipe began on would use the same
+    /// answer rather than recomputing the layout and drifting from it).
+    tile_rects: Vec<(String, Rect)>,
 }
 
 struct PressTrack {
@@ -77,15 +89,34 @@ impl HatchUi {
             scroll_gen: 0,
             icon_cache: HashMap::new(),
             press: None,
+            swallow_click: false,
             grabber_drag: 0.0,
             last_error: None,
+            tile_rects: Vec::new(),
         }
+    }
+
+    /// Where a tile was painted last frame, if it was on screen.
+    pub fn tile_rect(&self, entry_id: &str) -> Option<Rect> {
+        self.tile_rects.iter().find(|(id, _)| id == entry_id).map(|(_, r)| *r)
+    }
+
+    /// The union of the tiles painted last frame — the occupied part of the
+    /// grid, as distinct from the empty space around it.
+    pub fn tiles_bounds(&self) -> Option<Rect> {
+        self.tile_rects
+            .iter()
+            .map(|(_, r)| *r)
+            .reduce(|a, b| a.union(b))
     }
 
     /// Called by the shell whenever the window becomes visible again.
     pub fn on_shown(&mut self) {
         self.query.clear();
         self.core.set_query("");
+        // A re-summoned launcher is the natural moment for favorites toggled
+        // last time to take their new places.
+        self.core.resettle();
         self.sel = 0;
         self.scroll_gen += 1;
         self.focus_search = true;
@@ -255,6 +286,7 @@ impl HatchUi {
         let rows = count.div_ceil(cols);
         let mut launch: Option<String> = None;
         let mut fav_toggle: Option<String> = None;
+        self.tile_rects.clear();
 
         for row in 0..rows {
             ui.horizontal(|ui| {
@@ -270,6 +302,7 @@ impl HatchUi {
 
                     let (rect, resp) =
                         ui.allocate_exact_size(cell, Sense::click());
+                    self.tile_rects.push((id.clone(), rect));
                     if resp.hovered() {
                         self.sel = n;
                     }
@@ -290,6 +323,13 @@ impl HatchUi {
         if decode_budget == 0 {
             // More icons still undecoded — come back next frame.
             ui.ctx().request_repaint();
+        }
+        // Once nothing is held, the press is over: forget it and stop
+        // swallowing. Done after the loop so a click delivered in the same
+        // frame as the pointer-up is still seen (and still swallowed).
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.press = None;
+            self.swallow_click = false;
         }
         if let Some(id) = fav_toggle {
             self.core.toggle_favorite(&id);
@@ -392,51 +432,46 @@ impl HatchUi {
     /// the hold state machine lives here: still + `LONG_PRESS` fires once,
     /// and the release click after a fire is swallowed.
     fn hold(&mut self, resp: &egui::Response, key: &str) -> Hold {
-        let down = resp.is_pointer_button_down_on();
+        if !resp.is_pointer_button_down_on() {
+            // Not this tile's press. Release bookkeeping is central, in
+            // `grid`, because by release time the press may not belong to any
+            // tile still under the pointer.
+            return if self.swallow_click { Hold::SwallowClick } else { Hold::Free };
+        }
         let pos = resp.interact_pointer_pos();
-        if down {
-            match &mut self.press {
-                Some(t) if t.key == key => {
-                    if let Some(p) = pos {
-                        if (p - t.origin).length() > LONG_PRESS_SLOP {
-                            // Moved: it's a scroll/drag, never a hold.
-                            t.fired = true; // also swallows the click
-                            return Hold::SwallowClick;
-                        }
-                    }
-                    if !t.fired && t.started.elapsed() >= LONG_PRESS {
+        match &mut self.press {
+            Some(t) if t.key == key => {
+                if let Some(p) = pos {
+                    if (p - t.origin).length() > LONG_PRESS_SLOP {
+                        // Moved: it's a scroll/drag, never a hold and never a tap.
                         t.fired = true;
-                        return Hold::Fired;
-                    }
-                    // Keep frames coming so the hold can mature without input.
-                    resp.ctx.request_repaint_after(Duration::from_millis(60));
-                    if t.fired {
+                        self.swallow_click = true;
                         return Hold::SwallowClick;
                     }
                 }
-                _ => {
-                    self.press = Some(PressTrack {
-                        key: key.to_string(),
-                        started: Instant::now(),
-                        origin: pos.unwrap_or_default(),
-                        fired: false,
-                    });
-                    resp.ctx.request_repaint_after(LONG_PRESS);
+                if !t.fired && t.started.elapsed() >= LONG_PRESS {
+                    t.fired = true;
+                    self.swallow_click = true;
+                    return Hold::Fired;
                 }
-            }
-            return Hold::Free;
-        }
-        // Released: if this key's press had fired, swallow exactly this click.
-        if let Some(t) = &self.press {
-            if t.key == key {
-                let fired = t.fired;
-                self.press = None;
-                if fired {
+                // Keep frames coming so the hold can mature without input.
+                resp.ctx.request_repaint_after(Duration::from_millis(60));
+                if t.fired {
                     return Hold::SwallowClick;
                 }
+                Hold::Free
+            }
+            _ => {
+                self.press = Some(PressTrack {
+                    key: key.to_string(),
+                    started: Instant::now(),
+                    origin: pos.unwrap_or_default(),
+                    fired: false,
+                });
+                resp.ctx.request_repaint_after(LONG_PRESS);
+                Hold::Free
             }
         }
-        Hold::Free
     }
 
     fn texture_for(
@@ -592,6 +627,237 @@ enum Hold {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hatch_core::AppEntry;
+    use std::path::PathBuf;
+
+    // ---- headless frame driver -------------------------------------------
+    //
+    // egui::Context::run needs no window, no GL, no eframe — it takes RawInput
+    // and returns shapes. That makes the drawing path testable, which matters
+    // more here than it sounds: layout code fails by PANICKING (bad index, id
+    // collision, allocate on a zero-size ui), and until this harness existed
+    // not one line of `HatchUi::ui` had ever been executed. Everything below
+    // asserts on the returned UiEvent; the shapes are discarded. What it does
+    // NOT prove is that the result looks right — only the phone can say that.
+
+    struct Harness {
+        ctx: egui::Context,
+        app: HatchUi,
+        palette: uikit_egui::PaletteColors,
+        size: Vec2,
+    }
+
+    impl Harness {
+        fn new(entries: Vec<AppEntry>) -> Harness {
+            // Private config home: the frame driver toggles favorites and
+            // records recents, which must not touch a real launcher's state.
+            let tmp = std::env::temp_dir().join(format!("hatch-ui-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+            let core = hatch_core::Launcher::with_entries(hatch_core::Config::default(), entries);
+            Harness {
+                ctx: egui::Context::default(),
+                app: HatchUi::new(core),
+                palette: uikit_egui::default_palette(),
+                size: Vec2::new(420.0, 900.0),
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> UiEvent {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), self.size)),
+                events,
+                ..Default::default()
+            };
+            let mut out = UiEvent::None;
+            let app = &mut self.app;
+            let palette = &self.palette;
+            self.ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = app.ui(ui, palette);
+                });
+            });
+            out
+        }
+
+        /// Press-and-release at `pos` across two frames, the way a real click
+        /// arrives. Returns the second frame's event, which is where egui
+        /// reports the click.
+        fn click(&mut self, pos: egui::Pos2) -> UiEvent {
+            let down = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ];
+            self.frame(down);
+            let up = vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }];
+            self.frame(up)
+        }
+
+        fn key(&mut self, key: Key) -> UiEvent {
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }])
+        }
+    }
+
+    fn entry(name: &str) -> AppEntry {
+        AppEntry {
+            id: name.to_lowercase(),
+            name: name.into(),
+            description: String::new(),
+            icon: String::new(), // no icon file → letter-tile path gets exercised
+            exec: "true".into(), // activate() spawns /bin/true
+            terminal: false,
+            path: PathBuf::new(),
+        }
+    }
+
+    fn some_apps() -> Vec<AppEntry> {
+        ["Files", "Firefox", "Terminal", "Camera", "Maps", "Notes"]
+            .iter()
+            .map(|n| entry(n))
+            .collect()
+    }
+
+    #[test]
+    fn a_full_frame_renders_without_panicking() {
+        let mut h = Harness::new(some_apps());
+        assert_eq!(h.frame(vec![]), UiEvent::None);
+        // Several frames: animations, the icon decode budget, and the
+        // long-press timer all have per-frame state worth stepping through.
+        for _ in 0..4 {
+            h.frame(vec![]);
+        }
+    }
+
+    #[test]
+    fn an_empty_grid_renders_too() {
+        // The no-results path is the one most likely to divide by zero or
+        // index off the end, and the easiest to never look at by hand.
+        let mut h = Harness::new(vec![]);
+        h.frame(vec![]);
+        h.frame(vec![]);
+    }
+
+    #[test]
+    fn a_narrow_phone_viewport_still_lays_out() {
+        let mut h = Harness::new(some_apps());
+        h.size = Vec2::new(320.0, 480.0);
+        h.frame(vec![]);
+        h.frame(vec![]);
+    }
+
+    #[test]
+    fn clicking_a_tile_launches_and_clicking_the_gap_does_nothing() {
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]); // first frame lays the grid out and records the rects
+
+        // Aim at where a tile really landed rather than re-deriving the
+        // layout in the test (which would pass even if the layout drifted).
+        let camera = h.app.tile_rect("camera").expect("Camera tile was painted");
+        assert_eq!(h.click(camera.center()), UiEvent::Launched, "a tap on a tile launches");
+
+        h.app.on_shown();
+        h.frame(vec![]);
+
+        // Just below the occupied grid: empty space, still inside the
+        // scrollable area, above the search pill. This is the regression the
+        // whole project started from — a missed tap must not dismiss.
+        let bounds = h.app.tiles_bounds().expect("some tiles painted");
+        let gap = egui::pos2(bounds.center().x, bounds.bottom() + 8.0);
+        assert!(
+            h.app.tile_rects.iter().all(|(_, r)| !r.contains(gap)),
+            "the gap point must genuinely miss every tile"
+        );
+        assert_eq!(h.click(gap), UiEvent::None, "a tap on empty grid space does nothing");
+    }
+
+    #[test]
+    fn a_long_press_favorites_the_tile_and_swallows_the_release_click() {
+        // The hold machine is the fiddliest thing in the file: it has to fire
+        // once, and then eat exactly the click that ends the same press —
+        // otherwise every favorite toggle also launches the app.
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+        let maps = h.app.tile_rect("maps").expect("Maps tile was painted");
+        let pos = maps.center();
+
+        h.frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        assert!(!h.app.core.is_favorite("maps"), "not yet — the hold must mature");
+
+        // Hold time is wall-clock, so the test waits it out rather than
+        // injecting a fake clock; one 0.6s test is cheaper than a clock seam
+        // that nothing else needs.
+        std::thread::sleep(LONG_PRESS + Duration::from_millis(60));
+        h.frame(vec![]); // a frame with the finger still down: the hold fires
+        assert!(h.app.core.is_favorite("maps"), "long press toggled the favorite");
+
+        let released = h.frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        assert_eq!(released, UiEvent::None, "the release must not also launch");
+    }
+
+    #[test]
+    fn escape_clears_a_query_first_and_dismisses_only_when_empty() {
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+        h.frame(vec![egui::Event::Text("fi".into())]);
+        assert_eq!(h.app.core.query(), "fi", "typing reaches the search pill");
+
+        assert_eq!(h.key(Key::Escape), UiEvent::None, "first Escape only clears");
+        assert_eq!(h.app.core.query(), "");
+        assert_eq!(h.key(Key::Escape), UiEvent::Dismiss, "second Escape dismisses");
+    }
+
+    #[test]
+    fn typing_narrows_the_rendered_grid() {
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+        assert_eq!(h.app.core.result_count(), 6);
+        h.frame(vec![egui::Event::Text("fi".into())]);
+        h.frame(vec![]);
+        assert_eq!(h.app.core.result_count(), 2, "Files and Firefox");
+    }
+
+    #[test]
+    fn reopening_resets_query_and_selection() {
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+        h.frame(vec![egui::Event::Text("term".into())]);
+        h.app.on_shown();
+        h.frame(vec![]);
+        assert_eq!(h.app.core.query(), "", "a re-summoned launcher starts clean");
+        assert_eq!(h.app.core.result_count(), 6);
+    }
+
+    // ---- pure helpers -----------------------------------------------------
 
     #[test]
     fn columns_come_from_config_when_set_and_from_width_when_not() {
