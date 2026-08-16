@@ -401,6 +401,13 @@ struct VoicetermApp {
     /// available and row_render's docs say so. Shaping a row into a galley is
     /// what costs, and it is what this keeps.
     row_galleys: voiceterm_egui::row_render::RowLayoutCache<String>,
+    /// The reading-mode corpus tape. Fed by an audio callback on a device with
+    /// a microphone; here only its POLICY runs — start, bound, keep-or-discard.
+    tape: voiceterm_egui::corpus_tape::Tape,
+    /// The paragraph being read aloud, which the recording is saved beside.
+    tape_reference: String,
+    /// What the last stop decided, so a discarded take says why.
+    tape_note: String,
     colors: PaletteColors,
     /// The toolbar gesture menus (QML `_pipePopup` / `_bracePopup`): press-drag-release on the
     /// `|⋯` / `{⋯}` chips at the left of the keycap bar.
@@ -1043,6 +1050,62 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     CentralView::Docs => {
+                        // READING MODE. corpus_tape records a paragraph read
+                        // aloud, and the corpus it fills is what acoustic_cache
+                        // later learns from — "a bad recording here becomes a
+                        // bad fingerprint there, and a bad fingerprint promotes
+                        // wrong text". So the quality gate is the feature.
+                        use voiceterm_egui::corpus_tape as ct;
+                        ui.horizontal(|ui| {
+                            ui.label("read aloud:");
+                            ui.text_edit_singleline(&mut self.tape_reference);
+                            if !self.tape.is_active() {
+                                // Refused without a reference rather than
+                                // recorded and discarded later: worth_keeping
+                                // rejects an empty reference, so starting one
+                                // is asking the user to read for nothing.
+                                let ok = !self.tape_reference.trim().is_empty();
+                                if ui.add_enabled(ok, egui::Button::new("record")).clicked() {
+                                    self.tape.start(&self.tape_reference);
+                                    self.tape_note.clear();
+                                }
+                            } else if ui.button("stop").clicked() {
+                                match self.tape.stop() {
+                                    Some(r) if ct::worth_keeping(&r) => {
+                                        self.tape_note = format!(
+                                            "kept {:.1}s for {:?}",
+                                            r.duration_s(), ct::sanitize_id(&r.reference));
+                                    }
+                                    // A take that is too short is DISCARDED and
+                                    // said so. Silently keeping it would put a
+                                    // fingerprint in the corpus built from a
+                                    // fraction of a word.
+                                    Some(r) => {
+                                        self.tape_note = format!(
+                                            "discarded: {:.2}s is under the {:.1}s minimum",
+                                            r.duration_s(), ct::MIN_KEEP_S);
+                                    }
+                                    // No samples at all — which is this build,
+                                    // with no microphone attached.
+                                    None => self.tape_note =
+                                        "no audio captured (no microphone on this build)".into(),
+                                }
+                            }
+                        });
+                        if self.tape.is_active() {
+                            // The 60s cap is shown while recording, not
+                            // discovered at it: a tape that stops on its own
+                            // with no warning reads as a crash.
+                            let secs = self.tape.len() as f32
+                                / self.tape.sample_rate().max(1) as f32;
+                            ui.colored_label(c.warning,
+                                format!("● {secs:.1}s / {}s max",
+                                        ct::MAX_SAMPLES / 48_000));
+                        }
+                        if !self.tape_note.is_empty() {
+                            ui.colored_label(c.text_weak, &self.tape_note);
+                        }
+                        ui.separator();
                         if let Some(name) = voiceterm_egui::manpage_view::manpage_ui(
                             ui, &mut self.docs, &c)
                         {
@@ -1663,6 +1726,9 @@ fn main() -> eframe::Result<()> {
                 pty_echoed: 0,
                 row_dirty: voiceterm_egui::row_cache::RowCache::new(24),
                 row_galleys: voiceterm_egui::row_render::RowLayoutCache::new(),
+                tape: Default::default(),
+                tape_reference: String::new(),
+                tape_note: String::new(),
                 colors,
                 pipe_menu: pipe_slide_menu("voiceterm-pipe-menu"),
                 // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
