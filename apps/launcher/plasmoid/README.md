@@ -47,8 +47,29 @@ qmllint contents/ui/*.qml                            # static check
 
 ## Verification status
 
-**Not compiled or run in the authoring sandbox** (no Qt6/Plasma host — same
-policy as qt-ui-kit). The QML here has been reviewed, not executed; `qmllint`
-on device is the first gate. Known-untested spots: DragHandler-vs-GridView
-grab arbitration for swipe-down-to-close, and maliit's keyboardRectangle
-reporting under scale factors ≠ 1.
+**Not run in the authoring sandbox** (no Plasma host, no display — same
+policy as qt-ui-kit) — nothing here has actually opened as a running
+dashboard.
+
+What *has* been checked, mechanically rather than by eye: Qt 6.4.2's
+`qmllint` (installed via `apt` from Ubuntu 24.04's own repos —
+`qt6-declarative-dev-tools`, since the sandbox has network access to
+`archive.ubuntu.com`) parsed all six `.qml` files here with **zero syntax
+errors**. Every warning it does report is import-resolution noise: KDE
+Frameworks' QML modules (`org.kde.plasma.*`, `org.kde.kirigami`,
+`org.kde.plasma.private.kicker`) aren't type-checkable from a generic Ubuntu
+box, because Plasma 6's actual runtime (`libplasma`) isn't packaged there —
+Ubuntu 24.04 only ships the older KF5/Plasma 5 `plasma-framework`
+(confirmed via `apt-cache policy`), which targets a different, incompatible
+QML API surface (versioned imports like `org.kde.plasma.core 2.0`, not the
+unversioned `org.kde.plasma.core` this file uses) and would give
+misleading signal either way if force-installed alongside Plasma 6 code.
+So: structurally and syntactically sound, confirmed by a real parser: yes.
+Semantically correct against actual Plasma 6 types (SideBarItem gets the
+right props, ItemGridView's model shape matches what the delegate expects,
+etc.): still unverified, and can only be closed out with `qmllint` run on
+an actual Plasma 6 host, or `plasmoidviewer` for a real render.
+
+Known-untested spots beyond that: DragHandler-vs-GridView grab arbitration
+for swipe-down-to-close, and maliit's keyboardRectangle reporting under
+scale factors ≠ 1.
