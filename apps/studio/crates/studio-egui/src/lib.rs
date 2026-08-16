@@ -14,6 +14,7 @@
 
 pub mod touch;
 pub mod keys;
+pub mod playkeys;
 pub mod spectrum;
 
 /// The step-sequencer surface for studio-live.

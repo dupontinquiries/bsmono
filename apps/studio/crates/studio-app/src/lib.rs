@@ -85,6 +85,10 @@ pub struct Studio {
     pub mixer_drag: Option<(studio_core::TrackId, f32)>,
     /// The bus faders' twin of `mixer_drag`.
     pub bus_drag: Option<(studio_core::BusId, f32)>,
+    /// Motions (the Helix keymap) or Playing (the keyboard is a piano).
+    pub input_mode: studio_egui::playkeys::InputMode,
+    /// Octave shift for playing mode.
+    pub octave: i8,
     /// Which edge an ambiguous timeline grab prefers; `alt-;` flips it.
     pub trim_side: studio_egui::TrimSide,
     /// Set by the panel's bounce button; the shell performs it.
@@ -121,6 +125,8 @@ impl Studio {
             solo: Vec::new(),
             mixer_drag: None,
             bus_drag: None,
+            input_mode: Default::default(),
+            octave: 0,
             trim_side: studio_egui::TrimSide::default(),
             pending_bounce: false,
         }
@@ -251,6 +257,30 @@ impl Studio {
     /// Everything local since the last drain, for any carrier to ship.
     pub fn drain_outbox(&mut self) -> Vec<studio_collab::wire::Packet> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// A played note enters the pattern as a tuned step on the selected
+    /// channel at the loop's current column — typing a melody into the 808
+    /// lane, which is what the step grid's `tune` mod was minted for.
+    ///
+    /// Recording into the pattern rather than sounding a live voice is a
+    /// deliberate scope line: a live voice needs a polyphonic one-shot mixer
+    /// over the audition sink (named in `library`'s docs too), while step
+    /// entry is playable TODAY and its result is exactly what the grid, the
+    /// bounce, and a peer all already understand.
+    pub fn play_note_at(&mut self, note: studio_egui::playkeys::PlayNote, step: u32) {
+        let ch = self.selected_channel;
+        let Some(p) = self.rack.patterns.get_mut(self.current_pattern) else { return };
+        if ch >= p.rows.len() || step >= p.steps { return; }
+        p.set(ch, step, true);
+        let mut m = p.mod_at(ch, step);
+        m.tune = note.semitone;
+        // Analog travel becomes step velocity — the point of an analog
+        // keyboard is that a soft press stays soft in the pattern.
+        m.vel = note.velocity;
+        p.set_mod(ch, step, m);
+        self.loop_dirty = true;
+        self.status = format!("note {:+} at step {}", note.semitone, step + 1);
     }
 
     /// Publish the rack to the Doc's LWW register when it has drifted — the
@@ -424,6 +454,18 @@ impl Studio {
     /// Route a key through the modal map. Returns true if it was consumed.
     pub fn key(&mut self, k: studio_egui::keys::Key) -> bool {
         use studio_egui::keys::{Action, Resolution};
+        // In Playing mode the editing keymap is inert: `d` is a note, not a
+        // delete. Escape is the way back and is deliberately the ONLY editor
+        // key that still works — a mode you cannot leave with the key
+        // everyone reaches for is a trap. Consumed either way, so the caller
+        // does not double-handle a keystroke this mode already claimed.
+        if self.input_mode == studio_egui::playkeys::InputMode::Playing {
+            if k.ch == '\u{1b}' {
+                self.input_mode = studio_egui::playkeys::InputMode::Motions;
+                self.status = "motions".into();
+            }
+            return true;
+        }
         match self.keys.feed(k) {
             Resolution::Act(a) => {
                 match a {
@@ -863,6 +905,9 @@ pub struct App {
     library: Vec<library::LibraryEntry>,
     library_open: bool,
     export_rate: u32,
+    /// Velocity source for playing mode. `NullAnalog` today; a Wooting
+    /// binding drops in here (see playkeys' docs).
+    analog: Box<dyn studio_egui::playkeys::AnalogSource>,
     /// What the sink's buffer currently holds, so a mode switch (loop ↔
     /// arrangement) knows to reload even when nothing is dirty.
     loaded: SinkContent,
@@ -920,6 +965,7 @@ impl Default for App {
         App { studio, peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
               export_rate: 48_000,
+              analog: Box::new(studio_egui::playkeys::NullAnalog),
               loaded: SinkContent::Nothing }
     }
 }
@@ -958,6 +1004,17 @@ impl eframe::App for App {
                 // status line prints the exact path. No dialog on purpose:
                 // predictable beats configurable for the ship-a-beat loop,
                 // and a picker can arrive later without moving this seam.
+                let m = self.studio.input_mode;
+                if ui.add(egui::Button::selectable(
+                        m == studio_egui::playkeys::InputMode::Playing, m.label()))
+                    .on_hover_text("motions ⇄ playing (Esc leaves playing)").clicked()
+                {
+                    self.studio.input_mode = m.toggled();
+                }
+                if m == studio_egui::playkeys::InputMode::Playing {
+                    ui.label("oct");
+                    ui.add(egui::DragValue::new(&mut self.studio.octave).range(-2..=2));
+                }
                 if ui.button("save").clicked()
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
                 {
@@ -1041,6 +1098,33 @@ impl eframe::App for App {
                 // A decode error is not a missing-plugin error (studio-media's
                 // own rule): say exactly what failed, keep editing.
                 Err(e) => self.studio.status = format!("import '{name}' failed: {e}"),
+            }
+        }
+
+        // ── playing mode: the keyboard is a piano ────────────────────────
+        // Physical keys, not logical ones: see playkeys' module docs on why
+        // AZERTY otherwise scatters the layout. egui hands both to us.
+        if self.studio.input_mode == studio_egui::playkeys::InputMode::Playing {
+            let pressed: Vec<char> = ctx.input(|i| i.events.iter().filter_map(|e| {
+                let egui::Event::Key { key, physical_key, pressed: true, .. } = e else { return None };
+                let k = physical_key.unwrap_or(*key);
+                k.name().chars().next().map(|c| c.to_ascii_lowercase())
+            }).collect());
+            // The sink's column when the loop runs, else step 0 — playing
+            // into a stopped rack writes the downbeat, which is what a
+            // person tapping a stopped grid expects.
+            let column = self.sink.position().and_then(|pos| {
+                let p = self.studio.rack.patterns.get(self.studio.current_pattern)?;
+                let step = self.studio.rack.tempo().step_len()
+                    .to_samples(self.sink.rate()).max(1) as usize;
+                (p.steps > 0).then(|| (pos / step) as u32 % p.steps)
+            }).unwrap_or(0);
+            for c in pressed {
+                if let Some(note) = studio_egui::playkeys::play_note(
+                    c, self.studio.octave, &studio_egui::keys::Key::c(c), &*self.analog)
+                {
+                    self.studio.play_note_at(note, column);
+                }
             }
         }
 
@@ -2169,5 +2253,62 @@ mod export_rate_tests {
         let (ea, eb) = (e(&a, 0.2), e(&b, 0.2));
         assert!((ea - eb).abs() < ea * 0.1,
                 "the first 200ms carry the same energy per second: {ea} vs {eb}");
+    }
+}
+
+#[cfg(test)]
+mod playing_mode_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+    use studio_egui::playkeys::{play_note, InputMode, NullAnalog, PlayNote};
+
+    #[test]
+    fn a_played_note_lands_in_the_pattern_as_a_tuned_step() {
+        let mut s = Studio::demo();
+        s.selected_channel = 0; // the 808
+        let note = play_note('d', 0, &Key::c('d'), &NullAnalog).expect("E natural");
+        s.play_note_at(note, 4);
+        let p = &s.rack.patterns[s.current_pattern];
+        assert!(p.is_set(0, 4), "the step is on");
+        assert_eq!(p.mod_at(0, 4).tune, 4, "and carries the note's pitch");
+        assert!(s.loop_dirty, "the audition loop knows to re-render");
+    }
+
+    #[test]
+    fn analog_travel_becomes_step_velocity() {
+        let mut s = Studio::demo();
+        s.play_note_at(PlayNote { semitone: 0, velocity: 0.35 }, 2);
+        assert!((s.rack.patterns[0].mod_at(0, 2).vel - 0.35).abs() < 1e-6,
+                "a soft press stays soft in the pattern");
+    }
+
+    #[test]
+    fn a_note_past_the_pattern_or_the_channels_is_dropped_not_panicked() {
+        // Octave and column both come from live input; neither is trusted.
+        let mut s = Studio::demo();
+        let steps = s.rack.patterns[0].steps;
+        s.play_note_at(PlayNote { semitone: 0, velocity: 1.0 }, steps + 5);
+        s.selected_channel = 999;
+        s.play_note_at(PlayNote { semitone: 0, velocity: 1.0 }, 0);
+        assert_eq!(s.rack.patterns[0].hits(), studio_live::Rack::trap_kit().patterns[0].hits(),
+                   "nothing was written, nothing crashed");
+    }
+
+    #[test]
+    fn playing_mode_makes_the_editor_keys_inert_and_escape_gets_out() {
+        // The trap this mode must not be: `d` in playing mode is a note, so
+        // it must NOT delete — and Escape must always work.
+        let mut s = Studio::demo();
+        let clips = s.session.doc.project.clips.len();
+        s.selection = vec![*s.session.doc.project.clips.keys().next().unwrap()];
+        s.input_mode = InputMode::Playing;
+        s.key(Key::c('d'));
+        assert_eq!(s.session.doc.project.clips.len(), clips, "no edit happened");
+        s.key(Key::c(' '));
+        assert!(!s.transport.playing && !s.rack_playing, "not even transport");
+        s.key(Key::c('\u{1b}'));
+        assert_eq!(s.input_mode, InputMode::Motions, "escape is always the way out");
+        s.key(Key::c(' '));
+        assert!(s.rack_playing || s.transport.playing, "and the keymap is back");
     }
 }

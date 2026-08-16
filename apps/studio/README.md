@@ -216,7 +216,7 @@ from the same wishlist: bus SENDS in the UI (the model has them),
 clip-level chain editing, surround/downmix formats (mixdown is stereo
 end-to-end today), 
 audition-on-click (needs a live one-shot voice over the sink), a playing
-mode for keys (same dependency), Wooting analog input, and VST/CLAP
+mode for keys — now built, see below — Wooting analog input, and VST/CLAP
 hosting — studio-fx::retune is the native autotune seed; for external
 FOSS instruments (Surge XT, Dexed, sfizz + Salamander for piano) a plugin
 host is its own project.
@@ -1110,3 +1110,25 @@ newcomer therefore received a clip op with no track to put it on. It now sends a
 full snapshot via `file::snapshot`, so the ops that rebuild a project for a
 collaborator are literally the ones that rebuild it from disk. Same class of bug
 as `Doc::rebuild` starting from an empty project, caught the same way.
+
+
+**The keyboard is an instrument (and still a keyboard).** `studio-egui::playkeys`
+adds a Playing mode beside the Helix motions keymap: the tracker layout
+(`asdfghjk` white, `we tyu` black, `zxcvbnm` an octave down) keyed on egui's
+PHYSICAL key rather than the logical one — on AZERTY a character-keyed layout
+scatters C major across the board, and position is what "locale adaptive"
+actually means. Playing mode makes the editing keys inert (in it, `d` is a
+note, not a delete) with Escape as the guaranteed way out — tested, because a
+mode you cannot leave is a trap. Notes land in the pattern as tuned steps on
+the selected channel at the playhead's column: recording into the grid rather
+than sounding a live voice is a deliberate line — step entry works today and
+its result is what the grid, the bounce, and a peer all already understand,
+while a live voice needs a polyphonic one-shot mixer over the audition sink
+(named, with audition-on-click, as the next input milestone). Velocity comes
+through an `AnalogSource` seam: `NullAnalog` gives a held key full velocity,
+and an analog keyboard's travel becomes the step's velocity — a soft press
+stays soft in the pattern. The Wooting binding itself is NOT written here:
+`games/skydribble/src/analog.rs` already dlopens the Analog SDK behind a cargo
+feature with a no-op fallback, and lifting that into a shared crate (rather
+than copying 200 lines of FFI no test in this repo can exercise without the
+hardware) is the honest next step.
