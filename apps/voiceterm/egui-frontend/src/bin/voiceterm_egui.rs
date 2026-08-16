@@ -25,7 +25,7 @@ use voiceterm_egui::App;
 /// terminal first, and a switcher that made it a peer of the mail reader would
 /// be the wrong app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models }
+enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models, Chat }
 
 impl VoicetermApp {
     /// Feed PTY bytes to the screen.
@@ -285,10 +285,11 @@ impl CentralView {
     // The array LENGTH is part of the type: adding a variant without widening
     // this is a compile error rather than a tab that silently never renders,
     // which is the failure mode a Vec here would have had.
-    const ALL: [CentralView; 8] = [CentralView::Terminal, CentralView::Mail,
+    const ALL: [CentralView; 9] = [CentralView::Terminal, CentralView::Mail,
                                    CentralView::Browser, CentralView::Graph,
                                    CentralView::Table, CentralView::Docs,
-                                   CentralView::Archive, CentralView::Models];
+                                   CentralView::Archive, CentralView::Models,
+                                   CentralView::Chat];
     fn label(self) -> &'static str {
         match self {
             CentralView::Terminal => "Terminal", CentralView::Mail => "Mail",
@@ -296,6 +297,7 @@ impl CentralView {
             CentralView::Table => "Table", CentralView::Docs => "Docs",
             CentralView::Archive => "Archive",
             CentralView::Models => "Models",
+            CentralView::Chat => "Chat",
         }
     }
 }
@@ -471,6 +473,17 @@ struct VoicetermApp {
     acoustic_distance: f32,
     acoustic_confirms: u32,
     acoustic_same_speaker: bool,
+    /// The first-run model wizard (kit widget, re-exported by our
+    /// setup_wizard). Some() until it finishes; the Models tab hosts it.
+    wizard: Option<voiceterm_egui::setup_wizard::SetupWizard>,
+    /// The chat panel (kit widget via chat_panel) — the local model's
+    /// conversation, on its own view.
+    chat: voiceterm_egui::chat_panel::ChatPanel,
+    /// The voice halo (repl_voice_glow): drawn over everything while the mic
+    /// is armed, so the state is visible from across the room.
+    glow: voiceterm_egui::repl_voice_glow::ReplVoiceGlow,
+    /// A destructive action awaiting confirmation (confirm_dialog).
+    pending_confirm: Option<(String, voiceterm_egui::confirm_dialog::ConfirmDialog)>,
     bar_state: voiceterm_egui::bars::BarState,
     /// The graph's SOURCE, not a prebuilt topology.
     ///
@@ -496,6 +509,35 @@ impl eframe::App for VoicetermApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(self.theme));
+
+        // CONTEXT-LEVEL WIDGETS, drawn above every panel because that is what
+        // they are for: a modal that a panel can cover is not modal, and a
+        // voice halo that only shows on one tab is a status light behind a
+        // door.
+        if let Some((cmd, dlg)) = &mut self.pending_confirm {
+            use voiceterm_egui::confirm_dialog::Outcome;
+            match dlg.show(ctx) {
+                Outcome::Confirmed => {
+                    let cmd = cmd.clone();
+                    self.pending_confirm = None;
+                    self.pty_out.extend_from_slice(cmd.as_bytes());
+                    self.pty_out.push(b'\r');
+                }
+                // Cancelled and timed-out both drop the command. The line is
+                // NOT restored to the input: it was already audited as
+                // submitted, and silently re-typing it would invite a second
+                // Enter to run what was just refused.
+                // Cancelled and Discarded both drop it. They stay distinct in
+                // the enum because a caller that PERSISTS a draft needs the
+                // difference — this one does not, and conflating them here is
+                // a decision about this call site, not about the kit.
+                Outcome::Cancelled | Outcome::Discarded => self.pending_confirm = None,
+                Outcome::Pending => {}
+            }
+        }
+        // The mic halo follows the router's own state rather than a separate
+        // flag, so the glow cannot disagree with what is actually listening.
+        self.glow.show(ctx);
 
         // The escape chord, checked before anything draws: if the recogniser
         // has stopped working, voice mode must not be a room with no door.
@@ -1269,6 +1311,25 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     CentralView::Models => {
+                        // FIRST RUN: the wizard, until it finishes. It owns
+                        // the phase machine (Intro → Browse → Downloading →
+                        // Done) and reports events; the manual search below
+                        // stays available throughout, because a wizard that
+                        // hides the tools is a wall when it guesses wrong.
+                        if let Some(w) = &mut self.wizard {
+                            use voiceterm_egui::setup_wizard::WizardEvent;
+                            match w.ui(ui) {
+                                Some(WizardEvent::Finish) => self.wizard = None,
+                                Some(WizardEvent::Download(action)) => {
+                                    // No HTTP client in this crate — the same
+                                    // contract the Models search follows.
+                                    self.toasts.info(format!("{action:?}"),
+                                                     ui.input(|i| i.time));
+                                }
+                                _ => {}
+                            }
+                            ui.separator();
+                        }
                         use voiceterm_egui::model_picker as mp;
                         ui.horizontal(|ui| {
                             ui.label("search:");
@@ -1394,6 +1455,17 @@ impl eframe::App for VoicetermApp {
                             // this crate has no HTTP client, so opening means
                             // surfacing the URL.
                             self.toasts.info(url, ui.input(|i| i.time));
+                        }
+                    }
+                    CentralView::Chat => {
+                        // The local model's conversation. The panel owns the
+                        // transcript and returns what the user sent; there is
+                        // no llama.cpp in this crate, so the reply is an
+                        // explicit notice rather than a fabricated answer —
+                        // an invented assistant turn is worse than none.
+                        if let Some(sent) = self.chat.ui(ui) {
+                            self.chat.reload(&format!(
+                                "user: {sent}\nassistant: (no local model attached in this build)"));
                         }
                     }
                     CentralView::Terminal => {}
@@ -1586,11 +1658,33 @@ impl eframe::App for VoicetermApp {
                         self.audit_lines.drain(..cut);
                     }
                 }
-                // A submitted line goes to the same place, newline included: a
-                // PTY does not distinguish "the user typed a command" from "the
-                // user typed bytes", and having two paths is how they drift.
-                self.pty_out.extend_from_slice(line.as_bytes());
-                self.pty_out.push(b'\r');
+                // A MUTATING COMMAND ASKS FIRST. cmd_risk already classified
+                // every line for the snapshot policy; until now that verdict
+                // never stopped anything. The dialog's timeout action is
+                // Cancel — a confirmation that runs `rm -rf` because nobody
+                // was looking is not a confirmation.
+                use voiceterm_egui::cmd_risk::Risk;
+                use voiceterm_egui::confirm_dialog::{ConfirmDialog, TimeoutAction};
+                if voiceterm_egui::cmd_risk::classify(&line) == Risk::Mutating
+                    && self.pending_confirm.is_none()
+                {
+                    self.pending_confirm = Some((
+                        line.clone(),
+                        ConfirmDialog::new(
+                            "Run this command?",
+                            format!("`{line}` can modify or delete data."),
+                            "Run",
+                        )
+                        .with_timeout(20.0)
+                        .with_timeout_action(TimeoutAction::Cancel),
+                    ));
+                } else {
+                    // A PTY does not distinguish "the user typed a command"
+                    // from "the user typed bytes", and having two paths is how
+                    // they drift.
+                    self.pty_out.extend_from_slice(line.as_bytes());
+                    self.pty_out.push(b'\r');
+                }
             }
             // LOCAL ECHO INTO THE SCREEN, since there is no PTY here.
             //
@@ -1968,6 +2062,12 @@ fn main() -> eframe::Result<()> {
                 acoustic_distance: 0.20,
                 acoustic_confirms: 2,
                 acoustic_same_speaker: true,
+                // has_active_model = false: this build ships no .gguf, and
+                // claiming one would send the wizard to the wrong phase.
+                wizard: Some(voiceterm_egui::setup_wizard::SetupWizard::new(false)),
+                chat: Default::default(),
+                glow: Default::default(),
+                pending_confirm: None,
                 bar_state: Default::default(),
                 graph_source: String::new(),
                 settings_open: false,
