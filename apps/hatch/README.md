@@ -32,6 +32,18 @@ swipe down on the backdrop to close (both honor the Touch config section);
 tap on empty backdrop closes; typing anywhere searches; Enter launches the
 top hit; the system row hides while maliit is up.
 
+The plasmoid's pure logic is plain JavaScript under `contents/ui/code/`
+precisely so it can be run without Plasma:
+
+```sh
+node --test qml/tests/*.mjs
+```
+
+That covers `tools.js` (the context-menu builder, written from scratch
+because the fork's drop didn't include kicker's) and `animation.js` (the
+seven slide-in patterns, extracted from the delegate for this reason —
+the arithmetic is invisible in review and obvious on screen).
+
 ## hatch-egui
 
 ```sh
@@ -68,7 +80,7 @@ currently thinks.
 
 Verified here: `cargo test` green for hatch-core and hatch-egui
 (x86_64 host); `cargo build` of the full app feature; qmllint syntax pass
-on the QML (unresolved org.kde.* imports expected off-device).
+on the QML (unresolved org.kde.* imports expected off-device); `node --test qml/tests/*.mjs` green for the plasmoid's pure JS.
 
 Not verified here, needs the FP5: anything rendered (no display in the
 build env) — maliit summon/avoidance, KWin resize behavior when the

@@ -6,6 +6,7 @@ import org.kde.plasma.plasmoid 2.0
 import org.kde.kirigami 2.20 as Kirigami
 
 import "code/tools.js" as Tools
+import "code/animation.js" as Anim
 
 /* One tile. Pure presentation — ALL input lives in ItemGridView's handlers,
    which is the fix for the old tap bugs: no per-delegate MouseArea can steal
@@ -64,11 +65,9 @@ Item {
     }
 
     // ---- slide-in --------------------------------------------------------
-    // Grid geometry, derived once per tile.
+    // The only grid geometry the delegate needs; the pattern math derives
+    // row/column from it in animation.js.
     readonly property int gridCols: Math.max(1, Math.floor(GridView.view.width / GridView.view.cellWidth))
-    readonly property int col: index % gridCols
-    readonly property int row: Math.floor(index / gridCols)
-    readonly property int centerCol: Math.floor(gridCols / 2)
 
     transform: [
         Translate { id: slideT },
@@ -81,50 +80,16 @@ Item {
                 || !root.visible) {
             return;
         }
-        // Arrival vector + stagger, per pattern.
-        let dx = 0, dy = 0, delay = 0, fromScale = 1.0, fromRot = 0;
-        const base = 40 * speed;
-        switch (slideStyle) {
-        case 1: // from below
-            dy = 60 + (row * 12);
-            delay = index * 18;
-            break;
-        case 2: // from edges
-            dx = (col < centerCol ? -1 : 1) * (Math.abs(col - centerCol) + 1) * 30;
-            delay = (gridCols - Math.abs(col - centerCol)) * 22;
-            break;
-        case 3: // cascade
-            dx = -40; dy = 40;
-            delay = (row + col) * 26;
-            break;
-        case 4: { // ripple from grid center
-            const cr = row - 1.5, cc = col - centerCol;
-            const dist = Math.sqrt(cr * cr + cc * cc);
-            fromScale = 0.3;
-            delay = dist * 40;
-            break;
-        }
-        case 5: { // scatter (deterministic pseudo-random per index)
-            const r = (Math.sin(index * 127.1) * 43758.5453) % 1;
-            dx = (r - 0.5) * 160;
-            dy = (((r * 7919) % 1) - 0.5) * 160;
-            fromRot = (r - 0.5) * 40;
-            fromScale = 0.5;
-            delay = ((r + 1) % 1) * 180;
-            break;
-        }
-        case 6: // wave: below, sinusoidal by column
-            dy = 70;
-            delay = (Math.sin(col / Math.max(1, gridCols - 1) * Math.PI) * 90) + row * 30;
-            break;
-        }
-        slideT.x = dx;
-        slideT.y = dy;
-        scaleT.xScale = scaleT.yScale = fromScale;
-        rotT.angle = fromRot;
+        // The arrival vector lives in code/animation.js so it can be tested
+        // off-device (node --test qml/tests/); this side only applies it.
+        const from = Anim.slideFrom(slideStyle, index, gridCols, speed);
+        slideT.x = from.dx;
+        slideT.y = from.dy;
+        scaleT.xScale = scaleT.yScale = from.scale;
+        rotT.angle = from.rotation;
         item.opacity = 0;
-        slideAnim.duration = Math.round((260 + base) * speed);
-        slideDelay.interval = Math.max(1, Math.round(delay * speed));
+        slideAnim.duration = from.duration;
+        slideDelay.interval = Math.max(1, from.delay);
         slideDelay.start();
     }
 
