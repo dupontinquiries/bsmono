@@ -167,9 +167,21 @@ media uses. A missing sample is counted out loud and its clip stays
 silent; garbage refuses to open rather than becoming an empty project.
 The shell opens `STUDIO_PROJECT` (default `./project.studio`) at startup
 — a load FAILURE starts a demo but warns that Ctrl+S will overwrite —
-and saves on Ctrl+S or the save button. Also still named: streaming
-pattern playback inside `DeviceEngine`'s realtime render, and the Program
-panel, which says so on screen instead of showing nothing.
+and saves on Ctrl+S or the save button. **Clips answer the mouse.** The timeline's `hit_test`/`snap` helpers were
+built and never wired: clicks were thrown away by the shell and no drag
+path existed. `timeline` now returns a `TimelineResponse` — click (the
+shell selects; shift toggles) and drop (`MoveClip`, an op like any other:
+undoable, on the wire, and refusable out loud when `check_room` says no).
+The drag itself lives on the `View` as transient state, draws a ghost, and
+never touches the project; `move_target` is a pure, tested function that
+snaps, clamps at zero, and refuses to land audio on a video row (a
+cross-kind vertical move is a re-route the mixer cannot honour — refused
+at the gesture, not the op). The rack grew pattern LENGTH (1–64 steps, the
+rows' u64; shortening hides bits without eating them, so
+shorten-then-lengthen round-trips) and DUPLICATE (variations start from
+the groove, not silence). Also still named: streaming pattern playback
+inside `DeviceEngine`'s realtime render, and the Program panel, which says
+so on screen instead of showing nothing.
 
 ## Realtime collaboration, concretely
 

@@ -50,6 +50,23 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
             s.rack.patterns.push(studio_live::Pattern::new(&format!("Pat {}", n + 1), 16, ch));
             s.current_pattern = s.rack.patterns.len() - 1;
         }
+        if ui.button("dup").on_hover_text("duplicate this pattern").clicked() {
+            if let Some(p) = s.rack.patterns.get(s.current_pattern) {
+                // Variations start from the groove, not from silence — the
+                // "+" empty pattern exists for the other case.
+                let mut copy = p.clone();
+                copy.name = format!("{} copy", copy.name);
+                s.rack.patterns.push(copy);
+                s.current_pattern = s.rack.patterns.len() - 1;
+            }
+        }
+        if let Some(p) = s.rack.patterns.get_mut(s.current_pattern) {
+            ui.label("steps");
+            // 64 is the rows' u64 bitmask, not a taste: a 4-bar 16th grid.
+            // Shortening keeps the hidden bits, so shorten-then-lengthen
+            // round-trips instead of eating the tail of the pattern.
+            ui.add(egui::DragValue::new(&mut p.steps).range(1..=64));
+        }
         ui.separator();
         if ui.button("bounce → timeline").clicked() {
             s.pending_bounce = true;

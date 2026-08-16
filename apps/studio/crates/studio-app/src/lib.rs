@@ -1141,8 +1141,31 @@ impl eframe::App for App {
                 Panel::Timeline => {
                     let ph = self.studio.playhead();
                     let sel = self.studio.selection.clone();
-                    studio_egui::timeline(ui, &self.studio.session.doc, &mut self.studio.view,
-                                          &colors, ph, &sel, &self.peaks);
+                    let tr = studio_egui::timeline(ui, &self.studio.session.doc,
+                                                   &mut self.studio.view,
+                                                   &colors, ph, &sel, &self.peaks);
+                    if let Some(id) = tr.clicked {
+                        // Click selects; shift-click toggles membership — the
+                        // return the shell used to throw away, which made
+                        // every clip mouse-dead.
+                        if ui.input(|i| i.modifiers.shift) {
+                            if let Some(at) = self.studio.selection.iter().position(|c| *c == id) {
+                                self.studio.selection.remove(at);
+                            } else {
+                                self.studio.selection.push(id);
+                            }
+                        } else {
+                            self.studio.selection = vec![id];
+                        }
+                    }
+                    if let Some((id, pos, track)) = tr.moved {
+                        // The drop is an op like any other: undoable, on the
+                        // wire, and REFUSABLE — check_room may say no, and
+                        // the status says so instead of the clip snapping
+                        // back wordlessly.
+                        self.studio.edit(
+                            studio_core::Op::MoveClip { id, pos, track }, "moved");
+                    }
                 }
             }
         });

@@ -1905,3 +1905,39 @@ mod choke_tests {
         assert!(e(&out) > e(&free) * 0.9, "no group, no cut");
     }
 }
+
+#[cfg(test)]
+mod pattern_length_tests {
+    use super::*;
+
+    #[test]
+    fn shortening_a_pattern_hides_steps_without_eating_them() {
+        // The rack panel edits `steps` directly; the bits past the new end
+        // must survive so shorten-then-lengthen round-trips — losing the
+        // back half of a 32-step groove to a moment of 16-step curiosity
+        // would be a silent edit nobody made.
+        let mut p = Pattern::new("A", 32, 1);
+        p.set(0, 30, true);
+        p.set(0, 5, true);
+        p.steps = 16;
+        assert_eq!(p.hits(), vec![(0, 5)], "hidden steps do not render");
+        p.steps = 32;
+        assert_eq!(p.hits(), vec![(0, 5), (0, 30)], "and come back intact");
+    }
+
+    #[test]
+    fn a_long_pattern_renders_its_whole_length() {
+        let rack = Rack::trap_kit();
+        let mut p = Pattern::new("long", 64, rack.channels.len());
+        p.set(1, 0, true);
+        p.set(1, 63, true);
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let t = rack.tempo();
+        let out = render_pattern(&p, &rack, &mut synth, &t, 48_000, 0);
+        let step = t.step_len().to_samples(48_000) as usize;
+        assert_eq!(out.len(), step * 64, "four bars of buffer");
+        let tail: f32 = out[step * 63..].iter().map(|v| v.abs()).sum();
+        assert!(tail > 1.0, "the step-63 kick is in the last step's audio");
+    }
+}

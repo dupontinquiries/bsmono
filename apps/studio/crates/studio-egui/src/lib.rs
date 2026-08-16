@@ -49,11 +49,27 @@ pub struct View {
     pub track_h: f32,
     /// Width of the track-header gutter on the left.
     pub gutter: f32,
+    /// A clip mid-drag. Interaction state, not camera — it lives here because
+    /// both answer "what is this window doing right now", the view is already
+    /// the `&mut` the timeline holds across frames, and a `None` default
+    /// keeps every existing constructor working. The drag never touches the
+    /// project: the ghost is drawn from THIS, and only the drop becomes an
+    /// edit for the host to apply — grid's own returns-edits rule.
+    pub drag: Option<ClipDrag>,
+}
+
+/// A grabbed clip: which one, and where inside it the pointer took hold, so
+/// the clip doesn't jump to put its left edge under the finger.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipDrag {
+    pub id: ClipId,
+    /// Pointer time minus clip.pos at grab.
+    pub grab_dt: Ticks,
 }
 
 impl Default for View {
     fn default() -> Self {
-        View { px_per_sec: 100.0, scroll: Ticks::ZERO, track_h: 64.0, gutter: 132.0 }
+        View { px_per_sec: 100.0, scroll: Ticks::ZERO, track_h: 64.0, gutter: 132.0, drag: None }
     }
 }
 
@@ -102,6 +118,47 @@ pub const RULER_H: f32 = 26.0;
 /// Which clip (if any) sits under a point. Pure, so it is unit-testable — and
 /// it searches in reverse draw order so the clip you can SEE on top is the one
 /// you get, which matters the moment two tracks overlap visually.
+/// Where a dragged clip would land: snapped time (never negative), and the
+/// track under the pointer — but ONLY if that track carries the same kind as
+/// the clip's current one. Dragging audio "through" a video row keeps the
+/// original track: a vertical move between kinds is a re-route the mixer
+/// cannot honour, so refusing it at the gesture beats refusing it at the op.
+pub fn move_target(
+    project: &Project,
+    view: &View,
+    drag: &ClipDrag,
+    at: Pos2,
+    origin: Pos2,
+    playhead: Ticks,
+) -> Option<(Ticks, TrackId)> {
+    let clip = project.clips.get(&drag.id)?;
+    let raw = view.x_to_time(at.x, origin.x).saturating_sub(drag.grab_dt);
+    let tolerance = Ticks((0.25 * TICKS_PER_SECOND as f64 * (100.0 / view.px_per_sec as f64)) as i64);
+    let pos = Ticks(snap(project, raw, playhead, tolerance, Some(drag.id)).0.max(0));
+    let rows = track_rows(project);
+    let row = ((at.y - origin.y - RULER_H) / view.track_h).floor();
+    let from_kind = project.tracks.iter().find(|t| t.id == clip.track)?.kind;
+    let track = if row >= 0.0 {
+        rows.get(row as usize)
+            .and_then(|tid| project.tracks.iter().find(|t| t.id == *tid))
+            .filter(|t| t.kind == from_kind && !t.locked)
+            .map(|t| t.id)
+            .unwrap_or(clip.track)
+    } else {
+        clip.track
+    };
+    Some((pos, track))
+}
+
+/// What one timeline frame produced for the host.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TimelineResponse {
+    /// A clip was clicked (selection is the host's business).
+    pub clicked: Option<ClipId>,
+    /// A drag ended: move this clip here. An op-shaped fact, not a mutation.
+    pub moved: Option<(ClipId, Ticks, TrackId)>,
+}
+
 pub fn hit_test(project: &Project, view: &View, at: Pos2, origin: Pos2) -> Option<ClipId> {
     let rows = track_rows(project);
     let row = view.row_at(at.y, origin.y, rows.len())?;
@@ -157,7 +214,7 @@ pub fn timeline(
     // clip whose audio has not been scanned yet is still editable — analysis
     // must never gate editing.
     peaks: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
-) -> Option<ClipId> {
+) -> TimelineResponse {
     let rows = track_rows(&doc.project);
     let height = RULER_H + rows.len().max(1) as f32 * view.track_h;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
@@ -274,9 +331,51 @@ pub fn timeline(
                              Stroke::new(2.0_f32, colors.danger));
     }
 
-    resp.interact_pointer_pos()
+    // ── drag a clip: ghost while held, one move on release ─────────────────
+    let mut out = TimelineResponse::default();
+    if resp.drag_started() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            if let Some(id) = hit_test(&doc.project, view, p, origin) {
+                if let Some(clip) = doc.project.clips.get(&id) {
+                    view.drag = Some(ClipDrag {
+                        id,
+                        grab_dt: view.x_to_time(p.x, origin.x).saturating_sub(clip.pos),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(drag) = view.drag {
+        // The clip can vanish mid-drag — a peer's RemoveClip is not obliged
+        // to wait for our finger. A dead drag just ends.
+        if !doc.project.clips.contains_key(&drag.id) {
+            view.drag = None;
+        } else if let Some(p) = resp.interact_pointer_pos() {
+            if let Some((pos, track)) = move_target(&doc.project, view, &drag, p, origin, playhead) {
+                if resp.drag_stopped() {
+                    out.moved = Some((drag.id, pos, track));
+                    view.drag = None;
+                } else {
+                    // The ghost: outline at the prospective landing spot,
+                    // drawn from the drag state alone — the project is not
+                    // touched until the drop becomes an op.
+                    let clip = &doc.project.clips[&drag.id];
+                    if let Some(row) = track_rows(&doc.project).iter().position(|t| *t == track) {
+                        let r = view.clip_rect(pos, clip.len, row, origin);
+                        painter.rect_stroke(r, 3.0, Stroke::new(2.0_f32, colors.accent),
+                                            egui::StrokeKind::Inside);
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            view.drag = None; // released outside anything meaningful
+        }
+    }
+    out.clicked = resp.interact_pointer_pos()
         .filter(|_| resp.clicked())
-        .and_then(|p| hit_test(&doc.project, view, p, origin))
+        .and_then(|p| hit_test(&doc.project, view, p, origin));
+    out
 }
 
 /// A stable, well-separated colour per site id. Deterministic so the same peer
@@ -427,5 +526,67 @@ mod tests {
         assert_eq!(format_timecode(Ticks::from_seconds(61.5)), "0:01:01.500");
         assert_eq!(format_timecode(Ticks::from_seconds(3661.25)), "1:01:01.250");
         assert_eq!(format_timecode(Ticks::from_seconds(-2.0)), "-0:00:02.000");
+    }
+}
+
+#[cfg(test)]
+mod move_target_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId};
+
+    // Reuses the sibling module's fixture shape: V1 (video) row 0 with clip
+    // 10 at 2s..6s, A1 (audio) row 1 with clip 20 at 3s..8s.
+    fn project() -> Project {
+        let mut p = Project::default();
+        for (i, (kind, nm)) in [(studio_core::TrackKind::Video, "V1"),
+                                 (studio_core::TrackKind::Audio, "A1"),
+                                 (studio_core::TrackKind::Audio, "A2")].iter().enumerate() {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(i as u64 + 1), kind: *kind,
+                name: (*nm).into(), muted: false, locked: false, gain: 1.0, route: None },
+                at: i }).unwrap();
+        }
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2,
+            has_video: true } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(20), source: SourceId(1),
+            track: TrackId(2), pos: Ticks::from_seconds(3.0), src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        p
+    }
+
+    fn drag() -> ClipDrag { ClipDrag { id: ClipId(20), grab_dt: Ticks::ZERO } }
+    fn v() -> View { View::default() }
+
+    #[test]
+    fn a_vertical_move_lands_on_the_same_kind_and_never_on_the_wrong_one() {
+        let p = project();
+        // Pointer over row 2 (A2, audio): the audio clip may move there.
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(20.0), 0.0),
+                           RULER_H + v().track_h * 2.5);
+        let (_, track) = move_target(&p, &v(), &drag(), at, Pos2::ZERO,
+                                     Ticks::ZERO).unwrap();
+        assert_eq!(track, TrackId(3), "audio moved to the other audio track");
+        // Pointer over row 0 (V1, video): the kind mismatch keeps the track.
+        let at = Pos2::new(at.x, RULER_H + v().track_h * 0.5);
+        let (_, track) = move_target(&p, &v(), &drag(), at, Pos2::ZERO,
+                                     Ticks::ZERO).unwrap();
+        assert_eq!(track, TrackId(2), "audio does not land on a video row");
+    }
+
+    #[test]
+    fn the_drop_snaps_to_edges_and_never_goes_negative() {
+        let p = project();
+        // Near the clip's own old start (3.0s) — must NOT snap to itself,
+        // but 0s is far, so an open-space drop is exact.
+        let x = v().time_to_x(Ticks::from_seconds(20.02), 0.0);
+        let at = Pos2::new(x, RULER_H + v().track_h * 1.5);
+        let (pos, _) = move_target(&p, &v(), &drag(), at, Pos2::ZERO, Ticks::from_seconds(20.0)).unwrap();
+        assert_eq!(pos, Ticks::from_seconds(20.0), "snapped to the playhead");
+        // A grab deep inside the clip dragged left of zero clamps at zero.
+        let deep = ClipDrag { id: ClipId(20), grab_dt: Ticks::from_seconds(4.0) };
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(1.0), 0.0),
+                           RULER_H + v().track_h * 1.5);
+        let (pos, _) = move_target(&p, &v(), &deep, at, Pos2::ZERO, Ticks::from_seconds(500.0)).unwrap();
+        assert_eq!(pos, Ticks::ZERO, "a clip cannot be dragged before the origin");
     }
 }
