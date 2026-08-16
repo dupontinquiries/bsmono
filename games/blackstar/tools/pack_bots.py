@@ -60,7 +60,7 @@ import sys
 import zlib
 
 MAGIC = b"BSPK"
-VERSION = 1
+VERSION = 2
 
 
 def float_ranges(pose_dir):
@@ -122,14 +122,53 @@ def chassis_box(poses):
 
 
 def quantise(vals, lo, hi):
+    """u16 codes, reordered for the compressor. Lossless — v1 and v2 decode to
+    the same numbers.
+
+    Three transforms, each measured (docs/FLEET_COMPRESSION.md):
+
+      deinterleave by axis   100% -> 95%
+      + byte planes                -> 87%
+      + per-axis delta             -> 84%
+
+    The insight is the round-object one: a ring of vertices varies SMOOTHLY
+    along each axis, and interleaved xyz hides that from zlib — consecutive
+    bytes come from different axes, so a smooth run looks like noise.
+    """
     span = (hi - lo) or 1.0
-    return b"".join(struct.pack("<H", int(round((v - lo) / span * 65535))) for v in vals)
+    q = [int(round((v - lo) / span * 65535)) for v in vals]
+    n = len(q) // 3
+    out = []
+    for k in range(3):
+        ch = q[k::3]
+        # Delta within the axis. Wrapped to 16 bits: the decoder wraps back, and
+        # storing signed would need a wider type for no gain.
+        out.append(ch[0] if ch else 0)
+        prev = ch[0] if ch else 0
+        for v in ch[1:]:
+            out.append((v - prev) & 0xFFFF)
+            prev = v
+    # High and low bytes in separate runs. Deltas are small, so the high plane
+    # is mostly zeros and compresses to almost nothing; mixed together, every
+    # other byte would break the run.
+    return bytes((v >> 8) & 0xFF for v in out) + bytes(v & 0xFF for v in out)
 
 
 def dequantise(buf, lo, hi, n):
+    """Inverse of quantise: byte planes -> deltas -> codes -> floats."""
     span = (hi - lo) or 1.0
-    us = struct.unpack(f"<{n}H", buf)
-    return [lo + u / 65535.0 * span for u in us]
+    half = len(buf) // 2
+    codes = [(buf[i] << 8) | buf[half + i] for i in range(half)]
+    per = n // 3
+    vals = [0.0] * n
+    at = 0
+    for k in range(3):
+        prev = 0
+        for j in range(per):
+            prev = codes[at] if j == 0 else (prev + codes[at]) & 0xFFFF
+            vals[j * 3 + k] = lo + prev / 65535.0 * span
+            at += 1
+    return vals
 
 
 def pack_chassis(cdir, dry=False):
