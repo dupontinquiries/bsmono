@@ -147,6 +147,14 @@ pub struct Tadpole {
     /// two-column mess that looks like a bug.
     pub render: table::Render,
     pub last_error: Option<OcrError>,
+    /// Who said what, when the segments came from real audio. `None` for
+    /// pasted text: its timings are line indices, and turn detection on fake
+    /// gaps would be labels made of noise.
+    pub diarised: Option<speakers::Diarised>,
+    /// Show only this speaker. Honoured only when the labels are identities
+    /// (`Diarised::filterable`) — filtering turn numbers silently loses lines,
+    /// which is the exact affordance `speakers::Source` exists to forbid.
+    pub speaker_filter: Option<usize>,
 }
 
 impl Default for Tadpole {
@@ -158,6 +166,8 @@ impl Default for Tadpole {
             render: table::Render::Lines,
             models: models::ModelState::Missing,
             last_error: None,
+            diarised: None,
+            speaker_filter: None,
         }
     }
 }
@@ -241,9 +251,11 @@ impl Tadpole {
             }
             paste::Incoming::Audio(f) => {
                 match transcriber.transcribe(bytes, *f) {
-                    Ok(segs) => { self.take_segments(segs); }
+                    Ok(segs) => { self.take_segments(segs, true); }
                     Err(e) => {
                         self.segments.clear();
+                        self.diarised = None;
+                        self.speaker_filter = None;
                         self.last_error = Some(e);
                     }
                 }
@@ -259,14 +271,14 @@ impl Tadpole {
                         start_ms: i as u64, end_ms: i as u64, text: l.trim().into(), score: 1.0,
                     })
                     .collect();
-                self.take_segments(segs);
+                self.take_segments(segs, false);
             }
             _ => {}
         }
         what
     }
 
-    fn take_segments(&mut self, segs: Vec<audio::Segment>) {
+    fn take_segments(&mut self, segs: Vec<audio::Segment>, timed: bool) {
         self.segments = segs;
         // Regions and segments are two views of one document, and a new source
         // replaces the document. Leaving stale regions would put the previous
@@ -274,6 +286,15 @@ impl Tadpole {
         self.regions.clear();
         self.selected.clear();
         self.last_error = None;
+        // Turn labels only where the pauses are real. Pasted text carries
+        // line-index timestamps; running the 700ms heuristic over those would
+        // produce one giant turn and call it structure.
+        self.diarised = if timed && !self.segments.is_empty() {
+            Some(speakers::Diarised::from_turns(self.segments.clone()))
+        } else {
+            None
+        };
+        self.speaker_filter = None;
     }
 
     /// Topics for the overview pane, from whichever half has material.
@@ -294,6 +315,8 @@ impl Tadpole {
                 // Same rule in the other direction: a scan replaces the
                 // document, so a previous transcript must not linger.
                 self.segments.clear();
+                self.diarised = None;
+                self.speaker_filter = None;
                 // Selection is cleared, not remapped: indices from the previous
                 // image mean nothing here, and keeping them would copy text
                 // from wherever those indices happen to land.
@@ -350,6 +373,39 @@ impl Tadpole {
     /// Regions the user should look at before trusting.
     pub fn uncertain(&self) -> Vec<usize> {
         (0..self.regions.len()).filter(|&i| !self.regions[i].is_confident()).collect()
+    }
+
+    /// Set (or clear) the speaker filter. Refused — returning false and
+    /// clearing — when the labels are not identities: `speakers::Source`
+    /// draws that line, and honouring a filter on turn numbers would silently
+    /// drop half of what a returning speaker said.
+    pub fn set_speaker_filter(&mut self, id: Option<usize>) -> bool {
+        let ok = match (&self.diarised, id) {
+            (_, None) => true,
+            (Some(d), Some(_)) => d.filterable(),
+            (None, Some(_)) => false,
+        };
+        self.speaker_filter = if ok { id } else { None };
+        ok
+    }
+
+    /// The transcript as plain text, respecting the speaker filter where the
+    /// labels can support one. With no diarisation, the joined segments.
+    pub fn transcript(&self) -> String {
+        match &self.diarised {
+            Some(d) => d.raw_text(self.speaker_filter),
+            None => self
+                .segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// The transcript with speaker labels, when there are labels to show.
+    pub fn annotated_transcript(&self) -> Option<String> {
+        self.diarised.as_ref().map(|d| d.annotated_text())
     }
 }
 
@@ -731,5 +787,70 @@ and more routing", None, &Fake(vec![]), &NoVoice);
         let (x0, y0, x1, y1) = skew.bounds();
         assert_eq!((x0, y0, x1, y1), (10.0, 8.0, 62.0, 34.0));
         assert!(skew.contains(30.0, 20.0));
+    }
+
+    // ── speakers wiring: diarisation is part of the document lifecycle ──
+
+    fn tseg(start: u64, end: u64, text: &str) -> audio::Segment {
+        audio::Segment { start_ms: start, end_ms: end, text: text.into(), score: 0.9 }
+    }
+
+    #[test]
+    fn real_audio_gets_turn_labels_but_refuses_a_speaker_filter() {
+        let mut app = Tadpole::default();
+        let voice = FakeVoice(vec![
+            tseg(0, 1_000, "hello there"),
+            tseg(2_000, 3_000, "and back again"), // 1s pause ≥ TURN_GAP_MS
+        ]);
+        app.accept(&wav_bytes(), Some("m.wav"), &Fake(vec![]), &voice);
+        let d = app.diarised.as_ref().expect("timed audio is diarised");
+        assert_eq!(d.roster().len(), 2, "the pause is a turn boundary");
+        assert_eq!(d.roster()[0].label(), "Turn 1", "turns say turn, not speaker");
+        assert!(
+            !app.set_speaker_filter(Some(0)),
+            "turn labels are alternation, not identity — the filter is refused"
+        );
+        assert_eq!(app.speaker_filter, None);
+        assert_eq!(app.transcript(), "hello there\nand back again", "refused filter hides nothing");
+        assert!(app.annotated_transcript().unwrap().starts_with("Turn 1:"));
+    }
+
+    #[test]
+    fn pasted_text_is_never_diarised() {
+        let mut app = Tadpole::default();
+        app.accept(b"line one\nline two", None, &Fake(vec![]), &NoVoice);
+        assert_eq!(app.segments.len(), 2);
+        assert!(app.diarised.is_none(), "line-index timings are not pauses");
+        assert_eq!(app.transcript(), "line one\nline two");
+        assert!(app.annotated_transcript().is_none());
+    }
+
+    #[test]
+    fn a_scan_clears_the_previous_transcripts_labels() {
+        let mut app = Tadpole::default();
+        let voice = FakeVoice(vec![tseg(0, 500, "before")]);
+        app.accept(&wav_bytes(), Some("m.wav"), &Fake(vec![]), &voice);
+        assert!(app.diarised.is_some());
+        app.scan(&Fake(vec![r("abcd", 0.9, 0.0, 0.0, 40.0, 12.0)]), &img());
+        assert!(app.diarised.is_none(), "a scan replaces the document, labels included");
+        assert_eq!(app.speaker_filter, None);
+    }
+
+    #[test]
+    fn identity_labels_filter_and_rename_through_the_app() {
+        // A Model-source Diarised — the shape a diarisation backend will hand
+        // over. Installed directly since no backend ships yet; the app-level
+        // filter path is what this pins.
+        let segs = vec![tseg(0, 1, "alpha"), tseg(10_000, 10_001, "beta"), tseg(20_000, 20_001, "gamma")];
+        let sp = |id| Some(speakers::Speaker::new(id, speakers::Source::Model));
+        let mut app = Tadpole::default();
+        app.segments = segs.clone();
+        app.diarised = Some(speakers::Diarised::new(segs, vec![sp(0), sp(1), sp(0)]));
+        assert!(app.set_speaker_filter(Some(0)), "identities may filter");
+        assert_eq!(app.transcript(), "alpha\ngamma", "the returning speaker keeps both lines");
+        assert!(app.set_speaker_filter(None));
+        assert_eq!(app.transcript(), "alpha\nbeta\ngamma");
+        if let Some(d) = &mut app.diarised { d.rename(0, "Ada"); }
+        assert!(app.annotated_transcript().unwrap().contains("Ada:"));
     }
 }
