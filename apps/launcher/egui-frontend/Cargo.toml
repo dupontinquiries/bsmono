@@ -18,7 +18,7 @@ default = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs, no extra
 # flags — see manifest/projects.toml) produces the deploy binary directly, same
 # convention as the other -egui apps.
-app = ["dep:eframe", "dep:image"]
+app = ["dep:eframe", "dep:image", "dep:resvg"]
 
 [dependencies]
 config-kit = { path = "../../../shared/config-kit" }
@@ -30,5 +30,10 @@ eframe = { version = "0.34", default-features = false, features = ["glow", "wayl
 # eframe's own icon loading — declaring it explicitly (rather than reaching
 # for the transitive copy) is what lets shell.rs decode icon files itself.
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# SVG rasterization for icon themes whose apps/ entries are scalable/*.svg
+# only (the common case on modern themes — see decode_icon's doc comment).
+# resvg pulls usvg+tiny-skia+fontdb; no fonts are needed for icon artwork,
+# so this stays lean relative to a general-purpose text-capable SVG stack.
+resvg = { version = "0.48", optional = true }
 
 [workspace]

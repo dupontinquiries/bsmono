@@ -68,23 +68,53 @@ pub fn hit_tile(p: Pos2, spec: &GridSpec, count: usize, inset: f32) -> Option<us
 }
 
 /// Decode an icon file's bytes into something `egui::Context::load_texture`
-/// accepts. Only formats the `image` crate can decode work — this build only
-/// enables its `png` codec, so a theme entry that resolved to an `.svg` (the
-/// common case for modern themes' scalable dirs) decodes to `None` here and
-/// [`Shell::icon_texture`] falls back to the glyph. Rasterizing SVG is a
-/// real follow-up (needs `resvg` or similar), not something to fold into
-/// this pass.
+/// accepts. `target_px` is only used for SVG: freedesktop scalable/ icons
+/// commonly declare a small intrinsic viewBox (24×24 is typical) even though
+/// they're meant to be used at any size, so rasterizing at the SVG's own
+/// size and letting egui upscale the texture would look soft — this renders
+/// directly at the tile's actual on-screen size instead. PNG/other raster
+/// formats decode at their native resolution regardless of `target_px`;
+/// egui's own texture filtering handles scaling those.
 #[cfg(feature = "app")]
-fn decode_icon(path: &std::path::Path) -> Option<egui::ColorImage> {
+fn decode_icon(path: &std::path::Path, target_px: u32) -> Option<egui::ColorImage> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Some(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw()))
+    if ext == "svg" || ext == "svgz" {
+        decode_svg(&bytes, target_px)
+    } else {
+        let img = image::load_from_memory(&bytes).ok()?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        Some(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw()))
+    }
+}
+
+/// Rasterize SVG bytes to `target_px` on the longer side, preserving aspect
+/// ratio. `resvg` 0.48's actual shape (confirmed by reading its 0.48.1
+/// source directly rather than assuming an API): `usvg::Tree::from_data`
+/// parses, `Tree::size()` gives the intrinsic size, `resvg::render` paints
+/// onto a `tiny_skia::PixmapMut` under a `Transform`, and
+/// `Pixmap::take_demultiplied()` hands back straight (non-premultiplied)
+/// RGBA bytes — exactly what `ColorImage::from_rgba_unmultiplied` wants, no
+/// unpremultiply step needed on this side.
+#[cfg(feature = "app")]
+fn decode_svg(bytes: &[u8], target_px: u32) -> Option<egui::ColorImage> {
+    let opt = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(bytes, &opt).ok()?;
+    let size = tree.size();
+    let (iw, ih) = (size.width().max(1.0), size.height().max(1.0));
+    let scale = target_px as f32 / iw.max(ih);
+    let (w, h) = ((iw * scale).round().max(1.0) as u32, (ih * scale).round().max(1.0) as u32);
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(w as f32 / iw, h as f32 / ih);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let (w, h) = (pixmap.width() as usize, pixmap.height() as usize);
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixmap.take_demultiplied()))
 }
 
 #[cfg(not(feature = "app"))]
-fn decode_icon(_path: &std::path::Path) -> Option<egui::ColorImage> {
+fn decode_icon(_path: &std::path::Path, _target_px: u32) -> Option<egui::ColorImage> {
     None
 }
 
@@ -170,7 +200,7 @@ impl Shell {
         }
         let size = (size_px.round() as u32).max(16);
         let tex = crate::icontheme::find_icon(&self.icon_dirs, &self.icon_theme, icon_name, size, 1)
-            .and_then(|path| decode_icon(&path))
+            .and_then(|path| decode_icon(&path, size))
             .map(|img| ctx.load_texture(app_id.to_string(), img, egui::TextureOptions::LINEAR));
         self.icon_cache.insert(app_id.to_string(), tex.clone());
         tex
@@ -551,5 +581,38 @@ mod tests {
     fn truncate_is_char_safe() {
         assert_eq!(truncate("short", 16), "short");
         assert_eq!(truncate("allesübertrieben lang", 8), "allesüb…");
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn decode_svg_rasterizes_at_the_requested_size() {
+        // A minimal, self-contained SVG (no external files, no system icon
+        // theme needed) — a 24x24 viewBox with a solid red square, which is
+        // enough to prove the parse -> render -> demultiply -> ColorImage
+        // pipeline actually produces the right pixels, not just the right
+        // types. The 128x128-intrinsic-Adwaita-icon case was checked
+        // manually against this sandbox's real icon theme (not committed as
+        // a test: it depends on files this sandbox happens to have, which
+        // isn't portable to CI or the phone build).
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" fill="#ff0000"/></svg>"##;
+        let img = decode_svg(svg, 64).expect("a valid minimal SVG should decode");
+        assert_eq!(img.size, [64, 64]);
+        let center = img.pixels[64 * 32 + 32];
+        assert_eq!(center, egui::Color32::from_rgba_unmultiplied(255, 0, 0, 255));
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn decode_icon_dispatches_svg_by_extension_not_content_sniffing() {
+        // Same minimal SVG, but routed through decode_icon (which picks the
+        // decoder from the file extension) rather than calling decode_svg
+        // directly — this is the path shell.rs's paint loop actually takes.
+        let dir = std::env::temp_dir().join(format!("launcher-svg-dispatch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test-icon.svg");
+        std::fs::write(&path, br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#00ff00"/></svg>"##).unwrap();
+        let img = decode_icon(&path, 32).expect("svg via decode_icon should decode");
+        assert_eq!(img.size, [32, 32]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
