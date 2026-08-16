@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <kcfgfile name=""/>
+
+  <!-- Only keys the shipped QML actually reads. The old artifact schema's
+       SystemMonitor/SnapClone/Logscope/Notifications/ExpandedView groups
+       (and its duplicate showRecentApps) belonged to features that never
+       landed; resurrect entries here the day their QML exists. -->
+
+  <group name="General">
+    <entry name="icon" type="String">
+      <default>start-here-kde-symbolic</default>
+    </entry>
+    <entry name="useCustomButtonImage" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="customButtonImage" type="String">
+      <default></default>
+    </entry>
+
+    <entry name="appNameFormat" type="Int">
+      <default>0</default>
+    </entry>
+    <entry name="limitDepth" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="alphaSort" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showIconsRootLevel" type="Bool">
+      <default>true</default>
+    </entry>
+
+    <entry name="showRecentApps" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showRecentDocs" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="recentOrdering" type="Int">
+      <default>0</default>
+    </entry>
+
+    <entry name="useExtraRunners" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="extraRunners" type="StringList">
+      <default>krunner_shell,krunner_bookmarksrunner,baloosearch,locations</default>
+    </entry>
+    <entry name="alignResultsToBottom" type="Bool">
+      <default>false</default>
+    </entry>
+
+    <entry name="showSystemIcons" type="Int">
+      <default>1</default>
+    </entry>
+    <entry name="favoriteSystemActions" type="StringList">
+      <default>lock-screen,logout,reboot,shutdown</default>
+    </entry>
+  </group>
+
+  <group name="Appearance">
+    <entry name="appsIconSize" type="Int">
+      <default>2</default>
+    </entry>
+    <entry name="systemIconSize" type="Int">
+      <default>1</default>
+    </entry>
+
+    <entry name="useCustomGridSize" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="gridColumns" type="Int">
+      <default>6</default>
+    </entry>
+    <entry name="gridRows" type="Int">
+      <default>4</default>
+    </entry>
+
+    <entry name="backgroundOpacity" type="Double">
+      <default>0.4</default>
+    </entry>
+    <entry name="useCustomBackgroundColor" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="customBackgroundColor" type="String">
+      <default>#1e1e1e</default>
+    </entry>
+
+    <!-- Animations: icon micro-motion -->
+    <entry name="enableAnimations" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="animationSpeed" type="Int">
+      <default>1</default> <!-- 0 slow, 1 normal, 2 fast -->
+    </entry>
+    <entry name="iconAnimationStyle" type="Int">
+      <default>1</default> <!-- 0 none, 1 bounce, 3 wiggle, 6 squish; other legacy ids map to bounce -->
+    </entry>
+    <entry name="iconAnimateOnHover" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="iconAnimateOnPress" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="iconAnimateOnAppear" type="Bool">
+      <default>true</default>
+    </entry>
+
+    <!-- Animations: tile geometry (slide-in and restack) -->
+    <entry name="tileSlideStyle" type="Int">
+      <default>1</default> <!-- 0 none, 1 below, 2 edges, 3 cascade, 4 ripple, 5 scatter, 6 wave -->
+    </entry>
+    <entry name="restackDuration" type="Int">
+      <default>350</default>
+    </entry>
+    <entry name="restackStagger" type="Int">
+      <default>12</default>
+    </entry>
+
+    <!-- Touch behaviour -->
+    <entry name="pullToDismiss" type="Bool">
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>
