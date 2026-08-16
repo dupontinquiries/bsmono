@@ -306,3 +306,65 @@ re-cloned.
 The fix is on the producing side: re-cut those seven bundles against the current
 tip, or send them as `git format-patch` output, which records content rather
 than ancestry and applies regardless of renumbering.
+
+## Voxels and round objects: four things measured, two dead ends
+
+Asked whether voxelising the vehicles — with special handling for tires and
+round parts — would compress better. Measured each idea rather than reasoning
+about it, and the two that sound best are the two that fail.
+
+### 1. Surfaces of revolution: no (dead end)
+
+If a wheel were a surface of revolution it could be stored as a profile plus a
+sweep — a handful of numbers instead of a mesh. Tested every part of `analog` on
+all three axes, bucketing vertices along the axis and measuring how much the
+radius varies within each bucket:
+
+```
+best part:  15.4% radius spread   (288 verts)
+median:     ~40%
+worst:      69.7%
+```
+
+Nothing is round enough. **15% spread is not a cylinder**, it is a wheel with a
+tread pattern, a hub, and bolt detail — which is exactly why it was modelled
+rather than generated. And the roundest parts are 36 verts, so even perfect
+fitting would save nothing worth the decoder.
+
+### 2. Cross-vehicle part instancing: barely (12%)
+
+A wheel is a wheel on forty vehicles, so shared parts should dedup. Normalised
+each part to its own centroid, quantised to 12 bits and hashed: **460 parts
+across 40 vehicles, 405 unique shapes, 12% repeats, most-repeated shape appears
+4 times.**
+
+These are harvested from 1,012 different source vehicles, so the wheels genuinely
+differ. The parts-web found 107 duplicates in 1,000 CATALOG parts because those
+came from a parts library; the fleet did not.
+
+### 3. Per-part quantisation boxes: no (dead end)
+
+Smaller boxes should mean fewer bits for the same precision. But the median part
+box is **51% of the chassis box** — parts here are body panels, not greebles —
+so at equal precision it needs 100% of the bits. No gain.
+
+### 4. Axis deinterleaving + delta + byte planes: YES, 15%, lossless
+
+The one that works, and it works for the reason the round-object question was
+pointing at: **a ring of vertices varies smoothly, and interleaved xyz destroys
+that.** Splitting the stream by axis lets the compressor see the smooth run:
+
+```
+interleaved q16       115.9 KB   100%
+deinterleaved by axis 110.4 KB    95%
++ byte planes         101.0 KB    87%
++ per-axis delta       97.4 KB    84%
+```
+
+Across 20 chassis: **85%**. On 196 MB of packs that is **~167 MB, saving 29 MB**
+with no precision change at all — the same u16 values, reordered before the
+zlib pass and reassembled after.
+
+This is a `bots.pack` v2: same quantisation, different byte layout. The decoder
+change is small and mechanical, and `botpack.rs` already refuses an unknown
+version rather than misreading it, so v1 and v2 can coexist.
