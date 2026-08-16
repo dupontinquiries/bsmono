@@ -470,8 +470,38 @@ impl eframe::App for VoicetermApp {
                 }
                 let go = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if go && !self.editor_phrase.trim().is_empty() {
+                    // POLITENESS COMES OFF FIRST. Speech is not typed input:
+                    // "could you please just delete this line" and "delete
+                    // line" are the same command, and editor_keys' rules are
+                    // written against the second form.
+                    //
+                    // voice_prefix::normalise also GATES — it returns None for
+                    // something that reads as prose rather than a command, so
+                    // dictation that was meant as speech does not become
+                    // keystrokes. That is the more important half: a modal
+                    // editor turns stray words into commands.
+                    //
+                    // The two normalisers are not duplicates and I checked
+                    // before stacking them: editor_keys strips ANCHORED
+                    // multi-word filler ("could you" at the start only, because
+                    // "the file you saved" contains "you" as content), while
+                    // this strips politeness bounded against a transcript of
+                    // nothing but "please please please".
+                    let spoken = voiceterm_egui::voice_prefix::normalise(&self.editor_phrase);
+                    // The early return exits this ui.horizontal closure only —
+                    // the rest of the frame still draws. Worth stating because
+                    // a `return` inside an egui closure looks like it abandons
+                    // the panel and does not.
+                    let Some(phrase) = spoken else {
+                        self.toasts.info(
+                            format!("that reads as prose, not a command: {:?}",
+                                    self.editor_phrase),
+                            ui.input(|i| i.time));
+                        self.editor_phrase.clear();
+                        return;
+                    };
                     match voiceterm_egui::editor_keys::translate(
-                        self.editor_kind, &self.editor_phrase)
+                        self.editor_kind, &phrase)
                     {
                         Some(a) if a.confirm => {
                             // Destructive actions WAIT. `confirm` is set only
