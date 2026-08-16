@@ -162,7 +162,9 @@ impl HatchUi {
 
     /// Char-based elide with a middle ellipsis — matches the QML label's
     /// `Text.ElideMiddle`, which keeps both the brand and the suffix visible
-    /// ("Fir…fox Nightly" beats "Firefox Nig…").
+    /// ("Fir…fox Nightly" beats "Firefox Nig…"). This decides the SHAPE of
+    /// the elision; [`HatchUi::elide_fitting`] decides how much of it fits,
+    /// because a character count cannot see that "W" is three times "l".
     pub fn elide(name: &str, max_chars: usize) -> String {
         let chars: Vec<char> = name.chars().collect();
         if chars.len() <= max_chars || max_chars < 3 {
@@ -175,6 +177,40 @@ impl HatchUi {
         s.push('…');
         s.extend(&chars[chars.len() - tail..]);
         s
+    }
+
+    /// The longest middle-elided form of `text` that fits `max_w`, measured
+    /// with the font actually being painted. Binary search over the character
+    /// count: ~5 layouts for a name that overflows, none for one that
+    /// doesn't, and egui caches galleys so a steady grid pays once.
+    fn elide_fitting(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> String {
+        // Painter::layout_no_wrap, not Ui::fonts: in egui 0.34 the layout
+        // methods need &mut Fonts, and the painter is what hands that out.
+        let measure = |s: &str| {
+            ui.painter()
+                .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        };
+        if measure(text) <= max_w {
+            return text.to_string();
+        }
+        let len = text.chars().count();
+        let mut best = Self::elide(text, 3);
+        let (mut lo, mut hi) = (3usize, len);
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let cand = Self::elide(text, mid);
+            if measure(&cand) <= max_w {
+                best = cand;
+                lo = mid + 1;
+            } else if mid == 3 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        best
     }
 
     /// Arrow-key movement over a `cols`-wide grid of `count` items. Same
@@ -528,12 +564,15 @@ impl HatchUi {
             );
         }
 
-        let label = Self::elide(name, (rect.width() / 7.5) as usize);
+        // Measured against the tile, minus a little breathing room, so a
+        // wide-glyph name can't run under its neighbours.
+        let font = FontId::proportional(12.5);
+        let label = Self::elide_fitting(ui, name, &font, rect.width() - 8.0);
         p.text(
             egui::pos2(rect.center().x, rect.bottom() - 14.0),
             Align2::CENTER_CENTER,
             label,
-            FontId::proportional(12.5),
+            font,
             ui.visuals().text_color(),
         );
     }
@@ -754,6 +793,31 @@ mod tests {
         app: HatchUi,
         palette: uikit_egui::PaletteColors,
         size: Vec2,
+        /// Every text run painted by the last frame, with where it landed.
+        /// Asserting on geometry alone proves a menu is *shaped* right; this
+        /// proves it *says* the right thing, and lets a test click a button
+        /// by its label instead of at a fraction down the popup that quietly
+        /// stops being correct the next time the styling moves.
+        texts: Vec<(String, Rect)>,
+    }
+
+    /// Walk a frame's shapes for text. egui hands back the laid-out galleys,
+    /// so this is what the user would read, not what we hoped we asked for.
+    fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push((
+                    t.galley.text().to_string(),
+                    Rect::from_min_size(t.pos, t.galley.size()),
+                ));
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_text(s, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     impl Harness {
@@ -770,7 +834,25 @@ mod tests {
                 app: HatchUi::new(core),
                 palette: uikit_egui::default_palette(),
                 size: Vec2::new(420.0, 900.0),
+                texts: Vec::new(),
             }
+        }
+
+        /// The rect of a painted label containing `needle`, if any.
+        fn text_rect(&self, needle: &str) -> Option<Rect> {
+            self.texts.iter().find(|(t, _)| t.contains(needle)).map(|(_, r)| *r)
+        }
+
+        fn has_text(&self, needle: &str) -> bool {
+            self.text_rect(needle).is_some()
+        }
+
+        /// Click the middle of the label containing `needle`.
+        fn click_text(&mut self, needle: &str) -> UiEvent {
+            let r = self
+                .text_rect(needle)
+                .unwrap_or_else(|| panic!("no painted text containing {needle:?}"));
+            self.click(r.center())
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) -> UiEvent {
@@ -782,11 +864,15 @@ mod tests {
             let mut out = UiEvent::None;
             let app = &mut self.app;
             let palette = &self.palette;
-            self.ctx.run(input, |ctx| {
+            let full = self.ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     out = app.ui(ui, palette);
                 });
             });
+            self.texts.clear();
+            for clipped in &full.shapes {
+                collect_text(&clipped.shape, &mut self.texts);
+            }
             out
         }
 
@@ -971,22 +1057,23 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_favorites_from_its_first_item() {
+    fn the_menu_says_what_it_does_and_the_favorite_item_does_it() {
         let mut h = Harness::new(some_apps());
         open_menu(&mut h, "camera");
         h.frame(vec![]); // the menu needs a frame to lay its buttons out
 
-        // The favorite item sits under the title and separator; aim inside
-        // the popup rather than at a guessed offset from the tile.
-        let btn = h
-            .ctx
-            .memory(|m| m.area_rect(egui::Id::new("hatch-tile-menu")))
-            .expect("the menu area was laid out");
-        let target = egui::pos2(btn.center().x, btn.top() + btn.height() * 0.72);
+        assert!(h.has_text("Camera"), "the menu is titled with the app");
+        assert!(h.has_text("Add to favorites"), "and offers the toggle by name");
+        assert!(!h.has_text("Remove from favorites"));
 
-        h.click(target);
-        assert!(h.app.core.is_favorite("camera"), "the menu's first item toggles the favorite");
+        h.click_text("Add to favorites");
+        assert!(h.app.core.is_favorite("camera"), "clicking the label toggles the favorite");
         assert!(!h.app.menu_open(), "and closes the menu");
+
+        // Re-opening must offer the inverse, or the menu is lying.
+        open_menu(&mut h, "camera");
+        h.frame(vec![]);
+        assert!(h.has_text("Remove from favorites"));
     }
 
     #[test]
@@ -1003,31 +1090,27 @@ mod tests {
     }
 
     #[test]
-    fn a_menu_lists_the_entry_s_desktop_actions() {
-        // Maps is the fixture carrying a [Desktop Action]; the others don't,
-        // so this also checks the menu isn't inventing items.
+    fn a_menu_lists_the_entry_s_desktop_actions_and_invents_none() {
+        // Maps is the fixture carrying a [Desktop Action]; the others don't.
         let mut h = Harness::new(some_apps());
-        assert_eq!(h.app.core.actions_for("maps").len(), 1);
-        assert!(h.app.core.actions_for("camera").is_empty());
-
         open_menu(&mut h, "maps");
         h.frame(vec![]);
-        let with_action = h
-            .ctx
-            .memory(|m| m.area_rect(egui::Id::new("hatch-tile-menu")))
-            .expect("laid out")
-            .height();
+        assert!(h.has_text("New Window"), "the action appears under its own name");
 
         h.app.on_shown();
         open_menu(&mut h, "camera");
         h.frame(vec![]);
-        let without = h
-            .ctx
-            .memory(|m| m.area_rect(egui::Id::new("hatch-tile-menu")))
-            .expect("laid out")
-            .height();
+        assert!(!h.has_text("New Window"), "and only for the entry that declares it");
+    }
 
-        assert!(with_action > without, "the action adds a row: {with_action} vs {without}");
+    #[test]
+    fn choosing_a_desktop_action_launches_it() {
+        let mut h = Harness::new(some_apps());
+        open_menu(&mut h, "maps");
+        h.frame(vec![]);
+        assert_eq!(h.click_text("New Window"), UiEvent::Launched);
+        assert!(!h.app.menu_open());
+        assert!(!h.app.core.is_favorite("maps"), "an action is not a favorite toggle");
     }
 
     #[test]
@@ -1037,6 +1120,71 @@ mod tests {
         assert_eq!(h.key(Key::Escape), UiEvent::None, "the launcher stays put");
         assert!(!h.app.menu_open());
         assert_eq!(h.key(Key::Escape), UiEvent::Dismiss, "a second Escape dismisses");
+    }
+
+    #[test]
+    fn the_grid_paints_app_names_and_says_so_when_there_are_none() {
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+        assert!(h.has_text("Firefox"), "tiles are labelled");
+        assert!(h.has_text("Search"), "the search pill shows its hint");
+
+        h.frame(vec![egui::Event::Text("fi".into())]);
+        h.frame(vec![]);
+        assert!(h.has_text("Files") && h.has_text("Firefox"));
+        assert!(!h.has_text("Terminal"), "filtered-out apps stop being painted");
+
+        h.frame(vec![egui::Event::Text("zzz".into())]);
+        h.frame(vec![]);
+        assert!(h.has_text("No matches"), "the empty state explains itself");
+    }
+
+    #[test]
+    fn a_failed_launch_is_shown_rather_than_swallowed() {
+        // A launcher that silently does nothing when Exec is broken is the
+        // worst possible failure: the user taps again, harder.
+        let mut broken = entry("Broken");
+        broken.exec = "hatch-no-such-binary-exists".into();
+        let mut h = Harness::new(vec![broken]);
+        h.frame(vec![]);
+
+        let tile = h.app.tile_rect("broken").expect("tile painted");
+        assert_eq!(h.click(tile.center()), UiEvent::None, "a failed launch does not hide the window");
+        h.frame(vec![]);
+        assert!(h.has_text("Launch failed"), "and says so on screen");
+    }
+
+    #[test]
+    fn a_long_app_name_stays_inside_its_tile() {
+        // Elision is a character count against a proportional font, which is
+        // an estimate — this is the check that the estimate holds for the
+        // wide-glyph worst case rather than just for "Firefox".
+        let mut h = Harness::new(vec![
+            entry("WWWWWWWWWWWWWWWWWWWWWWWWWWWW"),
+            entry("Mozilla Firefox Developer Edition Nightly"),
+        ]);
+        h.frame(vec![]);
+
+        let cell_w = h.app.tile_rect("wwwwwwwwwwwwwwwwwwwwwwwwwwww").unwrap().width();
+        // Measured elision must still elide in the MIDDLE, matching the QML
+        // label — the tail is often the distinguishing part of a name.
+        let long = h
+            .texts
+            .iter()
+            .find(|(t, _)| t.starts_with("Mozilla"))
+            .map(|(t, _)| t.clone())
+            .expect("the long name was painted");
+        assert!(long.contains('…') && long.ends_with('y'), "kept the tail: {long:?}");
+        for (text, rect) in &h.texts {
+            if text == "Search" || text.is_empty() {
+                continue;
+            }
+            assert!(
+                rect.width() <= cell_w,
+                "label {text:?} is {} wide in a {cell_w} tile",
+                rect.width()
+            );
+        }
     }
 
     #[test]
