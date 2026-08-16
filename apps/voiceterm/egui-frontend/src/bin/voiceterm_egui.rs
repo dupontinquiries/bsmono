@@ -1043,6 +1043,42 @@ impl eframe::App for VoicetermApp {
                         }
 
                         ui.separator();
+                        // WHAT WOULD BE SENT. context_redact strips sensitive
+                        // lines out of terminal context BEFORE it becomes a
+                        // prompt — its threat model is "don't let sensitive
+                        // data escape the process", and an LLM call is the
+                        // largest hole in that.
+                        //
+                        // Shown before any call exists, deliberately: the point
+                        // is to see what would leave, and a preview that only
+                        // appears once the feature ships is a preview nobody
+                        // checks.
+                        let ctx: String = (0..self.grid.rows)
+                            .map(|y| self.grid.row_text(y))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let total = ctx.lines().count();
+                        let red = voiceterm_egui::context_redact::context_strip(&ctx);
+                        ui.colored_label(self.colors.text_weak,
+                            format!("context: {total} lines, {} redacted", red.lines_redacted));
+                        // MARKERS, NEVER THE LINES. The module is explicit that
+                        // markers_hit holds which rule fired and "never the
+                        // lines themselves" — printing the matched text here
+                        // would leak exactly what the redaction removed.
+                        if !red.markers_hit.is_empty() {
+                            ui.colored_label(self.colors.warning,
+                                format!("held back: {}", red.markers_hit.join(", ")));
+                        }
+                        if total > 0 && !voiceterm_egui::context_redact::worth_sending(&red, total) {
+                            // More than half redacted. Sending the remainder
+                            // costs tokens for context that has had its
+                            // substance removed, and the answer would be built
+                            // on the half that survived.
+                            ui.colored_label(self.colors.warning,
+                                "most of this screen is sensitive — not worth sending");
+                        }
+
+                        ui.separator();
                         // TOKEN ACCOUNTING. Empty until something logs a call —
                         // shown as a count rather than hidden, so "no LLM calls
                         // yet" is distinguishable from "the readout is broken".
