@@ -223,7 +223,23 @@ floor is right for turning a car and wrong for playing quietly). It is
 factored from `games/skydribble/src/analog.rs`, which proved the approach;
 that game is deliberately NOT refactored onto it in the same breath.
 studio-app supplies it as the real backend for `studio_egui::playkeys`'s
-`AnalogSource` seam. Named, not built, from the same wishlist: clip-level chain editing,
+`AnalogSource` seam. **Controllers play it.** `studio-app::midi` splits at the line that
+matters: a PURE parser (running status, note-on-velocity-0-is-note-off,
+14-bit bend, truncated packets dropped — all tested with nothing plugged
+in) under a feature-gated `midir` connection, so a build without ALSA
+still compiles and reports no ports. A controller note becomes the same
+`playkeys::PlayNote` the computer keyboard makes, so there is ONE note
+path: voiced through the sink now, and landed in the pattern when the
+transport is recording — quantised to the NEAREST step, both because a
+note struck a hair early belongs on the beat and because Transport stores
+position in frames, so an exact boundary reads back a fraction below it
+(flooring recorded a whole step early; a test caught it). CC and pitch
+bend are parsed and deliberately unrouted until there is a learn-and-bind
+UI: a mod wheel that silently moved an unrelated fader is worse than one
+that does nothing. MIDI clock is not parsed at all — syncing to an
+external clock means resampling against drifting wall time, which belongs
+with the streaming engine, not a 0xF8 match arm. Named, not built, from
+the same wishlist: clip-level chain editing,
 clip-level chain editing, surround/downmix formats (mixdown is stereo
 end-to-end today), 
  a playing

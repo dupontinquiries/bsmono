@@ -17,6 +17,7 @@ use studio_live::transport::Transport;
 
 pub mod audition;
 pub mod library;
+pub mod midi;
 pub mod mixer_panel;
 pub mod rack_panel;
 
@@ -268,6 +269,53 @@ impl Studio {
     /// over the audition sink (named in `library`'s docs too), while step
     /// entry is playable TODAY and its result is exactly what the grid, the
     /// bounce, and a peer all already understand.
+    /// Render one played note through the SELECTED channel's voice — the
+    /// instrument under any keyboard is whatever channel the grid is
+    /// editing. Goes through `apply_step_mod`, the same rule a sequenced
+    /// step uses, so a played note and a programmed one at the same tune and
+    /// velocity are the same sound.
+    pub fn render_play_note(
+        &self,
+        note: &studio_egui::playkeys::PlayNote,
+        rate: u32,
+    ) -> Vec<f32> {
+        use studio_live::Synth as _;
+        let Some(ch) = self.rack.channels.get(self.selected_channel) else { return Vec::new() };
+        let kind = studio_live::apply_step_mod(
+            &ch.kind,
+            &studio_live::StepMod { tune: note.semitone, vel: note.velocity,
+                                    ..studio_live::StepMod::default() },
+            None,
+        );
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = studio_live::BuiltinSynth { sources: &sources };
+        // Two seconds is past every built-in voice's tail and short enough
+        // that a flurry of notes cannot grow memory; voices self-retire.
+        let mut out = vec![0.0f32; rate as usize * 2];
+        synth.render(&kind, rate, &mut out);
+        let g = ch.gain * note.velocity;
+        for s in &mut out { *s *= g; }
+        out
+    }
+
+    /// Which step a note played RIGHT NOW belongs to, wrapped into the
+    /// current pattern. Quantised to the grid by construction: an unquantised
+    /// step does not exist in a step sequencer, so this is not a setting.
+    pub fn recording_step(&self) -> u32 {
+        let steps = self.rack.patterns.get(self.current_pattern)
+            .map(|p| p.steps).unwrap_or(16).max(1);
+        // NEAREST step, not `Tempo::step_at`'s floor. Two reasons, one
+        // musical and one mechanical: a note struck a hair BEFORE the beat
+        // belongs on that beat, not the one before it; and Transport stores
+        // position in frames, so a position set to an exact step boundary
+        // reads back a fraction below it — flooring there records the whole
+        // note one step early, which a test caught doing exactly that.
+        let step = self.rack.tempo().step_len().0.max(1);
+        let t = self.transport.position().0;
+        let s = (t + step / 2).div_euclid(step);
+        s.rem_euclid(steps as i64) as u32
+    }
+
     pub fn play_note_at(&mut self, note: studio_egui::playkeys::PlayNote, step: u32) {
         let ch = self.selected_channel;
         let Some(p) = self.rack.patterns.get_mut(self.current_pattern) else { return };
@@ -898,6 +946,15 @@ pub struct App {
     carrier: Option<studio_collab::stream::StreamPeer>,
     /// Where Ctrl+S writes: STUDIO_PROJECT if set, else ./project.studio.
     project_path: std::path::PathBuf,
+    /// The MIDI controller, if one was found at startup. `None` is normal
+    /// and silent: most sessions have no controller, and an editor that
+    /// complains about it every launch trains people to ignore its status
+    /// line.
+    midi: Option<midi::MidiIn>,
+    /// Notes currently held on the controller, so a note-off can end the
+    /// right one — the rack's voices self-retire, but a sustaining synth
+    /// (and MIDI-to-pattern recording) needs the pairing.
+    midi_held: std::collections::BTreeMap<u8, ()>,
     /// The sound library root and its scan — rescanned only on demand (the
     /// refresh button), not per frame: a directory walk per frame on a
     /// phone's flash is how battery dies.
@@ -962,9 +1019,13 @@ impl Default for App {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| "library".into());
         let library = library::scan(&library_root);
+        let midi = midi::MidiIn::open(std::env::var("STUDIO_MIDI").ok().as_deref()).ok();
         let analog = WootingAnalog::default();
         studio.status = format!("{} — {}", studio.status, analog.0.describe());
-        App { studio, peaks: Default::default(), audio: Default::default(), sink,
+        if let Some(m) = &midi {
+            studio.status = format!("{} — midi: {}", studio.status, m.port_name());
+        }
+        App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
               export_rate: 48_000,
               analog: Box::new(analog),
@@ -1168,6 +1229,41 @@ impl eframe::App for App {
             // Packets arrive between frames; a connected shell keeps frames
             // coming so a peer's edit shows without waiting for a local one.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // ── the controller ────────────────────────────────────────────────
+        // MIDI notes take the SAME path the computer keyboard's do: voice
+        // them now, and land them in the pattern when the transport is
+        // recording. One note path, so velocity and channel selection cannot
+        // drift between the two kinds of keyboard.
+        let mut midi_notes: Vec<studio_egui::playkeys::PlayNote> = Vec::new();
+        if let Some(m) = &self.midi {
+            for msg in m.poll() {
+                match msg {
+                    midi::MidiMessage::NoteOn { note, velocity, .. } => {
+                        self.midi_held.insert(note, ());
+                        midi_notes.push(midi::play_note(note, velocity));
+                    }
+                    midi::MidiMessage::NoteOff { note, .. } => {
+                        self.midi_held.remove(&note);
+                    }
+                    // CC and bend are parsed and deliberately unrouted: a
+                    // mod wheel that silently moved an unrelated fader would
+                    // be worse than one that does nothing. Mapping needs a
+                    // learn-and-bind UI, named rather than guessed.
+                    _ => {}
+                }
+            }
+        }
+        for n in midi_notes {
+            let samples = self.studio.render_play_note(&n, self.sink.rate());
+            if !samples.is_empty() {
+                self.sink.trigger(std::sync::Arc::new(samples));
+            }
+            if self.studio.transport.recording {
+                let step = self.studio.recording_step();
+                self.studio.play_note_at(n, step);
+            }
         }
 
         // ── media that finished arriving from peers ──────────────────────
@@ -2507,5 +2603,57 @@ mod bus_sends_tests {
         let full = at(&mut s, 1.0);
         assert!(full - dry > (quarter - dry) * 3.0,
                 "a louder send is a louder copy: +{} vs +{}", full - dry, quarter - dry);
+    }
+}
+
+#[cfg(test)]
+mod midi_shell_tests {
+    use super::*;
+
+    #[test]
+    fn a_controller_note_sounds_through_the_selected_channel() {
+        // One note path: a MIDI note and a keyboard note are the same
+        // PlayNote and hit the same voice, so they cannot drift.
+        let mut s = Studio::demo();
+        s.selected_channel = 1; // the kit's Kick
+        let n = midi::play_note(60, 100);
+        let out = s.render_play_note(&n, 48_000);
+        assert!(!out.is_empty());
+        let e: f32 = out.iter().map(|v| v.abs()).sum();
+        assert!(e > 1.0, "the note is audible ({e})");
+        // Velocity scales it, and a harder note is louder.
+        let soft: f32 = s.render_play_note(&midi::play_note(60, 20), 48_000)
+            .iter().map(|v| v.abs()).sum();
+        assert!(soft < e, "velocity 20 is quieter than 100: {soft} vs {e}");
+    }
+
+    #[test]
+    fn a_recorded_note_lands_quantised_on_a_real_step() {
+        let mut s = Studio::demo();
+        s.selected_channel = 2;
+        // Mid-pattern, deliberately off-grid: a step sequencer has no
+        // between-steps place to put it.
+        let step_len = s.rack.tempo().step_len();
+        s.transport.set_position(Ticks(step_len.0 * 5 + step_len.0 / 3));
+        let step = s.recording_step();
+        assert_eq!(step, 5, "a third of a step past 5 quantises back to 5");
+        s.play_note_at(midi::play_note(67, 100), step);
+        let p = &s.rack.patterns[s.current_pattern];
+        assert!(p.is_set(2, 5));
+        assert_eq!(p.mod_at(2, 5).tune, 7, "a G above middle C is +7");
+    }
+
+    #[test]
+    fn recording_past_the_pattern_wraps_instead_of_vanishing() {
+        // A 16-step pattern under a transport that has run for minutes must
+        // still record — the note belongs to the bar it is heard in.
+        let mut s = Studio::demo();
+        let steps = s.rack.patterns[s.current_pattern].steps as i64;
+        let step_len = s.rack.tempo().step_len();
+        s.transport.set_position(Ticks(step_len.0 * (steps * 7 + 3)));
+        assert_eq!(s.recording_step(), 3);
+        // And a count-in (negative position) lands on a real step, not a panic.
+        s.transport.set_position(Ticks(-step_len.0 * 2));
+        assert!(s.recording_step() < steps as u32);
     }
 }
