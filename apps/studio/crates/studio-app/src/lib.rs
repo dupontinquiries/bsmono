@@ -47,6 +47,9 @@ pub struct Studio {
     pub rack_playing: bool,
     /// Set by any rack edit; the shell re-renders the loop and clears it.
     pub loop_dirty: bool,
+    /// Set by any PROJECT edit (including undo/redo and a bounce); the shell
+    /// re-renders the arrangement buffer before the next timeline playback.
+    pub arrangement_dirty: bool,
     /// Set by the panel's bounce button; the shell performs it.
     pub pending_bounce: bool,
 }
@@ -71,6 +74,7 @@ impl Studio {
             paint: studio_egui::grid::Paint::default(),
             rack_playing: false,
             loop_dirty: true,
+            arrangement_dirty: true,
             pending_bounce: false,
         }
     }
@@ -101,7 +105,7 @@ impl Studio {
     /// Apply an edit through history, so undo works and the status line says so.
     pub fn edit(&mut self, op: studio_core::Op, what: &str) {
         match self.history.apply(&mut self.session.doc.project, &op) {
-            Ok(()) => self.status = what.into(),
+            Ok(()) => { self.status = what.into(); self.arrangement_dirty = true; }
             // An edit that cannot apply must SAY so. A silently dropped edit is
             // the worst failure an editor has: the user believes it worked.
             Err(e) => self.status = format!("{what} refused: {e:?}"),
@@ -121,21 +125,27 @@ impl Studio {
                         // starting audio you cannot see.
                         if self.panel == Panel::Rack {
                             self.rack_playing = !self.rack_playing;
+                            // One sink, one owner: the loop pedal takes it
+                            // from the tape, not both at once.
+                            if self.rack_playing { self.transport.stop(); }
                             self.status = if self.rack_playing { "loop playing".into() }
                                           else { "loop stopped".into() };
                         } else if self.transport.playing {
                             self.transport.stop(); self.status = "stopped".into();
                         } else {
+                            self.rack_playing = false;
                             self.transport.play(); self.status = "playing".into();
                         }
                     }
                     Action::Undo => {
                         self.status = if self.history.undo(&mut self.session.doc.project).is_some()
-                            { "undo".into() } else { "nothing to undo".into() };
+                            { self.arrangement_dirty = true; "undo".into() }
+                            else { "nothing to undo".into() };
                     }
                     Action::Redo => {
                         self.status = if self.history.redo(&mut self.session.doc.project).is_some()
-                            { "redo".into() } else { "nothing to redo".into() };
+                            { self.arrangement_dirty = true; "redo".into() }
+                            else { "nothing to redo".into() };
                     }
                     Action::Delete => {
                         let sel = std::mem::take(&mut self.selection);
@@ -182,6 +192,78 @@ impl Studio {
         self.mode.effective_playhead(self.transport.position(), None)
     }
 
+    /// Render the whole arrangement at `rate` as interleaved stereo — what
+    /// the sink plays when the TIMELINE transport rolls. `mixdown` is the
+    /// tested pure function; this is a one-shot offline render of it, traded
+    /// deliberately against `studio-engine`'s streaming path: at the sizes a
+    /// beat project has, re-rendering the whole thing on an edit is cheap,
+    /// keeps zero state, and cannot glitch — the streaming DeviceEngine
+    /// remains the named path for when projects outgrow that trade.
+    pub fn render_arrangement(
+        &self,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    ) -> Vec<f32> {
+        let end = self.session.doc.project.duration();
+        if end <= Ticks::ZERO { return Vec::new(); }
+        studio_audio::mixdown(
+            &self.session.doc.project, sources, &std::collections::BTreeMap::new(),
+            Ticks::ZERO, end, rate, &[], &[],
+        )
+    }
+
+    /// Land decoded audio on the timeline as a clip at the playhead — the
+    /// import a melody loop wants, where the rack sampler is the import a
+    /// drum hit wants. Same op shape as a bounce and a take, so it is
+    /// undoable and shareable for free.
+    pub fn import_clip(
+        &mut self,
+        name: &str,
+        path: &str,
+        audio: &studio_audio::SourceAudio,
+    ) -> Option<studio_core::SourceId> {
+        let len = Ticks::from_samples(audio.frames() as i64, audio.sample_rate);
+        let at = self.playhead();
+        // First audio track WITH ROOM at the playhead, not just the first
+        // audio track: check_room would (rightly) refuse an overlap, and a
+        // loop dropped where A1 is busy should land on A2, the way a person
+        // placing it by hand would — not bounce off with an error. This
+        // pre-flight mirrors check_room's rule; the op's own validation
+        // still has the final word.
+        let project = &self.session.doc.project;
+        let end = Ticks(at.0 + len.0);
+        let track = project.tracks.iter()
+            .filter(|t| t.kind == studio_core::TrackKind::Audio)
+            .find(|t| !project.clips.values()
+                .any(|c| c.track == t.id && c.pos < end && c.end() > at))
+            .map(|t| t.id);
+        let Some(track) = track else {
+            self.status = "import refused: no audio track has room at the playhead".into();
+            return None;
+        };
+        let id = studio_core::SourceId(
+            project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        let clip = studio_core::ClipId(
+            project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        self.edit(studio_core::Op::AddSource {
+            source: studio_core::Source {
+                id, path: path.into(), len,
+                sample_rate: audio.sample_rate,
+                channels: audio.channels.len() as u16,
+                has_video: false,
+            },
+        }, "imported");
+        self.edit(studio_core::Op::AddClip {
+            clip: studio_core::Clip {
+                id: clip, source: id, track,
+                pos: at, src_in: Ticks::ZERO, len,
+                gain: 1.0, effects: Vec::new(),
+            },
+        }, "imported");
+        self.status = format!("imported '{name}' to the timeline at the playhead");
+        Some(id)
+    }
+
     /// Render the current pattern's loop at `rate` — what the audition sink
     /// plays and what a bounce stores. One function so they cannot drift.
     pub fn render_loop(
@@ -223,7 +305,7 @@ impl Studio {
         let ch = self.rack.add_channel(studio_live::Channel {
             name: name.into(),
             kind: studio_live::SynthKind::Sampler { source: id },
-            gain: 0.9, pan: 0.0, muted: false,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
         });
         self.selected_channel = ch;
         self.loop_dirty = true;
@@ -357,11 +439,17 @@ mod tests {
 pub struct App {
     pub studio: Studio,
     peaks: std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
-    /// Decoded / synthesised audio per source — today only bounces land here;
-    /// a media importer would feed the same map.
+    /// Decoded / synthesised audio per source — bounces and imports land
+    /// here; the mixdown and the sampler both read it.
     audio: std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
-    sink: Box<dyn audition::LoopSink>,
+    sink: Box<dyn audition::PlaybackSink>,
+    /// What the sink's buffer currently holds, so a mode switch (loop ↔
+    /// arrangement) knows to reload even when nothing is dirty.
+    loaded: SinkContent,
 }
+
+#[derive(PartialEq, Clone, Copy)]
+enum SinkContent { Nothing, RackLoop, Arrangement }
 
 #[cfg(feature = "app")]
 impl Default for App {
@@ -369,7 +457,8 @@ impl Default for App {
         let sink = audition::open_sink();
         let mut studio = Studio::demo();
         studio.status = format!("ready — audition: {}", sink.describe());
-        App { studio, peaks: Default::default(), audio: Default::default(), sink }
+        App { studio, peaks: Default::default(), audio: Default::default(), sink,
+              loaded: SinkContent::Nothing }
     }
 }
 
@@ -431,9 +520,22 @@ impl eframe::App for App {
             };
             match decoded {
                 Ok((audio, path)) => {
-                    let id = self.studio.import_audio(&name, &path, &audio);
-                    self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
-                    self.audio.insert(id, audio);
+                    // The panel you're looking at names the import you meant:
+                    // a file dropped on the Rack is a drum hit for a sampler
+                    // channel; dropped anywhere else it's arrangement
+                    // material — a melody loop — and lands as a clip at the
+                    // playhead. (A long loop as a rack one-shot would be cut
+                    // at the voice window, which is never what a melody
+                    // loop means.)
+                    let id = if self.studio.panel == Panel::Rack {
+                        Some(self.studio.import_audio(&name, &path, &audio))
+                    } else {
+                        self.studio.import_clip(&name, &path, &audio)
+                    };
+                    if let Some(id) = id {
+                        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                        self.audio.insert(id, audio);
+                    }
                 }
                 // A decode error is not a missing-plugin error (studio-media's
                 // own rule): say exactly what failed, keep editing.
@@ -441,13 +543,40 @@ impl eframe::App for App {
             }
         }
 
-        // ── keep the audition loop honest before drawing it ──────────────
-        if self.studio.loop_dirty {
-            let samples = self.studio.render_loop(self.sink.rate(), &self.audio);
-            self.sink.set_loop(std::sync::Arc::new(samples));
-            self.studio.loop_dirty = false;
+        // ── one sink, one owner ───────────────────────────────────────────
+        // Priority is whoever the user pressed play on last (the key handler
+        // enforces exclusivity); this block just keeps the sink's buffer
+        // truthful for the current owner and idles it for nobody.
+        if self.studio.transport.playing {
+            if self.loaded != SinkContent::Arrangement || self.studio.arrangement_dirty {
+                let buf = self.studio.render_arrangement(self.sink.rate(), &self.audio);
+                self.sink.set_buffer(std::sync::Arc::new(buf), 2, false);
+                self.sink.seek(
+                    self.studio.transport.position().to_samples(self.sink.rate()).max(0) as usize);
+                self.studio.arrangement_dirty = false;
+                self.loaded = SinkContent::Arrangement;
+            }
+            self.sink.set_playing(true);
+            if let Some(f) = self.sink.position() {
+                // Video follows audio, never the reverse (transport's rule №1)
+                // — the sink's consumed frames ARE the playhead.
+                self.studio.transport.set_position(
+                    studio_core::Ticks::from_samples(f as i64, self.sink.rate()));
+            } else if !self.sink.playing() {
+                self.studio.transport.stop();
+                self.studio.status = "reached the end".into();
+            }
+        } else if self.studio.rack_playing {
+            if self.loaded != SinkContent::RackLoop || self.studio.loop_dirty {
+                let samples = self.studio.render_loop(self.sink.rate(), &self.audio);
+                self.sink.set_buffer(std::sync::Arc::new(samples), 1, true);
+                self.studio.loop_dirty = false;
+                self.loaded = SinkContent::RackLoop;
+            }
+            self.sink.set_playing(true);
+        } else {
+            self.sink.set_playing(false);
         }
-        self.sink.set_playing(self.studio.rack_playing);
         if self.studio.pending_bounce {
             self.studio.pending_bounce = false;
             // The timeline's rate, not the sink's: a bounce is project
@@ -464,9 +593,9 @@ impl eframe::App for App {
                 .to_samples(self.sink.rate()).max(1) as usize;
             Some((pos / step) as u32 % p.steps)
         });
-        if self.studio.rack_playing {
+        if self.studio.rack_playing || self.studio.transport.playing {
             // The playhead column is a read recomputed each frame (grid's own
-            // rule), so the frames have to keep coming while the loop runs.
+            // rule), so the frames have to keep coming while anything runs.
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
 
@@ -625,5 +754,84 @@ mod import_shell_tests {
         };
         s.import_audio("legacy", "samples/legacy.wav", &audio);
         assert!(s.status.contains("44100"), "status was {:?}", s.status);
+    }
+}
+
+#[cfg(test)]
+mod arrangement_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+
+    #[test]
+    fn a_bounce_is_audible_in_the_arrangement_render() {
+        // The full circle: pattern → bounce → clip → mixdown. If this holds,
+        // the timeline's play button has real audio behind it.
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let out = s.render_arrangement(48_000, &sources);
+        assert!(!out.is_empty());
+        // The bounce sits at tick 0; its first beat must be in the mix.
+        let first_beat: f32 = out[..9600].iter().map(|v| v.abs()).sum();
+        assert!(first_beat > 10.0, "the bounced kick is in the mixdown ({first_beat})");
+        // Interleaved stereo: even length, both channels carry it.
+        assert_eq!(out.len() % 2, 0);
+        let (l, r): (f32, f32) = out[..9600].chunks(2)
+            .fold((0.0, 0.0), |(l, r), fr| (l + fr[0].abs(), r + fr[1].abs()));
+        assert!(l > 1.0 && r > 1.0, "both channels are live: L={l} R={r}");
+    }
+
+    #[test]
+    fn edits_mark_the_arrangement_dirty_and_undo_does_too() {
+        let mut s = Studio::demo();
+        s.arrangement_dirty = false;
+        let clip = *s.session.doc.project.clips.keys().next().unwrap();
+        s.edit(studio_core::Op::RemoveClip { id: clip }, "deleted");
+        assert!(s.arrangement_dirty, "an edit stales the render");
+        s.arrangement_dirty = false;
+        s.key(Key::c('u'));
+        assert!(s.arrangement_dirty, "so does putting it back");
+    }
+
+    #[test]
+    fn the_two_play_buttons_take_the_sink_from_each_other() {
+        let mut s = Studio::demo();
+        s.panel = Panel::Rack;
+        s.key(Key::c(' '));
+        assert!(s.rack_playing && !s.transport.playing);
+        s.panel = Panel::Timeline;
+        s.key(Key::c(' '));
+        assert!(s.transport.playing && !s.rack_playing,
+                "the tape took the sink from the loop pedal");
+        s.panel = Panel::Rack;
+        s.key(Key::c(' '));
+        assert!(s.rack_playing && !s.transport.playing,
+                "and the loop pedal takes it back");
+    }
+
+    #[test]
+    fn a_melody_loop_import_lands_a_clip_at_the_playhead() {
+        let mut s = Studio::demo();
+        s.transport.set_position(Ticks::from_seconds(2.0));
+        let clips_before = s.session.doc.project.clips.len();
+        let audio = studio_audio::SourceAudio {
+            sample_rate: 48_000, channels: vec![vec![0.2; 96_000], vec![0.2; 96_000]],
+        };
+        let id = s.import_clip("melody", "loops/melody.opus", &audio).expect("a track has room");
+        assert_eq!(s.session.doc.project.clips.len(), clips_before + 1);
+        let clip = s.session.doc.project.clips.values().find(|c| c.source == id).unwrap();
+        assert_eq!(clip.pos, Ticks::from_seconds(2.0), "at the playhead, not at zero");
+        assert_eq!(clip.len, Ticks::from_samples(96_000, 48_000), "the whole 2s loop, uncut");
+        // A1 is busy at 2.0–4.0s (the demo's clip at 3.5s) — the import must
+        // have skipped to a track with room rather than bouncing off
+        // check_room, the way a hand placement would.
+        let a1 = s.session.doc.project.tracks.iter()
+            .find(|t| t.kind == studio_core::TrackKind::Audio).unwrap().id;
+        assert_ne!(clip.track, a1, "landed on the next free audio track");
+        // Two ops, two undos, gone — an import is an edit.
+        s.key(Key::c('u'));
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.clips.len(), clips_before);
     }
 }

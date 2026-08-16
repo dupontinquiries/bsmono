@@ -114,6 +114,13 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
                 ch.muted = !audible;
             }
             ui.add(egui::Slider::new(&mut ch.gain, 0.0..=1.2).show_value(false).text("gain"));
+            // Choke group as a small number, 0 = none: channels sharing a
+            // nonzero group cut each other (the hats ship in group 1).
+            let mut grp = ch.choke_group.map(|g| g as i32 + 1).unwrap_or(0);
+            ui.label("choke");
+            if ui.add(egui::DragValue::new(&mut grp).range(0..=8)).changed() {
+                ch.choke_group = (grp > 0).then(|| (grp - 1) as u8);
+            }
             match &mut ch.kind {
                 studio_live::SynthKind::Sub { note, glide_ms, drive, decay_ms, .. } => {
                     ui.label("note");

@@ -81,11 +81,24 @@ rate). `.opus` decodes natively via `studio-media`'s `opus` feature (ogg +
 libopus, default on) — stereo preserved, pre-skip and final-granule
 trimmed so loops seam cleanly — and files dropped on the window import as
 rack sampler channels; the project stores the file's own path (and, through
-collab assets, its compressed bytes), never inflated PCM. Not built, named
-plainly: open-hat choke groups, rack collaboration (the wire has
-`Packet::Rack`; the shell doesn't broadcast it yet), pattern playback inside
-the engine's timeline mixdown (audition is a separate loop player), and the
-Mixer/Program panels, which say so on screen instead of showing nothing.
+collab assets, its compressed bytes), never inflated PCM. **The timeline plays.** The transport now renders the arrangement through
+the tested `mixdown` (whole-project, offline, re-rendered on any edit or
+undo) and drives it out the same sink audition uses — generalized to
+interleaved one-shot/loop buffers with seek. One sink, one owner: starting
+the rack loop stops the tape and vice versa; a finished arrangement stops
+the transport and says so. This is a deliberate trade against
+`studio-engine`'s streaming path: at beat-project sizes a full re-render per
+edit is cheap and cannot glitch; `DeviceEngine` remains the named path for
+when projects outgrow it. Channels also gained **choke groups** (`Channel::
+choke_group`, wire v6): a group hit cuts the group's ringing voice with a
+~2ms fade; same-sample hits layer; the kit's hats ship in group 1. Drops are
+panel-routed: a file dropped on the Rack becomes a sampler channel, dropped
+on the Timeline it becomes a clip at the playhead on the first audio track
+*with room* — a melody loop is arrangement material, not a truncated
+one-shot. Not built, named plainly: rack collaboration (the wire has
+`Packet::Rack`; the shell doesn't broadcast it yet), streaming pattern
+playback inside `DeviceEngine`'s realtime render, and the Mixer/Program
+panels, which say so on screen instead of showing nothing.
 
 ## Realtime collaboration, concretely
 

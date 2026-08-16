@@ -55,7 +55,7 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 5;
+pub const WIRE_VERSION: u8 = 6;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -402,9 +402,19 @@ fn put_channel(o: &mut Vec<u8>, c: &Channel) {
     put_f32(o, c.gain);
     put_f32(o, c.pan);
     put_u8(o, c.muted as u8);
+    put_u8(o, c.choke_group.is_some() as u8);
+    put_u8(o, c.choke_group.unwrap_or(0));
 }
 fn get_channel(r: &mut R) -> Option<Channel> {
-    Some(Channel { name: r.str()?, kind: get_synthkind(r)?, gain: r.f32()?, pan: r.f32()?, muted: r.u8()? != 0 })
+    let name = r.str()?;
+    let kind = get_synthkind(r)?;
+    let gain = r.f32()?;
+    let pan = r.f32()?;
+    let muted = r.u8()? != 0;
+    let has_choke = r.u8()? != 0;
+    let choke = r.u8()?;
+    Some(Channel { name, kind, gain, pan, muted,
+                   choke_group: has_choke.then_some(choke) })
 }
 
 fn put_stepmod(o: &mut Vec<u8>, m: &StepMod) {
@@ -712,9 +722,9 @@ mod tests {
         pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)) });
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false },
-                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2) },
+                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false, choke_group: None },
+                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true, choke_group: Some(0) },
             ],
             patterns: vec![pattern],
             tempo_bpm: 140.0, swing: 0.11,
@@ -730,7 +740,7 @@ mod tests {
         rack.channels.push(Channel {
             name: "gan".into(),
             kind: SynthKind::Beatspace { z: [0.25, -0.5, 0.9], crossfade: 0.4 },
-            gain: 1.0, pan: 0.0, muted: false,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
         });
         let p = Packet::Rack(RackSync { rack, seq: 12, site: SiteId(3) });
         let bytes = p.encode();
@@ -845,7 +855,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 5, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 6, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

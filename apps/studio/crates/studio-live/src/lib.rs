@@ -174,6 +174,15 @@ pub struct Channel {
     pub gain: f32,
     pub pan: f32,
     pub muted: bool,
+    /// Channels sharing a group id choke each other: a new hit in the group
+    /// cuts (with a ~2ms fade) whatever the group was still ringing — the
+    /// 808's closed-hat-silences-open-hat rule, which is most of why a real
+    /// hat line breathes. `None` (the default, and what any pre-choke rack
+    /// deserializes to) never chokes or is choked. Hits that land on the
+    /// same sample LAYER rather than choke — simultaneity is a chord, not a
+    /// cut, and which one "wins" would otherwise be channel-order trivia.
+    #[serde(default)]
+    pub choke_group: Option<u8>,
 }
 
 /// A pattern: for each channel, which steps fire.
@@ -328,7 +337,7 @@ impl Rack {
     /// a broken one. 140 BPM, light swing, an 808 that slides.
     pub fn trap_kit() -> Rack {
         let ch = |name: &str, kind: SynthKind, gain: f32| Channel {
-            name: name.into(), kind, gain, pan: 0.0, muted: false,
+            name: name.into(), kind, gain, pan: 0.0, muted: false, choke_group: None,
         };
         let channels = vec![
             ch("808",   SynthKind::Sub { note: 0, glide_from: None, glide_ms: 70.0,
@@ -344,6 +353,11 @@ impl Rack {
             ch("OHat",  SynthKind::Drum { voice: DrumVoice::HatOpen, tone: 0.6,
                                           decay_ms: 320.0, tune: 0 }, 0.5),
         ];
+        let mut channels = channels;
+        // The hats choke each other — the open hat breathes until the next
+        // closed hat shuts it, which is most of what makes a hat line a line.
+        channels[4].choke_group = Some(1);
+        channels[5].choke_group = Some(1);
         let mut p = Pattern::new("Trap A", 16, channels.len());
         // 808 shadows the kick and slides down through the bar.
         for s in [0, 6, 10] { p.set(0, s, true); }
@@ -669,6 +683,19 @@ pub fn render_pattern(
     // this render, not the synth's business. See `apply_step_mod`'s docs.
     let mut last_note: BTreeMap<usize, i8> = BTreeMap::new();
 
+    // ── pass 1: place ───────────────────────────────────────────────────
+    // Decide WHERE every voice starts before rendering ANY of them, because
+    // choke needs to know the group's next hit to know where this one ends —
+    // a single interleaved pass would be adding tails it hasn't yet learned
+    // are cut.
+    struct Placed {
+        ch_i: usize,
+        at: usize,
+        kind: SynthKind,
+        amp: f32,
+        group: Option<u8>,
+    }
+    let mut placed: Vec<Placed> = Vec::new();
     for (ch_i, step_i) in pattern.hits() {
         let Some(ch) = rack.channels.get(ch_i) else { continue };
         if ch.muted { continue; }
@@ -701,14 +728,61 @@ pub fn render_pattern(
         // individually — a roll is one gesture, not four independent notes.
         let swing = tempo.swing_delay_samples(step_i, rate);
         for r in 0..ratchet {
-            scratch.fill(0.0);
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
-            synth.render(&this_kind, rate, &mut scratch);
-            let at = step_i as usize * step + swing + r * sub_step;
-            for (i, v) in scratch.iter().enumerate() {
-                if at + i >= out.len() { break; }
-                out[at + i] += v * ch.gain * m.vel;
+            placed.push(Placed {
+                ch_i,
+                at: step_i as usize * step + swing + r * sub_step,
+                kind: this_kind,
+                amp: ch.gain * m.vel,
+                group: ch.choke_group,
+            });
+        }
+    }
+
+    // Every group's hit-start list, sorted, so "when does the group fire
+    // next" is a partition-point lookup per voice.
+    let mut group_starts: BTreeMap<u8, Vec<usize>> = BTreeMap::new();
+    for p in &placed {
+        if let Some(g) = p.group {
+            group_starts.entry(g).or_default().push(p.at);
+        }
+    }
+    for starts in group_starts.values_mut() {
+        starts.sort_unstable();
+    }
+
+    // ── pass 2: render ──────────────────────────────────────────────────
+    let fade = (rate as usize / 500).max(1); // ~2ms: cut, not click
+    for p in &placed {
+        if p.at >= out.len() { continue; }
+        // What the voice would naturally occupy (its ring, clipped by the
+        // buffer end) vs what choke allows. The synth ALWAYS renders its full
+        // window: some voices (Sine's percussive envelope) shape themselves
+        // to the buffer they're given, so "render into fewer samples" is a
+        // different, faster sound than "render fully, cut at add time" — and
+        // add-time cutting is what the pre-choke renderer did.
+        let natural = voice_len.min(out.len() - p.at);
+        let mut allowed = natural;
+        if let Some(starts) = p.group.and_then(|g| group_starts.get(&g)) {
+            // First group start STRICTLY after this one — simultaneous group
+            // hits layer (see `choke_group`'s docs), and a voice must not
+            // choke itself at its own start index.
+            let next = starts.partition_point(|&s| s <= p.at);
+            if let Some(&cut_at) = starts.get(next) {
+                allowed = allowed.min(cut_at - p.at);
             }
+        }
+        if allowed == 0 { continue; }
+        scratch.fill(0.0);
+        synth.render(&p.kind, rate, &mut scratch);
+        let choked = allowed < natural;
+        for (i, v) in scratch[..allowed.min(scratch.len())].iter().enumerate() {
+            let mut v = *v;
+            if choked && allowed >= fade && i >= allowed - fade {
+                // Linear ramp over the last ~2ms before the cut.
+                v *= (allowed - i) as f32 / fade as f32;
+            }
+            out[p.at + i] += v * p.amp;
         }
     }
     out
@@ -851,11 +925,11 @@ mod tests {
     fn rack() -> Rack {
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false, choke_group: None },
                 Channel { name: "beatspace".into(),
                           kind: SynthKind::Beatspace { z: [0.1, -0.4, 0.0], crossfade: 0.5 },
-                          gain: 1.0, pan: 0.0, muted: false },
+                          gain: 1.0, pan: 0.0, muted: false, choke_group: None },
             ],
             patterns: vec![],
             tempo_bpm: 120.0, swing: 0.0,
@@ -1204,7 +1278,7 @@ mod tests {
         rack.channels.push(Channel {
             name: "808".into(),
             kind: SynthKind::Sub { note: -5, glide_from: None, glide_ms: 0.0, drive: 0.3, decay_ms: 300.0 },
-            gain: 1.0, pan: 0.0, muted: false,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
         });
         let mut pattern = Pattern::new("beat", 16, rack.channels.len());
         pattern.toggle(3, 0); // the new 808 channel, on step 0
@@ -1362,7 +1436,7 @@ mod tests {
             channels: vec![Channel {
                 name: "808".into(),
                 kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 30.0, drive: 0.0, decay_ms: 2000.0 },
-                gain: 1.0, pan: 0.0, muted: false,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
             }],
             patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
         };
@@ -1606,7 +1680,7 @@ mod trap_tests {
             channels: vec![Channel { name: "hat".into(),
                 kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5,
                                         decay_ms: 40.0, tune: 0 },
-                gain: 1.0, pan: 0.0, muted: false }],
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None }],
             patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
         };
         let mut p = Pattern::new("A", 4, 1);
@@ -1687,7 +1761,7 @@ mod import_tests {
         let ch = rack.add_channel(Channel {
             name: "snap".into(),
             kind: SynthKind::Sampler { source: studio_core::SourceId(7) },
-            gain: 0.9, pan: 0.0, muted: false,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
         });
         for p in &rack.patterns {
             assert_eq!(p.rows.len(), rack.channels.len(), "'{}' kept up", p.name);
@@ -1715,5 +1789,119 @@ mod import_tests {
         let mut same = vec![0.0f32; 50];
         synth.render(&SynthKind::Sampler { source: studio_core::SourceId(1) }, 24_000, &mut same);
         assert_eq!(same[10], 10.0 / 100.0);
+    }
+}
+
+#[cfg(test)]
+mod choke_tests {
+    use super::*;
+
+    fn hat_rack() -> Rack {
+        let ch = |name: &str, voice: DrumVoice, decay: f32, grp: Option<u8>| Channel {
+            name: name.into(),
+            kind: SynthKind::Drum { voice, tone: 0.5, decay_ms: decay, tune: 0 },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: grp,
+        };
+        Rack {
+            channels: vec![
+                ch("ohat", DrumVoice::HatOpen, 600.0, Some(1)),
+                ch("hat",  DrumVoice::HatClosed, 40.0, Some(1)),
+            ],
+            patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
+        }
+    }
+
+    fn render(rack: &Rack, p: &Pattern) -> (Vec<f32>, usize) {
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let t = rack.tempo();
+        let out = render_pattern(p, rack, &mut synth, &t, 48_000, 0);
+        (out, t.step_len().to_samples(48_000) as usize)
+    }
+
+    #[test]
+    fn a_closed_hat_shuts_the_open_hat_it_shares_a_group_with() {
+        let rack = hat_rack();
+        let mut p = Pattern::new("A", 8, 2);
+        p.set(0, 0, true); // open hat rings 600ms...
+        p.set(1, 2, true); // ...until the closed hat two steps later
+        let (choked, step) = render(&rack, &p);
+
+        let mut open_only = Pattern::new("B", 8, 2);
+        open_only.set(0, 0, true);
+        let (free, _) = render(&rack, &open_only);
+
+        let e = |b: &[f32], from: usize, to: usize| b[from..to].iter().map(|s| s.abs()).sum::<f32>();
+        // Before the cut the two renders are the same sound...
+        assert!((e(&choked, 0, step) - e(&free, 0, step)).abs() < e(&free, 0, step) * 0.01,
+                "the open hat is untouched before the choke");
+        // ...after it, the free render still rings and the choked one holds
+        // only the closed hat's own short burst, which dies within a step.
+        let ring_free = e(&free, step * 3, step * 4);
+        let ring_choked = e(&choked, step * 3, step * 4);
+        assert!(ring_free > 1.0, "unchoked open hat is still ringing ({ring_free})");
+        assert!(ring_choked < ring_free * 0.15,
+                "choke cut the tail: {ring_choked} vs free {ring_free}");
+    }
+
+    #[test]
+    fn the_cut_is_a_fade_not_a_cliff() {
+        // A hard truncation of a ringing waveform is a click. Compare the
+        // choked render against an unchoked one: inside the ~2ms fade window
+        // the choked signal must only ever be the free signal scaled DOWN,
+        // and the last pre-cut sample must carry almost none of it.
+        let rack = hat_rack();
+        let mut p = Pattern::new("A", 8, 2);
+        p.set(0, 0, true);
+        // Cut at step 2, well INSIDE the open hat's natural 4-step window —
+        // a cut at the window's own edge would make choke a no-op and this
+        // test vacuous (which is exactly how its first draft shipped).
+        p.set(1, 2, true);
+        let (out, step) = render(&rack, &p);
+        let mut solo_open = Pattern::new("B", 8, 2);
+        solo_open.set(0, 0, true);
+        let (free, _) = render(&rack, &solo_open);
+
+        let cut = step * 2;
+        let fade = 48_000 / 500;
+        assert!(free[cut - fade..cut].iter().any(|s| s.abs() > 1e-3),
+                "test premise: the open hat is actually ringing at the cut");
+        for i in (cut - fade)..cut {
+            assert!(out[i].abs() <= free[i].abs() + 1e-4,
+                    "sample {i}: faded exceeds unfaded — that is not a fade");
+        }
+        assert!(out[cut - 1].abs() <= free[cut - 1].abs() / fade as f32 + 1e-4,
+                "the ramp's last sample is ~zero, not a cliff edge");
+    }
+
+    #[test]
+    fn simultaneous_group_hits_layer_instead_of_fighting() {
+        let rack = hat_rack();
+        let mut both = Pattern::new("A", 4, 2);
+        both.set(0, 0, true);
+        both.set(1, 0, true);
+        let (layered, step) = render(&rack, &both);
+        let mut just_open = Pattern::new("B", 4, 2);
+        just_open.set(0, 0, true);
+        let (open, _) = render(&rack, &just_open);
+        // The open hat's late tail survives a same-instant closed hat.
+        let e = |b: &[f32]| b[step * 2..step * 3].iter().map(|s| s.abs()).sum::<f32>();
+        assert!(e(&layered) > e(&open) * 0.9,
+                "same-sample hits are a chord, not a cut: {} vs {}", e(&layered), e(&open));
+    }
+
+    #[test]
+    fn ungrouped_channels_never_choke_anything() {
+        let mut rack = hat_rack();
+        rack.channels[1].choke_group = None;
+        let mut p = Pattern::new("A", 8, 2);
+        p.set(0, 0, true);
+        p.set(1, 2, true);
+        let (out, step) = render(&rack, &p);
+        let mut solo = Pattern::new("B", 8, 2);
+        solo.set(0, 0, true);
+        let (free, _) = render(&rack, &solo);
+        let e = |b: &[f32]| b[step * 3..step * 4].iter().map(|s| s.abs()).sum::<f32>();
+        assert!(e(&out) > e(&free) * 0.9, "no group, no cut");
     }
 }
