@@ -2222,6 +2222,32 @@ impl Game {
             poses.push(raws.into_iter().map(|r| r.verts).collect());
         }
         self.morph = xform::Morph::build(poses, idx);
+        // COMPACTION ON, which it never has been: Morph::build sets
+        // `compaction: None` and nothing assigned it, so compact.rs — 
+        // written for exactly the "flat vehicle panels still hanging off the
+        // robot" problem — has been dead code since it landed.
+        //
+        // Style::Shrink is the one that matters here: "panels compact inward —
+        // vehicle bodywork folding into a smaller volume". A door that has
+        // nowhere to go collapses toward the body's own centre rather than
+        // staying at vehicle-mode extent while the body underneath it stands up.
+        //
+        // min_thickness is the other half, and it is the same mechanism rather
+        // than a separate mesh-repair pass: the project's own thin-shell audit
+        // found a "barrel" measuring 1.049 x 0.267 x 0.005, and "a
+        // zero-thickness shell is invisible edge-on, shades wrong, and reads as
+        // a paper cut-out at exactly the moment a transformation puts it
+        // side-on to the camera".
+        //
+        // The defaults are eye-tuned rather than guessed — cell 0.35 with
+        // strength 0.55 "was the pair that read as geometric compaction on
+        // every rig rather than as noise on the small ones and mush on the
+        // large ones", across six body types. An earlier 0.22/0.85 pass was
+        // picked before anything could be seen and was wrong in both
+        // directions, so these are left alone.
+        if let Some(m) = self.morph.as_mut() {
+            m.compaction = Some(crate::compact::Params::default());
+        }
         if self.morph.is_none() {
             // a strip whose poses disagree cannot be blended; stepping it is
             // still better than blending garbage
