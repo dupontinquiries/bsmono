@@ -171,8 +171,17 @@ def dequantise(buf, lo, hi, n):
     return vals
 
 
-def pack_chassis(cdir, dry=False):
-    pose_dirs = sorted(d for d in glob.glob(os.path.join(cdir, "f*"))
+def pack_chassis(cdir, dry=False, prefix="f", out_name="bots.pack"):
+    """Pack one STRIP of a chassis.
+
+    `prefix` selects which strip: "f" is the fold (vehicle -> robot), "w" the
+    walk cycle. They are packed SEPARATELY and get their own quantisation box,
+    because the shared-box rule is per-strip: it exists so a lerp between
+    consecutive poses sees one mapping, and nothing ever lerps a fold pose
+    toward a walk pose. Merging them would widen both boxes for no benefit and
+    lose precision in each.
+    """
+    pose_dirs = sorted(d for d in glob.glob(os.path.join(cdir, prefix + "*"))
                        if os.path.isfile(os.path.join(d, "scene.bin")))
     if len(pose_dirs) < 2:
         return None
@@ -181,22 +190,33 @@ def pack_chassis(cdir, dry=False):
     counts = {len(v) for v, _, _, _ in poses}
     if len(counts) != 1:
         return ("skip", cdir, f"pose float counts differ: {sorted(counts)}")
-    # The float ranges must be identical across poses too: the strip is one
-    # mesh in five positions, so a differing layout means differing topology
-    # and the morph would be lerping between unrelated vertices.
-    if len({tuple(r) for _, _, _, r in poses}) != 1:
-        return ("skip", cdir, "float ranges differ between poses")
+    # Each pose carries its OWN float ranges rather than one shared set.
+    #
+    # The first version required identical ranges across poses and refused 47
+    # fold strips and 45 walk strips on that basis. That was too strict: the
+    # ranges differ because the parts are laid out in a different ORDER in the
+    # buffer, not because the geometry differs. analog's w00 and w01 have the
+    # same 39 float accessors and the same 28,152 values, at different offsets.
+    #
+    # Quantisation does not care about order — it maps a value through a box.
+    # What it needs is to know WHICH BYTES of each pose are float, and that is
+    # per-pose information the packer already computed and was throwing away.
+    #
+    # (Whether the poses lerp correctly is a separate question, and the one
+    # fold_unpermute.py answers. Refusing to COMPRESS a strip because its parts
+    # are ordered oddly conflates storage with playback.)
 
     lo, hi = chassis_box([(v, n) for v, n, _, _ in poses])
-    ranges = poses[0][3]
 
     out = bytearray(MAGIC)
     out += struct.pack("<HH", VERSION, len(poses))
     out += struct.pack("<ff", lo, hi)
-    # The ranges, so the decoder knows which bytes it is putting back.
-    out += struct.pack("<I", len(ranges))
-    for st, n in ranges:
-        out += struct.pack("<II", st, n)
+    # Ranges PER POSE, since they can differ. A few hundred bytes against the
+    # 47 fold and 45 walk strips this makes packable.
+    for _, _, _, rs in poses:
+        out += struct.pack("<I", len(rs))
+        for st, n in rs:
+            out += struct.pack("<II", st, n)
     for vals, nbytes, _, _ in poses:
         out += struct.pack("<I", nbytes)
 
@@ -214,32 +234,41 @@ def pack_chassis(cdir, dry=False):
 
     raw_t = sum(n for _, n, _, _ in poses)
     if not dry:
-        with open(os.path.join(cdir, "bots.pack"), "wb") as f:
+        with open(os.path.join(cdir, out_name), "wb") as f:
             f.write(out)
     return ("ok", cdir, raw_t, len(out))
 
 
-def verify_chassis(cdir):
+def verify_chassis(cdir, prefix="f", out="bots.pack"):
     """Decode and compare byte-for-byte outside the float ranges."""
-    path = os.path.join(cdir, "bots.pack")
+    path = os.path.join(cdir, out)
     if not os.path.isfile(path):
         return None
     blob = open(path, "rb").read()
     if blob[:4] != MAGIC:
         return ("bad", cdir, "wrong magic")
     ver, npose = struct.unpack_from("<HH", blob, 4)
+    if ver != VERSION:
+        # A v1 pack in a v2 tree. Reported rather than parsed: v1 wrote ONE
+        # shared range table and a flat u16 stream, so reading it as v2 walks
+        # off the end of the buffer — which is how this was found.
+        return ("stale", cdir, ver)
     lo, hi = struct.unpack_from("<ff", blob, 8)
     off = 16
-    (nr,) = struct.unpack_from("<I", blob, off); off += 4
-    ranges = []
-    for _ in range(nr):
-        st, n = struct.unpack_from("<II", blob, off); off += 8
-        ranges.append((st, n))
+    # Per-pose ranges, matching the writer.
+    all_ranges = []
+    for _ in range(npose):
+        (nr,) = struct.unpack_from("<I", blob, off); off += 4
+        rs = []
+        for _ in range(nr):
+            st, n = struct.unpack_from("<II", blob, off); off += 8
+            rs.append((st, n))
+        all_ranges.append(rs)
     lens = []
     for _ in range(npose):
         (n,) = struct.unpack_from("<I", blob, off); lens.append(n); off += 4
 
-    pose_dirs = sorted(d for d in glob.glob(os.path.join(cdir, "f*"))
+    pose_dirs = sorted(d for d in glob.glob(os.path.join(cdir, prefix + "*"))
                        if os.path.isfile(os.path.join(d, "scene.bin")))
     if not pose_dirs:
         return None
@@ -251,7 +280,8 @@ def verify_chassis(cdir):
         q = zlib.decompress(blob[off:off + qlen]); off += qlen
         rest = bytearray(zlib.decompress(blob[off:off + rlen])); off += rlen
         vals = dequantise(q, lo, hi, len(q) // 2)
-        # Put the floats back where they came from.
+        ranges = all_ranges[i]
+        # Put the floats back where they came from, in THIS pose's layout.
         k = 0
         for st, n in ranges:
             for j in range(n // 4):
@@ -278,17 +308,27 @@ def main():
     ap.add_argument("bots_dir")
     ap.add_argument("--verify", action="store_true", help="decode and compare, no writes")
     ap.add_argument("--dry-run", action="store_true", help="report sizes, write nothing")
+    # The walk cycle is its own strip with its own pack. Separate flag rather
+    # than packing both by default, so a run says which strip it touched and a
+    # half-finished walk pass cannot be mistaken for a fold regression.
+    ap.add_argument("--walk", action="store_true",
+                    help="pack w00.. (the walk cycle) into walk.pack instead of the fold")
     a = ap.parse_args()
 
+    prefix, out_name = ("w", "walk.pack") if a.walk else ("f", "bots.pack")
     dirs = sorted(d for d in glob.glob(os.path.join(a.bots_dir, "*")) if os.path.isdir(d))
     raw_t = pack_t = 0
     packed = skipped = 0
     worst_err = worst_rel = 0.0
+    stale = 0
 
     for d in dirs:
         if a.verify:
-            r = verify_chassis(d)
+            r = verify_chassis(d, prefix, out_name)
             if r is None:
+                continue
+            if r[0] == "stale":
+                stale += 1
                 continue
             if r[0] == "bad":
                 print(f"FAIL {r[1]}: {r[2]}")
@@ -303,7 +343,7 @@ def main():
                 return 1
             continue
 
-        r = pack_chassis(d, dry=a.dry_run)
+        r = pack_chassis(d, dry=a.dry_run, prefix=prefix, out_name=out_name)
         if r is None:
             continue
         if r[0] == "skip":
@@ -318,6 +358,8 @@ def main():
     if a.verify:
         print(f"verified: worst absolute error {worst_err:.3g} "
               f"({worst_rel*100:.5f}% of span)")
+        if stale:
+            print(f"  {stale} pack(s) are an older version and were not checked")
         return 0
 
     if raw_t:
