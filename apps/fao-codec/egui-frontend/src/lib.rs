@@ -12,6 +12,7 @@
 pub mod part_fit;
 pub mod reproject;
 pub mod seq_lab;
+pub mod seq_page;
 pub mod lab;
 pub mod library;
 pub mod player;
@@ -19,6 +20,7 @@ pub mod player;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Lab,
+    SeqLab,
     Library,
     Player,
     Settings,
@@ -28,6 +30,7 @@ pub struct App {
     pub tab: Tab,
     pub prefs: settings_kit::Prefs,
     pub lab: lab::State,
+    pub seq: seq_page::SeqState,
     pub library: library::State,
     pub player: player::State,
 }
@@ -36,7 +39,7 @@ impl Default for App {
     fn default() -> Self {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "system".to_string();
-        App { tab: Tab::Lab, prefs, lab: lab::State::default(), library: library::State::default(), player: player::State::default() }
+        App { tab: Tab::Lab, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default() }
     }
 }
 
@@ -60,6 +63,7 @@ impl App {
         }
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Lab => lab::ui(self, ui),
+            Tab::SeqLab => seq_page::ui(self, ui),
             Tab::Library => library::ui(self, ui),
             Tab::Player => player::ui(self, ui),
             Tab::Settings => {
@@ -70,7 +74,8 @@ impl App {
     }
 
     fn nav(&mut self, ui: &mut egui::Ui) {
-        for (t, label) in [(Tab::Lab, "🎞 Encode Lab"), (Tab::Library, "🔗 Library"),
+        for (t, label) in [(Tab::Lab, "🎞 Encode Lab"), (Tab::SeqLab, "⏱ Seq Lab"),
+                           (Tab::Library, "🔗 Library"),
                            (Tab::Player, "▶ Player"), (Tab::Settings, "⚙ Settings")] {
             if ui.selectable_label(self.tab == t, label).clicked() {
                 self.tab = t;
