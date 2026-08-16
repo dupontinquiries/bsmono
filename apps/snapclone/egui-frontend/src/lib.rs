@@ -309,6 +309,12 @@ pub struct Snapclone {
     /// the host; this owns WHEN a frame may leave and WHAT SEQUENCE it carries
     /// — the two things the receiver depends on.
     pub sender: crate::voice_send::VoiceSender,
+    /// What our NAT looks like from outside, once two STUN probes agree.
+    ///
+    /// `None` until both come back — nat_punch returns Unknown from a single
+    /// probe, and the whole classification rests on comparing TWO reflexive
+    /// addresses seen from the SAME local port.
+    pub nat: Option<crate::nat_punch::NatKind>,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -469,6 +475,7 @@ impl Snapclone {
             // 20 ms frames, the value snap_frame_ms normalises toward.
             sink_latency: crate::sink_cushion::Latency::from_settings(2, 8, 20),
             sender: Default::default(),
+            nat: None,
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -664,6 +671,40 @@ impl Snapclone {
     /// that one.
     pub fn handshake_retry(&self, attempt: u32) -> Option<u64> {
         crate::handshake::next_retry_ms(attempt)
+    }
+
+    /// Classify our NAT from two STUN responses.
+    ///
+    /// Both probes must have left the SAME socket, and the source is explicit
+    /// about why: "send a STUN binding request FROM m_punchSocket" rather than
+    /// an ephemeral one. A reflexive address discovered on a different socket
+    /// describes a mapping that will not exist when the punch arrives — the
+    /// classification would be right about a port nobody is listening on.
+    ///
+    /// Enforced here rather than trusted: the two responses carry the local
+    /// port they came from, and a mismatch is refused.
+    pub fn classify_nat(&mut self, local_port: u16,
+                        a: &crate::nat_punch::Reflexive,
+                        b: &crate::nat_punch::Reflexive) -> bool {
+        if a.from_local_port != local_port || b.from_local_port != local_port {
+            return false;
+        }
+        self.nat = Some(crate::nat_punch::classify(local_port, a, b));
+        true
+    }
+
+    /// How to reach this peer, given both NATs.
+    ///
+    /// Returns `Wait` until ours is known, which is the module's own answer for
+    /// missing information — better than guessing DirectTcp and burning the
+    /// punch window on a connection that cannot form.
+    pub fn reach_strategy(&self, theirs: crate::nat_punch::NatKind)
+        -> crate::nat_punch::Strategy
+    {
+        match self.nat {
+            Some(ours) => crate::nat_punch::strategy(ours, theirs),
+            None => crate::nat_punch::Strategy::Wait,
+        }
     }
 
     /// Ask whether this captured frame may go out, and with what sequence.
@@ -3711,6 +3752,52 @@ mod gossip_wiring_tests {
             let got = s.view_for_storage()[0].last_seen_ms;
             assert!(got <= t, "{t} bucketed forward to {got}");
         }
+    }
+
+    fn refl(ip: &str, port: u16, from: u16) -> crate::nat_punch::Reflexive {
+        crate::nat_punch::Reflexive { ip: ip.into(), port, from_local_port: from }
+    }
+
+    #[test]
+    fn stun_from_the_wrong_socket_is_refused() {
+        // "Send a STUN binding request FROM m_punchSocket". A reflexive address
+        // discovered on an ephemeral socket describes a mapping that will not
+        // exist when the punch arrives — correct about a port nobody is on.
+        let mut s = Snapclone::new(vec![]);
+        assert!(!s.classify_nat(5000, &refl("1.2.3.4", 5000, 40001),
+                                       &refl("1.2.3.4", 5000, 5000)));
+        assert!(s.nat.is_none(), "classified from a foreign socket");
+    }
+
+    #[test]
+    fn two_agreeing_probes_from_one_socket_classify() {
+        let mut s = Snapclone::new(vec![]);
+        assert!(s.classify_nat(5000, &refl("1.2.3.4", 5000, 5000),
+                                     &refl("1.2.3.4", 5000, 5000)));
+        // Same port in and out: nothing is rewriting it.
+        assert_eq!(s.nat, Some(crate::nat_punch::NatKind::Open));
+    }
+
+    #[test]
+    fn a_changing_reflexive_port_is_symmetric_and_relays() {
+        // Two probes to different servers seeing different ports is the
+        // definition of symmetric, and relay is "not a failure, just the honest
+        // answer".
+        use crate::nat_punch::{NatKind, Strategy};
+        let mut s = Snapclone::new(vec![]);
+        s.classify_nat(5000, &refl("1.2.3.4", 6001, 5000),
+                             &refl("1.2.3.4", 6002, 5000));
+        assert_eq!(s.nat, Some(NatKind::Symmetric));
+        assert_eq!(s.reach_strategy(NatKind::Open), Strategy::Relay);
+    }
+
+    #[test]
+    fn an_unclassified_nat_waits_rather_than_guessing() {
+        // Guessing DirectTcp burns the punch window on a connection that
+        // cannot form.
+        use crate::nat_punch::{NatKind, Strategy};
+        let s = Snapclone::new(vec![]);
+        assert_eq!(s.reach_strategy(NatKind::Open), Strategy::Wait);
     }
 
     #[test]
