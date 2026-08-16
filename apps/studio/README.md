@@ -56,9 +56,36 @@ edits exactly reversible, which floats are not.
 | `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
 | `studio-video` | video probing, thumbnails, audio-track extraction (real `ffmpeg`/`ffprobe`) | 11 |
 
-`studio-egui` couldn't be re-verified in this pass — it needs `egui`/`eframe`,
-which needs a newer cargo than was available; the number above is carried
-over unchanged rather than guessed at. Every other row was re-run directly.
+**Toolchain note:** egui/eframe 0.34 declare `rust-version = 1.92`, so the
+GUI crates need rustc ≥ 1.92 (the offline `rustup.zip` toolchain pack, 1.96,
+works). On an older rustc, `cargo build --ignore-rust-version` compiles them
+anyway — the declared MSRV is policy, not a used language feature — but a
+real 1.92+ is the supported path. With that in place every row above,
+including `studio-egui` and `studio-app`, builds and its tests run directly.
+
+**The rack is now an application, not just a model.** `studio-app` renders
+the Rack panel: the step grid (paint on/off, per the grid module's rules), a
+per-step modifier lane (velocity, hat-roll ratchet, retune, 808 slide,
+probability — `studio-egui::lanes`), channel strip, BPM and swing, and a
+bounce button that lands the pattern on the timeline as an ordinary
+undoable/shareable `AddSource`+`AddClip`. Space on the Rack panel drives the
+loop; on the Timeline it stays the tape transport. Audition playback loops
+the rendered pattern through cpal (`studio-app::audition`, `audio` feature,
+default on) and degrades to a silent wall-clock playhead when no device
+exists — the status line says which sink you got. `studio-live` grew the
+trap half the rack existed for: synthesized `Drum` voices (kick, snare,
+clap, closed/open hats — deterministic, zero assets), `Tempo::swing`
+(placement-time, off-16ths only), `Rack::trap_kit()` as the demo groove, and
+rate-correct `Sampler` playback (linear resample when source rate ≠ render
+rate). `.opus` decodes natively via `studio-media`'s `opus` feature (ogg +
+libopus, default on) — stereo preserved, pre-skip and final-granule
+trimmed so loops seam cleanly — and files dropped on the window import as
+rack sampler channels; the project stores the file's own path (and, through
+collab assets, its compressed bytes), never inflated PCM. Not built, named
+plainly: open-hat choke groups, rack collaboration (the wire has
+`Packet::Rack`; the shell doesn't broadcast it yet), pattern playback inside
+the engine's timeline mixdown (audition is a separate loop player), and the
+Mixer/Program panels, which say so on screen instead of showing nothing.
 
 ## Realtime collaboration, concretely
 

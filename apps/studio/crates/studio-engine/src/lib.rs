@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn count_in_bars_convert_through_tempo_and_time_signature() {
         let mut engine = EngineState::new(empty_project(), 48_000, 16);
-        engine.tempo = Tempo { bpm: 120.0, steps_per_beat: 4 };
+        engine.tempo = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
         engine.beats_per_bar = 4;
         engine.apply(Command::Transport(TransportCmd::CountIn(2)));
         // 120 bpm -> 0.5s/beat -> 4 beats/bar -> 2s/bar -> 2 bars = 4s.

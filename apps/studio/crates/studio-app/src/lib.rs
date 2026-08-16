@@ -15,6 +15,9 @@ use studio_core::{Project, Ticks};
 use studio_egui::touch::{Panel, ViewMode};
 use studio_live::transport::Transport;
 
+pub mod audition;
+pub mod rack_panel;
+
 /// Everything the running editor holds.
 pub struct Studio {
     pub session: Session,
@@ -27,6 +30,25 @@ pub struct Studio {
     pub keys: studio_egui::keys::Keymap,
     /// Status line — what just happened, so an action never fails silently.
     pub status: String,
+
+    // ── the live half ────────────────────────────────────────────────────
+    /// The rack. Local to this Studio for now: `studio-collab` already has
+    /// `Packet::Rack` (whole-value LWW) on the wire, so sharing it is a
+    /// broadcast call away, but this shell does not make that call yet —
+    /// named here rather than implied.
+    pub rack: studio_live::Rack,
+    pub current_pattern: usize,
+    pub selected_channel: usize,
+    pub lane: studio_egui::lanes::Lane,
+    pub paint: studio_egui::grid::Paint,
+    /// Play intent for the audition loop. Intent, not the device state: the
+    /// shell syncs the sink to this every frame, so the headless tests below
+    /// can drive the space bar without a sound card existing.
+    pub rack_playing: bool,
+    /// Set by any rack edit; the shell re-renders the loop and clears it.
+    pub loop_dirty: bool,
+    /// Set by the panel's bounce button; the shell performs it.
+    pub pending_bounce: bool,
 }
 
 impl Studio {
@@ -42,6 +64,14 @@ impl Studio {
             history: studio_core::History::default(),
             keys: studio_egui::keys::Keymap::new(),
             status: "ready".into(),
+            rack: studio_live::Rack::trap_kit(),
+            current_pattern: 0,
+            selected_channel: 0,
+            lane: studio_egui::lanes::Lane::default(),
+            paint: studio_egui::grid::Paint::default(),
+            rack_playing: false,
+            loop_dirty: true,
+            pending_bounce: false,
         }
     }
 
@@ -85,8 +115,19 @@ impl Studio {
             Resolution::Act(a) => {
                 match a {
                     Action::PlayPause => {
-                        if self.transport.playing { self.transport.stop(); self.status = "stopped".into(); }
-                        else { self.transport.play(); self.status = "playing".into(); }
+                        // On the rack, space is the loop pedal; on the
+                        // timeline, the tape transport. One key, the thing
+                        // you are looking at — the alternative is space
+                        // starting audio you cannot see.
+                        if self.panel == Panel::Rack {
+                            self.rack_playing = !self.rack_playing;
+                            self.status = if self.rack_playing { "loop playing".into() }
+                                          else { "loop stopped".into() };
+                        } else if self.transport.playing {
+                            self.transport.stop(); self.status = "stopped".into();
+                        } else {
+                            self.transport.play(); self.status = "playing".into();
+                        }
                     }
                     Action::Undo => {
                         self.status = if self.history.undo(&mut self.session.doc.project).is_some()
@@ -139,6 +180,100 @@ impl Studio {
     /// The playhead to render, honouring theatre mode.
     pub fn playhead(&self) -> Ticks {
         self.mode.effective_playhead(self.transport.position(), None)
+    }
+
+    /// Render the current pattern's loop at `rate` — what the audition sink
+    /// plays and what a bounce stores. One function so they cannot drift.
+    pub fn render_loop(
+        &self,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    ) -> Vec<f32> {
+        let Some(p) = self.rack.patterns.get(self.current_pattern) else { return Vec::new() };
+        let mut synth = studio_live::BuiltinSynth { sources };
+        studio_live::render_pattern(p, &self.rack, &mut synth, &self.rack.tempo(), rate, 0)
+    }
+
+    /// Land decoded audio in the project and give it a rack channel, in one
+    /// gesture. The source reaches the project as an `AddSource` op — the
+    /// same undoable, shareable shape a take and a bounce use — with `path`
+    /// kept as the file's real location, because the compact representation
+    /// of a sample IS the compressed file: the project references (or, via
+    /// `studio-collab`'s chunked assets, carries the bytes of) the .opus
+    /// itself, and PCM only ever exists in memory after decode. That is the
+    /// difference between this and an editor that inflates every import to
+    /// WAV inside the project.
+    pub fn import_audio(
+        &mut self,
+        name: &str,
+        path: &str,
+        audio: &studio_audio::SourceAudio,
+    ) -> studio_core::SourceId {
+        let id = studio_core::SourceId(
+            self.session.doc.project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        self.edit(studio_core::Op::AddSource {
+            source: studio_core::Source {
+                id, path: path.into(),
+                len: studio_core::Ticks::from_samples(audio.frames() as i64, audio.sample_rate),
+                sample_rate: audio.sample_rate,
+                channels: audio.channels.len() as u16,
+                has_video: false,
+            },
+        }, "imported");
+        let ch = self.rack.add_channel(studio_live::Channel {
+            name: name.into(),
+            kind: studio_live::SynthKind::Sampler { source: id },
+            gain: 0.9, pan: 0.0, muted: false,
+        });
+        self.selected_channel = ch;
+        self.loop_dirty = true;
+        self.status = if audio.sample_rate == 48_000 {
+            format!("imported '{name}' → rack channel {}", ch + 1)
+        } else {
+            // Playable at pitch either way (the sampler resamples at render
+            // time), but worth a sentence: mixdown quality is best at the
+            // project rate, and the person can re-export their library once
+            // instead of wondering.
+            format!("imported '{name}' at {} Hz (project is 48000; resampled live)",
+                    audio.sample_rate)
+        };
+        id
+    }
+
+    /// Bounce the current pattern onto the first audio track at the playhead.
+    ///
+    /// Returns the new source's id plus the samples, so the caller can stash
+    /// the audio wherever it keeps decoded sources (and build a peak pyramid
+    /// for the timeline). The ops go through [`Studio::edit`], so the bounce
+    /// is undoable and — because it is `AddSource`+`AddClip`, the exact shape
+    /// a recorded take uses — shareable by the same mechanism a drag is.
+    pub fn bounce_current_pattern(
+        &mut self,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    ) -> Option<(studio_core::SourceId, studio_audio::SourceAudio)> {
+        let pattern = self.rack.patterns.get(self.current_pattern)?.clone();
+        let track = self.session.doc.project.tracks.iter()
+            .find(|t| t.kind == studio_core::TrackKind::Audio)
+            .map(|t| t.id);
+        let Some(track) = track else {
+            self.status = "bounce refused: no audio track".into();
+            return None;
+        };
+        let samples = self.render_loop(rate, sources);
+        let source = studio_core::SourceId(
+            self.session.doc.project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        let clip = studio_core::ClipId(
+            self.session.doc.project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        let at = self.playhead();
+        let path = format!("bounces/{}.wav", pattern.name);
+        let ops = studio_live::bounce_ops(&pattern, &self.rack.tempo(), rate,
+                                          source, clip, track, at, &path);
+        for op in ops {
+            self.edit(op, "bounced");
+        }
+        self.status = format!("bounced '{}' to the timeline", pattern.name);
+        Some((source, studio_audio::SourceAudio { sample_rate: rate, channels: vec![samples] }))
     }
 }
 
@@ -222,11 +357,20 @@ mod tests {
 pub struct App {
     pub studio: Studio,
     peaks: std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
+    /// Decoded / synthesised audio per source — today only bounces land here;
+    /// a media importer would feed the same map.
+    audio: std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    sink: Box<dyn audition::LoopSink>,
 }
 
 #[cfg(feature = "app")]
 impl Default for App {
-    fn default() -> Self { App { studio: Studio::demo(), peaks: Default::default() } }
+    fn default() -> Self {
+        let sink = audition::open_sink();
+        let mut studio = Studio::demo();
+        studio.status = format!("ready — audition: {}", sink.describe());
+        App { studio, peaks: Default::default(), audio: Default::default(), sink }
+    }
 }
 
 #[cfg(feature = "app")]
@@ -247,7 +391,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for p in Panel::ALL {
-                    if ui.selectable_label(self.studio.panel == p, p.label()).clicked() {
+                    if ui.add(egui::Button::selectable(self.studio.panel == p, p.label())).clicked() {
                         self.studio.panel = p;
                     }
                 }
@@ -268,11 +412,82 @@ impl eframe::App for App {
                 });
             });
         });
+        // ── files dropped on the window become rack channels ─────────────
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            let name = f.path.as_ref()
+                .and_then(|p| p.file_stem()).and_then(|s| s.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| f.name.clone());
+            let decoded = match (&f.path, &f.bytes) {
+                (Some(p), _) => studio_media::decode_file(p)
+                    .map(|a| (a, p.display().to_string())),
+                (None, Some(b)) => {
+                    let hint = f.name.rsplit('.').next();
+                    studio_media::decode_bytes(b.to_vec(), hint)
+                        .map(|a| (a, f.name.clone()))
+                }
+                (None, None) => continue,
+            };
+            match decoded {
+                Ok((audio, path)) => {
+                    let id = self.studio.import_audio(&name, &path, &audio);
+                    self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                    self.audio.insert(id, audio);
+                }
+                // A decode error is not a missing-plugin error (studio-media's
+                // own rule): say exactly what failed, keep editing.
+                Err(e) => self.studio.status = format!("import '{name}' failed: {e}"),
+            }
+        }
+
+        // ── keep the audition loop honest before drawing it ──────────────
+        if self.studio.loop_dirty {
+            let samples = self.studio.render_loop(self.sink.rate(), &self.audio);
+            self.sink.set_loop(std::sync::Arc::new(samples));
+            self.studio.loop_dirty = false;
+        }
+        self.sink.set_playing(self.studio.rack_playing);
+        if self.studio.pending_bounce {
+            self.studio.pending_bounce = false;
+            // The timeline's rate, not the sink's: a bounce is project
+            // material and must not change length because of the sound card.
+            if let Some((id, audio)) = self.studio.bounce_current_pattern(48_000, &self.audio) {
+                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                self.audio.insert(id, audio);
+            }
+        }
+        let playhead_col = self.sink.position().and_then(|pos| {
+            let p = self.studio.rack.patterns.get(self.studio.current_pattern)?;
+            if p.steps == 0 { return None; }
+            let step = self.studio.rack.tempo().step_len()
+                .to_samples(self.sink.rate()).max(1) as usize;
+            Some((pos / step) as u32 % p.steps)
+        });
+        if self.studio.rack_playing {
+            // The playhead column is a read recomputed each frame (grid's own
+            // rule), so the frames have to keep coming while the loop runs.
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            let ph = self.studio.playhead();
-            let sel = self.studio.selection.clone();
-            studio_egui::timeline(ui, &self.studio.session.doc, &mut self.studio.view,
-                                  &colors, ph, &sel, &self.peaks);
+            match self.studio.panel {
+                Panel::Rack => {
+                    rack_panel::show(ui, &mut self.studio, &colors, playhead_col);
+                }
+                Panel::Mixer | Panel::Program => {
+                    // Honest placeholder beats a silent no-op: a tab that
+                    // switches to nothing reads as a broken tab.
+                    ui.colored_label(colors.text_weak,
+                        format!("{} — not built yet.", self.studio.panel.label()));
+                }
+                Panel::Timeline => {
+                    let ph = self.studio.playhead();
+                    let sel = self.studio.selection.clone();
+                    studio_egui::timeline(ui, &self.studio.session.doc, &mut self.studio.view,
+                                          &colors, ph, &sel, &self.peaks);
+                }
+            }
         });
     }
 }
@@ -285,4 +500,130 @@ pub fn run(title: &str) -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(title, opts, Box::new(|_cc| Ok(Box::<App>::default())))
+}
+
+#[cfg(test)]
+mod rack_shell_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+
+    #[test]
+    fn space_on_the_rack_drives_the_loop_and_leaves_the_tape_alone() {
+        // One key, the thing you are looking at. Space starting audio you
+        // cannot see is the disorienting version.
+        let mut s = Studio::demo();
+        s.panel = Panel::Rack;
+        s.key(Key::c(' '));
+        assert!(s.rack_playing, "the loop pedal went down");
+        assert!(!s.transport.playing, "and the tape did not roll");
+        s.key(Key::c(' '));
+        assert!(!s.rack_playing);
+        s.panel = Panel::Timeline;
+        s.key(Key::c(' '));
+        assert!(s.transport.playing, "on the timeline, space is the transport");
+        assert!(!s.rack_playing);
+    }
+
+    #[test]
+    fn the_demo_rack_is_audible_with_zero_assets() {
+        let s = Studio::demo();
+        let out = s.render_loop(48_000, &Default::default());
+        assert!(!out.is_empty());
+        assert!(out.iter().map(|v| v.abs()).sum::<f32>() > 50.0,
+                "the trap kit makes an actual bar of noise");
+    }
+
+    #[test]
+    fn a_bounce_lands_an_undoable_clip_the_length_of_the_pattern() {
+        let mut s = Studio::demo();
+        let clips_before = s.session.doc.project.clips.len();
+        let (id, audio) = s.bounce_current_pattern(48_000, &Default::default()).expect("demo has an audio track");
+        assert_eq!(s.session.doc.project.clips.len(), clips_before + 1);
+        let clip = s.session.doc.project.clips.values()
+            .find(|c| c.source == id).expect("the clip points at the bounce");
+        // The clip is exactly as long as the audio it holds. (Not the pure
+        // tick-length of the pattern: render_pattern floors each step to
+        // whole samples, so at 140bpm a 16-step bar is ~14 samples shorter
+        // than the tick math — the clip must match the SAMPLES, or the
+        // timeline claims audio that does not exist.)
+        assert_eq!(clip.len, Ticks::from_samples(audio.frames() as i64, 48_000),
+                   "clip length is the audio's length");
+        assert_eq!(audio.channels.len(), 1, "a bounce is mono");
+        assert!(audio.frames() > 0);
+        // Two ops went through history (AddSource + AddClip): two undos
+        // return the project exactly to where it was — a bounce that cannot
+        // be taken back is a recording, not an edit.
+        s.key(Key::c('u'));
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.clips.len(), clips_before);
+        assert!(!s.session.doc.project.sources.contains_key(&id));
+    }
+
+    #[test]
+    fn a_bounce_with_no_audio_track_refuses_out_loud() {
+        // The worst failure an editor has is a silently dropped edit.
+        let p = Project { name: "empty".into(), ..Default::default() };
+        let mut s = Studio::new(p, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]));
+        assert!(s.bounce_current_pattern(48_000, &Default::default()).is_none());
+        assert!(s.status.contains("refused"), "status was {:?}", s.status);
+    }
+
+    #[test]
+    fn editing_the_rack_marks_the_loop_dirty_the_way_the_panel_will() {
+        // The panel detects edits by value comparison; pin that a step
+        // toggle actually changes the value it compares.
+        let mut s = Studio::demo();
+        let before = s.rack.clone();
+        s.rack.patterns[0].toggle(1, 3);
+        assert_ne!(s.rack, before);
+    }
+}
+
+#[cfg(test)]
+mod import_shell_tests {
+    use super::*;
+
+    #[test]
+    fn an_imported_sample_becomes_an_undoable_source_and_a_playable_channel() {
+        let mut s = Studio::demo();
+        let channels_before = s.rack.channels.len();
+        // A 100ms click at 48k — synthetic here; studio-media's own tests
+        // prove real .opus bytes land in this exact SourceAudio shape.
+        let mut click = vec![0.0f32; 4800];
+        click[0] = 1.0; click[1] = 0.5;
+        let audio = studio_audio::SourceAudio { sample_rate: 48_000, channels: vec![click] };
+        let id = s.import_audio("snap", "samples/snap.opus", &audio);
+
+        let src = s.session.doc.project.sources.get(&id).expect("source landed as an op");
+        assert_eq!(src.path, "samples/snap.opus",
+                   "the project references the compressed file, not an inflated copy");
+        assert_eq!(s.rack.channels.len(), channels_before + 1);
+        assert!(s.loop_dirty, "the audition loop knows to re-render");
+
+        // Sequence it and hear it: the new channel's steps are not no-ops.
+        let ch = s.rack.channels.len() - 1;
+        s.rack.patterns[0].set(ch, 0, true);
+        let mut sources = std::collections::BTreeMap::new();
+        let mut click = vec![0.0f32; 4800];
+        click[0] = 1.0; click[1] = 0.5;
+        sources.insert(id, studio_audio::SourceAudio { sample_rate: 48_000, channels: vec![click] });
+        // Mute the kit so the only audio in step 0's first ms is the click.
+        for c in &mut s.rack.channels[..channels_before] { c.muted = true; }
+        let out = s.render_loop(48_000, &sources);
+        assert!(out[0].abs() > 0.5, "the imported sample fires on its step");
+
+        // And undo takes the source back out — an import is an edit.
+        s.key(studio_egui::keys::Key::c('u'));
+        assert!(!s.session.doc.project.sources.contains_key(&id));
+    }
+
+    #[test]
+    fn a_low_rate_import_is_playable_but_says_so() {
+        let mut s = Studio::demo();
+        let audio = studio_audio::SourceAudio {
+            sample_rate: 44_100, channels: vec![vec![0.1; 4410]],
+        };
+        s.import_audio("legacy", "samples/legacy.wav", &audio);
+        assert!(s.status.contains("44100"), "status was {:?}", s.status);
+    }
 }
