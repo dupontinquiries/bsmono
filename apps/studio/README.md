@@ -239,7 +239,7 @@ UI: a mod wheel that silently moved an unrelated fader is worse than one
 that does nothing. MIDI clock is not parsed at all — syncing to an
 external clock means resampling against drifting wall time, which belongs
 with the streaming engine, not a 0xF8 match arm. Named, not built, from
-the same wishlist: clip-level chain editing,
+the same wishlist: live-monitor autotune,
 clip-level chain editing,  
  a playing
 mode for keys — now built, see below — Wooting analog input, and VST/CLAP
@@ -1191,3 +1191,26 @@ media has not arrived yet — tuning an absent source would land a silent
 'take' you would only discover later. Live-monitor autotune remains what
 the module says it is: separate work needing a streaming wrapper that
 carries epoch and ratio state across calls.
+
+
+**The clip inspector — the per-clip half of the signal path, finally
+reachable.** `Clip` has carried `gain` and `effects` from the start and
+`mixdown` has always rendered both (per-clip instances, cached by clip id),
+but nothing in the shell could edit them: that half was reachable only by
+writing ops in a test. The inspector sits above the arrangement — it is
+about the thing you just clicked, so it belongs where your eyes already
+are — and collapses to nothing when nothing is selected. Per-clip gain
+(commit-on-release, like every fader here) and a chain built from the same
+`ADDABLE_FX` catalog the Mixer uses, deliberately shared rather than
+re-listed so two catalogs cannot drift. Disabling an effect keeps it in the
+chain at its position, because the A/B a person wants is "with and without
+this one", not "delete it and add it back at the end". Why per-clip effects
+exist beside bus chains at all: a bus treats everything reaching it the
+same way — that is what a bus is — while "this one ad-lib needs a filter
+sweep and the other twelve do not" is a per-clip fact, and routing that
+ad-lib to its own bus to express it would be inventing structure to hold a
+single decision. Tests pin that a clip's chain reaches the render, that its
+neighbour never hears it, that bypass is audible while the effect keeps its
+place, and that clip gain is one undoable gesture. Multi-selection edits the
+first clip and says so rather than pretending — a batch shape this panel
+does not have yet.

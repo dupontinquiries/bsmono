@@ -27,7 +27,7 @@ use crate::Studio;
 /// `studio_fx::instantiate` is string-keyed, so this list is the UI's
 /// curated door into it, not a second source of truth: an unknown kind
 /// still instantiates to None and is skipped, exactly as before.
-const ADDABLE_FX: &[(&str, &[(&str, f32)])] = &[
+pub const ADDABLE_FX: &[(&str, &[(&str, f32)])] = &[
     ("saturation", &[("profile", 1.0), ("drive", 0.35)]), // 1 = tape
     ("eq", &[("bands", 1.0), ("freq0", 1000.0), ("q0", 0.707), ("gain0", 0.0)]),
     ("compressor", &[("threshold", -18.0), ("ratio", 4.0)]),
@@ -40,7 +40,7 @@ const ADDABLE_FX: &[(&str, &[(&str, f32)])] = &[
     ("halftime", &[("window", 0.5), ("channels", 2.0)]),
 ];
 
-fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
+pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
     studio_core::Effect {
         kind: kind.into(),
         params: params.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),

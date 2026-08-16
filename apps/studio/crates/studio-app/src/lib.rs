@@ -16,6 +16,7 @@ use studio_egui::touch::{Panel, ViewMode};
 use studio_live::transport::Transport;
 
 pub mod audition;
+pub mod clip_inspector;
 pub mod library;
 pub mod midi;
 pub mod mixer_panel;
@@ -84,6 +85,8 @@ pub struct Studio {
     /// A fader mid-drag: (track, previewed value). Local by design — one
     /// `SetTrackGain` op lands when the drag ends.
     pub mixer_drag: Option<(studio_core::TrackId, f32)>,
+    /// The clip inspector's fader mid-drag, same commit-on-release rule.
+    pub clip_gain_drag: Option<(studio_core::ClipId, f32)>,
     /// The bus faders' twin of `mixer_drag`.
     pub bus_drag: Option<(studio_core::BusId, f32)>,
     /// Motions (the Helix keymap) or Playing (the keyboard is a piano).
@@ -125,6 +128,7 @@ impl Studio {
             arrangement_dirty: true,
             solo: Vec::new(),
             mixer_drag: None,
+            clip_gain_drag: None,
             bus_drag: None,
             input_mode: Default::default(),
             octave: 0,
@@ -1600,6 +1604,11 @@ impl eframe::App for App {
                     ui.colored_label(colors.text_weak, "Program — not built yet.");
                 }
                 Panel::Timeline => {
+                    // The inspector sits above the arrangement rather than
+                    // in a side panel: it is about the thing you just
+                    // clicked, so it belongs where your eyes already are,
+                    // and it collapses to nothing when nothing is selected.
+                    clip_inspector::show(ui, &mut self.studio, &colors);
                     let ph = self.studio.playhead();
                     let sel = self.studio.selection.clone();
                     let tr = studio_egui::timeline(ui, &self.studio.session.doc,
@@ -2953,5 +2962,97 @@ mod surround_export_tests {
             assert_eq!(back.channels.len(), layout.channels(),
                        "{layout} wrote {} channels", back.channels.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod clip_fx_tests {
+    use super::*;
+
+    fn tone(secs: f32) -> studio_audio::SourceAudio {
+        let n = (48_000.0 * secs) as usize;
+        let ch: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / 48_000.0 * 220.0 * std::f32::consts::TAU).sin() * 0.4)
+            .collect();
+        studio_audio::SourceAudio { sample_rate: 48_000, channels: vec![ch] }
+    }
+
+    /// Two clips on the timeline, each on its own track, so a per-clip edit
+    /// can be shown to touch ONE of them — the distinction that justifies
+    /// per-clip effects existing beside bus chains.
+    fn two_clips() -> (Studio, std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+                       Vec<studio_core::ClipId>) {
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let a = tone(0.5);
+            s.transport.set_position(Ticks::ZERO);
+            let id = s.import_clip(&format!("t{i}"), &format!("takes/t{i}.wav"), &a)
+                .expect("lands on a free track");
+            sources.insert(id, a);
+            ids.push(*s.session.doc.project.clips.iter()
+                .find(|(_, c)| c.source == id).map(|(k, _)| k).unwrap());
+        }
+        (s, sources, ids)
+    }
+
+    #[test]
+    fn a_clip_effect_changes_that_clip_and_leaves_its_neighbour_alone() {
+        let (mut s, sources, ids) = two_clips();
+        let before = s.render_arrangement(48_000, &sources);
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("profile".to_string(), 1.0);
+        params.insert("drive".to_string(), 0.9);
+        s.selection = vec![ids[0]];
+        s.edit(studio_core::Op::SetEffects { id: ids[0], effects: vec![
+            studio_core::Effect { kind: "saturation".into(), params, enabled: true } ] },
+            "clip fx");
+        let after = s.render_arrangement(48_000, &sources);
+        let diff: f32 = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1.0, "the clip's own chain reached the render ({diff})");
+
+        // Its neighbour is untouched: remove the first clip from the project
+        // in both renders and the remainder must be identical.
+        s.edit(studio_core::Op::RemoveClip { id: ids[0] }, "removed");
+        let solo_neighbour = s.render_arrangement(48_000, &sources);
+        s.key(studio_egui::keys::Key::c('u'));
+        s.edit(studio_core::Op::SetEffects { id: ids[0], effects: vec![] }, "cleared");
+        s.edit(studio_core::Op::RemoveClip { id: ids[0] }, "removed");
+        let solo_neighbour_dry = s.render_arrangement(48_000, &sources);
+        assert_eq!(solo_neighbour, solo_neighbour_dry,
+                   "the other clip never heard the first clip's effect");
+    }
+
+    #[test]
+    fn disabling_an_effect_keeps_it_in_the_chain_but_out_of_the_sound() {
+        // The A/B a person wants is "with and without this one", in place —
+        // not "delete it and add it back at the end".
+        let (mut s, sources, ids) = two_clips();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("profile".to_string(), 1.0);
+        params.insert("drive".to_string(), 0.9);
+        let fx = studio_core::Effect { kind: "saturation".into(), params, enabled: true };
+        s.edit(studio_core::Op::SetEffects { id: ids[0], effects: vec![fx.clone()] }, "fx");
+        let wet = s.render_arrangement(48_000, &sources);
+
+        let off = studio_core::Effect { enabled: false, ..fx };
+        s.edit(studio_core::Op::SetEffects { id: ids[0], effects: vec![off] }, "bypassed");
+        let dry = s.render_arrangement(48_000, &sources);
+        assert_ne!(wet, dry, "bypass is audible");
+        assert_eq!(s.session.doc.project.clips[&ids[0]].effects.len(), 1,
+                   "and the effect kept its place in the chain");
+    }
+
+    #[test]
+    fn clip_gain_is_a_single_undoable_op() {
+        let (mut s, sources, ids) = two_clips();
+        let loud = s.render_arrangement(48_000, &sources);
+        s.edit(studio_core::Op::SetGain { id: ids[0], gain: 0.25 }, "clip gain");
+        let quiet = s.render_arrangement(48_000, &sources);
+        let e = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>();
+        assert!(e(&quiet) < e(&loud), "the fader moved the clip");
+        s.key(studio_egui::keys::Key::c('u'));
+        assert_eq!(s.render_arrangement(48_000, &sources), loud, "one gesture, one undo");
     }
 }
