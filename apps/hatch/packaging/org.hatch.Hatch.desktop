@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Hatch
+GenericName=Application Launcher
+Comment=Fullscreen app grid launcher
+Exec=hatch-egui
+Icon=org.hatch.Hatch
+Terminal=false
+Categories=Utility;
+# The launcher launches things; it should not list itself in its own grid.
+NoDisplay=true
+StartupWMClass=org.hatch.Hatch
