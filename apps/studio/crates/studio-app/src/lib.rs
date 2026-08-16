@@ -82,6 +82,8 @@ pub struct Studio {
     /// A fader mid-drag: (track, previewed value). Local by design — one
     /// `SetTrackGain` op lands when the drag ends.
     pub mixer_drag: Option<(studio_core::TrackId, f32)>,
+    /// Which edge an ambiguous timeline grab prefers; `alt-;` flips it.
+    pub trim_side: studio_egui::TrimSide,
     /// Set by the panel's bounce button; the shell performs it.
     pub pending_bounce: bool,
 }
@@ -115,6 +117,7 @@ impl Studio {
             arrangement_dirty: true,
             solo: Vec::new(),
             mixer_drag: None,
+            trim_side: studio_egui::TrimSide::default(),
             pending_bounce: false,
         }
     }
@@ -474,6 +477,17 @@ impl Studio {
                         for id in sel { self.edit(studio_core::Op::RemoveClip { id }, "deleted"); }
                     }
                     Action::Split => self.split_at_playhead(),
+                    Action::FlipTrimSide => {
+                        self.trim_side = match self.trim_side {
+                            studio_egui::TrimSide::Left => studio_egui::TrimSide::Right,
+                            studio_egui::TrimSide::Right => studio_egui::TrimSide::Left,
+                        };
+                        self.status = format!("trim grabs the {} edge on a tie",
+                            match self.trim_side {
+                                studio_egui::TrimSide::Left => "left",
+                                studio_egui::TrimSide::Right => "right",
+                            });
+                    }
                     Action::SelectAll => {
                         self.selection = self.session.doc.project.clips.keys().copied().collect();
                         self.status = format!("{} clips selected", self.selection.len());
@@ -1143,7 +1157,8 @@ impl eframe::App for App {
                     let sel = self.studio.selection.clone();
                     let tr = studio_egui::timeline(ui, &self.studio.session.doc,
                                                    &mut self.studio.view,
-                                                   &colors, ph, &sel, &self.peaks);
+                                                   &colors, ph, &sel, &self.peaks,
+                                                   self.studio.trim_side);
                     if let Some(id) = tr.clicked {
                         // Click selects; shift-click toggles membership — the
                         // return the shell used to throw away, which made
@@ -1156,6 +1171,26 @@ impl eframe::App for App {
                             }
                         } else {
                             self.studio.selection = vec![id];
+                        }
+                    }
+                    if let Some((id, pos, src_in, len)) = tr.trimmed {
+                        // A right trim is one op. A left trim genuinely IS
+                        // two facts — new material window AND new position —
+                        // and lands as two ops / two undo steps, the same
+                        // precedent a bounce set. Trim first: shrinking
+                        // can't collide, and the subsequent move slides
+                        // into space the shrink just vacated.
+                        let old_pos = self.studio.session.doc.project.clips
+                            .get(&id).map(|c| c.pos);
+                        self.studio.edit(
+                            studio_core::Op::TrimClip { id, src_in, len }, "trimmed");
+                        if old_pos.is_some_and(|p| p != pos) {
+                            let track = self.studio.session.doc.project.clips
+                                .get(&id).map(|c| c.track);
+                            if let Some(track) = track {
+                                self.studio.edit(
+                                    studio_core::Op::MoveClip { id, pos, track }, "trimmed");
+                            }
                         }
                     }
                     if let Some((id, pos, track)) = tr.moved {
@@ -1936,5 +1971,33 @@ mod persistence_tests {
         let err = Studio::load_from(&file, SiteId(1),
             Team::from_contacts("solo", &["sc-local".into()]));
         assert!(err.is_err(), "quietly loading empty over someone's work loses it");
+    }
+}
+
+#[cfg(test)]
+mod trim_shell_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+
+    #[test]
+    fn a_left_trim_lands_as_two_facts_and_two_undos_restore_it() {
+        // The view reports one gesture; the model records the two things it
+        // truly was — material window and position — the same shape a
+        // bounce's two ops set as precedent.
+        let mut s = Studio::demo();
+        let (id, clip) = s.session.doc.project.clips.iter()
+            .map(|(i, c)| (*i, c.clone())).next().unwrap();
+        let new_pos = Ticks(clip.pos.0 + Ticks::from_seconds(0.5).0);
+        s.edit(studio_core::Op::TrimClip {
+            id, src_in: Ticks(clip.src_in.0 + Ticks::from_seconds(0.5).0),
+            len: Ticks(clip.len.0 - Ticks::from_seconds(0.5).0) }, "trimmed");
+        s.edit(studio_core::Op::MoveClip { id, pos: new_pos, track: clip.track }, "trimmed");
+        let now = &s.session.doc.project.clips[&id];
+        assert_eq!(now.pos, new_pos);
+        assert_eq!(Ticks(now.pos.0 + now.len.0), Ticks(clip.pos.0 + clip.len.0),
+                   "the right edge did not move — that is what makes it a LEFT trim");
+        s.key(Key::c('u'));
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.clips[&id], clip, "two undos, whole gesture back");
     }
 }

@@ -179,7 +179,17 @@ cross-kind vertical move is a re-route the mixer cannot honour — refused
 at the gesture, not the op). The rack grew pattern LENGTH (1–64 steps, the
 rows' u64; shortening hides bits without eating them, so
 shorten-then-lengthen round-trips) and DUPLICATE (variations start from
-the groove, not silence). Also still named: streaming pattern playback
+the groove, not silence). **The timeline scrolls, zooms, and trims.** The wheel pans (both axes —
+a timeline is a horizontal thing), ctrl-wheel/pinch zooms about the
+pointer, both hover-gated; panning clamps at zero. Edge grabs trim (7px
+grips), body grabs move; `grab` classifies purely, `trim_target` clamps to
+a 10ms sliver, the source's material, and — for a LEFT trim — moves start
+and in-point together so audio never smears in time, revealing earlier
+material only as far as the source actually has it. An ambiguous grab on a
+tiny clip goes to the preferred side, and `alt-;` (`FlipTrimSide` — a key
+the map minted before the drag existed) finally flips it. A left trim
+lands as its two true facts, TrimClip then MoveClip: two ops, two undos,
+the precedent a bounce set. Also still named: streaming pattern playback
 inside `DeviceEngine`'s realtime render, and the Program panel, which says
 so on screen instead of showing nothing.
 
