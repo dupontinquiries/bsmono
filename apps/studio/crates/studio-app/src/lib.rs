@@ -750,6 +750,11 @@ pub struct App {
     /// here; the mixdown and the sampler both read it.
     audio: std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
     sink: Box<dyn audition::PlaybackSink>,
+    /// The wire, when one was asked for: STUDIO_LISTEN=addr:port waits for a
+    /// peer, STUDIO_CONNECT=addr:port dials one. Env vars, not a dialog —
+    /// the same predictable-beats-configurable trade the export path makes,
+    /// and this shell's whole collab stack works identically without it.
+    carrier: Option<studio_collab::stream::StreamPeer>,
     /// What the sink's buffer currently holds, so a mode switch (loop ↔
     /// arrangement) knows to reload even when nothing is dirty.
     loaded: SinkContent,
@@ -764,8 +769,25 @@ impl Default for App {
         let sink = audition::open_sink();
         let mut studio = Studio::demo();
         studio.status = format!("ready — audition: {}", sink.describe());
+        let carrier = if let Ok(addr) = std::env::var("STUDIO_LISTEN") {
+            match studio_collab::stream::StreamPeer::listen(&addr) {
+                Ok(p) => {
+                    studio.status = format!("{} — listening on {}",
+                        studio.status, p.local.map(|a| a.to_string()).unwrap_or(addr));
+                    Some(p)
+                }
+                Err(e) => { studio.status = format!("listen {addr} failed: {e}"); None }
+            }
+        } else if let Ok(addr) = std::env::var("STUDIO_CONNECT") {
+            match studio_collab::stream::StreamPeer::connect(&addr) {
+                Ok(p) => { studio.status = format!("{} — dialing {addr}", studio.status); Some(p) }
+                Err(e) => { studio.status = format!("connect {addr} failed: {e}"); None }
+            }
+        } else {
+            None
+        };
         App { studio, peaks: Default::default(), audio: Default::default(), sink,
-              loaded: SinkContent::Nothing }
+              carrier, loaded: SinkContent::Nothing }
     }
 }
 
@@ -870,6 +892,45 @@ impl eframe::App for App {
                 // own rule): say exactly what failed, keep editing.
                 Err(e) => self.studio.status = format!("import '{name}' failed: {e}"),
             }
+        }
+
+        // ── the wire, if one exists ───────────────────────────────────────
+        if let Some(carrier) = &self.carrier {
+            for ev in carrier.events.try_iter() {
+                match ev {
+                    studio_collab::stream::PeerEvent::Connected(addr) => {
+                        self.studio.status = format!("peer connected: {addr}");
+                        // since: 0 EXPLICITLY, not Doc::hello() — that
+                        // helper sends our own max lamport, which is right
+                        // for resuming a one-way catch-up but under-asks on
+                        // first contact between peers who both edited
+                        // offline: their concurrent ops stamped below our
+                        // lamport would be filtered out. Lost edits. The
+                        // seen-set makes over-fetching free; asking for
+                        // everything is the only safe opening line.
+                        carrier.send(studio_collab::wire::Packet::Hello {
+                            site: self.studio.session.doc.site, since: 0,
+                        });
+                        if let Some(rack) = self.studio.session.rack_broadcast() {
+                            carrier.send(rack);
+                        }
+                    }
+                    studio_collab::stream::PeerEvent::Disconnected(why) => {
+                        self.studio.status = format!("peer disconnected: {why}");
+                    }
+                }
+            }
+            for p in carrier.poll() {
+                for reply in self.studio.integrate_packet(p) {
+                    carrier.send(reply);
+                }
+            }
+            for p in self.studio.drain_outbox() {
+                carrier.send(p);
+            }
+            // Packets arrive between frames; a connected shell keeps frames
+            // coming so a peer's edit shows without waiting for a local one.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         // ── media that finished arriving from peers ──────────────────────
@@ -1590,5 +1651,99 @@ mod asset_transfer_tests {
             studio_collab::wire::Packet::ChunkRequest { .. })),
             "no chunks were requested for bytes already held");
         assert!(b.manifests.contains_key(&src_a), "yet the asset completed");
+    }
+}
+
+#[cfg(test)]
+mod tcp_carrier_tests {
+    use super::*;
+    use studio_collab::stream::StreamPeer;
+
+    /// The shell's per-frame pump, extracted for the test: events → hello,
+    /// incoming → integrate (+replies), outbox → wire. Exactly what App::ui
+    /// runs when a carrier exists.
+    fn pump(s: &mut Studio, c: &StreamPeer) {
+        for ev in c.events.try_iter() {
+            if let studio_collab::stream::PeerEvent::Connected(_) = ev {
+                c.send(studio_collab::wire::Packet::Hello {
+                    site: s.session.doc.site, since: 0 });
+                if let Some(rack) = s.session.rack_broadcast() {
+                    c.send(rack);
+                }
+            }
+        }
+        for p in c.poll() {
+            for r in s.integrate_packet(p) {
+                c.send(r);
+            }
+        }
+        for p in s.drain_outbox() {
+            c.send(p);
+        }
+    }
+
+    #[test]
+    fn the_flagship_over_an_actual_socket() {
+        // Everything previous turns proved through Vec pipes, now through
+        // 127.0.0.1: A bounces and edits the rack; B — connected only by
+        // TCP — ends up able to RENDER A's kick, holding A's groove.
+        let mut a = Studio::demo();
+        let mut b = Studio::new(a.session.doc.project.clone(), SiteId(2),
+                                Team::from_contacts("duo", &["sc-b".into()]));
+        let ca = StreamPeer::listen("127.0.0.1:0").expect("bind");
+        let cb = StreamPeer::connect(ca.local.unwrap()).expect("dial");
+
+        let (id, audio) = a.bounce_current_pattern(48_000, &Default::default()).expect("bounced");
+        let wav = studio_audio::export::export_wav_dithered_bytes(
+            &audio.channels[0], 1, 48_000, id.0).unwrap();
+        a.register_asset(id, &wav);
+        a.rack.swing = 0.19;
+        a.sync_rack_if_changed();
+
+        let mut arrived = None;
+        for _ in 0..400 {
+            pump(&mut a, &ca);
+            pump(&mut b, &cb);
+            if let Some(pos) = b.incoming_audio.iter().position(|(s, _)| *s == id) {
+                arrived = Some(b.incoming_audio.remove(pos).1);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let got = arrived.expect("A's bounce crossed the wire");
+        assert_eq!(got.frames(), audio.frames());
+        assert_eq!(b.rack.swing, 0.19, "the groove crossed too");
+        assert_eq!(b.session.doc.project, a.session.doc.project, "and the project converged");
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(id, got);
+        let out = b.render_arrangement(48_000, &sources);
+        let head: f32 = out[..9600].iter().map(|v| v.abs()).sum();
+        assert!(head > 5.0, "B's mixdown plays A's kick, delivered by TCP ({head})");
+    }
+
+    #[test]
+    fn a_late_joiner_over_tcp_catches_up_from_hello() {
+        // B exists (same base), then A edits while NOBODY is connected —
+        // the outbox drains to the void. When the socket finally opens, the
+        // since:0 Hello is the only thing that recovers those edits; see
+        // the comment at the send site for why Doc::hello() would not.
+        let mut a = Studio::demo();
+        let mut b = Studio::new(a.session.doc.project.clone(), SiteId(2),
+                                Team::from_contacts("duo", &["sc-b".into()]));
+        let clip = *a.session.doc.project.clips.keys().next().unwrap();
+        a.edit(studio_core::Op::RemoveClip { id: clip }, "deleted");
+        a.drain_outbox(); // nobody was listening yet
+
+        let ca = StreamPeer::listen("127.0.0.1:0").expect("bind");
+        let cb = StreamPeer::connect(ca.local.unwrap()).expect("dial");
+        for _ in 0..200 {
+            pump(&mut a, &ca);
+            pump(&mut b, &cb);
+            if a.session.doc.project == b.session.doc.project {
+                return; // converged purely from the connection handshake
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("projects never converged over the socket");
     }
 }

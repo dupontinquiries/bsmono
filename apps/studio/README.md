@@ -140,11 +140,23 @@ at the mix. Bounces register their WAV bytes (one encode feeds both the
 file the op's path promises and the chunk store); imports register the
 COMPRESSED original — a .opus stays .opus on the wire, which is the whole
 size story. The flagship test is the point end to end: A bounces, and B's
-own `mixdown` renders A's kick. Still not built, named plainly: the CARRIER
-— no socket drains the outbox yet (the dht module's network half is the
-named future), streaming pattern playback inside `DeviceEngine`'s realtime
-render, and the Program panel, which says so on screen instead of showing
-nothing.
+own `mixdown` renders A's kick. **The wire is real.** `studio-collab::stream` is a TCP carrier: two
+threads per connection over `Packet::frame`/`drain`, mpsc facing the shell
+so the `Studio` stays single-threaded around the Doc, and dumb on purpose —
+it never reads a packet. Every thread exit path shuts the socket down (an
+abandoned socket leaves the far side blocked in `read()` forever, which is
+exactly how the dropped-peer test first failed). The shell opens it from
+`STUDIO_LISTEN=addr:port` / `STUDIO_CONNECT=addr:port` and pumps it per
+frame; on connect it sends `Hello { since: 0 }` EXPLICITLY rather than
+`Doc::hello()` — that helper reports our own max lamport, which under-asks
+on first contact between peers who both edited offline and would silently
+lose their concurrent ops; the seen-set makes over-fetching free. The
+flagship now runs over 127.0.0.1: A bounces, and B — connected only by
+TCP — renders A's kick, holds A's groove, and the projects converge. One
+peer, no reconnect, no discovery, no encryption: stated in the module docs;
+the dht network half stays the named future. Also still named: streaming
+pattern playback inside `DeviceEngine`'s realtime render, and the Program
+panel, which says so on screen instead of showing nothing.
 
 ## Realtime collaboration, concretely
 
