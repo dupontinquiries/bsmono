@@ -315,6 +315,14 @@ pub struct Snapclone {
     /// probe, and the whole classification rests on comparing TWO reflexive
     /// addresses seen from the SAME local port.
     pub nat: Option<crate::nat_punch::NatKind>,
+    /// The on-screen keyboard, in SCREEN coordinates.
+    ///
+    /// A rectangle rather than a height, which the module is emphatic about:
+    /// the inset is the overlap against this window's own bottom edge, and
+    /// using the height insets a window the keyboard never covered — a
+    /// floating composer, a split-screen phone, a desktop window above the
+    /// panel.
+    pub keyboard: crate::keyboard_inset::KeyboardWatcher,
     /// Agreed wire version per peer, from negotiation. Absent means we have not
     /// negotiated yet and must not send anything version-dependent.
     pub wire: std::collections::HashMap<String, u8>,
@@ -479,6 +487,7 @@ impl Snapclone {
             sink_latency: crate::sink_cushion::Latency::from_settings(2, 8, 20),
             sender: Default::default(),
             nat: None,
+            keyboard: Default::default(),
             wire: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
@@ -707,6 +716,31 @@ impl Snapclone {
         let v = *self.wire.get(peer)?;
         let delta_ok = is_delta && crate::wire_v3::supports_delta(v);
         Some(crate::wire_v3::predictive_flags(has_payload, delta_ok, acking))
+    }
+
+    /// The bottom padding this window needs so the keyboard covers nothing.
+    ///
+    /// Overlap against the window's own bottom edge, not the keyboard's height.
+    pub fn keyboard_inset(&self, window: crate::keyboard_inset::Rect) -> f32 {
+        self.keyboard.inset_for(window)
+    }
+
+    /// A compositor reported a new keyboard rectangle. True if it CHANGED.
+    ///
+    /// The return value is the point: compositors re-send the same rectangle,
+    /// and relayouting on every report re-lays out continuously while the
+    /// keyboard sits perfectly still. The caller only acts on true.
+    pub fn on_keyboard(&mut self, r: crate::keyboard_inset::Rect) -> bool {
+        self.keyboard.report(r)
+    }
+
+    /// How far to scroll so `field` clears the keyboard, or 0 if it already does.
+    ///
+    /// Guarded by `covers` inside the module: scrolling a field that was never
+    /// covered moves the page under the user for no reason.
+    pub fn scroll_for_keyboard(&self, field: crate::keyboard_inset::Rect,
+                               margin: f32) -> f32 {
+        self.keyboard.scroll_to_clear(field, margin)
     }
 
     /// Classify our NAT from two STUN responses.
@@ -3844,6 +3878,62 @@ mod gossip_wiring_tests {
         assert_ne!(f & F_ANNOUNCE, 0);
         assert_ne!(f & F_DATA, 0);
         assert_ne!(f & F_ACK, 0);
+    }
+
+    #[test]
+    fn a_window_the_keyboard_does_not_reach_is_not_inset() {
+        // The reason it is a RECTANGLE and not a height. A 400-tall window
+        // ending at y=400, with a keyboard from y=800: using the height would
+        // inset 280 and shove a window the keyboard never touched.
+        use crate::keyboard_inset::Rect;
+        let mut s = Snapclone::new(vec![]);
+        s.on_keyboard(Rect::new(0.0, 800.0, 720.0, 280.0));
+        let window = Rect::new(0.0, 0.0, 720.0, 400.0);
+        assert_eq!(s.keyboard_inset(window), 0.0,
+                   "inset a window the keyboard is nowhere near");
+    }
+
+    #[test]
+    fn a_covered_window_is_inset_by_the_overlap() {
+        use crate::keyboard_inset::Rect;
+        let mut s = Snapclone::new(vec![]);
+        s.on_keyboard(Rect::new(0.0, 800.0, 720.0, 280.0));
+        // Full-height window: overlap is 1080 - 800 = 280.
+        assert_eq!(s.keyboard_inset(Rect::new(0.0, 0.0, 720.0, 1080.0)), 280.0);
+        // Window ending at 900: only 100 of it is covered.
+        assert_eq!(s.keyboard_inset(Rect::new(0.0, 0.0, 720.0, 900.0)), 100.0);
+    }
+
+    #[test]
+    fn an_identical_report_changes_nothing() {
+        // Compositors re-send the same rectangle; acting on every one relayouts
+        // continuously while the keyboard sits still.
+        use crate::keyboard_inset::Rect;
+        let mut s = Snapclone::new(vec![]);
+        let r = Rect::new(0.0, 800.0, 720.0, 280.0);
+        assert!(s.on_keyboard(r), "first report is a change");
+        assert!(!s.on_keyboard(r), "the same rectangle again is not");
+    }
+
+    #[test]
+    fn a_field_above_the_keyboard_does_not_scroll() {
+        // Scrolling one that was never covered moves the page under the user
+        // for no reason.
+        use crate::keyboard_inset::Rect;
+        let mut s = Snapclone::new(vec![]);
+        s.on_keyboard(Rect::new(0.0, 800.0, 720.0, 280.0));
+        assert_eq!(s.scroll_for_keyboard(Rect::new(0.0, 100.0, 300.0, 40.0), 8.0), 0.0);
+        // One underneath it does.
+        assert!(s.scroll_for_keyboard(Rect::new(0.0, 820.0, 300.0, 40.0), 8.0) > 0.0);
+    }
+
+    #[test]
+    fn hiding_the_keyboard_clears_the_inset() {
+        use crate::keyboard_inset::Rect;
+        let mut s = Snapclone::new(vec![]);
+        s.on_keyboard(Rect::new(0.0, 800.0, 720.0, 280.0));
+        s.keyboard.hide();
+        assert_eq!(s.keyboard_inset(Rect::new(0.0, 0.0, 720.0, 1080.0)), 0.0);
     }
 
     #[test]
