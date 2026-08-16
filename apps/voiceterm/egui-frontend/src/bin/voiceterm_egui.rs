@@ -270,6 +270,18 @@ struct VoicetermApp {
     /// of output.
     chrome: voiceterm_egui::chrome_mode::Chrome,
     compass: ActionCompass,
+    /// A spoken editing phrase, e.g. "delete line" or "save as notes.txt".
+    ///
+    /// Typed here because dictation lands as text either way — the point of
+    /// editor_keys is the TRANSLATION, and it is the same whether the words
+    /// arrived by microphone or by keyboard. Wiring it to the mic first would
+    /// have made the feature untestable without one.
+    editor_phrase: String,
+    /// Which modal editor is on the other end. Helix and vim diverge exactly
+    /// where their keymaps do, so this cannot be guessed per phrase.
+    editor_kind: voiceterm_egui::editor_keys::Editor,
+    /// A translated action awaiting confirmation, when it would lose work.
+    editor_pending: Option<voiceterm_egui::editor_keys::EditorAction>,
     colors: PaletteColors,
     /// The toolbar gesture menus (QML `_pipePopup` / `_bracePopup`): press-drag-release on the
     /// `|⋯` / `{⋯}` chips at the left of the keycap bar.
@@ -431,6 +443,57 @@ impl eframe::App for VoicetermApp {
                 }
             });
 
+            // SPOKEN EDITING. editor_keys turns "delete line" into the keys a
+            // modal editor wants — the mobility thesis of this app, "edit files
+            // on the move, one-handed, on a phone" — and had no surface at all.
+            ui.horizontal(|ui| {
+                ui.label("say:");
+                let r = ui.text_edit_singleline(&mut self.editor_phrase);
+                // The editor is a CHOICE, not a guess: helix and vim diverge
+                // exactly where their keymaps do, and translating a phrase for
+                // the wrong one sends valid keystrokes that mean something else.
+                for (k, name) in [(voiceterm_egui::editor_keys::Editor::Helix, "helix"),
+                                  (voiceterm_egui::editor_keys::Editor::Vim, "vim")] {
+                    if ui.selectable_label(self.editor_kind == k, name).clicked() {
+                        self.editor_kind = k;
+                    }
+                }
+                let go = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if go && !self.editor_phrase.trim().is_empty() {
+                    match voiceterm_egui::editor_keys::translate(
+                        self.editor_kind, &self.editor_phrase)
+                    {
+                        Some(a) if a.confirm => {
+                            // Destructive actions WAIT. `confirm` is set only
+                            // for the ones that lose work, and a misheard word
+                            // that quits without writing is the failure this
+                            // whole feature would be blamed for.
+                            self.editor_pending = Some(a);
+                        }
+                        Some(a) => {
+                            self.pty_out.extend_from_slice(a.keys.as_bytes());
+                            self.editor_phrase.clear();
+                        }
+                        // Unrecognised phrases are NOT sent as literal text. A
+                        // modal editor in normal mode reads stray letters as
+                        // commands, so "umm delete that" would run d, e, l...
+                        None => self.toasts.info(
+                            format!("no editor action for {:?}", self.editor_phrase),
+                            ui.input(|i| i.time)),
+                    }
+                }
+            });
+            if let Some(a) = self.editor_pending.clone() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(self.colors.warning, "this discards changes:");
+                    if ui.button("send").clicked() {
+                        self.pty_out.extend_from_slice(a.keys.as_bytes());
+                        self.editor_pending = None;
+                        self.editor_phrase.clear();
+                    }
+                    if ui.button("cancel").clicked() { self.editor_pending = None; }
+                });
+            }
             // Above the keycaps, below the grid: a build's progress belongs
             // where the output is, not in a status bar the user is not looking
             // at while watching a compile.
@@ -1231,6 +1294,9 @@ fn main() -> eframe::Result<()> {
                 app,
                 sidebar,
                 compass: ActionCompass::default(),
+                editor_phrase: String::new(),
+                editor_kind: voiceterm_egui::editor_keys::Editor::Helix,
+                editor_pending: None,
                 colors,
                 pipe_menu: pipe_slide_menu("voiceterm-pipe-menu"),
                 // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
