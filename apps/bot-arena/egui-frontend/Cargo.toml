@@ -3,7 +3,7 @@ name = "bot-arena-egui"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "bot-arena's dashboard, ported from GTK4/libadwaita to egui on uikit-egui. Views (Arena / Standings / Replays) are swipe-paged via the shared gesture layer (uikit-gesture), laid out by the adaptive layer, and voice/a11y-navigable. bot-arena's engine.rs/fsm.rs are already GTK-free; on-device this front-end drives them directly."
+description = "bot-arena's dashboard, ported from GTK4/libadwaita to egui on uikit-egui. Views (Setup / Arena / Standings / Replays / Logs / Studio) are swipe-paged via the shared gesture layer (uikit-gesture), laid out by the adaptive layer, and voice/a11y-navigable. Drives the real engine: bot-arena (GTK-free with default-features = false) runs on a worker thread and streams EngineMsg back, exactly as under the GTK shell; Corpus Studio (GTK's second binary) is the Studio page."
 
 [lib]
 path = "src/lib.rs"
@@ -18,6 +18,9 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# The real core: engine / fsm / registry / models, GTK-free.
+bot-arena = { path = "..", default-features = false }
+async-channel = "2"
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }

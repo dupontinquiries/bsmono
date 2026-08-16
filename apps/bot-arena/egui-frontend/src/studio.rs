@@ -145,8 +145,16 @@ impl Studio {
     /// that mattered.
     pub fn log(&mut self, line: &str) {
         if let Some(i) = self.running {
-            if let Some(s) = self.stages.get_mut(i) { s.log.push(line.to_string()); }
+            self.log_at(i, line);
         }
+    }
+
+    /// A line of output for a KNOWN stage. The worker's stdout is forwarded on
+    /// a helper thread (the GTK worker does the same), so a final line can
+    /// arrive after the stage's `finish` — routing by index appends it to the
+    /// right pane instead of dropping it on the floor.
+    pub fn log_at(&mut self, i: usize, line: &str) {
+        if let Some(s) = self.stages.get_mut(i) { s.log.push(line.to_string()); }
     }
 
     /// The worker reports a stage finished.

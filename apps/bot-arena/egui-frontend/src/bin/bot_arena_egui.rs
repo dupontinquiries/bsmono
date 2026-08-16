@@ -4,28 +4,12 @@
 //!
 //! Run:  cargo run --bin bot-arena-egui --features app   (from apps/bot-arena/egui-frontend)
 
+use bot_arena_egui::Dashboard;
 use eframe::egui;
-use bot_arena_egui::{Bot, Dashboard, Replay};
 use uikit_egui::Adaptive;
 
 struct App {
     dash: Dashboard,
-}
-
-impl App {
-    fn new() -> Self {
-        let bots = vec![
-            Bot { name: "Vex-7".into(), score: 42, status: "running".into() },
-            Bot { name: "Corvid".into(), score: 38, status: "passed".into() },
-            Bot { name: "Null Pointer".into(), score: 51, status: "running".into() },
-            Bot { name: "Grimalkin".into(), score: 12, status: "failed".into() },
-        ];
-        let replays = vec![
-            Replay { title: "Vex-7 vs Corvid".into(), turns: 84 },
-            Replay { title: "Null Pointer solo run".into(), turns: 130 },
-        ];
-        Self { dash: Dashboard::new(bots, replays) }
-    }
 }
 
 impl eframe::App for App {
@@ -35,6 +19,12 @@ impl eframe::App for App {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "arena".to_string();
         self.dash.apply_settings(ctx, &prefs);
+        // Drain the engine + studio workers; keep painting while either is
+        // live so a fast Sim run doesn't finish invisibly between events.
+        self.dash.tick();
+        if self.dash.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             let adaptive = Adaptive::detect(ctx);
             self.dash.ui(ui, &adaptive);
@@ -50,9 +40,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "bot-arena (egui)",
         eframe::NativeOptions {
-        viewport: uikit_egui::desktop::viewport(APP_ID, "Bot Arena", [900.0, 700.0]),
-        ..Default::default()
-    },
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+            viewport: uikit_egui::desktop::viewport(APP_ID, "Bot Arena", [900.0, 700.0]),
+            ..Default::default()
+        },
+        Box::new(|_cc| Ok(Box::new(App { dash: Dashboard::new() }))),
     )
 }
