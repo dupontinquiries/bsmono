@@ -2147,7 +2147,13 @@ impl Game {
         self.switch_car(m);
         let d = self.world.sdf(self.car.pos);
         if d < self.car.half_h {
-            self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
+            // Seat on the LOWEST POINT, not the half-height. They differ the
+            // moment the body stops being centred on its bounding box, which is
+            // exactly what standing up does — feet hang below centre while the
+            // mass sits high. Falls back to half_h when ride_h is unset so a
+            // model that never folds is unaffected.
+            let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+            self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
     }
 
@@ -2259,10 +2265,16 @@ impl Game {
                 }
                 // the hitbox tracks the blended body rather than jumping at
                 // pose boundaries
-                let h = m.half_at(t) * self.cfg.car.size;
+                // One sample for both numbers: bounds_at returns the
+                // half-extents and the drop to the lowest point together,
+                // because walking every prim at `t` is the cost and doing it
+                // twice would double it on every folding frame.
+                let (hb, drop) = m.bounds_at(t);
+                let h = hb * self.cfg.car.size;
                 self.car.half_w = h.x.max(0.12);
                 self.car.half_h = h.y.max(0.10);
                 self.car.half_len = h.z.max(0.10);
+                self.car.ride_h = (drop * self.cfg.car.size).max(0.10);
             }
         } else {
             // FALLBACK: no morph built, step the strip as before
@@ -2287,7 +2299,13 @@ impl Game {
         // lift clear as the body grows, or a standing robot ends up buried
         let d = self.world.sdf(self.car.pos);
         if d < self.car.half_h {
-            self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
+            // Seat on the LOWEST POINT, not the half-height. They differ the
+            // moment the body stops being centred on its bounding box, which is
+            // exactly what standing up does — feet hang below centre while the
+            // mass sits high. Falls back to half_h when ride_h is unset so a
+            // model that never folds is unaffected.
+            let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+            self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
         if self.xf.state == xform::State::Idle {
             let nm = if self.xf.mode == xform::Mode::Robot { "ROBOT" } else { "VEHICLE" };

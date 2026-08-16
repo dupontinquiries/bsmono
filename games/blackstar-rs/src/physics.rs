@@ -50,6 +50,16 @@ pub struct Car {
     pub ground_n: Vec3,
     pub half_len: f32,
     pub half_h: f32,
+    /// Distance from the body origin to its LOWEST point.
+    ///
+    /// Equal to `half_h` while the model is centred on its bounding box, which
+    /// a vehicle is and a standing robot is not — a legged bot's mass sits high
+    /// and its feet hang far below centre. Seating by half_h buried 50 of 221
+    /// chassis in the ground, some by more than their own height.
+    ///
+    /// Defaults to 0.0 and the seating code falls back to half_h when it is
+    /// unset, so a caller that never assigns it behaves exactly as before.
+    pub ride_h: f32,
     pub half_w: f32,
     pub susp: f32, // suspension compression 0..1 (renderer bobs the body)
     /// where we were last step, for portal plane crossing
@@ -211,6 +221,7 @@ impl Car {
             ground_n: Vec3::Y,
             half_len: 0.62,
             half_h: 0.19,
+            ride_h: 0.0,
             wheel_r: 0.11,
             drive: crate::model::Drive::Combustion,
             hover: None,
@@ -333,6 +344,7 @@ impl Car {
         *self = Car {
             half_len: self.half_len,
             half_h: self.half_h,
+            ride_h: 0.0,
             half_w: self.half_w,
             wheel_r: self.wheel_r,
             drive: self.drive,

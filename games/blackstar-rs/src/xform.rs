@@ -303,6 +303,27 @@ impl Morph {
     /// Half-extents at this fold position, so the hitbox tracks the body
     /// instead of jumping at pose boundaries.
     pub fn half_at(&mut self, t: f32) -> Vec3 {
+        self.bounds_at(t).0
+    }
+
+    /// Half-extents AND the drop from the origin to the lowest point.
+    ///
+    /// These are the same number only when the pose is centred on its own
+    /// bounding box, and a fold strip stops being centred the moment it stands
+    /// up: measured on `analog`, the vehicle pose spans y -0.239..0.239 (half
+    /// 0.239, |lo| 0.239) while the robot spans -0.400..0.355 — half 0.377,
+    /// but 0.400 to the feet.
+    ///
+    /// The caller seats the body by pushing it up by half_h, so the difference
+    /// is exactly how far the robot sinks. 50 of 221 chassis are affected, some
+    /// by more than their own height — a legged bot's mass sits high and its
+    /// feet hang far below centre, which is precisely why a tread's median
+    /// point and a foot's contact point are not the same place.
+    ///
+    /// Returned together rather than as a second pass: sampling every prim at
+    /// `t` is the expensive part and doing it twice to get two numbers out of
+    /// one bounding box would double the cost of every frame that folds.
+    pub fn bounds_at(&mut self, t: f32) -> (Vec3, f32) {
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for p in 0..self.prims() {
             let m = self.sample(p, t);
@@ -313,7 +334,7 @@ impl Morph {
             }
             self.scratch = m.verts;
         }
-        (hi - lo) * 0.5
+        ((hi - lo) * 0.5, -lo.y)
     }
 }
 
