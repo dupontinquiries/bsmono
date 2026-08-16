@@ -651,6 +651,37 @@ impl Snapclone {
         crate::handshake::next_retry_ms(attempt)
     }
 
+    /// The peer view as it should be WRITTEN TO DISK.
+    ///
+    /// store_privacy exists to stop the database leaking what the user never
+    /// agreed to publish, and a precise last-seen is a presence fingerprint: it
+    /// says when someone was awake, to the millisecond, for anything that later
+    /// reads the store.
+    ///
+    /// APPLIED AT PERSISTENCE, NOT IN THE LIVE VIEW, and that distinction is
+    /// load-bearing rather than stylistic. The bucket is 5 minutes and gossip's
+    /// FAILURE_MS is 15 seconds, so bucketing on the way IN makes every peer
+    /// look 100+ seconds stale the instant it is heard from — `is_alive` goes
+    /// false for everyone and discovery stops working. I wrote that version
+    /// first and the arithmetic caught it.
+    ///
+    /// The live view keeps millisecond precision because liveness needs it; the
+    /// stored copy does not, because nothing reading it later needs to know the
+    /// second.
+    ///
+    /// Floored rather than rounded to nearest, which the module is explicit
+    /// about: rounding can move a timestamp into the FUTURE, and "a last-seen
+    /// in the future reads as a clock bug and can make freshness comparisons
+    /// negative".
+    pub fn view_for_storage(&self) -> Vec<crate::gossip::PeerRecord> {
+        self.view.peers().iter().map(|r| {
+            let mut r = r.clone();
+            r.last_seen_ms =
+                crate::store_privacy::bucket_last_seen(r.last_seen_ms as i64).max(0) as u64;
+            r
+        }).collect()
+    }
+
     /// Age out peers nobody has heard from, on the gossip prune schedule.
     ///
     /// Called every frame, acting every PRUNE_MS: a view pruned per frame would
@@ -3565,6 +3596,44 @@ mod gossip_wiring_tests {
         s.tick_gossip(crate::gossip::FAILURE_MS + crate::gossip::PRUNE_MS);
         assert_eq!(s.peers.len(), 1, "the contact was deleted, not just marked");
         assert!(!s.peers[0].online);
+    }
+
+    #[test]
+    fn the_stored_view_is_bucketed_and_the_live_one_is_not() {
+        // The leak: a precise last-seen is a presence fingerprint. The trap:
+        // bucketing the LIVE view kills liveness, because the bucket is 5
+        // minutes and FAILURE_MS is 15 seconds.
+        let mut s = Snapclone::new(vec![]);
+        let precise = 7 * 60_000 + 1234;
+        s.on_gossip(rec("sc-a", precise), 100);
+        assert_eq!(s.view.peers()[0].last_seen_ms, precise,
+                   "the live view must keep millisecond precision");
+        let stored = s.view_for_storage();
+        assert_eq!(stored[0].last_seen_ms % 300_000, 0,
+                   "the stored copy must land on a bucket boundary");
+    }
+
+    #[test]
+    fn bucketing_never_moves_a_timestamp_forward() {
+        // store_privacy: rounding to nearest "can move a timestamp into the
+        // FUTURE, and a last-seen in the future reads as a clock bug".
+        let mut s = Snapclone::new(vec![]);
+        for t in [1u64, 299_999, 300_000, 300_001, 899_999] {
+            s = Snapclone::new(vec![]);
+            s.on_gossip(rec("sc-a", t), 100);
+            let got = s.view_for_storage()[0].last_seen_ms;
+            assert!(got <= t, "{t} bucketed forward to {got}");
+        }
+    }
+
+    #[test]
+    fn a_freshly_heard_peer_is_still_alive() {
+        // The regression the arithmetic caught: bucket on the way in and every
+        // peer is 100+ seconds stale the moment it is heard from.
+        let mut s = Snapclone::new(vec![]);
+        let now = 7 * 60_000 + 1234;
+        s.on_gossip(rec("sc-a", now), 100);
+        assert!(s.view.peers()[0].is_alive(now), "a peer just heard from is dead");
     }
 
     #[test]
