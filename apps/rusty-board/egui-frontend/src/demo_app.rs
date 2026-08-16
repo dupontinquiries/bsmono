@@ -22,7 +22,11 @@ struct Feel {
     tray: crate::tray::Tray,
     tray_open: bool,
     microterm: crate::microterm::Microterm,
-    dictation: crate::dictation::Dictation,
+    /// The dictation SERVICE, not a bare Dictation: it owns the same state
+    /// machine and adds the audio-window bookkeeping the transcriber needs.
+    /// Asking for "everything captured so far" each interval is what makes
+    /// partials fall behind the speaker on a phone.
+    dictation: crate::voice::DictationService,
     /// What the microphone broker said. Dictation had no audio source at all —
     /// start() set a flag — so a refusal was invisible and the user just saw
     /// dictation do nothing.
@@ -94,7 +98,9 @@ impl Feel {
             tray: Default::default(),
             tray_open: false,
             microterm: Default::default(),
-            dictation: Default::default(),
+            // 16kHz: what the transcriber expects, and what the window maths
+            // is computed against.
+            dictation: crate::voice::DictationService::new(16_000),
             mic: crate::mic_source::MicState::Idle,
             swipe: SwipeState::with_dictionary(
                 include_str!("../demo_words.txt").lines().map(|l| l.trim().to_string())
@@ -189,7 +195,7 @@ impl eframe::App for Feel {
                         if listening {
                             // PartialsOnly: the last partial IS the result, so
                             // release commits without a second inference.
-                            if let Some(text) = self.dictation.finish() {
+                            if let Some(text) = self.dictation.release() {
                                 if !self.typed.is_empty() && !self.typed.ends_with(' ') {
                                     self.typed.push(' ');
                                 }
@@ -206,12 +212,26 @@ impl eframe::App for Feel {
                         }
                     }
                     if listening {
+                        // AUDIO ACCOUNTING. The service needs to know how much
+                        // has been captured to bound the next partial's window;
+                        // with a live mic the host reports real sample counts,
+                        // and with none the count stays zero — which yields an
+                        // empty window rather than a window over audio that
+                        // does not exist.
+                        if let crate::mic_source::MicState::Live { .. } = self.mic {
+                            // No capture backend attached in this build. The
+                            // count is left where the host would set it rather
+                            // than being invented: a fabricated sample count
+                            // would produce plausible-looking windows over
+                            // silence, which is worse than an obvious zero.
+                        }
+                        let _window = self.dictation.next_window();
                         // The partial goes to the MICROTERM's voice preview,
                         // which is the surface built for it — showing it in the
                         // toolbar instead would leave that surface unreachable
                         // again by a different route.
                         self.microterm.set_content(crate::microterm::Content::VoicePreview {
-                            partial: self.dictation.partial().to_string(), level: 0.4 });
+                            partial: self.dictation.preview().to_string(), level: 0.4 });
                         self.microterm.show();
                     }
                 }

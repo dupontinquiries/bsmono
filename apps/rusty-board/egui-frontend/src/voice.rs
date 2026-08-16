@@ -123,3 +123,53 @@ mod tests {
         assert_eq!(c.replaces, "turn the lights on", "remove the preview, do not append");
     }
 }
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    #[test]
+    fn the_service_bounds_each_partial_and_resets_the_window_per_utterance() {
+        let mut s = DictationService::new(16_000);
+        s.start();
+        // Nothing captured yet: an empty window, not a window over audio that
+        // does not exist.
+        assert!(s.next_window().is_empty());
+        // Half a second in, the window is everything so far.
+        s.captured(8_000);
+        assert_eq!(s.next_window(), 0..8_000);
+        // A long utterance is CAPPED rather than re-read from the beginning —
+        // re-transcribing the whole ring every interval is what makes partials
+        // fall behind the speaker.
+        s.captured(16_000 * 30);
+        let w = s.next_window();
+        assert_eq!(w.end, 16_000 * 30);
+        assert!(w.start > 0, "the window slid rather than growing");
+        assert!(w.len() < 16_000 * 30, "bounded work per inference");
+        // A new utterance starts from nothing: carrying the previous count
+        // would window the next partial over the last utterance's audio.
+        s.release();
+        s.start();
+        assert!(s.next_window().is_empty());
+    }
+
+    #[test]
+    fn the_last_partial_is_the_result_so_release_needs_no_second_pass() {
+        let mut s = DictationService::new(16_000);
+        s.start();
+        // Each partial is a COMPLETE re-transcription, so they replace rather
+        // than accumulate — that replacement is the whole double-transcription
+        // fix this layer exists for.
+        s.partial("hello");
+        s.partial("hello world");
+        assert_eq!(s.preview(), "hello world");
+        assert_eq!(s.release().as_deref(), Some("hello world"));
+        assert!(!s.is_active());
+        // Cancelling mid-utterance commits nothing.
+        s.start();
+        s.partial("discard me");
+        s.cancel();
+        assert!(!s.is_active());
+        assert!(s.release().is_none(), "a cancelled utterance has nothing to commit");
+    }
+}
