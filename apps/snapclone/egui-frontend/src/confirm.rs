@@ -108,6 +108,10 @@ impl Confirm {
 
     pub fn press(&mut self) { self.holding = true; }
 
+    /// Is a hold in progress? A renderer needs this to know that the pointer
+    /// leaving the button mid-hold is a release, not a non-event.
+    pub fn is_holding(&self) -> bool { self.holding }
+
     /// Release. In Hold mode a short release is a cancel, not a confirm.
     pub fn release(&mut self) -> Outcome {
         self.holding = false;

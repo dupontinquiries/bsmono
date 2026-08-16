@@ -29,7 +29,10 @@
 //! ago" answers it. Showing that label under a live arrow would be noise; the
 //! arrow already says the position is current.
 
-use snapclone_location::freshness::{self, Confidence, FreshnessPolicy, PresentationTier};
+use snapclone_location::freshness::{self, Confidence, PresentationTier};
+// Re-exported so a shell can hold a policy without importing the location
+// crate itself — this module IS the frontend's freshness surface.
+pub use snapclone_location::freshness::FreshnessPolicy;
 
 /// What the wayfinder should draw for one node.
 #[derive(Debug, Clone, PartialEq)]

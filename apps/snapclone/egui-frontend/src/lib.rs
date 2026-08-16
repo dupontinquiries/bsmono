@@ -352,6 +352,25 @@ pub struct Snapclone {
     /// reason one component can serve both "clear this filter" and "delete this
     /// conversation" without either feeling wrong.
     pub confirm: Option<crate::chevron_confirm::ChevronConfirm>,
+    /// Per-feature use records — UxGuide's familiarity counter, ported as
+    /// `confirm::Familiarity`. This is what lets a confirmation stop being a
+    /// tax once a feature is learned (and re-raise itself after a cancel).
+    pub familiarity: std::collections::HashMap<String, crate::confirm::Familiarity>,
+    /// A Block being confirmed on the requests list: (sender_id, panel).
+    /// `confirm`'s own panel, not the chevron: Block is Tap-level risk where
+    /// the familiarity model actually gets to skip.
+    pub block_confirm: Option<(String, crate::confirm::Confirm)>,
+    /// Inbound connection requests — the mailbox's approval lifecycle.
+    pub mailbox: crate::requests::RequestMailbox,
+    /// Fix freshness per contact id: (age_secs, accuracy_m), supplied by the
+    /// host beside `wayfinder_contacts`. Parallel map rather than a Contact
+    /// field for now; folding age/accuracy into `wayfinder::Fix` is the
+    /// cleaner follow-up and is noted in the parity ledger.
+    pub contact_freshness: std::collections::HashMap<String, (i64, f32)>,
+    /// How stale is too stale, for the wayfinder's signal strip.
+    pub freshness_policy: crate::freshness::FreshnessPolicy,
+    /// The last export's one-line result, shown by the inbox card.
+    pub export_note: Option<String>,
     /// Which contact the open confirm panel is about. Held separately because
     /// ChevronConfirm is generic over WHAT is being confirmed — it carries a
     /// risk score, not a subject.
@@ -515,6 +534,12 @@ impl Snapclone {
             landmarks: Vec::new(),
             add_landmark: None,
             confirm: None,
+            familiarity: std::collections::HashMap::new(),
+            block_confirm: None,
+            mailbox: crate::requests::RequestMailbox::new(),
+            contact_freshness: std::collections::HashMap::new(),
+            freshness_policy: crate::freshness::FreshnessPolicy::default(),
+            export_note: None,
             confirm_id: String::new(),
             editor_id: String::new(),
             editor_name: String::new(),
@@ -1101,6 +1126,11 @@ impl Snapclone {
     /// fifty times "has stopped being a safety net and become a tax". But it
     /// can only skip a TAP — a hold-level action still asks, because
     /// familiarity with a dangerous action is exactly when a slip happens.
+    /// The measured familiarity for a feature (a fresh record for a new one).
+    pub fn familiarity_of(&mut self, feature: &str) -> &mut crate::confirm::Familiarity {
+        self.familiarity.entry(feature.to_string()).or_default()
+    }
+
     pub fn ask_delete(&mut self, familiar: bool) -> bool {
         use crate::chevron_confirm::{ChevronConfirm, Mode};
         let mode = Mode::for_score(Self::DELETE_CONTACT_RISK);
@@ -1115,6 +1145,8 @@ impl Snapclone {
         // The panel closes whichever way the answer went: leaving it open after
         // a confirmed delete would ask about a contact that no longer exists.
         self.confirm = None;
+        // The confirmation was answered — the feature got more familiar.
+        self.familiarity_of("delete-contact").record_use();
         // Forget the transport session too. Deleting a contact and leaving
         // their sequence number, negotiated version and known-snap list behind
         // is precisely the "lingers for every ever-connected peer" leak
@@ -1125,6 +1157,23 @@ impl Snapclone {
         self.cards.close(id);
         self.sync_roster();
         self.modal.dismiss(&format!("confirm-delete:{id}"));
+    }
+
+    /// The export plan for the host to run: tool, output path, argv. `None`
+    /// when neither archiver is installed — the card should say so rather
+    /// than fail later.
+    pub fn export_plan(&self, has_zip: bool, has_tar: bool, requested: &str)
+        -> Option<(crate::snap_export::Tool, String, Vec<String>)> {
+        let tool = crate::snap_export::choose_tool(has_zip, has_tar)?;
+        let out = crate::snap_export::output_path(requested, tool);
+        let argv = crate::snap_export::argv(tool, &out);
+        Some((tool, out, argv))
+    }
+
+    /// The host reports how the export went; the card's note shows the line.
+    pub fn export_finished(&mut self, outcome: crate::snap_export::Outcome) {
+        self.export_requested = false;
+        self.export_note = Some(outcome.message());
     }
 
     /// Carry out what the Friends page asked for.
@@ -1173,11 +1222,16 @@ impl Snapclone {
                     // render even once it had a renderer — three unwired halves
                     // of one feature.
                     //
-                    // familiar=false for now: UxGuide's use counter is not
-                    // ported, and claiming familiarity we have not measured
-                    // would skip a confirmation on the strength of a guess.
-                    // Erring toward asking is the safe direction for a delete.
-                    if self.ask_delete(false) {
+                    // Familiarity is now MEASURED (confirm::Familiarity per
+                    // feature) rather than guessed — though at delete's Hold
+                    // risk it can only ever skip a Tap, so this stays a
+                    // Hold panel however practised the user is. That is the
+                    // point: familiarity with a dangerous action is exactly
+                    // when a slip happens.
+                    let familiar = matches!(
+                        self.familiarity_of("delete-contact").mode(),
+                        crate::confirm::Mode::None);
+                    if self.ask_delete(familiar) {
                         self.confirm_id = id.clone();
                         self.modal.present_default(
                             &format!("confirm-delete:{id}"), crate::modal::Layer::Confirm,
@@ -2194,8 +2248,81 @@ impl Snapclone {
             .color(if delivery.replicates() { c.warning } else { c.text_weak }).small());
     }
 
+    /// Route one action from the requests list. Accept and Decline apply
+    /// immediately; Block goes through `confirm` — Tap-level risk, where the
+    /// familiarity model earns its keep: a first Block asks, a fiftieth does
+    /// not, and a cancel re-raises the friction.
+    pub fn request_action(&mut self, sender: String, act: crate::requests::RequestAction) {
+        if crate::requests::needs_confirmation(act) {
+            let fam = *self.familiarity_of("block-request");
+            match crate::confirm::Confirm::begin(
+                "block-request", &format!("Block {sender}?"), &fam) {
+                Some(panel) => { self.block_confirm = Some((sender, panel)); }
+                None => {
+                    // An expert is not asked — but the use is still recorded,
+                    // or the score would decay back into asking.
+                    self.mailbox.apply(&sender, act);
+                    self.familiarity_of("block-request").record_use();
+                }
+            }
+        } else {
+            self.mailbox.apply(&sender, act);
+        }
+    }
+
     fn peers_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Friends");
+        // Inbound connection requests, above the roster: a stranger asking to
+        // connect is the page's most time-sensitive row.
+        if let Some((sender, act)) = crate::requests::requests_ui(ui, &self.mailbox, c) {
+            self.request_action(sender, act);
+        }
+        // The Block confirmation, when one is open. confirm's own panel: tap
+        // or hold by familiarity, auto-cancel at 4s.
+        if let Some((sender, panel)) = &mut self.block_confirm {
+            let dt = ui.input(|i| i.stable_dt).min(0.1);
+            let mut outcome = panel.tick(dt);
+            ui.ctx().request_repaint(); // the dismiss clock runs even untouched
+            ui.horizontal(|ui| {
+                ui.colored_label(c.danger, format!("Block {sender}?"));
+                match panel.mode {
+                    crate::confirm::Mode::Hold => {
+                        let resp = ui.button("hold to block");
+                        if resp.is_pointer_button_down_on() { panel.press(); }
+                        else if panel.is_holding() { outcome = panel.release(); }
+                        let p = panel.progress();
+                        if p > 0.0 {
+                            let r = resp.rect;
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(r.min, egui::vec2(r.width() * p, 2.0)),
+                                0.0, c.danger);
+                        }
+                    }
+                    _ => {
+                        if ui.button("Block").clicked() {
+                            panel.press();
+                            outcome = panel.release();
+                        }
+                    }
+                }
+                if ui.button("Cancel").clicked() { outcome = panel.cancel(); }
+            });
+            let sender = sender.clone();
+            match outcome {
+                crate::confirm::Outcome::Confirmed => {
+                    self.block_confirm = None;
+                    self.mailbox.apply(&sender, crate::requests::RequestAction::Block);
+                    self.familiarity_of("block-request").record_use();
+                }
+                crate::confirm::Outcome::Cancelled => {
+                    self.block_confirm = None;
+                    // A cancel means the panel was WANTED: friction re-raises.
+                    self.familiarity_of("block-request").record_fail();
+                }
+                crate::confirm::Outcome::Pending => {}
+            }
+        }
+        ui.separator();
         // The contact picker, so Friends is a place you DO something rather
         // than a list you look at.
         ui.horizontal(|ui| {
@@ -2335,6 +2462,21 @@ impl Snapclone {
         }
         if nodes.is_empty() {
             ui.colored_label(c.text_weak, "No contacts to place yet.");
+        }
+        // The signal strip: how much to trust each bearing. The policy maps a
+        // fix's age and accuracy to a presentation — live arrow, faded arrow,
+        // or a "last seen" label that REPLACES the arrow. A contact the host
+        // has no freshness for is presented as long-stale, which is true.
+        if !nodes.is_empty() {
+            ui.separator();
+            ui.colored_label(c.text_weak, "signal");
+            for n in &nodes {
+                let (age, acc) = self.contact_freshness.get(&n.id)
+                    .copied().unwrap_or((i64::MAX / 4, 9_999.0));
+                let p = crate::freshness::presentation(&self.freshness_policy, age, acc);
+                crate::freshness::node_ui(
+                    ui, &n.display_name, n.bearing_deg as f32, n.distance_m as f32, &p, c);
+            }
         }
     }
 
@@ -4186,6 +4328,84 @@ mod gossip_wiring_tests {
         s.tick_gossip(crate::gossip::PRUNE_MS - 1);
         assert!(s.peers[0].online, "pruned before the interval elapsed");
     }
+    // ── requests + confirm + freshness + snap_export wiring ──
+
+    #[test]
+    fn blocking_asks_the_first_time_and_stops_asking_once_learned() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        // A new user: Block is gated by a Tap panel.
+        app.request_action("mallory".into(), crate::requests::RequestAction::Block);
+        assert!(app.block_confirm.is_some(), "a first Block asks");
+        // Confirm it: applied, and the feature got more familiar.
+        let (sender, mut panel) = app.block_confirm.take().unwrap();
+        panel.press();
+        assert_eq!(panel.release(), crate::confirm::Outcome::Confirmed);
+        app.mailbox.apply(&sender, crate::requests::RequestAction::Block);
+        app.familiarity_of("block-request").record_use();
+        // Learn the feature past the expert threshold.
+        for _ in 0..40 { app.familiarity_of("block-request").record_use(); }
+        assert_eq!(app.familiarity_of("block-request").mode(), crate::confirm::Mode::None);
+        app.request_action("eve".into(), crate::requests::RequestAction::Block);
+        assert!(app.block_confirm.is_none(), "an expert is not asked");
+        // Friction re-raises — but not on one slip. A fail costs 10 against a
+        // score saturated at 100, so a single hesitation after forty uses
+        // keeps expert status; a PATTERN of backing out demotes.
+        app.familiarity_of("block-request").record_fail();
+        assert_eq!(app.familiarity_of("block-request").mode(), crate::confirm::Mode::None,
+                   "one slip does not demote a practised user");
+        app.familiarity_of("block-request").record_fail();
+        app.familiarity_of("block-request").record_fail();
+        assert_ne!(app.familiarity_of("block-request").mode(), crate::confirm::Mode::None,
+                   "a pattern of cancels brings the panel back");
+    }
+
+    #[test]
+    fn accept_and_decline_apply_without_a_panel() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.request_action("carol".into(), crate::requests::RequestAction::Accept);
+        assert!(app.block_confirm.is_none(), "only Block needs confirmation");
+    }
+
+    #[test]
+    fn delete_familiarity_is_recorded_but_can_never_skip_a_hold() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        for _ in 0..60 { app.familiarity_of("delete-contact").record_use(); }
+        assert_eq!(app.familiarity_of("delete-contact").mode(), crate::confirm::Mode::None);
+        // Even at expert familiarity, delete's risk score demands a Hold —
+        // ask_delete only skips TAP-level panels.
+        let familiar = matches!(app.familiarity_of("delete-contact").mode(),
+                                crate::confirm::Mode::None);
+        assert!(app.ask_delete(familiar), "a hold-level action still asks");
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn the_signal_strip_defaults_unknown_contacts_to_stale() {
+        let app = Snapclone::new_with_login(vec![], false);
+        let (age, acc) = app.contact_freshness.get("nobody")
+            .copied().unwrap_or((i64::MAX / 4, 9_999.0));
+        let p = crate::freshness::presentation(&app.freshness_policy, age, acc);
+        assert!(!p.has_arrow(), "no freshness data must not draw a confident arrow");
+        assert!(p.label.is_some(), "the label says last-seen instead");
+    }
+
+    #[test]
+    fn the_export_plan_prefers_zip_and_reports_through_the_note() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        let (tool, out, argv) = app.export_plan(true, true, "/tmp/snaps").unwrap();
+        assert!(matches!(tool, crate::snap_export::Tool::Zip));
+        assert!(out.ends_with(".zip"));
+        // argv is ARGS only; the program comes from the tool.
+        assert_eq!(tool.program(), "zip");
+        assert!(argv.iter().any(|a| a == &out), "the args name the output");
+        assert!(app.export_plan(false, false, "/tmp/snaps").is_none(),
+                "no archiver, no plan — the card says install one");
+        app.export_requested = true;
+        app.export_finished(crate::snap_export::Outcome::Wrote {
+            path: out.clone(), files: 3 });
+        assert!(!app.export_requested);
+        assert!(app.export_note.as_deref().unwrap_or("").contains("3 snaps"));
+    }
 }
 
 /// Do two hosts share a /24-ish prefix?
@@ -4200,4 +4420,3 @@ fn same_prefix(a: &str, b: &str) -> bool {
         _ => false,
     }
 }
-
