@@ -25,7 +25,7 @@ use voiceterm_egui::App;
 /// terminal first, and a switcher that made it a peer of the mail reader would
 /// be the wrong app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive }
+enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models }
 
 impl VoicetermApp {
     /// The connections graph over what this app actually holds.
@@ -203,16 +203,17 @@ impl CentralView {
     // The array LENGTH is part of the type: adding a variant without widening
     // this is a compile error rather than a tab that silently never renders,
     // which is the failure mode a Vec here would have had.
-    const ALL: [CentralView; 7] = [CentralView::Terminal, CentralView::Mail,
+    const ALL: [CentralView; 8] = [CentralView::Terminal, CentralView::Mail,
                                    CentralView::Browser, CentralView::Graph,
                                    CentralView::Table, CentralView::Docs,
-                                   CentralView::Archive];
+                                   CentralView::Archive, CentralView::Models];
     fn label(self) -> &'static str {
         match self {
             CentralView::Terminal => "Terminal", CentralView::Mail => "Mail",
             CentralView::Browser => "Web", CentralView::Graph => "Graph",
             CentralView::Table => "Table", CentralView::Docs => "Docs",
             CentralView::Archive => "Archive",
+            CentralView::Models => "Models",
         }
     }
 }
@@ -282,6 +283,15 @@ struct VoicetermApp {
     editor_kind: voiceterm_egui::editor_keys::Editor,
     /// A translated action awaiting confirmation, when it would lose work.
     editor_pending: Option<voiceterm_egui::editor_keys::EditorAction>,
+    /// GGUF search box, and the parameter count to size against.
+    model_query: String,
+    model_params_b: f32,
+    /// Memory budget in GiB. Defaults low because this targets phones — a
+    /// picker that assumes a desktop recommends a model the device cannot load,
+    /// and the failure is an OOM kill rather than a message.
+    model_budget_gib: f32,
+    /// Token events, for the accounting readout.
+    tokens: Vec<voiceterm_egui::token_log::TokenEvent>,
     colors: PaletteColors,
     /// The toolbar gesture menus (QML `_pipePopup` / `_bracePopup`): press-drag-release on the
     /// `|⋯` / `{⋯}` chips at the left of the keycap bar.
@@ -861,6 +871,74 @@ impl eframe::App for VoicetermApp {
                             let _ = name;
                         }
                     }
+                    CentralView::Models => {
+                        use voiceterm_egui::model_picker as mp;
+                        ui.horizontal(|ui| {
+                            ui.label("search:");
+                            ui.text_edit_singleline(&mut self.model_query);
+                            if ui.button("open").clicked() && !self.model_query.trim().is_empty() {
+                                // URL construction, not fetching: this crate has
+                                // no HTTP client and the module was written to
+                                // be testable without one.
+                                self.toasts.info(mp::search_url(&self.model_query, 20),
+                                                 ui.input(|i| i.time));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("params (B)");
+                            ui.add(egui::Slider::new(&mut self.model_params_b, 0.5..=70.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("budget (GiB)");
+                            ui.add(egui::Slider::new(&mut self.model_budget_gib, 1.0..=32.0));
+                        });
+
+                        // WHICH QUANT FITS. best_fitting takes the LARGEST that
+                        // fits, because quality is the thing being traded away
+                        // — take as little of it as the machine forces.
+                        match mp::best_fitting(self.model_params_b, self.model_budget_gib) {
+                            Some(t) => {
+                                ui.colored_label(self.colors.text,
+                                    format!("best fit: {}  (~{:.1} GiB)",
+                                            t.label(), t.approx_gib(self.model_params_b)));
+                            }
+                            None => {
+                                // Said plainly rather than showing the smallest
+                                // anyway: a model that cannot load is not a
+                                // recommendation.
+                                ui.colored_label(self.colors.warning,
+                                    "no quant fits this budget — smaller model or more RAM");
+                            }
+                        }
+                        ui.separator();
+                        // Every tier, so the trade-off is visible rather than
+                        // decided silently.
+                        for t in mp::QuantTier::ALL {
+                            let ok = mp::fits(t, self.model_params_b, self.model_budget_gib);
+                            let c = if ok { self.colors.text_weak } else { self.colors.warning };
+                            ui.colored_label(c, format!("{:<8} {:>6.1} GiB  {}",
+                                t.label(), t.approx_gib(self.model_params_b),
+                                if ok { "fits" } else { "too big" }));
+                        }
+
+                        ui.separator();
+                        // TOKEN ACCOUNTING. Empty until something logs a call —
+                        // shown as a count rather than hidden, so "no LLM calls
+                        // yet" is distinguishable from "the readout is broken".
+                        let now = (ui.input(|i| i.time) * 1000.0) as u64;
+                        let tot = voiceterm_egui::token_log::totals_by_op(
+                            &self.tokens, voiceterm_egui::token_log::TimeWindow::Session,
+                            now, now);
+                        if tot.is_empty() {
+                            ui.colored_label(self.colors.text_weak, "no LLM calls this session");
+                        } else {
+                            for (op, t) in tot {
+                                ui.colored_label(self.colors.text_weak,
+                                    format!("{op}: {} calls, {} in / {} out, {} cached",
+                                            t.calls, t.input, t.output, t.cached));
+                            }
+                        }
+                    }
                     CentralView::Archive => {
                         ui.text_edit_singleline(&mut self.archive.query);
                         let pages: Vec<voiceterm_egui::bars::PageEntry> = Vec::new();
@@ -1297,6 +1375,10 @@ fn main() -> eframe::Result<()> {
                 editor_phrase: String::new(),
                 editor_kind: voiceterm_egui::editor_keys::Editor::Helix,
                 editor_pending: None,
+                model_query: String::new(),
+                model_params_b: 7.0,
+                model_budget_gib: 4.0,
+                tokens: Vec::new(),
                 colors,
                 pipe_menu: pipe_slide_menu("voiceterm-pipe-menu"),
                 // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
