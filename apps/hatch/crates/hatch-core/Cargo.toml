@@ -1,0 +1,14 @@
+[package]
+name = "hatch-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The headless launcher engine behind hatch: .desktop discovery, Exec field-code launching, freedesktop icon resolution, favorites/recents, and query ranking. std-only (+ config-kit for XDG paths), so the whole loop is testable without a display — the egui and QML surfaces are shells over this."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# XDG base dirs + the flat [section] key=value store. Same persistence plumbing
+# as the rest of the fleet, so hatch's config sits where the settings app looks.
+config-kit = { path = "../../../../shared/config-kit" }
