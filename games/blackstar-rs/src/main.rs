@@ -1371,13 +1371,20 @@ fn main() {
         // Categories seed the trait vector; see chassis_traits.rs.
         let tiers_cat = roster::load_categories(&bots_dir);
         bot_categories_loaded = tiers_cat.clone();
+        // SMOOTH ONLY. A chassis fleet.json marks "refused" has no real fold
+        // — Morph::build rejects the strip and the game steps between whole
+        // poses instead of blending them, a slideshow wearing a fold's
+        // clothing. roster::fit excludes these unconditionally now, so this
+        // is only read here to populate the field it checks.
+        let morph = roster::load_morph(&bots_dir);
         let inventory: Vec<roster::Chassis> = bots.iter().map(|name| {
             let n = std::fs::read_dir(bots_dir.join(name))
                 .into_iter().flatten().flatten()
                 .filter(|e| e.path().is_dir() && e.path().join("scene.gltf").is_file())
                 .count();
             roster::Chassis { name: name.clone(), poses: n,
-                              tier: tiers.get(name).copied() }
+                              tier: tiers.get(name).copied(),
+                              morph_ok: morph.get(name).copied() }
         }).collect();
 
         let pick = opts.bots.clone().unwrap_or(roster::Pick::All);

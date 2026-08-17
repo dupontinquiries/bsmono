@@ -47,6 +47,15 @@ pub struct Chassis {
     /// From fleet.json, when it says. `None` for the original hand-made bots,
     /// which predate the confidence sweep and are not worse for it.
     pub tier: Option<Tier>,
+    /// From fleet.json's `morph` field. `Some(false)` is a slideshow —
+    /// `xform::Morph::build` refuses the strip and `main.rs` steps
+    /// between whole poses instead of blending them — and `fit` excludes
+    /// those unconditionally, the same way it already refuses a
+    /// half-baked chassis regardless of which `Pick` was asked for.
+    /// `None` for chassis with no fleet.json entry (original hand-made
+    /// bots, which predate the morph sweep the same way they predate
+    /// the confidence one) — not assumed broken, same reasoning as `tier`.
+    pub morph_ok: Option<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -92,17 +101,23 @@ pub enum Pick {
 /// the loop stops before one that would not fit entirely rather than filling
 /// the remaining slots.
 pub fn fit(all: &[Chassis], pick: &Pick, budget: usize) -> Vec<Chassis> {
+    // SMOOTH ONLY, unconditionally — a slideshow chassis is not a lesser
+    // fold, it is not a fold, and no `Pick` variant exists to ask for one
+    // on purpose. Filtered before `pick` is even matched, same as
+    // `used + c.poses > budget` below refuses a half-baked chassis
+    // regardless of which selection was requested.
+    let all: Vec<&Chassis> = all.iter().filter(|c| c.morph_ok != Some(false)).collect();
     let candidates: Vec<&Chassis> = match pick {
-        Pick::All => all.iter().collect(),
-        Pick::OnlyTier(t) => all.iter().filter(|c| c.tier == Some(*t)).collect(),
-        Pick::Named(names) => all.iter().filter(|c| names.contains(&c.name)).collect(),
+        Pick::All => all.iter().copied().collect(),
+        Pick::OnlyTier(t) => all.iter().copied().filter(|c| c.tier == Some(*t)).collect(),
+        Pick::Named(names) => all.iter().copied().filter(|c| names.contains(&c.name)).collect(),
         Pick::Page(n) => {
             // Pages are cut by BUDGET, not by a fixed count, so every page
             // fills the GPU rather than leaving slots empty on a page of
             // small chassis.
             let mut pages: Vec<Vec<&Chassis>> = vec![Vec::new()];
             let mut used = 0usize;
-            for c in all {
+            for c in &all {
                 if used + c.poses > budget && !pages.last().unwrap().is_empty() {
                     pages.push(Vec::new());
                     used = 0;
@@ -201,6 +216,40 @@ pub fn load_categories(bots_dir: &std::path::Path)
     out
 }
 
+/// Read chassis MORPH STATUS out of `assets/bots/fleet.json`.
+///
+/// `true` = "accepted" — the strip's poses agree prim for prim and
+/// `xform::Morph::build` blends them into a real fold. `false` =
+/// "refused" — the poses disagree (usually because the colour merge
+/// ran per pose instead of once per chassis, see `examples/
+/// stripcheck.rs`), so `main.rs` steps between whole poses instead: no
+/// blend, one body replaced by the next on a timer. That is a
+/// slideshow wearing a fold's clothing, not a lesser fold — it is
+/// what `Morph::build` returning `None` at runtime already looks like
+/// (`self.toastf("strip mismatch — stepping")`), just not previously
+/// known ahead of load time.
+///
+/// Same two-field scan as `load_tiers`/`load_categories`, on `name`
+/// and `morph`.
+pub fn load_morph(bots_dir: &std::path::Path) -> std::collections::HashMap<String, bool> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(bots_dir.join("fleet.json")) else {
+        return out;
+    };
+    let mut name: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim().trim_end_matches(',');
+        if let Some(v) = field(line, "\"name\"") {
+            name = Some(v);
+        } else if let Some(v) = field(line, "\"morph\"") {
+            if let Some(n) = name.take() {
+                out.insert(n, v == "accepted");
+            }
+        }
+    }
+    out
+}
+
 /// `"key": "value"` -> value, for the one shape fleet.json uses.
 fn field(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(key)?.trim_start().strip_prefix(':')?.trim();
@@ -233,7 +282,11 @@ mod tests {
     use super::*;
 
     fn c(name: &str, poses: usize, tier: Option<Tier>) -> Chassis {
-        Chassis { name: name.into(), poses, tier }
+        Chassis { name: name.into(), poses, tier, morph_ok: None }
+    }
+
+    fn c_morph(name: &str, poses: usize, tier: Option<Tier>, morph_ok: Option<bool>) -> Chassis {
+        Chassis { name: name.into(), poses, tier, morph_ok }
     }
 
     fn fleet(n: usize) -> Vec<Chassis> {
@@ -353,6 +406,42 @@ mod tests {
         assert_eq!(fit(&all, &Pick::All, SDF_BUDGET).len(), 2);
         assert_eq!(fit(&all, &Pick::OnlyTier(Tier::High), SDF_BUDGET).len(), 1);
     }
+
+    #[test]
+    fn a_refused_morph_is_excluded_from_every_pick() {
+        // The slideshow filter: fleet.json says "refused" for 43 chassis
+        // (Morph::build rejects the strip; main.rs steps between whole
+        // poses instead of blending them). None of them should reach the
+        // player regardless of which selection they asked for -- there is
+        // no Pick variant that means "including the slideshows," the same
+        // way there is no Pick variant that means "including a chassis
+        // that does not fit the budget."
+        let smooth = c_morph("smooth_car", 5, Some(Tier::High), Some(true));
+        let slideshow = c_morph("static_tank", 5, Some(Tier::High), Some(false));
+        let unknown = c_morph("blackstar", 5, None, None); // hand-made, predates the sweep
+        let all = vec![smooth.clone(), slideshow.clone(), unknown.clone()];
+
+        let got_all = fit(&all, &Pick::All, SDF_BUDGET);
+        assert!(got_all.iter().any(|c| c.name == "smooth_car"));
+        assert!(got_all.iter().any(|c| c.name == "blackstar"), "hand-made bots must not be excluded");
+        assert!(!got_all.iter().any(|c| c.name == "static_tank"), "a slideshow reached Pick::All");
+
+        let got_tier = fit(&all, &Pick::OnlyTier(Tier::High), SDF_BUDGET);
+        assert!(!got_tier.iter().any(|c| c.name == "static_tank"), "a slideshow reached OnlyTier");
+
+        // Even asked for BY NAME, a slideshow is excluded -- this is a
+        // correctness filter, not a preference the caller can opt out of.
+        let got_named = fit(&all, &Pick::Named(vec!["static_tank".into()]), SDF_BUDGET);
+        assert!(got_named.is_empty(), "naming a slideshow explicitly still loaded it");
+    }
+
+    #[test]
+    fn hand_made_bots_have_no_morph_flag_and_are_not_excluded() {
+        // Same reasoning as the tier test above: None means "predates the
+        // sweep," not "assume broken."
+        let all = vec![c_morph("blackstar", 5, None, None)];
+        assert_eq!(fit(&all, &Pick::All, SDF_BUDGET).len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -439,6 +528,18 @@ mod tier_file_tests {
         // and a chassis this session's fleet-additions patch actually
         // added should be readable by name, not just present in count
         assert_eq!(tiers.get("animal_bot_runningwind"), Some(&Tier::High));
+    }
+
+    #[test]
+    fn load_morph_actually_reads_the_real_fleet_json() {
+        // Same discipline as the test above: skip the fixture, point at
+        // the real file, fail loudly if the shape ever changes rather
+        // than passing on an empty map.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/bots");
+        let morph = load_morph(&dir);
+        assert!(!morph.is_empty(), "the real fleet.json produced no morph flags at all");
+        assert!(morph.values().any(|v| *v), "no accepted (smooth) chassis found");
+        assert!(morph.values().any(|v| !*v), "no refused (slideshow) chassis found");
     }
 }
 
