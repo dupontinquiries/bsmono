@@ -36,12 +36,27 @@
 set -euo pipefail
 
 SRC=""; OUT=""; APPLY=0; DELETE=0
+# Top-level directories dropped from every drop before it is committed.
+#
+# art-targets is reference art — 14 PNGs, uncompressed in the original zips at
+# dozens of MB and still 5.4 MB after compression. It is not source, it barely
+# changes, and a binary that appears in most drops is the worst thing to put in
+# a delta-compressed history: git stores each near-identical revision at close
+# to full size. Carrying it would cost more than the entire replayed history of
+# actual code.
+EXCLUDE=("art-targets")
+EXCLUDE_SET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --src) SRC="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --apply) APPLY=1; shift ;;
     --delete) DELETE=1; shift ;;
+    # Repeatable. The first --exclude replaces the default rather than adding
+    # to it, so a caller who wants art-targets kept can say so.
+    --exclude) if [ "$EXCLUDE_SET" -eq 0 ]; then EXCLUDE=(); EXCLUDE_SET=1; fi
+               EXCLUDE+=("$2"); shift 2 ;;
+    --no-exclude) EXCLUDE=(); EXCLUDE_SET=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -97,6 +112,9 @@ awk -F'\t' '{ dup = ($2 ~ / \([0-9]+\)\.zip$/) ? 1 : 0; print dup "\t" $0 }' "$W
   | awk -F'\t' '!seen[$4]++' > "$WORK/plan"
 dupes=$(( $(wc -l < "$WORK/sorted") - $(wc -l < "$WORK/plan") ))
 
+if [ ${#EXCLUDE[@]} -gt 0 ]; then
+  echo "excluding:  ${EXCLUDE[*]} (top level, every drop)"
+fi
 echo "drops:      $(wc -l < "$WORK/plan")"
 echo "duplicates: $dupes (identical bytes, skipped)"
 echo
@@ -104,7 +122,12 @@ echo
 # ── 2. report the plan ───────────────────────────────────────────────────────
 prev_count=0
 while IFS=$'\t' read -r rev base status sha; do
-  n="$(unzip -Z1 "$SRC/$base" 2>/dev/null | grep -vc '/$' || true)"
+  # Counted with the exclusions applied, or a drop that is mostly art reads
+  # as larger than it is and the PARTIAL heuristic below misfires.
+  n="$(unzip -Z1 "$SRC/$base" 2>/dev/null | grep -v '/$' \
+       | sed -E 's#^[^/]+/##' \
+       | { if [ ${#EXCLUDE[@]} -gt 0 ]; then grep -vE "^($(IFS='|'; echo "${EXCLUDE[*]}"))/" || true; else cat; fi; } \
+       | wc -l)"
   flag=""
   # A drop with far fewer files than the last one is the shape of a partial
   # delivery, and partial + --delete is what silently corrupts the history.
@@ -161,6 +184,13 @@ while IFS=$'\t' read -r rev base status sha; do
     find "$OUT" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
   fi
   cp -a "$root/." "$OUT/"
+
+  # Removed after the copy rather than filtered during it: unzip has no
+  # exclude that survives the root-strip cleanly, and deleting a known
+  # top-level path is easier to verify than a pattern that has to be right.
+  for ex in ${EXCLUDE[@]+"${EXCLUDE[@]}"}; do
+    [ -e "$OUT/$ex" ] && rm -rf "${OUT:?}/$ex"
+  done
 
   git add -A
   if git diff --cached --quiet; then
