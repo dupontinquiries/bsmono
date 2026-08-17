@@ -699,6 +699,225 @@ fn build_capture() -> (Mesh, Vec3) {
     (m, v3(0.0, 0.0, 0.0))
 }
 
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Battleground of the Ancestors (battleground.rs): run the clan-war sim a while,
+/// print the state of the war the way `capture` prints its score, then stage the
+/// battlefield — camps and Great Trees, Trees of Healing with their aura rings,
+/// trails, prey camps, herb patches, warriors and patrols mid-march.
+/// args: [4] the player's ancestor `lion|tiger|leopard|panther|caracal|puma`.
+fn build_battle() -> (Mesh, Vec3) {
+    use clawbound_rs::ancestor::{self, Ancestor};
+    use clawbound_rs::battleground::{Battleground, Carry, Duty, Role, CLAN_A};
+    let pick = match std::env::args().nth(4).as_deref() {
+        Some("tiger") => Ancestor::Tiger, Some("leopard") => Ancestor::Leopard,
+        Some("panther") => Ancestor::Panther, Some("caracal") => Ancestor::Caracal,
+        Some("puma") => Ancestor::Puma, Some("serval") | Some("yowler") => Ancestor::Serval,
+        Some("cavelion") | Some("oldroar") => Ancestor::CaveLion,
+        Some("smilodon") | Some("sabertooth") => Ancestor::Smilodon,
+        Some("suncat") | Some("suneye") => Ancestor::SunCat,
+        Some("lynx") | Some("snowhush") => Ancestor::Lynx,
+        Some("jaguar") | Some("riptail") => Ancestor::Jaguar,
+        Some("suanni") | Some("stillsmoke") | Some("dragoncat") => Ancestor::Suanni, _ => Ancestor::Lion,
+    };
+    let mut g = Battleground::new(pick);
+    // play a couple of minutes so patrols are mid-trail, hunts and herb runs show
+    let mut t = 0;
+    while g.outcome.is_none() && t < 130 * 30 { g.step(1.0 / 30.0); t += 1; }
+    let down = |team: u8| g.heal_trees.iter().filter(|h| h.team == team && !h.alive()).count();
+    eprintln!("BATTLEGROUND [{}, {}]: piles A {:.0} / B {:.0}  herbs A {} / B {}  heal-trees down A {} / B {}  great A {:.0} / B {:.0}",
+        if g.is_night() { "night" } else { "day" }, if g.leafbare() { "leaf-bare" } else { "greenleaf" },
+        g.clans[0].pile, g.clans[1].pile, g.clans[0].herbs, g.clans[1].herbs,
+        down(0), down(1), g.clans[0].great_tree_hp.max(0.0), g.clans[1].great_tree_hp.max(0.0));
+
+    let mut m = world::build_terrain(150);
+    m.extend(&world::build_water());
+    m.extend(&world::build_trees(150));
+    m.extend(&world::build_bushes(160));
+    m.extend(&world::build_rocks(180));
+    m.extend(&world::build_logs(80));
+    m.extend(&world::build_grass(3600));
+    m.extend(&world::build_litter(2200));
+    m.extend(&world::build_reeds(500));
+
+    // ── the jungle layer: thickets, stone walls, mistfalls ──────────────────
+    use clawbound_rs::junglemap;
+    let mut jrng = 7u32;
+    let mut jr = || { jrng = jrng.wrapping_mul(0x7feb352d).wrapping_add(0x9e3779b9);
+        (jrng >> 8) as f32 / ((u32::MAX >> 8) as f32) };
+    for t in junglemap::thickets() {
+        // a dense stand: many overlapping dark brush lumps out to the radius
+        for _ in 0..22 {
+            let a = jr() * std::f32::consts::TAU;
+            let d = jr().sqrt() * t.r;
+            let (bx, bz) = (t.x + a.cos() * d, t.z + a.sin() * d);
+            let gy = world::height_at(bx, bz).max(world::WATER_Y);
+            let h = 1.6 + jr() * 1.8;
+            m.cone(v3(bx, gy + h * 0.4, bz), 1.4 + jr() * 1.2, h, 7, shade(rgb(0x2f4a2c), 0.85 + jr() * 0.3));
+        }
+    }
+    for w in junglemap::walls() {
+        // wind-and-water-carved stone: stacked strata narrowing as they rise, the
+        // banding alternating pale and rust the way old sandstone weathers, with
+        // hoodoo spires standing off the crest — real height, a true sight blocker.
+        // The pass reads as a worn notch: low rounded shoulders, open ground between.
+        for k in 0..17 {
+            let t = k as f32 / 16.0;
+            let in_pass = t > junglemap::PASS.0 && t < junglemap::PASS.1;
+            let (wx, wz) = (w.ax + (w.bx - w.ax) * t, w.az + (w.bz - w.az) * t);
+            let gy = world::height_at(wx, wz);
+            if in_pass {
+                // the notch's floor: worn shoulder stones only
+                if jr() > 0.5 {
+                    m.boxx(v3(wx, gy + 0.5, wz), v3(1.3, 0.5, 1.3), shade(rgb(0x9a9288), 0.9));
+                }
+                continue;
+            }
+            // strata: 4 layers, each narrower and paler/rustier than the last
+            let base_w = 2.6 + jr() * 0.8;
+            let mut y = gy;
+            let layers = 4;
+            for l in 0..layers {
+                let f = 1.0 - l as f32 * 0.18;
+                let lh = 1.5 + jr() * 0.9;
+                let band = if l % 2 == 0 { rgb(0x8b8d92) } else { rgb(0xa8917a) };   // grey / rust banding
+                m.boxx(v3(wx + (jr() - 0.5) * 0.8, y + lh * 0.5, wz + (jr() - 0.5) * 0.8),
+                    v3(base_w * f, lh * 0.5, base_w * f), shade(band, 0.82 + jr() * 0.3));
+                y += lh * 0.92;   // slight overlap so the stack reads as one mass
+            }
+            // every few stations a hoodoo spire stands off the crest
+            if k % 3 == 0 {
+                let sh = 3.0 + jr() * 2.5;
+                m.cone(v3(wx + (jr() - 0.5) * 2.0, y, wz + (jr() - 0.5) * 2.0),
+                    1.0 + jr() * 0.5, sh, 7, shade(rgb(0xa8917a), 0.9 + jr() * 0.25));
+                m.cone(v3(wx, y + sh * 0.4, wz), 0.5, 1.4, 5, rgb(0x8b8d92));   // the capstone
+            }
+        }
+    }
+    for mi in junglemap::mists() {
+        // the mistfall: a pale water column off a crag, spray hanging as a dome
+        let gy = world::height_at(mi.x, mi.z).max(world::WATER_Y);
+        m.boxx(v3(mi.x, gy + 4.5, mi.z), v3(1.2, 4.5, 1.2), rgb(0x9fc8d8));
+        m.set_op(0.3);
+        m.cone(v3(mi.x, gy + 0.3, mi.z), mi.r, 3.2, 16, rgb(0xdce8ec));
+        m.set_op(1.0);
+    }
+
+    let team_col = |t: u8| if t == CLAN_A { rgb(0xd8623c) } else { rgb(0x3d7fd8) };
+    // camps: the Great Tree — a mighty trunk and canopy in clan colour — over a pad
+    for team in 0..2u8 {
+        let (bx, bz) = g.camps[team as usize];
+        let gy = world::height_at(bx, bz);
+        let col = team_col(team);
+        m.set_op(0.5);
+        m.cone(v3(bx, gy + 0.15, bz), 9.0, 0.3, 22, col);
+        m.set_op(1.0);
+        m.segment(v3(bx, gy, bz), v3(bx, gy + 14.0, bz), 2.2, 0.9, 8, rgb(0x6b4a32));
+        let hp = g.clans[team as usize].great_tree_hp.max(0.0) / 1400.0;
+        m.cone(v3(bx, gy + 13.0, bz), 7.5, 6.0 + 4.0 * hp, 10, shade(col, 0.85));
+        // the medic cat at their den beside the trunk
+        let (mx, mz) = g.medics[team as usize];
+        cat::build(&mut m, v3(mx, world::height_at(mx, mz), mz), 0.0, &cat::stand(), clawbound_rs::class::Class::Cat);
+        m.boxx(v3(mx, world::height_at(mx, mz) + 2.0, mz), v3(0.3, 0.3, 0.3), rgb(0x8ee06a));   // herb-green marker
+    }
+    // Trees of Healing: pale silver-green trunks, aura ring while alive
+    for h in &g.heal_trees {
+        let gy = world::height_at(h.x, h.z);
+        if h.alive() {
+            let frac = h.hp / 550.0;
+            m.segment(v3(h.x, gy, h.z), v3(h.x, gy + 8.0, h.z), 1.1, 0.5, 7, rgb(0xa8b89a));
+            m.cone(v3(h.x, gy + 7.0, h.z), 4.5, 2.5 + 2.5 * frac, 9, shade(team_col(h.team), 0.7));
+            m.set_op(0.35);
+            m.cone(v3(h.x, gy + 0.2, h.z), 14.0, 0.2, 24, rgb(0x9fe08a));   // the healing aura
+            m.set_op(1.0);
+        } else {
+            m.segment(v3(h.x, gy, h.z), v3(h.x + 3.0, gy + 1.2, h.z), 0.9, 0.7, 6, rgb(0x584838));   // a felled trunk
+        }
+    }
+    // prey camps and fishing runs: small ochre mounds; the contention ground ring
+    for p in &g.prey {
+        if !p.alive() { continue; }
+        let gy = world::height_at(p.x, p.z).max(world::WATER_Y);
+        let col = if p.rich() { rgb(0xffd24a) } else { rgb(0xb0824f) };
+        m.cone(v3(p.x, gy + 0.4, p.z), 0.7, 0.9, 6, col);
+    }
+    m.set_op(0.3);
+    m.cone(v3(g.contention.0, world::height_at(g.contention.0, g.contention.1) + 0.25, g.contention.1), 20.0, 0.2, 28, rgb(0xffd24a));
+    m.set_op(1.0);
+    // the Skyrock: the ridge lookout — a tall stone spire, ledge, and a beacon in
+    // the watching clan's colour (white while unclaimed)
+    {
+        let (sx, sz) = g.skyrock;
+        let gy = world::height_at(sx, sz);
+        m.cone(v3(sx, gy + 4.0, sz), 3.2, 9.0, 8, shade(rgb(0x8b8d92), 0.95));
+        m.boxx(v3(sx, gy + 7.6, sz), v3(1.6, 0.35, 1.6), rgb(0xa8917a));   // the watchers' ledge
+        let bcol = match g.skyrock_holder {
+            Some(t) if t == CLAN_A => rgb(0xd8623c),
+            Some(_) => rgb(0x3d7fd8),
+            None => rgb(0xece8e0),
+        };
+        m.segment(v3(sx, gy + 8.0, sz), v3(sx, gy + 12.5, sz), 0.35, 0.1, 5, bcol);
+        m.set_op(0.3);
+        m.cone(v3(sx, gy + 0.25, sz), 14.0, 0.2, 24, rgb(0xece8e0));
+        m.set_op(1.0);
+    }
+    // the fords: pale gravel bars where the east trail crosses the river
+    for &(fx, fz) in &world::U_FORDS {
+        let gy = world::height_at(fx, fz).max(world::WATER_Y);
+        m.set_op(0.85);
+        m.cone(v3(fx, gy + 0.15, fz), 7.0, 0.3, 18, rgb(0xc9bda4));
+        m.set_op(1.0);
+        for _ in 0..6 {
+            let a = jr() * std::f32::consts::TAU;
+            let d = jr().sqrt() * 6.0;
+            m.boxx(v3(fx + a.cos() * d, gy + 0.35, fz + a.sin() * d), v3(0.4, 0.25, 0.4), rgb(0xb0a58c));
+        }
+    }
+
+    // scorched ground still burning; sweet rain still falling
+    for z in &g.zones {
+        let gy = world::height_at(z.x, z.z);
+        m.set_op(0.45);
+        let col = if z.mend { rgb(0x9fc8e8) } else { rgb(0xffa53c) };
+        m.cone(v3(z.x, gy + 0.3, z.z), z.r, 0.25, 20, col);
+        if z.mend {
+            m.set_op(0.25);
+            m.cone(v3(z.x, gy + 5.5, z.z), z.r * 0.8, -5.0, 14, rgb(0xbcd8ec));   // the falling rain
+        }
+        m.set_op(1.0);
+    }
+    // herb patches
+    for hp in &g.herb_patches {
+        if !hp.ready() { continue; }
+        let gy = world::height_at(hp.x, hp.z);
+        m.boxx(v3(hp.x, gy + 0.4, hp.z), v3(0.5, 0.4, 0.5), rgb(0x8ee06a));
+    }
+    // warriors: the cat rig in clan colour — a tall crest for ancestors, a small
+    // collar for patrol cats, a carried kill or sprig shown over the shoulders
+    for w in &g.warriors {
+        if !w.alive() { continue; }
+        let gy = world::height_at(w.x, w.z);
+        cat::build(&mut m, v3(w.x, gy, w.z), w.heading, &cat::stand(), clawbound_rs::class::Class::Cat);
+        let col = team_col(w.team);
+        if w.role == Role::Ancestor {
+            m.segment(v3(w.x, gy + 2.0, w.z), v3(w.x, gy + 3.4, w.z), 0.22, 0.05, 5, col);
+            if let Some(a) = w.ancestor {
+                let _ = ancestor::kit(a);   // crest colour per ancestor could hang here
+            }
+            m.boxx(v3(w.x, gy + 3.5, w.z), v3(0.42, 0.42, 0.42), shade(col, 1.15));
+        } else {
+            m.boxx(v3(w.x, gy + 2.1, w.z), v3(0.4, 0.15, 0.4), col);
+            if w.duty == Duty::Hunting { m.boxx(v3(w.x, gy + 2.35, w.z), v3(0.2, 0.2, 0.2), rgb(0xb0824f)); }
+        }
+        match w.carry {
+            Carry::Freshkill(_) => m.cone(v3(w.x, gy + 1.9, w.z), 0.45, 0.6, 6, rgb(0xb0824f)),
+            Carry::Herb => m.boxx(v3(w.x, gy + 1.9, w.z), v3(0.3, 0.3, 0.3), rgb(0x8ee06a)),
+            Carry::Nothing => {}
+        }
+    }
+    (m, v3(0.0, 0.0, 0.0))
+}
+
 #[cfg(feature = "app")]
 fn build_world_env() -> Mesh {
     world::init_world();
@@ -1094,6 +1313,7 @@ async fn run() {
         "prowl" => build_prowl(),
         "spirits" => build_spirits(),
         "capture" => build_capture(),
+        "battle" => build_battle(),
         "open" => build_open(),
         "wildlife" => build_wildlife(),
         _ => build_scene(),
@@ -1134,6 +1354,7 @@ async fn run() {
         "game" => (focus.add(v3(22.0, 40.0, -22.0)), focus.add(v3(0.0, -3.0, 9.0))),
         "prowl" => (focus.add(v3(20.0, 34.0, -20.0)), focus.add(v3(0.0, -3.0, 8.0))),
         "capture" => (v3(92.0, 104.0, -30.0), v3(-6.0, -10.0, 6.0)),
+        "battle" => (v3(210.0, 205.0, -210.0), v3(-16.0, -26.0, 16.0)),
         "open" => (focus.add(v3(17.0, 23.0, -19.0)), focus.add(v3(0.0, -2.0, 6.0))),
         "spirits" => (focus.add(v3(0.0, 4.5, -26.0)), focus.add(v3(0.0, 1.2, 8.0))),
         "wildlife" => (focus.add(v3(0.5, 2.3, -7.5)), focus.add(v3(0.0, 0.9, 3.2))),
