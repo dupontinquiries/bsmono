@@ -83,6 +83,46 @@ static int bp_inflate(const uint8_t *in, size_t in_len, uint8_t *out, size_t out
     return st == TINFL_STATUS_DONE && out_n == out_len;
 }
 
+/* ---- v4: one zstd frame per strip ------------------------------------------
+ *
+ * v4 keeps every v3 byte except the envelope: instead of two zlib streams per
+ * pose, all q streams then all r streams travel in ONE zstd frame. Grouping
+ * like with like puts the index streams adjacent, which is where the
+ * cross-pose matches are — zlib's 32 KB window could never see from one pose
+ * to the next. Measured 226 MB -> 118 MB across the fleet.
+ *
+ * THE DEPENDENCY QUESTION. This header's rule was "no new dependency":
+ * inflate comes from physfs's bundled miniz. zstd is not bundled anywhere in
+ * this tree, so rather than vendor a decoder into a repo we are actively
+ * shrinking, the call is a hook:
+ *
+ *   -DBP_HAVE_ZSTD  and link -lzstd     -> real decode
+ *   (default)                           -> builds, and fails LOUDLY at the
+ *                                          moment a v4 pack is opened
+ *
+ * The default builds rather than #error-ing because the C engine has paths
+ * that never touch a pack, and breaking those to enforce a dependency they do
+ * not use would be the wrong trade. It fails loudly rather than quietly
+ * because a silent zero here renders as geometry.
+ */
+#ifdef BP_HAVE_ZSTD
+#include <zstd.h>
+static int bp_unzstd(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len) {
+    size_t got = ZSTD_decompress(out, out_len, in, in_len);
+    if (ZSTD_isError(got) || got != out_len) return 0;
+    return 1;
+}
+#else
+static int bp_unzstd(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len) {
+    (void)in; (void)in_len; (void)out; (void)out_len;
+    fprintf(stderr,
+        "botpack: this pack is v4 (zstd) and this build has no zstd.\n"
+        "         rebuild with -DBP_HAVE_ZSTD and link -lzstd,\n"
+        "         or regenerate v3 packs with tools/pack_v4.py --revert\n");
+    return 0;
+}
+#endif
+
 /* Decode pose `idx` from a pack already in memory.
  *
  * Returns a zeroed buf on any malformed input rather than a partial one — a
@@ -91,7 +131,12 @@ static int bp_inflate(const uint8_t *in, size_t in_len, uint8_t *out, size_t out
 static botpack_buf botpack_decode(const uint8_t *blob, size_t n, unsigned idx) {
     botpack_buf out = {NULL, 0};
     if (n < 20 || bp_u32(blob) != BOTPACK_MAGIC) return out;
-    if (bp_u16(blob + 4) != BOTPACK_VERSION) return out;   /* refuse, never guess */
+    unsigned bp_ver = bp_u16(blob + 4);
+    /* v3 and v4 differ ONLY in the compression envelope: identical header,
+     * identical per-pose raw streams, so everything below this point is
+     * shared. Refuse anything else rather than guess — a future layout read
+     * as v4 produces plausible geometry, which is worse than nothing. */
+    if (bp_ver != 3 && bp_ver != 4) return out;
 
     unsigned poses = bp_u16(blob + 6);
     if (idx >= poses) return out;
@@ -109,20 +154,58 @@ static botpack_buf botpack_decode(const uint8_t *blob, size_t n, unsigned idx) {
     const uint8_t *lens = blob + off;
     off += (size_t)poses * 4;
 
+    /* v4: the (qraw, rraw) table gives UNCOMPRESSED lengths, then one zstd
+     * frame holds every q stream followed by every r stream. Decompress the
+     * whole frame — the loader walks poses consecutively, so the strip is
+     * wanted in full anyway, and slicing one pose out of a solid frame is not
+     * possible without it. */
+    uint8_t *v4frame = NULL;
+    const uint8_t *v4q = NULL, *v4r = NULL;
+    uint32_t v4qlen = 0, v4rlen = 0;
+    if (bp_ver == 4) {
+        if (off + (size_t)poses * 8 + 4 > n) return out;
+        size_t qtotal = 0, rtotal = 0, qbefore = 0, rbefore = 0;
+        for (unsigned i = 0; i < poses; i++) {
+            uint32_t qr = bp_u32(blob + off + (size_t)i * 8);
+            uint32_t rr = bp_u32(blob + off + (size_t)i * 8 + 4);
+            if (i < idx) { qbefore += qr; rbefore += rr; }
+            if (i == idx) { v4qlen = qr; v4rlen = rr; }
+            qtotal += qr; rtotal += rr;
+        }
+        size_t zoff = off + (size_t)poses * 8;
+        uint32_t zlen = bp_u32(blob + zoff); zoff += 4;
+        if (zoff + zlen > n) return out;
+        size_t total = qtotal + rtotal;
+        v4frame = (uint8_t *)malloc(total ? total : 1);
+        if (!v4frame) return out;
+        if (!bp_unzstd(blob + zoff, zlen, v4frame, total)) { free(v4frame); return out; }
+        v4q = v4frame + qbefore;
+        v4r = v4frame + qtotal + rbefore;
+    }
+
     for (unsigned i = 0; i < poses; i++) {
-        if (off + 8 > n) return out;
-        uint32_t qlen = bp_u32(blob + off), rlen = bp_u32(blob + off + 4);
-        off += 8;
-        if (off + (size_t)qlen + rlen > n) return out;
-        if (i != idx) { off += qlen + rlen; continue; }
+        uint32_t qlen = 0, rlen = 0;
+        if (bp_ver == 3) {
+            if (off + 8 > n) { free(v4frame); return out; }
+            qlen = bp_u32(blob + off); rlen = bp_u32(blob + off + 4);
+            off += 8;
+            if (off + (size_t)qlen + rlen > n) { free(v4frame); return out; }
+            if (i != idx) { off += qlen + rlen; continue; }
+        } else if (i != idx) {
+            continue;
+        }
 
         uint32_t want = bp_u32(lens + i * 4);
         uint8_t *buf = (uint8_t *)calloc(want ? want : 1, 1);
-        if (!buf) return out;
+        if (!buf) { free(v4frame); return out; }
 
         /* The non-float bytes first: they are the frame the floats sit in. */
-        if (!bp_inflate(blob + off + qlen, rlen, buf, want)) {
-            free(buf);
+        if (bp_ver == 4) {
+            /* Already raw inside the frame — copy, do not inflate. */
+            if (v4rlen != want) { free(buf); free(v4frame); return out; }
+            memcpy(buf, v4r, want);
+        } else if (!bp_inflate(blob + off + qlen, rlen, buf, want)) {
+            free(buf); free(v4frame);
             return out;
         }
 
@@ -130,26 +213,31 @@ static botpack_buf botpack_decode(const uint8_t *blob, size_t n, unsigned idx) {
         size_t qcount = 0;
         for (uint32_t r = 0; r < nranges; r++) qcount += bp_u32(ranges + r * 8 + 4) / 4;
         uint16_t *q = (uint16_t *)malloc(qcount * 2 ? qcount * 2 : 1);
-        if (!q) { free(buf); return out; }
-        if (!bp_inflate(blob + off, qlen, (uint8_t *)q, qcount * 2)) {
-            free(q); free(buf);
+        if (!q) { free(buf); free(v4frame); return out; }
+        if (bp_ver == 4) {
+            if (v4qlen != qcount * 2) { free(q); free(buf); free(v4frame); return out; }
+            memcpy(q, v4q, v4qlen);
+        } else if (!bp_inflate(blob + off, qlen, (uint8_t *)q, qcount * 2)) {
+            free(q); free(buf); free(v4frame);
             return out;
         }
 
         size_t k = 0;
         for (uint32_t r = 0; r < nranges; r++) {
             uint32_t st = bp_u32(ranges + r * 8), ln = bp_u32(ranges + r * 8 + 4);
-            if ((size_t)st + ln > want) { free(q); free(buf); return out; }
+            if ((size_t)st + ln > want) { free(q); free(buf); free(v4frame); return out; }
             for (uint32_t j = 0; j < ln / 4; j++, k++) {
                 float v = lo + ((float)q[k] / 65535.0f) * span;
                 memcpy(buf + st + j * 4, &v, 4);
             }
         }
         free(q);
+        free(v4frame);
         out.data = buf;
         out.len = want;
         return out;
     }
+    free(v4frame);
     return out;
 }
 
