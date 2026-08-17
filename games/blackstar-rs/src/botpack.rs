@@ -20,11 +20,32 @@
 //!
 //! ## Layout
 //!
+//! v3 (per-pose zlib):
+//!
 //! ```text
-//! "BSPK"  u16 version  u16 poses  f32 lo  f32 hi
+//! "BSPK"  u16 version=3  u16 poses  f32 lo  f32 hi
+//! poses x range table
 //! poses x u32 original byte length
-//! poses x (u32 compressed length, zlib(u16 stream))
+//! poses x (u32 qlen, u32 rlen, zlib(quantised stream), zlib(index stream))
 //! ```
+//!
+//! v4 (solid zstd) carries THE SAME two raw streams per pose — same codes,
+//! same box, same index deltas — but compresses the whole strip as one zstd
+//! frame instead of zlib per pose. zlib's 32 KB window cannot see from one
+//! pose to the next; a strip-wide window can, and poses of one chassis are
+//! highly redundant (often the entire index stream repeats verbatim).
+//! Measured on a 14-strip sample: 49% of the v3 size, byte-identical decode.
+//!
+//! ```text
+//! "BSPK"  u16 version=4  u16 poses  f32 lo  f32 hi
+//! poses x range table                      (as v3)
+//! poses x u32 original byte length         (as v3)
+//! poses x (u32 qraw, u32 rraw)             UNCOMPRESSED stream lengths
+//! u32 zlen, zstd frame = q0..qN-1 ++ r0..rN-1
+//! ```
+//!
+//! Because the streams are untouched, v3 <-> v4 is a lossless transcode
+//! (`tools/pack_v4.py`), and the fold-safety argument above transfers as-is.
 
 use std::path::Path;
 
@@ -50,7 +71,36 @@ pub fn pose_buffer(dir: &Path) -> Option<Vec<u8>> {
         Strip::Fold => "bots.pack",
         Strip::Walk => "walk.pack",
     };
-    let blob = std::fs::read(chassis.join(file)).ok()?;
+    let path = chassis.join(file);
+    let blob = std::fs::read(&path).ok()?;
+    // v4 packs decompress the WHOLE strip per call, and the loader asks for a
+    // chassis's poses consecutively (f00, f01, ...) — so cache the last
+    // decompressed frame. One entry, not a map: the access pattern is strictly
+    // sequential per chassis, and a map would pin every strip's frame
+    // (~2-10 MB each, ~300 chassis) in memory for no second hit.
+    if blob.len() >= 6 && &blob[..4] == MAGIC
+        && u16::from_le_bytes([blob[4], blob[5]]) == 4
+    {
+        use std::sync::{Arc, Mutex, OnceLock};
+        static LAST: OnceLock<Mutex<Option<(std::path::PathBuf, usize, Arc<Vec<u8>>)>>> =
+            OnceLock::new();
+        let h = parse_header(&blob)?;
+        let (frame_off, zlen) = v4_frame_extent(&blob, &h)?;
+        let cache = LAST.get_or_init(|| Mutex::new(None));
+        let frame = {
+            let mut slot = cache.lock().ok()?;
+            match &*slot {
+                // zlen in the key so a repacked file at the same path misses.
+                Some((p, z, f)) if p == &path && *z == zlen => f.clone(),
+                _ => {
+                    let f = Arc::new(unzstd(blob.get(frame_off..frame_off + zlen)?)?);
+                    *slot = Some((path.clone(), zlen, f.clone()));
+                    f
+                }
+            }
+        };
+        return v4_extract(&blob, &h, &frame, idx);
+    }
     decode_pose(&blob, idx)
 }
 
@@ -75,34 +125,27 @@ fn pose_index(dir: &Path) -> Option<(Strip, usize)> {
     Some((kind, rest.parse::<usize>().ok()?))
 }
 
-/// Pull one pose out of a pack blob.
-pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
-    if blob.len() < 16 || &blob[..4] != MAGIC {
-        return None;
-    }
-    let version = u16::from_le_bytes(blob[4..6].try_into().ok()?);
-    if version != 3 {
-        // Refused rather than guessed: a v1 pack read as v2 walks off the end
-        // of the buffer, and a future layout read as v2 would produce
-        // plausible-looking garbage geometry. Both are worse than an error.
-        //
-        // v1 packs are upgraded in place by tools/pack_upgrade.py, which
-        // transcodes the CODES rather than re-quantising the floats — so the
-        // upgrade is lossless by construction, not by measurement.
-        return None;
-    }
-    let poses = u16::from_le_bytes(blob[6..8].try_into().ok()?) as usize;
-    if idx >= poses {
-        return None;
-    }
-    let lo = f32::from_le_bytes(blob[8..12].try_into().ok()?);
-    let hi = f32::from_le_bytes(blob[12..16].try_into().ok()?);
+/// The header both versions share: magic through the length table.
+struct Header {
+    poses: usize,
+    lo: f32,
+    hi: f32,
+    all_ranges: Vec<Vec<(usize, usize)>>,
+    lens: Vec<usize>,
+    /// Byte offset of the first version-specific byte.
+    off: usize,
+}
+
+fn parse_header(blob: &[u8]) -> Option<Header> {
+    let poses = u16::from_le_bytes(blob.get(6..8)?.try_into().ok()?) as usize;
+    let lo = f32::from_le_bytes(blob.get(8..12)?.try_into().ok()?);
+    let hi = f32::from_le_bytes(blob.get(12..16)?.try_into().ok()?);
 
     let mut off = 16usize;
     // A range table PER POSE, because the same strip can lay its parts out in
-    // a different order in each pose. v3 needs these: the float ranges say
-    // which bytes the quantised stream fills in, and everything else is index
-    // data the second stream rebuilds.
+    // a different order in each pose. The float ranges say which bytes the
+    // quantised stream fills in, and everything else is index data the second
+    // stream rebuilds.
     let mut all_ranges: Vec<Vec<(usize, usize)>> = Vec::with_capacity(poses);
     for _ in 0..poses {
         let nr = u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize;
@@ -121,6 +164,112 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
         lens.push(u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize);
         off += 4;
     }
+    Some(Header { poses, lo, hi, all_ranges, lens, off })
+}
+
+/// Rebuild one pose's scene.bin bytes from its two UNCOMPRESSED streams.
+///
+/// Shared by v3 (streams inflated from per-pose zlib) and v4 (streams sliced
+/// out of the strip-wide zstd frame) — the streams themselves are identical
+/// between the versions, which is what makes the transcode lossless.
+fn rebuild(
+    qraw: &[u8],
+    rraw: &[u8],
+    ranges: &[(usize, usize)],
+    total: usize,
+    lo: f32,
+    hi: f32,
+) -> Option<Vec<u8>> {
+    // THE FLOAT STREAM COVERS ONLY THE FLOAT RANGES, not the whole buffer.
+    // v2's did cover everything, and sizing dequantise from the full buffer
+    // read past the end of a stream a third the size — reported as
+    // "index out of bounds, len 168912, index 168912".
+    let float_bytes: usize = ranges.iter().map(|&(_, n)| n).sum();
+    let floats = dequantise(qraw, lo, hi, float_bytes);
+    let indices = decode_indices(rraw, total, ranges)?;
+    // Merge: the float ranges come from the quantised stream, the rest from
+    // the index stream. The float stream is a PACKED SEQUENCE — range 0's
+    // bytes, then range 1's, with no gaps — while `out` is the real buffer
+    // with the ranges at their true offsets. So walk a cursor through the
+    // stream rather than indexing it by buffer offset, which would write the
+    // wrong vertices into the right places without ever panicking.
+    let mut out = indices;
+    let mut at = 0usize;
+    for &(st, n) in ranges {
+        if st + n > out.len() || at + n > floats.len() {
+            return None;
+        }
+        out[st..st + n].copy_from_slice(&floats[at..at + n]);
+        at += n;
+    }
+    Some(out)
+}
+
+/// Pull one pose out of a pack blob.
+pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
+    if blob.len() < 16 || &blob[..4] != MAGIC {
+        return None;
+    }
+    let version = u16::from_le_bytes(blob[4..6].try_into().ok()?);
+    match version {
+        // Refused rather than guessed for anything else: a v1 pack read as v2
+        // walks off the end of the buffer, and a future layout read as a known
+        // one would produce plausible-looking garbage geometry. Both are worse
+        // than an error.
+        //
+        // v1 packs are upgraded in place by tools/pack_upgrade.py, v3 packs to
+        // v4 by tools/pack_v4.py; both transcode the CODES rather than
+        // re-quantising the floats — so the upgrade is lossless by
+        // construction, not by measurement.
+        3 => decode_pose_v3(blob, idx),
+        4 => {
+            let h = parse_header(blob)?;
+            let (frame_off, zlen) = v4_frame_extent(blob, &h)?;
+            let frame = unzstd(blob.get(frame_off..frame_off + zlen)?)?;
+            v4_extract(blob, &h, &frame, idx)
+        }
+        _ => None,
+    }
+}
+
+/// Where the v4 zstd frame sits in the blob, without decompressing it.
+fn v4_frame_extent(blob: &[u8], h: &Header) -> Option<(usize, usize)> {
+    let z_off = h.off + h.poses * 8; // past the (qraw, rraw) pairs
+    let zlen = u32::from_le_bytes(blob.get(z_off..z_off + 4)?.try_into().ok()?) as usize;
+    Some((z_off + 4, zlen))
+}
+
+/// Slice pose `idx`'s two raw streams out of the decompressed v4 frame and
+/// rebuild the buffer.
+fn v4_extract(blob: &[u8], h: &Header, frame: &[u8], idx: usize) -> Option<Vec<u8>> {
+    if idx >= h.poses {
+        return None;
+    }
+    let mut off = h.off;
+    let mut qlens = Vec::with_capacity(h.poses);
+    let mut rlens = Vec::with_capacity(h.poses);
+    for _ in 0..h.poses {
+        qlens.push(u32::from_le_bytes(blob.get(off..off + 4)?.try_into().ok()?) as usize);
+        rlens.push(u32::from_le_bytes(blob.get(off + 4..off + 8)?.try_into().ok()?) as usize);
+        off += 8;
+    }
+    // Frame layout is all q streams then all r streams — matching how the
+    // measurement was taken. Grouping like with like keeps the index streams
+    // adjacent, which is where the cross-pose matches are.
+    let qtotal: usize = qlens.iter().sum();
+    let qstart: usize = qlens[..idx].iter().sum();
+    let rstart: usize = qtotal + rlens[..idx].iter().sum::<usize>();
+    let qraw = frame.get(qstart..qstart + qlens[idx])?;
+    let rraw = frame.get(rstart..rstart + rlens[idx])?;
+    rebuild(qraw, rraw, &h.all_ranges[idx], *h.lens.get(idx)?, h.lo, h.hi)
+}
+
+fn decode_pose_v3(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
+    let h = parse_header(blob)?;
+    let Header { poses, lo, hi, all_ranges, lens, mut off } = h;
+    if idx >= poses {
+        return None;
+    }
     // Walk to the pose we want. Sequential because the chunks are
     // variable-length; a chassis has five of them, so an index would cost more
     // bytes than it saves time.
@@ -133,36 +282,13 @@ pub fn decode_pose(blob: &[u8], idx: usize) -> Option<Vec<u8>> {
         let chunk = blob.get(off..off + qlen)?;
         off += qlen;
         if i == idx {
-            // Two streams now: quantised floats, and delta-coded indices.
-            // v2 stored the index bytes verbatim (with the float ranges
-            // zeroed); v3 delta-codes them, which is 54% of the file.
-            // THE FLOAT STREAM COVERS ONLY THE FLOAT RANGES, not the whole
-            // buffer. v2's did cover everything, and passing lens[i] here was
-            // left over from that — it made dequantise size itself from the
-            // full buffer and read past the end of a stream a third the size.
-            //
-            // Reported as: index out of bounds, len 168912, index 168912.
-            // 168912 bytes is 84456 codes; the old maths asked for 218199.
-            let float_bytes: usize = all_ranges[i].iter().map(|&(_, n)| n).sum();
-            let floats = dequantise(&inflate(chunk)?, lo, hi, float_bytes);
+            // Two streams: quantised floats and delta-coded indices. v2
+            // stored the index bytes verbatim (with the float ranges zeroed);
+            // v3 delta-codes them, which is 54% of the file. The stream
+            // sizing and merge pitfalls live in `rebuild`'s comments.
             let idx_chunk = blob.get(off..off + rlen)?;
-            let indices = decode_indices(&inflate(idx_chunk)?, lens[i], &all_ranges[i])?;
-            // Merge: the float ranges come from the quantised stream, the rest
-            // from the index stream. Neither covers the other's bytes.
-            // The float stream is a PACKED SEQUENCE — range 0's bytes, then
-            // range 1's, with no gaps — while `out` is the real buffer with the
-            // ranges at their true offsets. So it walks a cursor through the
-            // stream rather than indexing it by buffer offset, which was the
-            // second half of the same mistake and would have written the wrong
-            // vertices into the right places without ever panicking.
-            let mut out = indices;
-            let mut at = 0usize;
-            for &(st, n) in &all_ranges[i] {
-                if st + n > out.len() || at + n > floats.len() { return None; }
-                out[st..st + n].copy_from_slice(&floats[at..at + n]);
-                at += n;
-            }
-            return Some(out);
+            return rebuild(&inflate(chunk)?, &inflate(idx_chunk)?,
+                           &all_ranges[i], lens[i], lo, hi);
         }
         off += rlen;
     }
@@ -263,6 +389,21 @@ fn inflate(data: &[u8]) -> Option<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec_zlib(data).ok()
 }
 
+/// zstd inflate for v4 frames.
+///
+/// ruzstd rather than the `zstd` crate for the same reason miniz_oxide rather
+/// than flate2 above: this only ever DECOMPRESSES a file the repo produces,
+/// and ruzstd is pure Rust — no C toolchain in the cross builds. (Gotcha for
+/// upgrades: ruzstd 0.8 moved `StreamingDecoder` to `ruzstd::decoding::` and
+/// needs a newer cargo resolver; the import below is the 0.7 path.)
+fn unzstd(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut dec = ruzstd::StreamingDecoder::new(data).ok()?;
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,8 +451,24 @@ mod tests {
         for p in poses {
             out.extend_from_slice(&((p.len() * 4) as u32).to_le_bytes());
         }
+        for (body, idx_body) in raw_streams(lo, hi, poses) {
+            let c = miniz_oxide::deflate::compress_to_vec_zlib(&body, 6);
+            let rest = miniz_oxide::deflate::compress_to_vec_zlib(&idx_body, 6);
+            out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(rest.len() as u32).to_le_bytes());
+            out.extend_from_slice(&c);
+            out.extend_from_slice(&rest);
+        }
+        out
+    }
+
+    /// The two UNCOMPRESSED streams per pose, exactly as pack_bots.py's
+    /// `quantise` + `encode_indices` produce them for all-float poses.
+    /// Shared by the v3 and v4 fixtures — the format versions differ only in
+    /// how these bytes are compressed, and the tests should pin that.
+    fn raw_streams(lo: f32, hi: f32, poses: &[Vec<f32>]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let span = if hi > lo { hi - lo } else { 1.0 };
-        for p in poses {
+        poses.iter().map(|p| {
             let codes: Vec<u16> = p.iter()
                 .map(|v| (((v - lo) / span) * 65535.0).round() as u16)
                 .collect();
@@ -329,16 +486,60 @@ mod tests {
             }
             let mut body: Vec<u8> = planes.iter().map(|v| (v >> 8) as u8).collect();
             body.extend(planes.iter().map(|v| (*v & 0xFF) as u8));
-            let c = miniz_oxide::deflate::compress_to_vec_zlib(&body, 6);
             // ngaps = 0, real encoding (see doc comment above), not an
             // empty stream.
-            let idx_body = 0u32.to_le_bytes();
-            let rest = miniz_oxide::deflate::compress_to_vec_zlib(&idx_body, 6);
-            out.extend_from_slice(&(c.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(rest.len() as u32).to_le_bytes());
-            out.extend_from_slice(&c);
-            out.extend_from_slice(&rest);
+            (body, 0u32.to_le_bytes().to_vec())
+        }).collect()
+    }
+
+    /// A valid zstd frame of RAW blocks — no encoder dependency, and ruzstd
+    /// decodes it like any other frame. Single-segment, 8-byte content size.
+    fn store_zstd(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x28, 0xB5, 0x2F, 0xFD];
+        out.push(0b1110_0000); // FCS=8 bytes (bits 7-6), single segment (bit 5)
+        out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        if payload.is_empty() {
+            out.extend_from_slice(&[0b1, 0, 0]); // one last, empty, raw block
+            return out;
         }
+        let mut it = payload.chunks(0x1FFFF).peekable(); // < the 128 KB block cap
+        while let Some(c) = it.next() {
+            let last = it.peek().is_none() as u32;
+            let hdr = last | ((c.len() as u32) << 3); // type bits 1-2 = 0 = raw
+            out.extend_from_slice(&hdr.to_le_bytes()[..3]);
+            out.extend_from_slice(c);
+        }
+        out
+    }
+
+    /// Same header as pack(), then the v4 tail: uncompressed stream lengths
+    /// and one solid zstd frame of q-streams then r-streams.
+    fn pack_v4(lo: f32, hi: f32, poses: &[Vec<f32>]) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.extend_from_slice(&(poses.len() as u16).to_le_bytes());
+        out.extend_from_slice(&lo.to_le_bytes());
+        out.extend_from_slice(&hi.to_le_bytes());
+        for p in poses {
+            let byte_len = (p.len() * 4) as u32;
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&byte_len.to_le_bytes());
+        }
+        for p in poses {
+            out.extend_from_slice(&((p.len() * 4) as u32).to_le_bytes());
+        }
+        let streams = raw_streams(lo, hi, poses);
+        for (q, r) in &streams {
+            out.extend_from_slice(&(q.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        }
+        let mut payload = Vec::new();
+        for (q, _) in &streams { payload.extend_from_slice(q); }
+        for (_, r) in &streams { payload.extend_from_slice(r); }
+        let frame = store_zstd(&payload);
+        out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        out.extend_from_slice(&frame);
         out
     }
 
@@ -416,12 +617,46 @@ mod tests {
         // Read as the current version, a new layout produces plausible-looking
         // garbage geometry rather than an error — the worst outcome available.
         // The same guard is what makes a leftover v1 (or v2) pack an error too.
-        // pack() now writes the real current version (3), so the probe
-        // has to go one past it (4) to actually simulate a future
-        // layout — writing 3 here would be a no-op.
+        // The probe has to go one past the NEWEST version the decoder
+        // accepts to actually simulate a future layout. That was 4 when v3
+        // was current; v4 (solid zstd) is now a real version, so the probe
+        // moves to 5. (Relabelling a v3 body as 4 is separately refused —
+        // its "frame length" reads from mid-chunk garbage — but that is
+        // luck of the layout, not the guard this test pins.)
         let mut blob = pack(0.0, 1.0, &[vec![0.0, 0.0, 0.0], vec![1.0, 1.0, 1.0]]);
-        blob[4] = 4;
+        blob[4] = 5;
         assert!(decode_pose(&blob, 0).is_none());
+    }
+
+    #[test]
+    fn a_v4_pack_decodes_byte_identically_to_its_v3_twin() {
+        // THE TRANSCODE PROPERTY. v4 carries the same raw streams as v3 under
+        // different compression, so decoding must produce the same bytes —
+        // not merely close floats. This is what lets tools/pack_v4.py rewrite
+        // 296 packs and call the result lossless by construction.
+        let poses = vec![
+            vec![-1.0f32, 0.0, 0.5, 1.0, -0.25, 0.75],
+            vec![0.1f32, 0.2, 0.3, 0.4, 0.05, 0.15],
+            vec![-0.5f32, 0.9, -0.9, 0.33, 0.0, -0.33],
+        ];
+        let v3 = pack(-1.0, 1.0, &poses);
+        let v4 = pack_v4(-1.0, 1.0, &poses);
+        for i in 0..poses.len() {
+            assert_eq!(decode_pose(&v3, i), decode_pose(&v4, i), "pose {i}");
+            assert!(decode_pose(&v4, i).is_some(), "pose {i} decoded");
+        }
+        assert!(decode_pose(&v4, poses.len()).is_none(), "read past the end");
+    }
+
+    #[test]
+    fn a_truncated_v4_frame_is_none_rather_than_a_panic() {
+        // Same reason as the v3 truncation test: half-written packs happen.
+        // Every cut point must fail closed — the loader falls back to
+        // scene.bin on None, but garbage geometry has no fallback.
+        let blob = pack_v4(0.0, 1.0, &[vec![0.0, 1.0, 0.5], vec![0.5, 0.5, 0.5]]);
+        for cut in [4, 10, 20, blob.len() / 2, blob.len() - 3] {
+            assert!(decode_pose(&blob[..cut], 1).is_none(), "cut at {cut}");
+        }
     }
 
     #[test]

@@ -700,3 +700,46 @@ asked for. The two want the same thing and should be built once.
 Until then `chassis_traits` seeds from the harvester's own category, which is
 imperfect but is real evidence, and the vector can be corrected per chassis by
 hand where it is wrong.
+
+## v4: the same streams under one window (measured 2026-08)
+
+v3 left one redundancy on the table, and it is CROSS-POSE: each pose is
+zlib-compressed separately, and zlib's 32 KB window cannot see from one pose to
+the next. But poses of a strip are the same model slightly moved — on strips
+whose poses share a buffer layout, the delta-coded index stream repeats
+VERBATIM between poses (measured: 7 of a 14-strip sample have exactly one
+distinct index stream across all poses).
+
+Two candidates were measured against the fleet before either was built:
+
+| candidate | of v3 size | verdict |
+|---|---:|---|
+| temporal delta of quantised codes, per-pose zlib | 90-92%, sometimes >100% | rejected |
+| same raw streams, ONE zstd-19 frame per strip | **49%** | v4 |
+
+Explicit temporal modelling loses to the solid frame because pose layouts are
+not always aligned (the same per-pose range tables that v3 exists to carry),
+and a mispredicted delta is noise. zstd's strip-wide window finds the real
+matches without being told where they are — so the format stays dumb on
+purpose, and v4 changes ONLY the compression envelope. Same codes, same box,
+same index deltas: v3 <-> v4 is a lossless transcode, and the fold-safety
+argument (one box per chassis) transfers untouched.
+
+Fleet result: **296 packs, 226.2 MB -> 118.5 MB (52%)**, every pose of every
+pack byte-compared in `tools/pack_v4.py --verify`, cross-checked through the
+Rust decoder (13 strips decoded byte-identically via both versions), and
+`--revert` reproduces the original v3 files byte-for-byte (zlib level 9
+matches pack_bots.py exactly).
+
+The decode cost moved: v4 inflates the WHOLE strip per pose read, so
+`pose_buffer` keeps a one-entry cache of the last decompressed frame — the
+loader walks a chassis's poses consecutively, so one entry is the whole win
+(measured 2.6x) without pinning ~300 strips' frames in memory. Decoding is
+ruzstd (pure Rust, decode-only, no C toolchain in the cross builds), pinned to
+0.7: 0.8 moves StreamingDecoder into `ruzstd::decoding` and needs cargo
+resolver 3.
+
+Still unpacked in the same tree, in size order: 83 MB of text gltf+json
+(same sidecar trick would apply, but the seam is `gltf::Gltf::open` in
+model.rs — a loader change), and 20 MB of scene.bin on the non-bot models
+(fennec/octane/dominus/ball) that were never packed at all.
