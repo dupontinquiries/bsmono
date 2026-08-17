@@ -77,6 +77,7 @@ mod energon;
 mod finale;
 mod nightfall;
 mod orient;
+mod partdetect;
 mod orientsim;
 mod skirmish;
 mod raid;
