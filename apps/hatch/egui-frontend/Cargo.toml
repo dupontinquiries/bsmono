@@ -1,0 +1,39 @@
+[package]
+name = "hatch-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The egui shell over hatch-core: the fullscreen app grid the plasmoid draws in QML, mimicked on uikit-egui — same config (columns/icon size/opacity), same interaction contract (tap launches, background tap dismisses, search pill at the bottom, system row), no Qt. Icons decode in icons_img (png via `image`, svg via `resvg`, both isolated behind one function so a min-size musl build can drop svg)."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hatch-egui"
+path = "src/bin/hatch_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app", "svg"]
+app = ["dep:eframe"]
+# Breeze system icons are svg; app icons are mostly png. Dropping svg keeps
+# letter-tiles for the svg-only ones and shaves the resvg stack off a
+# size-constrained musl build.
+svg = ["dep:resvg"]
+
+[dependencies]
+hatch-core = { path = "../crates/hatch-core" }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+settings-kit = { path = "../../../shared/settings-kit" }
+egui = "0.34"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+# png decode only — the launcher never encodes and never meets jpeg icons in
+# practice; default features would drag every codec in.
+image = { version = "0.25", default-features = false, features = ["png"] }
+resvg = { version = "0.45", optional = true, default-features = false }
+
+# Headless probes. `required-features = []` is deliberate: these must build
+# without eframe so they stay seconds-fast to iterate on.
+[[example]]
+name = "probe"
+path = "examples/probe.rs"

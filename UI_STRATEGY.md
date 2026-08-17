@@ -26,6 +26,7 @@ on every surface yet. Nothing here deletes a working front-end.
 | rusty-board     | egui-frontend                     | —                           | gtk4                    |
 | logscope        | crates/logscope-egui              | —                           | crates/logscope (gtk)   |
 | snapclone       | egui-frontend                     | —                           | —                       |
+| hatch           | egui-frontend                     | qml (Plasma 6 plasmoid)     | —                       |
 | av1tuner(-m1)   | av1tuner_app                      | —                           | —                       |
 | settings-app    | SettingsEditor (`bsettings`)      | —                           | —                       |
 | dialer          | crates/dialer-egui (only UI)      | —                           | —                       |
