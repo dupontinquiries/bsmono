@@ -7,8 +7,24 @@
 // logic the loader depends on. The other two are satisfied here so that the
 // loader compiles and runs without a device, without a physics step, and
 // without touching the game's 180 KB `main.rs`.
+//
+// Two more real siblings since that comment was written: `model.rs` now
+// reads packed poses through `crate::botpack::pose_buffer` (the v3 pack
+// migration) and `xform.rs` now carries `crate::compact::Params`/
+// `displace` (the compaction feature). Neither needs stubbing — both are
+// self-contained (`botpack.rs` uses only `std::path`; `compact.rs` only
+// `glam::Vec3`, already a dependency) — so they're pulled in for real,
+// the same way `meshgen` is, rather than faked. Discovered because
+// `examples/stripcheck.rs` (added by the fleet-additions patch) failed
+// to compile against this shim at all until these two were added: the
+// shim's own doc comment had gone stale the same way the botpack test
+// fixtures had, and nobody had run a harness since either landed.
 #[path = "../src/meshgen.rs"]
 pub mod meshgen;
+#[path = "../src/botpack.rs"]
+pub mod botpack;
+#[path = "../src/compact.rs"]
+pub mod compact;
 #[path = "../src/model.rs"]
 pub mod model;
 
