@@ -712,7 +712,10 @@ fn build_battle() -> (Mesh, Vec3) {
     let pick = match std::env::args().nth(4).as_deref() {
         Some("tiger") => Ancestor::Tiger, Some("leopard") => Ancestor::Leopard,
         Some("panther") => Ancestor::Panther, Some("caracal") => Ancestor::Caracal,
-        Some("puma") => Ancestor::Puma, _ => Ancestor::Lion,
+        Some("puma") => Ancestor::Puma, Some("serval") | Some("yowler") => Ancestor::Serval,
+        Some("cavelion") | Some("oldroar") => Ancestor::CaveLion,
+        Some("smilodon") | Some("sabertooth") => Ancestor::Smilodon,
+        Some("suncat") | Some("suneye") => Ancestor::SunCat, _ => Ancestor::Lion,
     };
     let mut g = Battleground::new(pick);
     // play a couple of minutes so patrols are mid-trail, hunts and herb runs show
@@ -771,6 +774,13 @@ fn build_battle() -> (Mesh, Vec3) {
     m.set_op(0.3);
     m.cone(v3(g.contention.0, world::height_at(g.contention.0, g.contention.1) + 0.25, g.contention.1), 20.0, 0.2, 28, rgb(0xffd24a));
     m.set_op(1.0);
+    // scorched ground still burning
+    for z in &g.zones {
+        let gy = world::height_at(z.x, z.z);
+        m.set_op(0.45);
+        m.cone(v3(z.x, gy + 0.3, z.z), z.r, 0.25, 20, rgb(0xffa53c));
+        m.set_op(1.0);
+    }
     // herb patches
     for hp in &g.herb_patches {
         if !hp.ready() { continue; }

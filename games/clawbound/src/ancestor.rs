@@ -14,10 +14,19 @@
 //! and the same table drives the sim, the HUD, and any future draft screen.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ancestor { Lion, Tiger, Leopard, Panther, Caracal, Puma }
+pub enum Ancestor {
+    Lion, Tiger, Leopard, Panther, Caracal, Puma,
+    // the deep roster: the whole Felidae line, and further back than that —
+    Serval,     // Faryowl, the ranged caterwauler of the singing grasslands
+    CaveLion,   // Oldroar, the Ice Age hulk — the more it bleeds, the harder it smashes
+    Smilodon,   // Twofang, the saber-toothed executioner of the elder dawn
+    SunCat,     // Suneye, the desert sun-priest — the old sun-god fantasy, wild-born
+}
 
-pub const ALL: [Ancestor; 6] =
-    [Ancestor::Lion, Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther, Ancestor::Caracal, Ancestor::Puma];
+pub const ALL: [Ancestor; 10] = [
+    Ancestor::Lion, Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther, Ancestor::Caracal,
+    Ancestor::Puma, Ancestor::Serval, Ancestor::CaveLion, Ancestor::Smilodon, Ancestor::SunCat,
+];
 
 /// What an ability *does* when the sim fires it. One mechanic per kind keeps the
 /// sim generic over kits: a kit is numbers, the sim is verbs.
@@ -29,8 +38,11 @@ pub enum Verb {
     Shield,   // absorb `power × attack` damage for `dur` (self + close allies)
     Stealth,  // untargetable / unseen for `dur`
     Heal,     // restore `power × attack` hp to self + close allies
-    Fear,     // enemies within `range` turn and flee for `dur`
+    Fear,     // enemies within `range` turn and flee for `dur` (damages too if `power` > 0)
     Slow,     // enemies within `range` move at half pace for `dur`
+    Knockback,// smash enemies within `range` away from the caster (and hurt them)
+    Execute,  // a killing strike whose bite grows with the target's missing strength
+    Zone,     // scorch the ground for `dur`: enemies inside burn and the veil is seared away
 }
 
 #[derive(Clone, Copy)]
@@ -52,8 +64,12 @@ pub struct Kit {
     pub passive_name: &'static str,
     pub passive: &'static str,
     pub hp: f32,
-    pub attack: f32,                 // damage per second at the claw
+    pub attack: f32,                 // damage per second at the claw (or at the yowl)
     pub speed: f32,
+    pub reach: f32,                  // how far the basic attack carries — melee ≈ 2.8; the
+                                     // yowlers and sun-priests strike from many lengths away.
+                                     // Reach applies to warriors and prey only: no cat ever
+                                     // yowled down a tree — structures must be gnawed up close.
     pub abilities: [AbilitySpec; 2],
     pub ult: AbilitySpec,
 }
@@ -66,7 +82,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "A warrior alone is a whisker; a pride is a storm.",
             passive_name: "Pride's Warmth",
             passive: "allies fighting beside Goldenmane strike harder",
-            hp: 190.0, attack: 11.0, speed: 6.0,
+            hp: 190.0, attack: 11.0, speed: 6.0, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Sunstrike Pounce", desc: "leap the gap and rake on landing",
                     verb: Verb::Dash, power: 1.6, range: 9.0, dur: 0.0, cd: 8.0 },
@@ -82,7 +98,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "Strike once, from where they never looked.",
             passive_name: "Night's Hunger",
             passive: "unseen or from behind, the first blow bites far deeper",
-            hp: 170.0, attack: 13.0, speed: 6.2,
+            hp: 170.0, attack: 13.0, speed: 6.2, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Shadow Maul", desc: "a heavy double-paw blow",
                     verb: Verb::Strike, power: 2.4, range: 3.0, dur: 0.0, cd: 7.0 },
@@ -98,7 +114,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "The river never argues; it goes around, and wins.",
             passive_name: "Riverborn",
             passive: "water is home ground — swim fast, and wounds close in the shallows",
-            hp: 160.0, attack: 11.5, speed: 6.8,
+            hp: 160.0, attack: 11.5, speed: 6.8, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Spotted Blur", desc: "flicker through the enemy, claws trailing",
                     verb: Verb::Dash, power: 1.3, range: 11.0, dur: 0.0, cd: 6.0 },
@@ -114,7 +130,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "Never chase. Become where the prey chooses to run.",
             passive_name: "Silent Footfall",
             passive: "moving through shadow leaves no scent and quickens the step",
-            hp: 150.0, attack: 12.5, speed: 6.6,
+            hp: 150.0, attack: 12.5, speed: 6.6, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Pounce of Midnight", desc: "drop onto prey and pin it",
                     verb: Verb::Dash, power: 1.8, range: 10.0, dur: 0.0, cd: 9.0 },
@@ -130,7 +146,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "The sky itself can be hunted.",
             passive_name: "Skyward Hunger",
             passive: "every kill quickens the paws — speed stacks with the tally",
-            hp: 145.0, attack: 10.5, speed: 7.4,
+            hp: 145.0, attack: 10.5, speed: 7.4, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Sky Snap", desc: "a vertical snatch that plucks the quick out of the air",
                     verb: Verb::Strike, power: 2.0, range: 4.5, dur: 0.0, cd: 6.5 },
@@ -140,13 +156,85 @@ pub fn kit(a: Ancestor) -> Kit {
             ult: AbilitySpec { name: "Hundred Leaps", desc: "a blur of bounds — everything nearby is cuffed and left staggering",
                 verb: Verb::Slow, power: 1.8, range: 9.0, dur: 3.0, cd: 56.0 },
         },
+        // ── Faryowl — the far-yowler of the singing grasslands ─────────────────
+        // A serval: mostly ears, all voice. The first *ranged* ancestor — its yowl
+        // carries across the clearing and strikes like a cuffing paw.
+        Ancestor::Serval => Kit {
+            name: "Faryowl", legend: "the far-yowlers of the singing grasslands",
+            philosophy: "Why cross the clearing when your voice already has?",
+            passive_name: "The Far Song",
+            passive: "a yowl bites deepest from a distance — far strikes land harder",
+            hp: 130.0, attack: 11.0, speed: 6.4, reach: 11.0,
+            abilities: [
+                AbilitySpec { name: "Piercing Yowl", desc: "one note, aimed like a claw",
+                    verb: Verb::Strike, power: 1.9, range: 13.0, dur: 0.0, cd: 6.5 },
+                AbilitySpec { name: "Wall of Sound", desc: "a caterwaul that flings the close-pressed back",
+                    verb: Verb::Knockback, power: 1.0, range: 7.0, dur: 0.0, cd: 11.0 },
+            ],
+            ult: AbilitySpec { name: "The Great Caterwaul", desc: "the song the elders warn of — everything in earshot breaks and runs bleeding",
+                verb: Verb::Fear, power: 1.6, range: 13.0, dur: 1.8, cd: 58.0 },
+        },
+        // ── Oldroar — the cave-lion of the frozen long-ago ─────────────────────
+        // Panthera spelaea, half again the size of any lion living. The hulk of the
+        // roster: wound it and you have only made it angrier.
+        Ancestor::CaveLion => Kit {
+            name: "Oldroar", legend: "the cave-lions of the frozen long-ago",
+            philosophy: "The old world did not fall. It is only sleeping in me.",
+            passive_name: "Deep Wounds, Deep Fury",
+            passive: "every wound feeds the fury — the closer to falling, the harder the blows",
+            hp: 240.0, attack: 10.5, speed: 5.4, reach: 2.8,
+            abilities: [
+                AbilitySpec { name: "Boulder Paw", desc: "a paw like falling stone — the struck are hurled away",
+                    verb: Verb::Knockback, power: 1.5, range: 4.5, dur: 0.0, cd: 9.0 },
+                AbilitySpec { name: "Shatter Ground", desc: "stamp the earth until it cracks and grips",
+                    verb: Verb::Slow, power: 1.0, range: 7.0, dur: 3.0, cd: 12.0 },
+            ],
+            ult: AbilitySpec { name: "Earthshaker", desc: "the roar and the blow together, as the old world made them",
+                verb: Verb::Aoe, power: 3.4, range: 10.0, dur: 0.0, cd: 62.0 },
+        },
+        // ── Twofang — the saber-tooth of the elder dawn ────────────────────────
+        // Smilodon: the fangs that ended arguments a million years before the clans.
+        Ancestor::Smilodon => Kit {
+            name: "Twofang", legend: "the two-fangs of the elder dawn",
+            philosophy: "Claws begin the hunt. The fangs only ever end it.",
+            passive_name: "The Saber Finishes",
+            passive: "a wounded foe is a finished foe — strikes bite far deeper below half strength",
+            hp: 175.0, attack: 12.5, speed: 6.0, reach: 3.2,
+            abilities: [
+                AbilitySpec { name: "Saber Lunge", desc: "the whole weight behind both fangs",
+                    verb: Verb::Dash, power: 1.7, range: 9.0, dur: 0.0, cd: 8.5 },
+                AbilitySpec { name: "Hamstring", desc: "one rake low, and the running is over",
+                    verb: Verb::Slow, power: 0.8, range: 4.0, dur: 3.5, cd: 9.0 },
+            ],
+            ult: AbilitySpec { name: "The Killing Bite", desc: "the bite the elder dawn is remembered by",
+                verb: Verb::Execute, power: 2.2, range: 3.5, dur: 0.0, cd: 55.0 },
+        },
+        // ── Suneye — the sun-priest of the endless dunes ───────────────────────
+        // The desert wildcat whose line the elders say once *spoke with the sun*.
+        // This is the old sun-god fantasy kept wild: no temples, no two-legs —
+        // just a clan that watched the sun so long the sun began watching back.
+        Ancestor::SunCat => Kit {
+            name: "Suneye", legend: "the sun-priests of the endless dunes",
+            philosophy: "The night hides many things. The sun keeps none of them.",
+            passive_name: "The Sun's Favor",
+            passive: "under the open sun every strike burns brighter — the day belongs to Suneye",
+            hp: 125.0, attack: 10.8, speed: 6.2, reach: 12.0,
+            abilities: [
+                AbilitySpec { name: "Sunspear", desc: "a lance of noon light, thrown from the eye",
+                    verb: Verb::Strike, power: 1.8, range: 14.0, dur: 0.0, cd: 6.0 },
+                AbilitySpec { name: "Noon Blaze", desc: "scorch the ground — nothing hides on burning sand",
+                    verb: Verb::Zone, power: 0.9, range: 6.0, dur: 4.0, cd: 14.0 },
+            ],
+            ult: AbilitySpec { name: "The Eye of the Sun", desc: "the sun looks down in anger — a great burning gaze no veil survives",
+                verb: Verb::Zone, power: 1.6, range: 9.0, dur: 6.0, cd: 60.0 },
+        },
         // ── Stonewhisper — the grey ghost of the high crags ────────────────────
         Ancestor::Puma => Kit {
             name: "Stonewhisper", legend: "the grey ghosts of the high crags",
             philosophy: "The mountain does not hurry, and the mountain is never late.",
             passive_name: "Sure-Footed",
             passive: "slopes and scree cost nothing; blows barely shift those paws",
-            hp: 210.0, attack: 10.0, speed: 5.6,
+            hp: 210.0, attack: 10.0, speed: 5.6, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Crag Leap", desc: "a boulder-to-boulder leap ending in a landslide of a landing",
                     verb: Verb::Dash, power: 1.5, range: 8.0, dur: 0.0, cd: 9.0 },
@@ -168,7 +256,8 @@ impl Ancestor {
 /// threat, speed its map control. Roughly commensurate scales.
 pub fn budget(a: Ancestor) -> f32 {
     let k = kit(a);
-    k.hp / 30.0 + k.attack + k.speed * 1.5
+    // reach beyond the claw is safety, and safety is power — it costs budget
+    k.hp / 30.0 + k.attack + k.speed * 1.5 + (k.reach - 2.8) * 0.5
 }
 
 #[cfg(test)]
@@ -198,10 +287,14 @@ mod tests {
             let b = budget(a);
             assert!(b > 25.0 && b < 30.0, "{} off-budget: {b}", kit(a).name);
         }
-        // and the archetypes are real: the tank out-lives, the skirmisher outruns
-        assert!(ALL.iter().all(|&a| kit(Ancestor::Puma).hp >= kit(a).hp));
+        // and the archetypes are real: the hulk out-lives, the skirmisher outruns,
+        // the yowlers pay for their reach in thinner pelts
+        assert!(ALL.iter().all(|&a| kit(Ancestor::CaveLion).hp >= kit(a).hp));
         assert!(ALL.iter().all(|&a| kit(Ancestor::Caracal).speed >= kit(a).speed));
         assert!(ALL.iter().all(|&a| kit(Ancestor::Tiger).attack >= kit(a).attack));
+        let ranged: Vec<Ancestor> = ALL.iter().copied().filter(|&a| kit(a).reach > 4.0).collect();
+        assert_eq!(ranged.len(), 2, "two ranged kits: the yowler and the sun-priest");
+        for a in ranged { assert!(kit(a).hp < 150.0, "{} must pay for reach in hp", kit(a).name); }
     }
 
     #[test]
@@ -217,5 +310,10 @@ mod tests {
         assert!(verbs(Ancestor::Puma).contains(&Verb::Shield));
         // only the river kit heals others
         assert_eq!(ALL.iter().filter(|&&a| verbs(a).contains(&Verb::Heal)).count(), 1);
+        // the smashers knock back; only the elder dawn executes; only the sun scorches ground
+        assert!(verbs(Ancestor::Serval).contains(&Verb::Knockback));
+        assert!(verbs(Ancestor::CaveLion).contains(&Verb::Knockback));
+        assert_eq!(ALL.iter().filter(|&&a| verbs(a).contains(&Verb::Execute)).count(), 1);
+        assert!(ALL.iter().all(|&a| !verbs(a).contains(&Verb::Zone) || a == Ancestor::SunCat));
     }
 }

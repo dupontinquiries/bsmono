@@ -160,6 +160,7 @@ pub struct Warrior {
     pub x: f32, pub z: f32, pub heading: f32,
     pub hp: f32, pub max_hp: f32,
     pub attack: f32, pub speed: f32,
+    pub reach: f32,       // basic-attack reach vs warriors and prey (structures stay melee)
     pub mind: Mind,
     pub carry: Carry,
     pub shield: f32,      // absorbs damage first (Mane of Dawn / Stone Patience)
@@ -205,6 +206,10 @@ impl Prey {
     pub fn worth(&self) -> f32 { self.kind.worth() }
 }
 
+/// Scorched ground (Suneye's Noon Blaze / Eye of the Sun): enemies inside burn,
+/// and the light sears every veil away — the built-in answer to the night kits.
+pub struct Zone { pub x: f32, pub z: f32, pub team: u8, pub r: f32, pub dps: f32, pub t: f32 }
+
 pub struct HerbPatch { pub x: f32, pub z: f32, pub regrow_t: f32 }
 impl HerbPatch { pub fn ready(&self) -> bool { self.regrow_t <= 0.0 } }
 
@@ -219,6 +224,7 @@ pub struct Battleground {
     pub heal_trees: Vec<HealTree>,
     pub prey: Vec<Prey>,
     pub herb_patches: Vec<HerbPatch>,
+    pub zones: Vec<Zone>,
     pub clans: [ClanState; 2],
     pub camps: [(f32, f32); 2],
     pub medics: [(f32, f32); 2],
@@ -261,10 +267,27 @@ impl Battleground {
         if near_lion { m *= 1.15; }
         if matches!(w.ancestor, Some(Ancestor::Tiger) | Some(Ancestor::Panther))
             && (self.is_night() || w.stealth_t > 0.0) { m *= 1.3; }
+        // Suneye is Night's Hunger mirrored: the day belongs to the sun-priest
+        if w.ancestor == Some(Ancestor::SunCat) && !self.is_night() { m *= 1.3; }
+        // Oldroar's Deep Wounds, Deep Fury: the closer to falling, the harder the blows
+        if w.ancestor == Some(Ancestor::CaveLion) {
+            m *= 1.0 + 0.6 * (1.0 - w.hp / w.max_hp);
+        }
         // leaf-bare desperation: with prey thin and auras failing, patrols press the
         // attack — this is what finally fells trees instead of a full-time stalemate
         if w.role == Role::Patrol && self.leafbare() { m *= 1.5; }
         w.attack * m
+    }
+
+    /// Per-strike bonus that depends on the *target* — Twofang's finishing bite,
+    /// Faryowl's Far Song landing hardest from a distance.
+    fn strike_vs(&self, i: usize, target: usize) -> f32 {
+        let w = &self.warriors[i];
+        let t = &self.warriors[target];
+        let mut m = 1.0;
+        if w.ancestor == Some(Ancestor::Smilodon) && t.hp < t.max_hp * 0.5 { m *= 1.4; }
+        if w.ancestor == Some(Ancestor::Serval) && dist(w.x, w.z, t.x, t.z) > 4.0 { m *= 1.15; }
+        m
     }
 
     fn respawn_time(&self, team: u8) -> f32 {
@@ -275,16 +298,16 @@ impl Battleground {
     }
     fn enemy(team: u8) -> u8 { 1 - team }
 
-    /// Default rosters: the player leads clan A; the rest fill from the pool.
+    /// Default rosters: the player leads clan A; packmates and the enemy clan fill
+    /// deterministically from the pool in order, starting after the player's pick —
+    /// so which five ancestors you face varies with who you bring.
     pub fn new(player: Ancestor) -> Battleground {
         let pool = ancestor::ALL;
-        let mut a = [player; 3];
-        let mut i = 0usize;
-        for slot in 1..3 {
-            while pool[i] == player { i = (i + 1) % pool.len(); }
-            a[slot] = pool[i]; i += 1;
-        }
-        Battleground::new_draft(a, [pool[3], pool[4], pool[5]])
+        let start = pool.iter().position(|&p| p == player).unwrap_or(0);
+        let mut order = (1..pool.len()).map(|k| pool[(start + k) % pool.len()]);
+        let a = [player, order.next().unwrap(), order.next().unwrap()];
+        let b = [order.next().unwrap(), order.next().unwrap(), order.next().unwrap()];
+        Battleground::new_draft(a, b)
     }
 
     /// A drafted match: each clan fields exactly the three ancestors picked for it.
@@ -340,7 +363,7 @@ impl Battleground {
                 warriors.push(Warrior {
                     team, role: Role::Ancestor, ancestor: Some(a), lane: slot % LANES,
                     x: cx + slot as f32 * 2.0 - 2.0, z: cz, heading: 0.0,
-                    hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed,
+                    hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
                     shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
                     cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border,
@@ -350,7 +373,7 @@ impl Battleground {
         }
 
         Battleground {
-            warriors, heal_trees, prey, herb_patches,
+            warriors, heal_trees, prey, herb_patches, zones: Vec::new(),
             clans: [
                 ClanState { pile: 0.0, herbs: 0, great_tree_hp: GREAT_TREE_HP },
                 ClanState { pile: 0.0, herbs: 0, great_tree_hp: GREAT_TREE_HP },
@@ -373,7 +396,7 @@ impl Battleground {
             self.warriors.push(Warrior {
                 team, role: Role::Patrol, ancestor: None, lane,
                 x: cx + i as f32 * 1.5, z: cz + 1.5, heading: 0.0,
-                hp: PATROL_HP, max_hp: PATROL_HP, attack: PATROL_ATK, speed: PATROL_SPEED,
+                hp: PATROL_HP, max_hp: PATROL_HP, attack: PATROL_ATK, speed: PATROL_SPEED, reach: REACH,
                 mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
                 carry: Carry::Nothing,
                 shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
@@ -455,7 +478,7 @@ impl Battleground {
         match spec.verb {
             Verb::Strike => {
                 let Some(t) = target else { return };
-                self.hurt(t, spec.power * atk);
+                self.hurt(t, spec.power * atk * self.strike_vs(i, t));
                 self.warriors[i].kills += (!self.warriors[t].alive()) as u32;
             }
             Verb::Dash => {
@@ -464,9 +487,10 @@ impl Battleground {
                 let d = dist(x, z, tx, tz);
                 let (nx, nz) = norm(tx - x, tz - z);
                 let step = spec.range.min(d - REACH * 0.5).max(0.0);
+                let bonus = self.strike_vs(i, t);
                 let w = &mut self.warriors[i];
                 w.x += nx * step; w.z += nz * step;
-                self.hurt(t, spec.power * atk);
+                self.hurt(t, spec.power * atk * bonus);
             }
             Verb::Aoe => {
                 let victims: Vec<usize> = self.warriors.iter().enumerate()
@@ -502,8 +526,36 @@ impl Battleground {
                     let e = &self.warriors[j];
                     if e.team != team && e.alive() && dist(x, z, e.x, e.z) < spec.range {
                         self.warriors[j].fear_t = spec.dur;
+                        if spec.power > 0.0 { self.hurt(j, spec.power * atk); }   // the Great Caterwaul draws blood
                     }
                 }
+            }
+            Verb::Knockback => {
+                // smash everything close away from the caster — peel divers off a
+                // tree, fling a brawl apart, buy a wounded packmate its retreat
+                let victims: Vec<usize> = self.warriors.iter().enumerate()
+                    .filter(|(_, e)| e.team != team && e.alive() && dist(x, z, e.x, e.z) < spec.range)
+                    .map(|(j, _)| j).collect();
+                if victims.is_empty() { return; }
+                for v in victims {
+                    let (vx, vz) = (self.warriors[v].x, self.warriors[v].z);
+                    let (mut nx, mut nz) = norm(vx - x, vz - z);
+                    if nx == 0.0 && nz == 0.0 { nx = 1.0; nz = 0.0; }
+                    let w = &mut self.warriors[v];
+                    w.x = (w.x + nx * 5.0).clamp(-ARENA, ARENA);
+                    w.z = (w.z + nz * 5.0).clamp(-ARENA, ARENA);
+                    self.hurt(v, spec.power * atk);
+                }
+            }
+            Verb::Execute => {
+                // the killing bite: its power grows with the target's missing strength
+                let Some(t) = target else { return };
+                let missing = 1.0 - self.warriors[t].hp / self.warriors[t].max_hp;
+                self.hurt(t, spec.power * atk * (1.0 + missing * 1.2) * self.strike_vs(i, t));
+                self.warriors[i].kills += (!self.warriors[t].alive()) as u32;
+            }
+            Verb::Zone => {
+                self.zones.push(Zone { x, z, team, r: spec.range, dps: spec.power * atk / spec.dur.max(0.5), t: spec.dur });
             }
             Verb::Slow => {
                 for j in 0..self.warriors.len() {
@@ -570,9 +622,9 @@ impl Battleground {
             self.warriors[i].mind = Mind::LastStand;
             if let Some(t) = self.nearest_enemy(i, LAST_STAND_R * 2.0) {
                 let (tx, tz) = (self.warriors[t].x, self.warriors[t].z);
-                if dist(x, z, tx, tz) > REACH { self.walk_toward(i, tx, tz, dt); }
+                if dist(x, z, tx, tz) > self.warriors[i].reach { self.walk_toward(i, tx, tz, dt); }
                 else {
-                    let dmg = self.strike_of(i) * dt;
+                    let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
                     self.hurt(t, dmg);
                 }
                 if role == Role::Ancestor { self.auto_cast(i); }
@@ -655,7 +707,7 @@ impl Battleground {
                 match target {
                     Some(p) => {
                         let (px, pz) = (self.prey[p].x, self.prey[p].z);
-                        if dist(x, z, px, pz) > REACH { self.walk_toward(i, px, pz, dt); }
+                        if dist(x, z, px, pz) > self.warriors[i].reach { self.walk_toward(i, px, pz, dt); }
                         else {
                             self.prey[p].hp -= self.warriors[i].attack * dt;
                             if self.prey[p].hp <= 0.0 {
@@ -678,12 +730,19 @@ impl Battleground {
                 if let Some(t) = self.nearest_enemy(i, ENGAGE_R) {
                     self.warriors[i].mind = Mind::Fight;
                     let (tx, tz) = (self.warriors[t].x, self.warriors[t].z);
-                    if dist(x, z, tx, tz) > REACH { self.walk_toward(i, tx, tz, dt); }
+                    let reach = self.warriors[i].reach;
+                    let d = dist(x, z, tx, tz);
+                    if d > reach { self.walk_toward(i, tx, tz, dt); }
                     else {
-                        let dmg = self.strike_of(i) * dt;
+                        let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
                         let was_alive = self.warriors[t].alive();
                         self.hurt(t, dmg);
                         if was_alive && !self.warriors[t].alive() { self.warriors[i].kills += 1; }
+                        // a ranged cat keeps its distance: yowl, and give ground
+                        if reach > 4.0 && d < reach * 0.45 {
+                            let (nx, nz) = norm(x - tx, z - tz);
+                            self.walk_toward(i, x + nx * 6.0, z + nz * 6.0, dt);
+                        }
                     }
                     if role == Role::Ancestor { self.auto_cast(i); }
                     return;
@@ -828,7 +887,7 @@ impl Battleground {
                 }
                 if let Some(slot) = ability { self.cast(0, slot.min(2)); }
                 if claw {
-                    if let Some(t) = self.nearest_enemy(0, REACH) {
+                    if let Some(t) = self.nearest_enemy(0, self.warriors[0].reach) {
                         let dmg = self.strike_of(0) * dt;
                         self.hurt(t, dmg);
                     }
@@ -841,6 +900,22 @@ impl Battleground {
             if !self.warriors[i].alive() || (self.warriors[i].is_player && self.player_driven) { continue; }
             self.think(i, dt);
         }
+
+        // scorched ground burns intruders and sears every veil away
+        for zi in 0..self.zones.len() {
+            let (zx, zz, zteam, zr, zdps) = {
+                let z = &self.zones[zi]; (z.x, z.z, z.team, z.r, z.dps)
+            };
+            let victims: Vec<usize> = self.warriors.iter().enumerate()
+                .filter(|(_, w)| w.team != zteam && w.alive() && dist(w.x, w.z, zx, zz) < zr)
+                .map(|(j, _)| j).collect();
+            for v in victims {
+                self.warriors[v].stealth_t = 0.0;   // nothing hides on burning sand
+                self.hurt(v, zdps * dt);
+            }
+        }
+        for z in self.zones.iter_mut() { z.t -= dt; }
+        self.zones.retain(|z| z.t > 0.0);
 
         // Heal Tree auras mend every ally sheltering under them (thinner in leaf-bare);
         // the Riverborn mends wherever there is water
@@ -893,6 +968,7 @@ impl Battleground {
             mix(w.team as u32 ^ ((w.mind == Mind::Dead) as u32) << 8);
         }
         for t in &self.heal_trees { mix(t.hp.to_bits()); }
+        for z in &self.zones { mix(z.x.to_bits()); mix(z.t.to_bits()); }
         for c in &self.clans { mix(c.pile.to_bits()); mix(c.herbs); mix(c.great_tree_hp.to_bits()); }
         h
     }
@@ -955,7 +1031,7 @@ mod tests {
         bg.warriors.push(Warrior {
             team: CLAN_B, role: Role::Patrol, ancestor: None, lane: 1,
             x: cx + 8.0, z: cz, heading: 0.0,
-            hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0,
+            hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0, reach: REACH,
             mind: Mind::Trail, carry: Carry::Nothing,
             shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
             cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border, is_player: false, seg: 0,
@@ -1220,6 +1296,141 @@ mod tests {
         assert_eq!(picks(CLAN_A), a.to_vec());
         assert_eq!(picks(CLAN_B), b.to_vec());
         assert!(bg.warriors[0].is_player);
+    }
+
+    #[test]
+    fn a_yowler_strikes_from_across_the_clearing() {
+        use crate::ancestor::kit;
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Serval, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther]);
+        bg.patrol_t = [1e9; 2];
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let d = kit(Ancestor::Serval).reach - 1.0;   // in yowl range, far past claw range
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = x + d; bg.warriors[e].z = z;
+        bg.warriors[e].mind = Mind::AtMedic;   // hold still
+        let hp0 = bg.warriors[e].hp;
+        bg.step(1.0 / 30.0);
+        assert!(bg.warriors[e].hp < hp0, "the yowl should land without closing");
+        assert!(dist(bg.warriors[0].x, bg.warriors[0].z, x, z) < 0.5,
+            "a ranged cat in range should not have charged in");
+        // and the Far Song bites harder from a distance than muzzle-to-muzzle
+        assert!(bg.strike_vs(0, e) > 1.0);
+        bg.warriors[e].x = x + 1.0;
+        assert!((bg.strike_vs(0, e) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_cat_ever_yowled_down_a_tree() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Serval, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther]);
+        quiet(&mut bg);
+        // park the yowler in yowl range of an enemy Heal Tree — but beyond the claw
+        bg.warriors.retain(|w| w.role == Role::Ancestor);
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let (tx, tz) = (bg.heal_trees[t].x, bg.heal_trees[t].z);
+        let lane = bg.heal_trees[t].lane;
+        bg.warriors[0].x = tx + 8.0; bg.warriors[0].z = tz;
+        bg.warriors[0].lane = lane;
+        let hp0 = bg.heal_trees[t].hp;
+        for _ in 0..15 {
+            bg.warriors[0].x = tx + 8.0; bg.warriors[0].z = tz;   // hold it at range
+            bg.warriors[0].mind = Mind::Trail;
+            bg.step(1.0 / 30.0);
+        }
+        assert_eq!(bg.heal_trees[t].hp, hp0, "structures must be gnawed up close, never yowled");
+    }
+
+    #[test]
+    fn boulder_paw_flings_the_close_pressed_away() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::CaveLion, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther]);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].is_player = false;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = x + 1.5; bg.warriors[e].z = z;
+        let d0 = dist(bg.warriors[e].x, bg.warriors[e].z, x, z);
+        let hp0 = bg.warriors[e].hp;
+        bg.cast(0, 0);   // Boulder Paw
+        let d1 = dist(bg.warriors[e].x, bg.warriors[e].z, x, z);
+        assert!(d1 > d0 + 3.0, "the struck are hurled away: {d0} -> {d1}");
+        assert!(bg.warriors[e].hp < hp0);
+    }
+
+    #[test]
+    fn deep_wounds_deep_fury_and_the_saber_finishing() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::CaveLion, Ancestor::Smilodon, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther]);
+        quiet(&mut bg);
+        // Oldroar hits harder the closer it is to falling
+        let whole = bg.strike_of(0);
+        bg.warriors[0].hp = bg.warriors[0].max_hp * 0.2;
+        let bleeding = bg.strike_of(0);
+        assert!(bleeding > whole * 1.3, "fury should rise with the wounds: {whole} vs {bleeding}");
+        // Twofang bites deeper below half strength — and the Killing Bite deeper still
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Smilodon, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther]);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].is_player = false;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = x + 2.0; bg.warriors[e].z = z;
+        assert!((bg.strike_vs(0, e) - 1.0).abs() < 1e-6, "no bonus against the hale");
+        bg.warriors[e].hp = bg.warriors[e].max_hp * 0.3;
+        assert!(bg.strike_vs(0, e) > 1.3, "the saber finishes the wounded");
+        let hp_hurt = bg.warriors[e].hp;
+        bg.warriors[e].shield = 0.0;
+        bg.cast(0, 2);   // The Killing Bite
+        let bite_wounded = hp_hurt - bg.warriors[e].hp.max(0.0);
+        assert!(bite_wounded > 0.0);
+        // against a hale target the same bite is much smaller
+        bg.warriors[e].hp = bg.warriors[e].max_hp;
+        bg.warriors[0].cds[2] = 0.0;
+        bg.cast(0, 2);
+        let bite_hale = bg.warriors[e].max_hp - bg.warriors[e].hp;
+        assert!(bite_wounded > bite_hale * 1.5,
+            "the execute must scale with missing strength: hale {bite_hale} vs wounded {bite_wounded}");
+    }
+
+    #[test]
+    fn nothing_hides_on_burning_sand() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::SunCat, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Panther, Ancestor::Tiger, Ancestor::Leopard]);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].is_player = false;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = x + 2.0; bg.warriors[e].z = z;
+        bg.warriors[e].stealth_t = 10.0;   // Nightpelt under the veil
+        bg.warriors[e].mind = Mind::AtMedic;
+        bg.cast(0, 1);   // Noon Blaze
+        assert!(!bg.zones.is_empty(), "the ground should be scorched");
+        let hp0 = bg.warriors[e].hp;
+        bg.step(1.0 / 30.0);
+        assert_eq!(bg.warriors[e].stealth_t, 0.0, "the veil must not survive the light");
+        assert!(bg.warriors[e].hp < hp0, "burning sand burns");
+        // the scorch expires
+        for _ in 0..30 * 10 { bg.step(1.0 / 30.0); }
+        assert!(bg.zones.is_empty(), "scorched ground cools");
+    }
+
+    #[test]
+    fn the_sun_and_the_night_mirror_each_other() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::SunCat, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther]);
+        quiet(&mut bg);
+        let day = bg.strike_of(0);
+        bg.time = DAY_LEN + 1.0;   // night falls
+        let night = bg.strike_of(0);
+        assert!(day > night * 1.2, "the day belongs to Suneye: {night} vs {day}");
     }
 
     #[test]

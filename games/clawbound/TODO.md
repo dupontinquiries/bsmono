@@ -71,6 +71,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   camps/Great Trees (canopy scales with hp), Heal Trees + aura rings, prey camps, herb
   patches, warriors with crests/collars/carries. Verified headless via llvmpipe GL → PNG.
 - [x] `new_draft(picks_a, picks_b)` — engine-side draft API for a future pick screen
+- [x] The deep roster (6 → 10): **Faryowl** the serval — the first *ranged* ancestor, yowl-bolts
+  at 11 reach with kiting AI and the Far Song distance bonus; **Oldroar** the cave lion
+  (Panthera spelaea) — the hulk, Deep Wounds Deep Fury scaling damage with missing hp,
+  Boulder Paw knockback, Earthshaker; **Twofang** the Smilodon — The Saber Finishes vs
+  wounded targets and a Killing Bite execute scaling with missing strength; **Suneye** the
+  desert sun-priest — The Sun's Favor (the day-side mirror of Night's Hunger), Sunspear at
+  12 reach, and scorched-ground Zones whose light sears stealth (the built-in counter to
+  the veil kits). Egypt/Ra fantasy kept wild-born: sun-priests, no temples, no two-legs.
+- [x] Three new verbs in the sim: Knockback (fling + hurt), Execute (missing-hp scaling),
+  Zone (persistent burn that strips stealth; rendered as glowing ground in `battle`).
+  Rule kept deliberately: *no cat ever yowled down a tree* — attack reach applies to
+  warriors and prey only, structures must be gnawed at the claw (tested by that name).
+- [x] Default rosters now rotate through the 10-pool from the player's pick, so every
+  choice faces a different five. Report: 10/10 headless matches end by felling
+  (491–658s, no timeouts), outcomes 5–5.
 - [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
   camera follow; needs the `app` feature stack (winit/wgpu) compiled
 - [ ] Player-pick draft UI in menu.rs (menu logic is already unit-tested — extend the same way)
