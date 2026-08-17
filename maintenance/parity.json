@@ -56,13 +56,13 @@
  },
  {
   "app": "rusty-board",
-  "surfaces": 8,
+  "surfaces": 6,
   "covered": 5,
-  "pct": 62,
+  "pct": 83,
   "wired": 5,
-  "wired_pct": 62,
+  "wired_pct": 83,
   "live": 5,
-  "live_pct": 62,
+  "live_pct": 83,
   "stranded": [],
   "bin": true,
   "app_default": true,
@@ -70,30 +70,25 @@
   "primary": true,
   "role": "app",
   "missing": [
-   "KeyboardBehaviorsTests",
-   "MicrotermView",
-   "RustyBoardTestHarness"
+   "MicrotermView"
   ]
  },
  {
   "app": "snapclone",
-  "surfaces": 51,
+  "surfaces": 49,
   "covered": 49,
-  "pct": 96,
+  "pct": 100,
   "wired": 25,
-  "wired_pct": 49,
+  "wired_pct": 51,
   "live": 49,
-  "live_pct": 96,
+  "live_pct": 100,
   "stranded": [],
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": [
-   "ComponentTestWindow",
-   "ModalLayerTestPanel"
-  ]
+  "missing": []
  },
  {
   "app": "voiceterm",

@@ -81,6 +81,13 @@ def surfaces(app_dir):
             rel = p.replace(os.sep, '/')
             if any(seg in rel for seg in ('/tests/', '/fixtures/', '/golden/')):
                 continue
+            # A test HARNESS tree is the same thing under a different name.
+            # rusty-board keeps one at test_harness_qml/, and its
+            # RustyBoardTestHarness.qml was sitting at the top of that app's
+            # "next surfaces" list — telling us to port the scaffolding that
+            # exists to exercise the port.
+            if '/test_harness' in rel or '/test-harness' in rel:
+                continue
             # QML only — .html files under a docs or test tree are fixtures,
             # not UI surfaces, and voiceterm's showed up as "missing surfaces"
             # which is nonsense.
@@ -139,6 +146,15 @@ def surfaces(app_dir):
         for sub in inherits.get(base, ()):
             found.add(sub)
             frontier.append(sub)
+    # Test scaffolding is not a surface to port, wherever it lives. snapclone's
+    # ComponentTestWindow and ModalLayerTestPanel are exercisers for the Qt
+    # build — they inherit QWidget, so the inheritance pass above legitimately
+    # finds them, and they then occupy the top of the "next surfaces" list
+    # ahead of real work. Matched on the name because that is what the
+    # convention actually is here; a directory rule cannot catch a test window
+    # that lives beside the widgets it tests.
+    found = {n for n in found
+             if 'Test' not in n and 'Harness' not in n and not n.endswith('Tests')}
     return found
 
 def port_dirs(app_dir):
