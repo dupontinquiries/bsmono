@@ -25,6 +25,8 @@ pub mod roster;
 pub mod runview;
 /// A/B slots: flash a kernel to the spare half and keep a way back.
 pub mod slots;
+/// Preflight: does this device reach a udev rule that grants access?
+pub mod udevcheck;
 pub mod flow;
 pub mod identity;
 pub mod importer;

@@ -1,0 +1,37 @@
+ACTION!="add", ACTION!="bind", GOTO="android_usb_rules_end"
+SUBSYSTEM!="usb", GOTO="android_usb_rules_end"
+ATTR{bDeviceClass}=="09", GOTO="android_usb_rules_end"
+
+# Fairphone 2 (f000=mtp,mass f003=mtp ...)
+ATTR{idVendor}!="2ae5", GOTO="not_Fairphone2"
+ATTR{idProduct}=="9015", GOTO="adb"
+ATTR{idProduct}=="9024", GOTO="adbrndis"
+ATTR{idProduct}=="9039", GOTO="adbmtp"
+ATTR{idProduct}=="904e", GOTO="adbptp"
+ATTR{idProduct}=="90bb", GOTO="adbmidi"
+ATTR{idProduct}=="90dc", GOTO="adb"
+GOTO="android_usb_rules_end"
+LABEL="not_Fairphone2"
+
+# Google
+ATTR{idVendor}!="18d1", GOTO="not_Google"
+ATTR{idProduct}=="4ee0", GOTO="adbfast"
+ATTR{idProduct}=="4ee7", GOTO="adb"
+GOTO="android_usb_rules_end"
+LABEL="not_Google"
+
+# HTC
+ATTR{idVendor}!="0bb4", GOTO="not_HTC"
+ATTR{idProduct}=="0c01", GOTO="mass"
+ENV{adb_user}="yes"
+GOTO="android_usb_rule_match"
+LABEL="not_HTC"
+
+GOTO="android_usb_rules_end"
+LABEL="adb", ENV{adb_adb}="yes", GOTO="android_usb_rule_match"
+LABEL="adbfast", ENV{adb_adbfast}="yes", GOTO="android_usb_rule_match"
+LABEL="adbrndis", ENV{adb_adb}="yes"
+LABEL="rndis", ENV{adb_user}="yes", GOTO="android_usb_rule_match"
+LABEL="android_usb_rule_match"
+ENV{adb_user}=="yes", MODE="0660", GROUP="adbusers", TAG+="uaccess", SYMLINK+="android"
+LABEL="android_usb_rules_end"
