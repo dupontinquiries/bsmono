@@ -136,9 +136,39 @@ def surfaces(app_dir):
                 except Exception: continue
                 # a UI surface, not every struct in the codebase: something
                 # that draws or holds view state
-                for m in re.finditer(r'pub struct\s+(\w+(?:View|Page|Panel|Widget|Dialog|Screen|Tab|Bar|Overlay|App))\b', txt):
+                # `App` is deliberately NOT in this list. It names the
+                # top-level application root — ambient-learner's iced
+                # `AmbientLearnerApp` — which every toolkit has one of and no
+                # port can share: the egui version has its own root by
+                # definition. Asking for it produced a permanent 94% on an app
+                # whose surfaces were all ported.
+                for m in re.finditer(r'pub struct\s+(\w+(?:View|Page|Panel|Widget|Dialog|Screen|Tab|Bar|Overlay))\b', txt):
                     found.add(m.group(1))
-                if re.search(r'fn\s+\w*(?:ui|draw|render|show)\s*\(', txt):
+                # The filename rule, but only when the function actually takes
+                # a UI CONTEXT. Matching the name alone made two false
+                # surfaces that sat on the "next surfaces" list for weeks:
+                #
+                #   bo-suite's lyrics_transcriber.rs has
+                #     pub fn render(phrases, template, title, artist) -> String
+                #   which renders TEXT from a whisper transcription and has no
+                #   Qt or egui in it at all — the audit asked for a
+                #   "LyricsTranscriber" surface that never existed.
+                #
+                # A drawing function takes something to draw into. Requiring
+                # that in the signature separates a view from any code that
+                # happens to use the word render.
+                # The context types of EVERY toolkit in this tree, not just
+                # the one I had in mind. Requiring egui/iced types alone took
+                # bot-arena and fao-codec to ZERO surfaces — both are
+                # GTK/libadwaita and draw with `cr: &cairo::Context` or build
+                # with `app: &adw::Application`. The comment six lines up says
+                # a detector that silently sees nothing is worse than one that
+                # over-counts, and I had just made that exact mistake while
+                # fixing an over-count.
+                if re.search(r'fn\s+\w*(?:ui|draw|render|show|build_ui)\s*(?:<[^>]*>)?\s*\('
+                             r'[^)]*(?:&mut\s+(?:egui::)?Ui|&mut\s+Frame|Renderer|'
+                             r'Painter|&mut\s+Canvas|cairo::Context|'
+                             r'adw::Application|gtk::|&Context)', txt):
                     found.add(''.join(w.capitalize() for w in f[:-3].split('_')))
 
     # Everything reachable from a Qt widget base is a surface. Transitive, so
