@@ -154,8 +154,18 @@ impl Default for Body {
 impl Body {
     pub fn hp_of(&self, s: Section) -> f32 { self.hp[Self::idx(s)] }
     pub fn is_gone(&self, s: Section) -> bool { self.gone[Self::idx(s)] }
+    /// A vital section (head, torso) can never actually be marked "gone" —
+    /// `apply` only severs `!s.vital()` parts — so checking `is_gone` alone
+    /// meant this returned `true` unconditionally: a torso at 0 hp is
+    /// destroyed but still attached, not severed, and `is_gone` never sees
+    /// it. `hp_of(*s) > 0.0` is the actual "still standing" check;
+    /// `!is_gone` stays as a defensive second condition in case a future
+    /// change ever does let a vital section come off. `all` rather than
+    /// `any`: the module doc says "a bot with no torso is scrap," not "a
+    /// bot with no torso AND no head" — losing either vital section alone
+    /// is what "vital" is supposed to mean.
     pub fn alive(&self) -> bool {
-        Section::ALL.iter().filter(|s| s.vital()).any(|s| !self.is_gone(*s))
+        Section::ALL.iter().filter(|s| s.vital()).all(|s| !self.is_gone(*s) && self.hp_of(*s) > 0.0)
     }
 
     /// Leg asymmetry, as a signed fraction. Negative means the LEFT leg is the
