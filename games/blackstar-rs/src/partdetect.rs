@@ -236,6 +236,67 @@ pub fn classify(
     Kind::Body
 }
 
+/// One prim, as `forward_sign_hint` needs it: its geometry and what
+/// `classify` already thinks it is (computed once by the caller,
+/// which typically already ran `classify` for other reasons — this
+/// does not recompute it).
+pub struct KindedPrim<'a> {
+    pub verts: &'a [Vertex],
+    pub kind: Kind,
+}
+
+/// `orient.rs`'s own doc names the gap this fills: forward's AXIS is
+/// resolved by mirror symmetry, but its SIGN — which end is the front
+/// — "is not resolved by this heuristic and is left for the confidence
+/// flag... rather than silently guess." This is the first real attempt
+/// at that sign, not a replacement for the confidence flag: a
+/// cockpit or head sitting elevated and biased toward one end is a
+/// real, common design convention (visibility for a cockpit, a
+/// sensor/eye line for a head) in both vehicle and humanoid forms —
+/// common, not universal. Some real designs put the cabin aft.
+///
+/// Picks the most head/cockpit-LIKE candidate among `Kind::Body`
+/// prims — the one sitting highest (by `ground_fraction`) among those
+/// also reasonably centred (not a side-mounted lump) — and reports
+/// which side of the body's own centre, along `forward`, it sits on.
+/// `Some(1.0)`: keep `forward`'s current sign, the candidate is on the
+/// positive side. `Some(-1.0)`: flip it. `None`: no candidate stood
+/// out enough to have an opinion, which callers should treat the same
+/// as `orient::Guess::forward_confident == false` — a reason to fall
+/// back to the confidence flag, not a silent default.
+pub fn forward_sign_hint(prims: &[KindedPrim], up: Vec3, forward: Vec3, body_lo: f32, body_hi: f32) -> Option<f32> {
+    let mut best: Option<(f32, Vec3)> = None; // (elevation, centroid)
+    for p in prims {
+        if p.kind != Kind::Body || p.verts.is_empty() {
+            continue;
+        }
+        let ground = ground_fraction(p.verts, up, body_lo, body_hi);
+        // "elevated" only -- a torso is Kind::Body too and usually sits
+        // in the middle of the height range, not a useful head/cockpit
+        // candidate; requiring the TOP quarter keeps this from picking
+        // whichever blob happens to be biggest instead of highest.
+        const HEAD_LIKE_MIN: f32 = 0.72;
+        if ground < HEAD_LIKE_MIN {
+            continue;
+        }
+        let mut centroid = Vec3::ZERO;
+        for v in p.verts {
+            centroid += Vec3::from_array(v.pos);
+        }
+        centroid /= p.verts.len() as f32;
+        let take = match best {
+            None => true,
+            Some((be, _)) => ground > be,
+        };
+        if take {
+            best = Some((ground, centroid));
+        }
+    }
+    let (_, centroid) = best?;
+    let along = centroid.dot(forward);
+    Some(if along >= 0.0 { 1.0 } else { -1.0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +439,65 @@ mod tests {
         // A body: the blob, wherever it sits.
         let body_kind = classify(&blob(), Vec3::Y, -2.0, 2.0, Vec3::ZERO, 1.0);
         assert_eq!(body_kind, Kind::Body, "an unelongated blob should read as a body/hub part");
+    }
+
+    #[test]
+    fn forward_sign_hint_follows_the_elevated_head_like_blob() {
+        // A body spanning y -2..2. A torso-ish blob near the middle
+        // height, and a small "head" blob near the top, offset toward
+        // +Z. Both are Kind::Body (blob() shape, unelongated).
+        let torso: Vec<Vertex> = blob(); // centred at origin, y -0.3..0.3 -- NOT top-quarter
+        let mut head = Vec::new();
+        for x in [-0.1, 0.1] {
+            for y in [1.7, 1.9] { // well within the top quarter of -2..2
+                for z in [2.7, 2.9] { // offset toward +Z
+                    head.push(vtx(x, y, z));
+                }
+            }
+        }
+        let prims = vec![
+            KindedPrim { verts: &torso, kind: Kind::Body },
+            KindedPrim { verts: &head, kind: Kind::Body },
+        ];
+        let hint = forward_sign_hint(&prims, Vec3::Y, Vec3::Z, -2.0, 2.0);
+        assert_eq!(hint, Some(1.0), "the head sits on the +Z side, so +Z should be confirmed as forward");
+
+        // Same body, head offset toward -Z instead -- the hint should flip.
+        let mut head_back = Vec::new();
+        for x in [-0.1, 0.1] {
+            for y in [1.7, 1.9] {
+                for z in [-2.9, -2.7] {
+                    head_back.push(vtx(x, y, z));
+                }
+            }
+        }
+        let prims2 = vec![
+            KindedPrim { verts: &torso, kind: Kind::Body },
+            KindedPrim { verts: &head_back, kind: Kind::Body },
+        ];
+        let hint2 = forward_sign_hint(&prims2, Vec3::Y, Vec3::Z, -2.0, 2.0);
+        assert_eq!(hint2, Some(-1.0), "the head sits on the -Z side, so the +Z guess should be flipped");
+    }
+
+    #[test]
+    fn forward_sign_hint_ignores_non_body_and_non_elevated_candidates() {
+        // A leg (elongated, near the ground) offset toward +Z should
+        // NOT be picked as a head candidate even though it is the only
+        // other prim -- kind and elevation both gate this, not just
+        // "the other thing in the body."
+        let torso = blob();
+        let mut leg_verts = Vec::new();
+        for i in 0..16 {
+            let a = i as f32 / 16.0 * std::f32::consts::TAU;
+            let (s, c) = a.sin_cos();
+            leg_verts.push(vtx(c * 0.1, -1.9, s * 0.1 + 2.0));
+            leg_verts.push(vtx(c * 0.1, -1.0, s * 0.1 + 2.0));
+        }
+        let prims = vec![
+            KindedPrim { verts: &torso, kind: Kind::Body },
+            KindedPrim { verts: &leg_verts, kind: Kind::Leg },
+        ];
+        let hint = forward_sign_hint(&prims, Vec3::Y, Vec3::Z, -2.0, 2.0);
+        assert_eq!(hint, None, "a low leg should not be mistaken for a head, even offset toward +Z");
     }
 }
