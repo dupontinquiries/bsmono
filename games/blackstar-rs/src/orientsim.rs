@@ -123,9 +123,9 @@ fn check(bot: &str) {
         match guess_for(p) {
             Some((g, _)) => println!(
                 "  {name:4} up={} (conf={}) fwd={} (conf={})",
-                axis_name(g.up),
+                orient::axis_name(g.up),
                 g.up_confident,
-                axis_name(g.forward),
+                orient::axis_name(g.forward),
                 g.forward_confident
             ),
             None => println!("  {name:4} (could not load)"),
@@ -141,8 +141,8 @@ fn show(bot: &str, pose: &str) {
     };
     println!(
         "{bot}/{pose} -- guess: up={} fwd={} confident={}",
-        axis_name(g.up),
-        axis_name(g.forward),
+        orient::axis_name(g.up),
+        orient::axis_name(g.forward),
         g.confident()
     );
     print!("{}", orient::ascii_front(&verts, g.up, g.forward));
@@ -171,8 +171,8 @@ fn fix_bot(bot: &str, commit: bool) {
                 }
                 println!(
                     "  {name:4} -> up={} fwd={} confident={}{}",
-                    axis_name(g.up),
-                    axis_name(g.forward),
+                    orient::axis_name(g.up),
+                    orient::axis_name(g.forward),
                     g.confident(),
                     if commit { "" } else { " (dry run)" }
                 );
@@ -290,7 +290,7 @@ fn scores(bot: &str, pose: &str) {
     };
     println!("{bot}/{pose} -- up_score per axis:");
     for ax in orient::AXES {
-        println!("  {:4} {:.4}", axis_name(ax), orient::up_score(&verts, ax));
+        println!("  {:4} {:.4}", orient::axis_name(ax), orient::up_score(&verts, ax));
     }
     println!("mirror asymmetry per horizontal axis (lower = more symmetric):");
     let g = orient::guess(&verts);
@@ -302,22 +302,8 @@ fn scores(bot: &str, pose: &str) {
         hi = hi.max(p);
     }
     let center = (lo + hi) * 0.5;
-    println!("  {:4} {:.4}", axis_name(a), orient::mirror_asymmetry(&verts, a, center));
-    println!("  {:4} {:.4}", axis_name(b), orient::mirror_asymmetry(&verts, b, center));
+    println!("  {:4} {:.4}", orient::axis_name(a), orient::mirror_asymmetry(&verts, a, center));
+    println!("  {:4} {:.4}", orient::axis_name(b), orient::mirror_asymmetry(&verts, b, center));
 }
 
-fn axis_name(v: glam::Vec3) -> &'static str {
-    if v.x > 0.5 {
-        "+X"
-    } else if v.x < -0.5 {
-        "-X"
-    } else if v.y > 0.5 {
-        "+Y"
-    } else if v.y < -0.5 {
-        "-Y"
-    } else if v.z > 0.5 {
-        "+Z"
-    } else {
-        "-Z"
-    }
-}
+

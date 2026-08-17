@@ -244,6 +244,25 @@ pub fn all_verts(raws: &[RawPrim]) -> Vec<Vertex> {
     raws.iter().flat_map(|r| r.verts.iter().copied()).collect()
 }
 
+/// One of the 6 axis-aligned directions, as a human-readable label —
+/// shared between `orientsim.rs` and `partsim.rs` rather than each
+/// keeping its own copy.
+pub fn axis_name(v: Vec3) -> &'static str {
+    if v.x > 0.5 {
+        "+X"
+    } else if v.x < -0.5 {
+        "-X"
+    } else if v.y > 0.5 {
+        "+Y"
+    } else if v.y < -0.5 {
+        "-Y"
+    } else if v.z > 0.5 {
+        "+Z"
+    } else {
+        "-Z"
+    }
+}
+
 /// Write an `orient.json` matching what `model.rs::declared_orientation`
 /// expects to read back.
 pub fn write_orient_json(dir: &std::path::Path, up: Vec3, forward: Vec3, source: &str) -> std::io::Result<()> {

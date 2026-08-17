@@ -79,6 +79,7 @@ mod nightfall;
 mod orient;
 mod partdetect;
 mod orientsim;
+mod partsim;
 mod skirmish;
 mod raid;
 mod raidcon;
@@ -1016,6 +1017,12 @@ fn main() {
     if argv.iter().any(|a| a == "--orient") {
         // diagnose or fix a bot pose's orientation; see orient.rs
         orientsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--parts") {
+        // classify a bot pose's prims (leg/wheel/thruster/wing/body);
+        // see partdetect.rs -- read-only, no --commit, nothing to write yet
+        partsim::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--intel") {
