@@ -41,7 +41,6 @@ const HILL: f32 = 7.0;
 /// already did).
 static MOUNTAIN_BIAS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F800000); // 1.0
 static LAND_LIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0.0
-static RIVER_COURSE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // classic meander
 static TERRAIN_SEASON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1); // Greenleaf
 
 /// Configure the terrain pool before `init_world()`. `mountain_bias` scales how much of
@@ -51,13 +50,11 @@ static TERRAIN_SEASON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8
 pub fn set_terrain_pool(mountain_bias: f32, season: u8) {
     MOUNTAIN_BIAS.store(mountain_bias.to_bits(), std::sync::atomic::Ordering::Relaxed);
     TERRAIN_SEASON.store(season, std::sync::atomic::Ordering::Relaxed);
-    // a pool is a complete terrain spec: the land lift and river course are
-    // explicit opt-ins a mode sets *after* its pool (see `set_land_lift`,
-    // `set_river_course`), so choosing a pool clears whatever a previous mode
-    // left behind — without this, a battleground bake would quietly raise the
-    // waterline or move the river out from under the next sim/prowl bake
+    // a pool is a complete terrain spec: the land lift is an explicit opt-in a
+    // mode sets *after* its pool (see `set_land_lift`), so choosing a pool clears
+    // any lift a previous mode left behind — without this, a battleground bake
+    // would quietly raise the waterline out from under the next sim/prowl bake
     LAND_LIFT.store(0.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    RIVER_COURSE.store(RIVER_MEANDER, std::sync::atomic::Ordering::Relaxed);
 }
 fn mountain_bias() -> f32 { f32::from_bits(MOUNTAIN_BIAS.load(std::sync::atomic::Ordering::Relaxed)) }
 /// Raise (or sink) the whole land relative to the waterline, in metres. The
@@ -70,54 +67,15 @@ pub fn set_land_lift(lift: f32) {
     LAND_LIFT.store(lift.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 fn land_lift() -> f32 { f32::from_bits(LAND_LIFT.load(std::sync::atomic::Ordering::Relaxed)) }
-
-/// Choose the river's course. Like the lift, an explicit per-mode opt-in set after
-/// the pool (`set_terrain_pool` resets it to the classic meander).
-/// * `RIVER_MEANDER` (0, default) — the north–south meander every mode has always had.
-/// * `RIVER_U_EAST` (1) — the battleground's course: a U-shaped bend bowed around the
-///   east lane's territory, centered on the anti-diagonal so it treats both clans
-///   alike while leaving the mid line between the camps **dry**. Two paw-deep fords
-///   where the east trail crosses it — gravel bars, not bridges.
-pub const RIVER_MEANDER: u8 = 0;
-pub const RIVER_U_EAST: u8 = 1;
-pub fn set_river_course(course: u8) {
-    RIVER_COURSE.store(course, std::sync::atomic::Ordering::Relaxed);
-}
-/// The U course's geometry, public so modes can place fishing runs and renderers
-/// can dress the fords: circle centre, radius, half-width, and the two ford points
-/// (each the anti-diagonal mirror of the other, right where the east trail crosses).
-pub const U_RIVER_C: (f32, f32) = (140.0, -140.0);
-pub const U_RIVER_R: f32 = 120.0;
-pub const U_RIVER_W: f32 = 13.0;
-pub const U_FORDS: [(f32, f32); 2] = [(34.1, -93.3), (93.3, -34.1)];
-pub const FORD_R: f32 = 9.0;
 /// The terrain pool's current season ordinal (0=Newleaf .. 3=Leaf-bare).
 pub fn terrain_season() -> u8 { TERRAIN_SEASON.load(std::sync::atomic::Ordering::Relaxed) }
 
-/// River channel carved into the base terrain (fills to WATER_Y), per the course.
+/// Meandering river channel carved into the base terrain (fills to WATER_Y).
 fn river_carve(x: f32, z: f32) -> f32 {
-    match RIVER_COURSE.load(std::sync::atomic::Ordering::Relaxed) {
-        RIVER_U_EAST => {
-            // an arc of a circle centred past the east corner: the U-bend
-            let d = ((x - U_RIVER_C.0).powi(2) + (z - U_RIVER_C.1).powi(2)).sqrt();
-            let off = (d - U_RIVER_R).abs();
-            if off >= U_RIVER_W { return 0.0; }
-            let mut carve = -(1.0 - off / U_RIVER_W) * 8.5;   // deep enough to stay a river through rocky ground
-            // the fords: the bed rises to a paw-deep gravel bar at each crossing
-            for &(fx, fz) in &U_FORDS {
-                let fd = ((x - fx).powi(2) + (z - fz).powi(2)).sqrt();
-                if fd < FORD_R { carve *= 0.12 + 0.88 * (fd / FORD_R); }
-            }
-            carve
-        }
-        _ => {
-            // the classic north–south meander
-            let rx = 46.0 * (z * 0.011).sin() + 22.0 * (z * 0.031).cos();
-            let d = (x - rx).abs();
-            let w = 15.0;
-            if d < w { -(1.0 - d / w) * 6.5 } else { 0.0 }
-        }
-    }
+    let rx = 46.0 * (z * 0.011).sin() + 22.0 * (z * 0.031).cos();
+    let d = (x - rx).abs();
+    let w = 15.0;
+    if d < w { -(1.0 - d / w) * 6.5 } else { 0.0 }
 }
 
 /// Raw procedural height (pre-erosion). The grid is baked from this.
@@ -131,32 +89,7 @@ pub fn raw_height(x: f32, z: f32) -> f32 {
     h /= sum;
     let r = (wx * wx + wz * wz).sqrt() / 300.0;
     let peaks = (h - 0.5) * 2.0 * HILL * mountain_bias();
-    // the centre-lake bowl is COURSE geometry, not neutral land: it exists to feed
-    // the meander. The U course carries its own water in its own carve, so the
-    // bowl would only re-flood the (deliberately dry) line between the camps.
-    let course = RIVER_COURSE.load(std::sync::atomic::Ordering::Relaxed);
-    let bowl = if course == RIVER_U_EAST { 0.0 } else { (1.0 - r).max(0.0) * 3.0 };
-    // the U course also raises THE OLD HIGH TRAIL: a gentle causeway of dry ground
-    // along the camp diagonal, the ridgeline the clans have always marched — so the
-    // line between the Great Trees is dry by landform, not by luck of the noise
-    let causeway = if course == RIVER_U_EAST {
-        let d = (z - x).abs() / std::f32::consts::SQRT_2;   // distance to the camp line
-        let along = (x + z) * 0.5;                          // position along it
-        let w = 15.0;
-        let ends = (1.0 - ((along.abs() - 110.0) / 20.0).clamp(0.0, 1.0));   // fade past the camps
-        if d < w { (1.0 - d / w) * 3.4 * ends } else { 0.0 }
-    } else { 0.0 };
-    // the U course also TILTS the country: the duo side climbs to a mountain
-    // shoulder while the river keeps the valley floor — one-sided (only the west
-    // rises; a full-plane tilt would drown the solo side's prey camps). The
-    // gradient runs along the anti-diagonal, so the clan-swap reflection fixes
-    // it: lanes differ in height, clans do not.
-    let tilt = if course == RIVER_U_EAST {
-        let u = (z - x) / std::f32::consts::SQRT_2;         // + toward the duo corner
-        let t = (u / 130.0).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t) * 6.0
-    } else { 0.0 };
-    peaks - bowl + causeway + tilt + river_carve(x, z) + land_lift()
+    peaks - (1.0 - r).max(0.0) * 3.0 + river_carve(x, z) + land_lift()
 }
 
 // ── stored, eroded heightfield (adapted from unendlich thermal_erosion + water_field) ──
@@ -361,13 +294,10 @@ pub fn cover_at(x: f32, z: f32) -> f32 {
 }
 
 pub fn biome_at(x: f32, z: f32) -> Biome {
-    // classify on the land's SHAPE, not its raised elevation: a lifted mode moves
-    // the waterline relationship, not the vegetation — without subtracting the
-    // lift, a +1.2m lift reclassifies most of the map as bare mountain stone
-    let y = height_at(x, z) - land_lift();
+    let y = height_at(x, z);
     let (m, s) = climate(x, z);
     if y > 1.9 { return MOUNTAINS; }                       // the rare high ground (top ~2%)
-    if height_at(x, z) < WATER_Y + 0.7 {                   // a tight shoreline band (true waterline)
+    if y < WATER_Y + 0.7 {                                 // a tight shoreline band
         if m > 0.72 { return MANGROVE; }                   // the wettest, warmest shallows grow mangroves
         return if m > 0.5 { RIVER_REEDS } else { LAKE_SHORE };
     }

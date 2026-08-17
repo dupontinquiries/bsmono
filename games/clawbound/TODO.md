@@ -94,6 +94,25 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   enemies to the claw (never inside the caster), The River Remembers biting +20% into
   the slowed/rooted/feared. Controller identity enforced by test: their techniques
   cycle ≤10s, faster than any ultimate. Root/slow timers join the determinism digest.
+- [x] The jungle layer (`junglemap.rs`) — the map's natural blockers, every feature mirrored
+  under a half-turn by construction: **thickets** (brush that conceals a cat from outside
+  beyond 6m — one-way ambush sight, the hidden cat sees out; two cats in the same brush see
+  each other), **stone walls** with a carved pass (sight never crosses the solid spans;
+  crossing off-pass is a 0.45x scramble), **mistfalls** (drifting concealment near water).
+  Wired into the sim: nearest_enemy respects sight, prey isn't spooked by hunters it cannot
+  see (brush-hunting is now genuinely better), the ambush kits' Night's Hunger feeds in
+  cover, walls slow underfoot. Kept pure and battleground-local — world's global terrain
+  untouched, so parallel tests and other modes are unaffected. The layout test
+  `the_trails_themselves_stay_open` caught two real wall placements crossing/grazing lanes.
+- [x] Land adjustment: the battleground bakes **craggier, drier country** — mountain_bias
+  1.6 (the per-mode pool knob prowl already rolls) paired with a new `world::set_land_lift`
+  (+1.3m). Lift is additive with default 0.0; choosing a pool resets it, because a global
+  lift leaking into the next mode's bake broke two sim/prowl water tests exactly as
+  predicted — the reset is the contract, learned the measured way.
+- [x] Battle render fullness: bushes/rocks/logs/litter added to the scene, thicket stands
+  as dense dark brush, wall slab lines with their pass, mistfall columns + spray domes.
+- [ ] Landform-carved heightfield (walls/crags as real terrain relief rather than placed
+  slabs) would need a per-mode heightfield overlay in world — a bigger seam, deferred
 - [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes
   the gather) — both controller-led report matches ran longest and lost their single
   sample; consider auto_cast coordination (hold Earthshaker/Eclipse for a fresh

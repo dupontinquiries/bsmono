@@ -731,9 +731,50 @@ fn build_battle() -> (Mesh, Vec3) {
 
     let mut m = world::build_terrain(150);
     m.extend(&world::build_water());
-    m.extend(&world::build_trees(110));
-    m.extend(&world::build_grass(2400));
-    m.extend(&world::build_reeds(400));
+    m.extend(&world::build_trees(150));
+    m.extend(&world::build_bushes(160));
+    m.extend(&world::build_rocks(180));
+    m.extend(&world::build_logs(80));
+    m.extend(&world::build_grass(3600));
+    m.extend(&world::build_litter(2200));
+    m.extend(&world::build_reeds(500));
+
+    // ── the jungle layer: thickets, stone walls, mistfalls ──────────────────
+    use clawbound_rs::junglemap;
+    let mut jrng = 7u32;
+    let mut jr = || { jrng = jrng.wrapping_mul(0x7feb352d).wrapping_add(0x9e3779b9);
+        (jrng >> 8) as f32 / ((u32::MAX >> 8) as f32) };
+    for t in junglemap::thickets() {
+        // a dense stand: many overlapping dark brush lumps out to the radius
+        for _ in 0..22 {
+            let a = jr() * std::f32::consts::TAU;
+            let d = jr().sqrt() * t.r;
+            let (bx, bz) = (t.x + a.cos() * d, t.z + a.sin() * d);
+            let gy = world::height_at(bx, bz).max(world::WATER_Y);
+            let h = 1.6 + jr() * 1.8;
+            m.cone(v3(bx, gy + h * 0.4, bz), 1.4 + jr() * 1.2, h, 7, shade(rgb(0x2f4a2c), 0.85 + jr() * 0.3));
+        }
+    }
+    for w in junglemap::walls() {
+        // broken stone slabs along the solid spans; the pass stays open
+        for k in 0..14 {
+            let t = k as f32 / 13.0;
+            if t > junglemap::PASS.0 && t < junglemap::PASS.1 { continue; }
+            let (wx, wz) = (w.ax + (w.bx - w.ax) * t, w.az + (w.bz - w.az) * t);
+            let gy = world::height_at(wx, wz);
+            let h = 3.2 + jr() * 1.6;
+            m.boxx(v3(wx + (jr() - 0.5), gy + h * 0.5, wz + (jr() - 0.5)),
+                v3(1.8 + jr(), h * 0.5, 1.8 + jr()), shade(rgb(0x8b8d92), 0.8 + jr() * 0.35));
+        }
+    }
+    for mi in junglemap::mists() {
+        // the mistfall: a pale water column off a crag, spray hanging as a dome
+        let gy = world::height_at(mi.x, mi.z).max(world::WATER_Y);
+        m.boxx(v3(mi.x, gy + 4.5, mi.z), v3(1.2, 4.5, 1.2), rgb(0x9fc8d8));
+        m.set_op(0.3);
+        m.cone(v3(mi.x, gy + 0.3, mi.z), mi.r, 3.2, 16, rgb(0xdce8ec));
+        m.set_op(1.0);
+    }
 
     let team_col = |t: u8| if t == CLAN_A { rgb(0xd8623c) } else { rgb(0x3d7fd8) };
     // camps: the Great Tree — a mighty trunk and canopy in clan colour — over a pad

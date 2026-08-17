@@ -35,6 +35,7 @@
 //! world is the wild.
 
 use crate::ancestor::{self, Ancestor, Verb};
+use crate::junglemap;
 use crate::world;
 
 pub const CLAN_A: u8 = 0;
@@ -267,7 +268,8 @@ impl Battleground {
             && dist(a.x, a.z, w.x, w.z) < 8.0);
         if near_lion { m *= 1.15; }
         if matches!(w.ancestor, Some(Ancestor::Tiger) | Some(Ancestor::Panther))
-            && (self.is_night() || w.stealth_t > 0.0) { m *= 1.3; }
+            && (self.is_night() || w.stealth_t > 0.0
+                || junglemap::concealment_at(w.x, w.z).is_some()) { m *= 1.3; }
         // Suneye is Night's Hunger mirrored: the day belongs to the sun-priest
         if w.ancestor == Some(Ancestor::SunCat) && !self.is_night() { m *= 1.3; }
         // Oldroar's Deep Wounds, Deep Fury: the closer to falling, the harder the blows
@@ -324,8 +326,19 @@ impl Battleground {
 
     /// A drafted match: each clan fields exactly the three ancestors picked for it.
     /// Clan A's first pick is the player's warrior.
+    /// The battleground bakes a **craggier land** than the other modes: the war is
+    /// fought over broken country — ridgelines, deeper draws, real relief — using
+    /// the same per-mode terrain-pool knob prowl already rolls (house idiom, held
+    /// under the terrain lock like every other mode's bake).
+    pub const MOUNTAIN_BIAS: f32 = 1.6;
+    /// Paired with the bias: lift the land so craggier does not mean *wetter* —
+    /// the deepened basins drain back to marshes and draws, the carved river stays.
+    pub const LAND_LIFT: f32 = 1.3;
+
     pub fn new_draft(picks_a: [Ancestor; 3], picks_b: [Ancestor; 3]) -> Battleground {
         let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        world::set_terrain_pool(Self::MOUNTAIN_BIAS, 1);
+        world::set_land_lift(Self::LAND_LIFT);
         world::init_world();
         let camps = [land_near(CAMP_ANCHOR[0].0, CAMP_ANCHOR[0].1), land_near(CAMP_ANCHOR[1].0, CAMP_ANCHOR[1].1)];
         drop(_terrain_guard);
@@ -470,6 +483,7 @@ impl Battleground {
         let mut best: Option<(usize, f32)> = None;
         for (i, e) in self.warriors.iter().enumerate() {
             if e.team == team || !e.alive() || e.stealth_t > 0.0 { continue; }
+            if !junglemap::sees(x, z, e.x, e.z) { continue; }   // brush, mist, stone
             let d = dist(x, z, e.x, e.z);
             if d < within && best.map_or(true, |b| d < b.1) { best = Some((i, d)); }
         }
@@ -625,6 +639,7 @@ impl Battleground {
         if w.ancestor == Some(Ancestor::Caracal) {                                   // Skyward Hunger
             s *= 1.0 + (w.kills as f32 * 0.04).min(0.4);
         }
+        if junglemap::on_wall(w.x, w.z) { s *= junglemap::SCRAMBLE; }   // claws on stone
         if w.carry != Carry::Nothing { s *= CARRY_SLOW; }
         if w.slow_t > 0.0 { s *= 0.5; }
         s
@@ -872,7 +887,8 @@ impl Battleground {
             let p = &self.prey[pi];
             if !p.alive() || !p.kind.flees() { continue; }
             let threat = self.warriors.iter()
-                .filter(|w| w.alive() && dist(w.x, w.z, p.x, p.z) < 8.0)
+                .filter(|w| w.alive() && dist(w.x, w.z, p.x, p.z) < 8.0
+                    && junglemap::sees(p.x, p.z, w.x, w.z))   // a hunter in the brush spooks nothing
                 .map(|w| (w.x, w.z))
                 .min_by(|a, b| dist(a.0, a.1, p.x, p.z).total_cmp(&dist(b.0, b.1, p.x, p.z)));
             let p = &mut self.prey[pi];
@@ -1533,6 +1549,83 @@ mod tests {
         assert!((bg.strike_vs(0, e) - 1.0).abs() < 1e-6);
         bg.warriors[e].root_t = 1.0;
         assert!(bg.strike_vs(0, e) > 1.1, "the held are already caught");
+    }
+
+    #[test]
+    fn the_jungle_hides_a_waiting_warrior() {
+        use crate::junglemap;
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        let th = junglemap::thickets()[1];   // clean eastern sightline (no wall)
+        // an enemy lurks in the brush; a clan A warrior stands in the open nearby
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = th.x; bg.warriors[e].z = th.z;
+        bg.warriors[0].x = th.x + 20.0; bg.warriors[0].z = th.z;
+        assert!(bg.nearest_enemy(0, 50.0).is_none(),
+            "from the open, the brush shows nothing");
+        // step to the thicket's edge and the rustling gives them away
+        bg.warriors[0].x = th.x + junglemap::CLOSE_SENSE - 1.0;
+        assert_eq!(bg.nearest_enemy(0, 50.0), Some(e));
+        // and the hidden cat has seen the open-ground warrior the whole time
+        bg.warriors[0].x = th.x + 20.0;
+        assert_eq!(bg.nearest_enemy(e, 50.0), Some(0), "ambush sight is one-way");
+        // the ambush kits treat the brush as their darkness
+        let mut bg2 = Battleground::new_draft(
+            [Ancestor::Tiger, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Leopard, Ancestor::Caracal, Ancestor::Panther]);
+        quiet(&mut bg2);
+        // baseline away from the camp: at spawn the Tiger stands beside its Lion
+        // packmate, and Pride's Warmth would pollute the comparison
+        bg2.warriors[0].x = th.x + 40.0; bg2.warriors[0].z = th.z;
+        let open = bg2.strike_of(0);
+        bg2.warriors[0].x = th.x; bg2.warriors[0].z = th.z;
+        assert!(bg2.strike_of(0) > open * 1.2, "Night's Hunger feeds in the brush too");
+    }
+
+    #[test]
+    fn stone_walls_cut_sight_and_slow_the_scramble() {
+        use crate::junglemap;
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        let w = junglemap::walls()[0];
+        let q = (w.ax + (w.bx - w.ax) * 0.2, w.az + (w.bz - w.az) * 0.2);
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[0].x = q.0 + 10.0; bg.warriors[0].z = q.1 - 10.0;
+        bg.warriors[e].x = q.0 - 10.0; bg.warriors[e].z = q.1 + 10.0;
+        assert!(bg.nearest_enemy(0, 60.0).is_none(), "sight does not cross stone");
+        // through the pass, the same spacing sees fine
+        let (mx, mz) = ((w.ax + w.bx) * 0.5, (w.az + w.bz) * 0.5);
+        bg.warriors[0].x = mx + 10.0; bg.warriors[0].z = mz - 10.0;
+        bg.warriors[e].x = mx - 10.0; bg.warriors[e].z = mz + 10.0;
+        assert_eq!(bg.nearest_enemy(0, 60.0), Some(e));
+        // and stone underfoot is a scramble
+        bg.warriors[0].x = q.0; bg.warriors[0].z = q.1;
+        let on = bg.speed_of(0);
+        bg.warriors[0].x = mx; bg.warriors[0].z = mz;
+        let pass = bg.speed_of(0);
+        assert!(on < pass * 0.6, "scrambling over stone: {on} vs {pass} through the pass");
+    }
+
+    #[test]
+    fn prey_does_not_fear_the_hunter_it_cannot_see() {
+        use crate::junglemap;
+        let mut bg = Battleground::new(Ancestor::Lion);
+        quiet(&mut bg);
+        // a prey camp with brush beside it — the layout placed it there on purpose
+        let th = junglemap::thickets()[1];
+        let p = bg.prey.iter().position(|p| p.kind.flees()
+            && dist(p.home.0, p.home.1, th.x, th.z) < 20.0).expect("brush beside a prey camp");
+        let (hx, hz) = bg.prey[p].home;
+        // hunter crouched in the brush, well inside spook range of the prey — and
+        // as a control, the same crouch in the open must send it bolting
+        let (cx, cz) = (th.x, th.z - 2.5);
+        assert!(dist(cx, cz, hx, hz) < 7.0, "the crouch spot must be in spook range");
+        bg.warriors[1].x = cx; bg.warriors[1].z = cz;
+        bg.warriors[1].mind = Mind::AtMedic;
+        let d0 = dist(bg.prey[p].x, bg.prey[p].z, hx, hz);
+        for _ in 0..30 * 5 { bg.warriors[1].x = cx; bg.warriors[1].z = cz; bg.step(1.0 / 30.0); }
+        let d1 = dist(bg.prey[p].x, bg.prey[p].z, hx, hz);
+        assert!(d1 < d0 + 1.0, "a hunter in the brush spooks nothing: {d0} -> {d1}");
     }
 
     #[test]
