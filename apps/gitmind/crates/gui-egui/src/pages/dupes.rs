@@ -403,8 +403,23 @@ pub fn card(app: &mut App, ui: &mut egui::Ui) {
         for (oid, subj) in r.incoming.iter().take(12) {
             ui.label(egui::RichText::new(format!("{oid} {subj}")).monospace().small());
         }
+        // Through status_rows rather than printing the pair. cockpit hands
+        // back Vec<(String, String)> — a porcelain XY code and a path — and
+        // printing them raw shows "R  old -> new" as one opaque string. Row
+        // parses the two-letter code into a Stage, and describe() renders a
+        // rename as "old → new" with the arrow the Qt FileRow used.
+        //
+        // This is what the STRANDED entry in parity_audit meant: status_rows
+        // was ported, declared in lib.rs, and called by nothing. The port was
+        // finished; only the wiring was missing.
         for (stat, path) in r.files.iter().take(12) {
-            ui.label(egui::RichText::new(format!("{stat} {path}")).monospace().weak().small());
+            let row = crate::status_rows::Row::from_pair(stat, path);
+            ui.label(
+                egui::RichText::new(format!("{:<2} {}", row.status_letter(), row.describe()))
+                    .monospace()
+                    .weak()
+                    .small(),
+            );
         }
     }
 

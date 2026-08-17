@@ -41,6 +41,33 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Classify porcelain's two status letters.
+    ///
+    /// `None` means "not a change": both columns blank. Porcelain does not
+    /// emit that line, and treating it as unstaged would put a clean file in
+    /// the list — so the caller skips rather than inventing a stage.
+    ///
+    /// Extracted from inside `parse_porcelain` when `from_pair` needed the
+    /// same rule. Two copies of an XY classifier is exactly the duplication
+    /// that let bo-suite's UI and engine disagree about a threshold, and this
+    /// one decides whether a button says "stage" or "unstage".
+    pub fn from_xy(xy: &str) -> Option<Stage> {
+        let b = xy.as_bytes();
+        if b.len() < 2 {
+            return None;
+        }
+        let (x, y) = (b[0] as char, b[1] as char);
+        if x == '?' && y == '?' {
+            return Some(Stage::Untracked);
+        }
+        match (x != ' ' && x != '?', y != ' ' && y != '?') {
+            (true, true) => Some(Stage::Both),
+            (true, false) => Some(Stage::Indexed),
+            (false, true) => Some(Stage::Worktree),
+            (false, false) => None,
+        }
+    }
+
     /// May this row be staged?
     ///
     /// Everything except a purely-indexed change: there is nothing left in the
@@ -82,6 +109,41 @@ pub struct Row {
 }
 
 impl Row {
+    /// Build a row from cockpit's `(status, path)` pair.
+    ///
+    /// `parse_porcelain` takes whole `git status --porcelain` lines, which is
+    /// right when this module runs git itself. cockpit's flow already ran it
+    /// and split the result, so its callers had the two halves and no way in —
+    /// they printed "{stat} {path}" instead, which shows a rename as one
+    /// opaque "R  old -> new" string.
+    ///
+    /// The rename arrow is parsed HERE rather than by the caller, because the
+    /// caller is a UI page and " -> " is porcelain's spelling, not a display
+    /// choice. A page that split on it would be parsing git output in a
+    /// render function.
+    pub fn from_pair(status: &str, path: &str) -> Row {
+        // NOT trimmed. Porcelain's XY is POSITIONAL: in "R " the X column is
+        // R and the Y column is a space meaning "no worktree change". Trimming
+        // leaves one character, from_xy rejects it as truncated, and a staged
+        // rename silently classifies as Worktree — offering "stage" on a file
+        // that is already staged. Padded instead, so a caller that did trim
+        // still lands in the right column.
+        let mut xy = status.to_string();
+        while xy.len() < 2 {
+            xy.push(' ');
+        }
+        let (from, path) = match path.split_once(" -> ") {
+            Some((old, new)) => (Some(old.trim().to_string()), new.trim().to_string()),
+            None => (None, path.trim().to_string()),
+        };
+        // A pair that classifies to nothing still becomes a row: cockpit
+        // produced it from a real status run, so dropping it here would hide
+        // a file the engine reported. Worktree is the conservative reading —
+        // it offers "stage", which is reversible, rather than "unstage".
+        let stage = Stage::from_xy(&xy).unwrap_or(Stage::Worktree);
+        Row { xy, path, from, stage }
+    }
+
     /// What the row shows on the right, trimmed the way the QML trims it.
     pub fn status_letter(&self) -> String {
         self.xy.trim().to_string()
@@ -113,21 +175,7 @@ pub fn parse_porcelain(out: &str) -> Vec<Row> {
         if rest.is_empty() {
             continue;
         }
-        let x = xy.as_bytes()[0] as char;
-        let y = xy.as_bytes()[1] as char;
-        let stage = if x == '?' && y == '?' {
-            Stage::Untracked
-        } else {
-            match (x != ' ' && x != '?', y != ' ' && y != '?') {
-                (true, true) => Stage::Both,
-                (true, false) => Stage::Indexed,
-                (false, true) => Stage::Worktree,
-                // Neither side changed is not a change; porcelain does not
-                // emit it, and treating it as unstaged would put a clean file
-                // in the list.
-                (false, false) => continue,
-            }
-        };
+        let Some(stage) = Stage::from_xy(&xy) else { continue };
         // A rename is `old -> new`. Quoted paths (git quotes anything with a
         // space or a non-ASCII byte) keep their quotes: stripping them here
         // would produce a path the caller then has to re-quote to use, and
@@ -299,5 +347,49 @@ mod tests {
         // with a space is exactly where that goes wrong.
         let rows = parse_porcelain("?? \"my notes.txt\"\n");
         assert_eq!(rows[0].path, "\"my notes.txt\"");
+    }
+
+    #[test]
+    fn a_cockpit_pair_becomes_the_same_row_a_porcelain_line_would() {
+        // cockpit already ran git and split the output, so its callers had
+        // two halves and no way into this model — they printed "{stat} {path}"
+        // and a rename showed as one opaque string.
+        let a = Row::from_pair("R ", "old/name.rs -> new/name.rs");
+        assert_eq!(a.path, "new/name.rs", "the path to act on is the NEW one");
+        assert_eq!(a.from.as_deref(), Some("old/name.rs"));
+        assert_eq!(a.describe(), "old/name.rs → new/name.rs");
+        assert_eq!(a.stage, Stage::Indexed);
+
+        // And it agrees with the whole-line parser on the same content, which
+        // is the property that makes one classifier worth extracting.
+        let b = &parse_porcelain("R  old/name.rs -> new/name.rs\n")[0];
+        assert_eq!(a.stage, b.stage);
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.from, b.from);
+    }
+
+    #[test]
+    fn a_pair_that_classifies_to_nothing_is_still_shown() {
+        // cockpit produced it from a real status run. Dropping it here would
+        // hide a file the engine reported; Worktree is the conservative
+        // reading because it offers "stage", which is reversible.
+        let r = Row::from_pair("  ", "odd/case.rs");
+        assert_eq!(r.stage, Stage::Worktree);
+        assert_eq!(r.describe(), "odd/case.rs");
+        assert!(r.stage.can_stage());
+    }
+
+    #[test]
+    fn the_classifier_is_shared_not_copied() {
+        // Both entry points route through Stage::from_xy. Two copies of an XY
+        // classifier is the duplication that let bo-suite's UI and engine
+        // disagree about a threshold, and this one decides whether a button
+        // says stage or unstage.
+        assert_eq!(Stage::from_xy("??"), Some(Stage::Untracked));
+        assert_eq!(Stage::from_xy("MM"), Some(Stage::Both));
+        assert_eq!(Stage::from_xy("M "), Some(Stage::Indexed));
+        assert_eq!(Stage::from_xy(" M"), Some(Stage::Worktree));
+        assert_eq!(Stage::from_xy("  "), None, "not a change");
+        assert_eq!(Stage::from_xy("M"), None, "a truncated read is not a stage");
     }
 }
