@@ -204,6 +204,53 @@ pub const ROUTE: &[Destination] = &[
             "something built this and did not stay"
         ],
     },
+    // ---- exoworlds: real systems, past the bridge's first jump ----
+    // (`exoworlds.rs` is the source of truth for the physical numbers;
+    // gravity and day_len below are literals rather than calls into it
+    // because ROUTE is a const array and exoworlds::gravity_g/orbit are
+    // not const fns -- `patrol::tests::exoworld_destinations_agree_with_
+    // exoworlds_rs` is what actually guarantees these four numbers
+    // stay honest rather than drifting from the module that derived
+    // them. Reachability is not encoded here: `exoworlds::unlocked`
+    // is the gate a menu checks, same as any other story lock in this
+    // game — ROUTE itself has never distinguished "listed" from
+    // "currently allowed", and this does not start now.)
+    Destination { id: "trappist1e", name: "TRAPPIST-1e", terrain: Terrain::Procedural, gravity: 0.8176, weather: true,
+        hostiles: Faction::Hijacks,
+        note: "one of three TRAPPIST-1 worlds in the habitable zone; tidally locked, one face always to the star",
+        sky: Sky::Glare, day_len: 0.0, ambient: &[
+            "the star sits fixed on the horizon, small and red and never moving",
+            "the terminator line is the only weather this world has",
+            "six days is a year here; nothing about that feels real yet"
+        ],
+    },
+    Destination { id: "trappist1g", name: "TRAPPIST-1g", terrain: Terrain::Procedural, gravity: 1.0364, weather: true,
+        hostiles: Faction::Hijacks,
+        note: "the outer edge of the same system's habitable zone -- colder, heavier, denser air",
+        sky: Sky::Glare, day_len: 0.0, ambient: &[
+            "the same red star, further out, and noticeably less generous",
+            "heavier here -- the suits log it before the legs do",
+            "the sixth world in this sky is a bright fixed point, not a star: it's e"
+        ],
+    },
+    Destination { id: "proxima_b", name: "PROXIMA CENTAURI b", terrain: Terrain::Procedural, gravity: 0.8843, weather: true,
+        hostiles: Faction::Corrupted,
+        note: "the nearest star system to Earth's own; radius is a modelled estimate, not a transit measurement",
+        sky: Sky::Glare, day_len: 0.0, ambient: &[
+            "the nearest star to earth's own, and nobody standing here is from earth",
+            "the flare warning fires again; proxima does this more than sol ever did",
+            "four light-years. the number keeps not meaning anything"
+        ],
+    },
+    Destination { id: "kepler186f", name: "KEPLER-186f", terrain: Terrain::Procedural, gravity: 1.0519, weather: true,
+        hostiles: Faction::BlackstarClans,
+        note: "the first Earth-sized world confirmed in another star's habitable zone",
+        sky: Sky::Glare, day_len: 194.0, ambient: &[
+            "far enough out that this world actually turns -- a real day, a real night",
+            "the first world humanity ever confirmed like this one. it took a while to get here",
+            "five hundred eighty light-years behind, however the bridge counts distance"
+        ],
+    },
 ];
 
 /// The look of the place. Not a material — a mood the renderer can read off
@@ -656,5 +703,24 @@ mod tests {
         // ~55-85 s apart plus the 40 s opener: a handful in five minutes,
         // not a wall of text
         assert!((3..=7).contains(&n), "{n} fragments in five minutes");
+    }
+
+    #[test]
+    fn exoworld_destinations_agree_with_exoworlds_rs() {
+        // ROUTE's gravity/day_len for the four exoworlds are literals
+        // (const arrays cannot call exoworlds::gravity_g / orbit, which
+        // are not const fns) -- this is what actually keeps them honest
+        // against the module that derived them, rather than trusting
+        // two hand-copied numbers to never drift apart
+        for w in crate::exoworlds::EXOWORLDS {
+            let d = find(w.id).expect("every ExoWorld should have a matching Destination");
+            let want_g = crate::exoworlds::gravity_g(w);
+            assert!((d.gravity - want_g).abs() < 0.001,
+                "{}: ROUTE gravity {} vs exoworlds::gravity_g {}", w.id, d.gravity, want_g);
+            let want_day = crate::exoworlds::orbit(w).day_len();
+            assert!((d.day_len - want_day).abs() < 0.5,
+                "{}: ROUTE day_len {} vs orbit().day_len() {}", w.id, d.day_len, want_day);
+            assert_eq!(d.hostiles, w.hostiles, "{}: faction mismatch between ROUTE and EXOWORLDS", w.id);
+        }
     }
 }

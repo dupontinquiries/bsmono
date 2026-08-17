@@ -29,17 +29,19 @@
 //! directly — the same "measured, not assumed" discipline `clones.rs`'s
 //! `ICE_REF` uses for its own reference figure.
 //!
-//! ## What this deliberately does not do
+//! ## Reachable now
 //!
-//! No `patrol::Destination` records are added and `ROUTE` is untouched —
-//! that table's tests assume a fixed, curated, film-matched list, and
-//! folding four more entries into it would ask `waves_for` and the film
-//! theatre-matching tests to make sense of worlds no mission is set on.
-//! This is the seam: a real, tested, standalone table and a gate
-//! (`unlocked`) a patrol-mode screen can query once one exists. Turning an
-//! `ExoWorld` into a place the player can actually stand in — terrain,
-//! sky, ambient lines, a hostiles roster deep enough to fight in — is the
-//! next piece, not this one.
+//! `patrol::ROUTE` carries all four as real destinations — gravity and
+//! day length agree with this module by test
+//! (`patrol::tests::exoworld_destinations_agree_with_exoworlds_rs`), not
+//! by hand-copying and hoping. `ROUTE`'s own tests assume a curated
+//! list, not a *fixed-length* one, so appending four entries no mission
+//! is sited on yet cost nothing to check — the theatre-matching and
+//! campaign-ordering tests only constrain what `FILMS`/`MISSIONS`
+//! reference, and neither references these four. What ROUTE does NOT
+//! do is gate them: `unlocked()` below is the check a patrol-mode menu
+//! runs before offering them, the same way every other story lock in
+//! this game lives beside the data rather than inside it.
 //!
 //! ## The fitness question
 //!
