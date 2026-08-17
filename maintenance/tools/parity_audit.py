@@ -198,6 +198,28 @@ def port_text(app_dir):
 def snake(name):
     return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
 
+def mentions(name, text):
+    """Does `text` name this surface, allowing for Rust dropping Qt's suffix?
+
+    The single place that answers "is this surface referred to here". It lived
+    in two of the three callers with slightly different bodies, and the
+    disagreement was visible in the output: MicrotermView matched in `code`
+    but not in `named`, then matched in `named` but not in `live`, appearing
+    first as unported work and then as stranded work — both times finished.
+    """
+    if name in text or snake(name) in text:
+        return True
+    # A Qt class ending in View/Widget/Page/Dialog/Panel/Window also matches
+    # its stem: in Rust the suffix is Qt's noise rather than part of the name,
+    # and `microterm.rs` is the complete port of `MicrotermView`.
+    for suffix in ('View', 'Widget', 'Page', 'Dialog', 'Panel', 'Window'):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            stem = name[:-len(suffix)]
+            if stem in text or snake(stem) in text:
+                return True
+    return False
+
+
 def covered(name, text):
     """Does the port mention this surface? CamelCase or snake_case, since a
     ported widget usually keeps its name in one form or the other.
@@ -217,8 +239,16 @@ def covered(name, text):
     find out whether a surface actually behaves. The next revision should look
     for a surface's name in a `fn *_ui`/`draw` signature or a test name rather
     than anywhere in the file, which would kill most false positives without
-    reintroducing the transliteration bias."""
-    return name in text or snake(name) in text
+    reintroducing the transliteration bias.
+
+    The trailing-noun rule below is shared with `covered_in_code` rather than
+    living only there, which is where it used to be. That asymmetry made the
+    columns contradict each other: rusty-board's MicrotermView is ported as
+    `Microterm` — Rust drops Qt's View suffix — so it counted as in CODE while
+    counting as never NAMED, and appeared on the worklist as missing work that
+    was finished. `code` is meant to be the stricter reading of `named`, so it
+    cannot recognise something `named` does not."""
+    return mentions(name, text)
 
 
 def covered_in_code(name, text):
@@ -296,7 +326,7 @@ def covered_live(name, port_dirs_list):
                     t = open(os.path.join(root, f), encoding='utf8').read()
                 except Exception:
                     continue
-                if name in t or snake(name) in t:
+                if mentions(name, t):
                     hits.append((root, f[:-3]))
     if not hits:
         return False

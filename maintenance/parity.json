@@ -57,21 +57,19 @@
  {
   "app": "rusty-board",
   "surfaces": 6,
-  "covered": 5,
-  "pct": 83,
+  "covered": 6,
+  "pct": 100,
   "wired": 5,
   "wired_pct": 83,
-  "live": 5,
-  "live_pct": 83,
+  "live": 6,
+  "live_pct": 100,
   "stranded": [],
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": [
-   "MicrotermView"
-  ]
+  "missing": []
  },
  {
   "app": "snapclone",
