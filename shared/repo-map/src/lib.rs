@@ -8,6 +8,8 @@
 pub mod matrix;
 /// The repo as facts and operators: a plan over these can be checked, not just run.
 pub mod state;
+/// One interface over the verifiers that already exist — and where none applies.
+pub mod oracle;
 use std::path::Path;
 
 /// How a crate is built.
