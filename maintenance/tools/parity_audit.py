@@ -65,7 +65,20 @@ def surfaces(app_dir):
     without a vocabulary of suffixes: ContactCard : public QWidget is a surface,
     NetworkManager : public QObject is not. The pass is transitive, since the
     app defines its own bases -- most dialogs here inherit MobileDialog rather
-    than QDialog, and stopping at the Qt classes would miss all of them."""
+    than QDialog, and stopping at the Qt classes would miss all of them.
+
+    A source file may opt ITSELF out with a `parity-audit: not-a-surface`
+    comment. That exists for a component the original itself does not use —
+    gitmind's GestureHost.qml is 27 lines of press/release delta arithmetic
+    with a threshold, referenced by nothing in the Qt app, and the kit's
+    GestureLayer already does the same job better (detents, barrier fraction,
+    takeover lock). Porting it would re-solve a solved problem and add a second
+    gesture implementation to a tree that has one.
+
+    The marker goes in the FILE rather than a list here, for the same reason
+    the engine column's service opt-out does: an exception list inside the tool
+    rots the first time a file moves, and the reasoning belongs where the next
+    reader of that file will see it."""
     found = set()
     inherits = {}          # base class -> {subclasses}
     for root, dirs, files in os.walk(app_dir):
@@ -92,6 +105,13 @@ def surfaces(app_dir):
             # not UI surfaces, and voiceterm's showed up as "missing surfaces"
             # which is nonsense.
             if f.endswith('.qml'):
+                # A file may opt itself out — see this function's docstring.
+                try:
+                    head = open(p, encoding='utf8', errors='replace').read(400)
+                except Exception:
+                    head = ''
+                if 'parity-audit: not-a-surface' in head:
+                    continue
                 found.add(f[:-4])
             elif f.endswith(('.h', '.hpp')):
                 try: txt = open(p, encoding='utf8', errors='replace').read()

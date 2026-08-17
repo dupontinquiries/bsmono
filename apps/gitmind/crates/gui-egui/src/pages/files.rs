@@ -10,7 +10,10 @@ pub struct State {
     pub loaded: bool,
     pub err: String,
     pub peek_name: String,
-    pub peek_content: String,
+    /// The viewer, replacing a raw read_to_string. The page is named for
+    /// peeking and was not using the peek engine — no spec, no line numbers,
+    /// and a 20,000-char truncation that cut mid-line.
+    pub viewer: crate::peek_viewer::PeekViewer,
     /// Fuzzy filter over the current directory (voiceterm's nav-palette pattern).
     pub filter: String,
 }
@@ -110,9 +113,11 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     root.join(&app.files.subpath).join(&f)
                 };
                 app.files.peek_name = f.clone();
-                app.files.peek_content = std::fs::read_to_string(&path)
-                    .map(|s| s.chars().take(20000).collect())
-                    .unwrap_or_else(|e| format!("(cannot read: {e})"));
+                // Through the engine, so a spec like 5xx or @fn works here
+                // exactly as it does in the Qt PeekViewer — and a file too
+                // large to read whole is narrowed by the operator rather than
+                // truncated at 20,000 characters mid-line.
+                app.files.viewer.open(path.to_string_lossy().to_string());
             }
         }
         if hidden > 0 {
@@ -123,8 +128,6 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if !app.files.peek_name.is_empty() {
         ui.separator();
         ui.label(egui::RichText::new(&app.files.peek_name).strong());
-        uikit_egui::scroll::bounded(ui, 260.0, |ui| {
-            ui.label(egui::RichText::new(&app.files.peek_content).monospace().small());
-        });
+        crate::peek_viewer::peek_viewer_ui(ui, &mut app.files.viewer);
     }
 }

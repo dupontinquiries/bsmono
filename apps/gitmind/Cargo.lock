@@ -1310,6 +1310,7 @@ dependencies = [
  "egui_extras",
  "gitmind-core",
  "image",
+ "peek",
  "serde_json",
  "settings-kit",
  "snapclone-theme",
