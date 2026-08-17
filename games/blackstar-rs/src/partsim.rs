@@ -1,4 +1,5 @@
-//! PART SIM — run `partdetect::classify` against real chassis geometry.
+//! PART SIM — run `partdetect::classify` and `loadbearing::check`
+//! against real chassis geometry.
 //!
 //! Read-only, unlike `orientsim.rs`'s `fix`/`sweep` — there is nowhere
 //! to WRITE a part guess yet (no file format for it, no consumer), so
@@ -6,10 +7,11 @@
 //! is explicit that `classify`'s thresholds are reasoned about, not
 //! fit to labelled data, and the only way to move that from "reasoned
 //! about" to "checked" is to look at what it says about real chassis
-//! and correct by eye — which is what this command is for, not for
+//! and correct by eye — which is what these commands are for, not for
 //! committing a guess anywhere yet.
 //!
 //!     skydribble --parts check <bot> <pose>
+//!     skydribble --parts stability <bot> <pose>
 //!
 //! Whole-body up-axis comes from `orient::guess` on the fly, same
 //! convention `orientsim.rs`'s own `guess_for` already uses rather than
@@ -17,6 +19,7 @@
 
 use std::path::PathBuf;
 
+use crate::loadbearing;
 use crate::orient;
 use crate::partdetect::{self, Kind};
 
@@ -40,9 +43,17 @@ pub fn run(argv: &[String]) {
             };
             check(bot, pose);
         }
+        Some("stability") => {
+            let (Some(bot), Some(pose)) = (argv.get(i + 2), argv.get(i + 3)) else {
+                println!("usage: --parts stability <bot> <pose>");
+                return;
+            };
+            stability(bot, pose);
+        }
         _ => {
             println!("usage:");
             println!("  skydribble --parts check <bot> <pose>");
+            println!("  skydribble --parts stability <bot> <pose>");
         }
     }
 }
@@ -57,27 +68,38 @@ fn kind_label(k: Kind) -> &'static str {
     }
 }
 
-fn check(bot: &str, pose: &str) {
+/// Everything both commands need from a pose: the raw prims, the
+/// whole-body up-axis guess, and the whole-body bounds/centre/width
+/// `partdetect`'s per-prim functions and `loadbearing::check` both
+/// take as input rather than each re-deriving.
+struct Loaded {
+    raws: Vec<crate::model::RawPrim>,
+    up: glam::Vec3,
+    up_confident: bool,
+    lo: f32,
+    hi: f32,
+    center: glam::Vec3,
+    half_width: f32,
+}
+
+fn load(bot: &str, pose: &str) -> Option<Loaded> {
     let dir = bots_dir().join(bot).join(pose);
     let raws = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::model::load_raw_unoriented(&dir)
-    }));
-    let Ok(raws) = raws else {
-        println!("could not load {:?}", dir);
-        return;
-    };
+    }))
+    .ok()?;
     if raws.is_empty() {
-        println!("{bot}/{pose}: no prims found");
-        return;
+        return None;
     }
     let whole = orient::all_verts(&raws);
     let guess = orient::guess(&whole);
     let up = guess.up;
 
     // Whole-body bounds along up, and the horizontal centre/half-width
-    // partdetect's ground_fraction/lateral_offset both need -- computed
-    // once here rather than inside classify, the same "measure the
-    // whole body once, not per prim" discipline xform::bounds_at uses.
+    // partdetect's ground_fraction/lateral_offset and loadbearing::check
+    // all need -- computed once here rather than inside each of them,
+    // the same "measure the whole body once, not per prim" discipline
+    // xform::bounds_at uses.
     let (pa, pb) = orient::perp_pair(up);
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     let (mut a_lo, mut a_hi) = (f32::MAX, f32::MIN);
@@ -107,19 +129,57 @@ fn check(bot: &str, pose: &str) {
     let center = up * center_h + pa * ((a_lo + a_hi) * 0.5) + pb * ((b_lo + b_hi) * 0.5);
     let half_width = ((a_hi - a_lo).max(b_hi - b_lo) * 0.5).max(1e-6);
 
+    Some(Loaded { raws, up, up_confident: guess.up_confident, lo, hi, center, half_width })
+}
+
+fn check(bot: &str, pose: &str) {
+    let Some(l) = load(bot, pose) else {
+        println!("could not load {bot}/{pose}");
+        return;
+    };
     println!("{bot}/{pose}: {} prims, whole-body up guess {} (confident={})",
-        raws.len(), orient::axis_name(up), guess.up_confident);
+        l.raws.len(), orient::axis_name(l.up), l.up_confident);
     println!("  {:<4} {:<9} {:>10} {:>8} {:>8} {:>7}  verts", "idx", "kind", "elongation", "taper", "ground", "lateral");
-    for (idx, r) in raws.iter().enumerate() {
+    for (idx, r) in l.raws.iter().enumerate() {
         if r.verts.is_empty() {
             continue;
         }
         let elong = partdetect::elongation(&r.verts);
-        let tap = partdetect::taper(&r.verts, up);
-        let ground = partdetect::ground_fraction(&r.verts, up, lo, hi);
-        let lateral = partdetect::lateral_offset(&r.verts, up, center, half_width);
-        let kind = partdetect::classify(&r.verts, up, lo, hi, center, half_width);
+        let tap = partdetect::taper(&r.verts, l.up);
+        let ground = partdetect::ground_fraction(&r.verts, l.up, l.lo, l.hi);
+        let lateral = partdetect::lateral_offset(&r.verts, l.up, l.center, l.half_width);
+        let kind = partdetect::classify(&r.verts, l.up, l.lo, l.hi, l.center, l.half_width);
         println!("  {:<4} {:<9} {:>10.2} {:>8.2} {:>8.2} {:>7.2}  {}",
             idx, kind_label(kind), elong, tap, ground, lateral, r.verts.len());
     }
+}
+
+fn stability(bot: &str, pose: &str) {
+    let Some(l) = load(bot, pose) else {
+        println!("could not load {bot}/{pose}");
+        return;
+    };
+    // classify() needs Vec3 verts, not Vertex -- convert once per prim
+    // rather than inside the hot loop loadbearing::check runs.
+    let converted: Vec<(Vec<glam::Vec3>, Kind)> = l
+        .raws
+        .iter()
+        .filter(|r| !r.verts.is_empty())
+        .map(|r| {
+            let vs: Vec<glam::Vec3> = r.verts.iter().map(|v| glam::Vec3::from_array(v.pos)).collect();
+            let kind = partdetect::classify(&r.verts, l.up, l.lo, l.hi, l.center, l.half_width);
+            (vs, kind)
+        })
+        .collect();
+    let inputs: Vec<loadbearing::PrimInput> =
+        converted.iter().map(|(vs, k)| loadbearing::PrimInput { verts: vs, kind: *k }).collect();
+    let st = loadbearing::check(&inputs, l.up);
+    println!("{bot}/{pose}: up guess {} (confident={})", orient::axis_name(l.up), l.up_confident);
+    if st.contact_points < 3 {
+        println!("  {} leg/wheel contact point(s) -- not enough for a support polygon", st.contact_points);
+        return;
+    }
+    println!("  {} contact points, stability margin {:.4} ({})",
+        st.contact_points, st.margin,
+        if st.margin > 0.0 { "stands" } else { "would tip -- centre of mass falls outside its own feet" });
 }
