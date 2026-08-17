@@ -275,3 +275,113 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod real_device_tests {
+    use super::*;
+
+    /// `fastboot getvar all` from a Fairphone 5 in bootloader fastboot,
+    /// trimmed to the variables this module reads. Everything in slots.rs was
+    /// written from the spec and from two other implementations, with no
+    /// device to check against; this is the first time it meets one.
+    const FP5: &str = include_str!("../testdata/fp5-getvar-all.txt");
+
+    /// Look up a variable by exact key.
+    ///
+    /// Matched as a `key:` prefix rather than by splitting on the first colon,
+    /// because the keys themselves contain colons — `partition-size:boot_a`
+    /// is one key whose value is ` 0x6000000`, and a first-colon split turns
+    /// it into key `partition-size` with value `boot_a: 0x6000000`. My first
+    /// attempt did exactly that and the test blew up on a None.
+    fn var(name: &str) -> Option<String> {
+        let prefix = format!("{name}:");
+        FP5.lines()
+            .find(|l| l.starts_with(&prefix))
+            .map(|l| l[prefix.len()..].trim().to_string())
+    }
+
+    /// `getvar all` prints `has-slot:boot:yes`, so the value is everything
+    /// after the LAST colon.
+    fn has_slot_var(partition: &str) -> Option<bool> {
+        let key = format!("has-slot:{partition}");
+        FP5.lines()
+            .find(|l| l.starts_with(&key))
+            .and_then(|l| l.rsplit_once(':'))
+            .map(|(_, v)| v.trim().eq_ignore_ascii_case("yes"))
+    }
+
+    fn info() -> SlotInfo {
+        SlotInfo {
+            current: var("current-slot").and_then(|s| Slot::parse(&s)),
+            count: var("slot-count").and_then(|s| s.parse().ok()).unwrap_or(1),
+        }
+    }
+
+    #[test]
+    fn the_real_device_reports_a_slot_this_module_understands() {
+        let i = info();
+        assert_eq!(i.current, Some(Slot::A), "current-slot:a");
+        assert_eq!(i.count, 2);
+        assert!(i.is_ab());
+        assert_eq!(i.target(), Some(Slot::B), "the spare half");
+    }
+
+    #[test]
+    fn a_kernel_try_names_a_partition_the_device_actually_has() {
+        // The device lists partition-type for boot_a AND boot_b, both
+        // 0x6000000. So the name this plan produces is one that exists — the
+        // check that would have caught a suffix convention I had only inferred.
+        let plan = plan_kernel_try(&info(), "boot").unwrap();
+        assert_eq!(plan[0], SlotStep::Flash { partition: "boot_b".into() });
+        assert!(
+            FP5.contains("partition-size:boot_b"),
+            "the plan targets a partition the device enumerated"
+        );
+        // And it is NOT the running one.
+        assert!(!matches!(&plan[0], SlotStep::Flash { partition } if partition == "boot_a"));
+    }
+
+    #[test]
+    fn the_slotted_and_unslotted_asymmetry_is_real_and_not_a_hypothetical() {
+        // slots.rs asks the device rather than assuming, on the argument that
+        // some partitions are slotted and others are not on the same phone.
+        // The FP5 confirms it outright: has-slot:boot:yes, has-slot:system:no.
+        assert_eq!(has_slot_var("boot"), Some(true));
+        assert_eq!(has_slot_var("system"), Some(false));
+        assert_eq!(has_slot_var("modem"), Some(true));
+
+        assert_eq!(partition_for("boot", Some(Slot::B), true), "boot_b");
+        // Suffixing system would name something this device does not have.
+        assert_eq!(partition_for("system", Some(Slot::B), false), "system");
+    }
+
+    #[test]
+    fn the_download_buffer_is_smaller_than_a_rootfs_and_the_session_refuses() {
+        // max-download-size is 768 MiB. A postmarketOS rootfs is bigger than
+        // that, so the short-DATA refusal in session::upload is not a
+        // defensive hypothetical — it is the case that will fire the first
+        // time anyone flashes a full image, and the answer is sparse upload
+        // rather than a smaller write.
+        let max: u64 = var("max-download-size").unwrap().parse().unwrap();
+        assert_eq!(max, 805_306_368);
+        let boot_size = u64::from_str_radix(
+            var("partition-size:boot_a").unwrap().trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        // A boot image fits comfortably; that is why kernel work is the
+        // feature that works before sparse support exists.
+        assert!(boot_size < max, "boot is {boot_size} bytes, buffer is {max}");
+        assert_eq!(boot_size, 0x6000000, "96 MiB");
+    }
+
+    #[test]
+    fn this_is_the_bootloader_and_not_fastbootd() {
+        // is-userspace:no means bootloader fastboot, which is what handles
+        // physical partitions like boot_b. Logical partitions inside `super`
+        // would need fastbootd, and nothing here claims to do that.
+        assert_eq!(var("is-userspace").as_deref(), Some("no"));
+        assert_eq!(var("unlocked").as_deref(), Some("yes"), "flashing is permitted");
+        assert!(FP5.contains("partition-size:super"), "dynamic partitions exist");
+    }
+}

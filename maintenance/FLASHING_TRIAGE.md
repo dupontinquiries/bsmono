@@ -209,7 +209,43 @@ Every port tried landed on 3 or 7, and the driver name says why:
 So reaching bus 5 with a phone needs a **USB-A to USB-C cable**, not another
 USB-C port. Moving between USB-C ports can only ever produce another dwc3 bus.
 
-### The experiment that would make this reportable
+### CONFIRMED: it is the dwc3/ATC controller
+
+The experiment ran. A mini USB-A-male to USB-C-female adapter — the one that
+came with a mouse — put the phone on **bus 5 port 2**, the PCI `xhci_hcd`, and
+`fastboot getvar all` returned the complete variable list. Same phone, same
+cable, same kernel, same udev rules, same unprivileged user.
+
+```
+Bus 005.Port 001: Dev 001, Driver=xhci_hcd/2p, 480M
+    |__ Port 002: Dev 005, If 0, Class=Vendor Specific Class, Driver=[none]
+
+$ fastboot getvar all
+(bootloader) version-bootloader:FP5.VT2D.C.054.20250814
+(bootloader) current-slot:a
+(bootloader) slot-count:2
+... 400 lines
+```
+
+So the diagnosis is settled and it is narrow:
+
+* **Control transfers work on both controllers.** Enumeration, descriptors and
+  the serial in `fastboot devices` succeeded on dwc3 all along.
+* **Bulk transfers fail on dwc3/ATC and succeed on the PCI xHCI.** Two dwc3
+  instances (`xhci-hcd.1.auto`, `xhci-hcd.2.auto`) both returned ENOENT on the
+  first bulk write; the PCI controller does not.
+* Nothing about permissions, udev, groups, the browser, or the phone.
+
+**Workaround, available now:** flash through a rear USB-A port with an A-to-C
+adapter. Everything else on this machine can stay on USB-C.
+
+**The bug report:** on Apple Silicon under Asahi, the dwc3/ATC xHCI accepts
+control transfers to a fastboot device but returns ENOENT (`Write to device
+failed (No such file or directory)`) on the first bulk OUT, while a PCI xHCI on
+the same machine, kernel and cable works. `dmesg` during the failure would
+sharpen it further and is the one piece still missing.
+
+### The experiment that made this reportable
 
 `lsusb -t` shows two driver spellings on this machine: `xhci-hcd` on buses
 1/2/3/4/7/8 (platform, the dwc3 Type-C ports) and `xhci_hcd` on 5/6 (a

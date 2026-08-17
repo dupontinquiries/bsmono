@@ -1,0 +1,21 @@
+parallel-download-flash:yes
+unlocked:yes
+version-bootloader:FP5.VT2D.C.054.20250814
+erase-block-size: 0x1000
+logical-block-size: 0x1000
+variant:QCM UFS
+partition-type:boot_b:raw
+partition-size:boot_b: 0x6000000
+partition-type:boot_a:raw
+partition-size:boot_a: 0x6000000
+has-slot:modem:yes
+has-slot:system:no
+current-slot:a
+has-slot:boot:yes
+slot-count:2
+secure:yes
+serialno:c1146e6f
+product:FP5
+is-userspace:no
+max-download-size:805306368
+partition-size:super: 0x180000000
