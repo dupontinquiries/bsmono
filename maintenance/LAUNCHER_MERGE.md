@@ -63,9 +63,12 @@ exists to avoid.
 
 Ported in this order, each step independently testable:
 
-1. `launcher/icontheme.rs` → `hatch-core/icons.rs`. Both resolve icons; the
-   launcher's is the more complete implementation and its nine tests come
-   with it. Landing in core means the plasmoid can use it too.
+1. ~~`launcher/icontheme.rs` → `hatch-core/icons.rs`.~~ **Done.** Ported whole
+   with its nine tests, as `hatch-core/src/icontheme.rs`, and `icons::resolve`
+   now tries it first. The grid walk stays behind it as the fallback for
+   themes that ship no `index.theme` — the spec implementation cannot resolve
+   those at all, so replacing rather than layering would have lost a case.
+   hatch-core: 42 → 53 tests.
 2. `launcher/anim.rs` (the `Board`) → `hatch-core`, or a sibling crate if it
    pulls anything egui-shaped. It is already headless and tick-based, so it
    belongs beside the model rather than in a shell.
@@ -83,8 +86,12 @@ they could reproduce it.
 
 ## Status
 
-Both branches are fetched and preserved as refs so nothing is lost while this
-is decided:
+**hatch is merged** (`8444e17b`), clean, 42 core + 24 egui tests passing on
+the merged tree. Step 1 of the port is done. Steps 2-4 — the animation Board,
+the plasmoid config surface, and deleting `apps/launcher` — remain.
+
+`incoming/launcher` stays as a ref until they are, because it is still the
+only copy of that work:
 
 ```
 git log incoming/launcher     # apps/launcher

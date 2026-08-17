@@ -10,6 +10,7 @@
 pub mod entry;
 pub mod exec;
 pub mod icons;
+pub mod icontheme;
 pub mod plasma;
 pub mod rank;
 pub mod store;

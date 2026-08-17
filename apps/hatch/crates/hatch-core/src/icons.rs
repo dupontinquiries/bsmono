@@ -109,6 +109,16 @@ pub fn resolve(roots: &[PathBuf], theme: &str, name: &str, size_hint: u32) -> Op
         if s >= size_hint { (0, s - size_hint) } else { (1, size_hint - s) }
     });
 
+    // SPEC FIRST. icontheme reads each theme's index.theme and searches the
+    // directories it declares; the grid walk below only finds icons in themes
+    // shaped the way the grid guesses. Trying the spec path first means a
+    // theme with `scalable/apps` or any other legal layout resolves properly,
+    // and the grid stays as the fallback for themes that ship no index.theme
+    // at all — which exists, and which the spec implementation cannot serve.
+    if let Some(p) = crate::icontheme::find_icon(roots, theme, name, size_hint, 1) {
+        return Some(p);
+    }
+
     for t in theme_chain(roots, theme) {
         for root in roots {
             let troot = root.join(&t);
@@ -198,6 +208,39 @@ mod tests {
         touch(root.join("hicolor/scalable/apps/vec.svg"));
         let p = resolve(&[root.clone()], "hicolor", "vec", 64).unwrap();
         assert!(p.extension().unwrap() == "svg");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_theme_whose_layout_the_grid_cannot_guess_now_resolves() {
+        // The reason for porting icontheme in. This theme declares its
+        // directories in index.theme as `apps/48` — legal, used in the wild,
+        // and invisible to a hardcoded `48x48/apps` grid. Before the spec
+        // path went in front, this returned None.
+        let root = tree("indexed");
+        let theme = root.join("wonky");
+        std::fs::create_dir_all(&theme).unwrap();
+        std::fs::write(
+            theme.join("index.theme"),
+            "[Icon Theme]\nName=Wonky\nDirectories=apps/48\n\n\
+             [apps/48]\nSize=48\nType=Fixed\n",
+        )
+        .unwrap();
+        touch(theme.join("apps/48/firefox.png"));
+
+        let got = resolve(&[root.clone()], "wonky", "firefox", 48);
+        assert_eq!(got, Some(theme.join("apps/48/firefox.png")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_grid_still_serves_a_theme_with_no_index_file() {
+        // Kept as the fallback on purpose: themes that ship no index.theme
+        // exist, and the spec implementation cannot resolve them at all.
+        let root = tree("gridonly");
+        touch(root.join("plain/48x48/apps/thunderbird.png"));
+        let got = resolve(&[root.clone()], "plain", "thunderbird", 48);
+        assert_eq!(got, Some(root.join("plain/48x48/apps/thunderbird.png")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
