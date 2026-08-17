@@ -23,6 +23,8 @@ pub mod reroll;
 pub mod roster;
 /// A run in progress, folded from the event stream into what a UI draws.
 pub mod runview;
+/// Driving a fastboot exchange, with the wire behind a trait.
+pub mod session;
 /// A/B slots: flash a kernel to the spare half and keep a way back.
 pub mod slots;
 /// Preflight: does this device reach a udev rule that grants access?
