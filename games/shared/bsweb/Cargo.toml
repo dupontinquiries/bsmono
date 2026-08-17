@@ -7,4 +7,16 @@ description = "Reader for the BSWEB parts-web format: geometry stored once, refe
 [lib]
 path = "src/lib.rs"
 
+[features]
+# OFF by default. The crate's contract is that callers pass decompressed bytes
+# (see lib.rs) precisely so two engines with different toolchains are not each
+# forced to carry a decompressor they may already have. This feature is for a
+# caller that would otherwise write the same twenty lines.
+default = []
+zstd = ["dep:ruzstd"]
+
 [dependencies]
+# ruzstd rather than the zstd C bindings: pure Rust, no build script, no cc.
+# A crate meant to be linked by two engines with pinned toolchains should not
+# introduce a C dependency to save four megabytes.
+ruzstd = { version = "0.7", optional = true }

@@ -478,3 +478,28 @@ mod tests {
         assert!(w.by_sig("nope").is_none());
     }
 }
+
+/// Decompress a `.zst` container into the bytes [`Web::parse`] wants.
+///
+/// Behind the off-by-default `zstd` feature, because this crate's whole
+/// dependency argument is that a caller who already has a decompressor should
+/// not be handed a second one. It exists for the caller who does not.
+///
+/// The container choice is the file extension, decided in
+/// `games/blackstar/tools/build_web.py`: zstd lands at ~58% where gzip lands
+/// at ~65% on this payload, and — the half that matters at load time —
+/// decompresses several times faster. The payload inside is byte-identical
+/// either way, so a reader cannot tell which container it came from and
+/// nothing else in this crate changes.
+///
+/// Deliberately not tar.zst. A tar around one member costs a 512-byte header
+/// plus padding, and makes a reader walk a tar stream to reach the only thing
+/// in it.
+#[cfg(feature = "zstd")]
+pub fn decompress_zst(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut d = ruzstd::StreamingDecoder::new(bytes).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}

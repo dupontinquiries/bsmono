@@ -1,7 +1,7 @@
 //! Read the real web, not a fixture.
 //!
 //! The unit tests build a web by hand in the shape the Python writes. This one
-//! reads `catalog/parts_web_full.bin.gz` decompressed — 40,742 parts from 1,012
+//! reads `catalog/parts_web_full.bin.zst` decompressed — 40,742 parts from 1,012
 //! vehicles — because a hand-built fixture agrees with whatever the reader
 //! expects, and only the real artefact can disagree.
 //!
@@ -48,4 +48,35 @@ fn the_shipped_web_parses_and_decodes() {
     }
     assert_eq!(decoded, 400);
     assert!(named > 0, "the harvest's categories survived the round trip");
+}
+
+/// The `.zst` container, end to end: decompress, then parse the same web.
+///
+/// The point is not that ruzstd works — it is that the payload inside a `.zst`
+/// is the same payload as inside the `.gz`, so switching containers changes
+/// nothing a reader can observe. Skipped like its sibling when the file is
+/// absent, since the artefact lives outside this crate.
+#[cfg(feature = "zstd")]
+#[test]
+fn the_zst_container_yields_the_same_web() {
+    let Some(p) = std::env::var("BSWEB_TEST_FILE_ZST").ok() else {
+        eprintln!("BSWEB_TEST_FILE_ZST unset; skipping");
+        return;
+    };
+    let Ok(raw) = std::fs::read(&p) else {
+        eprintln!("{p} unreadable; skipping");
+        return;
+    };
+    let bytes = bsweb::decompress_zst(&raw).expect("zst decompresses");
+    let w = bsweb::Web::parse(&bytes).expect("the shipped web parses");
+    assert!(w.parts.len() > 1000, "parts: {}", w.parts.len());
+
+    // Decode a sample, exactly as the gz test does — same assertions, so a
+    // divergence between containers would show up as one of these failing.
+    for part in w.parts.iter().take(400) {
+        let v = w.vertices(part).expect("vertices decode");
+        let t = w.triangles(part).expect("triangles decode");
+        assert_eq!(v.len(), part.nv);
+        assert_eq!(t.len(), part.nt);
+    }
 }
