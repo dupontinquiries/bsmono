@@ -135,9 +135,86 @@ pmbootstrap that matter for this workflow are image *building*, which is slow,
 correct, and not the thing causing pain. Revisit only if image building
 becomes the bottleneck.
 
-## Status
+## MEASURED: it is the controller, not udev
 
-Unverified from here — this sandbox has no USB device, so the triage above is
-a procedure to run, not a result. What IS established: the pmOS web flasher's
-Linux failure is a documented permissions issue with a documented workaround,
-and the project hosting it is archived.
+The triage was run on the Asahi box against a Xiaomi in fastboot. I predicted
+udev. I was wrong, and the evidence is unambiguous.
+
+**udev granted access.** `udevadm test` on the device node:
+
+```
+7-1: /usr/lib/udev/rules.d/73-seat-late.rules:16 RUN{builtin}+="uaccess"
+  CURRENT_TAGS=:seat:uaccess:
+  ID_MODEL_FROM_DATABASE=Xiaomi Mi/Redmi 2 (fastboot)
+  adb_user=yes  adb_fast=yes
+```
+
+The device matched `ATTR{idProduct}=="d00d"` in the Google block, which has a
+working path — the Fairphone dead-end I predicted is real in that file but
+this device never entered that block. And `fastboot devices` as an unprivileged
+user lists the serial. Permissions were never the problem.
+
+**The failure is one layer lower.**
+
+```
+$ fastboot devices
+c1146e6f         fastboot
+$ fastboot getvar all
+getvar:all   FAILED (Write to device failed (No such file or directory))
+$ sudo fastboot getvar all
+getvar:all   FAILED (Write to device failed (No such file or directory))
+```
+
+Root fails identically, so this is not access. And the two commands differ in
+transfer type: `fastboot devices` prints a serial, which comes from a string
+descriptor — a CONTROL transfer, and it works. `getvar` is the first BULK
+write, and it fails with ENOENT, the kernel's way of saying the endpoint is
+not there.
+
+Control transfers succeed, bulk transfers do not. That is an endpoint
+configuration problem in the host controller, and the device path names which
+one:
+
+```
+/sys/devices/platform/soc@200000000/f02280000.usb/xhci-hcd.2.auto/usb7/7-1
+```
+
+`f02280000.usb` → the Apple ATC dwc3 behind a Type-C port.
+
+### The experiment that would make this reportable
+
+`lsusb -t` shows two driver spellings on this machine: `xhci-hcd` on buses
+1/2/3/4/7/8 (platform, the dwc3 Type-C ports) and `xhci_hcd` on 5/6 (a
+different controller). Reaching bus 5 — USB-A, a dock, or a powered USB 2.0
+hub in between — and re-running `fastboot getvar all` splits the hypothesis:
+
+* **Works there, fails on bus 7** → a dwc3/ATC bulk-endpoint bug. Controller
+  specific, a clean upstream report, and a workaround available immediately.
+* **Fails on both** → higher up, and the 16K page size Asahi runs is the first
+  thing to suspect; xHCI has been fragile about non-4K pages.
+
+`sudo dmesg -w` during the failing command should name the mechanism outright.
+
+### What this changes
+
+The udev preflight (`cockpit::udevcheck`) stays — it is correct, and the
+Fairphone dead-end it detects is genuinely in that file waiting for an FP5
+with an unlisted product id. But it is now a preflight that rules out the
+cheap explanation rather than the fix for this machine, and the wizard cannot
+patch a controller that will not do bulk transfers.
+
+One real secondary finding, from the same output:
+
+```
+/etc/udev/rules.d/51-android.rules:1076 Unknown group 'adbusers', ignoring.
+```
+
+Fedora's packaging does not create that group, so the rule's `GROUP=` is
+dropped. `uaccess` saved it here because there is a local seat — but over ssh,
+with no seat, there would be no ACL and no group, and access would fail for a
+reason that has nothing to do with the phone. Worth the wizard checking.
+
+### Still true from before
+
+The pmOS web flasher's Linux failure is a documented permissions issue with a
+documented workaround, and the project hosting it is archived.
