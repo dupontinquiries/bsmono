@@ -6,6 +6,8 @@
 //! answer: a pure command model + a filesystem scan.
 
 pub mod matrix;
+/// The repo as facts and operators: a plan over these can be checked, not just run.
+pub mod state;
 use std::path::Path;
 
 /// How a crate is built.
