@@ -341,15 +341,16 @@ impl Battleground {
     /// fought over broken country — ridgelines, deeper draws, real relief — using
     /// the same per-mode terrain-pool knob prowl already rolls (house idiom, held
     /// under the terrain lock like every other mode's bake).
-    pub const MOUNTAIN_BIAS: f32 = 1.6;
+    pub const MOUNTAIN_BIAS: f32 = 1.35;
     /// Paired with the bias: lift the land so craggier does not mean *wetter* —
     /// the deepened basins drain back to marshes and draws, the carved river stays.
-    pub const LAND_LIFT: f32 = 1.3;
+    pub const LAND_LIFT: f32 = 1.2;
 
     pub fn new_draft(picks_a: [Ancestor; 3], picks_b: [Ancestor; 3]) -> Battleground {
         let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::set_terrain_pool(Self::MOUNTAIN_BIAS, 1);
         world::set_land_lift(Self::LAND_LIFT);
+        world::set_river_course(world::RIVER_U_EAST);   // the U on the solo-lane side; the camp line stays dry
         world::init_world();
         let camps = [land_near(CAMP_ANCHOR[0].0, CAMP_ANCHOR[0].1), land_near(CAMP_ANCHOR[1].0, CAMP_ANCHOR[1].1)];
         drop(_terrain_guard);
@@ -379,7 +380,7 @@ impl Battleground {
             // two fishing runs, sought from mirrored anchors so neither clan's side
             // of the river eats better by construction
             let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            for anchor in [(-40.0, 40.0), (40.0, -40.0)] {
+            for anchor in [(60.0, -110.0), (110.0, -60.0)] {   // the U's two arms, mirrored across the anti-diagonal
                 if let Some((fx, fz)) = world::nearest_water(anchor, 100.0) {
                     prey.push(Prey { x: fx, z: fz, home: (fx, fz), kind: PreyKind::Fish, hp: PreyKind::Fish.hp(), respawn_t: 0.0 });
                 }
@@ -1737,6 +1738,45 @@ mod tests {
         bg2.warriors[0].is_player = false;
         bg2.cast(0, 1);   // Noon Blaze
         assert!(bg2.zones.iter().all(|z| !z.mend));
+    }
+
+    #[test]
+    fn the_river_bows_around_the_solo_lane_and_the_camp_line_stays_dry() {
+        // hold the terrain lock for the whole test so no parallel bake swaps the
+        // world out from under the sampling
+        let _guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        world::set_terrain_pool(Battleground::MOUNTAIN_BIAS, 1);
+        world::set_land_lift(Battleground::LAND_LIFT);
+        world::set_river_course(world::RIVER_U_EAST);
+        world::init_world();
+        // the line between the two Great Trees: dry the whole march
+        for k in 1..20 {
+            let t = -100.0 + k as f32 * 10.0;
+            assert!(world::height_at(t, t) > world::WATER_Y,
+                "the camp-to-camp line must not be a river: wet at ({t:.0},{t:.0})");
+        }
+        // the U itself holds water on both arms and at the bottom of the bend
+        let on_arc = |ang: f32| {
+            (world::U_RIVER_C.0 + ang.cos() * world::U_RIVER_R,
+             world::U_RIVER_C.1 + ang.sin() * world::U_RIVER_R)
+        };
+        let mut wet = 0;
+        for k in 0..24 {
+            let a = std::f32::consts::PI * (0.5 + k as f32 / 24.0);   // the map-side half of the circle
+            let (x, z) = on_arc(a);
+            if x.abs() > 148.0 || z.abs() > 148.0 { continue; }
+            if world::U_FORDS.iter().any(|f| dist(x, z, f.0, f.1) < world::FORD_R + 3.0) { continue; }
+            if world::height_at(x, z) < world::WATER_Y { wet += 1; }
+        }
+        assert!(wet >= 6, "the U-bend should hold real water along its course (wet {wet})");
+        // and each ford is a paw-deep crossing: dry gravel where the trail meets it
+        for &(fx, fz) in &world::U_FORDS {
+            assert!(world::height_at(fx, fz) > world::WATER_Y,
+                "the ford at ({fx:.0},{fz:.0}) must be crossable dry-pawed");
+        }
+        // restore the default spec for whoever bakes next
+        world::set_terrain_pool(1.0, 1);
+        world::init_world();
     }
 
     #[test]

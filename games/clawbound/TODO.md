@@ -119,6 +119,23 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   nothing, by test). Passive The Seated Mountain: stillness gathers up to +50% strike,
   spent the moment he moves (per-tick seat tracking). Cloud Breath slow, The Ninth Thunder
   fear ult. Ranged breath (8 reach, thin pelt) — ranged-kit count test now 3.
+- [x] The river re-routed off the camp line (Smite-conquest shape): `world::set_river_course`
+  joins the terrain-pool opt-ins (pool selection resets it, same contract as lift). The
+  battleground's `RIVER_U_EAST`: a U-shaped bend bowed around the solo lane's territory,
+  centred on the **anti-diagonal** — the map's second clan-swapping symmetry, which keeps
+  the clans equal while letting the lanes differ (river solo side, dry duo side). Two
+  paw-deep **fords** (gravel bars, rendered) where the east trail crosses; fishing runs
+  moved to the U's two mirrored arms. The centre-lake bowl in raw_height turned out to be
+  meander-course geometry and moves with the course; the camp line is dry **by landform**
+  — a raised causeway, "the old high trail" — not by luck of the noise (a −4.5m pocket
+  proved lift alone can't guarantee it). Locked-terrain test asserts dry camp line, wet U,
+  dry fords.
+- [x] Biomes classify on the land's *shape* (lift-corrected height), shoreline on the true
+  waterline — without this, +1.2m of lift reclassified most of the map as bare mountain
+  stone (two renders' worth of moonscape to find it).
+- [x] Walls carved by wind and water: stacked strata narrowing as they rise, grey/rust
+  banding, hoodoo spires with capstones off the crest, the pass a worn notch with
+  shoulder stones — roughly double the height, true sight blockers in silhouette.
 - [ ] Landform-carved heightfield (walls/crags as real terrain relief rather than placed
   slabs) would need a per-mode heightfield overlay in world — a bigger seam, deferred
 - [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes

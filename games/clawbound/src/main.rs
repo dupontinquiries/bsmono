@@ -757,15 +757,41 @@ fn build_battle() -> (Mesh, Vec3) {
         }
     }
     for w in junglemap::walls() {
-        // broken stone slabs along the solid spans; the pass stays open
-        for k in 0..14 {
-            let t = k as f32 / 13.0;
-            if t > junglemap::PASS.0 && t < junglemap::PASS.1 { continue; }
+        // wind-and-water-carved stone: stacked strata narrowing as they rise, the
+        // banding alternating pale and rust the way old sandstone weathers, with
+        // hoodoo spires standing off the crest — real height, a true sight blocker.
+        // The pass reads as a worn notch: low rounded shoulders, open ground between.
+        for k in 0..17 {
+            let t = k as f32 / 16.0;
+            let in_pass = t > junglemap::PASS.0 && t < junglemap::PASS.1;
             let (wx, wz) = (w.ax + (w.bx - w.ax) * t, w.az + (w.bz - w.az) * t);
             let gy = world::height_at(wx, wz);
-            let h = 3.2 + jr() * 1.6;
-            m.boxx(v3(wx + (jr() - 0.5), gy + h * 0.5, wz + (jr() - 0.5)),
-                v3(1.8 + jr(), h * 0.5, 1.8 + jr()), shade(rgb(0x8b8d92), 0.8 + jr() * 0.35));
+            if in_pass {
+                // the notch's floor: worn shoulder stones only
+                if jr() > 0.5 {
+                    m.boxx(v3(wx, gy + 0.5, wz), v3(1.3, 0.5, 1.3), shade(rgb(0x9a9288), 0.9));
+                }
+                continue;
+            }
+            // strata: 4 layers, each narrower and paler/rustier than the last
+            let base_w = 2.6 + jr() * 0.8;
+            let mut y = gy;
+            let layers = 4;
+            for l in 0..layers {
+                let f = 1.0 - l as f32 * 0.18;
+                let lh = 1.5 + jr() * 0.9;
+                let band = if l % 2 == 0 { rgb(0x8b8d92) } else { rgb(0xa8917a) };   // grey / rust banding
+                m.boxx(v3(wx + (jr() - 0.5) * 0.8, y + lh * 0.5, wz + (jr() - 0.5) * 0.8),
+                    v3(base_w * f, lh * 0.5, base_w * f), shade(band, 0.82 + jr() * 0.3));
+                y += lh * 0.92;   // slight overlap so the stack reads as one mass
+            }
+            // every few stations a hoodoo spire stands off the crest
+            if k % 3 == 0 {
+                let sh = 3.0 + jr() * 2.5;
+                m.cone(v3(wx + (jr() - 0.5) * 2.0, y, wz + (jr() - 0.5) * 2.0),
+                    1.0 + jr() * 0.5, sh, 7, shade(rgb(0xa8917a), 0.9 + jr() * 0.25));
+                m.cone(v3(wx, y + sh * 0.4, wz), 0.5, 1.4, 5, rgb(0x8b8d92));   // the capstone
+            }
         }
     }
     for mi in junglemap::mists() {
@@ -818,6 +844,19 @@ fn build_battle() -> (Mesh, Vec3) {
     m.set_op(0.3);
     m.cone(v3(g.contention.0, world::height_at(g.contention.0, g.contention.1) + 0.25, g.contention.1), 20.0, 0.2, 28, rgb(0xffd24a));
     m.set_op(1.0);
+    // the fords: pale gravel bars where the east trail crosses the river
+    for &(fx, fz) in &world::U_FORDS {
+        let gy = world::height_at(fx, fz).max(world::WATER_Y);
+        m.set_op(0.85);
+        m.cone(v3(fx, gy + 0.15, fz), 7.0, 0.3, 18, rgb(0xc9bda4));
+        m.set_op(1.0);
+        for _ in 0..6 {
+            let a = jr() * std::f32::consts::TAU;
+            let d = jr().sqrt() * 6.0;
+            m.boxx(v3(fx + a.cos() * d, gy + 0.35, fz + a.sin() * d), v3(0.4, 0.25, 0.4), rgb(0xb0a58c));
+        }
+    }
+
     // scorched ground still burning; sweet rain still falling
     for z in &g.zones {
         let gy = world::height_at(z.x, z.z);
