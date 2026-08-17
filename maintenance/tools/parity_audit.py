@@ -157,6 +157,58 @@ def surfaces(app_dir):
              if 'Test' not in n and 'Harness' not in n and not n.endswith('Tests')}
     return found
 
+def engine_link(app_dir, pdirs):
+    """Does the port link this app's OWN engine crates?
+
+    The column the audit was missing, and the one that explains an app scoring
+    100% while doing nothing. `named`, `code` and `live` all ask whether a
+    SURFACE is reachable — whether some file mentions it and something calls
+    that file. None asks whether the port is connected to the thing the app
+    actually does.
+
+    bo-suite is the case that motivated it: 47 surfaces, 100% named, 396 tests,
+    and its egui frontend depends on config-kit and three UI kits — not
+    bo-core, not bo-mux, not bo-controller. It renders the whole application
+    and cannot cancel a single decibel, because the ANC engine is not in its
+    dependency graph.
+
+    An app with no sibling crates returns (None, None) — n/a rather than
+    passing, since there is nothing to link and a clean result would be a
+    false clean bill.
+    """
+    sibs = []
+    for name in sorted(os.listdir(app_dir)):
+        sub = os.path.join(app_dir, name)
+        manifest = os.path.join(sub, "Cargo.toml")
+        if not os.path.isdir(sub) or not os.path.isfile(manifest):
+            continue
+        if any(os.path.abspath(sub) == os.path.abspath(pd) for pd in pdirs):
+            continue
+        try:
+            txt = open(manifest, encoding="utf-8", errors="ignore").read()
+        except OSError:
+            continue
+        m = re.search(r'(?m)^name\s*=\s*"([^"]+)"', txt)
+        if m:
+            sibs.append(m.group(1))
+    if not sibs:
+        return None, None
+    linked, missing = [], []
+    for pd in pdirs:
+        try:
+            dep_txt = open(os.path.join(pd, "Cargo.toml"),
+                           encoding="utf-8", errors="ignore").read()
+        except OSError:
+            continue
+        for pkg in sibs:
+            stem = re.escape(pkg).replace(r"\-", "[-_]")
+            if re.search(r"(?m)^\s*" + stem + r"\s*=", dep_txt):
+                linked.append(pkg)
+            else:
+                missing.append(pkg)
+    return sorted(set(linked)), sorted(set(missing) - set(linked))
+
+
 def port_dirs(app_dir):
     """Where an egui port might live.
 
@@ -423,6 +475,7 @@ def main():
             "bin": has_bin, "app_default": app_default,
             "manifest": in_man, "primary": primary, "role": role,
             "missing": sorted(surf - hit)[:8],
+            "engine": engine_link(d, port_dirs(d)),
         })
     w = max(len(r["app"]) for r in rows) if rows else 10
     print(f"{'app':<{w}}  {'surfaces':>8} {'named':>6} {'%':>4} {'code':>5} {'%':>4} "
@@ -439,6 +492,14 @@ def main():
             print(f"{r['app']}: next surfaces — {', '.join(r['missing'][:6])}")
     # Named but not reachable: written and never connected, which is a
     # different job from porting and usually a much smaller one.
+    # Reported separately because it is a different failure from an unported
+    # surface: the port is COMPLETE and inert.
+    for r in rows:
+        linked, missing = r.get("engine", (None, None))
+        if missing:
+            tail = (" (links " + ", ".join(linked) + ")") if linked else " (links none)"
+            print(r["app"] + ": NOT LINKED to its own engine — "
+                  + ", ".join(missing[:6]) + tail)
     for r in rows:
         if r.get("stranded"):
             print(f"{r['app']}: STRANDED (named, nothing live mentions it) — "
