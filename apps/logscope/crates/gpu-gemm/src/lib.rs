@@ -12430,8 +12430,16 @@ struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,sl:u32,bcz:u3
 var<workgroup> sc: array<f32,2048>;
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let row=wg.x;                                       // which (query row, head) this workgroup handles
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(local_invocation_id) lid:vec3<u32>){
+  // FLAT INDEX ACROSS X AND Y. One workgroup per (query row, head) means s*nh
+  // workgroups, and a 6905-token prefill on a 32-head model is 220,960 — past
+  // the 65535 per-dimension limit, which wgpu drops as a NON-FATAL validation
+  // error, leaving the attention output stale. Reading num_workgroups lets the
+  // caller spill the count into y; when it does not, nwg.x is the whole grid
+  // and this is arithmetically identical to the old `wg.x`.
+  let row=wg.x + wg.y*nwg.x;
+  if (row >= dd.s*dd.nh) { return; }                  // spilled grids overshoot
   let i=row/dd.nh; let hh=row%dd.nh; let tid=lid.x;
   let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
   let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;   // GQA: query head -> shared KV head
@@ -13061,6 +13069,18 @@ pub fn timestep_embedding(t: f32, dim: usize, max_period: f32) -> Vec<f32> {
 /// Workgroup grid for a 1-D dispatch of `n_elems` (workgroup_size 64), splitting the
 /// count across the y dimension when the x count would exceed the 65535 per-dim limit.
 /// Shaders using this compute their flat index as `g.y * nwg.x * 64 + g.x`.
+/// The grid for a kernel where ONE WORKGROUP IS ONE ROW (attention over
+/// (query row, head) pairs), rather than one workgroup per 64 elements.
+///
+/// Split out from the dispatch site so the limit can be tested without a GPU.
+/// The bug it fixes was live: a 6905-token prefill on a 32-head model asks for
+/// 220,960 workgroups, and wgpu drops an over-limit dispatch as a NON-FATAL
+/// validation error — the attention output silently keeps its previous
+/// contents. It panics now, and with this spill it does not have to.
+pub fn row_grid(rows: u32) -> (u32, u32, u32) {
+    if rows <= 65535 { (rows, 1, 1) } else { (65535, rows.div_ceil(65535), 1) }
+}
+
 fn wg1(n_elems: u32) -> (u32, u32, u32) {
     let wg = n_elems.div_ceil(64);
     if wg <= 65535 { (wg, 1, 1) } else { (65535, wg.div_ceil(65535), 1) }
@@ -13502,7 +13522,12 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         // register accumulator holds ceil(hd/64) head-dim cols, so it's valid for hd<=192 (head_dim=128
         // → 2 cols). For the rare hd>192 model, fall back to the serial kernel (correct, slow).
         if hd <= 192 {
-            self.dispatch(ATTENTION_MH_EXT_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((s * n_heads) as u32, 1, 1));
+            // Spilled into y when the row count exceeds one dimension. wg1()
+            // divides by 64 for elementwise kernels; here a workgroup IS a
+            // row, so the same spill shape is applied without that divide.
+            let rows = (s * n_heads) as u32;
+            let grid = row_grid(rows);
+            self.dispatch(ATTENTION_MH_EXT_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), grid);
         } else {
             self.dispatch(ATTENTION_MH_EXT, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), (((s * n_heads) as u32).div_ceil(64), 1, 1));
         }
@@ -20367,6 +20392,46 @@ mod fusion_does_not_submit {
         assert_eq!(want.len(), got.len());
         for (i, (x, y)) in want.iter().zip(&got).enumerate() {
             assert!((x - y).abs() <= 1e-9 * x.abs().max(1.0), "block {i}: {y} != {x}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_grid_tests {
+    use super::row_grid;
+
+    /// The exact crash from the field: a 6905-token prefill on a 32-head model.
+    #[test]
+    fn the_prefill_that_crashed_now_fits() {
+        let rows = 6905u32 * 32;
+        assert_eq!(rows, 220_960, "the number from the panic");
+        let (x, y, z) = row_grid(rows);
+        assert!(x <= 65535 && y <= 65535 && z <= 65535, "grid {x},{y},{z} still over");
+        // Every row must be covered — a spill that lost rows would silently
+        // drop attention for them, which is the same failure class as the
+        // dropped dispatch, only harder to see.
+        assert!(x as u64 * y as u64 >= rows as u64);
+    }
+
+    #[test]
+    fn small_grids_are_unchanged_so_nothing_else_moves() {
+        // Below the limit the shape is identical to what it always was, which
+        // is why the kernel's flat index is arithmetically the same there.
+        for rows in [1u32, 64, 2048, 65535] {
+            assert_eq!(row_grid(rows), (rows, 1, 1));
+        }
+    }
+
+    #[test]
+    fn the_spill_covers_every_row_at_the_boundary() {
+        for rows in [65536u32, 65537, 131_070, 220_960, 4_294_000] {
+            let (x, y, _) = row_grid(rows);
+            assert!(x <= 65535 && y <= 65535, "{rows} -> {x},{y}");
+            assert!(x as u64 * y as u64 >= rows as u64, "{rows} not covered");
+            // And not wildly over-dispatched: the kernel bounds-checks, but a
+            // grid twice the needed size is wasted occupancy.
+            let cells = x as u64 * y as u64;
+            assert!(cells < rows as u64 + 65535);
         }
     }
 }
