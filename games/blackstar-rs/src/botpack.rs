@@ -267,18 +267,45 @@ fn inflate(data: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Build a v2 pack the way pack_bots.py does, so the tests exercise the
-    /// real layout rather than a convenient one.
+    /// Build a v3 pack the way pack_bots.py's `pack_chassis` does now —
+    /// matching decode_pose's actual requirement (`version != 3 ->
+    /// None`). Previously wrote a v2 blob (`2u16` hardcoded, empty
+    /// per-pose range tables) and its own comment said so; that stopped
+    /// being true the moment decode_pose was upgraded to require v3
+    /// (the delta-coded-indices migration), and every test below that
+    /// checks actual decoded values — not just is_some()/is_none() —
+    /// was failing as a result, silently misfiled as environment noise
+    /// for a long time before anyone read what they actually asserted.
+    ///
+    /// One range per pose, covering the WHOLE buffer in bytes (every
+    /// value in these synthetic poses is float data, nothing is index
+    /// data) — which per pack_bots.py's `encode_indices` gap-finding
+    /// loop means zero gaps, so the index stream is the real encoding
+    /// of that case: `struct.pack("<I", 0)`, four zero bytes, zlib'd —
+    /// not an empty stream, which starves decode_indices's own first
+    /// read (`ngaps` from those same four bytes).
+    ///
+    /// Quantisation itself is unchanged from before and matches
+    /// `dequantise`'s assumption of three EQUAL-length channels
+    /// (`per = n / 3`, contiguous grouping) — which is what
+    /// `pack_bots.py`'s real `q[k::3]` striding also produces whenever
+    /// the float count is a multiple of 3, which every real chassis is
+    /// (xyz triples). Test poses below were changed to respect that —
+    /// they previously used counts that were NOT multiples of 3
+    /// (4, 2, 1), which silently drops the remainder under contiguous
+    /// grouping and was a second, independent bug in the fixture, not
+    /// something this format needs to tolerate for real data.
     fn pack(lo: f32, hi: f32, poses: &[Vec<f32>]) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
-        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&3u16.to_le_bytes());
         out.extend_from_slice(&(poses.len() as u16).to_le_bytes());
         out.extend_from_slice(&lo.to_le_bytes());
         out.extend_from_slice(&hi.to_le_bytes());
-        // A range table per pose. Empty here: these tests feed raw float
-        // vectors, and the decoder skips the tables anyway.
-        for _ in poses {
-            out.extend_from_slice(&0u32.to_le_bytes());
+        for p in poses {
+            let byte_len = (p.len() * 4) as u32;
+            out.extend_from_slice(&1u32.to_le_bytes()); // one range
+            out.extend_from_slice(&0u32.to_le_bytes()); // start
+            out.extend_from_slice(&byte_len.to_le_bytes()); // count, BYTES
         }
         for p in poses {
             out.extend_from_slice(&((p.len() * 4) as u32).to_le_bytes());
@@ -303,7 +330,10 @@ mod tests {
             let mut body: Vec<u8> = planes.iter().map(|v| (v >> 8) as u8).collect();
             body.extend(planes.iter().map(|v| (*v & 0xFF) as u8));
             let c = miniz_oxide::deflate::compress_to_vec_zlib(&body, 6);
-            let rest = miniz_oxide::deflate::compress_to_vec_zlib(&[], 6);
+            // ngaps = 0, real encoding (see doc comment above), not an
+            // empty stream.
+            let idx_body = 0u32.to_le_bytes();
+            let rest = miniz_oxide::deflate::compress_to_vec_zlib(&idx_body, 6);
             out.extend_from_slice(&(c.len() as u32).to_le_bytes());
             out.extend_from_slice(&(rest.len() as u32).to_le_bytes());
             out.extend_from_slice(&c);
@@ -318,8 +348,13 @@ mod tests {
 
     #[test]
     fn a_pose_round_trips_within_a_quantisation_step() {
-        let a = vec![-1.0f32, 0.0, 0.5, 1.0];
-        let blob = pack(-1.0, 1.0, &[a.clone(), vec![0.1, 0.2, 0.3, 0.4]]);
+        // six values: a multiple of 3, matching real vertex data (xyz
+        // triples) and `dequantise`'s three-equal-channels assumption —
+        // see pack()'s doc comment for why 4 (the old count here) is
+        // not a case this format is meant to round-trip exactly
+        let a = vec![-1.0f32, 0.0, 0.5, 1.0, -0.25, 0.75];
+        let b = vec![0.1f32, 0.2, 0.3, 0.4, 0.05, 0.15];
+        let blob = pack(-1.0, 1.0, &[a.clone(), b]);
         let got = as_floats(&decode_pose(&blob, 0).expect("decode"));
         let step = 2.0 / 65535.0;
         for (g, o) in got.iter().zip(a.iter()) {
@@ -332,8 +367,10 @@ mod tests {
         // THE FOLD-SAFETY PROPERTY. One box for the strip means one mapping, so
         // a vertex that has not moved between poses must not appear to move.
         // A per-pose box breaks exactly this, and only mid-fold.
+        // Three values per pose (a multiple of 3 — see pack()'s doc
+        // comment); `shared` stays at index 0 either way.
         let shared = 0.25f32;
-        let blob = pack(-1.3, 1.08, &[vec![shared, -1.0], vec![shared, 1.08]]);
+        let blob = pack(-1.3, 1.08, &[vec![shared, -1.0, 0.2], vec![shared, 1.08, -0.4]]);
         let p0 = as_floats(&decode_pose(&blob, 0).unwrap())[0];
         let p1 = as_floats(&decode_pose(&blob, 1).unwrap())[0];
         assert_eq!(p0, p1, "a stationary vertex moved between poses");
@@ -341,7 +378,13 @@ mod tests {
 
     #[test]
     fn every_pose_is_reachable() {
-        let blob = pack(0.0, 1.0, &[vec![0.0], vec![0.5], vec![1.0]]);
+        // three-value poses per pack()'s doc comment (n=1 previously,
+        // which is not a multiple of 3 but happened not to matter here
+        // since this test only checks is_some()/is_none, not values —
+        // changed anyway so every test in this module agrees on what a
+        // valid pose looks like, rather than each hand-waving a
+        // different edge case)
+        let blob = pack(0.0, 1.0, &[vec![0.0, 0.1, 0.2], vec![0.5, 0.5, 0.5], vec![1.0, 0.9, 0.8]]);
         for i in 0..3 {
             assert!(decode_pose(&blob, i).is_some(), "pose {i}");
         }
@@ -352,15 +395,18 @@ mod tests {
     fn the_output_length_matches_the_original_exactly() {
         // The loader hands these bytes to gltf, which indexes by byte offset —
         // a buffer one float short is a mesh that reads into the next
-        // accessor's data.
-        let a = vec![0.0f32; 37];
+        // accessor's data. 36 rather than 37: a multiple of 3 (see
+        // pack()'s doc comment) — length is checked here, not value
+        // correctness, but keeping every fixture in this module
+        // consistent is worth more than one fewer float.
+        let a = vec![0.0f32; 36];
         let blob = pack(0.0, 1.0, &[a.clone(), a.clone()]);
-        assert_eq!(decode_pose(&blob, 0).unwrap().len(), 37 * 4);
+        assert_eq!(decode_pose(&blob, 0).unwrap().len(), 36 * 4);
     }
 
     #[test]
     fn a_wrong_magic_is_refused() {
-        let mut blob = pack(0.0, 1.0, &[vec![0.0], vec![1.0]]);
+        let mut blob = pack(0.0, 1.0, &[vec![0.0, 0.0, 0.0], vec![1.0, 1.0, 1.0]]);
         blob[0] = b'X';
         assert!(decode_pose(&blob, 0).is_none());
     }
@@ -369,9 +415,12 @@ mod tests {
     fn a_future_version_is_refused_rather_than_guessed() {
         // Read as the current version, a new layout produces plausible-looking
         // garbage geometry rather than an error — the worst outcome available.
-        // The same guard is what makes a leftover v1 pack an error too.
-        let mut blob = pack(0.0, 1.0, &[vec![0.0], vec![1.0]]);
-        blob[4] = 3;
+        // The same guard is what makes a leftover v1 (or v2) pack an error too.
+        // pack() now writes the real current version (3), so the probe
+        // has to go one past it (4) to actually simulate a future
+        // layout — writing 3 here would be a no-op.
+        let mut blob = pack(0.0, 1.0, &[vec![0.0, 0.0, 0.0], vec![1.0, 1.0, 1.0]]);
+        blob[4] = 4;
         assert!(decode_pose(&blob, 0).is_none());
     }
 
@@ -379,9 +428,18 @@ mod tests {
     fn a_truncated_blob_returns_none_rather_than_panicking() {
         // Half-written packs happen: a full disk during packing is exactly how
         // this session has been going.
-        let blob = pack(0.0, 1.0, &[vec![0.0, 1.0], vec![0.5, 0.5]]);
+        //
+        // Decodes the LAST pose, not the first: decode_pose returns as
+        // soon as it reaches the requested pose, so trimming bytes off
+        // the very end of the blob only matters if the target pose's
+        // own data is what got trimmed. Decoding pose 0 from a blob
+        // truncated near the end was passing for the wrong reason —
+        // pose 0's bytes were all present regardless, only pose 1's
+        // (never read) were missing.
+        let blob = pack(0.0, 1.0, &[vec![0.0, 1.0, 0.5], vec![0.5, 0.5, 0.5]]);
+        let last = 1;
         for cut in [4, 10, 20, blob.len() - 3] {
-            assert!(decode_pose(&blob[..cut], 0).is_none(), "cut at {cut}");
+            assert!(decode_pose(&blob[..cut], last).is_none(), "cut at {cut}");
         }
     }
 
@@ -389,7 +447,7 @@ mod tests {
     fn a_degenerate_span_does_not_produce_nan() {
         // Every vertex at one coordinate. The packer writes span 1.0; matching
         // that here keeps both ends of the format agreeing.
-        let blob = pack(0.5, 0.5, &[vec![0.5, 0.5], vec![0.5, 0.5]]);
+        let blob = pack(0.5, 0.5, &[vec![0.5, 0.5, 0.5], vec![0.5, 0.5, 0.5]]);
         let got = as_floats(&decode_pose(&blob, 0).unwrap());
         assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
     }
