@@ -23,12 +23,13 @@ pub enum Ancestor {
     CaveLion,   // Oldroar, the Ice Age hulk — the more it bleeds, the harder it smashes
     Smilodon,   // Twofang, the saber-toothed executioner of the elder dawn
     SunCat,     // Suneye, the desert sun-priest — the old sun-god fantasy, wild-born
+    Suanni,     // Stillsmoke, the ninth son of the storm-dragon — the seated colossus
 }
 
-pub const ALL: [Ancestor; 12] = [
+pub const ALL: [Ancestor; 13] = [
     Ancestor::Lion, Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther, Ancestor::Caracal,
     Ancestor::Puma, Ancestor::Serval, Ancestor::CaveLion, Ancestor::Smilodon, Ancestor::SunCat,
-    Ancestor::Lynx, Ancestor::Jaguar,
+    Ancestor::Lynx, Ancestor::Jaguar, Ancestor::Suanni,
 ];
 
 /// What an ability *does* when the sim fires it. One mechanic per kind keeps the
@@ -50,6 +51,9 @@ pub enum Verb {
               // setup move: gather a scattered fight into one spot
     Execute,  // a killing strike whose bite grows with the target's missing strength
     Zone,     // scorch the ground for `dur`: enemies inside burn and the veil is seared away
+    Rain,     // call sweet rain over the ground for `dur`: allies inside are mended —
+              // and so is *wood*: Heal Trees and the Great Tree drink it too, the
+              // roster's one way to knit a gnawed sanctuary back together
 }
 
 #[derive(Clone, Copy)]
@@ -273,6 +277,34 @@ pub fn kit(a: Ancestor) -> Kit {
             ult: AbilitySpec { name: "The River Takes", desc: "the flood answers — the whole fight is dragged to one drowning point, battered together",
                 verb: Verb::Pull, power: 2.0, range: 13.0, dur: 0.0, cd: 58.0 },
         },
+        // ── Stillsmoke — the ninth son of the storm-dragon ─────────────────────
+        // Out of the far-east thunder mountains, where the elders say the great
+        // storm-dragon of the river sky had nine sons — and the ninth came out
+        // cat-shaped: saber-fanged, scaled to the tail-tip, antlered like his
+        // father, and wanting nothing his brothers wanted. No flight, no hoard.
+        // He climbed onto a stone the size of a hill, folded his paws, and *sat*
+        // — so still, the story goes, that the mountains learned stillness from
+        // him, and the smoke of the peaks curled round him out of respect, and
+        // the storm itself would part in a ring rather than disturb him. He is
+        // the wild retelling of a lore the far-east cats kept about themselves:
+        // rain when the land is wounded, thunder when it is wronged.
+        // (The lion-dogs that flank the old drawings? Elders' embroidery. There
+        // were never any two-legs to carve him. There was only the sitting.)
+        Ancestor::Suanni => Kit {
+            name: "Stillsmoke", legend: "the ninth son of the storm-dragon, of the far-east thunder mountains",
+            philosophy: "Sit still long enough, and even the storm will come to ask your leave.",
+            passive_name: "The Seated Mountain",
+            passive: "stillness gathers the storm — the longer unmoving, the harder every strike, released on the move",
+            hp: 145.0, attack: 10.8, speed: 5.8, reach: 8.0,
+            abilities: [
+                AbilitySpec { name: "Cloud Breath", desc: "a slow exhalation of mountain smoke — all it touches wades as through deep water",
+                    verb: Verb::Slow, power: 0.7, range: 8.0, dur: 2.5, cd: 8.0 },
+                AbilitySpec { name: "Sweetrain", desc: "the dragon's rain — packmates mend beneath it, and so does wounded wood",
+                    verb: Verb::Rain, power: 0.8, range: 7.0, dur: 4.0, cd: 15.0 },
+            ],
+            ult: AbilitySpec { name: "The Ninth Thunder", desc: "he stands, once — and the thunder his father lent him empties the field",
+                verb: Verb::Fear, power: 1.5, range: 12.0, dur: 1.6, cd: 60.0 },
+        },
         // ── Stonewhisper — the grey ghost of the high crags ────────────────────
         Ancestor::Puma => Kit {
             name: "Stonewhisper", legend: "the grey ghosts of the high crags",
@@ -338,7 +370,7 @@ mod tests {
         assert!(ALL.iter().all(|&a| kit(Ancestor::Caracal).speed >= kit(a).speed));
         assert!(ALL.iter().all(|&a| kit(Ancestor::Tiger).attack >= kit(a).attack));
         let ranged: Vec<Ancestor> = ALL.iter().copied().filter(|&a| kit(a).reach > 4.0).collect();
-        assert_eq!(ranged.len(), 2, "two ranged kits: the yowler and the sun-priest");
+        assert_eq!(ranged.len(), 3, "three ranged kits: the yowler, the sun-priest, the ninth son");
         for a in ranged { assert!(kit(a).hp < 150.0, "{} must pay for reach in hp", kit(a).name); }
     }
 
@@ -364,6 +396,8 @@ mod tests {
         // only the jaguar pulls — and both kits are control through and through
         assert!(ALL.iter().all(|&a| !verbs(a).contains(&Verb::Root) || a == Ancestor::Lynx));
         assert!(ALL.iter().all(|&a| !verbs(a).contains(&Verb::Pull) || a == Ancestor::Jaguar));
+        // only the ninth son calls the rain — the one mender of wounded wood
+        assert!(ALL.iter().all(|&a| !verbs(a).contains(&Verb::Rain) || a == Ancestor::Suanni));
         let control = |v: Verb| matches!(v, Verb::Root | Verb::Pull | Verb::Slow | Verb::Fear | Verb::Knockback);
         assert!(verbs(Ancestor::Lynx).iter().filter(|&&v| control(v)).count() >= 2);
         assert!(verbs(Ancestor::Jaguar).iter().filter(|&&v| control(v)).count() >= 2);

@@ -173,6 +173,7 @@ pub struct Warrior {
     pub respawn_t: f32,
     pub gather_t: f32,
     pub kills: u32,
+    pub still_t: f32,     // seconds spent seated (The Seated Mountain gathers here)
     pub duty: Duty,
     pub is_player: bool,
     seg: usize,           // trail waypoint progress
@@ -210,7 +211,13 @@ impl Prey {
 
 /// Scorched ground (Suneye's Noon Blaze / Eye of the Sun): enemies inside burn,
 /// and the light sears every veil away — the built-in answer to the night kits.
-pub struct Zone { pub x: f32, pub z: f32, pub team: u8, pub r: f32, pub dps: f32, pub t: f32 }
+pub struct Zone {
+    pub x: f32, pub z: f32, pub team: u8, pub r: f32, pub dps: f32, pub t: f32,
+    /// false: scorched ground (burns enemies, sears the veil). true: sweet rain
+    /// (mends allies inside — warriors and *wood* alike: Heal Trees and even the
+    /// Great Tree drink it, the roster's one answer to a half-gnawed sanctuary).
+    pub mend: bool,
+}
 
 pub struct HerbPatch { pub x: f32, pub z: f32, pub regrow_t: f32 }
 impl HerbPatch { pub fn ready(&self) -> bool { self.regrow_t <= 0.0 } }
@@ -272,6 +279,10 @@ impl Battleground {
                 || junglemap::concealment_at(w.x, w.z).is_some()) { m *= 1.3; }
         // Suneye is Night's Hunger mirrored: the day belongs to the sun-priest
         if w.ancestor == Some(Ancestor::SunCat) && !self.is_night() { m *= 1.3; }
+        // The Seated Mountain: Stillsmoke's stillness, released into every strike
+        if w.ancestor == Some(Ancestor::Suanni) {
+            m *= 1.0 + (w.still_t / 4.0).min(1.0) * 0.5;
+        }
         // Oldroar's Deep Wounds, Deep Fury: the closer to falling, the harder the blows
         if w.ancestor == Some(Ancestor::CaveLion) {
             m *= 1.0 + 0.6 * (1.0 - w.hp / w.max_hp);
@@ -391,7 +402,7 @@ impl Battleground {
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
                     shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border,
+                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, still_t: 0.0, duty: Duty::Border,
                     is_player: team == CLAN_A && slot == 0, seg: 0,
                 });
             }
@@ -425,7 +436,7 @@ impl Battleground {
                 mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
                 carry: Carry::Nothing,
                 shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty,
+                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, still_t: 0.0, duty,
                 is_player: false, seg: 0,
             });
         }
@@ -582,7 +593,10 @@ impl Battleground {
                 self.warriors[i].kills += (!self.warriors[t].alive()) as u32;
             }
             Verb::Zone => {
-                self.zones.push(Zone { x, z, team, r: spec.range, dps: spec.power * atk / spec.dur.max(0.5), t: spec.dur });
+                self.zones.push(Zone { x, z, team, r: spec.range, dps: spec.power * atk / spec.dur.max(0.5), t: spec.dur, mend: false });
+            }
+            Verb::Rain => {
+                self.zones.push(Zone { x, z, team, r: spec.range, dps: spec.power * atk / spec.dur.max(0.5), t: spec.dur, mend: true });
             }
             Verb::Root => {
                 for j in 0..self.warriors.len() {
@@ -953,23 +967,51 @@ impl Battleground {
             }
         }
 
+        // The Seated Mountain: note where every cat stood before this tick's minds run
+        let seats: Vec<(f32, f32)> = self.warriors.iter().map(|w| (w.x, w.z)).collect();
+
         // minds (skip the player's warrior — the player is the mind)
         for i in 0..self.warriors.len() {
             if !self.warriors[i].alive() || (self.warriors[i].is_player && self.player_driven) { continue; }
             self.think(i, dt);
         }
 
-        // scorched ground burns intruders and sears every veil away
+        // stillness gathers for those who kept their seat this tick
+        for (i, &(px, pz)) in seats.iter().enumerate() {
+            let w = &mut self.warriors[i];
+            if !w.alive() { w.still_t = 0.0; continue; }
+            if dist(px, pz, w.x, w.z) < 0.05 { w.still_t += dt; } else { w.still_t = 0.0; }
+        }
+
+        // scorched ground burns intruders and sears every veil away;
+        // sweet rain mends the packmates — and the wood — beneath it
         for zi in 0..self.zones.len() {
-            let (zx, zz, zteam, zr, zdps) = {
-                let z = &self.zones[zi]; (z.x, z.z, z.team, z.r, z.dps)
+            let (zx, zz, zteam, zr, zdps, mend) = {
+                let z = &self.zones[zi]; (z.x, z.z, z.team, z.r, z.dps, z.mend)
             };
-            let victims: Vec<usize> = self.warriors.iter().enumerate()
-                .filter(|(_, w)| w.team != zteam && w.alive() && dist(w.x, w.z, zx, zz) < zr)
-                .map(|(j, _)| j).collect();
-            for v in victims {
-                self.warriors[v].stealth_t = 0.0;   // nothing hides on burning sand
-                self.hurt(v, zdps * dt);
+            if mend {
+                let allies: Vec<usize> = self.warriors.iter().enumerate()
+                    .filter(|(_, w)| w.team == zteam && w.alive() && dist(w.x, w.z, zx, zz) < zr)
+                    .map(|(j, _)| j).collect();
+                for a in allies { self.heal(a, zdps * dt); }
+                for t in self.heal_trees.iter_mut() {
+                    if t.team == zteam && t.alive() && dist(t.x, t.z, zx, zz) < zr {
+                        t.hp = (t.hp + zdps * dt * 2.0).min(HEAL_TREE_HP);   // wood drinks deep
+                    }
+                }
+                let (cx, cz) = self.camps[zteam as usize];
+                if dist(cx, cz, zx, zz) < zr {
+                    let g = &mut self.clans[zteam as usize].great_tree_hp;
+                    if *g > 0.0 { *g = (*g + zdps * dt * 2.0).min(GREAT_TREE_HP); }
+                }
+            } else {
+                let victims: Vec<usize> = self.warriors.iter().enumerate()
+                    .filter(|(_, w)| w.team != zteam && w.alive() && dist(w.x, w.z, zx, zz) < zr)
+                    .map(|(j, _)| j).collect();
+                for v in victims {
+                    self.warriors[v].stealth_t = 0.0;   // nothing hides on burning sand
+                    self.hurt(v, zdps * dt);
+                }
             }
         }
         for z in self.zones.iter_mut() { z.t -= dt; }
@@ -1093,7 +1135,7 @@ mod tests {
             hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0, reach: REACH,
             mind: Mind::Trail, carry: Carry::Nothing,
             shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border, is_player: false, seg: 0,
+            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
         });
         bg.step(1.0 / 30.0);
         assert_eq!(bg.warriors[p].mind, Mind::LastStand, "at the Great Tree a warrior stands");
@@ -1626,6 +1668,75 @@ mod tests {
         for _ in 0..30 * 5 { bg.warriors[1].x = cx; bg.warriors[1].z = cz; bg.step(1.0 / 30.0); }
         let d1 = dist(bg.prey[p].x, bg.prey[p].z, hx, hz);
         assert!(d1 < d0 + 1.0, "a hunter in the brush spooks nothing: {d0} -> {d1}");
+    }
+
+    #[test]
+    fn the_seated_mountain_gathers_and_movement_spends_it() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Suanni, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal]);
+        quiet(&mut bg);
+        // seat him away from packmates so Pride's Warmth can't pollute the baseline
+        bg.warriors[0].x = 40.0; bg.warriors[0].z = -40.0;
+        bg.warriors[0].mind = Mind::AtMedic;   // far from the medic → holds his seat
+        let restless = bg.strike_of(0);
+        for _ in 0..30 * 5 {
+            bg.warriors[0].x = 40.0; bg.warriors[0].z = -40.0;
+            bg.warriors[0].mind = Mind::AtMedic;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[0].still_t > 4.0, "he kept his seat");
+        let seated = bg.strike_of(0);
+        assert!(seated > restless * 1.4, "stillness gathers the storm: {restless} vs {seated}");
+        // one step and the gathering is spent
+        bg.warriors[0].mind = Mind::Retreat;
+        bg.step(1.0 / 30.0);
+        assert_eq!(bg.warriors[0].still_t, 0.0, "movement spends the stillness");
+    }
+
+    #[test]
+    fn sweetrain_mends_the_pack_and_the_wounded_wood() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Suanni, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal]);
+        bg.patrol_t = [1e9; 2];   // no patrols — but keep clan B: one of them is the control
+        for w in bg.warriors.iter_mut() { w.x = -140.0; w.z = 140.0; w.mind = Mind::Retreat; }
+        bg.warriors[0].is_player = false;
+        // stand the ninth son at a half-gnawed Heal Tree with a wounded packmate
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_A).unwrap();
+        let (tx, tz) = (bg.heal_trees[t].x, bg.heal_trees[t].z);
+        bg.heal_trees[t].hp = HEAL_TREE_HP * 0.4;
+        bg.warriors[0].x = tx; bg.warriors[0].z = tz;
+        bg.warriors[1].x = tx + 2.0; bg.warriors[1].z = tz;
+        bg.warriors[1].hp = 30.0;
+        // an enemy in the same rain must NOT drink it
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = tx - 2.0; bg.warriors[e].z = tz;
+        bg.warriors[e].hp = 30.0;
+        bg.warriors[e].root_t = 10.0;   // held in place — AtMedic would self-heal and spoil the control
+        bg.cast(0, 1);   // Sweetrain
+        assert!(bg.zones.iter().any(|z| z.mend), "the rain should be falling");
+        let (w1, wood, we) = (bg.warriors[1].hp, bg.heal_trees[t].hp, bg.warriors[e].hp);
+        // hold everyone in the rain a moment (aura also mends allies — the enemy is the control)
+        for _ in 0..30 {
+            bg.warriors[1].x = tx + 2.0; bg.warriors[1].z = tz;
+            bg.warriors[e].x = tx - 2.0; bg.warriors[e].z = tz; bg.warriors[e].root_t = 10.0;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[1].hp > w1, "the packmate mends beneath the rain");
+        assert!(bg.heal_trees[t].hp > wood, "and the wounded wood drinks");
+        assert!(bg.warriors[e].hp <= we, "the enemy stands in the same rain and gains nothing");
+        // the rain passes
+        for _ in 0..30 * 10 { bg.step(1.0 / 30.0); }
+        assert!(bg.zones.iter().all(|z| !z.mend), "sweet rain always passes");
+        // and only the ninth son calls it: a scorch zone must not mend wood
+        let mut bg2 = Battleground::new_draft(
+            [Ancestor::SunCat, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal]);
+        quiet(&mut bg2);
+        bg2.warriors[0].is_player = false;
+        bg2.cast(0, 1);   // Noon Blaze
+        assert!(bg2.zones.iter().all(|z| !z.mend));
     }
 
     #[test]

@@ -111,6 +111,14 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   predicted — the reset is the contract, learned the measured way.
 - [x] Battle render fullness: bushes/rocks/logs/litter added to the scene, thicket stands
   as dense dark brush, wall slab lines with their pass, mistfall columns + spray domes.
+- [x] **Stillsmoke, the ninth son of the storm-dragon** (roster 13) — the dragon-cat, from
+  the wild retelling of far-east lore (Suanni, the dragon's cat-shaped son who loved smoke
+  and stillness; the seated-colossus image). The open niche he takes: **storm support /
+  siege defense** — the roster's only mender of wood. New Rain verb: Sweetrain zones heal
+  packmates AND drink into Heal Trees / the Great Tree (enemies in the same rain gain
+  nothing, by test). Passive The Seated Mountain: stillness gathers up to +50% strike,
+  spent the moment he moves (per-tick seat tracking). Cloud Breath slow, The Ninth Thunder
+  fear ult. Ranged breath (8 reach, thin pelt) — ranged-kit count test now 3.
 - [ ] Landform-carved heightfield (walls/crags as real terrain relief rather than placed
   slabs) would need a per-mode heightfield overlay in world — a bigger seam, deferred
 - [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes

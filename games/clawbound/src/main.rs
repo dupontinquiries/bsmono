@@ -717,7 +717,8 @@ fn build_battle() -> (Mesh, Vec3) {
         Some("smilodon") | Some("sabertooth") => Ancestor::Smilodon,
         Some("suncat") | Some("suneye") => Ancestor::SunCat,
         Some("lynx") | Some("snowhush") => Ancestor::Lynx,
-        Some("jaguar") | Some("riptail") => Ancestor::Jaguar, _ => Ancestor::Lion,
+        Some("jaguar") | Some("riptail") => Ancestor::Jaguar,
+        Some("suanni") | Some("stillsmoke") | Some("dragoncat") => Ancestor::Suanni, _ => Ancestor::Lion,
     };
     let mut g = Battleground::new(pick);
     // play a couple of minutes so patrols are mid-trail, hunts and herb runs show
@@ -817,11 +818,16 @@ fn build_battle() -> (Mesh, Vec3) {
     m.set_op(0.3);
     m.cone(v3(g.contention.0, world::height_at(g.contention.0, g.contention.1) + 0.25, g.contention.1), 20.0, 0.2, 28, rgb(0xffd24a));
     m.set_op(1.0);
-    // scorched ground still burning
+    // scorched ground still burning; sweet rain still falling
     for z in &g.zones {
         let gy = world::height_at(z.x, z.z);
         m.set_op(0.45);
-        m.cone(v3(z.x, gy + 0.3, z.z), z.r, 0.25, 20, rgb(0xffa53c));
+        let col = if z.mend { rgb(0x9fc8e8) } else { rgb(0xffa53c) };
+        m.cone(v3(z.x, gy + 0.3, z.z), z.r, 0.25, 20, col);
+        if z.mend {
+            m.set_op(0.25);
+            m.cone(v3(z.x, gy + 5.5, z.z), z.r * 0.8, -5.0, 14, rgb(0xbcd8ec));   // the falling rain
+        }
         m.set_op(1.0);
     }
     // herb patches
