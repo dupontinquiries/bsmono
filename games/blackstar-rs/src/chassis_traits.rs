@@ -107,13 +107,20 @@ impl Traits {
     /// exists: "70% tank, 30% hoverer" is a sentence about a real chassis.
     pub fn blend(self, other: Traits, w: f32) -> Traits {
         let w = w.clamp(0.0, 1.0);
-        // `a * (1.0 - w) + b * w` rather than `a + (b - a) * w`: the latter
-        // is not exact at w == 1.0 (floating-point rounding in `(b - a)`
-        // means `a + (b - a)` can differ from `b` by an ULP or two), which
-        // broke `blending_is_clamped_at_both_ends`'s exact equality against
-        // `other`. This form is exact at both clamped ends: at w == 0.0,
-        // `1.0 - w == 1.0` so the result is exactly `a`; at w == 1.0,
-        // `1.0 - w == 0.0` so the result is exactly `b`.
+        // `a * (1.0 - w) + b * w` rather than `a + (b - a) * w`. Both are the
+        // same lerp algebraically, but only this form recovers the endpoints
+        // exactly in floating point: multiplying by an exact 0.0 or 1.0
+        // introduces no rounding, while `a + (b - a) * w` computes a
+        // subtraction and an addition, each rounding once, and the two
+        // roundings do not generally cancel back to exactly `b` at w == 1.
+        //
+        // Found independently on both sides of the c8/c9 split, which is why
+        // this comment carries both halves of the evidence. Observed on real
+        // data: tank.traction (0.95) blended toward hoverer.traction (0.20) at
+        // w == 1 came out 0.19999999, not 0.2. The test that catches it is
+        // `blending_is_clamped_at_both_ends`, whose exact equality against
+        // `other` the old formula broke. Not a tolerance problem — a formula
+        // problem, and loosening the assert would have hidden it.
         let m = |a: f32, b: f32| a * (1.0 - w) + b * w;
         Traits {
             traction: m(self.traction, other.traction),
