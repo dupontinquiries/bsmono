@@ -303,11 +303,15 @@ impl Bindings {
         set(&mut b, Slide, vec![ch("a"), Bind::Pad(crate::gamepad::PB_WEST)]);
         set(&mut b, Transform, vec![named(NamedKey::PageDown), Bind::Pad(crate::gamepad::PB_LB)]);
         set(&mut b, AutoTarget, vec![named(NamedKey::Space), Bind::Pad(crate::gamepad::PB_R3)]);
-        // FIRE HAS NO KEYBOARD/MOUSE BIND IN THIS PASS EITHER — the
-        // requested scheme names only the pad trigger. Left as given
-        // rather than quietly keeping the old mouse-left default;
-        // flagged for the same reason RollL is.
-        set(&mut b, Fire, vec![Bind::Pad(crate::gamepad::PB_RT)]);
+        // FIRE gets its mouse-left bind back alongside the pad trigger.
+        // The prior pass moved Fire to "trigger-first feel" and left
+        // keyboard/mouse players with no bind at all, flagged in its own
+        // comment as an open gap rather than a final decision ("left as
+        // given rather than quietly keeping the old mouse-left default").
+        // classic() (below) already pairs Fire with mouse-left + pad
+        // trigger; this matches it instead of leaving a second, silently
+        // different answer for the scheme players actually start on.
+        set(&mut b, Fire, vec![Bind::Mouse(MouseButton::Left), Bind::Pad(crate::gamepad::PB_RT)]);
         set(&mut b, CycleForm, vec![Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_DUP)]);
         // CAR1/2/3 ARE UNBOUND BY DEFAULT. 1-9 now drive the hotbar
         // (`hotbar.rs`'s nine slots); the actions still exist for
