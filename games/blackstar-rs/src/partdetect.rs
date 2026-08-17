@@ -236,13 +236,80 @@ pub fn classify(
     Kind::Body
 }
 
-/// One prim, as `forward_sign_hint` needs it: its geometry and what
-/// `classify` already thinks it is (computed once by the caller,
-/// which typically already ran `classify` for other reasons — this
-/// does not recompute it).
+/// One prim, as `leg_symmetry_under`/`forward_sign_hint` need it: its
+/// geometry and what `classify` already thinks it is (computed once
+/// by the caller, which typically already ran `classify` for other
+/// reasons — this does not recompute it).
 pub struct KindedPrim<'a> {
     pub verts: &'a [Vertex],
     pub kind: Kind,
+}
+
+/// Fraction of `points` that have a mirror-image partner across
+/// `left_right` (through `center`), within `tolerance` — a real
+/// structural signature that legs come in pairs, independent of
+/// `orient.rs`'s whole-body mass-distribution `up_score`. 1.0 means
+/// every point found a partner (a symmetric quadruped/biped/hexapod
+/// leg layout); 0.0 means none did (scattered, or a genuinely
+/// asymmetric design, or the axis choice feeding this is wrong).
+///
+/// Deliberately excludes a point from matching ITSELF as its own
+/// mirror — a single leg sitting exactly on the centreline would
+/// otherwise score a hollow 1.0 by matching its own reflection, which
+/// is a leg with no partner, not a symmetric pair.
+pub fn leg_symmetry_fraction(points: &[Vec3], left_right: Vec3, center: Vec3, tolerance: f32) -> f32 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    let mut matched = 0;
+    for (i, &p) in points.iter().enumerate() {
+        let rel = p - center;
+        let mirrored = rel - 2.0 * rel.dot(left_right) * left_right + center;
+        let found = points.iter().enumerate().any(|(j, &q)| {
+            j != i && (q - mirrored).length() <= tolerance
+        });
+        if found {
+            matched += 1;
+        }
+    }
+    matched as f32 / points.len() as f32
+}
+
+/// Cross-checks a chosen up-axis against `orient.rs`'s own, using a
+/// DIFFERENT signal than `up_score`'s whole-body mass distribution:
+/// do the parts `classify` calls legs/wheels under this axis actually
+/// come in mirrored pairs? Real agreement between two independent
+/// measurements is a stronger claim than either alone — this does not
+/// replace `orient::Guess::up_confident`, it is a second opinion a
+/// caller can compare it against.
+///
+/// Returns `None` when fewer than 2 leg/wheel candidates exist (no
+/// pairing question to ask), `Some(fraction)` otherwise.
+pub fn leg_symmetry_under(
+    prims: &[KindedPrim],
+    up: Vec3,
+    left_right: Vec3,
+    body_lo: f32,
+    body_hi: f32,
+    body_center: Vec3,
+) -> Option<f32> {
+    let contacts: Vec<Vec3> = prims
+        .iter()
+        .filter(|p| matches!(p.kind, Kind::Leg | Kind::Wheel))
+        .filter_map(|p| {
+            p.verts.iter().map(|v| Vec3::from_array(v.pos))
+                .min_by(|a, b| a.dot(up).partial_cmp(&b.dot(up)).unwrap())
+        })
+        .collect();
+    if contacts.len() < 2 {
+        return None;
+    }
+    let span = (body_hi - body_lo).max(1e-3);
+    // tolerance scales with the body's own size -- a fixed metres
+    // value would be too loose for a tiny drone and too tight for a
+    // building-sized walker
+    let tolerance = span * 0.20;
+    Some(leg_symmetry_fraction(&contacts, left_right, body_center, tolerance))
 }
 
 /// `orient.rs`'s own doc names the gap this fills: forward's AXIS is
@@ -499,5 +566,80 @@ mod tests {
         ];
         let hint = forward_sign_hint(&prims, Vec3::Y, Vec3::Z, -2.0, 2.0);
         assert_eq!(hint, None, "a low leg should not be mistaken for a head, even offset toward +Z");
+    }
+
+    #[test]
+    fn leg_symmetry_fraction_of_a_perfect_quadruped_is_one() {
+        // four legs at the corners of a square, centred on the origin
+        // -- every leg's mirror across X lands on another leg exactly
+        let legs = [
+            Vec3::new(-1.0, -1.8, -1.0), Vec3::new(1.0, -1.8, -1.0),
+            Vec3::new(-1.0, -1.8, 1.0), Vec3::new(1.0, -1.8, 1.0),
+        ];
+        let f = leg_symmetry_fraction(&legs, Vec3::X, Vec3::ZERO, 0.05);
+        assert_eq!(f, 1.0, "a perfect quadruped's legs should all find a mirror partner");
+    }
+
+    #[test]
+    fn leg_symmetry_fraction_of_scattered_legs_is_low() {
+        // three legs with no mirror structure at all
+        let legs = [Vec3::new(-2.0, -1.8, -1.0), Vec3::new(0.3, -1.8, 3.0), Vec3::new(1.7, -1.8, -0.5)];
+        let f = leg_symmetry_fraction(&legs, Vec3::X, Vec3::ZERO, 0.05);
+        assert!(f < 0.5, "scattered legs with no left-right structure should score low: {f}");
+    }
+
+    #[test]
+    fn a_single_leg_on_the_centreline_does_not_falsely_match_itself() {
+        // one leg sitting exactly on the mirror axis -- its own
+        // reflection is itself, which must not count as "found a
+        // partner": a lone centreline leg has no partner
+        let legs = [Vec3::new(0.0, -1.8, 0.0)];
+        let f = leg_symmetry_fraction(&legs, Vec3::X, Vec3::ZERO, 0.05);
+        assert_eq!(f, 0.0, "a single centreline leg must not match its own reflection");
+    }
+
+    #[test]
+    fn leg_symmetry_under_needs_at_least_two_candidates() {
+        let torso = blob();
+        let leg = {
+            let mut v = Vec::new();
+            for i in 0..8 {
+                let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                let (s, c) = a.sin_cos();
+                v.push(vtx(c * 0.1 - 1.0, -1.9, s * 0.1));
+                v.push(vtx(c * 0.1 - 1.0, -1.0, s * 0.1));
+            }
+            v
+        };
+        let prims = vec![
+            KindedPrim { verts: &torso, kind: Kind::Body },
+            KindedPrim { verts: &leg, kind: Kind::Leg },
+        ];
+        let out = leg_symmetry_under(&prims, Vec3::Y, Vec3::X, -2.0, 2.0, Vec3::ZERO);
+        assert_eq!(out, None, "a single leg candidate should not produce a symmetry score at all");
+    }
+
+    #[test]
+    fn leg_symmetry_under_finds_a_symmetric_pair() {
+        let torso = blob();
+        let leg_at = |x: f32| {
+            let mut v = Vec::new();
+            for i in 0..8 {
+                let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                let (s, c) = a.sin_cos();
+                v.push(vtx(c * 0.1 + x, -1.9, s * 0.1));
+                v.push(vtx(c * 0.1 + x, -1.0, s * 0.1));
+            }
+            v
+        };
+        let left = leg_at(-1.0);
+        let right = leg_at(1.0);
+        let prims = vec![
+            KindedPrim { verts: &torso, kind: Kind::Body },
+            KindedPrim { verts: &left, kind: Kind::Leg },
+            KindedPrim { verts: &right, kind: Kind::Leg },
+        ];
+        let out = leg_symmetry_under(&prims, Vec3::Y, Vec3::X, -2.0, 2.0, Vec3::ZERO);
+        assert_eq!(out, Some(1.0), "a genuinely mirrored leg pair should score 1.0");
     }
 }
