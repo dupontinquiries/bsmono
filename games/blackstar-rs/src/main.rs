@@ -65,6 +65,7 @@ mod campaign;
 mod campsim;
 mod chi;
 mod clones;
+mod exoworlds;
 mod deck;
 mod gear;
 mod gearsim;
