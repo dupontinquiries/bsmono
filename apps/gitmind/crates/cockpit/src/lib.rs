@@ -17,6 +17,8 @@ pub mod fleet;
 pub mod fastboot;
 /// First contact with a freshly-imaged phone: pairing code and join script.
 pub mod join;
+/// Trying a kernel on the spare slot, and getting evidence out when it dies.
+pub mod kerneltry;
 /// One-button reroll across the test fleet: plan, dedupe, report.
 pub mod reroll;
 /// The fleet, remembered between runs: stable ids, IP churn, wipe detection.
