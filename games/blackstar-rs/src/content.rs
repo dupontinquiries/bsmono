@@ -101,6 +101,21 @@ pub const TROOPS: &[Troop] = &[
     Troop { id: "blackstar_raider", role: Role::Enemy, chassis: "angular",  fire: Verb::Pierce, element: Element::Electric, tint: [70, 70, 90], abilities: &["dash"] , faction: patrol::Faction::BlackstarClans },
     Troop { id: "ravager",          role: Role::Enemy, chassis: "bruiser",  fire: Verb::Flak,   element: Element::Fire,     tint: [180, 90, 60], abilities: &["shield"] , faction: patrol::Faction::Hijacks },
     Troop { id: "slipstream",       role: Role::Enemy, chassis: "raptor",   fire: Verb::Cone,   element: Element::Air,      tint: [160, 190, 200], abilities: &["hover", "dash"] , faction: patrol::Faction::Hijacks },
+    // ---- the Hijacks, expanded (TF_TRILOGY_TWO_FRAMEWORK.md, Film 4
+    // "First Light" / Film 5 "Solar"): a scouting force, not an army --
+    // "sending fifty to accomplish what three could do is normal to
+    // them," no ideology or strategy in the Transformer sense, and by
+    // Film 5 they are field-testing tech pulled from recovered Unicron
+    // debris in the outer belt. Two roster gaps that left "uncharted"
+    // and "shield_edge" (both Faction::Hijacks sites) drawing on the
+    // same three troops as the Trilogy One frontier fights: swarmer is
+    // the cheap, numerous scout body the doc's arithmetic describes;
+    // harvester is the elite that is starting to carry Corrupted-
+    // frequency signal (tint drifts toward corrupted_apex's palette
+    // rather than a stock Hijack one -- the connection is visual before
+    // the treatment names it in Film 5).
+    Troop { id: "hijack_swarmer",   role: Role::Enemy,   chassis: "angular",  fire: Verb::Chain,  element: Element::None,     tint: [55, 50, 65],   abilities: &["dash"] , faction: patrol::Faction::Hijacks },
+    Troop { id: "hijack_harvester", role: Role::Variant, chassis: "sentinel", fire: Verb::Vortex, element: Element::None,     tint: [45, 55, 45],   abilities: &["shield", "pulse"] , faction: patrol::Faction::Hijacks },
     // ---- elemental variants ----
     Troop { id: "ashfall_lancer",     role: Role::Variant, chassis: "raptor",   fire: Verb::Flak,     element: Element::Fire, tint: [210, 110, 60], abilities: &["overclock"] , faction: patrol::Faction::Coalition },
     Troop { id: "hoarfrost_sentinel", role: Role::Variant, chassis: "sentinel", fire: Verb::Beam,     element: Element::Ice,  tint: [170, 215, 235], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
@@ -509,16 +524,16 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     // ============ TRILOGY TWO — the inversion: wonder, scale, light ============
     Mission { order: 10, id: "the_far_gate", film: 4, dest: "uncharted", site: "the dig",
-        objective: Objective::Eliminate, champion: None,
-        beat: "the bridge's first jump; the Corrupted were here first",
+        objective: Objective::Eliminate, champion: Some("hijack_swarmer"),
+        beat: "the bridge's first jump; the Hijacks were already testing the boundary",
         intro: &[
             "the bridge did not ask where you wanted to go. it took you where the signal was.",
-            "a world off every chart -- and the corrupted were here FIRST, digging.",
-            "clear the dig. whatever they were reaching for, they do not get to finish.",
+            "a world off every chart -- and something is already here, digging. not corrupted. not blackstar's.",
+            "a scout swarm, dozens strong, indifferent to its own losses. clear the dig before it reports home.",
         ],
         outro: &[
-            "the site goes quiet. at its bottom: a door, older than the war, still sealed.",
-            "a voice from nowhere: 'now you have seen a far gate. there are more.'",
+            "the swarm breaks off mid-fight, unhurried -- it was never trying to win, only to learn.",
+            "a voice on an unfamiliar band, calibrated and unhurried: 'now you have seen a hijack. there are more.'",
         ] },
     Mission { order: 11, id: "the_vault_of_ice", film: 4, dest: "glaciem", site: "the archive",
         objective: Objective::Protect, champion: Some("hoarfrost_sentinel"),
@@ -567,6 +582,8 @@ pub const MISSIONS: &[Mission] = &[
         outro: &[
             "the ward shatters. blackstar, over the ship's bones: 'kept. every plate of you.'",
             "he does not pursue. kings who survive know which battles buy nothing.",
+            "later, alone with aiden: 'i was wrong about one thing. the far-travelers who never came home --",
+            "they weren't unprepared because they grew too fast. they were unprepared because they grew alone.'",
         ] },
     Mission { order: 15, id: "the_heart_of_the_god_machine", film: 6, dest: "cybertron", site: "the spark chamber",
         objective: Objective::Eliminate, champion: None,
@@ -580,6 +597,7 @@ pub const MISSIONS: &[Mission] = &[
             "the matrix pours into the heart. not destruction -- QUIET. the god-machine lies down.",
             "on pluto, the wall watches a calm sky. 'now THIS is what safe sounds like.'",
             "and out past the bridge, nineteen old signals keep broadcasting. the wardens are waiting.",
+            "at the shield boundary, a watch on an ice-clone's wrist runs warm for a moment, then cools. patient.",
         ] },
 ];
 

@@ -108,6 +108,34 @@ impl Chi {
     pub fn attune_mul(&self, toward: Element) -> f32 {
         (1.0 - 0.08 * self.level(toward) as f32).max(0.60)
     }
+
+    /// How many of the seven pools stand at mastery (level 5). The
+    /// script's Watch names twelve reliable forms — six elements each
+    /// with a base and an amplified tier (Ice/Blizzard, Water/Tsunami,
+    /// Fire/Magma, Metal/Titanium, Wind/Tornado) plus Electricity alone
+    /// — which this engine's seven-element system folds into one
+    /// staircase per element: level 3 opens the base shift
+    /// (`can_shift`), level 5 is the amplified tier. Nothing new to
+    /// track; mastery is just the top of a ladder that already exists.
+    pub fn mastered(&self) -> u8 {
+        ELEMENTS.iter().filter(|e| self.level(**e) == 5).count() as u8
+    }
+
+    /// THE CEILING — Photon Man, form thirteen. Per `TF_TRILOGY_TWO_
+    /// FRAMEWORK.md`: not a form the bearer chooses, one the Watch
+    /// decides he is ready for. The game's version of "ready": every
+    /// element mastered, nothing left the Watch hasn't already taught
+    /// through the other twelve. Eligibility is necessary, not
+    /// sufficient — the framework is explicit that the Watch, not the
+    /// bearer, picks the moment, so this gates the trigger check a
+    /// combat system adds later rather than something the player can
+    /// press directly. That trigger (a desperation surge when eligible
+    /// and the fight is otherwise lost, with the three-day blackout
+    /// the script names as its cost) is not wired into `skirmish.rs`
+    /// yet — this is the seam, not the mechanic.
+    pub fn photon_eligible(&self) -> bool {
+        self.mastered() == ELEMENTS.len() as u8
+    }
 }
 
 /// Which element GOVERNS a mod, read off what the mod does: heat gear
@@ -239,6 +267,26 @@ mod tests {
         for m in MODS.iter().filter(|m| m.fits != BodyFit::Machine) {
             assert!(required(m) >= 1, "{} asks nothing of the body", m.name);
         }
+    }
+
+    #[test]
+    fn mastery_counts_and_photon_needs_all_seven() {
+        let mut c = Chi::default();
+        assert_eq!(c.mastered(), 0);
+        assert!(!c.photon_eligible());
+        for e in ELEMENTS {
+            c.bank(e, 40); // top of the staircase, every pool
+        }
+        assert_eq!(c.mastered(), 7);
+        assert!(c.photon_eligible());
+        // six of seven is not the ceiling -- the framework is explicit
+        // that the Watch shows a door with no handle, not a discount
+        let mut almost = Chi::default();
+        for e in ELEMENTS.iter().take(6) {
+            almost.bank(*e, 40);
+        }
+        assert_eq!(almost.mastered(), 6);
+        assert!(!almost.photon_eligible());
     }
 
     #[test]
