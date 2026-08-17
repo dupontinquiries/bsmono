@@ -15,6 +15,8 @@ pub mod deploy;
 pub mod fleet;
 /// One-button reroll across the test fleet: plan, dedupe, report.
 pub mod reroll;
+/// The fleet, remembered between runs: stable ids, IP churn, wipe detection.
+pub mod roster;
 pub mod flow;
 pub mod identity;
 pub mod importer;
