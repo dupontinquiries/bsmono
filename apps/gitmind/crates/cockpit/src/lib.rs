@@ -13,6 +13,8 @@ pub mod buildsystem;
 pub mod daemons;
 pub mod deploy;
 pub mod fleet;
+/// One-button reroll across the test fleet: plan, dedupe, report.
+pub mod reroll;
 pub mod flow;
 pub mod identity;
 pub mod importer;
