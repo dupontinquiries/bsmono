@@ -199,8 +199,15 @@ def engine_link(app_dir, pdirs):
         # in the host, because a UI crate that opens /dev/video0 cannot be
         # tested" — the port is right and the audit was wrong.
         #
-        # A [[bin]] with no [lib] is unlinkable, full stop.
-        has_bin = "[[bin]]" in txt
+        # A binary with no library is unlinkable, full stop.
+        #
+        # Checked against the FILESYSTEM, not just the manifest. bo-controller
+        # declares neither [[bin]] nor [lib]: it has src/main.rs and cargo
+        # infers the binary by convention, so a manifest-only test called it
+        # linkable and reported the Qt app as a missing dependency of the egui
+        # port. Cargo's own rule is the convention plus the declaration, and
+        # this has to match it.
+        has_bin = "[[bin]]" in txt or os.path.isfile(os.path.join(sub, "src", "main.rs"))
         has_lib = "[lib]" in txt or os.path.isfile(os.path.join(sub, "src", "lib.rs"))
         if has_bin and not has_lib:
             continue
