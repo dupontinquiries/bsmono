@@ -441,6 +441,7 @@ pub fn run(args: &[String]) {
             sdf_half: Vec3::ZERO,
             half_len: 0.64,
             half_h: 0.31,
+            ride_h: 0.31,
             half_w: 0.32,
             wheel_r: 0.16,
         };

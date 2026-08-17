@@ -1448,7 +1448,7 @@ fn main() {
             // permutes the extents but cannot change which is biggest, so the
             // measurement survives the loader's own orientation search.
             let raw_span = |p: &PathBuf| -> f32 {
-                let (_, _, _, s) = model::load_raw_at(p, 1.0, false);
+                let (_, _, _, s, _) = model::load_raw_at(p, 1.0, false);
                 if s > 1e-9 { 1.0 / s } else { 1.0 }
             };
             let span0 = raw_span(&poses[0]);
@@ -1891,6 +1891,15 @@ fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.wheel_r = (m.wheel_r * size).max(0.05);
     car.drive = m.drive;
     car.hover = m.hover;
+    // The other half of da831f98: that fix updated ride_h every frame
+    // during a smooth-morph blend (xform::Morph::bounds_at) but never
+    // here, in the static per-pose path every chassis switch runs
+    // through — which is the ONLY seating input for a morph-refused
+    // (stepping) chassis, and for any chassis in the instant before its
+    // first blended frame. Same sign convention as bounds_at: negative
+    // means the pose sits entirely above the origin, and the seating
+    // code's own `> 0.0` check already treats that as "leave it be."
+    car.ride_h = m.ride_h * size;
 }
 
 impl Game {

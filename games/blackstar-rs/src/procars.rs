@@ -160,7 +160,7 @@ pub fn volt(gpu: &mut Gpu) -> Model {
     );
     arches(gpu, &mut prims, 0.125, 0.30, -0.36, 0.36, -0.07, [0.13, 0.14, 0.16, 1.0]);
     ev_wheels(gpu, &mut prims, 0.125, 0.28, -0.36, 0.36, -0.07, [0.72, 0.76, 0.80, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.26, half_w: 0.31, wheel_r: 0.125 }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.26, ride_h: 0.26, half_w: 0.31, wheel_r: 0.125 }
 }
 
 /// AXION — a low electric hypercar. Long, flat, fast: the flick blade.
@@ -189,7 +189,7 @@ pub fn axion(gpu: &mut Gpu) -> Model {
     }
     arches(gpu, &mut prims, 0.105, 0.36, -0.50, 0.50, -0.045, [0.11, 0.11, 0.13, 1.0]);
     ev_wheels(gpu, &mut prims, 0.105, 0.34, -0.50, 0.50, -0.045, [0.55, 0.58, 0.62, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.78, half_h: 0.17, half_w: 0.38, wheel_r: 0.105 }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.78, half_h: 0.17, ride_h: 0.17, half_w: 0.38, wheel_r: 0.105 }
 }
 
 /// HAULER — an electric pickup, all shoulders. The heaviest-feeling of the
@@ -219,7 +219,7 @@ pub fn hauler(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::cbox(0.22), Vec3::new(0.31, 0.06, 0.028), Quat::IDENTITY, Vec3::new(0.0, 0.16, 0.56)), paint));
     arches(gpu, &mut prims, 0.145, 0.33, -0.40, 0.40, -0.06, [0.20, 0.21, 0.24, 1.0]);
     ev_wheels(gpu, &mut prims, 0.145, 0.31, -0.40, 0.40, -0.06, [0.28, 0.30, 0.33, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.28, half_w: 0.34, wheel_r: 0.145 }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.28, ride_h: 0.28, half_w: 0.34, wheel_r: 0.145 }
 }
 
 /// PULSE — a rally EV on tall soft tyres: short overhangs, high stance, a
@@ -250,7 +250,7 @@ pub fn pulse(gpu: &mut Gpu) -> Model {
     }
     arches(gpu, &mut prims, 0.155, 0.32, -0.32, 0.34, -0.02, [0.15, 0.15, 0.17, 1.0]);
     ev_wheels(gpu, &mut prims, 0.155, 0.30, -0.32, 0.34, -0.02, [0.85, 0.86, 0.88, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.52, half_h: 0.30, half_w: 0.33, wheel_r: 0.155 }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.52, half_h: 0.30, ride_h: 0.30, half_w: 0.33, wheel_r: 0.155 }
 }
 
 /// TRAM — an electric shuttle: a long slab of glass and aluminium with a
@@ -279,7 +279,7 @@ pub fn tram(gpu: &mut Gpu) -> Model {
     }
     arches(gpu, &mut prims, 0.125, 0.31, -0.38, 0.40, -0.07, [0.22, 0.23, 0.26, 1.0]);
     ev_wheels(gpu, &mut prims, 0.125, 0.29, -0.38, 0.40, -0.07, [0.62, 0.65, 0.70, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, half_w: 0.32, wheel_r: 0.125 }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, ride_h: 0.34, half_w: 0.32, wheel_r: 0.125 }
 }
 
 // ======================= ELECTRIFICATION =================================
@@ -359,6 +359,7 @@ pub fn hoverize(gpu: &mut Gpu, base: &Model, accent: [f32; 4], h: crate::physics
         sdf_half: base.sdf_half,
         half_len: hl,
         half_h: hh,
+        ride_h: hh,
         half_w: hw,
         wheel_r: base.wheel_r,
     }
@@ -436,6 +437,7 @@ pub fn electrify(gpu: &mut Gpu, base: &Model, accent: [f32; 4]) -> Model {
         sdf_half: base.sdf_half,
         half_len: hl,
         half_h: hh,
+        ride_h: hh,
         half_w: hw,
         wheel_r: base.wheel_r,
     }
@@ -592,7 +594,7 @@ pub fn vipera(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::cbox(0.14), Vec3::new(0.28, 0.012, 0.20), Quat::from_rotation_x(-0.12), Vec3::new(0.0, -0.075, 0.50)), [0.05, 0.05, 0.06, 1.0]));
 
     mount_wheels(gpu, &mut prims, &hp, [0.16, 0.17, 0.19, 1.0], 6);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.175, half_w, wheel_r }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.175, ride_h: 0.175, half_w, wheel_r }
 }
 
 /// AEGIS — the silver armoured wedge.
@@ -687,7 +689,7 @@ pub fn aegis(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.24, 0.010, 0.014), Quat::IDENTITY, Vec3::new(0.0, 0.035, half_len - 0.02)), copper));
 
     mount_wheels(gpu, &mut prims, &hp, copper, 6);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.205, half_w, wheel_r }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.205, ride_h: 0.205, half_w, wheel_r }
 }
 
 /// The house recipe, in one place.
@@ -747,7 +749,7 @@ pub fn breadbox(gpu: &mut Gpu) -> Model {
         20,
     );
     wheels(gpu, &mut prims, 0.115, 0.30, -0.32, 0.32, -0.09);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.25, half_w: 0.36, wheel_r: 0.115 }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.25, ride_h: 0.25, half_w: 0.36, wheel_r: 0.115 }
 }
 
 
@@ -772,7 +774,7 @@ pub fn wedge(gpu: &mut Gpu) -> Model {
     // the stripe, as a raised spine rather than paint
     prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.045, 0.012, 0.62), Quat::from_rotation_x(-0.06), Vec3::new(0.0, 0.055, -0.05)), [0.85, 0.16, 0.16, 1.0]));
     wheels(gpu, &mut prims, 0.095, 0.36, -0.52, 0.52, -0.06);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.80, half_h: 0.125, half_w: 0.42, wheel_r: 0.095 }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.80, half_h: 0.125, ride_h: 0.125, half_w: 0.42, wheel_r: 0.095 }
 }
 
 
@@ -795,7 +797,7 @@ pub fn roller(gpu: &mut Gpu) -> Model {
         24,
     );
     wheels(gpu, &mut prims, 0.13, 0.29, -0.28, 0.28, -0.08);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.24, half_w: 0.34, wheel_r: 0.13 }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.24, ride_h: 0.24, half_w: 0.34, wheel_r: 0.13 }
 }
 
 
@@ -818,7 +820,7 @@ pub fn longboy(gpu: &mut Gpu) -> Model {
         20,
     );
     wheels(gpu, &mut prims, 0.09, 0.27, -0.72, 0.72, -0.05);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.00, half_h: 0.115, half_w: 0.30, wheel_r: 0.09 }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.00, half_h: 0.115, ride_h: 0.115, half_w: 0.30, wheel_r: 0.09 }
 }
 
 
@@ -849,7 +851,7 @@ pub fn cube(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.17, 0.13, 0.30), Quat::IDENTITY, Vec3::new(0.0, -0.09, 0.0)), body));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.31, 0.06, 0.31), Quat::IDENTITY, Vec3::new(0.0, 0.36, 0.0)), [0.98, 0.92, 0.85, 1.0]));
     wheels(gpu, &mut prims, 0.11, 0.30, -0.225, 0.225, -0.14);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.34, half_h: 0.34, half_w: 0.34, wheel_r: 0.11 }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.34, half_h: 0.34, ride_h: 0.34, half_w: 0.34, wheel_r: 0.11 }
 }
 
 pub fn shark(gpu: &mut Gpu) -> Model {
@@ -873,6 +875,6 @@ pub fn shark(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::cbox(0.34), Vec3::new(0.022, 0.13, 0.15), Quat::from_rotation_x(0.28), Vec3::new(0.0, 0.22, 0.14)), [0.30, 0.42, 0.55, 1.0]));
     prims.push(body_prim(gpu, part(meshgen::cbox(0.40), Vec3::new(0.24, 0.014, 0.02), Quat::IDENTITY, Vec3::new(0.0, -0.02, -0.63)), [0.92, 0.92, 0.95, 1.0]));
     wheels(gpu, &mut prims, 0.10, 0.28, -0.44, 0.44, -0.09);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.20, half_w: 0.31, wheel_r: 0.10 }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.20, ride_h: 0.20, half_w: 0.31, wheel_r: 0.10 }
 }
 

@@ -20,7 +20,7 @@ fn main() {
     // chassis, and the only way a still shows the real proportions.
     let refdir = std::env::args().nth(3).map(PathBuf::from);
     let span = |p: &PathBuf| -> f32 {
-        let (_, _, _, s) = model::load_raw_at(p, 1.0, false);
+        let (_, _, _, s, _) = model::load_raw_at(p, 1.0, false);
         if s > 1e-9 { 1.0 / s } else { 1.0 }
     };
     let (raws, half) = match &refdir {
