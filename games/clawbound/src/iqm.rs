@@ -106,12 +106,12 @@ impl Model {
     /// Load from assets by short name ("white_tiger"). Paths are anchored to the
     /// crate dir so `cargo run`/`cargo test` agree on where assets live.
     ///
-    /// **The packed web wins when it exists.** `assets/animals.web.zst` carries
-    /// all seventeen models in 2.8 MB against 19.0 MB of IQM (see
-    /// `assetpack.rs`), so a shipped build reads the pack and the loose IQMs do
-    /// not need to travel. They stay the source of truth for the build step, and
-    /// remain the fallback here: a checkout that has not run
-    /// `cargo run --example pack_animals` still loads, just from the big files.
+    /// **The pack is what ships.** `assets/animals.web` carries all seventeen
+    /// models in 3.7 MB against the 19.0 MB of IQM they were extracted from (see
+    /// `assetpack.rs`), and the loose IQMs were removed once it proved itself —
+    /// so this is the normal path, not an optimisation. The `.iqm` fallback below
+    /// still works if someone drops the originals back in, which is how the
+    /// round-trip test re-runs against the source.
     pub fn load(name: &str) -> Result<Model, String> {
         if let Some(web) = crate::assetpack::shipped_web() {
             return crate::assetpack::load_web(web, name);
@@ -222,24 +222,26 @@ mod tests {
 
     #[test]
     fn every_shipped_animal_parses_and_normalizes() {
-        let Some(dir) = assets_present() else {
-            eprintln!("assets/animals absent; skipping (see assets_present)");
-            return;
-        };
+        // Reads the pack, because the pack is now what ships: the loose IQMs
+        // were removed once the web proved itself. Everything this asserted
+        // about a parsed IQM it still asserts about a decoded model, which is
+        // the point — the loader's contract did not change, only its input.
+        //
+        // This REPLACES an `assets_present()` skip guard that came off our side
+        // of the split. That guard was honest about the assets being gone, but
+        // its effect was a test that silently passed while checking nothing —
+        // and the pack is committed, so there is nothing to skip for.
+        let web = crate::assetpack::shipped_web().expect("assets/animals.web ships");
+        let names = crate::assetpack::names(web).expect("index parses");
         let mut n = 0;
-        for e in std::fs::read_dir(&dir).expect("assets/animals exists") {
-            let p = e.unwrap().path();
-            if p.extension().map_or(true, |x| x != "iqm") {
-                continue;
-            }
-            let bytes = std::fs::read(&p).unwrap();
-            let mut m = Model::parse(&bytes).unwrap_or_else(|e| panic!("{p:?}: {e}"));
-            assert!(!m.tris.is_empty() && !m.positions.is_empty(), "{p:?} is empty");
+        for name in &names {
+            let mut m = Model::load(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!m.tris.is_empty() && !m.positions.is_empty(), "{name} is empty");
             m.normalize(3.0);
             let (lo, hi) = m.bbox();
-            assert!(lo[1].abs() < 1e-3, "{p:?}: feet must sit at y=0 (got {})", lo[1]);
-            assert!((hi[1] - 3.0).abs() < 1e-3, "{p:?}: height must be 3.0 (got {})", hi[1]);
-            assert!(lo[0] < 0.0 && hi[0] > 0.0, "{p:?}: x must straddle the origin");
+            assert!(lo[1].abs() < 1e-3, "{name}: feet must sit at y=0 (got {})", lo[1]);
+            assert!((hi[1] - 3.0).abs() < 1e-3, "{name}: height must be 3.0 (got {})", hi[1]);
+            assert!(lo[0] < 0.0 && hi[0] > 0.0, "{name}: x must straddle the origin");
             n += 1;
         }
         assert_eq!(n, 17, "all seventeen models ship");
@@ -265,7 +267,12 @@ mod tests {
 
     #[test]
     fn the_pack_and_the_iqm_agree_on_what_a_model_is() {
-        // Model::load now prefers the packed web (assetpack.rs); this holds it
+        // Skips where the source IQMs are gone, which is everywhere after the
+        // removal — it is kept for the one place it can still run: a checkout
+        // that predates it, or the archived originals restored beside the crate.
+        // A lossy conversion deserves a test that can be re-run against the
+        // source, even if the source no longer travels with the game.
+        // Model::load reads the packed web (assetpack.rs); this holds it
         // to the file it replaced. Not byte equality — quantisation is the whole
         // point — but the geometry a renderer would see: same triangle budget,
         // same extents, same footprint after normalize().

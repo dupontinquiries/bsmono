@@ -220,10 +220,20 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   2,811,122), so the container only earns its keep when files ship loose. Loader prefers
   the raw web; both are gitignored (committing a derived pack beside its source is exactly
   the trap FLEET_COMPRESSION.md records: a 904 MB bundle).
-- [ ] **Your call, not mine:** dropping the loose IQMs. Shipping only the pack takes
-  assets from 19.0 MB to 2.8 MB, but reclaiming it needs a history rewrite
-  (`git filter-repo --invert-paths`), and the pack is lossy-by-design at 14 bits — the
-  IQMs are the only way back to a finer ladder. Decide before rewriting, not after.
+- [x] The loose IQMs are gone: `assets/` 19.0 MB -> 6.3 MB (the committed `animals.web` is
+  3.7 MB, 2.97 MB as a git object). `Model::load` reads the pack as its normal path, the
+  `.iqm` branch survives as the way to re-run the round-trip test against restored source,
+  and the shipped-asset tests now assert against the pack. `docs/ASSET_ARCHIVE.md` records
+  what went, the exact restore commands, and the `git filter-repo` invocation.
+- [x] The raw web is committed and the `.zst` is gitignored, measured: as a git object the
+  raw web costs 2.97 MB against the container's 2.81 MB (155 KB apart) while the container
+  costs ~37 ms of ruzstd on first touch against ~4 ms. For a repo file read at startup that
+  trade goes the other way.
+- [ ] **History rewrite deliberately NOT done here.** `git filter-repo` renames every commit
+  hash from the first that touched the IQMs, which would make this bundle unappliable to
+  the base it was built on — a rewrite cannot be delivered as a patch. Run it locally when
+  clone size matters, after archiving the originals outside git; commands in
+  docs/ASSET_ARCHIVE.md.
 - [ ] Decode speed: 1.3 ms/model (21.9 ms for all 17) against 5.6 ms for parsing the loose
   IQMs — 4x slower, invisible for statues, worth revisiting if a mode ever streams these
 - [ ] The triangle stream could be ~8% smaller with per-triangle (b-a, c-a) deltas instead
