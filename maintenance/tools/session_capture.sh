@@ -77,7 +77,10 @@ _capture_flush() {
   local rc=$1
   [ -n "${_CAP_CMD:-}" ] || return 0
   case "$_CAP_CMD" in
-    _capture_*|trap*|*CAPTURE_LOG*) _CAP_CMD=""; return 0 ;;
+    # The script's own machinery, including the `return 0` that ends the
+    # sourcing — it was appearing as the first "command" of every session.
+    _capture_*|trap*|*CAPTURE_LOG*|"return 0 2> /dev/null"|return*|set\ -T|source*|.\ */session_capture.sh*)
+      _CAP_CMD=""; return 0 ;;
   esac
   local now dur cmd
   now=$(date +%s%3N 2>/dev/null || date +%s000)

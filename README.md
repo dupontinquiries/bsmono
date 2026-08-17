@@ -5,6 +5,21 @@ the source is organized and de-duplicated, but nothing here has been compiled or
 wired into a single build yet. The next stages add (a) static verification via
 the suspender tools, then (b) the cross-target build + Flatpak orchestration.
 
+## Working in this repo
+
+If you are about to make commits here — person or agent — run this once per
+session:
+
+```sh
+source maintenance/tools/session_capture.sh    # first time: --install
+```
+
+It attaches the commands you ran to each commit as a git note, which is how
+`observed_calls` in the commit corpus gets populated. Tool calls cannot be
+recovered after the fact, so capture is cheap and reconstruction is impossible;
+that asymmetry is the whole reason. Details, and the three ways it silently
+records nothing, are in `maintenance/SKILL_session_capture.md`.
+
 ## Layout
 
 ```
