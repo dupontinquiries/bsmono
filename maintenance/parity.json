@@ -177,14 +177,11 @@
   "pct": 92,
   "wired": 30,
   "wired_pct": 75,
-  "live": 35,
-  "live_pct": 88,
-  "stranded": [
-   "Pearl-input-view",
-   "Status-view"
-  ],
+  "live": 37,
+  "live_pct": 92,
+  "stranded": [],
   "bin": true,
-  "app_default": false,
+  "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",

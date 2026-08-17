@@ -281,12 +281,15 @@ def covered_live(name, port_dirs_list):
                 except Exception:
                     continue
                 if name in t or snake(name) in t:
-                    hits.append((src, f[:-3]))
+                    hits.append((root, f[:-3]))
     if not hits:
         return False
-    for src, mod in hits:
-        # The crate root and its binaries are live by definition.
-        if mod in ('lib', 'main') or os.path.basename(os.path.dirname(src)) == 'bin':
+    for root, mod in hits:
+        # The crate root is live by definition — and so is a binary target.
+        # The previous version tested the PORT dir's parent rather than the
+        # file's own directory, so logscope's pearl-input-view and status-view
+        # read as stranded while both are [[bin]] entries that ship.
+        if mod in ('lib', 'main') or os.path.basename(root) == 'bin':
             return True
         # Reachability is asked across EVERY port dir, not just the one the
         # module lives in. ambient-learner keeps its pages inline at
@@ -321,8 +324,29 @@ def cargo_state(app_dir):
         tm = os.path.join(src, 'Cargo.toml')
         try: t = open(tm, encoding='utf8').read()
         except Exception: continue
-        if '[[bin]]' in t:
-            return (True, 'default = ["app"]' in t)
+        if '[[bin]]' not in t:
+            continue
+        # Does a default build produce the app? The check used to look for the
+        # literal `default = ["app"]`, which is this fleet's convention but not
+        # a rule — logscope gates its GUI bin on `gui` and defaults to
+        # `["gui", "gpu-scene"]`, so it built fine while the column said
+        # otherwise. Read the bin's required-features and ask whether the
+        # default list satisfies them.
+        default = re.search(r'^default\s*=\s*\[([^\]]*)\]', t, re.M)
+        defaults = set(re.findall(r'"([^"]+)"', default.group(1))) if default else set()
+        needed = set()
+        for block in re.findall(r'\[\[bin\]\](.*?)(?=^\[|\Z)', t, re.S | re.M):
+            if 'required-features' in block:
+                rf = re.search(r'required-features\s*=\s*\[([^\]]*)\]', block)
+                feats = set(re.findall(r'"([^"]+)"', rf.group(1))) if rf else set()
+                # Any ONE bin that a default build produces is enough.
+                if feats <= defaults:
+                    return (True, True)
+                needed |= feats
+            else:
+                # No gate at all: it builds by default.
+                return (True, True)
+        return (True, not needed)
     return (False, False)
 
 def main():
