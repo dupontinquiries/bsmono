@@ -100,6 +100,23 @@ merge rather than a fast-forward.
 * `fullscreen-launcher/` — QML sources and two design docs (icon animations,
   tile geometry) for the Plasma plasmoid. Source material for step 3 above
   rather than a separate thing to merge.
-* `studio-trap/` — three bundles and an mbox. Each bundle requires a base ref
-  this repo does not have, so they are a separate lineage and cannot be
-  fetched here yet. Unassessed.
+* `studio-trap/` — a DAW, `apps/studio`, and it DOES fetch here. I wrote the
+  opposite in this file's first commit: `git bundle verify` printed a base ref
+  and I read "requires" as "is missing" without checking, when
+  `git cat-file -t` on that ref answers `commit` in one command. Corrected
+  the same day, but the lesson is that "requires" in that output names a
+  prerequisite, not a failure.
+
+  Three bundles, one lineage: `studio-trap-work` (6 commits) is an ancestor
+  of `autotune-bundle-02` (23), and `studio-session.bundle` inside the v2 zip
+  has the identical tip `f47ca49e` — a duplicate, not a third branch. All
+  three fork from `3e6b64d9`, a commit this repo has.
+
+  Fetched as `incoming/trap`, `incoming/trap-autotune`, `incoming/trap-session`.
+  The tip adds twelve crates under `apps/studio/crates` — core, engine, audio,
+  fx, io, live, media, command, collab, copilot, app, egui — so it is a
+  separate product from the launchers, not a competing implementation, and
+  merging it is an independent decision from the one above. Its own
+  assessment still to do.
+
+* `studio-session.mbox` — an mbox alongside the bundles, unexamined.
