@@ -220,6 +220,35 @@ def trailers(body):
     return {k: v.strip() for k, v in TRAILER_PAT.findall(body or "")}
 
 
+def observed(sha):
+    """Commands actually run for this commit, from the toolcalls note.
+
+    This is the field the whole corpus has been carrying as null. It is
+    populated only where a capture was running (see session_capture.sh) —
+    never inferred, never reconstructed. A commit made without capture stays
+    null, and null continues to mean "not recorded", not "none happened".
+
+    Notes do not transfer on clone by default, so this is empty on a fresh
+    clone until:
+        git fetch origin refs/notes/toolcalls:refs/notes/toolcalls
+    """
+    raw = run(["notes", "--ref=refs/notes/toolcalls", "show", sha])
+    if not raw.strip():
+        return None
+    out = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A malformed line is skipped rather than failing the record —
+            # a corrupt note must not cost the rest of the corpus.
+            continue
+    return out or None
+
+
 def record(c, files):
     paths = [p for _, _, p in files]
     added = sum(a or 0 for a, _, _ in files)
@@ -257,7 +286,7 @@ def record(c, files):
         # deliberately NOT reconstructed: a plausible trace generated from the
         # finished diff is model output that cannot be told apart from a
         # recording once it is in this field.
-        "observed_calls": None,
+        "observed_calls": observed(c["sha"]),
         "process": "unknown",
         # A replayed commit is a reconstruction: its tree and diff are real,
         # but the diff spans a whole delivery rather than one edit, and the
