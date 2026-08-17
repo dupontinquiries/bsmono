@@ -79,6 +79,11 @@ CORRECTION_PAT = re.compile(
     re.I,
 )
 
+# Test-run claims in a message: "106 tests pass", "1258 passed", "42 tests".
+# An entailed fact, not a guess — the number was read off a run that happened.
+TESTRUN_PAT = re.compile(
+    r"(\d[\d,]*)\s+(?:tests?\s+(?:pass|passed|green)|passed|tests?\b)", re.I)
+
 # A commit whose message explains WHY, not just what. The scarce signal.
 REASONING_PAT = re.compile(r"\bbecause\b|\brather than\b|\binstead of\b|\bso that\b", re.I)
 
@@ -163,6 +168,47 @@ def classify(c, files):
     return REFACTOR
 
 
+def entailed(c, files):
+    """Operations the artifact PROVES happened.
+
+    The distinction this file turns on. A reconstruction of what an author
+    plausibly typed is model output wearing a trace's clothes: generated from
+    the finished diff, it walks straight to the answer, and staging a wrong
+    turn means staging one whose resolution is already known. Training on that
+    teaches diagnosis-as-a-straight-line, which is the opposite of what the
+    self-correcting commits contain.
+
+    These are different. A commit that adds a file entails a write. A message
+    quoting "106 tests pass" entails a run that returned 106 — the number was
+    read off something. Each carries the evidence that supports it, so a
+    consumer can filter by how much it trusts, and nothing here is imagined.
+
+    What is still missing is stated as missing: the greps, the failed builds,
+    the reruns. Those left no trace and no amount of inference recovers them.
+    """
+    ops = []
+    for a, d, path in files:
+        if a is None and d is None:
+            ops.append({"op": "write_binary", "path": path, "evidence": "diff"})
+        elif d == 0 or (a and not d):
+            ops.append({"op": "create_or_append", "path": path,
+                        "added": a, "evidence": "diff"})
+        elif a == 0:
+            ops.append({"op": "delete_or_truncate", "path": path,
+                        "deleted": d, "evidence": "diff"})
+        else:
+            ops.append({"op": "edit", "path": path, "added": a,
+                        "deleted": d, "evidence": "diff"})
+    # A quoted test count came from a run. The count is evidence; the command
+    # that produced it is not recorded, so it is not claimed.
+    for m in TESTRUN_PAT.finditer(c["subject"] + " " + c["body"]):
+        n = m.group(1).replace(",", "")
+        if n.isdigit() and int(n) > 0:
+            ops.append({"op": "test_run", "reported": int(n),
+                        "evidence": "message", "command": None})
+    return ops
+
+
 def record(c, files):
     paths = [p for _, _, p in files]
     added = sum(a or 0 for a, _, _ in files)
@@ -192,6 +238,14 @@ def record(c, files):
         # NOT RECOVERABLE FROM GIT. Stated per record rather than omitted, so
         # a consumer cannot mistake absence for "there were none", and so a
         # later pipeline that does capture them has a field to fill.
+        # Operations the artifact proves. See entailed().
+        "entailed": entailed(c, files),
+        # The real trace — what was actually typed, in what order, including
+        # everything that failed. Not in git, not inferable from it, and
+        # deliberately NOT reconstructed: a plausible trace generated from the
+        # finished diff is model output that cannot be told apart from a
+        # recording once it is in this field.
+        "observed_calls": None,
         "process": "unknown",
     }
 
