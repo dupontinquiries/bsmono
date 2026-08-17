@@ -68,6 +68,40 @@ The reason to run this before writing code: the "deeper USB stack" hypothesis
 is the expensive one and the least likely, and thirty seconds of `sudo
 fastboot devices` either falsifies it or promotes it to the real problem.
 
+## What reading pmbootstrap changed
+
+Two facts from the source that the triage above did not account for.
+
+**pmbootstrap already runs fastboot as root, inside a chroot.** `pmb/flasher/run.py`
+ends every action with `pmb.chroot.root(command, ...)`. So the udev ACL is
+irrelevant to pmbootstrap's own flashing — it is root, the permission gate does
+not apply. That sharpens the diagnosis rather than muddying it:
+
+* If `pmbootstrap flasher list_devices` works while the web flasher does not,
+  the udev/browser hypothesis is **confirmed**, because the only difference
+  between those two paths is the permission gate.
+* If `pmbootstrap flasher list_devices` ALSO fails, the problem is below
+  permissions, and the chroot is the next suspect before the controller — see
+  below.
+
+So add one line to the triage, run before the others:
+
+```sh
+pmbootstrap flasher list_devices     # root, inside the chroot
+```
+
+**The chroot needs USB bind-mounted in, and that is a separate failure mode.**
+`pmb/config/__init__.py` carries `flash_mount_bind`: `/sys/bus/usb/devices/`,
+`/sys/dev/`, `/sys/devices/`, `/dev/bus/usb/`. Those four get bind-mounted into
+the native chroot before a flash program starts. If any is missing or empty
+inside the chroot, fastboot sees no device and reports exactly what a dead USB
+stack reports — nothing. Checking `ls /dev/bus/usb` from inside the chroot
+distinguishes "the host cannot see the phone" from "the chroot cannot see the
+host's phone", and those have completely different fixes.
+
+This is the failure most likely to be mistaken for an Asahi quirk, because it
+produces a hardware-shaped symptom from a mount-namespace cause.
+
 ## What to build, if the answer is "udev"
 
 Then the browser was never the right path anyway, and the useful piece is
@@ -76,6 +110,13 @@ narrow: **a Rust fastboot client**, not a pmbootstrap rewrite.
 * The fastboot protocol is small — a handful of ASCII commands over bulk
   transfers (`getvar`, `download:%08x`, `flash:%s`, `reboot`), with four
   response prefixes (`OKAY`, `FAIL`, `DATA`, `INFO`).
+* **pmbootstrap's flasher is 552 lines of 26,405** — about 2% of the codebase,
+  and most of it is a data table. `pmb/config/__init__.py` holds `flashers` as
+  a dict of method → action → argv templates with `$PARTITION_ROOTFS`,
+  `$IMAGE`, `$BOOT` substituted in; `run.py` does the substitution, checks a
+  partition blacklist, and shells out. That is the whole design. Porting *it*
+  is tractable in a way that porting pmbootstrap is not, and the table
+  translates to Rust almost literally.
 * `nusb` (pure Rust, no libusb) or `rusb` handles the transport.
 * Shipping the udev rule alongside it makes the permission problem a packaging
   concern rather than a thing the operator rediscovers per machine.
