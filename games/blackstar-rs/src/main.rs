@@ -1769,7 +1769,22 @@ fn main() {
                                     game.cycle_car(dir);
                                 }
                             }
-                            if !event.repeat {
+                            // ALREADY-HELD GUARD, not just !event.repeat: an
+                            // analog keyboard (Wooting) can send a genuine,
+                            // non-OS-repeat Pressed event more than once for
+                            // what is physically one soft press — the switch
+                            // chatters near its actuation point on a feather
+                            // press, and each chatter transition is a real
+                            // key-down as far as winit/the OS is concerned,
+                            // so event.repeat stays false for every one of
+                            // them. That double-fired every menu nav action
+                            // (arrow keys) on a feather press. The Jump
+                            // action a few lines below already guards this
+                            // exact way for the same reason; key_down's
+                            // call sites (menu navigation, the repeat timer)
+                            // did not, which is why this and not that ever
+                            // double-fired.
+                            if !event.repeat && !game.held.contains(&key) {
                                 game.key_down(key.clone(), elwt, &win);
                             } else if let Mode::Online { .. } = game.mode {
                                 game.key_down(key.clone(), elwt, &win); // key repeat in text fields
