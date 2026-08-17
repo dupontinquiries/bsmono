@@ -2332,6 +2332,18 @@ impl Game {
                 // because walking every prim at `t` is the cost and doing it
                 // twice would double it on every folding frame.
                 let (hb, drop) = m.bounds_at(t);
+                // "Expanding the long way, then shrinking back a ton": the
+                // raw lerp's length can overshoot both end poses mid-fold
+                // (a part in transit toward a far-off target pushes the
+                // silhouette out), and it snaps back the moment the fold
+                // finishes. Cap it to the straight-line envelope between
+                // this chassis's own vehicle and robot lengths, and fold
+                // the overflow into height instead of discarding it — see
+                // xform::redistribute_length_to_height's doc comment.
+                let strip = &self.cars.chassis[cid].strip;
+                let veh_len = self.cars.models[strip[0]].half_len;
+                let bot_len = self.cars.models[*strip.last().unwrap()].half_len;
+                let hb = xform::redistribute_length_to_height(hb, veh_len, bot_len, t);
                 let h = hb * self.cfg.car.size;
                 self.car.half_w = h.x.max(0.12);
                 self.car.half_h = h.y.max(0.10);

@@ -338,9 +338,103 @@ impl Morph {
     }
 }
 
+/// Redistributes bounding-box volume from LENGTH into HEIGHT when the
+/// raw lerp's silhouette runs longer than a straight interpolation
+/// between the vehicle's own length and the robot's own length.
+///
+/// This is the "expanding the long way, then shrinking back a ton"
+/// artifact: vertex-lerp travels each vertex in a straight line toward
+/// its counterpart in the next pose, and when a part's target sits far
+/// away (a nose panel becoming a shoulder, say) the geometry in transit
+/// pushes the silhouette's LENGTH out past what either end pose
+/// actually measures. It snaps back the moment the fold finishes,
+/// which reads as the body being briefly, arbitrarily larger rather
+/// than folding with any sense of conserved mass.
+///
+/// The correction: cap the displayed length at the straight-line
+/// envelope between the vehicle's and robot's own measured lengths,
+/// and instead of just discarding the overflow, fold that volume into
+/// HEIGHT — a transforming robot growing taller as it stands up reads
+/// as purpose; a vehicle stretching longer than either of its own end
+/// states reads as a glitch. Total displayed volume is conserved
+/// (checked by the tests below), not just capped.
+///
+/// A layer on top of the measured bounds, same relationship
+/// `compact.rs`'s displacement field has to the underlying lerp — this
+/// does not touch a single vertex, only the half-extents a caller
+/// (the hitbox, the seating check) uses afterward.
+///
+/// NOT visually verified: this environment has no GPU, so the actual
+/// on-screen result is unchecked. The math is tested against the
+/// invariant it claims (length capped, volume conserved), not against
+/// a rendered frame — tune `min_overflow` and whether this should
+/// blend with `t` toward the edges once someone can actually look at it.
+pub fn redistribute_length_to_height(actual: Vec3, veh_len: f32, bot_len: f32, t: f32) -> Vec3 {
+    let expected_len = veh_len + (bot_len - veh_len) * t.clamp(0.0, 1.0);
+    if actual.z <= expected_len || actual.x <= 0.0 || actual.y <= 0.0 {
+        return actual; // nothing to redistribute, or a degenerate box
+    }
+    let overflow_vol = 8.0 * actual.x * actual.y * (actual.z - expected_len);
+    let capped_vol = 8.0 * actual.x * actual.y * expected_len;
+    if capped_vol <= 0.0 {
+        return actual;
+    }
+    let height_scale = (capped_vol + overflow_vol) / capped_vol;
+    Vec3::new(actual.x, actual.y * height_scale, expected_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_redistribution_when_length_is_already_within_the_envelope() {
+        // veh_len 2.0, bot_len 1.0, t 0.5 -> expected 1.5. Actual length
+        // 1.4 is under that -- nothing should move.
+        let actual = Vec3::new(0.5, 0.3, 1.4);
+        let out = redistribute_length_to_height(actual, 2.0, 1.0, 0.5);
+        assert_eq!(out, actual, "an already-short body was still redistributed");
+    }
+
+    #[test]
+    fn overflowing_length_is_capped_and_the_volume_moves_to_height() {
+        let actual = Vec3::new(0.5, 0.3, 2.5); // ballooned length
+        let veh_len = 2.0;
+        let bot_len = 1.0;
+        let t = 0.5; // expected length 1.5
+        let out = redistribute_length_to_height(actual, veh_len, bot_len, t);
+        assert!((out.z - 1.5).abs() < 1e-5, "length should be capped to the envelope, got {}", out.z);
+        assert!(out.y > actual.y, "height should have grown to absorb the overflow");
+        assert_eq!(out.x, actual.x, "width is untouched -- only length and height move");
+        // the real invariant: total volume before and after should match,
+        // not just "length went down"
+        let vol_before = 8.0 * actual.x * actual.y * actual.z;
+        let vol_after = 8.0 * out.x * out.y * out.z;
+        assert!((vol_before - vol_after).abs() < 1e-4,
+            "volume should be conserved, not discarded: {vol_before} vs {vol_after}");
+    }
+
+    #[test]
+    fn a_degenerate_box_is_returned_unchanged_rather_than_producing_nan_or_inf() {
+        let zero = Vec3::new(0.0, 0.3, 2.5);
+        let out = redistribute_length_to_height(zero, 1.0, 2.0, 0.5);
+        assert!(out.x.is_finite() && out.y.is_finite() && out.z.is_finite());
+    }
+
+    #[test]
+    fn the_endpoints_of_the_fold_are_never_touched() {
+        // at t=0 and t=1 the expected length equals one of the real end
+        // lengths exactly, so a body that is not currently ballooning
+        // (the normal case at rest) never gets redistributed at the
+        // poses that ship as-is -- same "endpoints untouched" property
+        // compact.rs's own curve(t) already guarantees for its layer.
+        let veh_len = 2.0;
+        let bot_len = 1.0;
+        let at_rest_vehicle = Vec3::new(0.5, 0.3, veh_len);
+        let at_rest_robot = Vec3::new(0.5, 0.3, bot_len);
+        assert_eq!(redistribute_length_to_height(at_rest_vehicle, veh_len, bot_len, 0.0), at_rest_vehicle);
+        assert_eq!(redistribute_length_to_height(at_rest_robot, veh_len, bot_len, 1.0), at_rest_robot);
+    }
 
     fn vtx(x: f32) -> Vertex {
         Vertex { pos: [x, 0.0, 0.0], nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] }
