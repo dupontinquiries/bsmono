@@ -209,12 +209,24 @@ def entailed(c, files):
     return ops
 
 
+# Trailers written by zips_to_history.sh. A replayed commit knows things a
+# normal one does not — which zip it came from, and what the author called its
+# state — and those are the two fields a consumer of this corpus most wants.
+TRAILER_PAT = re.compile(r"^(Rev|Source-Zip|Zip-SHA256|Author-Status|Reconstructed):\s*(.+)$",
+                         re.M)
+
+
+def trailers(body):
+    return {k: v.strip() for k, v in TRAILER_PAT.findall(body or "")}
+
+
 def record(c, files):
     paths = [p for _, _, p in files]
     added = sum(a or 0 for a, _, _ in files)
     deleted = sum(d or 0 for _, d, _ in files)
     binary = [p for a, _, p in files if a is None]
     body = c["body"]
+    tr = trailers(body)
     return {
         "sha": c["sha"],
         "date": c["date"],
@@ -247,6 +259,18 @@ def record(c, files):
         # recording once it is in this field.
         "observed_calls": None,
         "process": "unknown",
+        # A replayed commit is a reconstruction: its tree and diff are real,
+        # but the diff spans a whole delivery rather than one edit, and the
+        # timestamp is a file mtime. Flagged so this never gets mixed with
+        # authored commits without the difference being visible — they teach
+        # different things and averaging them blurs both.
+        "reconstructed": tr.get("Reconstructed") == "true",
+        # The author's own confidence, off the filename: UNVERIFIED, CHECKED,
+        # VERIFIED-CORES, FIX. Rare and valuable — a human labelling their own
+        # work at the time, not inferred afterwards.
+        "author_status": (tr.get("Author-Status") or "none").lower(),
+        "source_zip": tr.get("Source-Zip"),
+        "rev": int(tr["Rev"]) if tr.get("Rev", "").isdigit() else None,
     }
 
 
