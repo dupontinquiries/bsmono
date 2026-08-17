@@ -181,6 +181,34 @@ one:
 
 `f02280000.usb` → the Apple ATC dwc3 behind a Type-C port.
 
+### Two controller instances, same failure
+
+A second round of logs settles part of it. The device was tried on several
+physical ports and landed on bus 7 and bus 3 — which are different dwc3
+instances:
+
+```
+f02280000.usb/xhci-hcd.1.auto/usb3      getvar all → FAILED (ENOENT)
+f02280000.usb/xhci-hcd.2.auto/usb7      getvar all → FAILED (ENOENT)
+```
+
+Both granted `uaccess`, both enumerated, both failed identically on the first
+bulk write. That rules out a single bad port and makes "dwc3/ATC bulk
+transfers" the standing hypothesis rather than one of several.
+
+### Which ports are which, because this is what blocked the experiment
+
+Every port tried landed on 3 or 7, and the driver name says why:
+
+* `xhci-hcd` (hyphen) — the PLATFORM driver, `f02280000.usb`, the Apple ATC
+  dwc3. Buses 1/2/3/4/7/8. Every USB-C and Thunderbolt port goes through this.
+* `xhci_hcd` (underscore) — the PCI driver. Buses 5/6, one controller with two
+  ports, USB2 and USB3 root hubs. On this machine that is the pair of rear
+  USB-A ports; the keyboard and mouse were on it.
+
+So reaching bus 5 with a phone needs a **USB-A to USB-C cable**, not another
+USB-C port. Moving between USB-C ports can only ever produce another dwc3 bus.
+
 ### The experiment that would make this reportable
 
 `lsusb -t` shows two driver spellings on this machine: `xhci-hcd` on buses
@@ -194,6 +222,14 @@ hub in between — and re-running `fastboot getvar all` splits the hypothesis:
   thing to suspect; xHCI has been fragile about non-4K pages.
 
 `sudo dmesg -w` during the failing command should name the mechanism outright.
+
+One anomaly not to over-read: after a failed `getvar`, `sudo fastboot getvar
+all` reported `< waiting for any device >` while the unprivileged user had
+listed the device moments earlier, and an earlier run had `sudo fastboot
+devices` working fine. The likely reading is that the failed bulk write knocked
+the device off the bus rather than a permissions inversion — worth confirming
+with `lsusb -t` immediately after a failure, because "the failed write
+re-enumerates the device" is itself a useful symptom.
 
 ### What this changes
 
