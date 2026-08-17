@@ -354,10 +354,14 @@ fn glass_frame() -> egui::Frame {
 /// A turn. `variants` lets an assistant turn hold multiple completions (reroll / branch); `cur`
 /// selects which is shown and which streaming appends to. User turns carry a single variant plus
 /// inline-edit state.
-struct Msg { role: Role, variants: Vec<String>, cur: usize, born: std::time::Instant, editing: bool, edit_buf: String, think_open: bool, parent: Option<usize> }
+/// `model` records WHICH model produced an assistant turn. None for user turns and for anything
+/// from before this was recorded — see convoprov, which skips unknown provenance rather than
+/// assuming it matches the neighbours, because that is exactly what an older conversation looks
+/// like and guessing there would label it with whatever happens to be loaded now.
+struct Msg { role: Role, variants: Vec<String>, cur: usize, born: std::time::Instant, editing: bool, edit_buf: String, think_open: bool, parent: Option<usize>, model: Option<String> }
 impl Msg {
-    fn user(text: String) -> Self { Self { role: Role::User, variants: vec![text], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None } }
-    fn assistant() -> Self { Self { role: Role::Assistant, variants: vec![String::new()], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None } }
+    fn user(text: String) -> Self { Self { role: Role::User, variants: vec![text], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
+    fn assistant() -> Self { Self { role: Role::Assistant, variants: vec![String::new()], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
     fn text(&self) -> &str { &self.variants[self.cur] }
     /// All variants, for an export that must not drop regenerations.
     fn all_variants(&self) -> &[String] { &self.variants }
@@ -384,6 +388,155 @@ struct VerifyJob {
     rx: std::sync::mpsc::Receiver<(bool, String, bool)>,
     started: Instant,
     result: Option<(bool, String, bool)>,
+}
+
+/// Replicator mode's UI-side state: the columns, who is paired with whom, and where the composer
+/// is aimed. The DECISIONS live in logscope::replicator (pure, tested); this holds only what a
+/// frame needs to draw and what the operator has clicked.
+struct ReplicatorMode {
+    workers: Vec<logscope::replicator::Replicant>,
+    /// Directed dilations: who sees whose latest, and how often.
+    grid: logscope::replicator::ShareGrid,
+    /// None = the composer broadcasts; Some(id) = it is aimed at one column.
+    aim: Option<usize>,
+    /// The slider's live value and the hardware bound it must respect.
+    want: usize,
+    slots: logscope::replicator::Slots,
+    /// Per worker: its transcript (operator prompt then reply, newest last) and its own turn
+    /// count. The turn count is per worker because dilation is anchored per RECEIVER — an idle
+    /// column must not have its cadence advanced by a busy one.
+    lanes: Vec<ReplicaLane>,
+    /// What actually crossed, for the coloured edges between columns.
+    crossings: logscope::replicator::CrossingLog,
+    /// Open the dilation matrix under the columns.
+    show_matrix: bool,
+}
+
+#[derive(Default, Clone)]
+struct ReplicaLane {
+    assignment: String,
+    lines: Vec<String>,
+    turn: usize,
+    /// True while the last line is a reply still streaming — so a second token stream cannot be
+    /// appended onto a finished reply, and `last` (what partners quote) is never a half sentence
+    /// from two different turns glued together.
+    streaming: bool,
+}
+
+impl ReplicaLane {
+    fn append_token(&mut self, t: &str) {
+        if !self.streaming { self.lines.push(String::new()); self.streaming = true; }
+        if let Some(last) = self.lines.last_mut() { last.push_str(t); }
+    }
+
+    fn finish_reply(&mut self, full: &str) {
+        let text = full.trim().to_string();
+        if self.streaming { if let Some(last) = self.lines.last_mut() { *last = text; } }
+        else { self.lines.push(text); }
+        self.streaming = false;
+    }
+}
+
+impl ReplicatorMode {
+    fn new(s: &logscope::replicator::Slots, n: usize) -> Self {
+        let mut m = Self { workers: Vec::new(), grid: logscope::replicator::ShareGrid::new(0),
+                           aim: None, want: n, slots: s.clone(), lanes: Vec::new(),
+                           crossings: logscope::replicator::CrossingLog::new(256),
+                           show_matrix: false };
+        m.resize(n);
+        m
+    }
+
+    /// Grow or shrink the column set, placing each worker on a host with room. Shrinking DROPS the
+    /// highest ids and unpairs them — a closed column that stayed in a pair group would keep
+    /// injecting a dead worker's last message into a live one's context.
+    fn resize(&mut self, n: usize) {
+        let n = n.clamp(self.slots.min, self.slots.selectable_max());
+        while self.workers.len() > n { self.workers.pop(); self.lanes.pop(); }
+        while self.workers.len() < n {
+            let id = self.workers.len();
+            // Fill each host to its own capacity before moving on, so columns land where the
+            // memory actually is rather than round-robin onto a machine that cannot hold them.
+            let mut placed = String::from("local");
+            let mut seen = 0usize;
+            for (host, cap) in &self.slots.per_host {
+                if id < seen + cap { placed = host.clone(); break; }
+                seen += cap;
+            }
+            self.workers.push(logscope::replicator::Replicant {
+                id, host: placed, assignment: String::new() });
+        }
+        // The grid follows the column set: resize drops a closed worker's row AND column, so a
+        // dead column cannot keep injecting its last message into a live one's context.
+        self.grid.fit_to(self.workers.len());
+        self.lanes.resize(self.workers.len(), ReplicaLane::default());
+        self.want = n;
+    }
+
+    /// Capture for the autosave. Assignments and turns come from the lanes, which are the live
+    /// copies — the workers' own `assignment` field is a per-frame mirror.
+    fn snapshot(&self) -> logscope::replicator::ReplicatorSave {
+        let names: Vec<String> = self.lanes.iter().map(|l| l.assignment.clone()).collect();
+        let turns: Vec<u32> = self.lanes.iter().map(|l| l.turn as u32).collect();
+        logscope::replicator::ReplicatorSave::capture(&self.grid, &names, &turns)
+    }
+
+    /// Reopen a saved fan at `n` columns. Transcripts are NOT restored — the chat's own autosave
+    /// owns message history, and a second copy here would let the two disagree about what a worker
+    /// said, which is exactly the string partners get quoted.
+    fn restore(&mut self, save: &logscope::replicator::ReplicatorSave, n: usize) {
+        self.resize(n);
+        for i in 0..self.lanes.len() {
+            let (assignment, turn) = save.worker_at(i);
+            self.lanes[i].assignment = assignment.clone();
+            self.lanes[i].turn = turn as usize;
+            if let Some(w) = self.workers.get_mut(i) { w.assignment = assignment; }
+        }
+        if let Some(g) = save.restore(self.lanes.len()) { self.grid = g; }
+    }
+
+    /// Compose one operator message into per-worker prompts, record the crossings, and advance
+    /// each receiving worker's turn.
+    ///
+    /// The prompts are RETURNED rather than sent: generation belongs to the backend path, and a
+    /// mode that both decides and dispatches is a mode that cannot be tested without a GPU. The
+    /// caller feeds these to the same lane machinery a normal turn uses.
+    fn submit(&mut self, text: &str) -> Vec<logscope::replicator::Dispatchable> {
+        for (i, w) in self.workers.iter().enumerate() {
+            if let Some(l) = self.lanes.get_mut(i) { l.assignment = w.assignment.clone(); }
+        }
+        let aim = match self.aim { Some(i) => logscope::replicator::Aim::One(i),
+                                   None => logscope::replicator::Aim::All };
+        let lanes = self.lanes.clone();
+        let out = logscope::replicator::compose_turn(
+            &self.workers, &self.grid, &aim, text,
+            |id| lanes.get(id).map(|l| l.turn).unwrap_or(0),
+            |id| lanes.get(id).and_then(|l| l.lines.last().cloned()),
+            &mut self.crossings);
+        for d in &out {
+            if let Some(l) = self.lanes.get_mut(d.to) {
+                l.lines.push(text.trim().to_string());
+                l.turn += 1;
+            }
+        }
+        out
+    }
+}
+
+/// A running `:image` generation. sd-cli takes seconds to tens of seconds for an 8-step 1024²,
+/// so it runs on a thread and the UI polls — blocking the frame would freeze the whole app on a
+/// task whose whole point is that you keep working while it renders.
+struct ImageJob {
+    rx: std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>,
+    prompt: String,
+    started: Instant,
+    result: Option<Result<std::path::PathBuf, String>>,
+    /// The decoded PNG, uploaded once. Kept on the job rather than re-decoded per frame: a 1024²
+    /// PNG is ~4 MB of RGBA and 60 decodes a second is not a thing to do by accident.
+    tex: Option<egui::TextureHandle>,
+    /// Set when decoding failed, so the path is still shown with a reason instead of the row
+    /// silently rendering nothing — the file exists either way and the operator can open it.
+    tex_err: Option<String>,
 }
 
 // ── Persistence: checkpoints, rollback, crash recovery ───────────────────────────────────────
@@ -417,13 +570,21 @@ struct Checkpoint { label: String, at_unix: u64, msgs: Vec<MsgSave> }
 /// What gets written to disk on every turn — the live conversation plus its checkpoints — so a
 /// crash (e.g. an OOM mid-generation) loses nothing and the user can reopen and recover.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
-struct ChatSave { msgs: Vec<MsgSave>, checkpoints: Vec<Checkpoint> }
+struct ChatSave {
+    msgs: Vec<MsgSave>,
+    checkpoints: Vec<Checkpoint>,
+    /// The replicator fan, when one is open. `#[serde(default)]` so every save written before this
+    /// field existed still loads — an autosave that refuses to parse costs the operator the
+    /// conversation, which is a far worse failure than a lost fan.
+    #[serde(default)]
+    replicator: Option<logscope::replicator::ReplicatorSave>,
+}
 
 fn msg_to_save(m: &Msg) -> MsgSave { MsgSave { role: if m.role == Role::User { 0 } else { 1 }, variants: m.variants.clone(), cur: m.cur } }
 fn save_to_msg(s: &MsgSave) -> Msg {
     let variants = if s.variants.is_empty() { vec![String::new()] } else { s.variants.clone() };
     let cur = s.cur.min(variants.len() - 1);
-    Msg { role: if s.role == 0 { Role::User } else { Role::Assistant }, variants, cur, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None }
+    Msg { role: if s.role == 0 { Role::User } else { Role::Assistant }, variants, cur, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None , model: None }
 }
 fn now_unix() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 
@@ -490,41 +651,8 @@ fn autosave_path() -> Option<std::path::PathBuf> {
 const MAX_CHECKPOINTS: usize = 30;
 
 struct Ctx { n_ctx: u32, max_tokens: u32, temperature: f32, repeat_penalty: f32, min_p: f32, history_turns: usize }
-impl Ctx {
-    /// Settings for a generation profile.
-    ///
-    /// A thinking model emits thousands of `<think>` tokens, so the old
-    /// max_tokens of 512 truncated mid-think every time — which presents as
-    /// "never finishes" and is indistinguishable from the loop the stop-token
-    /// and ChatML fixes already cured. See `gen_profile`.
-    pub fn for_profile(p: crate::gen_profile::Profile) -> Self {
-        let d = p.defaults();
-        Self { n_ctx: d.n_ctx, max_tokens: d.max_tokens, temperature: d.temperature,
-               repeat_penalty: d.repeat_penalty, min_p: d.min_p, history_turns: 8 }
-    }
-
-    /// Re-apply defaults for a newly loaded model, unless the user has changed them.
-    ///
-    /// Only when untouched: silently overwriting settings somebody typed is
-    /// worse than a bad default, because it happens after they have already
-    /// decided the app is wrong.
-    pub fn adopt_for_model(&mut self, name: &str, declared_ctx: Option<u32>) -> bool {
-        let current_profile_defaults = crate::gen_profile::Profile::Direct.defaults();
-        let untouched = self.n_ctx == current_profile_defaults.n_ctx
-            && self.max_tokens == current_profile_defaults.max_tokens
-            && self.temperature == current_profile_defaults.temperature;
-        if !untouched { return false; }
-        let p = crate::gen_profile::detect(name, declared_ctx);
-        if p == crate::gen_profile::Profile::Direct { return false; }
-        let turns = self.history_turns;
-        *self = Ctx::for_profile(p);
-        self.history_turns = turns;
-        true
-    }
-}
-
 impl Default for Ctx {
-    fn default() -> Self { Ctx::for_profile(crate::gen_profile::Profile::Direct) }
+    fn default() -> Self { Self { n_ctx: 4096, max_tokens: 512, temperature: 0.35, repeat_penalty: 1.15, min_p: 0.05, history_turns: 8 } }
 }
 
 fn est(s: &str) -> usize { s.len() / 4 + 1 } // rough tokens; the backend tokenizes exactly
@@ -790,7 +918,7 @@ fn persona_by_key(key: &str) -> Option<&'static str> { PERSONAS.iter().find(|p| 
 /// Which subpage the right sidebar shows. The sidebar consolidates the per-conversation panels
 /// (generated files, context/system settings, prompting modes) behind a button rail.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RightPage { Files, Graph, Context, Prompting }
+enum RightPage { Files, Graph, Context, Prompting, Engine }
 
 /// Neutralize control-token marker strings that appear inside INJECTED CONTENT (system prompt, log
 /// lines, user/assistant turns) so the tokenizer can't silently encode them as real special tokens.
@@ -872,6 +1000,10 @@ fn parse_imported_chat(text: &str) -> Vec<(Role, String)> {
 }
 
 pub struct Chat {
+    /// Model name for turns generated from now on; None until one is known. Deliberately stamped at
+    /// creation rather than derived at render time from whatever is loaded — deriving would relabel
+    /// history on every switch, which is the opposite of provenance.
+    stamp_model: Option<String>,
     msgs: Vec<Msg>,
     input: String,
     context: String,   // system prompt — the "context" the model always sees
@@ -882,6 +1014,9 @@ pub struct Chat {
     right_page: RightPage, // active sidebar subpage
     coord_mode: crate::coordinator::Mode, // prompting mode (barebones / coordinator / aggressive)
     verify_job: Option<VerifyJob>, // running sandbox build-check of the generated files
+    image_job: Option<ImageJob>,   // running :image generation (sd-cli, off-thread)
+    replicator: Option<ReplicatorMode>, // :replicate — parallel worker columns over the workspace
+    replica_jobs: std::collections::HashMap<crate::lanes::JobId, usize>, // lane job → replicator column
     verify_net: bool,              // allow the verify to fetch missing deps from crates.io (opt-in)
     show_files: bool,              // expand the generated-files drawer (toggled from the composer)
     hide_bottom_bar: bool,         // hide the whole composer/files/suggestions strip — reclaims the
@@ -895,6 +1030,10 @@ pub struct Chat {
     orbit: crate::spatial::OrbitCam, // 3D camera for the spatial message view
     pearl_input: crate::pearl_input::PearlInput, // the composer rendered as a resonance-cell pearl
     pearl_on: bool,        // show the in-scene refractive pearl (toggle in the spatial toolbar)
+    /// Last press in the 3D scene: world-space hit point + the scene-clock time it landed. Feeds
+    /// the shader's u_touch (world xyz + age), which existed and was DEAD — nothing ever set it
+    /// (physical-ui-findings.md). None once the response has faded.
+    scene_touch: Option<([f32; 3], f32)>,
     pearl_variant: u8,     // pearl optical style: 0 balanced · 1 fine-crackle · 2 milky · 3 clear-glass
     backdrop: bool,        // render-as-full-window-backdrop: suppress spatial chrome, fill the whole rect
     glass_host: bool,      // app is in glass mode: the central canvas stays transparent (the backdrop draws the scene)
@@ -963,6 +1102,8 @@ pub struct Chat {
     lanes: Option<crate::lanes::LanePool>, // :lanes N — concurrent generation lanes over ONE resident model; fan branches decode in parallel through this instead of round-robin on the single worker
     lane_jobs: std::collections::HashMap<crate::lanes::JobId, usize>, // in-flight pool job → fan branch (routes tagged Token/Done events)
     lanes_ready: bool, // the pool's async model load completed (LaneEvt::Ready seen)
+    /// Device cost of one more model instance, learned from LaneEvt::Ready. 0 = unknown.
+    instance_bytes: u64,
     local_model_path: Option<String>, // the picker's selected LOCAL .gguf, captured each frame for :lanes
     rep_monitor: crate::repetition::RepeatMonitor, // cuts a runaway repetition loop in the live reply (all backends)
     stream: Option<Stream>,
@@ -1059,11 +1200,16 @@ pub struct Chat {
 impl Default for Chat {
     fn default() -> Self {
         Self {
+            stamp_model: None,
             msgs: Vec::new(), input: String::new(),
             context: LONG_HORIZON.into(),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
             verify_job: None,
+            image_job: None,
+            replicator: None,
+            replica_jobs: Default::default(),
+            instance_bytes: 0,
             verify_net: false,
             show_files: false,
             hide_bottom_bar: false,
@@ -1072,6 +1218,7 @@ impl Default for Chat {
             orbit: crate::spatial::OrbitCam::default(), spatial_view: false,
             pearl_input: Default::default(),
             pearl_on: false,
+            scene_touch: None,
             pearl_variant: 0,
             backdrop: false,
             glass_host: false,
@@ -1261,7 +1408,18 @@ impl Chat {
                     }
                     return;
                 }
-                Evt::Loaded(Ok(info)) => { self.template = info.template; return; }
+                Evt::Loaded(Ok(info)) => {
+                    // BOTH, always. live_template is the OVERRIDE build_prompt reads
+                    // (`live_template.unwrap_or(template)`), and these handlers `return` before the
+                    // update loop's refresh — so a value left from a PREVIOUS model survived a model
+                    // switch and beat the new model's detection. That is how a Bailing2 model
+                    // received Llama3 markers with zero specials: the tab had loaded a Llama model
+                    // earlier in the session. Tying the override to the loaded model fixes it.
+                    self.template = info.template;
+                self.live_template = Some(info.template);   // see the Evt::Loaded comment above
+                    self.live_template = Some(info.template);
+                    return;
+                }
                 Evt::Loaded(Err(_)) => { return; }
             }
         }
@@ -1293,7 +1451,17 @@ impl Chat {
                     if let Some(crate::workspace_exec::AgentStep::Finished(stop)) = stepv { self.finish_agent_run(stop); }
                     return;
                 }
-                Evt::Loaded(Ok(info)) => { self.template = info.template; return; }
+                Evt::Loaded(Ok(info)) => {
+                    // BOTH, always. live_template is the OVERRIDE build_prompt reads
+                    // (`live_template.unwrap_or(template)`), and these handlers `return` before the
+                    // update loop's refresh — so a value left from a PREVIOUS model survived a model
+                    // switch and beat the new model's detection. That is how a Bailing2 model
+                    // received Llama3 markers with zero specials: the tab had loaded a Llama model
+                    // earlier in the session. Tying the override to the loaded model fixes it.
+                    self.template = info.template;
+                    self.live_template = Some(info.template);
+                    return;
+                }
                 Evt::Loaded(Err(_)) => { return; }
             }
         }
@@ -1593,6 +1761,26 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// The loaded model's template, preferring the worker's live value over the per-frame copy.
     fn live_template(&self) -> TemplateKind { self.live_template.unwrap_or(self.template) }
 
+    /// Context for command-argument completion. The ref-taking commands (:goto, :why, :mergectx,
+    /// :segment, …) address messages by short id, and until now the palette offered only the static
+    /// "-1/-2/-3", so picking a message meant reading its id out of the transcript by eye. Handing
+    /// the real conversation over lets the palette complete an id, annotate a positional ref with
+    /// the message it lands on, and find a message by what it SAYS.
+    fn arg_ctx(&self) -> crate::cmdpalette::ArgCtx {
+        let msgs = self.msgs.iter().enumerate().map(|(i, m)| crate::cmdpalette::MsgRef {
+            idx: i,
+            short_id: logscope_fan::vimmode::short_id(i),
+            role: if m.role == Role::User { "you".into() } else { "assistant".into() },
+            // One line is enough to recognise a message by; the palette truncates further.
+            preview: m.text().lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string(),
+        }).collect();
+        crate::cmdpalette::ArgCtx {
+            models: Vec::new(),
+            refs: vec!["-1".into(), "-2".into(), "-3".into()],
+            msgs,
+        }
+    }
+
     fn build_prompt(&self, doc: &crate::analysis::Doc) -> String { self.build_prompt_upto(self.msgs.len(), doc) }
 
     /// Every branch tip: a message id that is no other message's (effective) parent. The effective parent
@@ -1822,7 +2010,10 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         if self.stream.is_some() || leaf >= self.msgs.len() { return; }
         self.active_leaf = Some(leaf);              // lineage head for the prompt builder
         let prompt = self.build_prompt(doc);        // root→leaf + the assistant primer
-        self.msgs.push(Msg::assistant());
+        // Stamp the model onto the turn it produced. convoprov marks only the CHANGES, so this is
+        // what lets a conversation spanning four models read as a timeline instead of one model
+        // having a bad day — which is how the template-mismatch replies were read for several turns.
+        { let mut a = Msg::assistant(); a.model = self.stamp_model.clone(); self.msgs.push(a); }
         let aid = self.msgs.len() - 1;
         self.msgs[aid].parent = Some(leaf);
         self.active_leaf = Some(aid);
@@ -1861,10 +2052,13 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 // rewrites them to <|header_start|>/<|eot|> authoritatively at generate time.
                 TemplateKind::Llama4 => self.build_prompt_llama3(&sys, upto),
                 TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
+                TemplateKind::Bailing2 => self.build_prompt_bailing2(&sys, upto),
                 TemplateKind::Plain => self.build_prompt_plain(&sys, upto),
             },
             // llama.cpp path is otherwise Plain, but Gemma needs its own turn markers to stop correctly.
-            _ if self.template == TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
+            // Reads live_template() like the arm above: a persisted value that disagrees with what
+            // the worker detected must not decide the frame (see the resume builder's comment).
+            _ if self.live_template() == TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
             _ => self.build_prompt_plain(&sys, upto),
         }
     }
@@ -1892,9 +2086,40 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         // If the reply ended by asking to continue, drop that trailing question before resuming IN PLACE —
         // otherwise the model reads its own "let me know when you're ready" and stalls or answers itself.
         let partial = neutralize_markers(crate::stepwise::strip_trailing_solicitation(&raw_partial));
-        let chatml = self.backend == BackendKind::Wgpu && self.template == TemplateKind::ChatML;
-        let llama3 = self.backend == BackendKind::Wgpu && matches!(self.template, TemplateKind::Llama3 | TemplateKind::Llama4);
-        if chatml {
+        // RESUME BUILDER TEMPLATE SELECTION. Two defects fixed here, both visible in the 737
+        // hardware log, which showed a Bailing2-DETECTED model handed a prompt ending
+        // "assistant<|end_header_id|>\n\n" with ZERO special tokens:
+        //
+        // 1. It read `self.template` (the tab's persisted value) instead of `live_template()`,
+        //    which prefers what the worker actually detected for the loaded model. A restored
+        //    conversation carrying a stale Llama3 choice therefore framed every continuation in
+        //    Llama3 markers no matter which model was loaded.
+        // 2. It knew only ChatML and Llama3/Llama4; every other family fell through to bare
+        //    "System:/User:" text. Bailing2 (Ling 2.0 / LLaDA2) had no arm at all, so even with
+        //    correct detection this path could never emit <role> turns.
+        //
+        // The markers of a family the tokenizer does not know go in as ordinary words — which is
+        // exactly what "0 special tokens" on a 1718-token prompt meant.
+        let t_live = self.live_template();
+        let chatml = self.backend == BackendKind::Wgpu && t_live == TemplateKind::ChatML;
+        let llama3 = self.backend == BackendKind::Wgpu && matches!(t_live, TemplateKind::Llama3 | TemplateKind::Llama4);
+        let bailing2 = self.backend == BackendKind::Wgpu && t_live == TemplateKind::Bailing2;
+        if bailing2 {
+            // Same frame as build_prompt_bailing2, with the assistant turn left OPEN so the partial
+            // resumes in place: no <|role_end|> after it.
+            let nb = |t: &str| neutralize_markers(t).replace("<role>", "<\u{200b}role>").replace("</role>", "<\u{200b}/role>");
+            let mut s = if sys.trim().is_empty() {
+                String::from("<role>SYSTEM</role>detailed thinking off<|role_end|>")
+            } else {
+                format!("<role>SYSTEM</role>{}\ndetailed thinking off<|role_end|>", nb(&sys))
+            };
+            for m in self.chosen_msgs(8, &sys, last) {
+                let role = if m.role == Role::User { "HUMAN" } else { "ASSISTANT" };
+                s.push_str(&format!("<role>{role}</role>{}<|role_end|>", nb(m.text())));
+            }
+            s.push_str(&format!("<role>ASSISTANT</role>{partial}"));
+            s
+        } else if chatml {
             let mut s = format!("<|im_start|>system\n{}<|im_end|>\n", sys);
             for m in self.chosen_msgs(8, &sys, last) {
                 let role = if m.role == Role::User { "user" } else { "assistant" };
@@ -1912,6 +2137,18 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             s.push_str(&format!("<|start_header_id|>assistant<|end_header_id|>\n\n{}", partial));
             s
         } else {
+            // NO RESUME ARM for this template: the continuation is framed as bare text while the
+            // model expects its own turn markers. Silent before — say it once, because the symptom
+            // (a coherent first reply, degraded continuations) points nowhere near this code.
+            if self.backend == BackendKind::Wgpu && t_live != TemplateKind::Plain {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    eprintln!("logscope: continuation prompt has no arm for template {t_live:?} — \
+framing it as plain 'System:/User:' text. The model's own turn markers are absent, so a resumed \
+reply is framed differently from the turn that produced it.");
+                }
+            }
             let mut s = format!("System: {}\n", sys);
             for m in self.chosen_msgs(2, &sys, last) {
                 let tag = if m.role == Role::User { "User" } else { "Assistant" };
@@ -1944,7 +2181,9 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// turn and on checkpoint changes, so a crash mid-generation recovers everything.
     fn autosave(&self) {
         let Some(path) = autosave_path() else { return };
-        let save = ChatSave { msgs: self.msgs.iter().map(msg_to_save).collect(), checkpoints: self.checkpoints.clone() };
+        let save = ChatSave { msgs: self.msgs.iter().map(msg_to_save).collect(),
+                              checkpoints: self.checkpoints.clone(),
+                              replicator: self.replicator.as_ref().map(|m| m.snapshot()) };
         if let Ok(json) = serde_json::to_string(&save) {
             if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
             let _ = std::fs::write(&path, json);
@@ -1983,6 +2222,19 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         if let Some(save) = Self::load_autosave() {
             self.msgs = save.msgs.iter().map(save_to_msg).collect(); self.resync_tree();
             self.checkpoints = save.checkpoints;
+            // Reopen the fan the operator left running: its assignments and cadences, at the
+            // column count it was saved with, bounded by what this machine can hold now (the save
+            // may come from a bigger one). Transcripts come back through the conversation above,
+            // not through the fan — one owner for message history.
+            if let Some(rs) = save.replicator.filter(|r| !r.assignments.is_empty()) {
+                let hosts = self.replicator_hosts();
+                let slots = logscope::replicator::slots(&hosts, self.instance_bytes);
+                let n = rs.assignments.len().clamp(slots.min, slots.selectable_max());
+                let mut m = ReplicatorMode::new(&slots, n);
+                m.restore(&rs, n);
+                self.note = format!("replicator: reopened {n} worker(s) from the last session");
+                self.replicator = Some(m);
+            }
         }
         self.recover = None;
     }
@@ -2188,6 +2440,24 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         s
     }
 
+    fn build_prompt_bailing2(&self, sys: &str, upto: usize) -> String {
+        // Bailing2 (Ling 2.0 / LLaDA2), mirrored from llama.cpp llama-chat.cpp: uppercase roles in
+        // <role>...</role>, turns closed by <|role_end|>, and — faithful to the reference — a
+        // DEFAULT system of "detailed thinking off" when none is given (the thinking toggle lives
+        // in the system turn, so omitting it is not neutral). Content gets the standard marker
+        // neutralization PLUS a break on plain-bracket <role>/</role>, which the <| rule misses.
+        let nb = |t: &str| neutralize_markers(t).replace("<role>", "<\u{200b}role>").replace("</role>", "<\u{200b}/role>");
+        let mut s = String::new();
+        if sys.trim().is_empty() { s.push_str("<role>SYSTEM</role>detailed thinking off<|role_end|>"); }
+        else { s.push_str(&format!("<role>SYSTEM</role>{}\ndetailed thinking off<|role_end|>", nb(sys))); }
+        for m in self.chosen_msgs(8, sys, upto) {
+            let role = if m.role == Role::User { "HUMAN" } else { "ASSISTANT" };
+            s.push_str(&format!("<role>{role}</role>{}<|role_end|>", nb(m.text())));
+        }
+        s.push_str("<role>ASSISTANT</role>");
+        s
+    }
+
     fn send(&mut self, infer: &Inference, doc: &crate::analysis::Doc, ui: &egui::Ui) {
         // Composer command routing: a line the user submits that begins with ':' is executed as a
         // command HERE, not sent to the model. '::text' escapes a literal message that starts with a
@@ -2208,6 +2478,15 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             }
             Composed::Message(qt) => {
                 self.input.clear();
+                // REPLICATOR MODE OWNS A PLAIN MESSAGE. In this mode the composer is not talking to
+                // one model; it is addressing a fan (broadcast) or one column (aimed). Falling
+                // through to the single-model path here would send the message to a worker the
+                // operator did not choose and leave the columns silent — the mode would look
+                // broken while quietly working normally underneath.
+                if self.replicator.is_some() && !plain_escape {
+                    self.dispatch_replicator(&qt);
+                    return;
+                }
                 // WORKSPACE AUTO-ROUTE: with a repository loaded, a plain message IS a task on that
                 // repository — run it through the agent loop (which can read/search/edit the code)
                 // instead of plain chat (which cannot; the log's "add more blocks" got a generic
@@ -2284,7 +2563,10 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         self.hit_cap = false;
         let prompt = self.build_prompt(doc);
         self.last_prompt_tokens = est(&prompt); // for the live progress estimate
-        self.msgs.push(Msg::assistant());
+        // Stamp the model onto the turn it produced. convoprov marks only the CHANGES, so this is
+        // what lets a conversation spanning four models read as a timeline instead of one model
+        // having a bad day — which is how the template-mismatch replies were read for several turns.
+        { let mut a = Msg::assistant(); a.model = self.stamp_model.clone(); self.msgs.push(a); }
         let aid = self.msgs.len() - 1;
         self.msgs[aid].parent = Some(uid);
         self.active_leaf = Some(aid);
@@ -2315,7 +2597,10 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 self.msgs[i].variants = vec![buf]; self.msgs[i].cur = 0;
                 self.msgs.truncate(i + 1);                    // drop the now-stale reply + after
                 let prompt = self.build_prompt_upto(i + 1, doc);
-                self.msgs.push(Msg::assistant());
+                // Stamp the model onto the turn it produced. convoprov marks only the CHANGES, so this is
+        // what lets a conversation spanning four models read as a timeline instead of one model
+        // having a bad day — which is how the template-mismatch replies were read for several turns.
+        { let mut a = Msg::assistant(); a.model = self.stamp_model.clone(); self.msgs.push(a); }
                 let idx = self.msgs.len() - 1;
                 self.msgs[idx].parent = Some(i);
                 self.active_leaf = Some(idx);
@@ -2763,8 +3048,30 @@ them to", patches.len());
         let mut dead = false;
         for e in evts {
             match e {
-                crate::lanes::LaneEvt::Ready { lanes, model, .. } => {
+                crate::lanes::LaneEvt::Ready { lanes, model, instance_bytes, .. } => {
                     self.lanes_ready = true;
+                    // The one moment the engine's own memory figure is reachable from here. Store
+                    // it and re-derive replicator's slots: a mode already open was bounded by the
+                    // per-machine cap alone, and the honest detent can only appear now.
+                    self.instance_bytes = instance_bytes;
+                    if self.replicator.is_some() {
+                        let hosts = self.replicator_hosts();
+                        let slots = logscope::replicator::slots(&hosts, instance_bytes);
+                        if let Some(m) = self.replicator.as_mut() {
+                            let before = m.want;
+                            m.slots = slots;
+                            // Shrink the fan if the real figure cannot hold what the cap allowed.
+                            // Growing is NOT automatic: the operator chose that number, and a mode
+                            // that adds workers on its own is a mode that starts work nobody asked
+                            // for on a workspace it can edit.
+                            let capped = before.min(m.slots.selectable_max());
+                            if capped != before {
+                                m.resize(capped);
+                                self.note = format!("replicator: {before} -> {capped} worker(s) — {}",
+                                    m.slots.explain(&model));
+                            }
+                        }
+                    }
                     self.note = format!("lanes: {lanes} × {model} up — one weights copy, {lanes} KV caches; fans now decode {lanes} branches at once");
                     // Widen a fan that's already pool-driven (jobs queued before the load finished).
                     if !self.lane_jobs.is_empty() {
@@ -2776,13 +3083,38 @@ them to", patches.len());
                     if let Some(&b) = self.lane_jobs.get(&job) {
                         if let Some(f) = self.agent_fan.as_mut() { f.on_token_branch(b, &text); }
                     }
+                    // Replicator columns stream in place: the last line of a worker's lane IS its
+                    // reply-in-progress, appended token by token, so the operator watches four
+                    // workers think at once rather than waiting for four Dones.
+                    if let Some(&w) = self.replica_jobs.get(&job) {
+                        if let Some(m) = self.replicator.as_mut() {
+                            if let Some(l) = m.lanes.get_mut(w) { l.append_token(&text); }
+                        }
+                    }
                 }
-                crate::lanes::LaneEvt::Done { job, .. } => {
+                crate::lanes::LaneEvt::Done { job, text, .. } => {
                     if let Some(b) = self.lane_jobs.remove(&job) {
                         if let Some(f) = self.agent_fan.as_mut() { steps.extend(f.on_done_branch(b)); }
                     }
+                    if let Some(w) = self.replica_jobs.remove(&job) {
+                        if let Some(m) = self.replicator.as_mut() {
+                            // Replace the streamed partial with the pool's final text: the two can
+                            // differ (a lane may finish mid-token, and the pool's copy is what a
+                            // partner would be quoted), and the partner-context path must quote the
+                            // same words the worker actually produced.
+                            if let Some(l) = m.lanes.get_mut(w) { l.finish_reply(&text); }
+                        }
+                    }
                 }
                 crate::lanes::LaneEvt::Error { job, err } => {
+                    if let Some(w) = self.replica_jobs.remove(&job) {
+                        if let Some(m) = self.replicator.as_mut() {
+                            // The failure lands IN the column, not in a global banner: with four
+                            // workers running, a banner cannot say which one died, and a column
+                            // that simply stops looks identical to one still thinking.
+                            if let Some(l) = m.lanes.get_mut(w) { l.finish_reply(&format!("⚠ {err}")); }
+                        }
+                    }
                     if let Some(b) = self.lane_jobs.remove(&job) {
                         if let Some(f) = self.agent_fan.as_mut() { steps.extend(f.on_error_branch(b, err)); }
                     }
@@ -4044,9 +4376,19 @@ them to", patches.len());
                     // viewer; billboarded slabs (right/up basis) so each button faces the camera. The
                     // small downward offset keeps it a ledge beneath the pearl without dropping off the
                     // bottom of the canvas (the panel origin already sits low-centre).
-                    let dock_c = anchor(0.5, 0.87); // bottom-centre, adapts to window size
                     let dock_radius = (0.42 * win_w / ppw / 1.36).clamp(0.55, 1.7); // arc spans ~42% of width
                     let ds = dock_radius / 0.95; // scale buttons with the arc
+                    // BOTTOM-EDGE FIT. The old constant 0.87 placed the arc's CENTRE, so the lower
+                    // half of each slab hung below it — and since the slabs scale with window width
+                    // (ds), a wide window pushed that overhang past the canvas edge and the bottom
+                    // row was clipped. Measure the viewport's height in world units by sampling the
+                    // same anchor mapping at top and bottom, then let physui place the centre so the
+                    // slab's lower edge lands a margin above the edge. Tested in physui, which is
+                    // egui-free and runs standalone.
+                    let vspan = { let (t, b) = (anchor(0.5, 0.0), anchor(0.5, 1.0));
+                        ((t.x - b.x).powi(2) + (t.y - b.y).powi(2) + (t.z - b.z).powi(2)).sqrt() };
+                    let dock_v = crate::physui::dock_center_v(0.26_f32 * ds, vspan, 0.045);
+                    let dock_c = anchor(0.5, dock_v);
                     let pos = crate::physui::dock_arc(
                         DOCK_IDS.len(),
                         [dock_c.x, dock_c.y, dock_c.z],
@@ -4566,7 +4908,7 @@ them to", patches.len());
                     // focused message id so different messages' motes/glints don't move in lockstep.
                     let scene_light = crate::mesh3d::scene_light_for(theme::active().name);
                     let plaque_seed = fid as u32;
-                    let mut put_line = |g: &mut Vec<crate::mesh3d::Mesh3>, text: &str, y: f32, scale: f32, col: egui::Color32, lit: f32| {
+                    let put_line = |g: &mut Vec<crate::mesh3d::Mesh3>, text: &str, y: f32, scale: f32, col: egui::Color32, lit: f32| {
                         let w = text.chars().count() as f32 * 6.0 * scale;
                         let o = V3::new(rc.x - toward.x * 0.30 - right.x * left_edge + right.x * (w * 0.5) + up.x * y,
                                         rc.y - toward.y * 0.30 - right.y * left_edge + right.y * (w * 0.5) + up.y * y,
@@ -4678,7 +5020,35 @@ them to", patches.len());
                         if in_corridor { 0.0 } else { ((d - (rp - 1.0)) / 3.5).clamp(0.0, 1.0) }
                     }
                 } else { 0.0 };
+                // TOUCH RESPONSE — wire the dead u_touch. A primary press inside the scene casts a
+                // ray (gpuscene::ray_uv, the tested inverse of dir_uv) and anchors the glow where it
+                // meets the floor plane, or at orbit distance when pointing at sky — a mid-air glow
+                // still answers the finger. RAW pointer input rather than the orbit Response, on
+                // purpose: in-scene slabs consume clicks through their own interacts, and pressing a
+                // slab IS touching it — the physical UI should glow under every touch, not only the
+                // ones no control wanted. egui y grows DOWN, ndc-uv y grows UP: the flip lives here,
+                // at the screen boundary, so gpuscene stays in one convention.
+                if let Some(pp) = ui.input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None }) {
+                    if rect.contains(pp) {
+                        let uv = [(pp.x - rect.left()) / rect.width().max(1.0),
+                                  1.0 - (pp.y - rect.top()) / rect.height().max(1.0)];
+                        let (o, d) = cam.ray_uv(uv);
+                        let hit = if d[1] < -1e-4 {
+                            let th = (-o[1] / d[1]).clamp(0.5, 80.0);
+                            [o[0] + d[0] * th, o[1] + d[1] * th, o[2] + d[2] * th]
+                        } else {
+                            [o[0] + d[0] * view_cam.dist, o[1] + d[1] * view_cam.dist, o[2] + d[2] * view_cam.dist]
+                        };
+                        self.scene_touch = Some((hit, t));
+                    }
+                }
+                // age on the same scene clock the shader animates with; expire past the shader's fade
+                let touch = self.scene_touch.and_then(|(p2, t0)| {
+                    let age = t - t0;
+                    if age > 3.0 { None } else { Some([p2[0], p2[1], p2[2], age]) }
+                });
                 let u = crate::glow_scene::Uniforms {
+                    touch,
                     viewproj: cam.view_proj(), eye: cam.eye(),
                     sun_dir: [sun.x, sun.y, sun.z], sun_col: c3(sun_tod),
                     sky: c3(light.sky), ground: c3(light.ground), ambient: light.ambient * gambm * tod_amb,
@@ -4718,6 +5088,42 @@ them to", patches.len());
                     ..Default::default()
                 };
                 p.add(crate::glow_scene::callback(rect, u, verts));
+                // NAVIGATION CURSOR — where in the WORLD the pointer lands, not where it sits on
+                // the glass. Same ray as the touch response, every hovered frame; the ring has a
+                // FIXED WORLD radius, so its pixel size is a depth cue (near floor = wide, far
+                // wall = small) — deliberately the inverse of the constant-subtended-angle rule
+                // physical-ui-findings.md sets for CONTROLS: a control must stay pressable at any
+                // distance, a cursor must SHOW distance. Hidden while anything drags (orbiting
+                // reads as camera movement, not pointing). Drawn after the GL callback so it sits
+                // on the rendered world.
+                if let Some(hp) = ui.ctx().pointer_hover_pos() {
+                    if rect.contains(hp) && !ui.input(|i| i.pointer.is_decidedly_dragging()) {
+                        let uv = [(hp.x - rect.left()) / rect.width().max(1.0),
+                                  1.0 - (hp.y - rect.top()) / rect.height().max(1.0)];
+                        let (o, d) = cam.ray_uv(uv);
+                        let hit = if d[1] < -1e-4 {
+                            let th = (-o[1] / d[1]).clamp(0.5, 80.0);
+                            [o[0] + d[0] * th, o[1] + d[1] * th, o[2] + d[2] * th]
+                        } else {
+                            [o[0] + d[0] * view_cam.dist, o[1] + d[1] * view_cam.dist, o[2] + d[2] * view_cam.dist]
+                        };
+                        let hv = crate::spatial::Vec3::new(hit[0], hit[1], hit[2]);
+                        if let Some((sx, sy, _)) = view_cam.project(hv, cx, cy, scale) {
+                            const CURSOR_R: f32 = 0.14; // world units
+                            // pixel radius from a projected world-offset point (any horizontal axis works
+                            // for a screen-space circle; the ring is a marker, not a floor decal)
+                            let px = view_cam.project(crate::spatial::Vec3::new(hit[0] + CURSOR_R, hit[1], hit[2]), cx, cy, scale)
+                                .map(|(ex, ey, _)| ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt())
+                                .unwrap_or(4.0).clamp(2.0, 28.0);
+                            let acc = crate::theme::active().amber; // the palette's accent family
+                            let pulse = 150 + (40.0 * (t * 2.2).sin()) as i16;
+                            let col = egui::Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), pulse.clamp(90, 200) as u8);
+                            let c = egui::pos2(sx, sy);
+                            p.circle_stroke(c, px, egui::Stroke::new(1.4, col));
+                            p.circle_filled(c, 1.6, col);
+                        }
+                    }
+                }
             }
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(40)); // strands ripple + runes glow
         }
@@ -5102,6 +5508,214 @@ them to", patches.len());
     }
 
     /// `:a <path>` — read a file (bounded) and stage it into the composer, then drop into Insert.
+    /// Hosts available to replicator mode.
+    ///
+    /// Today that is THIS MACHINE ONLY, reported honestly rather than optimistically: the fleet
+    /// side (fleet::sightings over the DHT) can enumerate peers, but nothing yet ships a model
+    /// instance to one and streams it back, so counting remote machines here would offer slots the
+    /// mode cannot fill. The seam is `Vec<Host>` precisely so that adding peers later is a change
+    /// to this function and nothing else.
+    fn replicator_hosts(&self) -> Vec<logscope::replicator::Host> {
+        let budget = gpu_kernels::store::resident_budget_bytes().unwrap_or(0);
+        vec![logscope::replicator::Host { id: "local".into(), budget_bytes: budget }]
+    }
+
+    /// What one more instance of the loaded model would cost, learned from the lane pool's Ready
+    /// event (weights the planner placed + a KV cache at the default window).
+    ///
+    /// 0 until a pool has loaded, and `replicator::slots` reads 0 as "no memory bound" rather than
+    /// as zero slots — so before :lanes the slider shows the full per-machine track and after it
+    /// the detent appears where the device actually stops. A GGUF file-size proxy was rejected for
+    /// the gap: a q4 file on disk is not what int8 residency costs, and a slider that promises four
+    /// workers and OOMs on the third is worse than one that stops at the sane cap.
+    fn per_instance_bytes(&self) -> u64 { self.instance_bytes }
+
+    fn model_label(&self) -> String {
+        self.stamp_model.clone()
+            .or_else(|| self.local_model_path.as_ref().and_then(|p| {
+                std::path::Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned())
+            }))
+            .unwrap_or_else(|| "the model".into())
+    }
+
+    /// Start a `:image` generation on a worker thread.
+    ///
+    /// This is the trigger the whole sd-cli path was missing: mediagen builds the argv and
+    /// media::generate_image runs it, both tested, and NOTHING called them — the feature was
+    /// complete except for the part that starts it.
+    ///
+    /// The binary comes from LOGSCOPE_SD_CLI, or `sd-cli` on PATH. Resolution failures are
+    /// reported the way the fleet reports refusals: named, in the transcript, with the thing to
+    /// fix — a silent no-op here would be indistinguishable from a broken build.
+    fn start_image(&mut self, prompt: &str) {
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            self.note = "usage: :image <prompt> — e.g. :image a red bicycle in the rain".into();
+            return;
+        }
+        if self.image_job.is_some() {
+            self.note = "an image is already generating — one at a time (sd-cli wants the GPU too)".into();
+            return;
+        }
+        let sd_cli = std::env::var_os("LOGSCOPE_SD_CLI").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("sd-cli"));
+        let models = logscope::llm_backend::default_models_dir();
+        // Named by prompt and clock so two generations never collide, and so the file is
+        // identifiable later without opening it.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let slug: String = prompt.chars().filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
+            .take(40).collect::<String>().trim().replace(' ', "-").to_lowercase();
+        let out = self.save_dir.clone().unwrap_or_else(std::env::temp_dir)
+            .join(format!("logscope-{stamp}-{}.png", if slug.is_empty() { "image".into() } else { slug }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (p2, models2) = (prompt.clone(), models.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::media::generate_image(sd_cli, &models2, &p2, out));
+        });
+        self.image_job = Some(ImageJob { rx, prompt, started: Instant::now(), result: None, tex: None, tex_err: None });
+    }
+
+    /// Send one composed message into the fan: compose per-worker prompts, submit each to the lane
+    /// pool, and remember which job belongs to which column.
+    ///
+    /// Lanes are the right vehicle and were already built: LanePool runs N generators over ONE
+    /// resident weight set with N KV caches, which is exactly the shape replicator's memory bound
+    /// assumes. Without a pool this falls back to reporting what it WOULD have sent, because a
+    /// mode that silently drops the operator's message is worse than one that admits it is
+    /// half-wired.
+    fn dispatch_replicator(&mut self, text: &str) {
+        let params = self.params();
+        let Some(m) = &mut self.replicator else { return };
+        let jobs = m.submit(text);
+        if jobs.is_empty() {
+            self.note = "replicator: nothing aimed at — the column you targeted is gone".into();
+            return;
+        }
+        match self.lanes.as_mut() {
+            Some(pool) => {
+                for d in &jobs {
+                    let id = pool.submit(d.prompt.clone(), params.clone());
+                    self.replica_jobs.insert(id, d.to);
+                }
+                let crossed = jobs.iter().filter(|d| d.had_context).count();
+                self.note = format!("replicator: {} worker(s) working{}", jobs.len(),
+                    if crossed > 0 { format!(", {crossed} with partner context") } else { String::new() });
+            }
+            None => {
+                self.note = format!("replicator: composed for {} worker(s) but no lane pool is up \
+— run :lanes {} first (one weights copy, {} KV caches)", jobs.len(), jobs.len(), jobs.len());
+            }
+        }
+    }
+
+    /// Draw replicator mode's panel when it is on. Nothing at all when it is off — a mode's UI
+    /// should not cost a frame it is not part of.
+    fn draw_replicator(&mut self, ui: &mut egui::Ui) {
+        let model = self.model_label();
+        let Some(m) = &mut self.replicator else { return };
+        let (slots, want, aim) = (m.slots.clone(), m.want, m.aim);
+        let mut views: Vec<crate::replicatorui::ColumnView<'_>> = m.workers.iter()
+            .zip(m.lanes.iter_mut())
+            .map(|(w, l)| crate::replicatorui::ColumnView {
+                id: w.id, host: w.host.as_str(), turn: l.turn,
+                // The assignment edits IN PLACE through the view; the panel owns no copy that
+                // could go stale between frames.
+                assignment: &mut l.assignment,
+                lines: &l.lines[..],
+            }).collect();
+        let act = crate::replicatorui::panel(ui, &slots, want, aim, &mut views, &m.grid,
+                                             &m.crossings, &model);
+        drop(views);
+        if let Some(a) = act.aim { m.aim = a; }
+        if act.toggle_matrix { m.show_matrix = !m.show_matrix; }
+        if let Some(v) = act.want { m.resize(v); }
+        if m.show_matrix {
+            let labels: Vec<String> = m.workers.iter().zip(m.lanes.iter())
+                .map(|(w, l)| if l.assignment.is_empty() { format!("w{}", w.id) } else { l.assignment.clone() })
+                .collect();
+            // The turn a link is set on ANCHORS its cadence, so the matrix needs the clock: the
+            // newest lane turn is the operator's "now".
+            let now = m.lanes.iter().map(|l| l.turn).max().unwrap_or(0) as u32;
+            crate::replicatorui::dilation_matrix(ui, &mut m.grid, &labels, now);
+        }
+    }
+
+    /// Poll the running generation and surface it. Called once per frame from the chat UI.
+    ///
+    /// Dismissal is collected as a flag and applied AFTER the job borrow ends: an egui closure that
+    /// clears `self.image_job` while the match still holds `&mut` on it does not compile, and the
+    /// tempting fix (clone the job into the closure) would copy the Receiver out of the field it
+    /// has to stay in.
+    fn poll_image(&mut self, ui: &mut egui::Ui) {
+        let Some(job) = &mut self.image_job else { return };
+        if job.result.is_none() {
+            if let Ok(r) = job.rx.try_recv() { job.result = Some(r); }
+        }
+        let mut dismiss = false;
+        match &job.result {
+            None => {
+                let (elapsed, prompt) = (job.started.elapsed().as_secs_f32(), job.prompt.clone());
+                ui.horizontal(|ui| {
+                    theme::pulse_dot(ui, theme::CYAN());
+                    ui.label(RichText::new(format!("generating an image… ({elapsed:.0}s) — {prompt}"))
+                        .color(theme::CYAN()).small());
+                });
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            }
+            Some(Ok(path)) => {
+                let path = path.clone();
+                // Decode + upload ONCE, on the first frame after the generation lands. decode.rs
+                // has handled every colour type since it was written and had no callers until now;
+                // the picture appearing in the transcript is what it was for.
+                if job.tex.is_none() && job.tex_err.is_none() {
+                    match std::fs::read(&path).map_err(|e| e.to_string())
+                        .and_then(|b| crate::decode::decode_png_rgba(&b))
+                    {
+                        Ok((rgba, w, h)) => {
+                            let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                            job.tex = Some(ui.ctx().load_texture(
+                                format!("genimage::{}", path.display()), img, egui::TextureOptions::LINEAR));
+                        }
+                        Err(e) => job.tex_err = Some(e),
+                    }
+                }
+                let tex = job.tex.clone();
+                let tex_err = job.tex_err.clone();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("🖼 {}", path.display())).color(theme::GREEN()).small());
+                    if theme::carved_button(ui, "open").clicked() { Self::reveal(&path); }
+                    if theme::carved_button(ui, "dismiss").clicked() { dismiss = true; }
+                });
+                if let Some(e) = tex_err {
+                    ui.label(RichText::new(format!("(written, but not displayable here: {e})"))
+                        .color(theme::AMBER()).small());
+                }
+                if let Some(tex) = tex {
+                    // Fit the WIDTH and keep the aspect: a 1024² at native size overflows a phone
+                    // and pushes the composer off screen — the same out-of-bounds class
+                    // mobilelayout::dialog_width fixes for dialogs.
+                    let avail = ui.available_width().max(64.0);
+                    let [tw, th] = tex.size();
+                    let w = avail.min(tw as f32);
+                    let h = w * th as f32 / (tw as f32).max(1.0);
+                    ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(w, h)));
+                }
+            }
+            Some(Err(e)) => {
+                // Every failure mode here is actionable — no binary on PATH or in LOGSCOPE_SD_CLI,
+                // no diffusion model under models/image, no text encoder under models/text_encoders
+                // — so the message is the whole error rather than a summary of it.
+                let e = e.clone();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("image generation failed: {e}")).color(theme::RED()).small());
+                    if theme::carved_button(ui, "dismiss").clicked() { dismiss = true; }
+                });
+            }
+        }
+        if dismiss { self.image_job = None; }
+    }
+
     fn attach_path(&mut self, path: &str, ui: &egui::Ui) {
         let p = shellexpand_home(path);
         match std::fs::read(&p) {
@@ -5151,6 +5765,7 @@ them to", patches.len());
         match cmd {
             Command::Branch => { if let Some(f) = self.walk_focus { self.branch_from = Some(f); } }
             Command::Attach(p) => self.attach_path(&p, ui),
+            Command::Image(prompt) => self.start_image(&prompt),
             Command::Goto(n) => {
                 let i = n.saturating_sub(1).min(self.msgs.len().saturating_sub(1));
                 // Glide along the graph's shortest path (like clicking a node) AND zoom in, so a voice "go to
@@ -5268,6 +5883,32 @@ them to", patches.len());
                 }
             }
             // :ws / :workspace — status of the loaded /tmp .gitmind session and how much has changed in it.
+            // :ws <path> — open a workspace, which is the same operation :load-gitmind performs;
+            // reusing it rather than a second loader means one mirroring path, one set of failure
+            // messages, and no chance of the two drifting.
+            Command::OpenWorkspace(path) => {
+                self.run_command(crate::vimmode::Command::LoadGitmind(path), ui);
+                if self.gitmind_session.is_some() {
+                    self.note = format!("{} · :replicate to fan workers across it", self.note);
+                }
+            }
+            // :replicate [n] — enter replicator mode. The count is BOUNDED here rather than
+            // trusted: the slider's ceiling is a hardware fact (replicator::slots), and a typed
+            // ":replicate 12" on a machine with room for 3 must land on 3 with a reason, not
+            // start twelve workers that thrash.
+            Command::Replicate(n) => {
+                let hosts = self.replicator_hosts();
+                let per_instance = self.per_instance_bytes();
+                let s = logscope::replicator::slots(&hosts, per_instance);
+                let want = n.unwrap_or(s.selectable_max().min(3));
+                let got = want.clamp(s.min, s.selectable_max());
+                self.replicator = Some(ReplicatorMode::new(&s, got));
+                self.note = if got == want {
+                    format!("replicator: {got} worker(s) — {}", s.explain(&self.model_label()))
+                } else {
+                    format!("replicator: {got} worker(s), not {want} — {}", s.explain(&self.model_label()))
+                };
+            }
             Command::WorkspaceStatus => {
                 self.note = match &self.gitmind_session {
                     None => ":ws — no workspace loaded (:load-gitmind <path> to mirror one into /tmp)".into(),
@@ -5693,6 +6334,23 @@ them to", patches.len());
                         else { format!("no exact “{a}”. Did you mean: {}?", near.join(", ")) };
                 }
             }
+            Command::Tour(arg) => {
+                // The TOGGLE resolves here, not in the parser: only the tab knows whether the tour
+                // is currently running, and a parser that guessed would make a bare ":tour" mean
+                // "on" forever. Some(0.0) is an explicit off; any other speed enables at that pace.
+                let was = self.fly_auto;
+                self.fly_auto = match arg {
+                    None => if was.is_some() { None } else { Some(logscope_fan::vimmode::TOUR_DEFAULT_SPEED) },
+                    Some(v) if v <= 0.0 => None,
+                    Some(v) => Some(v),
+                };
+                // Leaving freecam on would fight the tour for the camera every frame.
+                if self.fly_auto.is_some() { self.freecam = false; }
+                self.note = match self.fly_auto {
+                    Some(v) => format!(":tour ON at {v:.2}x — flying the strand; :tour off to stop"),
+                    None => ":tour OFF — camera released".into(),
+                };
+            }
             Command::Suggest => {
                 let mut chain = Vec::new();
                 let mut cur = self.active_leaf;
@@ -5774,7 +6432,7 @@ them to", patches.len());
                     let arg_partial = parts.next().unwrap_or("");
                     if let Some(s) = crate::cmdpalette::spec(head) {
                         ui.label(RichText::new(format!("{}  ·  {}", s.usage, s.help)).color(theme::DIM()).small());
-                        let ctx = crate::cmdpalette::ArgCtx { models: Vec::new(), refs: vec!["-1".into(), "-2".into(), "-3".into()] };
+                        let ctx = self.arg_ctx();
                         let sugg = crate::cmdpalette::suggest_args(s, arg_partial, &ctx);
                         if !sugg.is_empty() {
                             let line = sugg.iter().take(4).map(|a| format!("{} — {}", a.value, a.hint)).collect::<Vec<_>>().join("    ");
@@ -6072,6 +6730,17 @@ if let Some(msg) = self.error_banner.clone() {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, model: &mut ModelState, doc: &crate::analysis::Doc, infer: &Inference, model_loaded: bool) {
+        // Refresh the stamp from the picker each frame: cheap, and it means a model switched
+        // between two turns is recorded on the turn that follows it rather than on the whole
+        // conversation. Never applied retroactively — history keeps the model that produced it.
+        // Only on CHANGE. model.current() allocates, and a panel body runs every frame — writing an
+        // unchanged String 60 times a second is the same mistake as the banner cloning the feed.
+        {
+            let c = model.current();
+            if !c.is_empty() && self.stamp_model.as_deref() != Some(c.as_str()) {
+                self.stamp_model = Some(c);
+            }
+        }
         self.sync_worker(infer);
         self.local_model_path = model.selected_local_path(); // for :lanes (run_command has no ModelState)
         self.pump_lanes(); // lane-pool events → fan (a second, parallel event source next to the worker)
@@ -6141,7 +6810,13 @@ if let Some(msg) = self.error_banner.clone() {
                         let (h, f, _b, _r, _) = gpu_kernels::moe_stream_stats();
                         let (pin, tot) = gpu_kernels::moe_pin_counts();
                         let rate = t as f32 / secs.max(0.001);
-                        let cs = crate::enginestrip::concerns(0, rate, h, f, pin, tot, None);
+                        // The ratio the phase-balance line has been spending on stderr since
+                        // c4-750. 0 = healthy or unmeasured, which concerns() reads as "say
+                        // nothing" rather than as a small ratio.
+                        let dr = f32::from_bits(crate::backend::LAST_DECODE_RATIO
+                            .load(std::sync::atomic::Ordering::Relaxed));
+                        let cs = crate::enginestrip::concerns(0, rate, h, f, pin, tot, None,
+                                                              (dr > 0.0).then_some(dr));
                         if let Some(c) = cs.first() {
                             ui.label(RichText::new(c.line()).color(theme::FAINT()).small());
                         }
@@ -6158,6 +6833,9 @@ if let Some(msg) = self.error_banner.clone() {
                             crate::sandbox::Verdict::TestFailure => theme::chip(ui, "✗ tests failed", theme::RED()),
                             crate::sandbox::Verdict::DepsUnavailable => theme::chip(ui, "⚠ deps not cached", theme::AMBER()),
                             crate::sandbox::Verdict::ToolError => theme::chip(ui, "⚠ verify error", theme::AMBER()),
+                            // Distinct from a failure ON PURPOSE: red would read as "your code is
+                            // broken" when the truth is that nothing was checked at all.
+                            crate::sandbox::Verdict::Refused => theme::chip(ui, "⊘ not verified — sandbox refused", theme::AMBER()),
                         },
                     }
                 }
@@ -6248,6 +6926,31 @@ if let Some(msg) = self.error_banner.clone() {
         }
 
         // ── right sidebar: per-conversation subpages behind a button rail (Files · Context · Prompting) ──
+        // ONE LINE, ABOVE EVERYTHING, when the engine had to do less than asked. The Engine page is
+        // somewhere you go; this is something you see. The case it exists for is silent data loss: a
+        // 13412-token paste truncated to 3840 produces a confident answer about code the model never
+        // received, and until now the only place that was said was stderr.
+        //
+        // Severity-then-recency, matching the Engine page's own ranking so the two never disagree,
+        // and absent entirely when nothing interrupts — a banner that is usually there is furniture.
+        if let Some(msg) = crate::diagfeed::banner() {
+            egui::TopBottomPanel::top("chat_diag_banner").show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("⚠").color(egui::Color32::from_rgb(230, 170, 80)));
+                    ui.label(RichText::new(msg).small().color(egui::Color32::from_rgb(230, 170, 80)));
+                    if ui.small_button("details").clicked() {
+                        self.show_context = true;
+                        self.right_page = RightPage::Engine;
+                    }
+                    // Hide, do not delete: the button beside this one opens the page that shows
+                    // these lines, and wiping them on the way there is the worst possible pairing.
+                    if ui.small_button("✕").on_hover_text("dismiss until the next engine notice").clicked() {
+                        crate::diagfeed::dismiss_banner();
+                    }
+                });
+            });
+        }
+
         if self.show_context {
             egui::SidePanel::right("chat_right").resizable(true).default_width(330.0).show_inside(ui, |ui| {
                 ui.add_space(theme::PAD_XS as f32);
@@ -6256,6 +6959,19 @@ if let Some(msg) = self.error_banner.clone() {
                     if ui.selectable_label(self.right_page == RightPage::Graph, RichText::new("⌗ Graph").small()).clicked() { self.right_page = RightPage::Graph; }
                     if ui.selectable_label(self.right_page == RightPage::Context, RichText::new("⚙ Context").small()).clicked() { self.right_page = RightPage::Context; }
                     if ui.selectable_label(self.right_page == RightPage::Prompting, RichText::new("✦ Prompting").small()).clicked() { self.right_page = RightPage::Prompting; }
+                    // ENGINE. The count comes from diagfeed::attention(), which counts only
+                    // warnings and failures — the engine emits dozens of provenance and measurement
+                    // lines a load, and a badge that always shows a number is a badge people learn
+                    // to ignore.
+                    {
+                        let n = crate::diagfeed::attention();
+                        let lbl = crate::diagfeed::tab_label(n);
+                        let txt = if n > 0 { RichText::new(lbl).small().color(egui::Color32::from_rgb(230, 170, 80)) }
+                                  else { RichText::new(lbl).small() };
+                        if ui.selectable_label(self.right_page == RightPage::Engine, txt).clicked() {
+                            self.right_page = RightPage::Engine;
+                        }
+                    }
                 });
                 ui.separator();
                 // floating context cards — the freshest code block, the loaded file, and salient
@@ -6296,6 +7012,42 @@ if let Some(msg) = self.error_banner.clone() {
                 }
                 egui::ScrollArea::vertical().id_salt("right_page").auto_shrink([false, false]).show(ui, |ui| {
                     match self.right_page {
+                        RightPage::Engine => {
+                            // The engine's own diagnostics, ranked and folded (diagfeed). Until now
+                            // these existed only on stderr, which is why diagnosing a refusal meant
+                            // running the app from a terminal.
+                            let snap = crate::diagfeed::snapshot();
+                            if snap.is_empty() {
+                                ui.weak("No engine output yet — load a model.");
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.weak(format!("{} line(s)", snap.len()));
+                                    if ui.small_button("clear").clicked() { crate::diagfeed::clear(); }
+                                });
+                                ui.separator();
+                                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                    for e in &snap {
+                                        // Severity by colour, because the ranking alone is invisible
+                                        // once someone scrolls: failures red, warnings amber,
+                                        // measurements plain, provenance dimmed.
+                                        let col = match e.kind {
+                                            crate::diagfeed::Kind::Failure => Some(egui::Color32::from_rgb(235, 110, 100)),
+                                            crate::diagfeed::Kind::Warning => Some(egui::Color32::from_rgb(230, 170, 80)),
+                                            crate::diagfeed::Kind::Performance => None,
+                                            crate::diagfeed::Kind::Context => Some(egui::Color32::from_gray(140)),
+                                        };
+                                        let line = format!("{}{}",
+                                            crate::diagfeed::shorten(&e.text, 72),
+                                            crate::diagfeed::count_suffix(e.count));
+                                        let rt = RichText::new(line).small();
+                                        let rt = match col { Some(c) => rt.color(c), None => rt };
+                                        // Full text on hover: shortening keeps the panel readable,
+                                        // and the tail is where the engine explains itself.
+                                        ui.label(rt).on_hover_text(&e.text);
+                                    }
+                                });
+                            }
+                        }
                         RightPage::Context => {
                             // The physical PARAMS panel (dials + backend/persona/model selectors, in the
                             // spatial scene) is now the primary place for these controls. When it's active
@@ -6361,7 +7113,14 @@ if let Some(msg) = self.error_banner.clone() {
                                     self.coord_mode = m;
                                     // aggressive pulls in the spatial view; barebones returns to the linear chat
                                     match m { crate::coordinator::Mode::Aggressive => self.set_view(true, ui),
-                                              crate::coordinator::Mode::Barebones => self.set_view(false, ui),
+                                              crate::coordinator::Mode::Barebones => { self.replicator = None; self.set_view(false, ui) }
+                                              // Selecting Replicator OPENS it. Every other entry
+                                              // in this list records an intent the next run reads;
+                                              // this one has a live UI, and a menu entry that only
+                                              // sets a flag would leave the operator exactly where
+                                              // they were — looking for the mode they just chose.
+                                              crate::coordinator::Mode::Replicator =>
+                                                  self.run_command(crate::vimmode::Command::Replicate(None), ui),
                                               _ => {} }
                                 }
                                 ui.label(RichText::new(m.blurb()).color(theme::DIM()).small());
@@ -6369,6 +7128,18 @@ if let Some(msg) = self.error_banner.clone() {
                             }
                             ui.separator();
                             ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. Task decomposition + execution wiring is in progress; selecting a mode here records the intent.").color(theme::FAINT()).small());
+                            // Replicator is the exception to that sentence and says so where the
+                            // sentence is, rather than leaving the operator to discover that one
+                            // entry behaves differently from the other seven.
+                            if self.coord_mode == crate::coordinator::Mode::Replicator {
+                                ui.label(RichText::new(match self.replicator.as_ref() {
+                                    Some(m) => format!("Replicator is OPEN with {} column(s). \
+Type into the composer to message all of them, click a column header to aim at one, and 'links' \
+sets how often each worker sees another's latest. Run :lanes {} so they generate in parallel.",
+                                        m.workers.len(), m.workers.len().max(2)),
+                                    None => "Replicator did not open — no host reported room for a worker.".into(),
+                                }).color(theme::CYAN()).small());
+                            }
                         }
                         RightPage::Graph => {
                             ui.label(RichText::new("CONVERSATION GRAPH").color(theme::DIM()).small().strong());
@@ -6487,6 +7258,12 @@ if let Some(msg) = self.error_banner.clone() {
                                                 crate::sandbox::Verdict::TestFailure => ("✗ tests failed", theme::RED(), "it compiled, but a test assertion failed — see the output below"),
                                                 crate::sandbox::Verdict::DepsUnavailable => ("⚠ dependencies not cached", theme::AMBER(), "ran offline; tick 'fetch deps' to resolve from crates.io once (the code itself wasn't judged)"),
                                                 crate::sandbox::Verdict::ToolError => ("⚠ verify error", theme::AMBER(), ""),
+                                                // The note carries the fix, because the operator
+                                                // cannot act on "refused" alone — and the code was
+                                                // NOT judged, which the wording has to say or this
+                                                // reads as a verdict on the model's work.
+                                                crate::sandbox::Verdict::Refused => ("⊘ not verified", theme::AMBER(),
+                                                    "the sandbox refused to run this — nothing was checked. Install bubblewrap, or mark the code Trust::Own if you wrote it"),
                                             };
                                             ui.horizontal(|ui| {
                                                 ui.label(RichText::new(txt).color(col).strong());
@@ -6822,7 +7599,7 @@ if let Some(msg) = self.error_banner.clone() {
                     let arg_partial = parts.next().unwrap_or("");
                     if let Some(s) = crate::cmdpalette::spec(head) {
                         ui.label(RichText::new(format!("⌘ {}  ·  {}", s.usage, s.help)).color(theme::CYAN()).small());
-                        let ctx = crate::cmdpalette::ArgCtx { models: Vec::new(), refs: vec!["-1".into(), "-2".into(), "-3".into()] };
+                        let ctx = self.arg_ctx();
                         let sugg = crate::cmdpalette::suggest_args(s, arg_partial, &ctx);
                         if !sugg.is_empty() {
                             let line = sugg.iter().take(4).map(|a| format!("{} — {}", a.value, a.hint)).collect::<Vec<_>>().join("    ");
@@ -6837,6 +7614,8 @@ if let Some(msg) = self.error_banner.clone() {
                     }
                 }
                 ui.add_space(theme::PAD_XS as f32);
+                self.draw_replicator(ui);
+                self.poll_image(ui);
                 // MOBILE OVERLAP. egui's horizontal() does not wrap: controls past the right edge are drawn
                 // anyway, on top of each other. On a desktop this bar never reaches the edge, so the failure is
                 // invisible in development and immediate on a phone. horizontal_wrapped stops the overlap;
@@ -7726,16 +8505,27 @@ mod tests {
     }
 
     #[test]
+    fn an_autosave_written_BEFORE_the_replicator_field_still_loads() {
+        // serde(default) is the claim; this is the check. An autosave that refuses to parse costs
+        // the operator the conversation, which is far worse than a lost fan.
+        let old = r#"{"msgs":[{"role":0,"variants":["hi"],"cur":0}],"checkpoints":[]}"#;
+        let back: ChatSave = serde_json::from_str(old).expect("old saves must still load");
+        assert_eq!(back.msgs.len(), 1);
+        assert!(back.replicator.is_none());
+    }
+
+    #[test]
     fn checkpoint_save_roundtrips_through_json() {
         // a conversation with an assistant turn that has two branches (cur=1)
         let msgs = vec![
             Msg::user("why is the disk full?".into()),
             Msg { role: Role::Assistant, variants: vec!["first try".into(), "better answer with ```code```".into()], cur: 1,
-                  born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None },
+                  born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None },
         ];
         let save = ChatSave {
             msgs: msgs.iter().map(msg_to_save).collect(),
             checkpoints: vec![Checkpoint { label: "before: x".into(), at_unix: 42, msgs: msgs.iter().map(msg_to_save).collect() }],
+            replicator: None,
         };
         let json = serde_json::to_string(&save).expect("serialize");
         let back: ChatSave = serde_json::from_str(&json).expect("deserialize");

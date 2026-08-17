@@ -69,3 +69,48 @@ applied selectively to the expert tensors.
 It does not fit an M2 Ultra. The 1-bit quant is ~223 GB against a 192 GB ceiling. This document exists so
 the architecture can be implemented and unit-tested without the weights — the metadata is the part that
 was missing, and it is now recorded.
+
+## STATUS UPDATE (c4-785) — the blocker list is shorter than this document claims
+
+Two of the three "missing" items above are CLOSED and this file went stale. `expert_weights_scale`
+and `expert_weights_norm` are both read from metadata and applied (archfeat.rs); the LLaDA2 loads in
+the operator's logs print `scale 2.5 (file)` and `normalize true` through the same code path. What
+remains is the indexer, and the upstream picture changes what that means.
+
+### llama.cpp does not implement DSA either — it runs GLM-5.2 DENSE
+
+Issues #24730 (GLM-5.2) and #20363 (DSA lightning indexer) are both open; mainline runs the model
+with a dense-attention fallback. So the indexer is NOT a prerequisite for first tokens, only for
+long-context efficiency. Our own note here — "there is no dense fallback that is merely slower" —
+is true of a 1M context and false of a 32K one, which is the context anyone would actually use on a
+workstation. Running dense at modest context is the same bargain mainline ships.
+
+### IndexShare is the trap, and it is a LOADER trap
+
+GLM-5.2's change over 5.1 is `index_skip_topk_offset: 3` and `index_topk_freq: 4`: the indexer is
+recomputed once every four layers after the first three, so only about one layer in four CARRIES
+indexer tensors and roughly 57 of 78 layers have none. Stock llama.cpp demands an indexer tensor on
+every layer and therefore FAILS TO LOAD converted GGUFs — a third-party conversion (0xSero) needed a
+custom patch for exactly this. Our loader must treat indexer tensors as optional and per-layer, or it
+will reproduce that failure with a confusing message.
+
+### The shape, confirmed against three sources
+
+744B total / ~40B active, 78 layers, d 6144, 256 routed + 1 shared, 8 active, 3 dense lead, MLA +
+DSA, context 1048576. Matches the metadata transcribed above.
+
+### Order of work to first tokens on a 192 GB M2 Ultra
+
+1. Treat indexer tensors as OPTIONAL and skip them; run dense MLA. This is what mainline does.
+2. Cap the context to what dense attention can afford (32K, not 1M) and say so at load.
+3. Fit. IQ1_S is 201.8 GiB against 192 GB and does not fit; IQ3_XXS at 151.6 GiB does, but needs the
+   IQ3 reader we do not have. The MoE-residency lever in glm52-fit.md is the alternative and needs no
+   new quant support — 8 of 256 experts means a small hot set, and `prefetch_mapped` already exists.
+4. Only then the indexer, for long context.
+
+### Alternatives worth weighing before building any of it
+
+* `unsloth/GLM-5.2-GGUF` is the de-facto artifact; a REAP expert-pruned 504B GGUF also exists and is
+  materially smaller, at the cost of pruned experts.
+* Two M3 Ultra 256 GB boxes run UD-Q4_K_S over llama.cpp RPC — decode there is latency-bound on the
+  link, not compute-bound, which is worth knowing before treating distribution as a fix.

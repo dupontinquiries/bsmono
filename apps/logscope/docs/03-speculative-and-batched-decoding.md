@@ -1,5 +1,17 @@
 # 3. Speculative and batched decoding
 
+> **This is implemented and verified.** `Gpu::speculative_generate_stats` has existed for a long
+> time, opt-in via `LOGSCOPE_SPEC_DRAFT` pointing at a draft GGUF. c4-837 re-proved it by self-draft
+> (a model drafting for itself accepts everything and reproduces plain greedy decoding exactly), and
+> c4-838 added `speculative_generate_drafter`, which takes any `spec::Drafter` instead of a second
+> model — `LOGSCOPE_SPEC_DRAFT=lookup` selects the model-free prompt-lookup drafter.
+>
+> Recorded prominently because c4-829 spent a bundle building a drafter seam on the belief that the
+> accept/reject loop was missing. It was not. The gap was that drafting required a second checkpoint.
+>
+> Expect ~1.5x on repository reading and ~1.0x on prose — see `HANDOVER-c4-849.md` §5 for the
+> measured table and for two tunings that were simulated and rejected.
+
 ```
 speculative(K=1) == target greedy generate_kv = true
 speculative(K=2) == target greedy generate_kv = true

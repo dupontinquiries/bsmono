@@ -76,11 +76,31 @@ pub trait Verifier {
 /// builds them in isolation. Gui-gated like `crate::sandbox` (bubblewrap/cargo); the pure orchestration
 /// core below builds on every tier and is exercised with mock verifiers in tests.
 #[cfg(feature = "gui")]
-pub struct SandboxVerifier { pub name: String, pub root: PathBuf, pub allow_net: bool }
+pub struct SandboxVerifier {
+    pub name: String,
+    pub root: PathBuf,
+    pub allow_net: bool,
+    /// The branch's review posture. A devloop is precisely where unreviewed work accumulates — it
+    /// writes and verifies for hours without anyone reading a diff — so it is the right place for
+    /// the budget to bite. Open by default; the caller sets it from review_gate::assess.
+    pub posture: crate::review_gate::Posture,
+}
+#[cfg(feature = "gui")]
+impl SandboxVerifier {
+    /// The common case: a loop verifying its own generated files, review budget not yet consulted.
+    pub fn new(name: impl Into<String>, root: PathBuf, allow_net: bool) -> Self {
+        Self { name: name.into(), root, allow_net, posture: crate::review_gate::Posture::Open }
+    }
+
+    /// Set the branch's posture from a review assessment. A Frozen branch verifies offline however
+    /// the loop was configured — the loop does not get to argue with the budget it filled.
+    pub fn under(mut self, posture: crate::review_gate::Posture) -> Self { self.posture = posture; self }
+}
+
 #[cfg(feature = "gui")]
 impl Verifier for SandboxVerifier {
     fn check(&mut self, files: &[(String, String)]) -> (Verdict, String) {
-        match crate::sandbox::verify_files(&self.name, files, &self.root, self.allow_net) {
+        match crate::sandbox::verify_files_under(&self.name, files, &self.root, self.allow_net, self.posture) {
             Ok(r) => (if r.passed { Verdict::Pass } else { Verdict::Fail }, r.output),
             Err(e) => (Verdict::None, format!("verifier error: {e}")),
         }

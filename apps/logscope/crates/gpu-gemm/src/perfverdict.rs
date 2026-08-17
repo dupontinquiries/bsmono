@@ -374,6 +374,11 @@ pub fn self_relative(prefill_ms_per_tok: f64, decode_ms_per_tok: f64,
     // A handful of tokens of either phase is noise. 32 is enough to average over pipeline fill.
     if prompt_tokens < 32 || decoded_tokens < 32 { return SelfRelative::NotEnoughData; }
     if prefill_ms_per_tok <= 0.0 || decode_ms_per_tok <= 0.0 { return SelfRelative::NotEnoughData; }
+    // A SKIPPED phase is not a fast phase. The diffusion path deliberately performs no KV prefill,
+    // so prefill_ms_per_tok arrives as microseconds and the ratio explodes: a real run printed
+    // "decode is 892957502.9x SLOWER PER TOKEN", which is a division artifact presented as a
+    // finding. No forward that actually reads a model's weights costs under a microsecond a token.
+    if prefill_ms_per_tok < 1e-3 { return SelfRelative::NotEnoughData; }
     let ratio = decode_ms_per_tok / prefill_ms_per_tok;
     if ratio >= STARVED_RATIO { SelfRelative::DecodeStarved { ratio } }
     else { SelfRelative::Consistent { ratio } }
@@ -383,7 +388,8 @@ impl SelfRelative {
     pub fn advice(&self) -> String {
         match self {
             SelfRelative::NotEnoughData =>
-                "not enough of one phase to compare decode against prefill".into(),
+                "not enough of one phase to compare decode against prefill (or a phase was SKIPPED — \
+the diffusion path runs no KV prefill, and a skipped phase is not a fast one)".into(),
             SelfRelative::Consistent { ratio } => format!(
                 "decode is {ratio:.1}x prefill's cost per token, which is what fixed per-token costs \
 account for — nothing here suggests the decode kernel is starved"),
@@ -393,8 +399,12 @@ weights in the same run. Prefill reads each weight once per chunk and decode rea
 so decode should be the cheaper of the two — a gap this size means decode has nothing in flight to \
 cover memory latency while prefill's batch covers it. The batched matvec for m<=8 already exists \
 (MATVEC_SMALL_Q4); what is missing is something producing more than one candidate token, which is \
-speculative decoding. This comparison needs no bandwidth measurement, which is why it is reported \
-when the roofline verdict cannot be."),
+speculative decoding — and this engine HAS one: set LOGSCOPE_SPEC_DRAFT=lookup for the model-free \
+prompt-lookup drafter (no second checkpoint; output is identical at temperature 0, only the speed \
+differs). It pays on repetitive text — repository reading, code with recurring identifiers — and \
+mostly whiffs on prose, where a miss costs one verification slot. LOGSCOPE_SPEC_K (default 4) and \
+LOGSCOPE_SPEC_NGRAM (default 2) tune it. This comparison needs no bandwidth measurement, which is \
+why it is reported when the roofline verdict cannot be."),
         }
     }
 }
@@ -402,6 +412,19 @@ when the roofline verdict cannot be."),
 #[cfg(test)]
 mod self_relative_tests {
     use super::*;
+
+    #[test]
+    fn the_starved_verdict_NAMES_the_lever_that_exists() {
+        // This line told the operator speculative decoding was "missing" while the engine had it
+        // behind LOGSCOPE_SPEC_DRAFT=lookup — so the one person positioned to try it was told not
+        // to bother. Advice that describes a lever must name how to pull it, and if the flag is
+        // ever renamed this test is what fails.
+        let v = SelfRelative::DecodeStarved { ratio: 30.5 };
+        let t = v.advice();
+        assert!(t.contains("LOGSCOPE_SPEC_DRAFT=lookup"), "{t}");
+        assert!(t.contains("identical at temperature 0"), "the safety property is the reason to try it");
+        assert!(t.contains("whiff"), "and the case where it does not pay must be stated too");
+    }
 
     #[test]
     fn the_measured_deepseek_run_is_STARVED() {
@@ -879,6 +902,13 @@ pub struct RunShape {
     pub no_frame: u64,
     pub download: u64,
     pub passes: u64,
+    /// ACTUAL compute passes opened (GPU_PASSES_OPENED) and dispatches recorded (GPU_DISPATCHES).
+    /// These disambiguate the pass-boundaries arm: passes ~= dispatches means pass-per-dispatch
+    /// (the pre-fusion architecture); dispatches/passes near the flush batch means fusion is live
+    /// and the cost is per-DISPATCH, which is a different lever. 0 means the caller has no data
+    /// (old call sites) and the arm falls back to the architectural statement.
+    pub gpu_passes: u64,
+    pub dispatches: u64,
     pub tokens: u64,
     pub wall_s: f64,
     /// Aggregate CPU wait across threads. May exceed wall time; that is not an error.
@@ -917,9 +947,30 @@ stall dominates")
             // Names the concrete lever now that one exists. After both frame leaks were fixed this
             // became the dominant cause on a dense model, and "work cannot accumulate" described the
             // symptom without saying what to do.
-            (ps / total, "submits were forced by PASS BOUNDARIES — the engine opens a compute pass \
+            // MEASUREMENT-DRIVEN: the first 729 hardware log could not answer whether pass fusion
+            // had engaged — submit counts are identical fused or not — and this arm asserted the
+            // pre-fusion architecture on a run that had fusion's default ON. With the counters the
+            // arm states what happened; without them it states only what it knows.
+            let ratio = if self.gpu_passes > 0 { self.dispatches as f64 / self.gpu_passes as f64 } else { 0.0 };
+            if ratio >= 2.0 {
+                let ms_disp = if self.dispatches > 0 { self.sync_s * 1000.0 / self.dispatches as f64 } else { 0.0 };
+                (ps / total, Box::leak(format!("submits were pass-batch flushes with FUSION ACTIVE \
+({:.1} dispatches/pass measured, ~{ms_disp:.2} ms of GPU time per dispatch) — pass sharing is \
+already done; the lever is FEWER, FATTER dispatches per token (fuse the kernel graph: \
+norm+matvec, the attention chain, the MoE chain)", ratio).into_boxed_str()) as &'static str)
+            } else if self.gpu_passes > 0 {
+                (ps / total, Box::leak(format!("submits were forced by PASS BOUNDARIES with \
+fusion NOT engaging ({} passes for {} dispatches measured) — consecutive dispatches can share one \
+pass, but LOGSCOPE_PASS_FUSE is RETRACTED — it broke AR decode 6/6 (c4-736) and changes generated \
+tokens on 3 of 6 diffusion configurations (tools/gate-passfuse-diffusion.sh). This line used to \
+recommend it, which pointed the operator at a corrupting flag on exactly the runs most tempted to \
+try it",
+                    self.gpu_passes, self.dispatches).into_boxed_str()) as &'static str)
+            } else {
+                (ps / total, "submits were forced by PASS BOUNDARIES — the engine opens a compute pass \
 per dispatch, and WebGPU permits consecutive dispatches to share one, which is what llama.cpp's \
 Vulkan backend does with a whole graph")
+            }
         };
         format!("{rate:.2} tok/s at {:.0} submits/tok — {:.0}% of {what}",
             self.submits_per_token(), share * 100.0)
@@ -950,7 +1001,7 @@ mod headline_tests {
 
     fn shape(nf: u64, dl: u64, ps: u64, tokens: u64, wall: f64, sync: f64) -> RunShape {
         RunShape { submits: nf + dl + ps, no_frame: nf, download: dl, passes: ps,
-                   tokens, wall_s: wall, sync_s: sync }
+                   gpu_passes: 0, dispatches: 0, tokens, wall_s: wall, sync_s: sync }
     }
 
     #[test]
@@ -1160,5 +1211,64 @@ mod bg_split_tests {
         // field instead of a view.
         let s = BgCacheSplit { hits: 80259, lookups: 634903, view_varying: 545000 };
         assert!(s.explain().contains("whole buffer plus an offset in the uniform"));
+    }
+}
+
+#[cfg(test)]
+mod skipped_phase {
+    use super::*;
+    /// A skipped prefill must not be reported as an infinitely starved decode. The diffusion path
+    /// performs no KV prefill by design (c4-744), which made this verdict print a nine-digit ratio.
+    #[test]
+    fn a_skipped_prefill_is_not_a_fast_prefill() {
+        // 1718 prompt tokens in ~0 ms — what the engine reports when prefill is skipped.
+        assert!(matches!(self_relative(1e-7, 2700.0, 1718, 64), SelfRelative::NotEnoughData));
+        assert!(matches!(self_relative(0.0, 2700.0, 1718, 64), SelfRelative::NotEnoughData));
+        // A real prefill still compares normally.
+        assert!(matches!(self_relative(6.9, 160.0, 1718, 64), SelfRelative::DecodeStarved { .. }));
+        assert!(matches!(self_relative(6.9, 12.0, 1718, 64), SelfRelative::Consistent { .. }));
+    }
+}
+
+#[cfg(test)]
+mod phase_balance_denominators {
+    use super::*;
+
+    /// A phase that was MOSTLY skipped is not a fast phase either — the same artifact c4-750 caught
+    /// for a phase skipped entirely, wearing a smaller number.
+    ///
+    /// The operator's turn: 1721 prompt tokens, 1626 reused from the prefix tree, 95 actually
+    /// prefilled in 0.39s, then 538 tokens decoded in 33.1s. Dividing the prefill time by the whole
+    /// PROMPT reports a cache success as a decode pathology.
+    #[test]
+    fn a_mostly_reused_prefill_must_not_inflate_the_ratio() {
+        let decode_ms_per_tok = 33_100.0 / 538.0;                 // ~61.5
+        let wrong = self_relative(390.0 / 1721.0, decode_ms_per_tok, 1721, 538);
+        let right = self_relative(390.0 / 95.0, decode_ms_per_tok, 95, 538);
+
+        let r_wrong = match wrong { SelfRelative::DecodeStarved { ratio } => ratio,
+                                    SelfRelative::Consistent { ratio } => ratio, _ => 0.0 };
+        let r_right = match right { SelfRelative::DecodeStarved { ratio } => ratio,
+                                    SelfRelative::Consistent { ratio } => ratio, _ => 0.0 };
+        assert!(r_wrong > 250.0, "the old denominator gives {r_wrong:.0}x — the reported 269x");
+        assert!(r_right > 10.0 && r_right < 25.0,
+            "dividing by real prefill work gives {r_right:.1}x, which is the honest gap");
+        assert!(r_wrong / r_right > 15.0, "the artifact is worth {:.0}x on its own", r_wrong / r_right);
+    }
+
+    /// The guard for a phase skipped ENTIRELY still holds — this change must not weaken it.
+    #[test]
+    fn a_fully_skipped_prefill_is_still_refused() {
+        assert!(matches!(self_relative(1e-6, 60.0, 2000, 100), SelfRelative::NotEnoughData),
+            "microsecond-per-token prefill means no prefill happened");
+    }
+
+    /// And a turn with no reuse is unaffected: the denominators coincide.
+    #[test]
+    fn a_cold_turn_is_unchanged() {
+        let a = self_relative(2900.0 / 1626.0, 60.0, 1626, 100);
+        let b = self_relative(2900.0 / 1626.0, 60.0, 1626, 100);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        assert!(!matches!(a, SelfRelative::NotEnoughData));
     }
 }

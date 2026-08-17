@@ -54,6 +54,10 @@ pub enum SearchKind { Messages, Tree, FuzzyTree }
 pub enum Command {
     Branch,            // :b / :branch         — next message forks off the focused node
     Attach(String),    // :a / :add / :attach <path>
+    /// `:image <prompt>` — generate a picture from the prompt via the sd-cli path (mediagen).
+    /// Empty prompt is still an Image("") rather than Unknown: the handler says what is missing,
+    /// which is a better error than "unknown command".
+    Image(String),
     Goto(usize),       // :<N> / :goto <N>     — focus turn N (1-based as shown in the UI)
     Prune,             // :prune / :p          — prune the focused turn
     Unprune,           // :unprune / :up
@@ -67,6 +71,13 @@ pub enum Command {
     MapFiles { glob: String, template: String }, // :map <glob> ['tmpl'] — fan one worker task per changed file in
                        // the /tmp workspace ({file} → the path); the worker-thread-per-file fan-out for a project
     WorkspaceStatus,   // :ws / :workspace — show the loaded /tmp .gitmind session + its changed files
+    /// `:ws <path>` — OPEN a cargo workspace at that path. Bare `:ws` keeps its old meaning
+    /// (status), because that is what it has always done and silently repurposing a command an
+    /// operator has muscle memory for is worse than adding a form of it.
+    OpenWorkspace(String),
+    /// `:replicate [n]` — enter replicator mode with n workers (absent = the slider's default).
+    /// Parsed here so the mode is reachable from the same place every other mode is.
+    Replicate(Option<usize>),
     SyncWorkspace,     // :sync — rescan the /tmp workspace's changed files (refresh after edits)
     Stop,              // :stop / :st          — cancel a running fan + clear the queue
     Fill(String),      // :fill [path]         — decompose a todo!()-skeleton into KV-shared sub-tasks + fan them
@@ -125,9 +136,20 @@ pub enum Command {
     Suggest,           // :suggest / :sg — a throwaway small model reads recent messages + the command list
                        // and proposes the next commands to run
     Prompt(String),    // :prompt <key> / :pr — stage a specialized prompt from the library over recent turns
+    /// :tour [speed|off] — the auto-flying camera that walks the conversation strand.
+    ///
+    /// `None` TOGGLES (the common case: turn it on, turn it off again), `Some(0.0)` means an
+    /// explicit off, and any other speed both enables and sets the pace. Carrying the distinction
+    /// in the command rather than resolving it at parse time keeps the toggle honest — the parser
+    /// does not know the current state, and guessing here would make ":tour" mean "on" forever.
+    Tour(Option<f32>),
     Noop,              // empty line
     Unknown(String),
 }
+
+/// Default tour pace. Slow enough that a long message is readable as the camera passes it; the
+/// per-node dwell weighting then stretches it further for long turns.
+pub const TOUR_DEFAULT_SPEED: f32 = 1.0;
 
 /// Stable short id for the node at push-position `n` — a scrambled base36 hash so ids read as distinct
 /// tokens (not sequential), addressed by any UNIQUE prefix the way git short hashes are ("first bits").
@@ -428,6 +450,7 @@ pub fn parse_command(line: &str) -> Command {
     match cmd {
         "b" | "branch" => Command::Branch,
         "a" | "add" | "attach" => Command::Attach(arg.to_string()),
+        "image" | "img" | "draw" => Command::Image(arg.to_string()),
         "goto" => arg.parse::<usize>().ok().map(Command::Goto).unwrap_or_else(|| Command::Unknown(line.into())),
         "prune" | "p" => Command::Prune,
         "unprune" | "up" => Command::Unprune,
@@ -448,7 +471,20 @@ pub fn parse_command(line: &str) -> Command {
             Command::Continue(n)
         }
         "map" => { let (glob, template) = parse_map_args(arg); Command::MapFiles { glob, template } }
-        "ws" | "workspace" => Command::WorkspaceStatus,
+        "ws" | "workspace" => if arg.trim().is_empty() {
+            Command::WorkspaceStatus
+        } else {
+            Command::OpenWorkspace(arg.trim().to_string())
+        },
+        "replicate" | "rep" => match arg.trim() {
+            "" => Command::Replicate(None),
+            n => match n.parse::<usize>() {
+                Ok(v) if v >= 1 => Command::Replicate(Some(v)),
+                // A bad count is Unknown, not a silent default: ":replicate lots" that quietly
+                // started one worker would look like the mode ignoring the operator.
+                _ => Command::Unknown(format!(":replicate {n}")),
+            },
+        },
         "sync" => Command::SyncWorkspace,
         "stop" | "st" | "qa" => Command::Stop,  // :qa reads as vim "quit all" → cancel the run
         "quest" | "questions" => {
@@ -486,6 +522,13 @@ pub fn parse_command(line: &str) -> Command {
         "why" | "diagnose" => { let (refs, _) = parse_strategy_args(arg); Command::Diagnose(refs) }
         "help" | "h" | "?" => Command::Help(arg.to_string()),
         "suggest" | "sg" => Command::Suggest,
+        "tour" | "fly" => {
+            let a = arg.trim();
+            if a.is_empty() { Command::Tour(None) }
+            else if a.eq_ignore_ascii_case("off") || a.eq_ignore_ascii_case("stop") { Command::Tour(Some(0.0)) }
+            else if a.eq_ignore_ascii_case("on") { Command::Tour(Some(TOUR_DEFAULT_SPEED)) }
+            else { Command::Tour(Some(a.parse::<f32>().unwrap_or(TOUR_DEFAULT_SPEED).clamp(0.0, 20.0))) }
+        }
         "prompt" | "pr" => Command::Prompt(arg.to_string()),
         _ => cmd.parse::<usize>().map(Command::Goto).unwrap_or_else(|_| Command::Unknown(line.into())),
     }
@@ -586,6 +629,13 @@ mod tests {
         assert_eq!(parse_command(":branch"), Command::Branch);
         assert_eq!(parse_command(":b"), Command::Branch);
         assert_eq!(parse_command(":a ~/notes.rs"), Command::Attach("~/notes.rs".into()));
+        // :image keeps the WHOLE remainder as the prompt — a prompt is a sentence, not a token,
+        // and splitting on whitespace would silently generate from the first word only.
+        assert_eq!(parse_command(":image a red bicycle in the rain"),
+                   Command::Image("a red bicycle in the rain".into()));
+        assert_eq!(parse_command(":draw x"), Command::Image("x".into()));
+        assert_eq!(parse_command(":image"), Command::Image(String::new()),
+                   "an empty prompt reaches the handler, which can say what is missing");
         assert_eq!(parse_command(":attach /tmp/x.txt"), Command::Attach("/tmp/x.txt".into()));
         assert_eq!(parse_command(":add a.md"), Command::Attach("a.md".into()));
         assert_eq!(parse_command(":goto 12"), Command::Goto(12));
@@ -786,6 +836,16 @@ mod tests {
         assert_eq!(parse_command(":cont"), Command::Continue(1), "default 1");
         assert_eq!(parse_command(":3continue"), Command::Continue(3), "count prefix");
         assert_eq!(parse_command(":ws"), Command::WorkspaceStatus);
+        // The new form takes a path and does NOT disturb the bare one.
+        assert_eq!(parse_command(":ws path/to/cargo-workspace/"),
+                   Command::OpenWorkspace("path/to/cargo-workspace/".into()));
+        assert_eq!(parse_command(":workspace ~/src/logscope"),
+                   Command::OpenWorkspace("~/src/logscope".into()));
+        assert_eq!(parse_command(":replicate"), Command::Replicate(None));
+        assert_eq!(parse_command(":replicate 3"), Command::Replicate(Some(3)));
+        assert_eq!(parse_command(":rep 12"), Command::Replicate(Some(12)));
+        assert_eq!(parse_command(":replicate lots"), Command::Unknown(":replicate lots".into()),
+                   "a bad count must not quietly become one worker");
         assert_eq!(parse_command(":workspace"), Command::WorkspaceStatus);
         assert_eq!(parse_command(":sync"), Command::SyncWorkspace);
         assert_eq!(parse_command(":map *.rs 'add tests to {file}'"),
@@ -873,5 +933,64 @@ mod tests {
         assert_eq!(parse_command(":todo 'the shader work'"),
             Todo { refs: vec![], focus: "the shader work".into() });
         assert!(command_completions(":tod").iter().any(|c| c.name == "todo"));
+    }
+}
+
+#[cfg(test)]
+mod tour_command {
+    use super::*;
+
+    /// The toggle must stay UNRESOLVED at parse time. The parser cannot see whether the tour is
+    /// running, so a bare ":tour" has to mean "flip it" — if this ever parsed to Some(speed) the
+    /// command would mean "on" forever and could never turn the tour off.
+    #[test]
+    fn a_bare_tour_is_a_toggle_not_an_enable() {
+        assert_eq!(parse_command(":tour"), Command::Tour(None));
+        assert_eq!(parse_command(":tour   "), Command::Tour(None));
+        assert_eq!(parse_command(":fly"), Command::Tour(None), "alias toggles too");
+    }
+
+    #[test]
+    fn explicit_on_off_and_speed_are_distinguished() {
+        assert_eq!(parse_command(":tour off"), Command::Tour(Some(0.0)));
+        assert_eq!(parse_command(":tour stop"), Command::Tour(Some(0.0)));
+        assert_eq!(parse_command(":tour OFF"), Command::Tour(Some(0.0)), "case-insensitive");
+        assert_eq!(parse_command(":tour on"), Command::Tour(Some(TOUR_DEFAULT_SPEED)));
+        assert_eq!(parse_command(":tour 2.5"), Command::Tour(Some(2.5)));
+        // Garbage falls back to the default rather than to a speed of 0, which would silently
+        // read as "off" — a typo must not disable the thing you asked to enable.
+        assert_eq!(parse_command(":tour banana"), Command::Tour(Some(TOUR_DEFAULT_SPEED)));
+        // And an absurd speed is clamped rather than handed to the camera.
+        assert_eq!(parse_command(":tour 1000"), Command::Tour(Some(20.0)));
+    }
+
+    /// The dispatch rule, transcribed from the chat tab so the semantics are pinned somewhere
+    /// testable: None flips, Some(<=0) is off, Some(v) is on at v.
+    fn apply(cur: Option<f32>, arg: Option<f32>) -> Option<f32> {
+        match arg {
+            None => if cur.is_some() { None } else { Some(TOUR_DEFAULT_SPEED) },
+            Some(v) if v <= 0.0 => None,
+            Some(v) => Some(v),
+        }
+    }
+
+    #[test]
+    fn toggling_twice_returns_to_where_it_started() {
+        let off = None;
+        let on = apply(off, None);
+        assert!(on.is_some(), "first :tour enables");
+        assert_eq!(apply(on, None), None, "second :tour disables");
+        // explicit forms are idempotent, unlike the toggle
+        assert_eq!(apply(on, Some(0.0)), None);
+        assert_eq!(apply(None, Some(0.0)), None, ":tour off on an already-off tour stays off");
+        assert_eq!(apply(Some(3.0), Some(1.5)), Some(1.5), "a speed retunes a running tour");
+    }
+
+    #[test]
+    fn the_palette_lists_it() {
+        let s = crate::cmdpalette::spec("tour").expect(":tour must be in the palette");
+        assert_eq!(s.name, "tour");
+        assert_eq!(crate::cmdpalette::spec(":fly").unwrap().name, "tour", "alias resolves");
+        assert!(crate::cmdpalette::matches("to").iter().any(|c| c.name == "tour"), "prefix completes");
     }
 }

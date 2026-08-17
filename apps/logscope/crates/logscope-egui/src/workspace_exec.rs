@@ -533,6 +533,14 @@ pub enum ReadPolicy { Full, Surgical }
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub max_steps: usize,
+    /// Which tool calls are honoured. Default `Required(nonce)`: a call must carry this run's
+    /// token, so a tool call the model QUOTED out of a file it read is inert. The nonce is not
+    /// secrecy — the model may echo it — it separates "the model is calling a tool" from "the
+    /// model is repeating text that looks like one", which is the failure that turns a hostile
+    /// README into an executed command.
+    pub gate: crate::taint::ToolGate,
+    /// Where irreversible actions are recorded. None = no audit (tests, previews).
+    pub audit_log: Option<std::path::PathBuf>,
     /// Verify-as-you-go (1): after a turn that WROTE a file whose extension is in `verify_exts`, run this
     /// command and fold its output into the next observation — so the model sees compiler errors every
     /// turn instead of being trusted to self-check. Empty = off. `["cargo","check"]` is the Rust default.
@@ -566,6 +574,10 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_steps: 24,
+            // Default::default() is Required(fresh nonce) — the fail-closed end. A default of Open
+            // would make every caller that never thought about it vulnerable.
+            gate: crate::taint::ToolGate::default(),
+            audit_log: None,
             verify_cmd: vec!["cargo".into(), "check".into()],
             verify_exts: vec!["rs".into()],
             gate_done_on_verify: true,
@@ -660,14 +672,61 @@ pub trait Llm {
 ///   * `<tool_call> { … } </tool_call>` (Qwen/ChatML native tool syntax),
 /// each carrying a JSON object `{ "tool": "...", ... }`. Unrecognized/garbled blocks are skipped (the
 /// model gets a "no tool call parsed" nudge and can retry) rather than crashing the loop.
-pub fn parse_tools(text: &str) -> Vec<Tool> {
-    let mut out = Vec::new();
+pub fn parse_tools(text: &str) -> Vec<Tool> { parse_tools_reported(text).0 }
+
+/// Why a block that LOOKED like a tool call was not one.
+///
+/// Each variant is a distinct `?` in `parse_one`, and they call for different responses: an unknown
+/// tool name means the prompt advertised something we do not implement (or the model invented one),
+/// a missing field means the schema was not followed, and a block with no `tool` key at all usually
+/// means the model wrote prose inside the fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rejected {
+    /// No `"tool"` key — typically prose or a JSON object of some other shape.
+    NoToolKey,
+    /// A tool name the dispatcher does not implement.
+    UnknownTool(String),
+    /// The named tool is real but a required field was absent.
+    MissingField { tool: String, field: &'static str },
+}
+
+/// Parse tool calls AND report the blocks that were discarded.
+///
+/// The previous shape was `if let Some(t) = parse_one(&block) { out.push(t) }`: a block that failed
+/// to parse vanished. That makes a model which TRIED to call a tool and got one field wrong
+/// indistinguishable from one that never tried — and those need opposite fixes, a better prompt
+/// against a better model. Nothing about which calls are ACCEPTED changes here; the rejects simply
+/// stop being invisible.
+pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
+    let (mut out, mut bad) = (Vec::new(), Vec::new());
     for block in extract_blocks(text) {
-        if let Some(t) = parse_one(&block) {
-            out.push(t);
+        match parse_one(&block) {
+            Some(t) => out.push(t),
+            None => bad.push(diagnose(&block)),
         }
     }
-    out
+    (out, bad)
+}
+
+/// Name the reason a block failed. Mirrors `parse_one`'s field requirements — if that gains a tool,
+/// this must too, or a real call will be reported as an unknown one.
+fn diagnose(block: &str) -> Rejected {
+    let Some(tool) = json_str(block, "tool") else { return Rejected::NoToolKey };
+    let need: &[&'static str] = match tool.as_str() {
+        "write_file" => &["path"],
+        "read_file" => &["path"],
+        "edit" | "edit_file" | "patch" => &["path", "find"],
+        "read_range" => &["path"],
+        _ => return Rejected::UnknownTool(tool),
+    };
+    for f in need {
+        let present = json_str(block, f).is_some()
+            || (*f == "find" && (json_str(block, "old").is_some()));
+        if !present { return Rejected::MissingField { tool, field: f }; }
+    }
+    // Required fields all present but parse_one still declined — report it as the tool it claimed
+    // rather than inventing a reason.
+    Rejected::MissingField { tool, field: "(a required field parse_one checks that diagnose does not)" }
 }
 
 /// Find the ``` that actually terminates a fenced JSON payload: the first fence position where the text
@@ -961,7 +1020,10 @@ pub fn collect_shared_docs(root: &std::path::Path, budget: usize) -> String {
     for f in files {
         if s.len() >= budget { s.push_str("\n… (docs truncated)"); break; }
         let name = f.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
-        let body = std::fs::read_to_string(&f).unwrap_or_default();
+        // Another worker's document is CONTENT, not instruction: neutralize defangs tool-call
+        // syntax inside it, so worker A cannot make worker B run something by writing it into a
+        // shared doc — the fan's own channel is the easiest injection path it has.
+        let body = crate::taint::neutralize(&std::fs::read_to_string(&f).unwrap_or_default());
         let take = (budget - s.len()).min(body.len());
         // cut on a char boundary
         let mut cut = take; while cut < body.len() && !body.is_char_boundary(cut) { cut += 1; }
@@ -1082,6 +1144,13 @@ fn step_turn(
     text: &str, prompt: &mut String, ws: &mut Workspace, cfg: &AgentConfig,
     plan: &mut Plan, verified: &mut bool, step: usize, guard: &mut crate::repetition::LoopGuard,
 ) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
+    // AUTHORISE BEFORE PARSING. Everything below reads `text` for tool calls, so the gate must run
+    // first or a quoted call is already through. With ToolGate::Open this is a pass-through, which
+    // is what the fixtures rely on.
+    let (authorized, anomalies) = crate::taint::authorize_text(text, &cfg.gate);
+    let text: &str = &authorized;
+    for a in &anomalies { eprintln!("agent: {}", a.message()); }
+
     prompt.push_str("\n\nASSISTANT:\n");
     prompt.push_str(text);
 
@@ -1090,13 +1159,38 @@ fn step_turn(
         if !p.is_empty() { *plan = p; }
     }
 
-    let tools = parse_tools(text);
+    // REPORT THE BLOCKS WE THREW AWAY. c4-801 built this diagnosis and wired it to nothing, so a
+    // model that TRIED to call a tool and got one field wrong still looked identical to one that
+    // never tried — and the loop guard below cannot tell them apart either, because both produce
+    // the same empty action signature.
+    //
+    // That is the operator's "8 turns, 0 files" case exactly: the run reported no files and there
+    // was no way to know whether the model emitted nothing, or emitted something this parser
+    // refused. Those need opposite fixes — a better prompt against a better model — and guessing
+    // between them is what a whole session of "maybe the tooling is missing" was.
+    let (tools, rejected) = parse_tools_reported(text);
+    if !rejected.is_empty() {
+        let why: Vec<String> = rejected.iter().map(|r| match r {
+            Rejected::NoToolKey => "prose inside the fence".to_string(),
+            Rejected::UnknownTool(t) => format!("unknown tool '{t}'"),
+            Rejected::MissingField { tool, field } => format!("'{tool}' missing '{field}'"),
+        }).collect();
+        crate::diag!("wgpu-engine: agent turn emitted {} tool block(s) this parser REFUSED: {} — \
+the model attempted a call and it was discarded, which is not the same as the model not trying",
+            rejected.len(), why.join("; "));
+    }
 
     // ── loop management (bad-actor detection) ────────────────────────────────────────────────────
     // Signature of what this turn DID (its tool calls, or "done"/"noop") so the guard can tell a repeating
     // agent from a progressing one. A repeat or an internally-looping reply escalates: nudge, then abort.
     let action_sig = if text.contains(DONE_MARKER) && tools.is_empty() {
         "done".to_string()
+    } else if tools.is_empty() && !rejected.is_empty() {
+        // A REFUSED call is not a noop. The model acted; the parser discarded it. Signing these
+        // distinctly means two turns that both "did nothing" are only treated as a repeat when they
+        // failed the SAME way — and a turn that tried and was refused no longer collides with a turn
+        // that emitted prose, which is how a run stalls at 8 turns without either cause being named.
+        format!("refused:{}", rejected.len())
     } else if tools.is_empty() {
         "noop".to_string()
     } else {
@@ -2035,7 +2129,11 @@ error: could not compile `demo` (lib) due to 3 previous errors
             format!("All set. {DONE_MARKER}"),
         ]};
         // verification off (scripted model, no cargo in the sandbox); tests the plan + loop + files.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        // ToolGate::Open in the fixtures here and below, and it is not a shortcut: they script a
+        // model emitting PLAIN tool calls, which is the thing under test. Under the default gate
+        // those calls are stripped and the tests fail — correctly. Stated per fixture so a reader
+        // sees an opt-out rather than a default that happens to be permissive.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
@@ -2055,7 +2153,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         // diff_fn returns a per-branch canned diff (no git needed in the test)
         let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
@@ -2104,7 +2202,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("fanadd");
         std::fs::create_dir_all(base.join("b0")).unwrap();
         std::fs::create_dir_all(base.join("b1")).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
         // first branch starts running
         let s0 = fan.next();
@@ -2123,7 +2221,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("adopt");
         std::fs::create_dir_all(base.join("orig")).unwrap();
         std::fs::create_dir_all(base.join("react")).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         // a single run in progress, with a queued next prompt
         let (run, first) = AgentRun::start(base.join("orig"), "build a thing", cfg.clone());
         let mut fan = AgentFan::adopt(run, Some(first), "build a thing", "original", &cfg, Box::new(|_| String::new()));
@@ -2200,7 +2298,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
                 Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
             }
         }
-        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
         assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
         assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
@@ -2210,7 +2308,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
     fn async_driver_matches_sync_behavior() {
         // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
         // captures the plan, and finishes — the same state machine the sync loop uses.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
         assert!(first.contains("PLAN")); // prompt asks for a plan
         let replies = [
@@ -2251,7 +2349,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let mut ws = Workspace::new(tmp("gate"));
         struct ClaimsDone;
         impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
-        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
         // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
         assert_eq!(s.stop, Stop::StepLimit);
@@ -2504,5 +2602,76 @@ mod verify_badge_tests {
             let b = VerifyBadge::of(true, had);
             assert_eq!(b == VerifyBadge::Passed, had, "passing requires a verifier to have run");
         }
+    }
+}
+
+#[cfg(test)]
+mod rejected_tool_calls {
+    use super::*;
+
+    /// A well-formed call is still accepted and reports nothing — the point of this change is that
+    /// rejects become visible, not that acceptance gets stricter.
+    #[test]
+    fn a_good_call_is_accepted_and_reports_nothing() {
+        let (ok, bad) = parse_tools_reported("```tool\n{\"tool\": \"read_file\", \"path\": \"src/lib.rs\"}\n```");
+        assert_eq!(ok.len(), 1, "a valid call must still parse");
+        assert!(bad.is_empty(), "and must not be reported as rejected: {bad:?}");
+    }
+
+    /// The case that motivated this: the model TRIED and got a field wrong. Before, this looked
+    /// exactly like a turn with no tool call at all.
+    #[test]
+    fn a_missing_field_is_named_rather_than_vanishing() {
+        let (ok, bad) = parse_tools_reported("```tool\n{\"tool\": \"read_file\"}\n```");
+        assert!(ok.is_empty());
+        assert_eq!(bad, vec![Rejected::MissingField { tool: "read_file".into(), field: "path" }],
+            "the operator needs to know a call was attempted and why it failed");
+    }
+
+    /// A tool we do not implement is a PROMPT problem — either we advertised it or the model
+    /// invented it — and is not the same as a malformed call.
+    #[test]
+    fn an_unknown_tool_is_distinguished_from_a_malformed_one() {
+        let (_, bad) = parse_tools_reported("```tool\n{\"tool\": \"send_email\", \"to\": \"x\"}\n```");
+        assert_eq!(bad, vec![Rejected::UnknownTool("send_email".into())]);
+    }
+
+    /// Prose inside the fence — a very common local-model failure — is its own category.
+    #[test]
+    fn prose_in_the_fence_reports_no_tool_key() {
+        let (_, bad) = parse_tools_reported("```tool\nI will now read the file for you.\n```");
+        assert_eq!(bad, vec![Rejected::NoToolKey]);
+    }
+
+    /// Mixed output: one good call, two different failures. All three must be visible, because a
+    /// model that gets one of three right is a different problem from one that gets none.
+    #[test]
+    fn a_mixed_turn_reports_every_outcome() {
+        let text = "first\n```tool\n{\"tool\": \"read_file\", \"path\": \"a.rs\"}\n```\n\
+then\n```tool\n{\"tool\": \"write_file\"}\n```\n\
+and\n```tool\n{\"tool\": \"deploy\", \"env\": \"prod\"}\n```";
+        let (ok, bad) = parse_tools_reported(text);
+        assert_eq!(ok.len(), 1, "the good one still runs");
+        assert_eq!(bad.len(), 2, "both failures are reported: {bad:?}");
+        assert!(bad.contains(&Rejected::UnknownTool("deploy".into())));
+        assert!(bad.iter().any(|r| matches!(r, Rejected::MissingField { tool, .. } if tool == "write_file")));
+    }
+
+    /// `edit` accepts `old` as an alias for `find`; the diagnosis must know that or it would report
+    /// a working call as broken.
+    #[test]
+    fn the_find_alias_is_not_reported_as_missing() {
+        let (ok, bad) = parse_tools_reported(
+            "```tool\n{\"tool\": \"edit\", \"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}\n```");
+        assert_eq!(ok.len(), 1, "the alias is valid");
+        assert!(bad.is_empty(), "and must not be diagnosed as missing 'find': {bad:?}");
+    }
+
+    /// parse_tools keeps its old signature and behaviour exactly.
+    #[test]
+    fn the_old_entry_point_is_unchanged() {
+        let text = "```tool\n{\"tool\": \"read_file\", \"path\": \"a\"}\n```\n```tool\nnonsense\n```";
+        assert_eq!(parse_tools(text).len(), parse_tools_reported(text).0.len());
+        assert_eq!(parse_tools(text).len(), 1);
     }
 }

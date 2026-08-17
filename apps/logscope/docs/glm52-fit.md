@@ -12,7 +12,12 @@ IQ2_XS             114.5 GB   fits
 IQ2_XXS            102.1 GB   fits
 ```
 
-IQ3_XXS clears 192 GB with room for KV. But per `extreme-quant.md`, we cannot READ IQ2/IQ3 today, the
+IQ3_XXS clears 192 GB with room for KV. **UPDATE (c4-786): we CAN read it.** dequantize() has
+dispatched IQ3_XXS (type 18) to `iq23::dequant_iq3_xxs` all along, alongside IQ3_S, IQ2_S, IQ2_XXS and
+IQ1_M — the claim below was stale and is why this lever was written off. The scale constants are now
+pinned by tests (`iq3xxs_properties`), because IQ3_XXS shares its layout with IQ2_XXS apart from a
+0.5-against-0.25 multiplier, and copying the neighbour's constant doubles every weight while leaving
+the output coherent. What remains true: the
 loss concentrates in exactly the capabilities a coding assistant needs, and a 200B-class model at IQ2 is
 not "the same model, smaller" — it is a weaker model with the same parameter count.
 

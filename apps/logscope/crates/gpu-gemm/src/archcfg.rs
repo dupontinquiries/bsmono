@@ -119,6 +119,27 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         // expert (unlike Qwen2-MoE). This is Qwen3-30B-A3B / Qwen3-Coder-30B-A3B (128 experts, 8 active).
         // Softmax gating. Same expert shape as a dense Qwen3 FFN, so each selected expert reuses the existing
         // matvec/SwiGLU kernels; the router is a small matvec + top-k (moe::route).
+        // Qwen3.5 / Qwen3.6 MoE — general.architecture = "qwen35moe". c4-804 mapped this to the
+        // qwen3moe shape on the reasoning that "that is what the family has been", and the operator's
+        // first load falsified it: blk.0 of Qwen3.6-35B-A3B carries ssm_a, ssm_alpha, ssm_beta,
+        // ssm_conv1d, ssm_dt.bias, ssm_norm and ssm_out alongside attn_qkv and attn_gate. It is the
+        // same hybrid GATED DELTANET architecture as Qwen3.8, at a size that looked runnable.
+        //
+        // A DeltaNet layer reuses the attention projections for q/k/v and adds the recurrent state,
+        // so attn_* being present says nothing; the ssm_* tensors are what distinguish the layer
+        // types, and gguf::ssm_layer_census counts them. Observed shape: 256 experts, a shared expert
+        // with its OWN gate (ffn_gate_inp_shexp), fused attn_qkv [2048x8192], attn_gate [2048x4096].
+        "qwen35moe" | "qwen36moe" | "qwen3_5moe" => ArchConfig {
+            prefix: "qwen35moe",
+            supported: false, dense_supported: false,
+            note: "Qwen3.5/3.6 35B-A3B is HYBRID GATED DELTANET, not a larger Qwen3-30B-A3B — \
+observed in the operator's own tensor dump, which is why the family guess was wrong. The ssm_* \
+tensors per block are a recurrent state this engine has no path for, so those layers have no forward \
+pass at all rather than a slow one; only the ~1-in-4 gated-attention blocks are shapes we run. It \
+stays unverified end to end because nothing can run it. The MoE side is fine: 256 experts, shared \
+expert with its own gate, and Q4_K/MXFP4 both slice since c4-784 and c4-805",
+            ..for_arch("qwen3moe")
+        },
         "qwen3moe" => ArchConfig {
             arch: Arch::Qwen3Moe, prefix: "qwen3moe", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: false, interleaved_nope: false,
@@ -140,32 +161,6 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: true, dense_supported: true,
             note: "RND1-30B-A3B: qwen3moe-shaped diffusion model; run the denoise path (denoise-bench), not AR decode. Mask id from tokenizer.ggml.mask_token_id.",
         },
-        // LLaDA2 (general.architecture = "llada2"): ByteDance's masked-DIFFUSION MoE. Like rnd1 it
-        // runs the DENOISE forward rather than AR decode — non-causal attention over the whole
-        // block, no KV cache — but it is NOT simply "qwen3moe with a different forward", and the
-        // four differences all fail silently if assumed away (see the llada2 module, which carries
-        // them as testable data):
-        //
-        //   1. The LAST layers are NextN multi-token-prediction blocks and the transformer loop does
-        //      NOT run them: n_transformer_layers = n_layer - nextn_predict_layers. Iterating
-        //      0..n_layer walks into plausibly-shaped non-attention tensors — wrong numbers, not a
-        //      missing-tensor error.
-        //   2. The FIRST n_layer_dense_lead layers are dense; the rest are MoE.
-        //   3. FUSED attn_qkv with a GQA-asymmetric split: V starts at n_embd + n_embd_gqa, NOT at
-        //      2*n_embd. Thirding the row reads V from inside K and still produces fluent text.
-        //   4. A shared expert is ADDED to the routed sum, and the router carries an expert bias
-        //      (ffn_exp_probs_b) this loader has no representation for yet.
-        //
-        // supported: false until a forward pass runs on the real checkpoint — (2) and (3) are wired
-        // as data but the dense-lead split, the expert bias and the NextN skip are not yet in the
-        // loader. LOGSCOPE_TRY_UNSUPPORTED_ARCH=1 attempts it; wrong output is the EXPECTED failure.
-        "llada2" => ArchConfig {
-            arch: Arch::Qwen3Moe, prefix: "llada2", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
-            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false,
-            logit_softcap: None, attn_softcap: None, tied_embed_default: false,
-            supported: false, dense_supported: false,
-            note: "LLaDA2.0-mini-preview (Q4_0, ~9.3 GB): masked-diffusion MoE. Run the DENOISE path (denoise-bench), not AR decode — AR-decoding a diffusion checkpoint emits fluent noise; that is the model, not a bug. Needs, in order: (1) skip the trailing nextn_predict_layers rather than iterating 0..n_layer, (2) dense-lead split at n_layer_dense_lead, (3) FUSED attn_qkv sliced at 0 / n_embd / n_embd+n_embd_gqa — the V offset is NOT 2*n_embd under GQA, (4) ffn_exp_probs_b expert bias in the router, (5) shared expert added to the routed sum. llada2::Llada2Shape carries 1-3 as validated data. Mask id from tokenizer.ggml.mask_token_id.",
-        },
         // Qwen4 (general.architecture = "qwen4"): continues Qwen3.5's per-head QK-Norm base and adds
         // mixture-of-experts — a router (blk.N.ffn_gate_inp.weight) selecting top-k of N expert FFNs
         // (ffn_{gate,up,down}_exps.weight). The DENSE forward (QK-Norm → RoPE → GQA → SwiGLU → RMSNorm) is
@@ -176,7 +171,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             rope_interleaved: false, moe: true, moe_shared_expert: false, interleaved_nope: false,
             logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: false, dense_supported: true,
-            note: "Qwen4 adds mixture-of-experts (ffn_gate_inp router + ffn_{gate,up,down}_exps) on the Qwen3.5 QK-Norm base. A DENSE Qwen4 (expert_count 0) loads on the existing QK-Norm path; a MoE checkpoint needs the top-k routing + expert-gather kernel (M2-gated).",
+            note: "Qwen4 adds mixture-of-experts (ffn_gate_inp router + ffn_{gate,up,down}_exps) on the Qwen3.5 QK-Norm base. The claim that a MoE checkpoint NEEDS a top-k routing + expert-gather kernel is STALE (c4-799): that machinery ships and is exercised daily by qwen3moe and llada2. A qwen3moe fixture rebranded as qwen4 loads and produces BIT-IDENTICAL stats, so the forward path is the one already in use. `supported` stays false only because this project flips it on a real checkpoint, never a synthetic — what is missing is a Qwen4 GGUF to run, not code.",
         },
         // Llama4 (general.architecture = "llama4"): MoE with a shared expert (Scout/Maverick), interleaved
         // NoPE — a subset of attention layers use NO positional encoding (iRoPE, for length generalization) —
@@ -243,23 +238,53 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         // `glm-dsa.attention.kv_lora_rank` — so the loader reported "no kv_lora_rank in its metadata"
         // about a checkpoint that states it plainly. A wrong reason is worse than no reason: it sends
         // the reader to the checkpoint when the fault is ours.
+        // LLaDA2 (general.architecture = "llada2"): Ant's masked-DIFFUSION conversion of the
+        // Ling-2.0 / bailingmoe2 family — LLaDA2.0-mini is 16B total, ~1.4B active. Spec source:
+        // the llama.cpp llada2 PR (converter tensor list + llm_build_llada2 graph), which is
+        // Glm4Moe-shaped end to end: fused attn_qkv (loader's fused fallback), per-head QK-Norm
+        // BEFORE RoPE, NEOX rope, sigmoid routing normalized over the selected k, shared expert
+        // added to the routed output, leading_dense_block_count dense lead (per-layer detection
+        // handles it), and trailing nextn/MTP blocks (generic nextn_predict_layers exclusion).
+        // KNOWN GAP, inherited from the GLM/DSV3 support here: blk.N.exp_probs_b (the no-aux
+        // selection bias) is not fetched — expert SELECTION runs unbiased until that lands.
+        // Mechanics and throughput are unaffected; routing fidelity is approximate. The forward
+        // is caller-side: run the denoise path (denoise-bench); AR-decoding this checkpoint
+        // emits fluent noise by design. Mask id from tokenizer.ggml.mask_token_id;
+        // diffusion.shift_logits is expected FALSE (LLaDA lineage predicts in place).
+        "llada2" => ArchConfig {
+            arch: Arch::Glm4Moe, prefix: "llada2", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false,
+            logit_softcap: None, attn_softcap: None, tied_embed_default: false,
+            supported: true, dense_supported: true,
+            note: "LLaDA2.0 (Ling-2.0 diffusion): run the denoise path, not AR decode. exp_probs_b selection bias wired (reference order: bias steers selection, weights stay unbiased).",
+        },
         "glm-dsa" | "glm_dsa" => ArchConfig {
             arch: Arch::DeepseekV3, prefix: "glm-dsa", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
-            note: "GLM-5.2: MLA plus a SPARSE-ATTENTION INDEXER (32 heads, key_length 128, top_k 2048 \
-over a 1M context) and expert_weights_scale 2.5. The indexer tensors are present per block \
-(indexer.attn_k, indexer.attn_q_b, indexer.k_norm, indexer.proj) and nothing reads them — see \
-docs/glm-5.2-arch.md",
+            note: "GLM-5.2 (744B-A40B, 78 layers, MLA + DeepSeek Sparse Attention). NOT blocked on the \
+indexer: llama.cpp mainline does not implement DSA either (issues #24730, #20363) and runs this model \
+with a DENSE attention fallback, so the indexer costs long-context efficiency, not correctness. Two \
+things that DO block a load: IndexShare means only ~1 layer in 4 carries indexer tensors \
+(index_topk_freq 4, skip_offset 3), so a loader demanding them per-layer fails — that is precisely \
+what breaks stock llama.cpp on converted GGUFs; and IQ1_S is 201.8 GiB against 192 GB, so fitting \
+needs either the IQ3 reader or the MoE-residency lever. expert_weights_scale 2.5 and \
+expert_weights_norm are already wired. Order of work in docs/glm-5.2-arch.md",
         },
         "deepseek2" | "deepseek3" | "deepseekv3" => ArchConfig {
             arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
-            note: "MLA is wired: compressed-latent cache, per-layer routing, the decode block \
+            note: "MLA KERNELS are wired and LOADING IS NOT — the distinction this note used to blur. Present: \
+the compressed-latent cache, per-layer routing, the decode block \
 (--gate-mla-block), and BOTH kv_b layouts — the legacy fused attn_kv_b and the modern split \
 attn_k_b + attn_v_b, which GGUF stores 3-D but which are the same bytes as llama.cpp's 2-D declaration \
-(PR #12801). Still unverified end to end on a real checkpoint, so `supported` stays false until one runs",
+(PR #12801). ABSENT: any path that loads those tensors into a Model. The loader detects MLA, derives \
+dimensions, logs, and falls through to the dense layer loop, which cannot consume \
+attn_q_a/attn_kv_a_mqa — so every MLA checkpoint fails at blk.0. \
+tools/tiny-variants/gen_glmdsa.py reproduces it in 3 layers, and note_claims::mla_loading_is_still_absent \
+fails the moment that stops being true, which is the only thing that will make anyone update this \
+line. It stays unverified end to end for the same reason: nothing has run an MLA checkpoint here",
         },
         _ => ArchConfig {
             arch: Arch::Unknown, prefix: "", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
@@ -378,7 +403,9 @@ pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32,
         // AFTER normalization — see the ordering note on the field.
         routed_scale: scale.unwrap_or(1.0),
         weight_before: matches!(cfg.arch, Arch::Llama4),
-    }
+        // Group-limited routing arrives from METADATA at the loader (expert_group_count kvs) or the
+        // llada2 architecture default — this constructor leaves it off and the loader overrides.
+        n_group: 0, topk_group: 0 }
 }
 
 /// Per-block bias tensor names — present only when `attn_qkv_bias` (Qwen2). Empty otherwise.
@@ -750,8 +777,18 @@ mod tests {
         assert_eq!(for_arch("deepseek3").prefix, "deepseek2");
         // they still SHARE the forward-pass shape — only the namespace differs
         assert_eq!(for_arch("glm-dsa").arch, for_arch("deepseek3").arch);
-        // and glm-dsa's note must name the indexer, since that is the blocking gap rather than MLA
-        assert!(for_arch("glm-dsa").note.contains("INDEXER"));
+        // The note must name what ACTUALLY blocks a load, and that changed once the upstream picture
+        // was checked (c4-785): llama.cpp does not implement DSA either and runs GLM-5.2 dense, so
+        // the indexer is a long-context cost rather than a prerequisite. What does block a load is
+        // IndexShare — only ~1 layer in 4 carries indexer tensors, which is what breaks stock
+        // llama.cpp on converted GGUFs — and the 201.8 GiB against 192 GB fit. This guard used to
+        // demand the word INDEXER, which would now keep a stale diagnosis alive.
+        let note = for_arch("glm-dsa").note;
+        assert!(note.contains("IndexShare"), "the note must name the loader trap: {note}");
+        // Case-insensitive: the note emphasises DENSE in caps, and a guard that fails on
+        // capitalisation tests the prose rather than the claim.
+        assert!(note.to_ascii_lowercase().contains("dense"), "and that mainline runs this model dense: {note}");
+        assert!(note.contains("201.8 GiB") || note.contains("IQ3"), "and the fit problem: {note}");
     }
 
     #[test]
@@ -810,5 +847,98 @@ mod tests {
         // And an arch with no shared expert keeps none when the file says none.
         let q = for_arch("qwen3moe");
         assert_eq!(moe_config(&q, 128, 8, 0, None, None).n_shared, 0);
+    }
+}
+
+#[cfg(test)]
+mod qwen4_shares_the_qwen3moe_path {
+    /// The qwen4 registry note claimed a MoE checkpoint needed routing and expert-gather kernels
+    /// this engine did not have. It has them — qwen3moe and llada2 both run on them — and a
+    /// qwen3moe fixture rebranded as qwen4 produces bit-identical stats, which is the strongest
+    /// statement a synthetic can make: not "it works" but "it takes the same path".
+    ///
+    /// Kept as a note rather than a flag flip, because `supported` is earned on a real checkpoint.
+    /// The point is that the blocker is a download, not an implementation — the same correction
+    /// glm-dsa needed in c4-785 and IQ3_XXS in c4-786. Registry gap claims go stale silently when
+    /// the gap is closed somewhere else.
+    #[test]
+    fn the_note_says_what_is_actually_missing() {
+        let note = super::for_arch("qwen4").note;
+        assert!(note.contains("STALE"), "the superseded claim must be marked: {note}");
+        assert!(note.to_ascii_lowercase().contains("real checkpoint"),
+            "and the note must say what would flip it: {note}");
+        assert!(!super::for_arch("qwen4").supported,
+            "still false — a rebranded synthetic is not evidence a real Qwen4 runs");
+    }
+}
+
+#[cfg(test)]
+mod note_claims {
+    //! Notes that assert ENGINE STATE, paired with the check that expires them.
+    //!
+    //! Borrowed from the shape of a Claude "skill" file, whose description carries not just a
+    //! trigger but a NEGATIVE one — "do NOT use this skill if the content is already in context".
+    //! The condition under which the claim stops holding travels with the claim.
+    //!
+    //! This registry has no such condition on anything, and it shows. In roughly fifteen bundles
+    //! five notes were found asserting things that had stopped being true: group-limited routing
+    //! described as "engine support pending" after c4-750 implemented it on both CPU and GPU;
+    //! extreme-quant.md claiming IQ2/IQ3 could not be READ when dequantize had dispatched IQ3_XXS
+    //! all along, which caused glm52-fit.md to write off the one quant that fits GLM-5.2 in 192 GB;
+    //! the sparse-attention gap called STRUCTURAL when llama.cpp runs the same model dense; and this
+    //! one, "MLA is wired", which was true of the kernels and false of the loader.
+    //!
+    //! Every one was found by accident while doing something else. A stale note is worse than no
+    //! note: it is a confident answer that sends the reader somewhere the code is not.
+    //!
+    //! So: if a note claims the engine cannot do something, a test here must FAIL when it can. That
+    //! is the only force that reliably updates prose.
+    use super::*;
+
+    /// The `glm-dsa` and `deepseek2` notes both say MLA loading is absent. When someone implements
+    /// it, this fails and points at the lines to rewrite.
+    ///
+    /// Checked structurally rather than by loading a model: the MLA detection branch ends without
+    /// handing off, so no symbol exists that would consume attn_q_a into a Model. If that changes,
+    /// the note is stale.
+    #[test]
+    fn mla_loading_is_still_absent() {
+        let src = include_str!("lib.rs");
+        // The branch that would exist if loading were implemented: something building layer weights
+        // from the low-rank query / latent KV pair.
+        let implemented = src.contains("fn load_mla_layer")
+            || src.contains("fn block_mla(")
+            || src.contains("MlaLayerWeights");
+        assert!(!implemented,
+            "MLA layer loading now appears to exist. Update the glm-dsa and deepseek2 notes in \
+archcfg.rs — they tell the reader it is absent, and a note that is wrong about the engine is worse \
+than no note at all.");
+    }
+
+    /// The mirror: notes must not describe as PENDING anything the engine already honours. Group
+    /// routing was reported pending for 50 bundles after it landed.
+    #[test]
+    fn no_note_calls_a_shipped_feature_pending() {
+        for arch in ["llada2", "glm-dsa", "deepseek3", "qwen3moe"] {
+            let note = for_arch(arch).note.to_ascii_lowercase();
+            if note.contains("group") && note.contains("pending") {
+                panic!("{arch}: group-limited routing has been honored on CPU and GPU since c4-750, \
+but this note still calls it pending");
+            }
+        }
+    }
+
+    /// A note claiming something is UNVERIFIED must not also claim it is validated by a gate — the
+    /// two together mean the reader cannot tell which is current.
+    #[test]
+    fn a_note_does_not_claim_both_unverified_and_gated() {
+        for arch in ["llada2", "glm-dsa", "deepseek3", "qwen2", "qwen3", "gemma4"] {
+            let n = for_arch(arch).note.to_ascii_lowercase();
+            let unverified = n.contains("unverified");
+            let validated = n.contains("validated by") || n.contains("correctness via");
+            assert!(!(unverified && validated),
+                "{arch}: the note says both UNVERIFIED and validated-by-a-gate. One of them is out \
+of date and a reader has no way to tell which");
+        }
     }
 }

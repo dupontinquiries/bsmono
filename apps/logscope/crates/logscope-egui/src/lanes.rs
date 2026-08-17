@@ -46,7 +46,20 @@ pub type JobId = u64;
 #[derive(Debug)]
 pub enum LaneEvt {
     /// The async loader finished: the pool is serving with this many lanes on this model.
-    Ready { lanes: usize, model: String, template: crate::backend::TemplateKind },
+    Ready {
+        lanes: usize,
+        model: String,
+        template: crate::backend::TemplateKind,
+        /// What ONE more instance of this model costs in device memory (weights the planner
+        /// placed + a KV cache at the default window), or 0 when the planner did not run.
+        ///
+        /// Carried on Ready because this is the only moment the figure and the UI meet: the
+        /// engine lives on the pool's thread and Chat holds no handle to it, so without a field
+        /// here replicator's slot detent has nothing to be computed from and the slider promises
+        /// slots the device cannot hold. 0 means unknown, which the slider treats as "no memory
+        /// bound" rather than as zero slots.
+        instance_bytes: u64,
+    },
     /// The async loader failed; the pool will complete queued jobs with `Error`s.
     LoadError(String),
     Token { job: JobId, text: String },
@@ -109,6 +122,7 @@ impl LanePool {
                 };
                 let _ = evt_tx.send(LaneEvt::Ready {
                     lanes, model: primary.model_name().to_string(), template: primary.template(),
+                    instance_bytes: primary.instance_bytes(),
                 });
                 let mut engines: Vec<crate::backend::engine::Engine> = Vec::with_capacity(lanes);
                 for n in 1..lanes { engines.push(primary.lane(n)); }

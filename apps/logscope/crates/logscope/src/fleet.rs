@@ -14,7 +14,7 @@
 //! id and a path, `deviceplan::Device` carries a triple and a link speed, and **nothing joins them**.
 //! A peer is reachable and a device is capable and the fleet needs both facts about one machine.
 
-use crate::{deviceplan, reachability};
+use crate::{deviceplan, microdht, peerrecord, reachability};
 
 /// A machine, with both halves of what is known about it.
 ///
@@ -149,6 +149,77 @@ pub fn worth_the_wait(r: &ModelPresence, link_mib_s: f32, local_est_s: f32, remo
             "{ready:.0}s to be ready plus {remote_est_s:.0}s of work is {remote_total:.0}s against {local_est_s:.0}s locally — {}", r.explain(link_mib_s)));
     }
     Ok(local_est_s / remote_total)
+}
+
+// ---------------------------------------------------------------- the DHT half of the join
+
+/// A validated record plus OUR clock's view of its age — the two things a DHT lookup actually
+/// yields about a peer. Everything in `record` is the PUBLISHER's claim (authenticated by the
+/// signature, still a claim); `age_s` is the one fact we measured.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Sighting {
+    pub record: peerrecord::PeerRecord,
+    pub age_s: f32,
+}
+
+impl Sighting {
+    /// Join a sighting with LOCALLY MEASURED link facts into a FleetMember. The record cannot
+    /// carry rtt or link speed — those are properties of the PAIR of machines, measured from this
+    /// side — which is exactly the seen_at/published_at split peerrecord documents. `path` is
+    /// None until something has actually connected; reachability treats "never tried" and "tried
+    /// and failed" as different answers, and so does this.
+    pub fn member(&self, path: Option<reachability::Path>, rtt_s: f32, link_mib_s: f32,
+                  can_execute: bool) -> FleetMember {
+        FleetMember {
+            peer: reachability::Peer {
+                id: self.record.id.clone(),
+                how_found: reachability::Discovery::Dht,
+                path,
+                record_age_s: self.age_s,
+            },
+            device: deviceplan::Device {
+                name: self.record.id.clone(),
+                target_triple: self.record.target_triple.clone(),
+                gpu_gib: self.record.gpu_gib,
+                rtt_s, link_mib_s, can_execute,
+            },
+        }
+    }
+}
+
+/// Everything a DHT GET yielded, split into usable sightings and named refusals.
+///
+/// This is the composition the modules kept assuming someone else would write: microdht carries
+/// bytes, peerrecord defines and validates them, reachability/deviceplan judge the machine — and
+/// nothing turned `Response::Values` into peers. Refusals come back as strings for the same
+/// reason `candidates` returns them: a lookup that silently shrinks to nothing looks like an
+/// empty network, and the operator cannot fix what they are not told about.
+pub fn sightings(
+    values: &[Vec<u8>],
+    now_s: u64,
+    verify: impl Fn(&peerrecord::PeerRecord, &[u8]) -> bool,
+) -> (Vec<Sighting>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut refused = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        match peerrecord::PeerRecord::decode_wire(v) {
+            Err(e) => refused.push(format!("value {i}: {e}")),
+            Ok(r) => match peerrecord::validate_record(&r, now_s, |rr, sig| verify(rr, sig)) {
+                Err(fault) => refused.push(format!("value {i} ({}): {}", r.id, fault.explain())),
+                Ok(()) => {
+                    let age_s = now_s.saturating_sub(r.published_at) as f32;
+                    ok.push(Sighting { record: r, age_s });
+                }
+            },
+        }
+    }
+    (ok, refused)
+}
+
+/// The PUT that announces this machine. Refuses an unsigned record (encode_wire's rule) and uses
+/// the record's OWN ttl — two lifetimes for one record is a desynchronisation waiting to happen.
+pub fn announce_put(r: &peerrecord::PeerRecord) -> Result<microdht::Request, String> {
+    Ok(microdht::Request::Put { sc_id: r.id.clone(), value: r.encode_wire()?, ttl_s: r.ttl_s })
 }
 
 /// Pick one member for a task, given how much work the session can commit to.
@@ -394,4 +465,64 @@ mod tests {
         let e = assign(&m, Task::Inference).unwrap_err();
         assert!(e.explain(Task::Inference).contains("works for a build check does not serve it"));
     }
+    fn signed_rec(id: &str, published: u64) -> crate::peerrecord::PeerRecord {
+        crate::peerrecord::PeerRecord {
+            id: id.into(), addr: "203.0.113.7:4001".into(),
+            target_triple: "aarch64-unknown-linux-gnu".into(), gpu_gib: 24.0,
+            published_at: published, ttl_s: crate::peerrecord::DEFAULT_TTL_S,
+            signature: Some(vec![7, 7, 7]),
+        }
+    }
+
+    #[test]
+    fn a_DHT_lookup_becomes_members_and_the_refused_are_NAMED() {
+        // The full pipeline: bytes -> decode -> validate -> sighting -> member. One good record,
+        // one expired, one that is not a record at all — the good one joins, the other two come
+        // back as reasons rather than vanishing.
+        let good = signed_rec("sc-good", 1000).encode_wire().unwrap();
+        let expired = signed_rec("sc-old", 0).encode_wire().unwrap();
+        let junk = b"VALUES-shaped garbage".to_vec();
+        let (ok, refused) = sightings(&[good, expired, junk], 1010, |_, _| true);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].record.id, "sc-good");
+        assert!((ok[0].age_s - 10.0).abs() < 0.001, "age is OUR clock minus THEIR stamp");
+        assert_eq!(refused.len(), 2);
+        assert!(refused[0].contains("sc-old"), "{}", refused[0]);
+        let m = ok[0].member(Some(Path::Direct), 0.02, 900.0, true);
+        assert_eq!(m.device.target_triple, "aarch64-unknown-linux-gnu");
+        assert!(assign(&m, Task::BuildCheck).is_ok(), "the joined member is usable by the existing fleet fns");
+    }
+
+    #[test]
+    fn a_FORGED_record_is_refused_by_the_pipeline_not_just_by_theory() {
+        let forged = signed_rec("sc-fake", 1000).encode_wire().unwrap();
+        let (ok, refused) = sightings(&[forged], 1000, |_, _| false);
+        assert!(ok.is_empty());
+        assert!(refused[0].contains("someone else's record wearing this name"));
+    }
+
+    #[test]
+    fn announce_uses_the_records_OWN_ttl_and_refuses_unsigned() {
+        let r = signed_rec("sc-me", 500);
+        match announce_put(&r).unwrap() {
+            crate::microdht::Request::Put { sc_id, ttl_s, .. } => {
+                assert_eq!(sc_id, "sc-me");
+                assert_eq!(ttl_s, crate::peerrecord::DEFAULT_TTL_S, "one record, one lifetime");
+            }
+            other => panic!("expected Put, got {other:?}"),
+        }
+        let mut unsigned = signed_rec("sc-me", 500); unsigned.signature = None;
+        assert!(announce_put(&unsigned).unwrap_err().contains("UNSIGNED"));
+    }
+
+    #[test]
+    fn a_sighting_stays_a_CLAIM_until_something_connects() {
+        // path None + Dht discovery must refuse assignment with the claim/measurement wording —
+        // the join must not have quietly promoted discovery to reachability.
+        let s = Sighting { record: signed_rec("sc-new", 1000), age_s: 5.0 };
+        let m = s.member(None, 0.0, 0.0, true);
+        let e = assign(&m, Task::BuildCheck).unwrap_err();
+        assert!(e.explain(Task::BuildCheck).contains("Discovery is a CLAIM"));
+    }
+
 }

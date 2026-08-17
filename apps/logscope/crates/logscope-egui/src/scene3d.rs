@@ -17,19 +17,19 @@ use crate::texgen::mat as M;
 #[inline] fn normv(a: Vec3) -> Vec3 { let l = (a.x * a.x + a.y * a.y + a.z * a.z).sqrt(); if l > 1e-6 { mulv(a, 1.0 / l) } else { v(0.0, 1.0, 0.0) } }
 #[inline] fn crossv(a: Vec3, b: Vec3) -> Vec3 { v(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x) }
 
-/// Recursive triplet branch (trunk → 3 → 9): a tapering wooden tube that splits into three children
-/// splayed around the parent direction, with a leaf tuft at each tip. Stout + leaning is the caller's job
-/// (the trunk direction). Matches the prototype's `branch()`.
-/// Per-scene TREE BEND POLICY (set before a scene's tree loop): (lean_x, lean_z, variety, bend_boost). `variety`
-/// scales how widely each tree's bow direction scatters horizontally (Forest high, Canopy low); (lean_x,lean_z)
-/// is a preferred horizontal lean the bow biases toward (Alley leans its trees out over the lane); `bend_boost`
-/// adds to the arc strength (Alley bends hard). Default (0,0,1.0,0) reproduces the original varied look.
+// Recursive triplet branch (trunk → 3 → 9): a tapering wooden tube that splits into three children
+// splayed around the parent direction, with a leaf tuft at each tip. Stout + leaning is the caller's job
+// (the trunk direction). Matches the prototype's `branch()`.
+// Per-scene TREE BEND POLICY (set before a scene's tree loop): (lean_x, lean_z, variety, bend_boost). `variety`
+// scales how widely each tree's bow direction scatters horizontally (Forest high, Canopy low); (lean_x,lean_z)
+// is a preferred horizontal lean the bow biases toward (Alley leans its trees out over the lane); `bend_boost`
+// adds to the arc strength (Alley bends hard). Default (0,0,1.0,0) reproduces the original varied look.
 thread_local! { static TREE_BEND: std::cell::Cell<(f32, f32, f32, f32)> = const { std::cell::Cell::new((0.0, 0.0, 1.0, 0.0)) }; }
 fn set_tree_bend(lean_x: f32, lean_z: f32, variety: f32, boost: f32) { TREE_BEND.with(|c| c.set((lean_x, lean_z, variety, boost))); }
 fn tree_bend() -> (f32, f32, f32, f32) { TREE_BEND.with(|c| c.get()) }
 
-/// Per-scene FOLIAGE TINT (low, high) read by tree_branch's leaf clusters, so a scene can shift its canopy colour
-/// — e.g. Forest tints the whole canopy by season (spring/summer/autumn/winter). Default = the standard green.
+// Per-scene FOLIAGE TINT (low, high) read by tree_branch's leaf clusters, so a scene can shift its canopy colour
+// — e.g. Forest tints the whole canopy by season (spring/summer/autumn/winter). Default = the standard green.
 thread_local! { static FOLIAGE_TINT: std::cell::Cell<(Color32, Color32)> = std::cell::Cell::new((c(0x4c, 0x66, 0x26), c(0x9a, 0xb0, 0x46))); }
 fn set_foliage_tint(lo: Color32, hi: Color32) { FOLIAGE_TINT.with(|cl| cl.set((lo, hi))); }
 fn foliage_tint() -> (Color32, Color32) { FOLIAGE_TINT.with(|cl| cl.get()) }
@@ -477,7 +477,7 @@ fn mistfall() -> Scene {
     // with a hue from the bioluminescent palette + its own height / size / phase (its local context) — not one ring.
     let n_portals = (env_params().nodes / 22).clamp(1, 5) as i32;
     let portal_hues = [c(0x4e, 0x66, 0x70), c(0x6a, 0x5a, 0x2e), c(0x5e, 0x2e, 0x52), c(0x2e, 0x66, 0x5a), c(0x46, 0x4e, 0x76)];
-    let mut portal = |s: &mut Scene, px: f32, py: f32, pz: f32, rad: f32, idx: i32| {
+    let portal = |s: &mut Scene, px: f32, py: f32, pz: f32, rad: f32, idx: i32| {
         let hue = portal_hues[(idx as usize) % portal_hues.len()];
         let mut ring = m3::torus(v(px, py, pz), rad, 0.42 * (rad / 3.2), 72, 22, c(0x33, 0x44, 0x4c));
         m3::tint_height(&mut ring, py - 3.2, py + 3.2, c(0x26, 0x34, 0x3a), hue); ring.mat = M::STONE;
@@ -722,7 +722,7 @@ fn archive() -> Scene {
     // LECTERNS scale with the conversation: a long chat lines the nave with several glowing tomes (stations down
     // the aisle), each varied by a per-station seed, instead of one lectern marooned at the far end.
     let n_lec = (env_params().nodes / 22).clamp(1, 5) as i32;
-    let mut lectern = |s: &mut Scene, px: f32, lz: f32, idx: i32| {
+    let lectern = |s: &mut Scene, px: f32, lz: f32, idx: i32| {
         let mut stand = m3::tube(v(px, yf, lz), v(px, yf + 1.4, lz), 0.34, 12, c(0x5a, 0x46, 0x2c)); stand.mat = M::WOOD; s.add(stand, Float::STILL);
         let mut tome = m3::paper_fold(v(px, yf + 1.6, lz), 1.2, 0.5, c(0xf6, 0xea, 0xc8)); tome.mat = M::PAPER; tome.emissive = 0.5 + 0.2 * hash(idx, 71);
         s.add(tome, Float { amp: 0.02, speed: 0.5, phase: hash(idx, 72) * 6.28, drift: 0.0 });
@@ -842,7 +842,7 @@ fn reading_room() -> Scene {
     // READING TABLES scale with the conversation: a big chat furnishes the floor with several glowing-tome tables
     // arranged around the central one (each varied per-station), instead of a single lonely table on the rug.
     let n_tbl = (env_params().nodes / 22).clamp(1, 5) as i32;
-    let mut table = |s: &mut Scene, px: f32, pz: f32, scl: f32, idx: i32| {
+    let table = |s: &mut Scene, px: f32, pz: f32, scl: f32, idx: i32| {
         let mut tbl = m3::tube(v(px, yf, pz), v(px, yf + 0.9, pz), 1.4 * scl, 20, wood_lo); tbl.mat = M::WOOD; s.add(tbl, Float::STILL);
         let mut ttop = m3::disc(v(px, yf + 0.92, pz), 1.8 * scl, 30, c(0x6a, 0x50, 0x30)); ttop.mat = M::WOOD; s.add(ttop, Float::STILL);
         let mut tome = m3::paper_fold(v(px, yf + 1.0, pz), 0.5 * scl, 0.3, c(0xff, 0xf0, 0xd0)); tome.mat = M::PAPER; tome.emissive = 0.4 + 0.2 * hash(idx, 71);
@@ -875,7 +875,7 @@ fn foldingathome() -> Scene {
         dot.mat = M::STONE; dot.emissive = 0.1; s.add(dot, Float::STILL);
     }
     // double-helix builder (placed several times across the cell at varied positions + heights)
-    let mut helix = |s: &mut Scene, cx: f32, cz: f32, y0: f32, turns: usize, rad: f32, seed: i32| {
+    let helix = |s: &mut Scene, cx: f32, cz: f32, y0: f32, turns: usize, rad: f32, seed: i32| {
         let (dy, twist) = (0.36f32, 0.5f32);
         let (mut pa, mut pb): (Option<Vec3>, Option<Vec3>) = (None, None);
         for k in 0..turns {
@@ -1328,7 +1328,7 @@ fn mansion_garden() -> Scene {
     // STRUCTURE CLUSTERS scattered across the whole world — varied scale: closer/smaller groves, far grand monuments
     for k in 0..44 {
         let a = hash(k, 410) * TAU + hash(k, 414); 
-        let rr = (9.0 * sc + hash(k, 411).sqrt() * (world_r * 0.92 - 9.0 * sc));   // sqrt → even areal spread
+        let rr = 9.0 * sc + hash(k, 411).sqrt() * (world_r * 0.92 - 9.0 * sc);   // sqrt → even areal spread
         let cscale = sc * (0.8 + hash(k, 412) * 2.8 + (rr / world_r) * 3.0);       // bigger the farther out → grand distant monuments
         marble_cluster(&mut s, a.cos() * rr, a.sin() * rr, 1300 + k, cscale, yf, mlo, mhi, mem);
     }
@@ -1403,7 +1403,7 @@ fn old_library() -> Scene {
     let pr = env_params();
     let n_centers = (pr.nodes / 22).clamp(1, 5) as i32;
     let glow_tints = [c(0xf2, 0xe6, 0xc6), c(0xf0, 0xdc, 0xb0), c(0xe8, 0xe2, 0xd0), c(0xf4, 0xd8, 0xa8), c(0xe6, 0xd0, 0xc4)];
-    let mut lectern = |s: &mut Scene, px: f32, pz: f32, scl: f32, idx: i32| {
+    let lectern = |s: &mut Scene, px: f32, pz: f32, scl: f32, idx: i32| {
         let yb = -3.0_f32;
         let mut stand = m3::tube(v(px, yb, pz), v(px, yb + 2.5 * scl, pz), 0.42 * scl, 16, c(0x46, 0x32, 0x1c));
         m3::tint_height(&mut stand, yb, yb + 2.5 * scl, c(0x30, 0x20, 0x12), c(0x5a, 0x42, 0x26)); stand.mat = M::WOOD; s.add(stand, Float::STILL);
@@ -3306,7 +3306,7 @@ fn critter(s: &mut Scene, kind: u32, pos: Vec3, face: f32, seed: u32) {
 }
 /// Critter with an explicit shared MOTION Float — so a critter walking a swaying bridge rides the exact same
 /// sway as the planks (no detaching) instead of its own ground bob.
-fn critter_m(s: &mut Scene, kind: u32, pos: Vec3, face: f32, seed: u32, bob: Float) {
+fn critter_m(s: &mut Scene, kind: u32, pos: Vec3, face: f32, _seed: u32, bob: Float) {
     let (body_col, ear_col, tail_col) = if kind == 0 {
         (c(0xb6, 0xac, 0x9e), c(0xca, 0xc0, 0xb6), c(0xf0, 0xec, 0xe4)) // rabbit: warm grey, pale ears + tail
     } else {
@@ -4233,7 +4233,7 @@ fn brick_building(s: &mut Scene, x: f32, zc: f32, h: f32, seclen: f32, seed: u32
     let backz = zc - face_n * depth;                          // box extends AWAY from the lane
     let midz = (zc + backz) * 0.5;
     let w = seclen;
-    let mut brick = |s: &mut Scene, ctr: Vec3, right: Vec3, up: Vec3, ww: f32, hh: f32, col: Color32| {
+    let brick = |s: &mut Scene, ctr: Vec3, right: Vec3, up: Vec3, ww: f32, hh: f32, col: Color32| {
         let mut p = m3::panel(ctr, right, up, ww, hh, col);
         m3::tint_height(&mut p, ctr.y - hh * 0.5, ctr.y + hh * 0.5, col, hi); p.mat = M::STONE; s.add(p, Float::STILL);
     };

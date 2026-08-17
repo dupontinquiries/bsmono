@@ -707,6 +707,25 @@ fn build_prompt(tmpl: TemplateKind, system: &str, turns: &[(Role, &str)]) -> Str
             }
             s.push_str("<|turn>model\n");
         }
+        TemplateKind::Bailing2 => {
+            // Bailing2 (Ling 2.0 / LLaDA2), mirrored from llama.cpp llama-chat.cpp: uppercase roles
+            // in <role>...</role>, turns closed by <|role_end|>, and — faithful to the reference —
+            // the thinking line ALWAYS present — the model's own jinja appends it AFTER user system
+            // content (newline-separated); llama.cpp's bailing2 replaces it, and this model's template
+            // is the authority here. (Ling's thinking
+            // toggle lives in the system turn; omitting it changes model behavior).
+            // Content neutralization: the standard rule breaks <| sigils, which covers
+            // <|role_end|>, but <role>/</role> use plain angle brackets — break those too
+            // so an imported message containing literal role markers cannot corrupt the structure.
+            let nb = |t: &str| neutralize(t).replace("<role>", "<\u{200b}role>").replace("</role>", "<\u{200b}/role>");
+            if system.is_empty() { s.push_str("<role>SYSTEM</role>detailed thinking off<|role_end|>"); }
+            else { s.push_str(&format!("<role>SYSTEM</role>{}\ndetailed thinking off<|role_end|>", nb(system))); }
+            for (role, text) in turns {
+                let r = if *role == Role::User { "HUMAN" } else { "ASSISTANT" };
+                s.push_str(&format!("<role>{r}</role>{}<|role_end|>", nb(text)));
+            }
+            s.push_str("<role>ASSISTANT</role>");
+        }
         TemplateKind::Plain => {
             if !system.is_empty() { s.push_str(&format!("{system}\n\n")); }
             for (role, text) in turns {

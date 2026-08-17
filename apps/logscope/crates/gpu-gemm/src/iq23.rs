@@ -276,3 +276,61 @@ mod iq3s_tests {
         assert_eq!(crate::gguf::type_nbytes(21, 256), Some(IQ3_S_BLOCK));
     }
 }
+
+#[cfg(test)]
+mod iq3xxs_properties {
+    use super::*;
+
+    /// IQ3_XXS is what makes GLM-5.2 fit: IQ1_S is 201.8 GiB against 192 GB of RAM and IQ3_XXS is
+    /// 151.6 GiB. It has been readable all along — `extreme-quant.md` said otherwise and was stale —
+    /// so these pin the three constants that silently halve or double every weight when copied from
+    /// the neighbouring format.
+    fn block(d_bits: u16, aux: [u32; 8], grid_idx: u8) -> Vec<u8> {
+        let mut b = Vec::with_capacity(IQ3_XXS_BLOCK);
+        b.extend_from_slice(&d_bits.to_le_bytes());
+        b.extend(std::iter::repeat(grid_idx).take(64));          // qs: grid indices
+        for a in aux { b.extend_from_slice(&a.to_le_bytes()); }  // scales+signs
+        b
+    }
+
+    /// The scale is d * (0.5 + hi4) * 0.5 — IQ2_XXS uses 0.25 in that last place, and the comment in
+    /// the dequantiser says why that matters: the wrong constant doubles every weight and the model
+    /// still reads as coherent, merely worse.
+    #[test]
+    fn the_scale_uses_the_half_offset_and_the_half_multiplier() {
+        let one = 0x3C00u16;                                     // f16 1.0
+        // hi4 = 0 → db = 1.0 * 0.5 * 0.5 = 0.25; hi4 = 15 → db = 15.5 * 0.5 = 7.75
+        for (hi4, want) in [(0u32, 0.25f32), (1, 0.75), (15, 7.75)] {
+            let aux = [hi4 << 28; 8];
+            let v = dequant_iq3_xxs(&block(one, aux, 0), 256).unwrap();
+            let g0 = IQ3XXS_GRID[0].to_le_bytes()[0] as f32;
+            assert!((v[0] - want * g0).abs() < 1e-5,
+                "hi4={hi4}: got {}, expected {want} x grid {g0}", v[0]);
+        }
+    }
+
+    /// Signs come from the low 28 bits, seven per group of eight, and the second grid entry uses the
+    /// mask shifted by four — swapping those halves mirrors the block and is invisible in a length
+    /// check.
+    #[test]
+    fn signs_are_seven_bits_per_group_and_the_second_half_is_offset() {
+        let one = 0x3C00u16;
+        // sign byte 0 for l=0 → all positive; set bit 0 → first value negative.
+        let mut aux = [0u32; 8];
+        aux[0] = 1;                                              // (a >> 0) & 127 == 1
+        let v = dequant_iq3_xxs(&block(one, aux, 0), 256).unwrap();
+        let neg = KSIGNS_IQ2XS[1] & KMASK_IQ2XS[0] != 0;
+        assert_eq!(v[0] < 0.0, neg, "the first value's sign must follow ksigns[1] & kmask[0]");
+        // the +4 half is a different mask on the SAME sign byte
+        let neg4 = KSIGNS_IQ2XS[1] & KMASK_IQ2XS[4] != 0;
+        assert_eq!(v[4] < 0.0, neg4, "the second grid entry uses the mask offset by four");
+    }
+
+    /// A zero block is exactly zero — d = 0 must not leak a scale floor, which is how a padded tail
+    /// tensor turns into faint noise.
+    #[test]
+    fn a_zero_scale_yields_exact_zeros() {
+        let v = dequant_iq3_xxs(&block(0, [0xF000_0000; 8], 7), 256).unwrap();
+        assert!(v.iter().all(|&x| x == 0.0), "d=0 must give exact zeros");
+    }
+}

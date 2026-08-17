@@ -109,7 +109,7 @@ pub enum CandKind {
 pub fn ordered_pairs(local: &[Candidate], remote: &[Candidate]) -> Vec<(usize, usize)> {
     let mut v: Vec<(usize, usize)> = Vec::new();
     for (i, a) in local.iter().enumerate() {
-        for (j, b) in remote.iter().enumerate() { v.push((i, j)); }
+        for (j, _b) in remote.iter().enumerate() { v.push((i, j)); }
         let _ = a;
     }
     v.sort_by_key(|(i, j)| (local[*i].kind.max(remote[*j].kind), local[*i].kind, remote[*j].kind));

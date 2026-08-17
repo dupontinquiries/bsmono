@@ -282,7 +282,9 @@ impl FilePicker {
         let mut outcome: Option<Outcome> = None;
         let mut window_open = true;
         egui::Window::new(RichText::new(&self.title).strong())
-            .collapsible(false).resizable(true).default_size([660.0, 480.0])
+            .collapsible(false).resizable(true)
+            .default_size([crate::mobilelayout::dialog_width(ctx.screen_rect().width(), 660.0), 480.0])
+            .max_width(crate::mobilelayout::dialog_width(ctx.screen_rect().width(), 660.0))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut window_open)
             .show(ctx, |ui| {

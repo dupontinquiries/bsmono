@@ -20,6 +20,9 @@ pub struct CmdSpec {
 pub const SPECS: &[CmdSpec] = &[
     CmdSpec { name: "help", aliases: &["h", "?"], usage: ":help [command]", arg: ArgKind::Free,
         help: "list commands, or show one command's usage", example: ":help compact" },
+    CmdSpec { name: "tour", aliases: &["fly"], usage: ":tour [speed|off]", arg: ArgKind::Free,
+        help: "toggle the auto-flying camera along the conversation strand; a number sets the pace",
+        example: ":tour 1.5" },
     CmdSpec { name: "suggest", aliases: &["sg"], usage: ":suggest", arg: ArgKind::None,
         help: "ask the smallest local model what to do next from your last messages", example: ":suggest" },
     CmdSpec { name: "prompt", aliases: &["pr"], usage: ":prompt <key>", arg: ArgKind::Free,
@@ -44,8 +47,13 @@ pub const SPECS: &[CmdSpec] = &[
         help: "deepen the focused line n times (single-line continue, follows this branch's tip)", example: ":continue 3" },
     CmdSpec { name: "map", aliases: &[], usage: ":map <glob> ['tmpl']", arg: ArgKind::Free,
         help: "fan one worker task per changed file in the /tmp workspace ({file} → the path)", example: ":map *.rs 'add tests to {file}'" },
-    CmdSpec { name: "ws", aliases: &["workspace"], usage: ":ws", arg: ArgKind::None,
-        help: "show the loaded /tmp .gitmind workspace and its changed files", example: ":ws" },
+    CmdSpec { name: "ws", aliases: &["workspace"], usage: ":ws [path]", arg: ArgKind::Path,
+        help: "with no argument, show the loaded workspace and its changed files; with a path, OPEN that cargo workspace",
+        example: ":ws ~/src/monorepo" },
+    CmdSpec { name: "replicate", aliases: &["rep"], usage: ":replicate [n]", arg: ArgKind::Count,
+        help: "open replicator mode: n independent chats side by side over the workspace, each with its own job — \
+message all or aim at one, and pair any two so each sees the other's latest",
+        example: ":replicate 3" },
     CmdSpec { name: "sync", aliases: &[], usage: ":sync", arg: ArgKind::None,
         help: "rescan the /tmp workspace's changed files after edits", example: ":sync" },
     CmdSpec { name: "branch", aliases: &["b"], usage: ":branch", arg: ArgKind::None,
@@ -142,8 +150,32 @@ pub fn matches(partial: &str) -> Vec<&'static CmdSpec> {
 }
 
 /// Context for argument suggestions — what the live app can offer (model names, recent message refs).
+/// One addressable message, as the ref grammar sees it.
+///
+/// `resolve_ref` accepts three forms — `-K` (K back from the end), `N` (1-based position), and a
+/// PREFIX of the message's `short_id`, which resolves to nothing when two messages share the prefix.
+/// So completing a message means offering its FULL short_id: that is the only form guaranteed to
+/// resolve, and the guarantee is what makes an autocomplete worth having rather than a hint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MsgRef {
+    /// 0-based position in the conversation.
+    pub idx: usize,
+    /// The stable short id (`vimmode::short_id`) — what the user should end up typing.
+    pub short_id: String,
+    /// "you" / "assistant" / a participant name.
+    pub role: String,
+    /// Enough of the text to recognise the message by.
+    pub preview: String,
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct ArgCtx { pub models: Vec<String>, pub refs: Vec<String> }
+pub struct ArgCtx {
+    pub models: Vec<String>,
+    pub refs: Vec<String>,
+    /// The conversation, newest LAST. Empty means the caller has nothing to offer and only the
+    /// static relative refs are suggested, which is the old behaviour.
+    pub msgs: Vec<MsgRef>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArgSuggestion { pub value: String, pub hint: String }
@@ -160,11 +192,84 @@ pub fn suggest_args(spec: &CmdSpec, partial: &str, ctx: &ArgCtx) -> Vec<ArgSugge
         ArgKind::Count => stat(&[("4", "a few"), ("8", "several"), ("16", "many")]),
         ArgKind::Model => ctx.models.iter().filter(|m| p.is_empty() || m.starts_with(p))
             .map(|m| ArgSuggestion { value: m.clone(), hint: "switch to this model".into() }).collect(),
-        ArgKind::Refs => ctx.refs.iter().filter(|r| p.is_empty() || r.starts_with(p))
-            .map(|r| ArgSuggestion { value: r.clone(), hint: "message".into() }).collect(),
+        ArgKind::Refs => suggest_refs(p, ctx),
         ArgKind::Path => vec![ArgSuggestion { value: "~/".into(), hint: "a folder on disk".into() }],
         ArgKind::None | ArgKind::Free => Vec::new(),
     }
+}
+
+/// Message-id completion for the ref-taking commands (`:goto`, `:why`, `:mergectx`, `:segment`, …).
+///
+/// Three ways a person reaches for a message, all supported because all three get typed:
+///   * BY ID — they can see `3df` in the transcript and start typing it.
+///   * BY POSITION — `-1` for the last message, `4` for the fourth. Kept, and now annotated with
+///     WHICH message it lands on, since a bare `-2` tells you nothing about what you are about to
+///     operate on.
+///   * BY CONTENT — they remember the message said "auth" but not where it was. Substring search
+///     over the preview, which is the case a plain prefix-matcher cannot serve at all.
+///
+/// Newest first throughout: in a conversation the recent end is where the work is.
+pub fn suggest_refs(p: &str, ctx: &ArgCtx) -> Vec<ArgSuggestion> {
+    const MAX: usize = 8;
+    let n = ctx.msgs.len();
+    let label = |m: &MsgRef| -> String {
+        let back = n - m.idx;                       // 1 = last message
+        let text: String = m.preview.chars().take(48).collect();
+        format!("-{back} · {} · {}", m.role, text.trim())
+    };
+    // No context to offer: fall back to whatever static refs the caller passed.
+    if ctx.msgs.is_empty() {
+        return ctx.refs.iter().filter(|r| p.is_empty() || r.starts_with(p))
+            .map(|r| ArgSuggestion { value: r.clone(), hint: "message".into() }).collect();
+    }
+    let mut out: Vec<ArgSuggestion> = Vec::new();
+    let newest_first = || ctx.msgs.iter().rev();
+
+    if p.is_empty() {
+        out.extend(newest_first().take(MAX)
+            .map(|m| ArgSuggestion { value: m.short_id.clone(), hint: label(m) }));
+        return out;
+    }
+
+    // A positional ref: show it, and say what it resolves to so the choice is informed.
+    if p.parse::<i64>().is_ok() {
+        if let Some(m) = resolve_positional(p, ctx) {
+            out.push(ArgSuggestion { value: p.to_string(), hint: format!("{} (position)", label(m)) });
+        }
+    }
+
+    let lower = p.to_ascii_lowercase();
+    // By id prefix. An id that is still ambiguous would resolve to NOTHING, so completing to the
+    // full short_id is the point rather than a nicety.
+    out.extend(newest_first().filter(|m| m.short_id.starts_with(&lower))
+        .take(MAX).map(|m| ArgSuggestion { value: m.short_id.clone(), hint: label(m) }));
+    // By content, for the ones the id prefix did not already offer.
+    if lower.chars().any(|c| !c.is_ascii_digit()) {
+        let already: std::collections::HashSet<String> = out.iter().map(|s| s.value.clone()).collect();
+        out.extend(newest_first()
+            .filter(|m| !already.contains(&m.short_id)
+                     && m.preview.to_ascii_lowercase().contains(&lower))
+            .take(MAX)
+            .map(|m| ArgSuggestion { value: m.short_id.clone(), hint: format!("{} (match)", label(m)) }));
+    }
+    out.truncate(MAX * 2);
+    out
+}
+
+/// Which message a `-K` / `N` ref lands on, mirroring `vimmode::resolve_ref` for those two forms.
+/// Duplicated deliberately rather than depended on: this crate's palette must not gain a dependency
+/// on the mode layer just to render a hint, and the shapes are pinned by a test.
+fn resolve_positional<'a>(r: &str, ctx: &'a ArgCtx) -> Option<&'a MsgRef> {
+    let n = ctx.msgs.len();
+    let v: i64 = r.trim().parse().ok()?;
+    let idx = if r.trim_start().starts_with('-') {
+        let k = (-v) as usize;
+        (k >= 1 && k <= n).then(|| n - k)?
+    } else {
+        let k = v as usize;
+        (k >= 1 && k <= n).then(|| k - 1)?
+    };
+    ctx.msgs.get(idx)
 }
 
 #[cfg(test)]
@@ -197,7 +302,7 @@ mod tests {
 
     #[test]
     fn arg_suggestions_match_the_kind() {
-        let ctx = ArgCtx { models: vec!["smollm2-360m".into(), "llama-1b".into()], refs: vec!["-1".into(), "-2".into()] };
+        let ctx = ArgCtx { models: vec!["smollm2-360m".into(), "llama-1b".into()], refs: vec!["-1".into(), "-2".into()], msgs: Vec::new() };
         // ratio presets, filtered by partial
         let r = suggest_args(spec("compact").unwrap(), "0.3", &ctx);
         assert_eq!(r, vec![ArgSuggestion { value: "0.3".into(), hint: "keep ~30% — balanced".into() }]);
@@ -250,5 +355,90 @@ mod tests {
             assert!(spec(c.name).is_some(),
                     "'{}' is in the live command grid but missing from :help/:suggest", c.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod msg_id_completion {
+    use super::*;
+
+    fn convo() -> ArgCtx {
+        // short_ids taken from vimmode::short_id so the test pins the REAL ids, not invented ones.
+        let ids: Vec<String> = (0..5).map(crate::vimmode::short_id).collect();
+        let texts = ["hello there", "let us fix the auth bug", "which auth bug",
+                     "the token refresh one", "on it"];
+        let msgs = ids.iter().zip(texts).enumerate().map(|(i, (id, t))| MsgRef {
+            idx: i, short_id: id.clone(),
+            role: if i % 2 == 0 { "you".into() } else { "assistant".into() },
+            preview: t.to_string(),
+        }).collect();
+        ArgCtx { models: Vec::new(), refs: Vec::new(), msgs }
+    }
+    fn goto() -> &'static CmdSpec { spec("goto").unwrap() }
+
+    /// Empty partial offers the recent end first — that is where the work is.
+    #[test]
+    fn empty_partial_lists_newest_first_with_a_readable_hint() {
+        let c = convo();
+        let s = suggest_args(goto(), "", &c);
+        assert_eq!(s[0].value, c.msgs[4].short_id, "the LAST message should come first");
+        assert!(s[0].hint.starts_with("-1 · you · on it"), "hint should say how far back and what it says: {}", s[0].hint);
+        assert_eq!(s[1].value, c.msgs[3].short_id);
+    }
+
+    /// The completed value must RESOLVE. A prefix that is still ambiguous resolves to nothing in
+    /// vimmode::resolve_ref, so completing to the full short_id is the whole point.
+    #[test]
+    fn every_suggested_value_resolves_through_the_real_resolver() {
+        let c = convo();
+        for partial in ["", "a", "-2", "auth"] {
+            for sg in suggest_args(goto(), partial, &c) {
+                assert!(crate::vimmode::resolve_ref(c.msgs.len(), &sg.value).is_some(),
+                    "suggested {:?} for partial {partial:?} but the resolver rejects it", sg.value);
+            }
+        }
+    }
+
+    /// Positional refs keep working AND now say what they land on.
+    #[test]
+    fn a_positional_ref_is_annotated_with_its_target() {
+        let c = convo();
+        let s = suggest_args(goto(), "-2", &c);
+        assert!(!s.is_empty(), "-2 should suggest something");
+        assert_eq!(s[0].value, "-2");
+        assert!(s[0].hint.contains("the token refresh one"), "should name the message: {}", s[0].hint);
+        assert!(s[0].hint.contains("(position)"));
+        // out of range offers nothing rather than a ref that fails later
+        assert!(suggest_args(goto(), "-99", &c).is_empty());
+    }
+
+    /// Content search — the case a prefix matcher cannot serve.
+    #[test]
+    fn a_word_finds_the_messages_that_contain_it() {
+        let c = convo();
+        let s = suggest_args(goto(), "auth", &c);
+        let vals: Vec<&str> = s.iter().map(|x| x.value.as_str()).collect();
+        assert!(vals.contains(&c.msgs[2].short_id.as_str()), "should find 'which auth bug'");
+        assert!(vals.contains(&c.msgs[1].short_id.as_str()), "should find 'let us fix the auth bug'");
+        assert!(!vals.contains(&c.msgs[4].short_id.as_str()), "'on it' does not mention auth");
+        assert!(s.iter().all(|x| x.hint.contains("(match)")), "content hits should say why they matched");
+    }
+
+    #[test]
+    fn an_id_prefix_completes_to_the_full_id() {
+        let c = convo();
+        let target = c.msgs[3].short_id.clone();
+        let s = suggest_args(goto(), &target[..2], &c);
+        assert!(s.iter().any(|x| x.value == target), "prefix {:?} should complete to {target}", &target[..2]);
+    }
+
+    /// With no conversation supplied the old static behaviour survives — callers that have not been
+    /// updated must not lose what they had.
+    #[test]
+    fn without_messages_the_static_refs_still_work() {
+        let c = ArgCtx { models: Vec::new(), refs: vec!["-1".into(), "-2".into()], msgs: Vec::new() };
+        let s = suggest_args(goto(), "-", &c);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].value, "-1");
     }
 }

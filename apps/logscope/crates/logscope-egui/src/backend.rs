@@ -191,7 +191,7 @@ pub(crate) mod engine {
             // — and a session that switches models was otherwise holding every one of them resident.
             let stale = gpu_kernels::release_stale_map_residency(path);
             if stale > 0 {
-                eprintln!("wgpu-engine: released page cache from {stale} previously-loaded model file(s) \
+                crate::diag!("wgpu-engine: released page cache from {stale} previously-loaded model file(s) \
 — only the active model stays resident");
             }
             // Configure the engine from the tuning profile BEFORE the device is created — these values are
@@ -223,14 +223,16 @@ pub(crate) mod engine {
                         extra_maps.push(gpu_kernels::retain_map(p.to_string_lossy().as_ref())
                             .map_err(|e| format!("open shard {}: {e}", p.display()))?);
                     }
-                    eprintln!("wgpu-engine: split checkpoint — {} shards found, loading as one model", paths.len());
+                    crate::diag!("wgpu-engine: split checkpoint — {} shards found, loading as one model", paths.len());
                 }
             }
             let mut parts: Vec<&'static [u8]> = vec![bytes];
             for m in &extra_maps { parts.push(m); }
             let gpu = Gpu::new();
             gpu.maybe_start_gpu_spin();
-            eprintln!("wgpu-engine: adapter = {}", gpu.adapter_name);
+            // Build stamp beside the adapter: a log that does not identify its own binary cannot be
+            // read against a change, and three have now been mis-attributed for exactly that reason.
+            crate::diag!("wgpu-engine: adapter = {} | engine build {}", gpu.adapter_name, gpu_kernels::BUILD);
             // Preflight readiness report (cf. Colibri's doctor): surface detected fragilities + the
             // mitigations they trigger ONCE at load, so a driver quirk or a mis-set knob is visible before
             // the first token instead of as an opaque mid-decode hang. Cheap; read-only.
@@ -260,9 +262,9 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                     if let Some(v) = val { notes.push(format!("env {name}={v} (active)")); }
                 }
                 if notes.is_empty() {
-                    eprintln!("wgpu-engine: preflight — no special fragilities or overrides detected (standard path)");
+                    crate::diag!("wgpu-engine: preflight — no special fragilities or overrides detected (standard path)");
                 } else {
-                    for n in notes { eprintln!("wgpu-engine: preflight — {n}"); }
+                    for n in notes { crate::diag!("wgpu-engine: preflight — {n}"); }
                 }
             }
             let g = gpu_kernels::gguf::parse(&bytes)?;
@@ -282,7 +284,26 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                     }
                 }
             }
-            let tok = Tokenizer::from_gguf(&g).map_err(|e| format!("tokenizer: {e}"))?;
+            // Weights-only checkpoints (diffuse-cpp's LLaDA-8B GGUFs) carry no tokenizer at all, which is
+            // why that project's CLI takes raw ids. LOGSCOPE_TOKENIZER_GGUF borrows one from a file with
+            // the same vocabulary; the width is cross-checked against the model's own output before it
+            // is accepted, because a near-miss prints fluent nonsense rather than failing.
+            // FROM THE EMBEDDING TENSOR, not from a metadata key. The first version of this looked up
+            // "llama.vocab_size" or "vocab_size" — but hparams are ARCH-PREFIXED, and this file's arch
+            // is 'diffuse', so the lookup returned None, the width came out 0, and the check silently
+            // skipped itself. A Llama-3 tokenizer (128256) was then accepted for a 126464-wide model
+            // and the prompt's own special ids (128000, 128006, 128009) indexed past the embedding
+            // table: "range start index 524288000 out of range for slice of length 517996544", which
+            // is 128000 x 4096 against 126464 x 4096. A guard that cannot find its input is not a
+            // guard. token_embd.weight always exists and always has the real row count.
+            let want_vocab = g.tensor("token_embd.weight")
+                .and_then(|t| t.dims.last().copied())
+                .map(|v| v as usize)
+                .or_else(|| g.declared_arch()
+                    .and_then(|a| g.get_u32(&format!("{a}.vocab_size")))
+                    .map(|v| v as usize))
+                .unwrap_or(0);
+            let tok = Tokenizer::from_gguf_with_fallback(&g, want_vocab).map_err(|e| format!("tokenizer: {e}"))?;
             // Resolve the stop the way the harness does: the GGUF-declared eos FIRST (DeepSeek-R1-
             // Distill declares 128001 <｜end▁of▁sentence｜>), THEN fall back to a stop special. The
             // old order preferred <|eot_id|>(128009) and so missed DeepSeek's real stop → the
@@ -326,6 +347,13 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                 TemplateKind::Llama3
             } else if tok.special_id("<|turn>").is_some() || tok.special_id("<turn|>").is_some() {
                 TemplateKind::Gemma // Gemma 4 turn markers (changed from Gemma 3's <start_of_turn>/<end_of_turn>)
+            } else if tok.special_id("<role>").is_some()
+                || (tok.special_id("<|role_end|>").is_some() && tok.special_id("<|role_start|>").is_none()) {
+                // Bailing2 (Ling 2.0 / LLaDA2): <role>HUMAN</role>...<|role_end|> turns. The first
+                // LLaDA2 hardware run fed 1718 tokens with ZERO specials under Plain — an
+                // instruct-tuned model given role-free text, independent of its missing shexp.
+                // <|role_start|> excluded: that spelling is Megrez, a different family.
+                TemplateKind::Bailing2
             } else {
                 TemplateKind::Plain
             };
@@ -341,9 +369,9 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
             let cache = gpu_kernels::store::cache_path(key);
             // Fast path: load the ready int8 weights from the central blob and skip dequant entirely.
             let model = match gpu.load_int8_cache(&cache, fp) {
-                Some(m) => { eprintln!("wgpu-engine: loaded int8 cache (skipped dequant) in {:.1}s [{}]", t0.elapsed().as_secs_f32(), cache.display()); m }
+                Some(m) => { crate::diag!("wgpu-engine: loaded int8 cache (skipped dequant) in {:.1}s [{}]", t0.elapsed().as_secs_f32(), cache.display()); m }
                 None => {
-                    eprintln!("wgpu-engine: loading {path} ({:.1} MiB) — quantizing to resident weights (int8, or q4 if it won't fit)…", bytes.len() as f32 / (1 << 20) as f32);
+                    crate::diag!("wgpu-engine: loading {path} ({:.1} MiB) — quantizing to resident weights (int8, or q4 if it won't fit)…", bytes.len() as f32 / (1 << 20) as f32);
                     let m = gpu.load_gguf_quantized_parts_static(&parts)?;
                     // Write the central blob so the NEXT load (any project, incl. crash-recovery) skips
                     // this. Make room BEFORE writing (evict to cap − incoming) so the dir never briefly
@@ -355,7 +383,7 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                     let src_type = g.tensor("blk.0.attn_q.weight").map(|t| t.ggml_type).unwrap_or(0);
                     let incoming_est = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
                     if !gpu_kernels::memplan::int8_worth_it(src_type) {
-                        eprintln!("wgpu-engine: int8 cache SKIPPED — source is ggml type {src_type}, \
+                        crate::diag!("wgpu-engine: int8 cache SKIPPED — source is ggml type {src_type}, \
 which already carries per-32 scales. Converting to int8 would double the bytes without adding \
 precision, and cost {:.1} GiB of disk for nothing",
                             gpu_kernels::memplan::int8_cache_waste(src_type, incoming_est) as f64
@@ -368,10 +396,10 @@ precision, and cost {:.1} GiB of disk for nothing",
                         Ok(true) => {
                             let (n, freed) = gpu_kernels::store::evict_to_cap(cap);
                             let evicted = if n > 0 { format!("; evicted {n}, freed {:.1} GiB", freed as f64 / (1u64 << 30) as f64) } else { String::new() };
-                            eprintln!("wgpu-engine: wrote int8 cache [{}] (central, content-addressed){evicted}", cache.display());
+                            crate::diag!("wgpu-engine: wrote int8 cache [{}] (central, content-addressed){evicted}", cache.display());
                         }
-                        Ok(false) => eprintln!("wgpu-engine: int8 cache skipped (bias/QK-Norm/MoE/q4 layouts aren't cacheable yet — reloads from the GGUF)"),
-                        Err(e) => eprintln!("wgpu-engine: int8 cache write skipped: {e}"),
+                        Ok(false) => crate::diag!("wgpu-engine: int8 cache skipped (bias/QK-Norm/MoE/q4 layouts aren't cacheable yet — reloads from the GGUF)"),
+                        Err(e) => crate::diag!("wgpu-engine: int8 cache write skipped: {e}"),
                     }
                     }
                     m
@@ -381,12 +409,41 @@ precision, and cost {:.1} GiB of disk for nothing",
             // occupies) so memory pressure is visible before loading a bigger model. The q4-resident
             // + mmap path for models that don't fit as int8 is the TODO that lets 30B run in 32 GB.
             if let Ok(md) = std::fs::metadata(&cache) {
-                eprintln!("wgpu-engine: int8 resident footprint ≈ {:.2} GiB", md.len() as f64 / (1u64 << 30) as f64);
+                crate::diag!("wgpu-engine: int8 resident footprint ≈ {:.2} GiB", md.len() as f64 / (1u64 << 30) as f64);
             }
-            eprintln!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} head_dim={} rope_base={} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
+            crate::diag!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} head_dim={} rope_base={} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
                 t0.elapsed().as_secs_f32(), model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.head_dim, model.base, model.h, model.vocab,
                 model.output_is_quantized(), eos, stop_ids, template, tok.is_byte_level(), tok.vocab_size());
-            // LOAD ADVICE. Runs the planners against this model and says only what they DISAGREE with —
+
+            // WHICH PATH THE WEIGHTS TOOK. A load-path optimisation that misses the bytes is worth
+            // nothing, and this model's bytes are its experts: they are stacked into an f32 buffer
+            // before quantisation, so no byte-slicing fast path reaches them. Printing the split
+            // means the next log answers "was it worth it" instead of the next guess.
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                // RESET AFTER READING. These are process-global counters and nothing cleared them,
+                // so a second model load reported the FIRST model's sliced bytes as part of its own
+                // total: an M4 Max log showed "15.71B" as the sliced figure for three different
+                // checkpoints in a row, with the percentage falling each time as the denominator
+                // grew. A cumulative counter presented as a per-load percentage is a wrong number,
+                // not a rough one.
+                // CAPTURE BEFORE THE RESET. c4-774 made these swap-to-zero so a second model load
+                // could not report the first one's sliced bytes, and c4-809 then read them at
+                // GENERATION time for the roofline — by which point they are zero, so that line
+                // never printed once. Two correct changes that break each other, which is what a
+                // process-global counter with a consuming read invites.
+                let fast = gpu_kernels::LOAD_FAST_WEIGHTS.swap(0, Relaxed);
+                let slow = gpu_kernels::LOAD_SLOW_WEIGHTS.swap(0, Relaxed);
+                crate::backend::RESIDENT_ELEMS.store(fast + slow, Relaxed);
+                let tot = fast + slow;
+                if tot > 0 {
+                    crate::diag!("wgpu-engine: load path — {:.1}% of weights sliced from the file directly \
+({:.2}B of {:.2}B), {:.1}% took the f32 round-trip. What still round-trips is the \
+leftovers — 1D norms and any tensor the converter left f32.",
+                        100.0 * fast as f64 / tot as f64, fast as f64 / 1e9, tot as f64 / 1e9,
+                        100.0 * slow as f64 / tot as f64);
+                }
+            }            // LOAD ADVICE. Runs the planners against this model and says only what they DISAGREE with —
             // an unprobed budget, a split that would beat streaming, a GPU the planner would skip. Every
             // planner is otherwise tested logic with no caller, and a hypothesis that has never seen a
             // real model is exactly what produced the 24 GiB constant and the thread-spawn figure.
@@ -402,16 +459,16 @@ precision, and cost {:.1} GiB of disk for nothing",
                     gpu_gib_s: 258.1, cpu_gib_s: 113.2, d: model.d,
                 };
                 for line in logscope::loadadvice::advise(&facts) {
-                    eprintln!("wgpu-engine: advice — {line}");
+                    crate::diag!("wgpu-engine: advice — {line}");
                 }
             }
             if std::env::var("LOGSCOPE_DISPATCH_BENCH").is_ok() { gpu.dispatch_bench(); }
-            if std::env::var("LOGSCOPE_WEIGHT_CHECK").is_ok() { eprintln!("wgpu-engine: {}", model.weight_probe(&gpu)); }
+            if std::env::var("LOGSCOPE_WEIGHT_CHECK").is_ok() { crate::diag!("wgpu-engine: {}", model.weight_probe(&gpu)); }
             // Prewarm: compile the prefill + decode pipelines now (in the load window) so the
             // first user token runs at steady speed instead of crawling up from ~0.1 tok/s
             // while shaders compile. The returned count is the "warm" signal.
             let warm = gpu.prewarm(&model);
-            eprintln!("wgpu-engine: prewarmed {warm} pipelines (prefill+decode kernels compiled at load)");
+            crate::diag!("wgpu-engine: prewarmed {warm} pipelines (prefill+decode kernels compiled at load)");
             // System-optimization: pick the fastest decode mat-vec tile for THIS GPU by a quick
             // benchmark on the model's dominant (FFN up) shape — runs only on first load per
             // (adapter, shape); the result is cached to disk so later loads stay snappy. Skipped when
@@ -433,7 +490,7 @@ precision, and cost {:.1} GiB of disk for nothing",
                     let t = {
                         let dc = gpu_kernels::DecodeConfig::unpack(t);
                         if dc.kernel.needs_subgroups() && !gpu.subgroup_kernel_ok() {
-                            eprintln!("wgpu-engine: cached decode kernel {:?} needs subgroups, which \
+                            crate::diag!("wgpu-engine: cached decode kernel {:?} needs subgroups, which \
 are disabled on this device — falling back to the autotuned non-subgroup default", dc.kernel);
                             gpu_kernels::DecodeConfig { kernel: gpu_kernels::MatvecKernel::V2Wg128,
                                                         tile: dc.tile }.pack()
@@ -447,17 +504,17 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                     // Harmless to the engine and corrosive to the log: a number nobody can read is a
                     // line nobody checks, and this is the line you would consult when a shape is slow.
                     let dc = gpu_kernels::DecodeConfig::unpack(t);
-                    eprintln!("wgpu-engine: decode tile = {} (kernel {:?}, cached autotune for this GPU)",
+                    crate::diag!("wgpu-engine: decode tile = {} (kernel {:?}, cached autotune for this GPU)",
                         dc.tile, dc.kernel);
                 } else {
                     let t0 = std::time::Instant::now();
                     let best = gpu.autotune_matvec(k, n);
                     gpu.set_matvec_tile(best);
                     gpu_kernels::store::autotune_put(&gpu.adapter_name, k, n, best);
-                    eprintln!("wgpu-engine: autotuned decode tile = {best} in {:.0}ms (cached; set LOGSCOPE_MATVEC_TILE to override, LOGSCOPE_NO_AUTOTUNE to skip)", t0.elapsed().as_secs_f32() * 1000.0);
+                    crate::diag!("wgpu-engine: autotuned decode tile = {best} in {:.0}ms (cached; set LOGSCOPE_MATVEC_TILE to override, LOGSCOPE_NO_AUTOTUNE to skip)", t0.elapsed().as_secs_f32() * 1000.0);
                 }
             } else if gpu.profile_forced() {
-                eprintln!("wgpu-engine: decode tile = {} (LOGSCOPE_MATVEC_TILE override)", gpu.matvec_tile());
+                crate::diag!("wgpu-engine: decode tile = {} (LOGSCOPE_MATVEC_TILE override)", gpu.matvec_tile());
             }
             // Per-shape autotuning, beyond the single global tile above: the model's distinct mat-vec
             // shapes (attention QKVO, fused FFN gate/up, FFN-down, output) have different optimal tiles
@@ -483,7 +540,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 let cache = gpu_kernels::store::cache_root()
                     .join(format!("autotune-shapes-v2-{safe}.bin"));
                 let (dl, gl) = gpu.load_autotune(&cache).unwrap_or((0, 0));
-                if dl > 0 || gl > 0 { eprintln!("wgpu-engine: per-shape autotune — loaded {dl} decode + {gl} GEMM tiles from cache"); }
+                if dl > 0 || gl > 0 { crate::diag!("wgpu-engine: per-shape autotune — loaded {dl} decode + {gl} GEMM tiles from cache"); }
                 // Time-box the whole probe so a slow/large model can never stall the load (capped-width
                 // probes keep each shape cheap; this is the hard backstop).
                 let t0 = std::time::Instant::now();
@@ -492,14 +549,14 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 let m_probe = model.d.clamp(64, 512);                             // representative prefill width
                 // The GEMM tile only matters when the tiled prefill is enabled, so only probe it then.
                 let gem = if std::env::var_os("LOGSCOPE_PREFILL_TILED").is_some() { gpu.autotune_gemm(&shapes, m_probe, Some(deadline)) } else { Vec::new() };
-                for (n, k, t, ms) in &dec { eprintln!("wgpu-engine:   probed decode n={n} k={k} → tile {t} in {ms:.0}ms"); }
-                for (n, k, t, ms) in &gem { eprintln!("wgpu-engine:   probed GEMM   n={n} k={k} → tile {t} in {ms:.0}ms"); }
+                for (n, k, t, ms) in &dec { crate::diag!("wgpu-engine:   probed decode n={n} k={k} → tile {t} in {ms:.0}ms"); }
+                for (n, k, t, ms) in &gem { crate::diag!("wgpu-engine:   probed GEMM   n={n} k={k} → tile {t} in {ms:.0}ms"); }
                 if !dec.is_empty() || !gem.is_empty() {
                     let _ = gpu.save_autotune(&cache);
                     let total: f32 = dec.iter().chain(gem.iter()).map(|x| x.3).sum();
-                    eprintln!("wgpu-engine: per-shape autotune probed {} decode + {} GEMM shapes ({:.0}ms work, {:.1}s wall; cached to {})",
+                    crate::diag!("wgpu-engine: per-shape autotune probed {} decode + {} GEMM shapes ({:.0}ms work, {:.1}s wall; cached to {})",
                         dec.len(), gem.len(), total, t0.elapsed().as_secs_f32(), cache.display());
-                    if std::time::Instant::now() >= deadline { eprintln!("wgpu-engine: NOTE — autotune hit its 20s time-box; remaining shapes use defaults (re-run to finish, or pin LOGSCOPE_*_TILE)"); }
+                    if std::time::Instant::now() >= deadline { crate::diag!("wgpu-engine: NOTE — autotune hit its 20s time-box; remaining shapes use defaults (re-run to finish, or pin LOGSCOPE_*_TILE)"); }
                 }
                 // Print the active per-shape table (covers the cached case too) so the chosen tiles are visible.
                 let tiled = std::env::var_os("LOGSCOPE_PREFILL_TILED").is_some();
@@ -507,17 +564,17 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 for (n, k) in shapes.iter().copied() {
                     if seen.insert((n, k)) {
                         let gemm = if tiled { format!(" · GEMM tile {}", gpu.gemm_tile_for(n, k)) } else { String::new() };
-                        eprintln!("wgpu-engine:   shape n={n} k={k} → decode tile {}{gemm}", gpu.decode_tile_for(n, k));
+                        crate::diag!("wgpu-engine:   shape n={n} k={k} → decode tile {}{gemm}", gpu.decode_tile_for(n, k));
                     }
                 }
-                eprintln!("wgpu-engine: tile overrides — LOGSCOPE_DECODE_TILE / LOGSCOPE_GEMM_TILE pin, LOGSCOPE_NO_AUTOTUNE skips, LOGSCOPE_PREFILL_TILED=1 enables the tiled prefill GEMM");
+                crate::diag!("wgpu-engine: tile overrides — LOGSCOPE_DECODE_TILE / LOGSCOPE_GEMM_TILE pin, LOGSCOPE_NO_AUTOTUNE skips, LOGSCOPE_PREFILL_TILED=1 enables the tiled prefill GEMM");
                 // Dispatch-reduction levers for dispatch-bound decode (Asahi): all bit-identical to default,
                 // OPT-IN. One switch enables the set; the profile prints the bind-group hit rate when active.
                 let fast = std::env::var("LOGSCOPE_FAST_DECODE").as_deref() == Ok("1");
                 if fast {
-                    eprintln!("wgpu-engine: LOGSCOPE_FAST_DECODE=1 — dispatch levers ON (bind-group cache + MoE gate‖up/SwiGLU + down/combine fusions); bit-identical, decode-speed only");
+                    crate::diag!("wgpu-engine: LOGSCOPE_FAST_DECODE=1 — dispatch levers ON (bind-group cache + MoE gate‖up/SwiGLU + down/combine fusions); bit-identical, decode-speed only");
                 } else {
-                    eprintln!("wgpu-engine: dispatch levers available (dispatch-bound decode): LOGSCOPE_FAST_DECODE=1 enables all (bind-group cache + 2 MoE fusions), or set LOGSCOPE_BG_CACHE / LOGSCOPE_FUSE_GLU / LOGSCOPE_FUSE_DOWN individually");
+                    crate::diag!("wgpu-engine: dispatch levers available (dispatch-bound decode): LOGSCOPE_FAST_DECODE=1 enables all (bind-group cache + 2 MoE fusions), or set LOGSCOPE_BG_CACHE / LOGSCOPE_FUSE_GLU / LOGSCOPE_FUSE_DOWN individually");
                 }
             }
             // Submit batching: a 14B decode is ~24 submits/token and the profile is sync-dominated, so the
@@ -525,11 +582,11 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
             // next replies (SubmitTuner sweeps SUBMIT_PROFILES by per-token decode time). Bit-exact across
             // flush values (--gate-submit), so adapting between replies never changes output.
             let submit_tuner = if gpu.flush_every_pinned() {
-                eprintln!("wgpu-engine: submit batch = {} passes/submit (LOGSCOPE_FLUSH_EVERY override)", gpu.flush_every());
+                crate::diag!("wgpu-engine: submit batch = {} passes/submit (LOGSCOPE_FLUSH_EVERY override)", gpu.flush_every());
                 None
             } else if let Some(v) = gpu_kernels::store::flush_get(&gpu.adapter_name) {
                 gpu.set_flush_every(v);
-                eprintln!("wgpu-engine: submit batch = {v} passes/submit (cached autotune for this GPU)");
+                crate::diag!("wgpu-engine: submit batch = {v} passes/submit (cached autotune for this GPU)");
                 None
             } else if std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_some() {
                 None
@@ -550,7 +607,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 let t = gpu_kernels::SubmitTuner::new(
                     Box::leak(neighborhood.clone().into_boxed_slice()), 2);
                 gpu.set_flush_every(winner);
-                eprintln!("wgpu-engine: submit batch = {winner} passes/submit (startup stride probe [{}]); live tuner refines {:?} over next replies; pin with LOGSCOPE_FLUSH_EVERY", table.join(" "), neighborhood);
+                crate::diag!("wgpu-engine: submit batch = {winner} passes/submit (startup stride probe [{}]); live tuner refines {:?} over next replies; pin with LOGSCOPE_FLUSH_EVERY", table.join(" "), neighborhood);
                 Some(t)
             };
             let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
@@ -563,8 +620,8 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
             // bit-exact regardless of pool size: only the pure-prefill region of an anchor is ever seeded.
             let kv_cap = std::env::var("LOGSCOPE_KV_TREE").ok()
                 .map(|v| v.trim().parse::<usize>().unwrap_or(6).max(1)).unwrap_or(3);
-            if std::env::var("LOGSCOPE_KV_OFF").is_ok() { eprintln!("wgpu-engine: KV reuse DISABLED (LOGSCOPE_KV_OFF) — full prefill every turn, graph speedups off"); }
-            else if kv_cap > 1 { eprintln!("wgpu-engine: KV prefix tree ON — pool cap {kv_cap} (each entry holds a KV cache; trades memory for fewer prefills on branchy/fan-out chats)"); }
+            if std::env::var("LOGSCOPE_KV_OFF").is_ok() { crate::diag!("wgpu-engine: KV reuse DISABLED (LOGSCOPE_KV_OFF) — full prefill every turn, graph speedups off"); }
+            else if kv_cap > 1 { crate::diag!("wgpu-engine: KV prefix tree ON — pool cap {kv_cap} (each entry holds a KV cache; trades memory for fewer prefills on branchy/fan-out chats)"); }
             // Tiered pool (opt-in): value-ranked eviction with int8/host demotion. Budget the
             // GPU-resident KV at kv_cap full f32 caches' worth of a typical 4k-token tip; the pool
             // then holds MORE tips than kv_cap by demoting the cold ones to int8/host instead of
@@ -574,7 +631,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 let per_tip = 2 * 4096 * kv_dim * 4 * model.n_layers; // f32 KV for a 4k-token tip
                 let budget = std::env::var("LOGSCOPE_KV_POOL_MB").ok().and_then(|v| v.parse::<usize>().ok())
                     .map(|mb| mb * 1_000_000).unwrap_or(per_tip * kv_cap);
-                eprintln!("wgpu-engine: KV pool ON (tiered Hot/Warm/Cold, value-ranked) — budget {:.0} MB, entry cap {}", budget as f32 / 1e6, kv_cap * 4);
+                crate::diag!("wgpu-engine: KV pool ON (tiered Hot/Warm/Cold, value-ranked) — budget {:.0} MB, entry cap {}", budget as f32 / 1e6, kv_cap * 4);
                 Some(crate::anchorpool::AnchorPool::new(budget, model.n_layers, kv_dim))
             } else { None };
             // Speculative decoding (opt-in): if LOGSCOPE_SPEC_DRAFT points at a GGUF, load it as a
@@ -592,11 +649,11 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                         Ok(dm) if dm.vocab == model.vocab => {
                             let base = std::path::Path::new(&dpath).file_name().and_then(|s| s.to_str()).unwrap_or(&dpath);
                             gpu.prewarm(&dm);
-                            eprintln!("wgpu-engine: spec-decode ENABLED — draft {base} (d={} L={} vocab={}) proposes, target verifies; tune the block with LOGSCOPE_SPEC_K (default 4)", dm.d, dm.n_layers, dm.vocab);
+                            crate::diag!("wgpu-engine: spec-decode ENABLED — draft {base} (d={} L={} vocab={}) proposes, target verifies; tune the block with LOGSCOPE_SPEC_K (default 4)", dm.d, dm.n_layers, dm.vocab);
                             Some(dm)
                         }
-                        Ok(dm) => { eprintln!("wgpu-engine: spec draft vocab {} != target {} — spec-decode OFF (draft and target must share a tokenizer)", dm.vocab, model.vocab); None }
-                        Err(e) => { eprintln!("wgpu-engine: spec draft load failed — spec-decode OFF: {e}"); None }
+                        Ok(dm) => { crate::diag!("wgpu-engine: spec draft vocab {} != target {} — spec-decode OFF (draft and target must share a tokenizer)", dm.vocab, model.vocab); None }
+                        Err(e) => { crate::diag!("wgpu-engine: spec draft load failed — spec-decode OFF: {e}"); None }
                     }
                 }
                 _ => None,
@@ -606,6 +663,18 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
         pub fn model_name(&self) -> &str { &self.name }
+
+        /// What ONE more instance of this model would cost in device memory: the weights the
+        /// planner actually placed, plus a KV cache for the app's default window. Replicator mode
+        /// divides the budget by this to bound its slider.
+        ///
+        /// 0 when the planner did not run (f32 loads, synthetic models) — the caller treats
+        /// unknown as "no memory bound" rather than as zero slots, the same rule ctxwin uses.
+        pub fn instance_bytes(&self) -> u64 {
+            let w = self.model.planned_weight_bytes;
+            if w == 0 { return 0; }
+            w + self.model.kv_bytes_per_token() * 4096
+        }
         /// Derive a sibling engine that SHARES this one's resident weights, device, and pipeline cache
         /// (all read-only after load — RULESET K9), with its own KV anchors, rng stream, and log tag.
         /// This is what makes N concurrent lanes cost N KV caches instead of N model copies: spinning a
@@ -637,10 +706,17 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
             let sample_win = std::env::var("LOGSCOPE_SAMPLE_WINDOW").ok()
                 .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
             if !(sample_win >= 2 && sp.temperature > 0.0 && (2..=64).contains(&sp.top_k)) { return None; }
+            // A DIFFUSION model never takes the autoregressive window, so building its int8 embed
+            // table is pure waste: 307 MiB and ~0.15s on LLaDA2-mini, allocated on every first turn
+            // and never read. The 737/739 logs printed "windowed sampling ON" immediately before
+            // the line announcing that generation was routing to diffuse_generate instead.
+            if self.model.diffusion
+                && std::env::var("LOGSCOPE_DIFFUSION_AR").as_deref() != Ok("1")
+                && self.model.mask_token_id.is_some() { return None; }
             if self.embed_q8.is_none() {
                 let tq = Instant::now();
                 self.embed_q8 = Some(self.gpu.embed_q8(&self.model));
-                eprintln!("wgpu-engine: [{}] windowed sampling ON (k={sample_win}) — int8 embed table resident ({:.0} MiB, {:.2}s)",
+                crate::diag!("wgpu-engine: [{}] windowed sampling ON (k={sample_win}) — int8 embed table resident ({:.0} MiB, {:.2}s)",
                     self.name, (self.model.vocab * self.model.d) as f32 / (1024.0 * 1024.0), tq.elapsed().as_secs_f32());
             }
             Some(sample_win)
@@ -663,11 +739,10 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
         /// persisted verdict skips it (already answered on this GPU); a dense (non-MoE) model skips it (the
         /// levers don't bear on it). Otherwise: probe now, so the first real reply is already on the fast path.
         pub fn ab_probe(&self) {
-            use std::sync::atomic::Ordering::Relaxed;
             // env override wins — set the state directly, no probe
             match std::env::var("LOGSCOPE_FAST_DECODE").as_deref() {
-                Ok("1") => { gpu_kernels::ab_set_decided(true);  eprintln!("wgpu-engine: fast-decode levers ON (LOGSCOPE_FAST_DECODE=1) — A/B skipped"); return; }
-                Ok("0") => { gpu_kernels::ab_set_decided(false); eprintln!("wgpu-engine: fast-decode levers OFF (LOGSCOPE_FAST_DECODE=0) — A/B skipped"); return; }
+                Ok("1") => { gpu_kernels::ab_set_decided(true);  crate::diag!("wgpu-engine: fast-decode levers ON (LOGSCOPE_FAST_DECODE=1) — A/B skipped"); return; }
+                Ok("0") => { gpu_kernels::ab_set_decided(false); crate::diag!("wgpu-engine: fast-decode levers OFF (LOGSCOPE_FAST_DECODE=0) — A/B skipped"); return; }
                 _ => {}
             }
             // Persisted verdict, keyed by GPU **and decode class**. Keying on the adapter alone was a
@@ -678,7 +753,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
             let ab_key = format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class());
             if let Some(on) = gpu_kernels::store::fast_ab_get(&ab_key) {
                 gpu_kernels::ab_set_decided(on);
-                eprintln!("wgpu-engine: fast-decode levers {} (cached A/B verdict for {ab_key})", if on { "ON" } else { "OFF" });
+                crate::diag!("wgpu-engine: fast-decode levers {} (cached A/B verdict for {ab_key})", if on { "ON" } else { "OFF" });
                 return;
             }
             // Probe on MoE AND dense models. The two MoE fusions are no-ops on a dense model, but the
@@ -714,7 +789,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
             // only in process memory.
             let prof_path = gpu_kernels::store::cache_path(0).with_file_name("tuning-profile.json");
             let (mut prof, warn) = logscope::tuneprofile::Profile::load_or_default(&prof_path, &self.gpu.adapter_name);
-            if let Some(w) = warn { eprintln!("wgpu-engine: {w}"); }
+            if let Some(w) = warn { crate::diag!("wgpu-engine: {w}"); }
             let v = logscope::tuneprofile::Verdict {
                 option: "fast_decode".into(), chosen: decision,
                 on_ms: on * 1000.0, off_ms: off * 1000.0,
@@ -745,19 +820,19 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 if verdict.switches() {
                     gpu_kernels::store::fast_ab_put(&key, decision);
                 } else {
-                    eprintln!("wgpu-engine: A/B verdict NOT persisted — {}", verdict.explain());
+                    crate::diag!("wgpu-engine: A/B verdict NOT persisted — {}", verdict.explain());
                 }
-                if let Err(e) = prof.save(&prof_path) { eprintln!("wgpu-engine: tuning profile not saved: {e}"); }
-                eprintln!("wgpu-engine: fast-decode A/B — {} by {:+.0}% ({:.1} vs {:.1} ms/tok), cached for [{}]",
+                if let Err(e) = prof.save(&prof_path) { crate::diag!("wgpu-engine: tuning profile not saved: {e}"); }
+                crate::diag!("wgpu-engine: fast-decode A/B — {} by {:+.0}% ({:.1} vs {:.1} ms/tok), cached for [{}]",
                     if decision { "ON" } else { "off" }, v.margin() * 100.0,
                     v.on_ms, v.off_ms, self.model.decode_class());
             } else {
-                eprintln!("wgpu-engine: fast-decode A/B INCONCLUSIVE ({:+.1}%, {:.1} vs {:.1} ms/tok) — \
+                crate::diag!("wgpu-engine: fast-decode A/B INCONCLUSIVE ({:+.1}%, {:.1} vs {:.1} ms/tok) — \
 using {} for this run but NOT caching it; a difference this small is run-to-run noise and caching it \
 would mislead every later load",
                     v.margin() * 100.0, v.on_ms, v.off_ms, if decision { "ON" } else { "off" });
             }
-            eprintln!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
+            crate::diag!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
                 if decision { "ON" } else { "OFF" }, self.gpu.adapter_name);
         }
         pub fn generate(&mut self, prompt: &str, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
@@ -772,8 +847,23 @@ would mislead every later load",
                 let sp: Vec<(usize, u32)> = prompt_ids.iter().enumerate()
                     .filter(|(_, &t)| self.tok.is_special(t)).map(|(i, &t)| (i, t)).collect();
                 let tail: Vec<u32> = prompt_ids.iter().rev().take(12).rev().copied().collect();
-                eprintln!("wgpu-engine: [{}] prompt diag — {} special tokens (showing ≤12): {:?}; tail ids = {:?}",
+                crate::diag!("wgpu-engine: [{}] prompt diag — {} special tokens (showing ≤12): {:?}; tail ids = {:?}",
                     self.name, sp.len(), &sp[..sp.len().min(12)], tail);
+                // TEMPLATE/TOKENIZER MISMATCH ALARM. A prompt whose marker text tokenises to ZERO
+                // specials, on a model that registers specials, means the builder emitted a
+                // different family's markers than this tokenizer knows — they go in as ordinary
+                // words and the model is handed an unfamiliar frame. Seen live: a load line
+                // reporting template=Bailing2 while the prompt ended
+                // "assistant<|end_header_id|>\n\n" (Llama3), 0 specials found, because a second
+                // prompt-building path bypassed the resolved template. Silent before this line —
+                // the specials count was printed but nothing said the count was WRONG.
+                if sp.is_empty() && prompt.contains("<|") {
+                    let marker = prompt.rfind("<|").map(|i| &prompt[i..(i + 24).min(prompt.len())]).unwrap_or("");
+                    crate::diag!("wgpu-engine: [{}] TEMPLATE MISMATCH — the prompt carries marker TEXT \
+({marker:?}…) that this tokenizer does not know as a special token, so it was tokenised as ordinary \
+words. The prompt builder and the model's template disagree; the load line above names the template \
+this model actually resolved to.", self.name);
+                }
             }
             let sp = SamplerParams { temperature: p.temperature, top_k: 40, top_p: 0.95, repeat_penalty: p.repeat_penalty, repeat_last_n: 64, min_p: p.min_p };
             // Decode budget for this reply. With auto-continue on, `reply_ceiling` is the per-reply
@@ -785,17 +875,69 @@ would mislead every later load",
             // prompt, so a long prompt isn't over-truncated to satisfy a large continuous ceiling; the
             // reply budget then yields to the prompt and fills whatever room remains. On overflow keep
             // the head (system prompt) + most recent tail, dropping the middle — standard window shift.
-            let window = (p.n_ctx as usize).clamp(1024, MAX_CONTEXT);
+            //
+            // The window SIZES ITSELF from what this prompt needs, within the model's trained
+            // context and the KV memory left after the resident weights — n_ctx is a floor, not the
+            // answer. This is T1: the operator's repository summary ran 8 turns at a hand-set 4864
+            // against a model trained to 131072, eliding the repo out of the middle of its own
+            // prompt every turn (c4-842). Telling them to raise a setting was the wrong shape of
+            // fix for a long-horizon agent; the engine knows all three bounds.
             let min_reply = ceiling.min(256);
+            let (window, why) = gpu_kernels::ctxwin::auto_window(
+                prompt_ids.len() + min_reply, p.n_ctx, self.model.trained_ctx,
+                self.model.kv_bytes_per_token(), self.model.planned_weight_bytes,
+                gpu_kernels::store::resident_budget_bytes(), MAX_CONTEXT);
+            if let Some(w) = &why { crate::diag!("wgpu-engine: [{}] {w}", self.name); }
             let max_prompt = window.saturating_sub(min_reply).max(256);
+            // Publish the fit for the status line, on BOTH paths. Setting it only when truncation
+            // happens would leave the badge showing a previous turn's elision after a short prompt,
+            // which is the kind of stale indicator that gets believed.
+            crate::backend::CTX_FIT.store(crate::backend::ctxfit_pack(prompt_ids.len(), window, 0),
+                              std::sync::atomic::Ordering::Relaxed);
             if prompt_ids.len() > max_prompt {
-                let head = (max_prompt / 3).min(1024);            // keep the system prompt
-                let tail = max_prompt - head;                     // keep the most recent context
                 let orig = prompt_ids.len();
+                // MARK THE GAP. The old splice joined the head straight onto the tail, so a sentence
+                // cut in half arrived as a sentence and a function whose body was removed arrived as
+                // a function with a different body — the model cannot tell that anything is missing,
+                // it just reads a document that says something else. That is tolerable for chat
+                // scrollback and actively wrong for reading a repository, where the middle IS the
+                // content.
+                //
+                // The marker is priced into the budget BEFORE the split (ctxwin::plan), never
+                // appended after: the window is what the KV cache is allocated from, so overflowing
+                // it is the device OOM the bound exists to prevent, not a formatting slip.
+                let mtext = gpu_kernels::ctxwin::marker_text(0);
+                let mlen = self.tok.encode(&mtext).len().max(8);
+                let pl = gpu_kernels::ctxwin::plan(orig, max_prompt, 1024, mlen);
+                // SNAP BOTH EDGES TO LINE BOUNDARIES. The plan's indices are arbitrary token
+                // positions: the head ends mid-function and the tail resumes mid-line, so the model
+                // receives a truncated file followed by half of another. For a pasted repository
+                // that is most of the damage. Snapping costs a few tokens and only ever SHRINKS what
+                // is kept (proved exhaustively in ctxwin::snapping), so the window the KV cache was
+                // sized from cannot be exceeded.
+                let boundary: Vec<bool> = prompt_ids.iter()
+                    .map(|&t| self.tok.decode_bytes(&[t]).contains(&b'\n')).collect();
+                const SNAP_SLACK: usize = 48;
+                let head = gpu_kernels::ctxwin::snap_back(&boundary, pl.head, SNAP_SLACK);
+                let tail_start = gpu_kernels::ctxwin::snap_fwd(&boundary, orig - pl.tail, SNAP_SLACK);
                 let mut kept = prompt_ids[..head].to_vec();
-                kept.extend_from_slice(&prompt_ids[orig - tail..]);
+                if pl.marker > 0 {
+                    let mut mids = self.tok.encode(&gpu_kernels::ctxwin::marker_text(pl.elided));
+                    mids.truncate(pl.marker);          // never spend more than was reserved
+                    kept.extend_from_slice(&mids);
+                }
+                kept.extend_from_slice(&prompt_ids[tail_start.min(orig)..]);
+                debug_assert!(kept.len() <= max_prompt, "context plan overflowed its own window");
                 prompt_ids = kept;
-                eprintln!("wgpu-engine: context {orig} tokens > {max_prompt} window — kept {head} head + {tail} tail (raise n_ctx for more)");
+                crate::backend::CTX_FIT.store(crate::backend::ctxfit_pack(orig, max_prompt, pl.elided),
+                                  std::sync::atomic::Ordering::Relaxed);
+                crate::diag!("wgpu-engine: context {orig} tokens > {max_prompt} window — kept {head} head \
++ {} tail, {} elided from the middle and MARKED as such; both cuts snapped to line boundaries \
+(head -{}, tail +{}) so neither edge lands mid-line — the window already auto-sized to what \
+this prompt needs, so a cut this deep means a HARDER bound held it (the auto-size line above \
+names which)",
+                    orig - tail_start, tail_start - head,
+                    pl.head - head, tail_start - (orig - pl.tail));
             }
             // Reply budget = ceiling, capped to the room left after the prompt (continuous decode fits
             // the window instead of forcing prompt truncation).
@@ -805,6 +947,49 @@ would mislead every later load",
             // Draft proposes a block; target verifies the whole block in one forward (engine
             // `speculative_generate_stats`). Greedy and bit-exact to normal decode, but more tokens per
             // expensive target pass. Bypasses KV-tree reuse (spec manages its own target+draft caches).
+            // LOGSCOPE_SPEC_DRAFT=lookup asks for the model-free drafter (c4-838): it finds the
+            // current suffix earlier in the context and proposes what followed. No second
+            // checkpoint to download, load or keep resident, and the same verifier c4-837 proved
+            // correct by self-draft — so output is identical to plain decoding, only the speed
+            // differs. Suited to repository reading, where identifiers and paths repeat; it should
+            // mostly whiff on prose, which costs a verification slot and nothing else.
+            let want_lookup = std::env::var("LOGSCOPE_SPEC_DRAFT").as_deref() == Ok("lookup");
+            if want_lookup && self.draft.is_none() {
+                let k: usize = std::env::var("LOGSCOPE_SPEC_K").ok().and_then(|s| s.trim().parse().ok())
+                    .filter(|&k| k >= 1).unwrap_or(4);
+                let ng: usize = std::env::var("LOGSCOPE_SPEC_NGRAM").ok().and_then(|s| s.trim().parse().ok())
+                    .filter(|&n| n >= 1).unwrap_or(2);   // measured: ng=2 beats 3 and 4 on every corpus
+                let mut d = gpu_kernels::spec::PromptLookup { ngram: ng };
+                let mut st = gpu_kernels::SpecStats::default();
+                let td = Instant::now();
+                let ids = self.gpu.speculative_generate_drafter(&self.model, &mut d, &prompt_ids,
+                                                                n_new, k, &mut st);
+                let secs = td.elapsed().as_secs_f32().max(1e-3);
+                let mut produced = 0usize;
+                let mut pending: Vec<u8> = Vec::new();
+                for &next in &ids {
+                    if self.stop_ids.contains(&next) { break; }
+                    if self.tok.is_special(next) { continue; }
+                    produced += 1;
+                    pending.extend_from_slice(&self.tok.decode_bytes(&[next]));
+                    let valid = match std::str::from_utf8(&pending) { Ok(t) => t.len(), Err(e) => e.valid_up_to() };
+                    if valid > 0 {
+                        let text: String = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        pending.drain(..valid);
+                        let _ = on(&text);
+                    }
+                }
+                // Tokens per verification pass is the speedup, NOT the acceptance rate: a high rate
+                // on short drafts can be worth less than a mediocre one on long drafts (c4-829).
+                let per_pass = if st.rounds > 0 { st.emitted as f64 / st.rounds as f64 } else { 0.0 };
+                crate::diag!("wgpu-engine: [{}] speculative (prompt-lookup, k={k}, ngram={ng}) — \
+{} tokens in {:.1}s = {:.2} tok/s | {} accepted of {} drafted over {} rounds = {:.2} tokens per \
+verification pass (1.00 means the drafter paid for nothing)",
+                    self.name, produced, secs, produced as f32 / secs,
+                    st.accepted, st.rounds * k, st.rounds, per_pass);
+                if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
+                return Ok(produced);
+            }
             if let Some(draft) = self.draft.as_ref() {
                 let k: usize = std::env::var("LOGSCOPE_SPEC_K").ok().and_then(|s| s.trim().parse().ok()).filter(|&k| k >= 1).unwrap_or(4);
                 let mut st = gpu_kernels::SpecStats::default();
@@ -822,11 +1007,12 @@ would mislead every later load",
                     let valid = match std::str::from_utf8(&pending) { Ok(s) => s.len(), Err(e) => e.valid_up_to() };
                     if valid == 0 { continue; }
                     let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                    crate::backend::check_output_markers(&self.name, &chunk, &self.tok);
                     pending.drain(..valid);
                     if !on(&chunk) { break; }
                 }
                 if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
-                eprintln!("wgpu-engine: [{}] SPECULATIVE k={k} — {} tokens in {:.1}s = {:.2} tok/s | {:.2} accepted/round × {} rounds (~{:.2} tok per target verify-pass)",
+                crate::diag!("wgpu-engine: [{}] SPECULATIVE k={k} — {} tokens in {:.1}s = {:.2} tok/s | {:.2} accepted/round × {} rounds (~{:.2} tok per target verify-pass)",
                     self.name, ids.len(), secs, ids.len() as f32 / secs,
                     st.accepted as f64 / st.rounds.max(1) as f64, st.rounds, st.emitted as f64 / st.rounds.max(1) as f64);
                 return Ok(produced);
@@ -847,21 +1033,58 @@ would mislead every later load",
                 (false, 0, 0)
             } else if let Some(pool) = self.pool.as_mut() {
                 had_cache = !pool.is_empty();
-                match pool.pick(&self.gpu, &self.model, &prompt_ids, 16, 256) {
+                // Prompt-scaled, not a fixed 256: an agent turn appends kilobytes of tool
+                // output, so its divergent suffix is always thousands of tokens and the old cap
+                // could not be met by construction — eight turns of the operator's repo summary
+                // missed the cache and paid a full 15.3s prefill each.
+                match pool.pick(&self.gpu, &self.model, &prompt_ids, 16, crate::kvtree::suffix_bound(prompt_ids.len())) {
                     Some((i, ln, sess)) => { picked_session = Some(sess); (true, ln, i) }
                     None => (false, 0, 0),
                 }
             } else {
                 let meta: Vec<(Vec<u32>, usize, usize)> =
                     self.anchors.iter().map(|(t, sess, pf)| (t.clone(), *pf, sess.pos)).collect();
-                match crate::kvtree::pick_anchor(&meta, &prompt_ids, 16, 256) {
-                    Some((i, ln)) => (true, ln, i), None => (false, 0, 0),
+                // REPORT WHAT THE PREFIX TREE DID. This cache saves whole prefills — the largest
+                // per-turn cost after the first — and had no telemetry at all: no hit line, no miss
+                // line, and kvtree::prefill_savings was called only by its own test. A log could not
+                // answer "did it ever hit", so the thresholds have never been tuned against a real
+                // session.
+                match crate::kvtree::pick_anchor(&meta, &prompt_ids, 16, crate::kvtree::suffix_bound(prompt_ids.len())) {
+                    Some((i, ln)) => {
+                        let saved = crate::kvtree::prefill_savings(prompt_ids.len(), ln);
+                        crate::diag!("wgpu-engine: [{}] KV prefix tree HIT — reusing {ln} of {} prompt \
+tokens ({:.0}% of the prefill skipped), {} to prefill", self.name, prompt_ids.len(),
+                            100.0 * saved as f64 / prompt_ids.len().max(1) as f64,
+                            prompt_ids.len() - ln);
+                        (true, ln, i)
+                    }
+                    None => {
+                        // A miss has three causes needing opposite responses, and "miss" names none
+                        // of them.
+                        let why = crate::kvtree::explain_miss(&meta, &prompt_ids, 16, crate::kvtree::suffix_bound(prompt_ids.len()));
+                        let fix = why.tunable().map(|f| format!(" — {f}")).unwrap_or_default();
+                        crate::diag!("wgpu-engine: [{}] KV prefix tree MISS ({} anchor(s)): {why:?}{fix}",
+                            self.name, meta.len());
+                        (false, 0, 0)
+                    }
                 }
             };
             let suffix_len = prompt_ids.len() - l;
             let mut s = self.gpu.session_new(&self.model, cap, self.rng);
             let t0 = Instant::now();
-            if reuse {
+            // A DIFFUSION model does not decode from a KV cache: diffuse_generate_cb re-forwards the
+            // block-truncated canvas each step and takes only the raw prompt ids. Prefilling one
+            // therefore buys nothing and costs the whole prompt — 12.5s on the 737 run, printed as
+            // "full prefill (first turn for this model)" immediately before the line saying
+            // generation was routing to the diffusion path instead. The empty session is still
+            // created so every borrow below stays valid; it is simply never filled.
+            let diffusion_path = self.model.diffusion
+                && std::env::var("LOGSCOPE_DIFFUSION_AR").as_deref() != Ok("1")
+                && self.model.mask_token_id.is_some();   // diffuse_generate refuses without one
+            if diffusion_path {
+                crate::diag!("wgpu-engine: [{}] diffusion model — skipping the KV prefill ({} prompt tokens); block denoising re-forwards the canvas and reads no cache",
+                    self.name, prompt_ids.len());
+            } else if reuse {
                 // Seed from the picked tip: the pool handed us an owned Session; the FIFO borrows in place.
                 if let Some(src) = picked_session.as_ref() {
                     self.gpu.seed_from_prefix(&self.model, &mut s, &src.cache, l);
@@ -902,7 +1125,7 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                         } else {
                             " (default; set LOGSCOPE_PREFILL_CHUNK to lower for GPU-watchdog hangs)".to_string()
                         };
-                        eprintln!("wgpu-engine: prefill chunk = {pc} tokens/dispatch{why}");
+                        crate::diag!("wgpu-engine: prefill chunk = {pc} tokens/dispatch{why}");
                     }
                 }
                 s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, pc);
@@ -911,10 +1134,17 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             // CARRIED TO THE PROFILE LINE. Decode compared against this model's OWN prefill needs no
             // roofline, which is why it can be reported when the bandwidth verdict cannot — and the
             // bandwidth verdict almost never can, because --gate-perf is rarely run.
-            let prefill_ms_per_tok = if prompt_ids.is_empty() { 0.0 }
-                else { t0.elapsed().as_secs_f64() * 1000.0 / prompt_ids.len() as f64 };
-            let prefill_tokens = prompt_ids.len();
-            eprintln!("wgpu-engine: [{}] prompt {} tokens → up to {} (temp {:.2}); {} in {:.2}s, decoding…", self.name,
+            // DIVIDE BY THE TOKENS ACTUALLY PREFILLED, not by the prompt. When the prefix tree hits,
+            // most of the prompt is not prefilled at all: a turn reusing 1626 of 1721 tokens spent
+            // 0.39s on 95 real tokens, and dividing that by 1721 gives 0.23 ms/tok instead of 4.1 —
+            // which inflated the phase-balance ratio to 269x and reported a cache SUCCESS as a
+            // decode pathology. c4-750's guard catches a phase that was skipped entirely; this is a
+            // phase that was mostly skipped, and the same division artifact wearing a smaller number.
+            let prefilled_now = prompt_ids.len().saturating_sub(if reuse { l } else { 0 });
+            let prefill_ms_per_tok = if prefilled_now == 0 { 0.0 }
+                else { t0.elapsed().as_secs_f64() * 1000.0 / prefilled_now as f64 };
+            let prefill_tokens = prefilled_now;
+            crate::diag!("wgpu-engine: [{}] prompt {} tokens → up to {} (temp {:.2}); {} in {:.2}s, decoding…", self.name,
                 prompt_ids.len(), n_new, p.temperature,
                 // NAME THE MISS. A hit says "reused N anchor tokens"; a miss said "full prefill",
                 // which is exactly what a FIRST turn says — so the one number worth watching was
@@ -948,7 +1178,10 @@ was evicted)", prompt_ids.len())
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
                 gpu_kernels::GPU_SETUP_NS.load(AOrd::Relaxed), gpu_kernels::GPU_SYNC_NS.load(AOrd::Relaxed));
+            let (gp0, gd0) = (gpu_kernels::GPU_PASSES_OPENED.load(AOrd::Relaxed),
+                              gpu_kernels::GPU_DISPATCHES.load(AOrd::Relaxed));
             let (bgh0, bgm0) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed), gpu_kernels::BG_MISSES.load(AOrd::Relaxed));
+            let enc0 = gpu_kernels::gpu_encode_ns();
             // Windowed SAMPLED decode: the whole sample→embed→decode cycle stays on-device for k
             // tokens per readback — no per-token full-vocab logits sync and no per-token O(v·log v)
             // CPU sort. Eligibility + lazy int8-embed build live in `windowed_ready` so the resume
@@ -988,6 +1221,97 @@ was evicted)", prompt_ids.len())
                     if crate::genguard::runaway_stop(&recent, 0.5) != crate::genguard::StopReason::None { return false; }
                     cont
                 };
+                // DIFFUSION MODELS ARE NOT AUTOREGRESSIVE. LLaDA2/LLaDA/Dream/RND1 are masked
+                // diffusion: they predict masked positions inside a block with bidirectional
+                // attention, iteratively. AR-decoding one produces exactly what the engine's own
+                // doc comment on diffuse_generate predicts — "fluent noise": real words, correct
+                // punctuation, no coherence. Every earlier fix in this hunt was necessary and none
+                // could have produced sense, because the chat path never called the diffusion
+                // generator at all.
+                if model.diffusion {
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::diag!("wgpu-engine: [{}] DIFFUSION model — routing generation through diffuse_generate (block denoising), NOT the autoregressive window. LOGSCOPE_DIFFUSION_AR=1 forces the old AR path for comparison; LOGSCOPE_DIFFUSION_STEPS / _BLOCK tune the schedule.", self.name);
+                    }
+                    if std::env::var("LOGSCOPE_DIFFUSION_AR").as_deref() != Ok("1") {
+                        // PER-BLOCK now (reference semantics), so this multiplies by block count:
+                        // forwards = ceil(n_fill/block) * steps. The reference's ideal is
+                        // steps == block (one token per commit), which at 20 blocks would be 640
+                        // whole-prefix forwards — minutes per reply until the committed prefix is
+                        // KV-cached. 8 is the compromise: 4 tokens per commit instead of the old
+                        // loop's 21, at a quarter of the ideal's cost. Raise it for quality.
+                        let block: usize = std::env::var("LOGSCOPE_DIFFUSION_BLOCK").ok()
+                            .and_then(|v| v.parse().ok()).unwrap_or(32);
+                        // ONE TOKEN PER COMMIT, the reference's schedule. The 8 above was chosen for
+                        // a cost that no longer exists: the comment beside it said the ideal meant
+                        // "minutes per reply until the committed prefix is KV-cached", and c4-770
+                        // cached it — a step now forwards its own 32 rows instead of ~2000.
+                        //
+                        // The reason to spend that budget on quality is in the output. Committing
+                        // 4 positions from ONE forward means each picks its best token against a
+                        // canvas that is still mostly masked, so neighbours never see each other's
+                        // choices: "provide provide", "like like", "What What", "with with" —
+                        // duplicated adjacent words and locally-plausible text that does not agree
+                        // with itself. That is the signature of multi-token commits, not of a broken
+                        // model, and steps == block is what the reference does to avoid it.
+                        //
+                        // It is not 32x the cost either: the confidence threshold (c4-766) commits
+                        // every position over 0.95 immediately, so a block the model is sure about
+                        // still closes in a couple of steps.
+                        let steps: usize = std::env::var("LOGSCOPE_DIFFUSION_STEPS").ok()
+                            .and_then(|v| v.parse().ok()).unwrap_or(block);
+                        // Stop set, cancel and per-block streaming all reach the generator now.
+                        // Before: a diffusion reply filled its entire ceiling (21 blocks at 8 steps
+                        // = 168 whole-prefix forwards) even when the model finished in two; cancel
+                        // was not checked at all, so an unwanted generation could only be escaped by
+                        // killing the app; and nothing appeared on screen until every block was
+                        // done. Each block's tokens now go through the SAME `step` callback the AR
+                        // path uses, so detokenisation, the runaway guard and stop handling are
+                        // identical between the two paths.
+                        let mut stop_ids: Vec<u32> = stop.iter().copied().collect();
+                        if let Some(e) = eos { stop_ids.push(e); }
+                        let mut produced = 0usize;
+                        let mut emit = |blk: &[u32]| -> bool {
+                            for &t in blk {
+                                // Count what the READER will see. `step` swallows specials, so
+                                // counting everything handed to it produced the log line "produced
+                                // 20 tokens" beside an empty reply — a number that described the
+                                // loop's bookkeeping rather than the answer, which is the opposite
+                                // of what telemetry is for.
+                                if !tok.is_special(t) { produced += 1; }
+                                if !step(t) { return false; }
+                            }
+                            true
+                        };
+                        // SAMPLING, per the reference (chatllm.cpp forces do_sample with top_p).
+                        // The loop previously took each position's argmax and the operator's
+                        // temperature did nothing on a diffusion turn — the log said "temp 0.35"
+                        // while generation was strictly greedy. LOGSCOPE_DIFFUSION_GREEDY=1 forces
+                        // the old behaviour, which is also what temperature 0 gives.
+                        let diff_sp = if std::env::var("LOGSCOPE_DIFFUSION_GREEDY").as_deref() == Ok("1") {
+                            None
+                        } else { Some(&sp) };
+                        // CONFIDENCE THRESHOLD, the reference's convergence accelerator
+                        // (chatllm.cpp defaults it to 0.95). We passed None, so it never ran: every
+                        // step committed exactly the schedule even when the model was certain about
+                        // a dozen positions, which costs forwards — the expensive unit on this path
+                        // — and diverges from the dynamics the schedule was designed around.
+                        // LOGSCOPE_DIFFUSION_TAU sets it; 0 restores the schedule-only behaviour.
+                        let tau = std::env::var("LOGSCOPE_DIFFUSION_TAU").ok()
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .unwrap_or(0.95)
+                            .clamp(0.0, 1.0);
+                        let tau = if tau <= 0.0 { None } else { Some(tau) };
+                        match gpu.diffuse_generate_sampled(model, &seen, n_new, steps, block, tau,
+                                                           &stop_ids, diff_sp, rng, cancel, &mut emit) {
+                            Ok(_) => {
+                                if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
+                                return produced;
+                            }
+                            Err(e) => crate::diag!("wgpu-engine: [{}] diffuse_generate refused ({e}) — falling back to the AR window, which cannot produce coherent text for this model", self.name),
+                        }
+                    }
+                }
                 let p = match (sample_win_opt, embed_q8) {
                     (Some(sample_win), Some(eq)) => {
                         let w = gpu.stream_session_window(model, s, &mut seen, n_new, eos, &sp, rng, sample_win,
@@ -999,7 +1323,7 @@ was evicted)", prompt_ids.len())
                             // per-token on the same device would just abort again. Latch windowing off so
                             // the NEXT turn uses per-token from the start, and end this turn cleanly.
                             self.disable_windowing = true;
-                            eprintln!("wgpu-engine: [{}] windowed decode hit the device buffer ceiling — windowing disabled; the NEXT turn will use per-token. (Lower LOGSCOPE_WINDOW_MAX to avoid this.)", self.name);
+                            crate::diag!("wgpu-engine: [{}] windowed decode hit the device buffer ceiling — windowing disabled; the NEXT turn will use per-token. (Lower LOGSCOPE_WINDOW_MAX to avoid this.)", self.name);
                             0
                         } else { w }
                     }
@@ -1019,7 +1343,7 @@ was evicted)", prompt_ids.len())
             // reuse drift tipping a near-tied eos — retry once with a clean full prefill. If that
             // also yields nothing, the model genuinely stopped (nothing more to be done here).
             if reuse && produced == 0 && !cancel() {
-                eprintln!("wgpu-engine: reuse produced 0 tokens — retrying with a clean full prefill…");
+                crate::diag!("wgpu-engine: reuse produced 0 tokens — retrying with a clean full prefill…");
                 let mut s2 = self.gpu.session_new(&self.model, cap, self.rng);
                 s2.logits = self.gpu.prefill_chunked(&self.model, &s2.cache, &prompt_ids, prefill_chunk_for_streaming(self.model.d, self.model.h, self.model.streams_experts(), self.model.moe_counts()));
                 s2.pos = prompt_ids.len();
@@ -1029,7 +1353,35 @@ was evicted)", prompt_ids.len())
             }
             self.rng = rng;
             let secs = td.elapsed().as_secs_f32().max(1e-3);
-            eprintln!("wgpu-engine: [{}] produced {} tokens in {:.1}s = {:.2} tok/s | {} pipelines cached (warm {})", self.name,
+            // ROOFLINE, from what the loader actually made resident. Decode reads each ACTIVE weight once
+            // per token, so achieved bandwidth is arithmetic on the throughput — no probe, no calibration.
+            // The fraction needs a denominator and only appears for adapters in the spec table; the
+            // achieved figure is always real. This is the number that says whether the next move is a
+            // different model or a faster engine: at 9% the hardware is idle and the model is not the
+            // problem, at 60% it is the only thing left.
+            {
+                use std::sync::atomic::Ordering::Relaxed as R2;
+                let elems = crate::backend::RESIDENT_ELEMS.load(R2);
+                let tok_s = produced as f64 / secs.max(1e-6) as f64;
+                    if elems > 0 && tok_s > 0.0 {
+                    // Resident width, not the file's — decode reads what is in memory. int8 is the default
+                        // residency; q4 models move half as much, so this is the CONSERVATIVE choice
+                        // and will under-report their achieved bandwidth rather than over-report it.
+                        let bits = 8.0f32;
+                    let got = gpu_kernels::roofline::achieved_gb_s(tok_s, elems as f64, bits);
+                    match gpu_kernels::roofline::spec_bandwidth(&self.gpu.adapter_name) {
+                        Some(bw) => {
+                            let f = got / bw;
+                            crate::diag!("wgpu-engine: [{}] roofline — {got:.0} GB/s of {bw:.0} spec = {:.0}% \
+of the decode ceiling; {}", self.name, 100.0 * f, gpu_kernels::roofline::verdict(f));
+                        }
+                        None => crate::diag!("wgpu-engine: [{}] roofline — {got:.0} GB/s achieved; this adapter \
+is not in the spec table so no fraction is reported (a percentage of a guessed denominator is worse \
+than none)", self.name),
+                    }
+                }
+            }
+            crate::diag!("wgpu-engine: [{}] produced {} tokens in {:.1}s = {:.2} tok/s | {} pipelines cached (warm {})", self.name,
                 produced, secs, produced as f32 / secs, self.gpu.pipeline_count(), self.warm);
             // Dispatch profile for this turn: submits & polls per token, and where the wall time went
             // (CPU setup vs GPU sync). A high submits/tok with setup ≳ sync is the dispatch-bound floor.
@@ -1041,7 +1393,8 @@ was evicted)", prompt_ids.len())
             // turn (setup 102ms and sync 0ms out of 46s is 0.2%, i.e. the GPU was simply busy). That
             // mislabel sends optimisation effort at command setup when the kernels are the cost.
             let total_ms = (secs as f64) * 1000.0;
-            let accounted = setup_ms + sync_ms;
+            let encode_ms = (gpu_kernels::gpu_encode_ns().saturating_sub(enc0)) as f64 / 1e6;
+            let accounted = setup_ms + encode_ms + sync_ms;
             // "GPU-execution-bound" WAS AN OVERSTATEMENT. The condition is that setup and sync together
             // are under 15% of wall time — which says where the time ISN'T, not where it is. At the 0.1%
             // seen in real runs, 99.9% is UNACCOUNTED, and unaccounted is not a bound: the GPU may be
@@ -1053,7 +1406,19 @@ was evicted)", prompt_ids.len())
             // The suffix "-bound" is appended by the caller, so a phrase that already reads as a
             // sentence produced "neither setup nor sync sees it-bound" in a real log. Kept short and
             // adjectival for that reason: the label must survive the template it is dropped into.
-            let bound = if accounted < total_ms * 0.02 { "UNACCOUNTED" }
+            // ENCODE IS NOW MEASURED, so it must be judged rather than left in the remainder. The
+            // operator's run reads "setup 15ms + encode 3534ms + submit 147ms + sync 351ms of
+            // 4183ms" — encode is 84% of decode — and this still said "likely GPU-execution-bound",
+            // because it inferred from setup+sync alone and found them small. That inference was
+            // reasonable while encode was invisible (c4-819) and is now simply wrong: the answer is
+            // in the terms, not in what is left over.
+            //
+            // 292 microseconds per dispatch of pure CPU command recording is not the GPU being
+            // busy. It is begin_compute_pass, a frame mutex, and two keep-alive allocations, 12095
+            // times a turn.
+            let enc_share = encode_ms / total_ms.max(1.0);
+            let bound = if enc_share >= 0.40 { "ENCODE-bound (CPU command recording)" }
+                else if accounted < total_ms * 0.02 { "UNACCOUNTED" }
                 else if accounted < total_ms * 0.15 { "likely GPU-execution" }
                 else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
             // NAME THE BOTTLENECK, not just the split. "GPU-execution-bound, 0.1% accounted" says
@@ -1090,7 +1455,7 @@ was evicted)", prompt_ids.len())
                 let expected_batch_ms = if ds > 0 { total_ms / ds as f64 } else { 0.0 };
                 let v = gpu_kernels::perfverdict::verdict(&sample, expected_batch_ms);
                 eprint!("[{}] ", gpu_kernels::stamp());
-                eprintln!("wgpu-engine: [{}] bottleneck — {}", self.name, v.advice());
+                crate::diag!("wgpu-engine: [{}] bottleneck — {}", self.name, v.advice());
             }
             eprint!("[{}] ", gpu_kernels::stamp());
             // THREE BUCKETS, not two. queue.submit was timed by nothing, and on a driver whose
@@ -1100,9 +1465,18 @@ was evicted)", prompt_ids.len())
             // Delta, like the others — an absolute here would be the lifetime-total bug from _456.
             let submit_ms = (gpu_kernels::gpu_submit_ns().saturating_sub(submit_ns0)) as f64 / 1e6;
             let sample_ms = (gpu_kernels::sample_ns().saturating_sub(sample_ns0)) as f64 / 1e6;
-            let accounted = setup_ms + sync_ms + submit_ms + sample_ms;
-            eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms + submit {submit_ms:.0}ms + sync {sync_ms:.0}ms + sample {sample_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
-                self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
+            // ENCODE joins the accounting. It was the one phase nobody timed, and the profile has
+            // been reporting "15.8% accounted" — attributing 84% of decode to nothing while the
+            // verdict inferred "likely GPU-execution-bound" from the size of what was left over.
+            // An inference from a remainder is only as good as the terms subtracted from it.
+            let encode_ms = (gpu_kernels::gpu_encode_ns().saturating_sub(enc0)) as f64 / 1e6;
+            let accounted = setup_ms + encode_ms + sync_ms + submit_ms + sample_ms;
+            // Passes vs dispatches settle the fusion question this line could not answer on the
+            // first 729 hardware log: ~= means pass-per-dispatch, a multiple means fusion is live.
+            let (gp1, gd1) = (gpu_kernels::GPU_PASSES_OPENED.load(AOrd::Relaxed).saturating_sub(gp0),
+                              gpu_kernels::GPU_DISPATCHES.load(AOrd::Relaxed).saturating_sub(gd0));
+            crate::diag!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls, {gp1} passes / {gd1} disp ({:.1}/pass) | setup {setup_ms:.0}ms + encode {encode_ms:.0}ms + submit {submit_ms:.0}ms + sync {sync_ms:.0}ms + sample {sample_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
+                self.name, ds as f64 / per, gd1 as f64 / (gp1.max(1)) as f64, accounted / total_ms.max(1.0) * 100.0);
             // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
             // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
             // said which mechanism was responsible.
@@ -1121,10 +1495,13 @@ was evicted)", prompt_ids.len())
             // the attribution line directly above it — 0% against 55% for the same run, because the
             // verdict was describing the previously-loaded model's dispatches.
             let (v_nf, v_dl, v_ps) = gpu_kernels::SubmitCauseSnapshot::now().shares_since(&cause0);
-            let (headline, caveat) = gpu_kernels::run_verdict_delta_shares(v_nf, v_dl, v_ps, 
+            let (v_gp, v_gd) = (
+                gpu_kernels::GPU_PASSES_OPENED.load(AOrd::Relaxed).saturating_sub(gp0),
+                gpu_kernels::GPU_DISPATCHES.load(AOrd::Relaxed).saturating_sub(gd0));
+            let (headline, caveat) = gpu_kernels::run_verdict_delta_shares(v_nf, v_dl, v_ps, v_gp, v_gd,
                 per as u64, secs as f64, sync_ms / 1000.0);
-            eprintln!("wgpu-engine: [{}] {headline}", self.name);
-            if let Some(c) = caveat { eprintln!("wgpu-engine: [{}] {c}", self.name); }
+            crate::diag!("wgpu-engine: [{}] {headline}", self.name);
+            if let Some(c) = caveat { crate::diag!("wgpu-engine: [{}] {c}", self.name); }
             // EXPERT RESIDENCY. These counters have been tracked and reported nowhere, so there has
             // been no way to tell whether pinning more experts would help or whether the cache is
             // already saturated and the cost is in the kernels. For a streaming MoE that is the whole
@@ -1136,12 +1513,12 @@ was evicted)", prompt_ids.len())
                         hits, fills, bytes, repins,
                         pinned: gpu_kernels::moe_pin_counts().0, total: gpu_kernels::moe_pin_counts().1,
                     };
-                    eprintln!("wgpu-engine: [{}] {}", self.name, r.report(per as u64));
+                    crate::diag!("wgpu-engine: [{}] {}", self.name, r.report(per as u64));
                     // Prediction is a DIFFERENT lever from the pin set: the pin set decides what is
                     // always here, prediction decides what will be wanted next and is the only one
                     // that can hide a fetch behind compute.
                     let (issued, phits) = gpu_kernels::moe_prefetch_stats();
-                    eprintln!("wgpu-engine: [{}] {}", self.name,
+                    crate::diag!("wgpu-engine: [{}] {}", self.name,
                         gpu_kernels::perfverdict::PrefetchAccuracy { issued, hits: phits }.verdict());
                 }
             }
@@ -1157,7 +1534,7 @@ was evicted)", prompt_ids.len())
                 gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&cause0),
                 sync_ms as f64, total_ms as f64)
             {
-                eprintln!("wgpu-engine: [{}] profile DOUBT — {}", self.name, d.explain());
+                crate::diag!("wgpu-engine: [{}] profile DOUBT — {}", self.name, d.explain());
             }
             // THE SELF-RELATIVE VERDICT. Prefill and decode read the same weights in the same run, so
             // the ratio between their per-token costs measures how much latency decode fails to hide —
@@ -1171,24 +1548,93 @@ was evicted)", prompt_ids.len())
                 let sr = gpu_kernels::perfverdict::self_relative(
                     prefill_ms_per_tok, dec_ms_per_tok, prefill_tokens, ntok);
                 if !matches!(sr, gpu_kernels::perfverdict::SelfRelative::NotEnoughData) {
-                    eprintln!("wgpu-engine: phase balance — {}", sr.advice());
+                    crate::diag!("wgpu-engine: phase balance — {}", sr.advice());
+                }
+                // PUBLISH THE RATIO for the UI strip. The comparison has always been computed here
+                // and spent on one stderr line; the strip could not raise a starvation concern
+                // because it had no baseline to compare against, only throughput. A f32 in an
+                // atomic is the whole mechanism — the alternative, deriving starvation from tok/s,
+                // is a claim without a measurement.
+                if let gpu_kernels::perfverdict::SelfRelative::DecodeStarved { ratio } = sr {
+                    crate::backend::LAST_DECODE_RATIO.store((ratio as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    crate::backend::LAST_DECODE_RATIO.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            eprintln!("[{}] {attr}", gpu_kernels::stamp());
+            crate::diag!("[{}] {attr}", gpu_kernels::stamp());
             crate::diag::note(&attr);
-            let vv0 = 0u64; // baseline is per-process; the subtraction keeps the shape of the others
-                    let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
+            // BOTH baselined at the same moment, or the ratio mixes scopes. vv0 was hardcoded to
+            // zero — "the subtraction keeps the shape of the others" — which made vv a LIFETIME
+            // total while hv is per-reply. c4-816 then divided one by the other, so the
+            // offset-bearing hit rate shrank toward zero the longer a session ran, and would have
+            // been read as the cache degrading. Exactly the mismatch c4-810 hit with the roofline
+            // counters, reintroduced two bundles later by me in the line meant to fix a denominator.
+            let vv0 = gpu_kernels::BG_VIEW_VARYING.load(AOrd::Relaxed);
+            let hv0 = gpu_kernels::BG_HITS_VIEWED.load(AOrd::Relaxed);
+                    // Saturating like its neighbours: a plain subtraction on a global counter wraps
+                    // if anything ever resets it, and a wrapped u64 reads as an enormous hit count.
+                    let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed).saturating_sub(bgh0),
+                                      gpu_kernels::BG_MISSES.load(AOrd::Relaxed).saturating_sub(bgm0));
             if bgh + bgm > 0 {
                 // SPLIT OUT THE UNCACHEABLE LOOKUPS. A dispatch whose input carries a non-zero view is a
                     // KV slice, and its key CAN NEVER REPEAT — counting those as misses makes a working
                     // cache read as 13% and invites optimising what is not broken. lib.rs says so at the
                     // increment site, and the counter it increments was never read by anything.
                     let vv = gpu_kernels::BG_VIEW_VARYING.load(AOrd::Relaxed).saturating_sub(vv0);
-                    let cacheable = (bgh + bgm).saturating_sub(vv);
-                    eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} cacheable lookups \
-({:.0}% reused, {:.0}/tok saved); {vv} uncacheable (KV slices, keys that cannot repeat) [LOGSCOPE_BG_CACHE]",
-                        self.name, cacheable,
-                        100.0 * bgh as f64 / cacheable.max(1) as f64, bgh as f64 / per);
+                    // Baselined the same way, or a lifetime total would be divided by a per-reply
+                    // denominator and the rate would climb past 100% as the session went on.
+                    let hv = gpu_kernels::BG_HITS_VIEWED.load(AOrd::Relaxed).saturating_sub(hv0);
+                    // THE DENOMINATOR WAS INVENTED. `cacheable = (hits + misses) - view_varying`
+                    // assumed an offset-bearing lookup could never hit, so it subtracted lookups
+                    // that DO hit — producing "45702 hits / 22090 cacheable" in the operator's log,
+                    // a rate above 100% that c4-797's guard then suppressed. The guard was right and
+                    // the arithmetic was wrong; suppressing a number is not the same as fixing it.
+                    //
+                    // There are only two honest rates here, and both have real denominators: how
+                    // often a lookup hits at all, and how often an OFFSET-BEARING lookup hits. The
+                    // second is the one that decides whether binding whole buffers and passing
+                    // offsets through the dims uniform would pay (perfverdict.rs documents that
+                    // change and gates it on exactly this measurement).
+                    let lookups = bgh + bgm;
+                    // A hardware log printed "2656 hits / 0 cacheable lookups (265600% reused)":
+                    // `vv` had exceeded hits+misses, `cacheable` saturated to zero, and the ratio was
+                    // divided by the max(1) floor. A percentage of nothing is not a small error, it
+                    // is a fabricated number in a line whose whole job is to be trusted — so when
+                    // the accounting does not close, say that instead of printing it.
+                    if lookups == 0 {
+                        crate::diag!("wgpu-engine: [{}] bind-group cache — no lookups this turn [LOGSCOPE_BG_CACHE]",
+                            self.name);
+                    } else {
+                        let overall = 100.0 * bgh as f64 / lookups as f64;
+                        let viewed = if vv > 0 {
+                            format!("{:.0}% of the {vv} offset-bearing ones hit", 100.0 * hv as f64 / vv as f64)
+                        } else {
+                            "none carried a view offset".to_string()
+                        };
+                        // WHY the misses missed. The hit rate alone points nowhere: this line has
+                        // reported "none carried a view offset" alongside a 57% rate, which rules
+                        // out the KV slices everyone blames and leaves no candidate named. These
+                        // three counters name one.
+                        let (mo, md, mi) = (gpu_kernels::BG_MISS_OUT.load(std::sync::atomic::Ordering::Relaxed),
+                                            gpu_kernels::BG_MISS_DIMS.load(std::sync::atomic::Ordering::Relaxed),
+                                            gpu_kernels::BG_MISS_INPUTS.load(std::sync::atomic::Ordering::Relaxed));
+                        let why = if mo + md + mi == 0 { String::new() } else {
+                            let worst = if mo >= md && mo >= mi {
+                                "the OUTPUT buffer moved — the pool hands back a different slab for the same dispatch, so the fix is pool reuse per call site, not the attention dispatches"
+                            } else if md >= mi {
+                                "the DIMS CONTENT changed — that cache is keyed by content, so these are dispatches whose position \
+or sequence length advanced. They are genuinely different dispatches and no cache can hold them: \
+this is the floor, not a defect"
+                            } else {
+                                "the INPUTS changed — these dispatches genuinely differ and the cache is behaving"
+                            };
+                            format!(" Repeat misses: {mo} output / {md} dims / {mi} inputs — {worst}.")
+                        };
+                        crate::diag!("wgpu-engine: [{}] bind-group cache — {bgh} of {lookups} lookups hit \
+({overall:.0}%), {:.0}/tok saved; {viewed}.{why} A moving view offset is the only genuinely unhittable \
+kind, so that figure — not the offset-bearing COUNT — is what would justify rebuilding the \
+attention dispatches [LOGSCOPE_BG_CACHE]", self.name, bgh as f64 / per);
+                    }
             }
             // Adapt passes-per-submit: feed this turn's per-token decode time to the tuner, which sweeps
             // SUBMIT_PROFILES across replies and settles on the fastest, then caches it. Bit-exact across
@@ -1203,10 +1649,10 @@ was evicted)", prompt_ids.len())
                         gpu_kernels::store::flush_put(&self.gpu.adapter_name, chosen);
                         let b = t.budget_ms();
                         let btxt = if b.is_finite() { format!("{b:.0} ms/submit budget") } else { "no submit budget".into() };
-                        eprintln!("wgpu-engine: submit-tuner SETTLED flush_every={chosen} passes/submit ({btxt}; cached for this GPU); sweep:");
-                        for (f, tok, sub) in t.results() { eprintln!("wgpu-engine:   flush {f:>4} → {:.1} ms/tok · {:.1} ms/submit", tok * 1000.0, sub); }
+                        crate::diag!("wgpu-engine: submit-tuner SETTLED flush_every={chosen} passes/submit ({btxt}; cached for this GPU); sweep:");
+                        for (f, tok, sub) in t.results() { crate::diag!("wgpu-engine:   flush {f:>4} → {:.1} ms/tok · {:.1} ms/submit", tok * 1000.0, sub); }
                     } else {
-                        eprintln!("wgpu-engine: submit-tuner sampled flush_every={used} → {:.1} ms/tok · {:.1} ms/submit ({} candidate(s) done)",
+                        crate::diag!("wgpu-engine: submit-tuner sampled flush_every={used} → {:.1} ms/tok · {:.1} ms/submit ({} candidate(s) done)",
                             spt * 1000.0, spt * 1000.0 / subs_per_tok as f64, t.results().len());
                     }
                     self.gpu.set_flush_every(t.current()); // value for the next reply
@@ -1225,18 +1671,18 @@ was evicted)", prompt_ids.len())
                 };
                 let next_argmax = s.logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i);
                 let decoded = String::from_utf8_lossy(&self.tok.decode_bytes(&s.generated)).replace('\n', "\\n");
-                eprintln!("wgpu-engine: [{}] SHORT REPLY ({produced} tok) — stop: {why}; stop_set={:?}; next-token argmax={:?}",
+                crate::diag!("wgpu-engine: [{}] SHORT REPLY ({produced} tok) — stop: {why}; stop_set={:?}; next-token argmax={:?}",
                     self.name, self.stop_ids, next_argmax);
-                eprintln!("wgpu-engine: [{}]   generated text = {:?}", self.name, decoded);
+                crate::diag!("wgpu-engine: [{}]   generated text = {:?}", self.name, decoded);
                 // CODE CHECK, behind LOGSCOPE_DEBUG_FORMAT. Reports rather than rewrites: a formatter that
                 // silently repairs a model's output makes broken code LOOK correct, and the reader loses the
                 // one signal that something went wrong.
                 if logscope::codefmt::enabled() {
                     if let Some(s) = logscope::codefmt::summary(&logscope::codefmt::check(&decoded)) {
-                        eprintln!("wgpu-engine: [{}] {s}", self.name);
+                        crate::diag!("wgpu-engine: [{}] {s}", self.name);
                     }
                 }
-                eprintln!("wgpu-engine: [{}]   generated ids (≤16) = {:?}", self.name, tail);
+                crate::diag!("wgpu-engine: [{}]   generated ids (≤16) = {:?}", self.name, tail);
             }
             // This turn (prompt + what we generated) joins the pool as a branch tip; `prefill_len` is how
             // many leading rows were batch-prefilled — the only region ever re-seeded.
@@ -1245,7 +1691,7 @@ was evicted)", prompt_ids.len())
             if let Some(pool) = self.pool.as_mut() {
                 pool.insert(&self.gpu, anchor_toks, prefill_len, s, self.kv_cap * 4);
                 if std::env::var("LOGSCOPE_KV_CENSUS").is_ok() {
-                    eprintln!("wgpu-engine: [{}] KV pool — {}", self.name, pool.census());
+                    crate::diag!("wgpu-engine: [{}] KV pool — {}", self.name, pool.census());
                 }
             } else {
                 // FIFO fallback: evict oldest to stay within kv_cap (each entry holds a full KV cache).
@@ -1278,8 +1724,14 @@ was evicted)", prompt_ids.len())
             // longest common token prefix across every branch — the shared ancestor, prefilled once
             let mut shared = enc[0].clone();
             for e in &enc[1..] { let c = shared.iter().zip(e).take_while(|(a, b)| a == b).count(); shared.truncate(c); }
-            let window = (p.n_ctx as usize).clamp(1024, MAX_CONTEXT);
             let reply = p.reply_ceiling.max(p.max_tokens).max(1);
+            // Same self-sizing as generate(): the widest branch plus reply headroom is the need.
+            let longest = enc.iter().map(|e| e.len()).max().unwrap_or(1);
+            let (window, why) = gpu_kernels::ctxwin::auto_window(
+                longest + reply.min(256), p.n_ctx, self.model.trained_ctx,
+                self.model.kv_bytes_per_token(), self.model.planned_weight_bytes,
+                gpu_kernels::store::resident_budget_bytes(), MAX_CONTEXT);
+            if let Some(w) = &why { crate::diag!("wgpu-engine: [{}] {w}", self.name); }
             let max_seq = window;
             let mut pc = self.gpu.session_new(&self.model, max_seq, self.rng);
             if !shared.is_empty() { let _ = self.gpu.prefill_chunked(&self.model, &pc.cache, &shared, prefill_chunk_for_streaming(self.model.d, self.model.h, self.model.streams_experts(), self.model.moe_counts())); pc.pos = shared.len(); }
@@ -1288,10 +1740,10 @@ was evicted)", prompt_ids.len())
                 .map(|(i, e)| (i, e[shared.len().min(e.len())..].to_vec(), reply.min(window.saturating_sub(e.len())).max(1)))
                 .collect();
             let t0 = Instant::now();
-            eprintln!("wgpu-engine: [{}] BATCHED — {} prompts, shared prefix {} tok, decoding together", self.name, n, shared.len());
+            crate::diag!("wgpu-engine: [{}] BATCHED — {} prompts, shared prefix {} tok, decoding together", self.name, n, shared.len());
             let prefix = if shared.is_empty() { None } else { Some((&pc.cache, shared.len())) };
             let out = self.gpu.run_batched(&self.model, prefix, queue, &sp, self.eos, n, max_seq);
-            eprintln!("wgpu-engine: [{}] batched {} replies in {:.1}s ({:.2}s/branch wall)", self.name, out.len(), t0.elapsed().as_secs_f32(), t0.elapsed().as_secs_f32() / n as f32);
+            crate::diag!("wgpu-engine: [{}] batched {} replies in {:.1}s ({:.2}s/branch wall)", self.name, out.len(), t0.elapsed().as_secs_f32(), t0.elapsed().as_secs_f32() / n as f32);
             let mut replies = vec![String::new(); n];
             for (id, toks) in out { if id < n { replies[id] = String::from_utf8_lossy(&self.tok.decode_bytes(&toks)).trim().to_string(); } }
             replies
@@ -1351,7 +1803,7 @@ was evicted)", prompt_ids.len())
                                                       &gpu_kernels::EmbedT::Q8(eq), cancel, &mut step);
                     if w == usize::MAX {
                         self.disable_windowing = true;
-                        eprintln!("wgpu-engine: [{}] windowed decode hit the device buffer ceiling — windowing disabled for the next turn. (Lower LOGSCOPE_WINDOW_MAX to avoid this.)", self.name);
+                        crate::diag!("wgpu-engine: [{}] windowed decode hit the device buffer ceiling — windowing disabled for the next turn. (Lower LOGSCOPE_WINDOW_MAX to avoid this.)", self.name);
                         0
                     } else { w }
                 }
@@ -1360,7 +1812,7 @@ was evicted)", prompt_ids.len())
             if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
             self.rng = rng;
             let secs = td.elapsed().as_secs_f32().max(1e-3);
-            eprintln!("wgpu-engine: [{}] continued {produced} tokens in {secs:.1}s = {:.2} tok/s (warm resume, no prefill{})",
+            crate::diag!("wgpu-engine: [{}] continued {produced} tokens in {secs:.1}s = {:.2} tok/s (warm resume, no prefill{})",
                 self.name, produced as f32 / secs, if sample_win_opt.is_some() { ", windowed" } else { "" });
             if let Some(pool) = self.pool.as_mut() {
                 pool.insert(&self.gpu, seen, prefill_len, s, self.kv_cap * 4);
@@ -1462,10 +1914,10 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
 /// must match the model: a ChatML model (smollm2, `<|im_end|>`) fed Llama-3 markers drifts into
 /// byte-level marker text and never hits its real stop. Detected from the tokenizer at load.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TemplateKind { Llama3, ChatML, Plain, Gemma, Llama4 }
+pub enum TemplateKind { Llama3, ChatML, Plain, Gemma, Llama4, Bailing2 }
 impl TemplateKind {
-    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3, Self::Llama4 => 4 } }
-    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, 4 => Self::Llama4, _ => return None }) }
+    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3, Self::Llama4 => 4, Self::Bailing2 => 5 } }
+    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, 4 => Self::Llama4, 5 => Self::Bailing2, _ => return None }) }
 }
 
 /// What a successful load reports back to the UI.
@@ -1480,10 +1932,40 @@ pub struct Inference { tx: Sender<Cmd>, pub rx: Receiver<Evt>, cancel: Arc<Atomi
     /// per-tab cached state, so a tab created after the load (or one whose Loaded event another drain
     /// consumed) can never silently build Llama-3 prompts for a ChatML model.
     template: Arc<std::sync::atomic::AtomicU8> }
+
+/// Prompt tokens, window and elision from the LAST generation, for the status line.
+///
+/// A static rather than a field on Inference: Engine has lanes and several constructors, and this
+/// is "whatever generated most recently" rather than per-handle state — threading it through every
+/// lane would be plumbing in service of a shape the data does not have. Packed into one u64
+/// (prompt:21 | window:21 | elided:22) so the three are read together; separately, a torn read
+/// would show one turn's prompt against another turn's window.
+pub(crate) static CTX_FIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Prompt tokens, window size, and how many tokens were dropped from the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtxFit { pub prompt: usize, pub window: usize, pub elided: usize }
+
+pub(crate) fn ctxfit_pack(prompt: usize, window: usize, elided: usize) -> u64 {
+    ((prompt.min((1 << 21) - 1) as u64) << 43)
+        | ((window.min((1 << 21) - 1) as u64) << 22)
+        | (elided.min((1 << 22) - 1) as u64)
+}
+pub(crate) fn ctxfit_unpack(v: u64) -> CtxFit {
+    CtxFit { prompt: (v >> 43) as usize,
+             window: ((v >> 22) & ((1 << 21) - 1)) as usize,
+             elided: (v & ((1 << 22) - 1)) as usize }
+}
 impl Inference {
     /// The worker-published template of the loaded model, if any.
     pub fn detected_template(&self) -> Option<TemplateKind> {
         TemplateKind::from_u8(self.template.load(Ordering::Relaxed))
+    }
+
+    /// The last generation's context fit, for the status line. None before the first generation.
+    pub fn context_fit(&self) -> Option<CtxFit> {
+        let v = CTX_FIT.load(Ordering::Relaxed);
+        if v == 0 { None } else { Some(ctxfit_unpack(v)) }
     }
 }
 impl Inference {
@@ -1513,8 +1995,98 @@ impl Inference {
 /// template state per tab and has been observed going stale (a ChatML model receiving Llama-3 headers —
 /// byte-split into garbage since they're not in its vocab → "0 special tokens" → word salad). The worker
 /// knows the loaded template authoritatively, so it repairs here as the last line of defense and logs it.
+/// OUTPUT-SIDE MIRROR of the TEMPLATE MISMATCH alarm.
+///
+/// The stream swallows special tokens by ID, so a marker that reaches the screen was emitted as
+/// ORDINARY TEXT — the model typed "<|python_tag|>" rather than producing token 128010. Models do
+/// that when the frame they were given taught them to: a prompt whose markers went in as words
+/// invites markers to come back as words, and the visible symptom is a reply that leaks its own
+/// scaffolding, or the prompt itself.
+///
+/// Reported, never stripped. Removing the text would hide the framing bug that caused it and leave
+/// a reply that looks almost right, which is the failure mode this project keeps paying for.
+// Gated with its only caller. gpu_kernels is a wgpu-engine dependency, and this signature names it
+// at module level — so `cargo test -p logscope-egui` WITHOUT the feature has failed to compile since
+// c4-771, which is why the tool-parser tests could not run and why nothing noticed for five bundles.
+#[cfg(feature = "wgpu-engine")]
+/// Weight elements the loader made resident, captured before the load-path counters are consumed.
+/// The roofline needs this at generation time and the counters do not survive that long.
+/// Decode-to-prefill cost ratio from the last run, f32 bits; 0 = not starved or not measured.
+///
+/// Read by the UI strip. Deliberately only set from the DecodeStarved verdict — a healthy or
+/// unmeasured run stores 0, so a stale ratio cannot outlive the condition that produced it.
+pub static LAST_DECODE_RATIO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub static RESIDENT_ELEMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// The cfg above attaches to RESIDENT_ELEMS, not to this fn — so this gpu_kernels-typed function
+// stayed in a headless build and broke it. Same shape of gate bug as the workspace/merge/sandbox
+// ones, found the same way: by building without default features for the first time in a while.
+#[cfg(feature = "wgpu-engine")]
+pub fn check_output_markers(name: &str, text: &str, tok: &gpu_kernels::tokenizer::Tokenizer) {
+    let Some(i) = text.find("<|") else { return };
+    let end = text[i..].find("|>").map(|j| i + j + 2);
+    let Some(end) = end else { return };
+    let marker = &text[i..end];
+    // Only interesting when the tokenizer KNOWS this marker as a special: then the model had a
+    // single id available and chose to spell it out instead.
+    if tok.special_id(marker).is_none() { return; }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+    crate::diag!("wgpu-engine: [{name}] OUTPUT MARKER LEAK — the reply contains {marker:?} as literal \
+TEXT, and this tokenizer knows that marker as a special token. The stream suppresses specials by id, \
+so this was typed, not emitted: the model is imitating its own scaffolding, which is what a prompt \
+framed in the wrong markers teaches it to do. Check the prompt diag line above for the special count.");
+}
+
 fn normalize_prompt_template(prompt: &str, t: TemplateKind) -> Option<String> {
     match t {
+        // BAILING2 (Ling 2.0 / LLaDA2). This arm was missing, and its absence is why the
+        // TEMPLATE MISMATCH alarm kept firing on real runs with nothing repairing it: the UI sent
+        // Llama-3 markers, the worker knew the model was Bailing2, and the repair function — whose
+        // entire job is exactly this — had no case for it, so the markers passed through and
+        // tokenised as ordinary words (prompt diag: "0 special tokens" on 1718 tokens).
+        //
+        // Repairing at the WORKER is the right layer for a last line of defence: it is the only
+        // place that knows what the loaded model actually wants, and it catches every UI path at
+        // once rather than each builder separately.
+        // FROM Bailing2, the direction that was missing. Every arm here translated INTO a template
+        // from Llama-3 or ChatML markers, so a prompt already framed in <role> turns — which is now
+        // what a Bailing2 model's builder produces — reached a ChatML or Llama model untranslated.
+        // Seen live: DiffuCoder (ChatML) received "<|role_end|><role>ASSISTANT</role>" as literal
+        // text, 0 specials on a 2147-token prompt. Switching models mid-session is exactly when the
+        // stale-prompt case fires, so the repair has to work in both directions or it only ever
+        // rescues the first model loaded.
+        TemplateKind::ChatML | TemplateKind::Llama3 | TemplateKind::Llama4 if prompt.contains("<role>") => {
+            let llama = !matches!(t, TemplateKind::ChatML);
+            let mut s = prompt.to_string();
+            for (src, ch, l3) in [("SYSTEM", "system", "system"), ("HUMAN", "user", "user"),
+                                  ("ASSISTANT", "assistant", "assistant")] {
+                let from = format!("<role>{src}</role>");
+                let to = if llama { format!("<|start_header_id|>{l3}<|end_header_id|>\n\n") }
+                         else { format!("<|im_start|>{ch}\n") };
+                s = s.replace(&from, &to);
+            }
+            s = s.replace("<|role_end|>", if llama { "<|eot_id|>" } else { "<|im_end|>\n" });
+            debug_assert!(!s.contains("<role>") && !s.contains("<|role_end|>"),
+                "Bailing2 markers survived translation");
+            Some(s)
+        }
+        TemplateKind::Bailing2 if prompt.contains("<|start_header_id|>") || prompt.contains("<|im_start|>") => {
+            let mut s = prompt.replace("<|begin_of_text|>", "");
+            for (role_src, role_dst) in [("system", "SYSTEM"), ("user", "HUMAN"), ("assistant", "ASSISTANT")] {
+                s = s.replace(&format!("<|start_header_id|>{role_src}<|end_header_id|>\n\n"),
+                              &format!("<role>{role_dst}</role>"));
+                s = s.replace(&format!("<|start_header_id|>{role_src}<|end_header_id|>"),
+                              &format!("<role>{role_dst}</role>"));
+                s = s.replace(&format!("<|im_start|>{role_src}\n"), &format!("<role>{role_dst}</role>"));
+            }
+            s = s.replace("<|eot_id|>", "<|role_end|>").replace("<|im_end|>\n", "<|role_end|>")
+                 .replace("<|im_end|>", "<|role_end|>");
+            debug_assert!(!s.contains("<|start_header_id|>") && !s.contains("<|im_start|>"),
+                "foreign turn markers survived translation to Bailing2");
+            Some(s)
+        }
         TemplateKind::ChatML if prompt.contains("<|start_header_id|>") => {
             let s = prompt.replace("<|begin_of_text|>", "")
                 .replace("<|start_header_id|>", "<|im_start|>")
@@ -1566,7 +2138,7 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
     // so the header Load and the chat tab operate on the same, working backend.
     let mut kind = BackendKind::preferred();
     let mut backend = make(kind);
-    eprintln!("worker: default backend = {} ({})", kind.label(), backend.name());
+    crate::diag!("worker: default backend = {} ({})", kind.label(), backend.name());
     let mut params = GenParams::default();
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -1575,15 +2147,15 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
             // that would silently wipe a model the user just loaded.
             Cmd::SetBackend(k) => if k != kind {
                 kind = k; backend = make(k);
-                eprintln!("worker: backend → {} ({})", k.label(), backend.name());
+                crate::diag!("worker: backend → {} ({})", k.label(), backend.name());
                 let _ = evt.send(Evt::Loaded(Err(format!("backend → {} ({}) — reload the model", k.label(), backend.name()))));
             },
             Cmd::SetParams(p) => { params = p; }
             Cmd::Load(path) => {
-                eprintln!("worker: loading '{path}' via {} backend", backend.name());
+                crate::diag!("worker: loading '{path}' via {} backend", backend.name());
                 match backend.load(&path, &params) {
                     Ok(()) => { let template = backend.template(); template_out.store(template.to_u8(), Ordering::Relaxed); let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template }))); }
-                    Err(e) => { eprintln!("worker: load failed: {e}"); let _ = evt.send(Evt::Loaded(Err(e))); }
+                    Err(e) => { crate::diag!("worker: load failed: {e}"); let _ = evt.send(Evt::Loaded(Err(e))); }
                 }
             }
             Cmd::Generate(prompt) => {
@@ -1600,7 +2172,7 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
                         let sent = if fixed.contains("<|im_start|>") { "Llama-3" } else { "ChatML" };
                         if backend.template() == TemplateKind::Llama4 && sent == "Llama-3" {
                             if !TEMPLATE_NOTE_DONE.swap(true, Ordering::Relaxed) {
-                                eprintln!("worker: prompt rewritten to Llama-4 markers (expected: the UI \
+                                crate::diag!("worker: prompt rewritten to Llama-4 markers (expected: the UI \
 builds Llama-3 markers and the worker translates them authoritatively)");
                             }
                         } else {
@@ -1617,7 +2189,7 @@ builds Llama-3 markers and the worker translates them authoritatively)");
                             static MISMATCH_NOTE: std::sync::atomic::AtomicBool =
                                 std::sync::atomic::AtomicBool::new(false);
                             if !MISMATCH_NOTE.swap(true, Ordering::Relaxed) {
-                                eprintln!("worker: prompt carried {sent} markers to a {:?} model and was \\
+                                crate::diag!("worker: prompt carried {sent} markers to a {:?} model and was \\
 translated. Expected on the first turn after a model switch — the prompt is built before the load \\
 finishes, so it cannot know the new template. The durable fix is rebuilding it once Evt::Loaded \\
 lands; until then the translation is total and this is not a fault.",
@@ -1815,5 +2387,119 @@ mod rolequant_agreement {
         let advice_says = logscope::rolequant_hint::liaison_saving_gib(8_000_000_000).unwrap();
         assert!((planner_frees - advice_says).abs() < 0.01,
             "advice quotes {advice_says:.2} GiB, planner frees {planner_frees:.2}");
+    }
+}
+
+#[cfg(test)]
+mod diffusion_setup_skips {
+    /// The KV prefill and the int8 embed table are skipped ONLY when generation will actually take
+    /// the diffusion path. Both fallbacks — LOGSCOPE_DIFFUSION_AR=1 and a model with no mask id
+    /// (diffuse_generate refuses) — decode autoregressively and need the prefilled cache; skipping
+    /// it there would decode from an EMPTY cache and produce garbage, which is the same class of
+    /// silent breakage this whole hunt has been about. The condition is duplicated at two call
+    /// sites, so this pins the predicate itself.
+    fn skip(diffusion: bool, ar_env: Option<&str>, has_mask: bool) -> bool {
+        diffusion && ar_env != Some("1") && has_mask
+    }
+
+    #[test]
+    fn skips_apply_exactly_when_the_diffusion_path_runs() {
+        assert!(skip(true, None, true), "a diffusion model with a mask id skips both setups");
+        assert!(!skip(true, Some("1"), true), "LOGSCOPE_DIFFUSION_AR=1 decodes AR and needs the prefill");
+        assert!(!skip(true, None, false), "no mask id means diffuse_generate refuses and AR runs");
+        assert!(!skip(false, None, true), "a normal model always prefills");
+        assert!(!skip(false, Some("1"), false), "a normal model is unaffected by the diffusion env");
+    }
+}
+
+#[cfg(test)]
+mod bailing2_repair {
+    use super::*;
+
+    /// The exact shape the hardware log carried: a Llama-3 framed prompt handed to a Bailing2 model,
+    /// which tokenised to ZERO specials because none of those markers exist in that vocabulary.
+    #[test]
+    fn llama3_markers_are_repaired_into_role_turns() {
+        let p = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nbe brief<|eot_id|>\
+<|start_header_id|>user<|end_header_id|>\n\nhi there<|eot_id|>\
+<|start_header_id|>assistant<|end_header_id|>\n\n";
+        let out = normalize_prompt_template(p, TemplateKind::Bailing2).expect("repair must fire");
+        assert!(!out.contains("<|start_header_id|>"), "Llama-3 markers survived: {out}");
+        assert!(!out.contains("<|begin_of_text|>"));
+        assert!(out.starts_with("<role>SYSTEM</role>be brief<|role_end|>"), "{out}");
+        assert!(out.contains("<role>HUMAN</role>hi there<|role_end|>"), "{out}");
+        assert!(out.ends_with("<role>ASSISTANT</role>"), "the turn must be left OPEN to generate: {out}");
+    }
+
+    #[test]
+    fn chatml_markers_are_repaired_too() {
+        let p = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n";
+        let out = normalize_prompt_template(p, TemplateKind::Bailing2).expect("repair must fire");
+        assert!(!out.contains("<|im_start|>"), "{out}");
+        assert!(out.contains("<role>HUMAN</role>hi<|role_end|>"), "{out}");
+        assert!(out.ends_with("<role>ASSISTANT</role>"), "{out}");
+    }
+
+    /// A prompt already in the right form must be left ALONE — repairing twice would double the
+    /// markers, and returning Some() for a correct prompt would hide the real builder's success.
+    #[test]
+    fn an_already_correct_bailing2_prompt_is_not_touched() {
+        let p = "<role>SYSTEM</role>x<|role_end|><role>HUMAN</role>hi<|role_end|><role>ASSISTANT</role>";
+        assert!(normalize_prompt_template(p, TemplateKind::Bailing2).is_none());
+    }
+
+    /// And the arm must not steal prompts meant for other families.
+    #[test]
+    fn other_templates_are_unaffected() {
+        let p = "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>";
+        let out = normalize_prompt_template(p, TemplateKind::Llama3);
+        assert!(out.is_none() || !out.unwrap().contains("<role>"));
+    }
+}
+
+#[cfg(test)]
+mod ctxfit_packing {
+    use super::{ctxfit_pack, ctxfit_unpack, CtxFit};
+
+    /// The three numbers share one word so they are read together. If the packing loses or bleeds a
+    /// field, the status line reports a prompt against the wrong window — worse than no badge,
+    /// because the operator would act on it.
+    #[test]
+    fn realistic_values_round_trip() {
+        for (p, w, e) in [(0usize, 0usize, 0usize), (13412, 3840, 9572), (1, 2, 3),
+                          (2_000_000, 1_048_576, 1_000_000), (5852, 32768, 0)] {
+            let got = ctxfit_unpack(ctxfit_pack(p, w, e));
+            let want = CtxFit { prompt: p.min((1 << 21) - 1),
+                                window: w.min((1 << 21) - 1),
+                                elided: e.min((1 << 22) - 1) };
+            assert_eq!(got, want, "packing {p}/{w}/{e}");
+        }
+    }
+
+    /// Fields must not bleed into each other: a huge elision cannot invent a prompt.
+    #[test]
+    fn fields_are_independent() {
+        let a = ctxfit_unpack(ctxfit_pack(0, 0, (1 << 22) - 1));
+        assert_eq!(a.prompt, 0, "elision bled into prompt");
+        assert_eq!(a.window, 0, "elision bled into window");
+        let b = ctxfit_unpack(ctxfit_pack((1 << 21) - 1, 0, 0));
+        assert_eq!(b.window, 0);
+        assert_eq!(b.elided, 0);
+    }
+
+    /// Zero means "nothing generated yet", so a real all-zero state must not be mistaken for data.
+    #[test]
+    fn the_empty_state_is_distinguishable() {
+        assert_eq!(ctxfit_pack(0, 0, 0), 0, "no generation yet reads as absent, not as 0/0");
+    }
+
+    /// The 1M-context case the repo-reading work is aiming at must not silently saturate: 21 bits
+    /// holds 2097151, so a 1048576 window fits with room. This pins that headroom rather than
+    /// leaving it to be discovered when a badge reads wrong.
+    #[test]
+    fn a_million_token_window_fits_the_field() {
+        let f = ctxfit_unpack(ctxfit_pack(1_048_576, 1_048_576, 0));
+        assert_eq!(f.prompt, 1_048_576);
+        assert_eq!(f.window, 1_048_576);
     }
 }

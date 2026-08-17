@@ -34,8 +34,8 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 
 fn install_signals() {
     unsafe {
-        libc::signal(libc::SIGTERM, on_signal as usize);
-        libc::signal(libc::SIGINT, on_signal as usize);
+        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
+        libc::signal(libc::SIGINT, on_signal as *const () as usize);
         libc::signal(libc::SIGHUP, libc::SIG_IGN); // survive a terminal hangup
         libc::signal(libc::SIGPIPE, libc::SIG_IGN); // a peer vanishing mid-write must not kill us
     }

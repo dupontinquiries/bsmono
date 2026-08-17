@@ -17,6 +17,13 @@
 
 use logscope::machinery::Concern;
 
+/// Decode costing this many times prefill per token is starvation rather than arithmetic.
+///
+/// Prefill reads each weight once per CHUNK and decode once per TOKEN, so decode should be the
+/// cheaper of the two; a few times over is fixed per-token cost, an order of magnitude is nothing
+/// in flight. 10 keeps the strip quiet on healthy runs while the operator's own logs sat at 30x.
+const DECODE_STARVED_X: f32 = 10.0;
+
 /// Above this share of the step spent waiting, nothing else is worth reporting: a cache does not
 /// shorten a stall, and every other lever acts on what is left.
 const SYNC_DOMINATES_PCT: u32 = 60;
@@ -39,7 +46,8 @@ const CHURN_MARGIN: f64 = 0.05;
 /// `sync_pct` and `tok_s` come from the phase breakdown; the rest from the MoE counters. All are
 /// already computed — this only decides which of them a person should be told about.
 pub fn concerns(sync_pct: u32, tok_s: f32, hits: u64, fills: u64,
-                pinned: usize, total: usize, clamped: Option<(u32, u32)>) -> Vec<Concern> {
+                pinned: usize, total: usize, clamped: Option<(u32, u32)>,
+                decode_ratio: Option<f32>) -> Vec<Concern> {
     let mut v = Vec::new();
 
     if sync_pct >= SYNC_DOMINATES_PCT {
@@ -64,15 +72,23 @@ pub fn concerns(sync_pct: u32, tok_s: f32, hits: u64, fills: u64,
             });
         }
     }
+    // DECODE STARVATION. Passed in as a RATIO rather than derived from tok_s, which this function
+    // has always received and discarded: throughput alone cannot distinguish a slow model from a
+    // starved decode, and a starvation claim without a baseline is the "percentage of a number
+    // nobody measured" roofline.rs refuses to print. The caller has the comparison; it only ever
+    // reached stderr.
+    if let Some(r) = decode_ratio {
+        if r >= DECODE_STARVED_X { v.push(Concern::DecodeStarved { ratio: r }); }
+    }
     let _ = tok_s;
     v
 }
 
 /// Build the strip, healthy line included when nothing else fires.
 pub fn strip(sync_pct: u32, tok_s: f32, hits: u64, fills: u64, pinned: usize, total: usize,
-             clamped: Option<(u32, u32)>) -> logscope::machinery::Strip {
+             clamped: Option<(u32, u32)>, decode_ratio: Option<f32>) -> logscope::machinery::Strip {
     logscope::machinery::Strip::new(
-        concerns(sync_pct, tok_s, hits, fills, pinned, total, clamped), tok_s)
+        concerns(sync_pct, tok_s, hits, fills, pinned, total, clamped, decode_ratio), tok_s)
 }
 
 #[cfg(test)]
@@ -85,7 +101,7 @@ mod tests {
     #[test]
     fn the_real_scout_run_reports_SYNC_first() {
         let (s, t, h, f, p, n) = SCOUT;
-        let st = strip(s, t, h, f, p, n, Some((48, 31)));
+        let st = strip(s, t, h, f, p, n, Some((48, 31)), None);
         assert!(matches!(st.worst(), Concern::SyncBound { pct: 99 }), "{:?}", st.worst());
     }
 
@@ -94,7 +110,7 @@ mod tests {
         // 6/16 is a 37.5% floor and a balanced router caps near it, so 46% is the policy finding real
         // skew. Flagging it would send someone to fix something that is working — which is exactly
         // what I did before checking how MoE routers are trained.
-        let c = concerns(10, 1.4, 2085, 2451, 6, 16, None);
+        let c = concerns(10, 1.4, 2085, 2451, 6, 16, None, None);
         assert!(!c.iter().any(|x| matches!(x, Concern::ExpertChurn { .. })), "{c:?}");
     }
 
@@ -103,34 +119,60 @@ mod tests {
         // 6 of 16 pinned and a hit rate AT the 37.5% floor: the policy is finding nothing, which is
         // a real fault and distinct from the pin set being small. The number alone cannot separate
         // those two, which is why the floor is the comparison rather than a constant.
-        let c = concerns(10, 1.4, 375, 625, 6, 16, None);
+        let c = concerns(10, 1.4, 375, 625, 6, 16, None, None);
         assert!(c.iter().any(|x| matches!(x, Concern::ExpertChurn { .. })), "{c:?}");
     }
 
     #[test]
     fn a_budget_that_was_NOT_reduced_is_not_reported() {
         // Reporting a clamp that did not bite trains people to ignore the line.
-        let c = concerns(10, 12.0, 900, 100, 6, 16, Some((31, 31)));
+        let c = concerns(10, 12.0, 900, 100, 6, 16, Some((31, 31)), None);
         assert!(!c.iter().any(|x| matches!(x, Concern::MemoryClamped { .. })), "{c:?}");
     }
 
     #[test]
     fn a_dense_model_with_no_expert_traffic_reports_no_churn() {
         // 0 hits and 0 fills is a model without experts, not a cache at 0%.
-        let c = concerns(10, 20.0, 0, 0, 0, 0, None);
+        let c = concerns(10, 20.0, 0, 0, 0, 0, None, None);
         assert!(c.is_empty(), "{c:?}");
     }
 
     #[test]
     fn a_healthy_engine_yields_a_strip_that_still_SAYS_something() {
-        let mut st = strip(5, 24.0, 950, 50, 12, 16, None);
+        let mut st = strip(5, 24.0, 950, 50, 12, 16, None, None);
         assert!(st.next().contains("24.0 tok/s"));
     }
 
     #[test]
     fn moderate_sync_is_not_reported_as_domination() {
         // 30% waiting is normal and flagging it would bury the 99% case in noise.
-        let c = concerns(30, 8.0, 950, 50, 12, 16, None);
+        let c = concerns(30, 8.0, 950, 50, 12, 16, None, None);
         assert!(!c.iter().any(|x| matches!(x, Concern::SyncBound { .. })), "{c:?}");
     }
+    #[test]
+    fn a_STARVED_decode_becomes_a_concern_that_names_the_flag() {
+        // The operator's own run: 30.5x, encode-bound, and the strip said nothing while stderr had
+        // the whole story. A concern the operator cannot act on is noise; this one carries the
+        // lever.
+        let c = concerns(10, 14.0, 900, 100, 6, 16, None, Some(30.5));
+        let line = c.iter().find_map(|x| match x {
+            logscope::machinery::Concern::DecodeStarved { .. } => Some(x.line()),
+            _ => None,
+        }).expect("30x must raise it");
+        assert!(line.contains("LOGSCOPE_SPEC_DRAFT=lookup"), "{line}");
+        assert!(line.contains("30x"), "the measurement travels with the advice: {line}");
+    }
+
+    #[test]
+    fn a_healthy_ratio_and_an_UNMEASURED_one_both_stay_quiet() {
+        // 3x is fixed per-token cost, not starvation. None means the comparison did not run — and
+        // an unmeasured ratio must not become a claim, which is the whole reason this is a
+        // parameter rather than something derived from tok_s.
+        for r in [Some(3.0), None] {
+            let c = concerns(10, 14.0, 900, 100, 6, 16, None, r);
+            assert!(!c.iter().any(|x| matches!(x, logscope::machinery::Concern::DecodeStarved { .. })),
+                    "ratio {r:?} must not raise a starvation concern");
+        }
+    }
+
 }

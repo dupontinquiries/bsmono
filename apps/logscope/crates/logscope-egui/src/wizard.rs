@@ -94,7 +94,11 @@ impl Wizard {
             .resizable(false)
             .collapsible(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([560.0, 0.0])
+            // 560 is a desktop number; on a phone it hangs the wizard's own edges off both sides of
+            // the screen. mobilelayout::dialog_width clamps to the viewport (minus a margin) without
+            // stretching on a wide one — egui's `constrain` moves a window inside the viewport but
+            // will not shrink a size the caller insisted on.
+            .fixed_size([crate::mobilelayout::dialog_width(ctx.screen_rect().width(), 560.0), 0.0])
             .frame(egui::Frame {
                 fill: theme::PANEL(),
                 corner_radius: theme::r(14),

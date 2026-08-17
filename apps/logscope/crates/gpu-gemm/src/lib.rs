@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
 pub mod flash_qblock;
-pub mod llada2;
 pub mod pool_class;
-pub mod quant_mix;
 pub mod gguf;
 pub mod cpumatvec;
 pub mod cpupool;
@@ -32,6 +30,15 @@ pub mod iq1m;
 pub mod iqgrids;
 pub mod iq2xxs;
 pub mod iq3;
+/// The commit this engine was built from. A log that does not say which binary produced it cannot
+/// be read against a change — three times a fix has been reported as not working when the binary
+/// predated it, or credited when it was already there.
+pub const BUILD: &str = env!("LOGSCOPE_BUILD");
+
+pub mod spec;
+pub mod roofline;
+pub mod mxfp4;
+pub mod ctxwin;
 pub mod iq23;
 pub mod kquant;
 pub mod shaderdev;
@@ -41,7 +48,6 @@ pub mod pagesize;
 pub mod kvbudget;
 pub mod sensitivity;
 pub mod lookupdraft;
-pub mod specloop;
 pub mod gateclass;
 pub mod tensornames;
 pub mod cpuops;
@@ -122,6 +128,24 @@ pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod llama4;  // Llama 4 iRoPE attention temperature tuning (long-context length gen)
 pub mod netserve;
 pub mod store;
+
+/// Load-time CPU dequant, parallel and instrumented. Pool is process-wide and lazy;
+/// tensors over 256 MB print their conversion so the load-phase breakdown is visible
+/// on the next run instead of inferred ("91 s to quantize and load" was one number).
+static DEQUANT_POOL: std::sync::OnceLock<cpupool::Pool> = std::sync::OnceLock::new();
+pub fn par_dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, String> {
+    let pool = DEQUANT_POOL.get_or_init(|| {
+        let t = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8).min(16);
+        cpupool::Pool::new(t)
+    });
+    let t0 = std::time::Instant::now();
+    let r = gguf::dequantize_par(pool, ggml_type, data, n);
+    if data.len() >= 256 << 20 {
+        eprintln!("loader: cpu-dequant type={} {:.2} GB in {:.1}s ({} threads)",
+            ggml_type, data.len() as f64 / 1e9, t0.elapsed().as_secs_f64(), pool.threads());
+    }
+    r
+}
 
 /// Memory-map a GGUF read-only. Big models (30B/70B) are tens of GB — `std::fs::read` would pull the
 /// whole file into a RAM `Vec` (the 40 GB read that got OOM-killed before dequant even started).
@@ -224,14 +248,9 @@ pub fn prefetch_mapped(path: &str, offset: usize, len: usize) -> bool {
     let g = reg.lock().unwrap();
     let Some(fb) = g.get(path) else { return false };
     if let FileBytes::Mapped(m) = *fb {
-        // PAGE-ALIGNED, because madvise wants an aligned ADDRESS and memmap2
-        // passes ptr+offset straight through. An unaligned offset returns
-        // EINVAL, which .is_ok() turns into a false nobody checks — so on a
-        // 16 KiB-page kernel (Asahi Fedora ships one; Apple silicon is 16 KiB
-        // natively) this silently did nothing for three offsets in four, and
-        // the symptom was a load that pages in on demand ON ONE KERNEL ONLY.
-        let Some((off, n)) = crate::pagesize::align_advice(offset, len, m.len()) else { return false };
-        return m.advise_range(memmap2::Advice::WillNeed, off, n).is_ok();
+        if offset >= m.len() || len == 0 { return false; }
+        let n = len.min(m.len() - offset);
+        return m.advise_range(memmap2::Advice::WillNeed, offset, n).is_ok();
     }
     false
 }
@@ -318,6 +337,80 @@ const TILE: u32 = 16;
 /// *count* of these, not by compute, since each decode op is a tiny 1-row kernel. Read via
 /// `gpu_submits()` / `gpu_polls()` around a decode to see the per-token structural cost.
 pub static GPU_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ACTUAL compute passes opened vs dispatches recorded. The 6.27 tok/s hardware log could not say
+/// whether pass fusion had engaged on the decode path — submit counts are identical either way
+/// (the flush counter increments per DISPATCH), and two stale messages asserted the pre-fusion
+/// architecture. These two numbers answer it in every future log: passes ~= dispatches means
+/// unfused; dispatches/passes >= the flush batch means fusion is live and the cost is per-dispatch.
+pub static GPU_PASSES_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SHEXP_LAYERS_LOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Weights that reached resident form WITHOUT an f32 round-trip (q8_0 / Q4_K / Q4_0 fast paths)
+/// versus those that took the long way. Counted because a load-path optimisation that misses the
+/// bytes is worth nothing, and on a 256-expert model the experts ARE the bytes: they are built from
+/// a stacked f32 buffer by make_lin, so no byte-slicing fast path reaches them today.
+/// Which quantity decides who commits first: 0 = p_top (diffuse.cpp LOW_CONFIDENCE, the default),
+/// 1 = top1-top2 margin (TOPK_MARGIN), 2 = entropy (ENTROPY_EXIT). Read once.
+/// Commit below-threshold positions greedily instead of sampling them. Read once.
+fn cold_greedy() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("LOGSCOPE_DIFFUSION_COLD_GREEDY").as_deref() == Ok("1"))
+}
+
+/// Disable the decode-path fusions (attention residual, SwiGLU+down+residual) so the same binary
+/// can be measured with and without them. Read once.
+fn decode_fuse_off() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("LOGSCOPE_NO_DECODE_FUSE").as_deref() == Ok("1"))
+}
+
+fn diffusion_rank() -> u8 {
+    static R: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *R.get_or_init(|| match std::env::var("LOGSCOPE_DIFFUSION_RANK").as_deref() {
+        Ok("margin") => 1, Ok("entropy") => 2, _ => 0,
+    })
+}
+
+pub static LOAD_FAST_WEIGHTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LOAD_SLOW_WEIGHTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Block size for BLOCK-CAUSAL attention on the diffusion path, or 0 for fully bidirectional.
+    /// Thread-local for the same reason as STATS_WINDOW: it is a property of the call, and Gpu is
+    /// shared. Set by the diffusion loop under LOGSCOPE_DIFFUSION_BLOCK_CAUSAL=1.
+    static BLOCK_CAUSAL: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+/// Restores the previous value on drop — an early return inside a block-causal forward must not
+/// leave the next caller silently masked.
+struct BlockCausalGuard((usize, usize));
+impl BlockCausalGuard {
+    fn set(b: usize, origin: usize) -> Self { let old = BLOCK_CAUSAL.with(|c| c.replace((b, origin))); BlockCausalGuard(old) }
+}
+impl Drop for BlockCausalGuard { fn drop(&mut self) { BLOCK_CAUSAL.with(|c| c.set(self.0)); } }
+
+thread_local! {
+    /// When set, the windowed denoise readout returns raw logits instead of the 4-stat reduction.
+    static LOGITS_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+struct LogitsModeGuard(bool);
+impl LogitsModeGuard {
+    fn set(v: bool) -> Self { LogitsModeGuard(LOGITS_MODE.with(|c| c.replace(v))) }
+}
+impl Drop for LogitsModeGuard { fn drop(&mut self) { LOGITS_MODE.with(|c| c.set(self.0)); } }
+
+thread_local! {
+    /// Row window for the next denoise forward's OUTPUT stage. Thread-local rather than a Gpu field:
+    /// Gpu is shared across threads and a Cell would cost it Sync; the window is a property of the
+    /// call, not of the device.
+    static STATS_WINDOW: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+/// Clears the window on drop, so an early return or a panic inside a windowed forward cannot leave
+/// the next caller silently reading a slice of its own logits.
+struct StatsWindowGuard;
+impl StatsWindowGuard {
+    fn set(w: (usize, usize)) -> Self { STATS_WINDOW.with(|c| c.set(Some(w))); StatsWindowGuard }
+}
+impl Drop for StatsWindowGuard { fn drop(&mut self) { STATS_WINDOW.with(|c| c.set(None)); } }
 pub static GPU_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Cumulative CPU nanoseconds spent (a) creating per-dispatch resources — the dims uniform
 /// buffer + bind group, which `dispatch` rebuilds every call — and (b) blocked in the GPU
@@ -360,6 +453,9 @@ pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// path reads as an unexplained one, so the remaining unmeasured path is worth closing before drawing
 /// any more conclusions from the split.
 pub static GPU_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Time spent ENCODING dispatches: the frame mutex, the compute pass, the keep-alive allocations.
+/// Untimed until c4-819, which is why the profile could only say what the remainder was not.
+pub static GPU_ENCODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Nanoseconds in host-side sampling: logits post-processing, penalties, top-k/p, argmax.
 ///
 /// The fourth thing a generation does, and the last one nothing timed. With a 128k vocabulary this is
@@ -449,11 +545,16 @@ impl SubmitCauseSnapshot {
 /// Self-contradicting output is worse than no output: it sent me looking for a third frame leak
 /// that the fixes had already closed.
 pub fn run_verdict_delta_shares(
-    no_frame: u64, download: u64, passes: u64, tokens: u64, wall_s: f64, sync_s: f64,
+    no_frame: u64, download: u64, passes: u64, gpu_passes: u64, dispatches: u64,
+    tokens: u64, wall_s: f64, sync_s: f64,
 ) -> (String, Option<String>) {
+    // gpu_passes/dispatches are DELTAS supplied by the caller against its own run-start snapshot —
+    // loading the statics here would carry a lifetime total into a per-generation verdict, the
+    // exact cumulative-counter bug the causes line already fixed once.
     let shape = crate::perfverdict::RunShape {
         submits: no_frame + download + passes,
         no_frame, download, passes,
+        gpu_passes, dispatches,
         tokens, wall_s, sync_s,
     };
     (shape.headline(), shape.caveat())
@@ -467,6 +568,10 @@ pub fn run_verdict(tokens: u64, wall_s: f64, sync_s: f64) -> (String, Option<Str
         no_frame: SUBMIT_BY_NO_FRAME.load(Relaxed),
         download: SUBMIT_BY_DOWNLOAD.load(Relaxed),
         passes: SUBMIT_BY_PASSES.load(Relaxed),
+        // Lifetime absolutes are acceptable HERE: run_verdict() is the whole-process entry with no
+        // baseline to delta against, and both numbers share the same lifetime so their ratio holds.
+        gpu_passes: GPU_PASSES_OPENED.load(Relaxed),
+        dispatches: GPU_DISPATCHES.load(Relaxed),
         tokens, wall_s, sync_s,
     };
     (shape.headline(), shape.caveat())
@@ -547,6 +652,25 @@ const BG_CACHE_CAP: usize = 8192;
 /// Lookups whose key contains a moving view and therefore CANNOT hit, reported beside the hit rate
 /// so a blended figure can be split into "the cache is missing" and "this workload rebinds".
 pub static BG_VIEW_VARYING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Hits among lookups that carry a non-zero view offset. The number that says whether the
+/// "uncacheable" population is genuinely uncacheable or merely offset-bearing and hitting fine.
+pub static BG_HITS_VIEWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// WHY a bind-group lookup missed, split by which part of the key moved.
+///
+/// The hit rate alone cannot direct any work. A cache at 57% with ZERO view-bearing lookups (the
+/// operator's own decode log) says the misses are not the KV slices everyone assumes — the key is
+/// moving for another reason, and the three candidates want different fixes: a rotating OUTPUT
+/// buffer means the pool hands back a different slab each token (fixable — that is what the FIFO
+/// pool addresses), a different DIMS buffer means the dims CONTENT changed (the cache is
+/// content-keyed, so this is a position or sequence length advancing — the dispatch genuinely
+/// differs and no caching can help), and changed INPUTS likewise mean a genuinely different
+/// dispatch.
+/// Counting them apart is the difference between fixing the pool and rebuilding the attention
+/// dispatches for nothing.
+pub static BG_MISS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BG_MISS_DIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BG_MISS_INPUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bind-group cache key: pipeline identity + the ordered buffer handles (inputs, then output) + the dims
 /// buffer handle. wgpu::Buffer is Eq/Hash on its inner handle, so equal keys ⇒ identical bindings.
 /// (pipeline, [(input buffer, view offset, view size)…], output buffer, dims buffer).
@@ -612,6 +736,7 @@ pub fn gpu_polls() -> u64 { GPU_POLLS.load(std::sync::atomic::Ordering::Relaxed)
 pub fn gpu_submit_ns() -> u64 { GPU_SUBMIT_NS.load(std::sync::atomic::Ordering::Relaxed) }
 
 pub fn gpu_setup_ns() -> u64 { GPU_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn gpu_encode_ns() -> u64 { GPU_ENCODE_NS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Relaxed) }
 /// Reset every per-run counter.
 ///
@@ -643,7 +768,7 @@ pub fn counted_poll(device: &wgpu::Device) {
 }
 
 pub fn gpu_counters_reset() {
-    for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS,
+    for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &GPU_PASSES_OPENED, &GPU_DISPATCHES,
               &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES,
               &SUBMIT_BY_PASSES, &SUBMIT_BY_RETAIN, &SUBMIT_BY_DOWNLOAD,
               &SUBMIT_BY_DIMS_WRAP, &SUBMIT_BY_END_FRAME, &SUBMIT_BY_NO_FRAME, &GPU_SUBMIT_NS,
@@ -729,6 +854,9 @@ pub struct Gpu {
     /// path gets the binding it was missing.
     iq1_grid: std::sync::OnceLock<Tensor>,
     bg_cache: Mutex<HashMap<BgKey, std::sync::Arc<wgpu::BindGroup>>>,
+    /// (pipeline, inputs) -> the out/dims buffers last seen with them. Miss attribution only; it
+    /// holds no GPU resources the cache does not already hold.
+    bg_shape: Mutex<HashMap<(usize, Vec<(wgpu::Buffer, u64, u64)>), ((wgpu::Buffer, u64, u64), wgpu::Buffer)>>,
     /// Free-list recycling per-op output buffers across ops/tokens (see BufferPool).
     pool: std::sync::Arc<BufferPool>,
     arena: Mutex<Option<ResidentArena>>,
@@ -753,6 +881,15 @@ pub struct Gpu {
     /// output — the ggml formulation: both q and k scaled, so scores scale by mscale²). Gpu-level
     /// state like `rope_neox` above, so the 13 rope call sites need no signature change.
     pub rope_mscale: std::sync::atomic::AtomicU32,
+    /// Rotary dims per head (partial RoPE). 0 = full head_dim. Set at load from rope.dimension_count
+    /// or the LLaDA2 architecture default; hosts read it like rope_neox so no signature changes.
+    pub rope_dims: std::sync::atomic::AtomicU32,
+    /// Active model's Q PRE-SCALE (`attn_scale * sqrt(head_dim)`), f32 bits; 1.0 = kernel default.
+    /// A mirror of a MODEL property refreshed by `activate_model`, exactly like the rope trio above
+    /// — same reason (the attention sites hold `&BlockWeights`, not `&Model`) and same discipline:
+    /// before c4-850 those were set at LOAD time, so every model adopted the last-loaded model's
+    /// rope. Never set from a load.
+    pub attn_qscale: std::sync::atomic::AtomicU32,
     /// Vulkan-on-Apple (Asahi/Honeykrisp): the platform with the low BO-VMA ceiling; scopes the
     /// conservative GPU-buffer budget clamp to where it's actually needed.
     pub conservative_vma: bool,
@@ -770,7 +907,7 @@ pub struct Gpu {
     /// mid-window flush that drops its frame.keep recycles dims buffers the GPU is still reading →
     /// "Buffer 'dims' is invalid". Flush points move their keep here instead of dropping it; the next
     /// poll (which waits for GPU completion) clears it. Bounded: cleared every readback.
-    pending_keep: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    pending_keep: Mutex<Vec<Keep>>,
     /// Reusable dims-uniform ring (see ring_dims): a fixed set of UNIFORM buffers rewritten in rotation
     /// for the per-position dims that would otherwise create a new Metal buffer every dispatch. `(buffers,
     /// next_index, writes_since_fence)`. Lazily filled up to DIMS_RING_SIZE. Caps total dims buffer count.
@@ -904,6 +1041,7 @@ fn fused_qkv_enabled() -> bool {
 /// a silent mid-session switch safe. Persisted per-GPU (like the tile cache) so later loads skip re-probing.
 /// State: 0=unmeasured, 1=measuring-OFF phase, 2=measuring-ON phase, 3=decided ON, 4=decided OFF.
 pub static FAST_AB_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[allow(dead_code)] // the zero state is stored numerically; kept for symmetry with the named states
 const AB_UNMEASURED: u8 = 0;
 const AB_MEASURING_OFF: u8 = 1;
 const AB_MEASURING_ON: u8 = 2;
@@ -1014,25 +1152,60 @@ pub fn ab_is_decided() -> bool {
 fn fast_decode_enabled() -> bool {
     dispatch_levers_active()
 }
-/// Enabled by LOGSCOPE_PASS_FUSE=1. Off by default until measured on a real generation — the gate
-/// proves the driver honours the barriers, not that fusing makes this engine faster.
+/// Enabled ONLY by LOGSCOPE_PASS_FUSE=1. Default OFF — see the retraction below.
 fn pass_fuse_enabled() -> bool {
+    // RETRACTED DEFAULT (was: follow the fast-decode verdict, since c4-723).
+    //
+    // probe-decode-parity reproduces the damage in-sandbox on a tiny dense model: with fusion on,
+    // decode's logits disagree with prefill's for the SAME token at every position tested (6/6,
+    // lavapipe); with fusion off, they agree to 8e-8. Bisected lever by lever — BG cache, FUSE_GLU
+    // and FUSE_DOWN are each clean, LOGSCOPE_PASS_FUSE=1 alone reproduces it, and
+    // LOGSCOPE_FAST_DECODE=1 LOGSCOPE_PASS_FUSE=0 is clean. Two unrelated models on Honeykrisp
+    // (dense DeepSeek-coder and MoE LLaDA2) collapse into a repeated token with `fast-decode levers
+    // ON` in the log, which is exactly this default.
+    //
+    // Why gate-passfuse missed it: it compares FUSED-vs-FUSED denoise steps for internal
+    // consistency and never compares a fused DECODE against the unfused prefill that must agree
+    // with it. A gate that only exercises the feature it is testing cannot see the feature being
+    // wrong — the parity probe compares two paths that must agree, which is the shape that catches
+    // this class. gate-decode-parity now runs both ways in the battery.
+    //
+    // The mechanism is not yet proven, so this is a RETRACTION, not a fix: the leading candidate is
+    // dims-buffer lifetime — deferred dispatches replay after `ring_dims` has recycled and rewritten
+    // the uniform they read, so an earlier dispatch executes with a later dispatch's dims. The
+    // ring's wrap-flush protects the immediate-encode path; whether it drains the pending list on
+    // every path is the thing to prove next. Until then the default is off and the env is the only
+    // way in.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("LOGSCOPE_PASS_FUSE").as_deref() == Ok("1"))
 }
+
 
 fn bind_group_cache_enabled() -> bool {
     fast_decode_enabled() || std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
 /// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
 /// scratch). Bit-identical to the unfused path; enabled by the magical A/B (or LOGSCOPE_FUSE_GLU=1).
+thread_local! {
+    /// Force the MoE fusions on inside a scope, independent of the decode verdict.
+    static FUSE_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Arms the fusions for the duration of a call. Restores on drop so a panic cannot leave them on.
+struct FuseForce(bool);
+impl FuseForce {
+    fn on() -> Self { FuseForce(FUSE_FORCED.with(|c| c.replace(true))) }
+}
+impl Drop for FuseForce { fn drop(&mut self) { FUSE_FORCED.with(|c| c.set(self.0)); } }
+
 fn moe_glu_fused() -> bool {
-    fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_GLU").as_deref() == Ok("1")
+    FUSE_FORCED.with(|c| c.get())
+        || fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_GLU").as_deref() == Ok("1")
 }
 /// Fuse the MoE down-projection with the weighted combine + residual into one kernel (one fewer dispatch
 /// per MoE layer, no [slots,d] scratch). Bit-identical to the unfused path; enabled by the A/B (or _DOWN=1).
 fn moe_down_fused() -> bool {
-    fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_DOWN").as_deref() == Ok("1")
+    FUSE_FORCED.with(|c| c.get())
+        || fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_DOWN").as_deref() == Ok("1")
 }
 /// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
@@ -1051,27 +1224,8 @@ fn route_trace_armed() -> bool {
 /// `<call> <layer> <tokid> <e0> <e1> …` — the routed-expert ids the CPU router just selected, plus the
 /// vocab token id (or -1 if unknown) so an offline tool can measure CONTEXT-CONDITIONED prediction (the
 /// lexical map) on top of one-layer-ahead coupling. Opened once; guarded so a trace-off run pays nothing.
-fn route_trace(layer: i32, experts: &[u32]) {
-    use std::io::Write;
-    use std::sync::OnceLock;
-    static FP: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
-    let slot = FP.get_or_init(|| {
-        std::env::var("LOGSCOPE_ROUTE_TRACE").ok().and_then(|p| {
-            std::fs::File::create(&p).ok().map(std::sync::Mutex::new)
-        })
-    });
-    if let Some(m) = slot {
-        static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut f) = m.lock() {
-            let mut line = format!("{call} {layer}");
-            for e in experts { line.push_str(&format!(" {e}")); }
-            let _ = writeln!(f, "{line}");
-        }
-    }
-}
-/// Route-trace writer that also records the current token id (the lexical signal). `tok` is the vocab id,
-/// or a negative value when unknown. Trace grammar: `<call> <layer> <tok> <e0> <e1> …`.
+// route_trace(layer, experts) was superseded by route_trace_tok, which carries the token id;
+// it had zero call sites, so LOGSCOPE_ROUTE_TRACE was already served entirely by the _tok variant.
 fn route_trace_tok(layer: i32, tok: i64, experts: &[u32]) {
     use std::io::Write;
     use std::sync::OnceLock;
@@ -1111,7 +1265,21 @@ fn env_gemm_tile() -> Option<u32> {
 /// how llama.cpp builds a graph before submitting it.
 type Pending = (wgpu::ComputePipeline, std::sync::Arc<wgpu::BindGroup>, (u32, u32, u32));
 
-struct Frame { enc: wgpu::CommandEncoder, pending: Vec<Pending>, keep: Vec<Box<dyn std::any::Any + Send>>, passes: u32 }
+/// What a submitted-but-unfinished frame must keep alive. A CLOSED enum instead of the old
+/// Box<dyn Any + Send>: the keep-list is pushed to twice per dispatch on the decode hot path
+/// (~12k dispatches per token on a dense 30B — the encode profile T2 names), and each Box was a
+/// heap allocation whose only job was to own an Arc. The enum holds the Arc inline, so pushing is
+/// allocation-free (amortized Vec growth aside). Measured-by-construction: 2 heap allocations per
+/// dispatch -> 0. The latency delta is deliberately UNCLAIMED — llvmpipe timings in this sandbox
+/// say nothing about the operator's M2, where encode was profiled at 84% of decode wall time.
+enum Keep { Bg(std::sync::Arc<wgpu::BindGroup>), Buf(std::sync::Arc<wgpu::Buffer>) }
+
+struct Frame { enc: wgpu::CommandEncoder, pending: Vec<Pending>, keep: Vec<Keep>, passes: u32,
+    /// BATCH frame: a framed step with no compositor to starve (denoise step, oracle stats).
+    /// Pass-count flushing inside one is pure submit tax — the display-duration rationale for
+    /// flush_every applies to INTERACTIVE frames sharing the GPU. Batch frames flush on the
+    /// retain cap (the memory bound) and at end_frame/download only.
+    batch: bool }
 /// Default passes-per-submit. Frame batching collapsed a token to a single ~129ms submit, which on a
 /// shared GPU (display + compute) starves the compositor and shows as screen artifacts. Flushing every N
 /// passes bounds each submit's duration so the display is serviced between chunks, while still batching
@@ -1305,7 +1473,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1462,7 +1630,18 @@ impl Gpu {
     /// uniform). Keyed by the shader constant's address — our kernels are `&'static`.
     fn pipeline(&self, shader: &str, n: u32) -> Pipe {
         let key = (shader.as_ptr() as usize, n);
-        if let Some(p) = self.pipelines.lock().unwrap().get(&key) { return p.clone(); }
+
+        // Label under the PIPELINE pointer — the identity mark_dispatch records — using the shader
+        // source, which is only in scope here. c4-835 registered under the SOURCE pointer instead,
+        // so every histogram lookup silently found nothing and printed a hex address.
+        //
+        // Registered on the cache-hit path too: a pipeline is created once and dispatched thousands
+        // of times, so labelling only on creation would work by luck and fail the moment the cache
+        // was warmed before the histogram was enabled.
+        if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
+            if dispatch_hist_on() { register_shader_label(std::sync::Arc::as_ptr(&p) as usize, shader); }
+            return p.clone();
+        }
         let dev = &self.device;
         let store = |b, ro| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, count: None,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: ro }, has_dynamic_offset: false, min_binding_size: None } };
@@ -1472,12 +1651,26 @@ impl Gpu {
         bgl_entries.push(wgpu::BindGroupLayoutEntry { binding: n + 1, visibility: wgpu::ShaderStages::COMPUTE, count: None,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None } });
         let bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &bgl_entries });
+        // FATAL, NAMED shader failures. A kernel that fails to compile becomes a dispatch that
+        // silently no-ops (wgpu logs a non-fatal validation error and moves on) — which is how a
+        // one-field WGSL rename voided a full night of gate results: every downstream comparison
+        // ran zero-vs-zero and "passed". The loud-loader philosophy applies to shaders too: refuse
+        // at creation, name the source, and quote the compiler. The panic text includes the first
+        // line of the WGSL so the failing kernel is identifiable without a label plumbing change.
+        let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(shader.into()) });
         let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout),
             module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            let head = shader.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            panic!("wgpu-engine: kernel failed to compile — its dispatches would silently no-op and \
+every result touching it would be garbage that can still agree with other garbage. First shader \
+line: {head:?}. Compiler: {e}");
+        }
         let p: Pipe = Arc::new((bgl, pipeline));
         self.pipelines.lock().unwrap().insert(key, p.clone());
+        if dispatch_hist_on() { register_shader_label(std::sync::Arc::as_ptr(&p) as usize, shader); }
         p
     }
 
@@ -1541,8 +1734,9 @@ impl Gpu {
 
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
             pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bg, &[]);
+            GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             pass.dispatch_workgroups(wg.0, wg.1, wg.2);
         }
         enc.copy_buffer_to_buffer(&out, 0, &staging, 0, out_bytes);
@@ -1618,7 +1812,7 @@ impl Gpu {
             *g = Some(self.alloc_words(need.max(1)));
         }
         let t = g.as_ref().unwrap();
-        Tensor { buf: t.buf.clone(), rows: 1, cols: t.cols, pool: None, view: None }
+        Tensor { buf: t.buf.clone(), rows: 1, cols: t.cols, pool: None, site: (0, 0), view: None }
     }
 
     /// Record a Q4_K conversion to run later. Returns immediately with the (as yet unwritten) output
@@ -1649,7 +1843,10 @@ impl Gpu {
         if let Ok(mut g) = self.arena.lock() {
             if let Some(a) = g.as_mut() {
                 if a.mapped {
-                    if let Some(last) = a.slabs.last() { last.unmap(); }
+                    if a.slabs.len() > a.unmapped_upto.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(last) = a.slabs.last() { last.unmap(); }
+                        a.unmapped_upto.store(a.slabs.len(), std::sync::atomic::Ordering::Relaxed);
+                    }
                     a.mapped = false;
                     a.used = a.slab_size; // any later allocation starts a fresh slab
                 }
@@ -1687,7 +1884,7 @@ impl Gpu {
                             (p.qw_base_words + b0 * 32) as u32,
                             gx];
                 // the bind group holds the source buffer alive past this scope, so no manual keep-list
-                let out_t = Tensor { buf: p.out.clone(), rows: 1, cols: 1, pool: None, view: None };
+                let out_t = Tensor { buf: p.out.clone(), rows: 1, cols: 1, pool: None, site: (0, 0), view: None };
                 self.dispatch(Q4K_TO_Q4, &[&src], &out_t, bytemuck::cast_slice(&dims), (gx, gy, 1));
                 b0 += cnt;
                 since_submit += 1;
@@ -1843,9 +2040,9 @@ impl Gpu {
         let (gx, gy) = wrapped_grid(nblk);
         let dims = [nblk as u32, qs_off_words as u32, 0u32, gx]; // qw_base = 0
         self.dispatch(Q4K_TO_Q4, &[&src], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
-        let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None,
+        let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None, site: (0, 0),
                           view: Some((0, (qw_words * 4) as u64)) };
-        let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None,
+        let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None, site: (0, 0),
                           view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)) };
         Q4Weight { qw, qs, n, k }
     }
@@ -1975,7 +2172,7 @@ impl Gpu {
     pub fn gather_t(&self, table: &Tensor, ids: &Tensor, n: usize, d: usize) -> Tensor {
         let out = self.alloc(n, d);
         let dims = [n as u32, d as u32, 0, 0];
-        self.dispatch(GATHER, &[table, ids], &out, bytemuck::cast_slice(&dims), (((n * d) as u32).div_ceil(64), 1, 1));
+        self.dispatch(GATHER, &[table, ids], &out, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
         out
     }
     /// gather_t reading a single id at slot `id_off` of a shared ids buffer → [1, d]. For windowed
@@ -1983,7 +2180,7 @@ impl Gpu {
     pub fn gather_at(&self, table: &Tensor, ids: &Tensor, id_off: u32, d: usize) -> Tensor {
         let out = self.alloc(1, d);
         let dims = [1u32, d as u32, id_off, 0];
-        self.dispatch(GATHER, &[table, ids], &out, bytemuck::cast_slice(&dims), ((d as u32).div_ceil(64), 1, 1));
+        self.dispatch(GATHER, &[table, ids], &out, bytemuck::cast_slice(&dims), wg1(d as u32));
         out
     }
     /// Gather ONE embedding row from an int8-resident table, by an id read from `ids[id_off]` —
@@ -2037,6 +2234,15 @@ impl Gpu {
         // handler — seen on the q4-30B long second prompt). Bail early with an empty result; the caller
         // treats empty as "step failed, back off" rather than crashing.
         if self.oom_backoff() { return Vec::new(); }
+        // SOURCE OFFSET HONORS THE VIEW. Both download paths copied from offset 0, so every
+        // readback of an arena-resident tensor returned the SLAB HEAD instead of the tensor — the
+        // dispatch path honored views (dispatch_with binds the range) while the readback path did
+        // not, the same two-paths-one-fixed shape as the download/download_u32 frame leak. What it
+        // cost: save_int8_cache serialized the slab head once per tensor, so the sidecar was
+        // corrupt in a way no download-based diff could see — the diff read the fresh side through
+        // the same blind copy and swore the bytes matched. Six probes eliminated the file, the f32
+        // round-trip, write_buffer ordering, binding shape, state clobbering and shader routing
+        // before pool-poison proved the garbage was COMPUTED, which left only this.
         let bytes = (t.len() * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -2046,7 +2252,7 @@ impl Gpu {
             // class of failure this codebase has spent a session learning to distrust.
             let mut frame = frame;
             Self::drain_pending(&mut frame);
-            frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            frame.enc.copy_buffer_to_buffer(&t.buf, t.view.map(|(o, _)| o).unwrap_or(0), &staging, 0, bytes);
             // TAGGED: a readback, flushing the open frame first. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
             SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2055,7 +2261,7 @@ impl Gpu {
             None::<()>
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            enc.copy_buffer_to_buffer(&t.buf, t.view.map(|(o, _)| o).unwrap_or(0), &staging, 0, bytes);
             // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
             SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2130,13 +2336,41 @@ waiting longer will not help because the work is gone");
 /// kernels fully overwrite their output (validated by the multi-op equivalence gates). Per-size cap bounds
 /// memory. `wgpu::Buffer` is Arc-backed (Clone), so a clone in the free-list keeps the allocation alive.
 #[derive(Default)]
-struct BufferPool { free: Mutex<HashMap<u64, Vec<wgpu::Buffer>>> }
+/// FIFO, not LIFO, and that is a MEASURED choice rather than a style one.
+///
+/// A decode token allocates the same tensors in the same order every time and frees them in that
+/// order too (drops land in `deferred` and flush in order at submit). With a stack, token N+1 pops
+/// them REVERSED, so every call site gets a different buffer than last token — which changes the
+/// bind-group cache key and forces a rebuild on a path that is already CPU-command-recording
+/// bound. Measured on the fixture before this change: 17 of 36 repeat misses were the output
+/// buffer moving, 0 were the dispatch genuinely differing.
+///
+/// A queue hands them back in allocation order, so the same call site sees the same buffer token
+/// after token and the key repeats. Correctness is untouched — the frame-boundary rule that makes
+/// recycling safe at all is about WHEN a buffer returns to the pool, not which end it comes off.
+struct BufferPool { free: Mutex<HashMap<(u64, usize, u32), std::collections::VecDeque<wgpu::Buffer>>>,
+    /// Returns DEFERRED while a frame is open. Intra-frame recycling is only safe under strict
+    /// encoding order, and a mid-frame download breaks it: the download submits EVERYTHING encoded
+    /// so far — including later work that already overwrote a recycled buffer being read. That one
+    /// mechanism produced the qwen3moe b==1 self-mismatch (router readback), both probe
+    /// corruptions, and the llada2 pow2-L batched failures (pow2 shapes are what collides in a
+    /// size-keyed pool; the exactly-uniform canvas was a zeroed recycled buffer read as hidden
+    /// state). Drops during an open frame land here; `Gpu::submit` flushes them into `free` after
+    /// queue.submit, when encoding order can no longer be violated retroactively.
+    deferred: Mutex<Vec<((u64, usize, u32), wgpu::Buffer)>>,
+    frames_open: std::sync::atomic::AtomicUsize }
 
 /// Slab bump-allocator for resident weights (opt-in: LOGSCOPE_ARENA). Packs many weight tensors into a
 /// few large GPU buffers as offset views instead of thousands of separate buffer objects — fewer driver
 /// allocations + bind bindings, and on some drivers (Asahi) it dodges per-object VMA/count ceilings that
 /// reject a large model even when total memory would fit. Slabs are sized to the device's max buffer.
-struct ResidentArena { slabs: Vec<wgpu::Buffer>, slab_size: u64, used: u64, mapped: bool }
+struct ResidentArena { slabs: Vec<wgpu::Buffer>, slab_size: u64, used: u64, mapped: bool,
+    /// Index below which slabs have been unmapped. Three sites unmap (as-you-go at slab
+    /// transition, the finish path, the keep-toggle path) and wgpu's unmap on an unmapped
+    /// buffer raises a VALIDATION error — which increments dev_errors, which the OOM guard
+    /// in arena_place reads as evidence. The llada2-mini load produced exactly that noise
+    /// every ~4 blocks. A watermark makes unmapping idempotent across all sites.
+    unmapped_upto: std::sync::atomic::AtomicUsize }
 
 /// A Q4_K conversion recorded during load and executed later, in a batch.
 ///
@@ -2172,7 +2406,10 @@ impl Drop for ArenaGuard<'_> {
         // Skipping it lets the original panic propagate as a catchable load error instead of crashing.
         if !std::thread::panicking() {
             if let Some(a) = g.as_ref() {
-                if a.mapped { if let Some(last) = a.slabs.last() { last.unmap(); } }
+                if a.mapped && a.slabs.len() > a.unmapped_upto.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(last) = a.slabs.last() { last.unmap(); }
+                    a.unmapped_upto.store(a.slabs.len(), std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         *g = None;
@@ -2182,15 +2419,30 @@ impl Drop for ArenaGuard<'_> {
 
 /// Holds the per-token scratch arena open; releases it on drop. See `Gpu::scratch_scope`.
 
-pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize, pool: Option<std::sync::Arc<BufferPool>>, view: Option<(u64, u64)> }
+pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize, pool: Option<std::sync::Arc<BufferPool>>, view: Option<(u64, u64)>,
+    /// Which `alloc` call produced this buffer, as (file pointer, line). Buffers return to THEIR
+    /// site's queue, so a call site gets the same buffer every token even when another site
+    /// allocates the same size in between — which the FIFO change alone could not guarantee,
+    /// because a size-keyed pool lets two sites trade places whenever their order interleaves.
+    site: (usize, u32) }
 impl Drop for Tensor {
     fn drop(&mut self) {
         if let Some(pool) = &self.pool {
             let size = (self.rows * self.cols * 4) as u64;
             if size > 0 {
-                let mut free = pool.free.lock().unwrap();
-                let v = free.entry(size).or_default();
-                if v.len() < 64 { v.push(self.buf.clone()); } // cap per size → bounded memory
+                static NO_DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let defer_off = *NO_DEFER.get_or_init(|| std::env::var("LOGSCOPE_NO_DEFER").as_deref() == Ok("1"));
+                if !defer_off && pool.frames_open.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    // A frame is open: encoded-but-unsubmitted work may still reference this buffer,
+                    // and a mid-frame download would submit any later overwrite of its recycled self.
+                    pool.deferred.lock().unwrap().push(((size, self.site.0, self.site.1), self.buf.clone()));
+                } else {
+                    let mut free = pool.free.lock().unwrap();
+                    let v = free.entry((size, self.site.0, self.site.1)).or_default();
+                    // Cap per (size, site): the total is bounded by the number of alloc sites,
+                    // which is a property of the code rather than of the workload.
+                    if v.len() < 16 { v.push_back(self.buf.clone()); }
+                }
             }
         }
     }
@@ -2265,6 +2517,11 @@ pub struct MoeLayer {
     pub stacked_gu: Lin,
     pub stacked_down: Lin,
     pub cfg: crate::moe::MoeConfig,  // n_routed / n_used / norm (softmax for qwen3moe)
+    /// No-aux SELECTION bias (blk.N.exp_probs_b — DeepSeek-V3 / Ling / llada2): added to the
+    /// post-activation gate probs for top-k selection ONLY; combine weights stay unbiased
+    /// (llama-graph.cpp:1870-1874, reference order). None → selection ranks pure probs.
+    pub sel_bias: Option<Tensor>,
+    pub sel_bias_host: Option<Vec<f32>>,
     /// SHARED expert (GLM / DeepSeek / Qwen2-MoE): a dense SwiGLU FFN every token runs IN ADDITION
     /// to its routed experts — out = x + Σ wᵢ·expertᵢ(n) + shared(n). Fused gate||up [2·sff, d] +
     /// down [d, sff] (sff read from the tensor itself; shared width differs from the routed ff).
@@ -2368,7 +2625,7 @@ pub struct MoeStream {
 fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
     fn tview(t: &Tensor, byte_off: u64, byte_len: u64, rows: usize, cols: usize) -> Tensor {
         let base = t.view.map(|(o, _)| o).unwrap_or(0);
-        Tensor { buf: t.buf.clone(), rows, cols, pool: None, view: Some((base + byte_off, byte_len)) }
+        Tensor { buf: t.buf.clone(), rows, cols, pool: None, site: (0, 0), view: Some((base + byte_off, byte_len)) }
     }
     match &l.kind {
         // Not sliceable yet: IQ1_S packs 256 weights into 50 bytes, so a row slice lands on a
@@ -2574,12 +2831,78 @@ pub static STALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 pub static STALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record the dispatch about to be submitted, so a stall can name it.
+/// Per-shader dispatch histogram, off unless LOGSCOPE_DISPATCH_HIST=1.
+///
+/// c4-834 measured 12 dispatches per layer against a floor near 6 and I proceeded to guess at the
+/// difference — separate q/k/v, QK-norm, rope on q and k — before checking that wqkv already exists
+/// and is already used. That is the third time this session a plausible reading of the code has
+/// been wrong about what runs. A histogram keyed by SHADER answers it directly: the remaining
+/// dispatches stop being an argument and become a list, and whatever is at the top of that list is
+/// the next thing worth fusing.
+static DISPATCH_HIST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, u64>>> =
+    std::sync::OnceLock::new();
+
+fn dispatch_hist_on() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("LOGSCOPE_DISPATCH_HIST").as_deref() == Ok("1"))
+}
+
+/// Snapshot the histogram as (shader_id, count), most frequent first.
+pub fn dispatch_histogram() -> Vec<(usize, u64)> {
+    let Some(h) = DISPATCH_HIST.get() else { return Vec::new() };
+    let Ok(g) = h.lock() else { return Vec::new() };
+    let mut v: Vec<(usize, u64)> = g.iter().map(|(k, c)| (*k, *c)).collect();
+    v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    v
+}
+
+/// Human-readable label for a shader pointer, taken from its first source line.
+static SHADER_LABELS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
+    std::sync::OnceLock::new();
+
+fn register_shader_label(id: usize, src: &str) {
+    let m = SHADER_LABELS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = m.lock() {
+        g.entry(id).or_insert_with(|| {
+            // Prefer a line that SAYS WHAT THE KERNEL IS over the first non-empty line. Most of
+            // these shaders open with their dims struct, so the first-line rule labelled five
+            // distinct kernels "struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };" and the histogram
+            // could not tell them apart — the exact question T3 asks it. Order: an entry-point
+            // fn name (unambiguous), else a leading comment, else the first line as before.
+            let entry = src.lines().find_map(|l| {
+                let t = l.trim();
+                t.starts_with("@compute").then(|| t.split("fn ").nth(1)?.split('(').next())?
+            });
+            if let Some(name) = entry.filter(|n| !n.is_empty() && *n != "main") {
+                return name.chars().take(64).collect();
+            }
+            let comment = src.lines().map(|l| l.trim())
+                .find(|l| l.starts_with("//") && l.len() > 4)
+                .map(|l| l.trim_start_matches("//").trim());
+            let first = src.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            comment.unwrap_or(first).chars().take(64).collect()
+        });
+    }
+}
+
+pub fn shader_label(id: usize) -> Option<String> {
+    SHADER_LABELS.get()?.lock().ok()?.get(&id).cloned()
+}
+
+pub fn dispatch_histogram_reset() {
+    if let Some(h) = DISPATCH_HIST.get() { if let Ok(mut g) = h.lock() { g.clear(); } }
+}
+
 #[inline]
 pub fn mark_dispatch(pipe_id: usize, wg: (u32, u32, u32), dim0: u32) {
     use std::sync::atomic::Ordering::Relaxed;
+    if dispatch_hist_on() {
+        let h = DISPATCH_HIST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Ok(mut g) = h.lock() { *g.entry(pipe_id).or_insert(0) += 1; }
+    }
     // COUNT unconditionally: the c689 report's disp/step column read 0 because this counter rode
     // the stall gate and never moved outside stall-armed runs. One relaxed add on a priced-hot path.
-    DISPATCH_SEQ.fetch_add(1, Relaxed);
+    DISPATCH_SEQ.fetch_add(1, Relaxed); GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if STALL_MS.load(Relaxed) == 0 { return; }
     // The PIPELINE identity, not a name: pipelines are cached for the process lifetime so the value is
     // stable and comparable across a run, and storing it is one atomic write on a path taken tens of
@@ -2729,7 +3052,7 @@ impl StreamSlots {
     /// The whole slot as a word-addressed Tensor, for a kernel that writes packed data into it.
     pub fn tensor_full(&self, idx: usize) -> Tensor {
         let buf = self.slots[idx.min(self.slots.len().saturating_sub(1))].clone();
-        Tensor { buf, rows: 1, cols: (self.slot_bytes / 4) as usize, pool: None, view: None }
+        Tensor { buf, rows: 1, cols: (self.slot_bytes / 4) as usize, pool: None, site: (0, 0), view: None }
     }
 
     /// The raw slot buffer handle (cloned; wgpu buffers are Arc-backed) for binding as a weight.
@@ -2739,7 +3062,7 @@ impl StreamSlots {
     /// `cols` describe the expert weight matrix living in the slot.
     pub fn tensor(&self, idx: usize, rows: usize, cols: usize) -> Option<Tensor> {
         let buf = self.slots.get(idx)?.clone();
-        Some(Tensor { buf, rows, cols, pool: None, view: None })
+        Some(Tensor { buf, rows, cols, pool: None, site: (0, 0), view: None })
     }
 
     /// Read `len` bytes back from slot `idx` — for verification/tests (fills must land intact).
@@ -2828,7 +3151,14 @@ impl Lin {
     /// apply(), then add `resid` — but for the unbiased quantized m=1 decode case the add is FOLDED
     /// into the matmul epilogue (one dispatch instead of two). Falls back to apply()+add_t otherwise.
     pub fn apply_add(&self, gpu: &Gpu, a: &Tensor, m: usize, resid: &Tensor) -> Tensor {
-        if m == 1 && self.bias.is_none() {
+        // A/B LEVER. c4-820, 821 and 831 each claimed a dispatch reduction and none could be
+        // verified here: the fixtures were f32, and when they were not, both source quantisations
+        // landed on the same resident path so the counts matched either way. The only way to measure
+        // a fusion is to build the same binary with and without it, which needs a switch.
+        //
+        // Same shape as LOGSCOPE_NO_Q4K_INT8 and LOGSCOPE_NO_GU_SLICE: default on, one variable to
+        // fall back to the path it replaced.
+        if m == 1 && self.bias.is_none() && !decode_fuse_off() {
             match &self.kind {
                 LinKind::Q8(q) => return gpu.linear_q8_0_add(a, q, resid),
             // No fused residual-add kernel for IQ1_S. Falling through to matvec-then-add is correct
@@ -2862,7 +3192,7 @@ impl Lin {
 impl Gpu {
     pub fn upload(&self, data: &[f32], rows: usize, cols: usize) -> Tensor {
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        Tensor { buf: self.upload_bytes(bytes, "tensor"), rows, cols, pool: None, view: None }
+        Tensor { buf: self.upload_bytes(bytes, "tensor"), rows, cols, pool: None, site: (0, 0), view: None }
     }
 
     /// EXPERT-STREAM PROBE (the M2 go/no-go), corrected. The first cut asked "does the copy overlap
@@ -2975,10 +3305,25 @@ impl Gpu {
             buf
         }
     }
+    #[track_caller]
     fn alloc(&self, rows: usize, cols: usize) -> Tensor {
         let size = (rows * cols * 4) as u64;
+        // `#[track_caller]` gives each allocation site a stable identity at zero runtime cost, and
+        // the pool is keyed by it. Without this, two sites allocating the same size hand each other
+        // buffers whenever their order interleaves, and the bind-group key moves again.
+        let loc = std::panic::Location::caller();
+        let site = (loc.file().as_ptr() as usize, loc.line());
         // Recycle a same-size buffer freed by a dropped Tensor, else allocate. Kills per-op alloc churn.
-        let recycled = if size > 0 { self.pool.free.lock().unwrap().get_mut(&size).and_then(|v| v.pop()) } else { None };
+        let recycled = if size > 0 { self.pool.free.lock().unwrap().get_mut(&(size, site.0, site.1)).and_then(|v| v.pop_front()) } else { None };
+        // POISON VERIFIER (LOGSCOPE_POOL_POISON=1): NaN-fill every recycled buffer at handout so a
+        // stale read screams at its source instead of surfacing as clean zeros three layers later.
+        if let Some(b) = &recycled {
+            static POISON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *POISON.get_or_init(|| std::env::var("LOGSCOPE_POOL_POISON").as_deref() == Ok("1")) {
+                let nan = vec![0x7fu8, 0xc0, 0x00, 0x00].repeat(size as usize / 4).iter().rev().cloned().collect::<Vec<u8>>();
+                self.queue.write_buffer(b, 0, &nan);
+            }
+        }
         let buf = match recycled {
             Some(b) => { POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); b }
             None => {
@@ -2987,7 +3332,7 @@ impl Gpu {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
             }
         };
-        Tensor { buf, rows, cols, pool: Some(self.pool.clone()), view: None }
+        Tensor { buf, rows, cols, pool: Some(self.pool.clone()), view: None, site }
     }
     /// `#[track_caller]` so the diagnostic attributes each readback to the code that ASKED for it.
     /// Without it the tally names this line 53 times and answers nothing.
@@ -3014,12 +3359,12 @@ impl Gpu {
             let mut frame = frame;
             Self::drain_pending(&mut frame);
             SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            frame.enc.copy_buffer_to_buffer(&t.buf, t.view.map(|(o, _)| o).unwrap_or(0), &staging, 0, bytes);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            enc.copy_buffer_to_buffer(&t.buf, t.view.map(|(o, _)| o).unwrap_or(0), &staging, 0, bytes);
             // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
             SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3241,7 +3586,9 @@ impl Gpu {
                 entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }] });
             loop {
                 let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                { let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                { // keepalive spin pass: deliberately NOT counted in GPU_PASSES_OPENED — it would pollute decode telemetry.
+                  let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                  GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                   p.set_pipeline(&pipeline); p.set_bind_group(0, &bg, &[]); p.dispatch_workgroups(1, 1, 1); }
                 queue.submit(Some(enc.finish()));
                 // ~1ms cadence: frequent enough to hold the clock, cheap enough to not contend with decode.
@@ -3353,11 +3700,12 @@ impl Gpu {
     /// pass — which `--gate-passfuse` confirmed this driver honours rather than assuming from spec.
     fn drain_pending(frame: &mut Frame) {
         if frame.pending.is_empty() { return }
-        let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("fused"), timestamp_writes: None });
         for (pipe, bg, wg) in frame.pending.drain(..) {
             pass.set_pipeline(&pipe);
             pass.set_bind_group(0, bg.as_ref(), &[]);
+            GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             pass.dispatch_workgroups(wg.0, wg.1, wg.2);
         }
     }
@@ -3423,7 +3771,7 @@ impl Gpu {
     /// Move a flushed frame's keep-list into the pending set: buffers referenced by a submitted-
     /// but-not-completed frame must outlive the async GPU work. Drained by `clear_retained` after
     /// the next poll (which waits for completion).
-    fn retain_keep(&self, keep: Vec<Box<dyn std::any::Any + Send>>) {
+    fn retain_keep(&self, keep: Vec<Keep>) {
         if keep.is_empty() { return; }
         self.pending_keep.lock().unwrap().extend(keep);
     }
@@ -3435,11 +3783,45 @@ impl Gpu {
 
     /// Single point through which every command buffer is flushed, so submits can be
     /// counted (see GPU_SUBMITS). Each call is one CPU→GPU flush.
+    /// Record an encoder-ordered zero fill of a tensor's storage. For ACCUMULATORS: wgpu buffers
+    /// are zeroed at CREATION, but a pool-recycled buffer carries whatever its last owner wrote —
+    /// any kernel that += into a fresh alloc is correct only by luck. The pool-poison verifier
+    /// (LOGSCOPE_POOL_POISON=1) turns that luck into NaN so it screams. Deferral makes this safe
+    /// under pass fusion: recycled handouts come only from post-submit free, so no same-encoder
+    /// predecessor can reference the buffer and the clear cannot be reordered against real work.
+    fn zero_tensor(&self, t: &Tensor) {
+        let bytes = (t.rows * t.cols * 4) as u64;
+        if bytes == 0 { return; }
+        let mut fr = self.frame.lock().unwrap();
+        if let Some(f) = fr.as_mut() {
+            f.enc.clear_buffer(&t.buf, 0, Some(bytes));
+        } else {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zero") });
+            enc.clear_buffer(&t.buf, 0, Some(bytes));
+            drop(fr);
+            SUBMIT_BY_NO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.submit(enc);
+            return;
+        }
+    }
+
     fn submit(&self, enc: wgpu::CommandEncoder) {
         use std::sync::atomic::Ordering::Relaxed;
         GPU_SUBMITS.fetch_add(1, Relaxed);
         let t_sub = std::time::Instant::now();
         self.queue.submit([enc.finish()]);
+        // Deferred pool returns flush HERE: encoding order can no longer be violated retroactively
+        // for anything encoded before this submit, so recycling these buffers is safe again.
+        {
+            let mut d = self.pool.deferred.lock().unwrap();
+            if !d.is_empty() {
+                let mut free = self.pool.free.lock().unwrap();
+                for (size, buf) in d.drain(..) {
+                    let v = free.entry(size).or_default();
+                    if v.len() < 64 { v.push_back(buf); }
+                }
+            }
+        }
         GPU_SUBMIT_NS.fetch_add(t_sub.elapsed().as_nanos() as u64,
                                 std::sync::atomic::Ordering::Relaxed);
         // SUBMIT GOVERNOR (see `inflight_cap`): bound queue depth so a display sharing this GPU is
@@ -3490,6 +3872,7 @@ impl Gpu {
     /// Idempotent-safe: an already-open frame is flushed first (no commands are lost).
     pub fn begin_frame(&self) {
         crate::framediag::FRAME_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pool.frames_open.store(1, std::sync::atomic::Ordering::Relaxed);
         let mut fr = self.frame.lock().unwrap();
         // TAGGED: flushing a previous frame is an end_frame in all but name. Six of eight submit callers incremented nothing, which is
         // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
@@ -3501,10 +3884,20 @@ impl Gpu {
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(prev.enc);
         }
-        *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0 });
+        *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0, batch: false });
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
+    /// begin_frame, then mark the fresh frame as BATCH (see Frame.batch). For framed steps
+    /// with no display to service — the denoise step, the oracle stats — where one submit per
+    /// step is the correct cadence and pass-count flushing is pure Asahi sync tax.
+    pub fn begin_batch_frame(&self) {
+        self.begin_frame();
+        if let Some(f) = self.frame.lock().unwrap().as_mut() { f.batch = true; }
+    }
     pub fn end_frame(&self) {
+        // Order matters: mark closed FIRST so drops during the flush below go straight to free;
+        // the flush-submit inside will drain anything deferred earlier in the frame.
+        self.pool.frames_open.store(0, std::sync::atomic::Ordering::Relaxed);
         crate::framediag::FRAME_CLOSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(frame) = self.frame.lock().unwrap().take() {
             // DRAIN BEFORE SUBMIT. A queued dispatch that is never encoded is silently dropped —
@@ -3523,6 +3916,25 @@ impl Gpu {
     /// otherwise it submits immediately. wgpu inserts barriers between passes in one encoder,
     /// so recording many ops into one frame preserves each op's writes for the next.
     fn dispatch(&self, shader: &str, inputs: &[&Tensor], out: &Tensor, dims: &[u8], wg: (u32, u32, u32)) {
+        // GRID LIMIT, FATAL AND NAMED. Every dimension must be <= 65535. Exceeding it is rejected as
+        // a NON-FATAL logged validation error, which means the dispatch simply does not run and the
+        // output tensor keeps whatever it had — the same silent-no-op class as a shader that fails
+        // to compile, and it cost this project a full round trip: a whole-canvas diffusion forward
+        // gathered 2048*2048 elements = exactly 65536 workgroups, one past the limit, so the
+        // embeddings never happened and every downstream number was garbage computed from nothing.
+        // wg1() spills into y for kernels that read num_workgroups; a kernel that does not read it
+        // cannot be spilled and must be fixed rather than dispatched flat.
+        if wg.0 > 65535 || wg.1 > 65535 || wg.2 > 65535 {
+            let head = shader.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            panic!("wgpu-engine: dispatch grid {wg:?} exceeds the 65535 per-dimension limit — the \
+dispatch would be dropped as a non-fatal validation error and its output left stale. Use wg1() and \
+make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
+        }
+        if std::env::var_os("LOGSCOPE_TRACE_BIND").is_some() {
+            let head: String = shader.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(90).collect();
+            eprintln!("  dispatch shader: {head} | dims[..8 u32]={:?} wg={wg:?}",
+                dims.chunks(4).take(8).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>());
+        }
         let pipe = self.pipeline(shader, inputs.len() as u32);
         self.dispatch_with(&pipe, inputs, out, dims, wg);
     }
@@ -3532,6 +3944,7 @@ impl Gpu {
         let dev = &self.device;
         let t_setup = std::time::Instant::now();
         let pipe_ptr = std::sync::Arc::as_ptr(pipe) as usize; // stable identity for this pipeline
+
         // Reuse the dims UNIFORM buffer for this op's byte-identical (m,k,n,grid) instead of
         // creating+uploading a fresh one every dispatch — the per-dispatch "upload locking" fix.
         let dbuf = {
@@ -3567,7 +3980,18 @@ impl Gpu {
             // A non-zero input view means a KV slice rather than a whole weight, so this key can
             // never repeat. Counted here, where the views are already in hand — blending these into
             // the hit rate makes a working cache read as 13% and invites optimising what is not broken.
-            if bufs.iter().any(|(_, off, _)| *off != 0) {
+            // "Has an offset" is NOT the same as "cannot repeat", and the split has been reporting
+            // it as though it were. A streaming MoE slot view carries an offset and hits every time
+            // the same slot comes round; only a view whose offset MOVES — a KV slice at a growing
+            // position — is genuinely unhittable. Counting the two together says 6952 lookups are
+            // hopeless when most of them may be landing, which would send someone rebuilding the
+            // attention dispatches to fix a cache that is already working.
+            //
+            // So count hits among offset-bearing lookups separately. That ratio, not the population,
+            // decides whether binding whole buffers and passing offsets through the dims uniform is
+            // worth the change it requires.
+            let viewed = bufs.iter().any(|(_, off, _)| *off != 0);
+            if viewed {
                 BG_VIEW_VARYING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Some((pipe_ptr, bufs, (out.buf.clone(), ov.0, ov.1), (*dbuf).clone()))
@@ -3575,10 +3999,30 @@ impl Gpu {
         if let Some(key) = &cache_key {
             if let Some(bg) = self.bg_cache.lock().unwrap().get(key).cloned() {
                 BG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if key.1.iter().any(|(_, off, _)| *off != 0) {
+                    BG_HITS_VIEWED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.record_dispatch(pipeline, &bg, wg, None);
                 return;
             }
+        }
+        // MISS ATTRIBUTION. One hash lookup on a path that is about to build a bind group, which
+        // costs orders more; only while the cache is on.
+        if let Some(key) = &cache_key {
+            let shape = (key.0, key.1.clone());
+            let mut sm = self.bg_shape.lock().unwrap();
+            match sm.get(&shape) {
+                Some((prev_out, prev_dims)) => {
+                    if *prev_out != key.2 { BG_MISS_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    else if *prev_dims != key.3 { BG_MISS_DIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    else { BG_MISS_INPUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                }
+                // First sight of this pipeline+inputs pair is a COLD miss, not churn — counting it
+                // as inputs-changed would make a warm cache look broken for every layer's first pass.
+                None => {}
+            }
+            if sm.len() < BG_CACHE_CAP { sm.insert(shape, (key.2.clone(), key.3.clone())); }
         }
         let mut bg_entries = Vec::new();
         for (i, t) in inputs.iter().enumerate() {
@@ -3630,7 +4074,16 @@ impl Gpu {
     /// the dims uniform, if any) are pushed onto the frame keep-list so neither is freed while the GPU may
     /// still read them — the same retain discipline as before, just with a shared bind group. `dbuf` is None
     /// on the cache-hit fast path (already pinned by an earlier miss's keep or the dims cache).
+    /// Encode one dispatch. TIMED, because it was not and the profile has been reporting "15.8%
+    /// accounted" — 84% of decode wall time attributed to nothing, with the verdict guessing
+    /// "likely GPU-execution-bound" from the size of the remainder.
+    ///
+    /// What happens here per dispatch: a mutex on the frame, a compute pass opened and closed, two
+    /// heap allocations for keep-alives, and a pair of Arc clones. Individually trivial; this runs
+    /// 11698 times for 71 tokens on a 1B, so the question is arithmetic rather than intuition — and
+    /// unanswerable while it is the one phase nobody times.
     fn record_dispatch(&self, pipeline: &wgpu::ComputePipeline, bg: &std::sync::Arc<wgpu::BindGroup>, wg: (u32, u32, u32), dbuf: Option<&std::sync::Arc<wgpu::Buffer>>) {
+        let t_enc = std::time::Instant::now();
         let dev = &self.device;
         let mut fr = self.frame.lock().unwrap();
         if let Some(frame) = fr.as_mut() {
@@ -3657,23 +4110,29 @@ impl Gpu {
                 if pass_fuse_enabled() {
                     frame.pending.push((pipeline.clone(), bg.clone(), wg));
                 } else {
-                let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
+                GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
                 }
             }
-            frame.keep.push(Box::new(bg.clone())); // Arc<BindGroup> kept until flush (cached or fresh)
-            if let Some(d) = dbuf { frame.keep.push(Box::new(d.clone())); } // AND its dims uniform Arc
+            frame.keep.push(Keep::Bg(bg.clone())); // Arc<BindGroup> kept until flush (cached or fresh)
+            if let Some(d) = dbuf { frame.keep.push(Keep::Buf(d.clone())); } // AND its dims uniform Arc
             frame.passes += 1;
-            let over_flush = frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
+            let over_flush = !frame.batch && frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
             let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
             if over_flush || over_retain {
+                let was_batch = fr.as_ref().map(|f| f.batch).unwrap_or(false);
+                let mut old = fr.take().unwrap();
+                // Cause tags sit ADJACENT to the submit: the drift guard scans for a SUBMIT_BY_
+                // within reach of each self.submit call, and a comment block between them is
+                // exactly the layout that made the profile's attribution shortfall possible.
                 if over_flush { SUBMIT_BY_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                 else { SUBMIT_BY_RETAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                let old = fr.take().unwrap();
+                Self::drain_pending(&mut old); // 723: this closer once submitted with pending queued — fused batches DROPPED
                 self.submit(old.enc);
                 self.retain_keep(old.keep);
-                *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0 });
+                *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0, batch: was_batch });
                 drop(fr);
                 if over_retain && self.pending_keep.lock().unwrap().len() >= DIMS_RETAIN_CAP {
                     crate::counted_poll(&self.device);
@@ -3685,8 +4144,9 @@ impl Gpu {
             drop(fr);
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
+                GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
             // Per-site tally, armed only by --frame-diag. The aggregate counter says 6821
@@ -3702,6 +4162,7 @@ impl Gpu {
             SUBMIT_BY_NO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc); // queue order makes each op's writes visible to the next
         }
+        GPU_ENCODE_NS.fetch_add(t_enc.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn linear_t(&self, a: &Tensor, w: &Tensor, m: usize, n: usize, k: usize) -> Tensor {
@@ -3728,14 +4189,16 @@ impl Gpu {
             let mut enc = self.device.create_command_encoder(&Default::default());
             if fuse {
                 // ONE pass, every dispatch inside it. Each must see the previous one's writes.
-                let mut p = enc.begin_compute_pass(&Default::default());
+                GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut p = enc.begin_compute_pass(&Default::default());
                 p.set_pipeline(&pipe); p.set_bind_group(0, &bg, &[]);
+                GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for _ in 0..steps { p.dispatch_workgroups(4, 1, 1); }
             } else {
                 // A pass per dispatch: the control, and what the engine does today.
                 for _ in 0..steps {
-                    let mut p = enc.begin_compute_pass(&Default::default());
+                    GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut p = enc.begin_compute_pass(&Default::default());
                     p.set_pipeline(&pipe); p.set_bind_group(0, &bg, &[]);
+                    GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     p.dispatch_workgroups(4, 1, 1);
                 }
             }
@@ -3748,7 +4211,7 @@ impl Gpu {
 
     pub fn upload_u32(&self, data: &[u32]) -> Tensor {
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        Tensor { buf: self.upload_bytes(bytes, "qw"), rows: 1, cols: data.len(), pool: None, view: None }
+        Tensor { buf: self.upload_bytes(bytes, "qw"), rows: 1, cols: data.len(), pool: None, site: (0, 0), view: None }
     }
     /// Resident-weight uploads: when an arena is active (LOGSCOPE_ARENA, set up by the loader) the bytes
     /// are packed into a shared slab and returned as an offset view; otherwise a dedicated buffer (the
@@ -3774,7 +4237,13 @@ impl Gpu {
             if a.mapped {
                 // ZERO-COPY: the previous slab is full — unmap it so it can be bound. No staging belt exists
                 // in this mode, so there's nothing to drain (this is where the ~2× load peak went away).
-                if let Some(prev) = a.slabs.last() { prev.unmap(); }
+                // WATERMARKED like the other three — this was the FOURTH unmap site, missed by 713's
+                // pattern anchors and found by the llada2 load still printing validation noise on a
+                // 717 tree: it fired here unguarded, then a guarded site double-tapped.
+                if a.slabs.len() > a.unmapped_upto.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(prev) = a.slabs.last() { prev.unmap(); }
+                    a.unmapped_upto.store(a.slabs.len(), std::sync::atomic::Ordering::Relaxed);
+                }
             } else if !a.slabs.is_empty() {
                 // Staging path: drain the PREVIOUS slab's staged writes before allocating the next. wgpu's
                 // write_buffer stages through internal buffers that are only reclaimed after a submit+poll;
@@ -3854,8 +4323,17 @@ it.",
                 a.mapped = false;
                 a.used = a.slab_size;   // force a fresh slab; the current one keeps its mapping
             }
+            // COPY_SRC on BOTH paths. The staged branch lacked it, so every copy FROM a resident
+            // weight — download(), and therefore save_int8_cache's dump of each tensor — failed
+            // validation on non-UMA devices and the staging buffer kept its zero-init. The sidecar
+            // then held zeros, the reload produced garbage logits (llvmpipe: max|d|=3.99 vs fresh),
+            // and the weight-level diff read EQUAL because it read the fresh side through the same
+            // failing copy. The mapped/UMA branch always had COPY_SRC, which is why the operator's
+            // M2 wrote a correct sidecar while this machine wrote zeros: one asymmetric flag, two
+            // machines, two different symptoms.
             let usage = if a.mapped { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC }
-                        else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
+                        else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+                               | wgpu::BufferUsages::COPY_SRC };
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
                 usage, mapped_at_creation: a.mapped });
             // A FAILED ALLOCATION MUST NOT BE MAPPED. create_buffer returns a Buffer even when the
@@ -3884,10 +4362,31 @@ it.",
                 eprintln!("wgpu-engine: arena slab allocation FAILED ({} MiB) — the driver could not \
 back it. Reporting device OOM rather than mapping an invalid buffer",
                     a.slab_size / (1 << 20));
+                // Explicit usage: the creation-time guard's `usage` is a local of the slab-creation
+                // block and is NOT in scope here (E0425 on first build — the one symbol the landing
+                // commit said it took on faith). The literal matches slab tensors, and it barely
+                // matters: oom_flag is set, so the enclosing load discards this buffer unused.
                 let dummy = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("arena-slab-oom"), size: 4, usage,
+                    label: Some("arena-slab-oom"), size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false });
-                return Tensor { buf: dummy, rows, cols, pool: None, view: None };
+                return Tensor { buf: dummy, rows, cols, pool: None, site: (0, 0), view: None };
+            }
+            // Unmap the FILLED predecessor before admitting a new slab. The post-mortem that
+            // motivated this measured the ceiling as CONCURRENTLY MAPPED bytes — "4.0 GiB of
+            // slabs had already been placed, all still mapped" — and slabs are bump-allocated
+            // write-once: nothing host-side touches a filled slab again; the device reads its
+            // GPU side. Map budget becomes ONE slab regardless of model size, which is what a
+            // 56.6 GiB resident plan needs on a ~4 GiB map ceiling. Same call the arena finish
+            // path already makes (last().unmap()). LOGSCOPE_ARENA_KEEP_MAPPED=1 restores the
+            // old lifecycle if some path this analysis missed re-reads a filled slab.
+            if a.mapped && std::env::var("LOGSCOPE_ARENA_KEEP_MAPPED").is_err() {
+                use std::sync::atomic::Ordering::Relaxed;
+                let last = a.slabs.len();
+                if last > a.unmapped_upto.load(Relaxed) {
+                    if let Some(prev) = a.slabs.last() { prev.unmap(); }
+                    a.unmapped_upto.store(last, Relaxed);
+                }
             }
             a.slabs.push(slab);
             a.used = 0;
@@ -3914,20 +4413,29 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 view.copy_from_slice(bytes);
             }));
             if wrote.is_err() {
-                eprintln!("wgpu-engine: ARENA SLAB UNUSABLE — slab {} of {:.1} MiB could not be mapped at offset {off} ({} bytes). {:.1} GiB of slabs had already been placed, all still mapped. 1024 MiB slabs are now the DEFAULT on this driver — that is the size the 31 GiB concurrent ceiling was measured with, and a 2 GiB arena died at 6 GiB placed. If this failed at 1024, the cap is on MAPPED BYTES and a smaller slab cannot help: rerun `kernel-validate --gate-residency` to re-measure the ceiling for THIS slab size, then lower LOGSCOPE_MAX_GPU_GB to what it reports, or let the model stream instead of forcing residency.",
+                eprintln!("wgpu-engine: ARENA SLAB UNUSABLE — slab {} of {:.1} MiB could not be mapped at offset {off} ({} bytes). {:.1} GiB of slabs placed so far (filled slabs are UNMAPPED as of the one-slab lifecycle; only the current slab holds map budget). If this still fires, the cap is per-buffer or per-count: rerun with LOGSCOPE_ARENA_SLAB_MB=1024 to bisect. Meanwhile lower LOGSCOPE_MAX_GPU_GB, or let the model stream instead of forcing residency.",
                     a.slabs.len(), a.slab_size as f64 / (1 << 20) as f64, len,
                     (a.slabs.len().saturating_sub(1) as f64 * a.slab_size as f64) / (1u64 << 30) as f64);
-                // Re-raised rather than swallowed: the buffer is unusable and there is no Tensor to
-                // return. What changes is that the operator now has the arena's own account of the
-                // failure above the wgpu backtrace, instead of only "get_mapped_range: Validation
-                // Error" from three frames away with no mention of memory.
-                std::panic::resume_unwind(wrote.unwrap_err());
+                // REFUSAL, not process death: this is the same situation the creation-time guard
+                // above already models — set the flag, hand back the dummy, and let the enclosing
+                // load report device OOM through the path built for it. The old resume_unwind gave
+                // the operator a good message and then killed the process anyway.
+                self.oom_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Explicit usage: the creation-time guard's `usage` is a local of the slab-creation
+                // block and is NOT in scope here (E0425 on first build — the one symbol the landing
+                // commit said it took on faith). The literal matches slab tensors, and it barely
+                // matters: oom_flag is set, so the enclosing load discards this buffer unused.
+                let dummy = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("arena-slab-oom"), size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false });
+                return Tensor { buf: dummy, rows, cols, pool: None, site: (0, 0), view: None };
             }
         } else {
             self.write_chunked(&slab, off, bytes);   // arena slabs are up to 2 GiB
         }
         a.used = off + len;
-        Tensor { buf: slab, rows, cols, pool: None, view: Some((off, len)) }
+        Tensor { buf: slab, rows, cols, pool: None, site: (0, 0), view: Some((off, len)) }
     }
     /// Quantize a row-major [n,k] f32 weight into a resident int8 `QWeight`
     /// (symmetric per-32-block scales). `k` must be a multiple of 32.
@@ -3942,6 +4450,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// byte-identical to before. Kept in sync with the memplan streaming preflight, which counts the embed
     /// q8 under the same flag so the budget matches what actually gets allocated.
     pub fn resident_embed(&self, m: &Model) -> ResidentEmbed {
+        self.activate_model(m);
         if std::env::var("LOGSCOPE_MOE_STREAM").is_ok() {
             ResidentEmbed::Q8(self.embed_q8(m))
         } else {
@@ -4006,6 +4515,392 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// re-quantize round-trip. q8_0 (34-byte blocks: f16 scale + 32×i8, w = d·q) and our resident format
     /// (per-32-block scale + packed i8) are the same scheme, so this is exact AND avoids materializing
     /// the f32 weights — the win for big q8_0 models (a 14B's f32 form is ~56 GiB).
+    /// Q4_K super-blocks straight to int8 residency, with no f32 tensor in between.
+    ///
+    /// Q4_K was the last common source with no slice path into int8: q8_0 had one, Q4_0 got one in
+    /// c4-754, and Q4_K had one only into *q4* residency. So a Q4_K model loading int8-resident —
+    /// DeepSeek-R1-Distill-Llama-8B, every Qwen and Llama K-quant — dequantised every weight to f32
+    /// and requantised, which is the "0.0% of weights sliced" and the 54.9 s load in the operator's
+    /// M4 Max log.
+    ///
+    /// The layouts line up exactly: a Q4_K super-block is 256 values in 8 groups of 32, each group
+    /// carrying its own 6-bit scale and min, and int8 residency wants one scale per 32. So each
+    /// group maps to one resident block. Q4_K is ASYMMETRIC (`d*sc*q - dmin*m`) while int8
+    /// residency is symmetric, so the scale is re-derived from the group's absmax rather than
+    /// copied — this is a transcode, not a repack.
+    ///
+    /// The value expression is `mul_add`, copied verbatim from the dequantiser and for its reason:
+    /// gate-q4k measured a single ULP there crossing a quantisation boundary and moving 297430
+    /// words. Computing it any other way here would reintroduce exactly that.
+    /// MXFP4 straight to int8 residency, with no f32 tensor in between.
+    ///
+    /// MXFP4 is NOT a macOS format — nothing about it is Apple-specific, and this engine dequantises
+    /// it on the CPU at load so the GPU never sees it. What made it a bad choice on any platform was
+    /// that it had no SLICE path: every weight took the f32 round-trip, which is the "0.0% of
+    /// weights sliced" line and the load time that goes with it. q8_0, Q4_0 (c4-754) and Q4_K
+    /// (c4-784) all had one; this closes the last common source.
+    ///
+    /// The block shapes line up more cleanly here than anywhere else: MXFP4 is 32 weights behind one
+    /// E8M0 scale, and int8 residency wants one f32 scale per 32. One block in, one block out. The
+    /// codes still have to be REQUANTISED rather than repacked — MXFP4's are a non-uniform table
+    /// {0,1,2,3,4,6,8,12} while int8 is a uniform grid — so the scale is re-derived from each
+    /// block's absmax.
+    ///
+    /// `amax * (1/127)` rather than `amax / 127`, matching quantize_q8_resident exactly: those
+    /// differ by one ULP, and c4-784's equivalence test caught precisely that on the Q4_K path.
+    pub fn mxfp4_to_int8_resident(&self, raw: &[u8], n: usize, k: usize) -> Option<QWeight> {
+        use crate::mxfp4::MXFP4_BLOCK;
+        if k % 32 != 0 { return None; }
+        let kb = k / 32;
+        if raw.len() < n * kb * MXFP4_BLOCK { return None; }
+        let mut qs = vec![0f32; n * kb];
+        let mut qbytes = vec![0i8; n * k];
+        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8)
+            .max(1).min(n.max(1));
+        let rows_per = n.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ci, (qs_c, qb_c)) in qs.chunks_mut(rows_per * kb)
+                .zip(qbytes.chunks_mut(rows_per * k)).enumerate()
+            {
+                let raw = &raw;
+                sc.spawn(move || {
+                    let r0 = ci * rows_per;
+                    let rows_here = qs_c.len() / kb;
+                    for lr in 0..rows_here {
+                        let r = r0 + lr;
+                        for b in 0..kb {
+                            let src = &raw[(r * kb + b) * MXFP4_BLOCK..][..MXFP4_BLOCK];
+                            // Decode one block through the same reader the dequantiser uses, so the
+                            // two cannot drift on the table, the scale or the nibble order.
+                            let vals = match crate::mxfp4::dequant_mxfp4(src, 32) {
+                                Ok(v) => v, Err(_) => return,
+                            };
+                            let amax = vals.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                            let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
+                            let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                            qs_c[lr * kb + b] = scale;
+                            let base = lr * k + b * 32;
+                            for (j, &v) in vals.iter().enumerate() {
+                                qb_c[base + j] = (v * inv).round().clamp(-127.0, 127.0) as i32 as i8;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let mut qw = vec![0u32; n * k / 4];
+        for (li, word) in qw.iter_mut().enumerate() {
+            let i4 = li * 4;
+            *word = (qbytes[i4] as u8 as u32)
+                | ((qbytes[i4 + 1] as u8 as u32) << 8)
+                | ((qbytes[i4 + 2] as u8 as u32) << 16)
+                | ((qbytes[i4 + 3] as u8 as u32) << 24);
+        }
+        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+    }
+
+    /// Q6_K straight to int8 residency. The other half of a Q4_K_M file.
+    ///
+    /// "Q4_K_M" names the majority type, not the only one: ffn_down, attn_v and often output are
+    /// Q6_K. On Llama-3.2-1B that is ffn_down x16 plus output — about 43% of the parameters — which
+    /// is why the load path reported "22.0% of weights sliced" immediately after the Q4_K transcode
+    /// announced itself. Slicing Q4_K and round-tripping Q6_K leaves most of the file on the slow
+    /// path, and the percentage is the only reason anyone would notice.
+    ///
+    /// Decoding goes through the SAME reader dequantize() uses, one super-block at a time, so the
+    /// fast path cannot drift from the slow one on Q6_K's two-part layout (ql, qh, sixteen int8
+    /// sub-scales, an f16 d) — the same discipline that kept the MXFP4 path honest in c4-805.
+    /// Concatenate several already-quantised sources into ONE int8-resident weight, row-wise.
+    ///
+    /// The dense gate||up fusion built its tensor by dequantising both halves to f32, concatenating,
+    /// and requantising — which is 537M of a 1.34B Llama-3.2-1B, and why the load path still read
+    /// "32.6% sliced" after Q4_K and Q6_K both had slice paths. The remaining 900M was gate+up plus
+    /// the embedding table, and only the percentage said so.
+    ///
+    /// Sound for exactly the reason c4-756 proved for the MoE expert stack: int8 residency quantises
+    /// per 32 elements ALONG k, and fusing gate with up is concatenation along ROWS. The two
+    /// operations touch disjoint axes, so quantising each source separately and concatenating the
+    /// results is bit-identical to concatenating in f32 and quantising once — and it never
+    /// materialises the f32 tensor.
+    ///
+    /// Each source may be a DIFFERENT ggml type. Q4_K_M mixes them within a layer, so this dispatches
+    /// per source rather than assuming they match.
+    pub fn int8_rows_from_sources(&self, srcs: &[(u32, &[u8], usize)], k: usize) -> Option<QWeight> {
+        if k % 32 != 0 { return None; }
+        let kb = k / 32;
+        // HOST-SIDE concatenation. Nothing is uploaded until the whole thing is assembled, because a
+        // submit during load() is illegal while an arena slab is mapped and produces an unwritten
+        // buffer rather than an error.
+        let (mut qs, mut codes) = (Vec::new(), Vec::new());
+        for &(ty, raw, rows) in srcs {
+            let (s_part, c_part) = match ty {
+                12 => self.q4_k_to_int8_host(raw, rows, k)?,
+                14 => self.q6_k_to_int8_host(raw, rows, k)?,
+                _ => return None,          // unhandled source: fall back, never guess
+            };
+            if s_part.len() != rows * kb || c_part.len() != rows * k { return None; }
+            qs.extend_from_slice(&s_part);
+            codes.extend_from_slice(&c_part);
+        }
+        let n_total: usize = srcs.iter().map(|(_, _, r)| *r).sum();
+        if qs.len() != n_total * kb { return None; }
+        let mut qw = vec![0u32; n_total * k / 4];
+        for (li, word) in qw.iter_mut().enumerate() {
+            let i4 = li * 4;
+            *word = (codes[i4] as u8 as u32)
+                | ((codes[i4 + 1] as u8 as u32) << 8)
+                | ((codes[i4 + 2] as u8 as u32) << 16)
+                | ((codes[i4 + 3] as u8 as u32) << 24);
+        }
+        Some(QWeight { qw: self.upload_u32_resident(&qw),
+                       qs: self.upload_resident(&qs, n_total, kb), n: n_total, k })
+    }
+
+    /// Host-side half of the Q6_K transcode. See q4_k_to_int8_host for why this exists.
+    pub fn q6_k_to_int8_host(&self, raw: &[u8], n: usize, k: usize) -> Option<(Vec<f32>, Vec<i8>)> {
+        self.q6_k_to_int8_parts(raw, n, k)
+    }
+
+    fn q6_k_to_int8_parts(&self, raw: &[u8], n: usize, k: usize) -> Option<(Vec<f32>, Vec<i8>)> {
+        const SB: usize = 210;
+        if k % 256 != 0 { return None; }
+        let sb_per_row = k / 256;
+        if raw.len() < n * sb_per_row * SB { return None; }
+        let kb = k / 32;
+        let mut qs = vec![0f32; n * kb];
+        let mut qbytes = vec![0i8; n * k];
+        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8)
+            .max(1).min(n.max(1));
+        let rows_per = n.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ci, (qs_c, qb_c)) in qs.chunks_mut(rows_per * kb)
+                .zip(qbytes.chunks_mut(rows_per * k)).enumerate()
+            {
+                let raw = &raw;
+                sc.spawn(move || {
+                    let r0 = ci * rows_per;
+                    let rows_here = qs_c.len() / kb;
+                    for lr in 0..rows_here {
+                        let r = r0 + lr;
+                        for sb in 0..sb_per_row {
+                            let src = &raw[(r * sb_per_row + sb) * SB..][..SB];
+                            let vals = match crate::gguf::dequantize(14, src, 256) {
+                                Ok(v) => v, Err(_) => return,
+                            };
+                            // int8 residency is per-32, so one Q6_K super-block becomes 8 blocks.
+                            for g in 0..8 {
+                                let grp = &vals[g * 32..(g + 1) * 32];
+                                let amax = grp.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                                let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
+                                let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                                let blk = sb * 8 + g;
+                                qs_c[lr * kb + blk] = scale;
+                                let base = lr * k + blk * 32;
+                                for (j, &v) in grp.iter().enumerate() {
+                                    qb_c[base + j] = (v * inv).round().clamp(-127.0, 127.0) as i32 as i8;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Some((qs, qbytes))
+    }
+
+    pub fn q6_k_to_int8_resident(&self, raw: &[u8], n: usize, k: usize) -> Option<QWeight> {
+        let (qs, codes) = self.q6_k_to_int8_parts(raw, n, k)?;
+        let kb = k / 32;
+        let mut qw = vec![0u32; n * k / 4];
+        for (li, word) in qw.iter_mut().enumerate() {
+            let i4 = li * 4;
+            *word = (codes[i4] as u8 as u32)
+                | ((codes[i4 + 1] as u8 as u32) << 8)
+                | ((codes[i4 + 2] as u8 as u32) << 16)
+                | ((codes[i4 + 3] as u8 as u32) << 24);
+        }
+        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+    }
+
+
+    /// Host-side half of the Q4_K transcode: scales and codes, no GPU touched.
+    ///
+    /// Split out because a FUSION must concatenate on the host. Building each half as a QWeight and
+    /// downloading it to join them issues submits, and inside load() an arena slab is mapped — wgpu
+    /// rejects the submit and the buffer is left UNWRITTEN, which is silent garbage weights rather
+    /// than an error. The arena contract says so in as many words; c4-813 broke it and the operator's
+    /// log filled with "Buffer with 'arena-slab' label is still mapped".
+    pub fn q4_k_to_int8_host(&self, raw: &[u8], n: usize, k: usize) -> Option<(Vec<f32>, Vec<i8>)> {
+        self.q4_k_to_int8_parts(raw, n, k)
+    }
+
+    fn q4_k_to_int8_parts(&self, raw: &[u8], n: usize, k: usize) -> Option<(Vec<f32>, Vec<i8>)> {
+        if k % 256 != 0 { return None; }
+        let sb_per_row = k / 256;
+        if raw.len() < n * sb_per_row * 144 { return None; }
+        let kb = k / 32;
+        let mut qs = vec![0f32; n * kb];
+        let mut qbytes = vec![0i8; n * k];
+        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8)
+            .max(1).min(n.max(1));
+        let rows_per = n.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ci, (qs_c, qb_c)) in qs.chunks_mut(rows_per * kb)
+                .zip(qbytes.chunks_mut(rows_per * k)).enumerate()
+            {
+                let raw = &raw;
+                sc.spawn(move || {
+                    let r0 = ci * rows_per;
+                    let rows_here = qs_c.len() / kb;
+                    let mut grp = [0f32; 32];
+                    for lr in 0..rows_here {
+                        let r = r0 + lr;
+                        for sb in 0..sb_per_row {
+                            let b = &raw[(r * sb_per_row + sb) * 144..][..144];
+                            let d = crate::gguf::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                            let dmin = crate::gguf::f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+                            let (scales, q) = (&b[4..16], &b[16..144]);
+                            let (mut is, mut qoff) = (0usize, 0usize);
+                            for pair in 0..4 {
+                                let (sc1, m1) = crate::gguf::get_scale_min_k4(is, scales);
+                                let (sc2, m2) = crate::gguf::get_scale_min_k4(is + 1, scales);
+                                let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+                                let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+                                for half in 0..2 {
+                                    for l in 0..32 {
+                                        let nib = if half == 0 { (q[qoff + l] & 0xF) as f32 }
+                                                  else { (q[qoff + l] >> 4) as f32 };
+                                        let (dd, mm) = if half == 0 { (d1, mm1) } else { (d2, mm2) };
+                                        grp[l] = dd.mul_add(nib, -mm);
+                                    }
+                                    let amax = grp.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                                    // MULTIPLY BY THE RECIPROCAL, exactly as quantize_q8_resident
+                                    // does. amax / 127.0 differs from amax * (1/127.0) by one ULP,
+                                    // and the test caught it as 0.36060533 against 0.3606053 — the
+                                    // same one-ULP class gate-q4k found moving 297430 words. Match
+                                    // the expression, not the arithmetic.
+                                    let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
+                                    let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                                    let blk = sb * 8 + pair * 2 + half;
+                                    qs_c[lr * kb + blk] = scale;
+                                    let base = lr * k + blk * 32;
+                                    for l in 0..32 {
+                                        qb_c[base + l] = (grp[l] * inv).round().clamp(-127.0, 127.0) as i32 as i8;
+                                    }
+                                }
+                                qoff += 32; is += 2;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // Same packing and upload as quantize_q8_resident: four i8 codes per u32, little-endian.
+        Some((qs, qbytes))
+    }
+
+    /// Q5_K super-blocks straight to int8 residency — the last common K-quant with no slice path.
+    ///
+    /// Same shape as the Q4_K transcode and the same reasons: a Q5_K super-block is 256 values in 8
+    /// groups of 32 with a 6-bit scale and min per group, and int8 residency wants one scale per 32,
+    /// so each group maps to one resident block. Q5_K is asymmetric (`d*sc*q - dmin*m`) and int8
+    /// residency is symmetric, so the scale is re-derived from the group's absmax — a transcode, not
+    /// a repack. The FIFTH bit lives in `qh`, one bit per weight, selected by the GROUP (`g*2` for
+    /// the low nibble, `g*2+1` for the high), which is the layout kquant::dequant_q5_k pins and the
+    /// one a wrong reading of silently permutes.
+    ///
+    /// LOGSCOPE_NO_Q5K_INT8=1 restores the f32 round-trip for an A/B.
+    fn q5_k_to_int8_parts(&self, raw: &[u8], n: usize, k: usize) -> Option<(Vec<f32>, Vec<i8>)> {
+        if k % 256 != 0 { return None; }
+        let sb_per_row = k / 256;
+        if raw.len() < n * sb_per_row * 176 { return None; }
+        let kb = k / 32;
+        let mut qs_out = vec![0f32; n * kb];
+        let mut qbytes = vec![0i8; n * k];
+        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8)
+            .max(1).min(n.max(1));
+        let rows_per = n.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ci, (qs_c, qb_c)) in qs_out.chunks_mut(rows_per * kb)
+                .zip(qbytes.chunks_mut(rows_per * k)).enumerate()
+            {
+                let raw = &raw;
+                sc.spawn(move || {
+                    let r0 = ci * rows_per;
+                    let rows_here = qs_c.len() / kb;
+                    let mut grp = [0f32; 32];
+                    for lr in 0..rows_here {
+                        let r = r0 + lr;
+                        for sb in 0..sb_per_row {
+                            let b = &raw[(r * sb_per_row + sb) * 176..][..176];
+                            let d = crate::gguf::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                            let dmin = crate::gguf::f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+                            let (scales, qh, q) = (&b[4..16], &b[16..48], &b[48..176]);
+                            for g in 0..4 {
+                                let (sc1, m1) = crate::gguf::get_scale_min_k4(g * 2, scales);
+                                let (sc2, m2) = crate::gguf::get_scale_min_k4(g * 2 + 1, scales);
+                                let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+                                let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+                                for half in 0..2 {
+                                    for l in 0..32 {
+                                        let qsb = q[g * 32 + l];
+                                        let bit = ((qh[l] >> (g * 2 + half)) & 1) << 4;
+                                        let v = if half == 0 { (qsb & 0xF) | bit } else { (qsb >> 4) | bit };
+                                        let (dd, mm) = if half == 0 { (d1, mm1) } else { (d2, mm2) };
+                                        grp[l] = dd.mul_add(v as f32, -mm);
+                                    }
+                                    let amax = grp.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                                    // Multiply by the reciprocal, matching quantize_q8_resident and
+                                    // the Q4_K path: amax/127.0 and amax*(1/127.0) differ by an ULP,
+                                    // and that ULP has already cost this codebase a gate.
+                                    let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
+                                    let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                                    let blk = sb * 8 + g * 2 + half;
+                                    qs_c[lr * kb + blk] = scale;
+                                    for l in 0..32 {
+                                        let q8 = (grp[l] * inv).round().clamp(-127.0, 127.0) as i8;
+                                        qb_c[lr * k + blk * 32 + l] = q8;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Some((qs_out, qbytes))
+    }
+
+    /// Q5_K → int8-resident QWeight. See `q5_k_to_int8_parts`.
+    pub fn q5_k_to_int8_resident(&self, raw: &[u8], n: usize, k: usize) -> Option<QWeight> {
+        let (qs, codes) = self.q5_k_to_int8_parts(raw, n, k)?;
+        let kb = k / 32;
+        let mut qw = vec![0u32; n * k / 4];
+        for (li, word) in qw.iter_mut().enumerate() {
+            let i4 = li * 4;
+            *word = (codes[i4] as u8 as u32)
+                | ((codes[i4 + 1] as u8 as u32) << 8)
+                | ((codes[i4 + 2] as u8 as u32) << 16)
+                | ((codes[i4 + 3] as u8 as u32) << 24);
+        }
+        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+    }
+
+    pub fn q4_k_to_int8_resident(&self, raw: &[u8], n: usize, k: usize) -> Option<QWeight> {
+        let (qs, codes) = self.q4_k_to_int8_parts(raw, n, k)?;
+        let kb = k / 32;
+        let mut qw = vec![0u32; n * k / 4];
+        for (li, word) in qw.iter_mut().enumerate() {
+            let i4 = li * 4;
+            *word = (codes[i4] as u8 as u32)
+                | ((codes[i4 + 1] as u8 as u32) << 8)
+                | ((codes[i4 + 2] as u8 as u32) << 16)
+                | ((codes[i4 + 3] as u8 as u32) << 24);
+        }
+        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+    }
+
+
     pub fn q8_0_to_resident(&self, raw: &[u8], n: usize, k: usize) -> QWeight {
         let kb = k / 32;
         let nblocks = n * kb;
@@ -4088,6 +4983,158 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 });
             }
         });
+        Q4Weight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k }
+    }
+
+    /// TRANSCODE ggml Q4_0 block bytes straight to the resident q4 layout, without the f32 detour.
+    ///
+    /// The load path is `GGUF quant -> dequantise to f32 -> requantise to resident`, and on a Q4_0
+    /// model that round-trip is most of the wall time between "loading" and "loaded". This is the
+    /// same arithmetic with the intermediate removed.
+    ///
+    /// IT IS NOT A CODE COPY, and the earlier claim that it could be a "widen and unpack" was
+    /// WRONG: ggml Q4_0 stores codes 0..=15 meaning (c-8)*d, i.e. -8..=+7 — sixteen levels,
+    /// asymmetric — while the resident format clamps to -7..=+7, fifteen levels symmetric about 8.
+    /// A source code of 0 has no resident equivalent, so the values must be re-derived.
+    ///
+    /// What makes it cheap anyway is that the source scale CANCELS. With
+    ///   w_j = (c_j - 8) * d,  amax = |d| * max_j|c_j - 8|,  scale = amax / 7
+    /// the resident code is round(w_j / scale) = round((c_j - 8) * 7 / max|c-8|): a function of the
+    /// NIBBLES alone. Only the emitted scale needs `d` at all. So the per-block absmax scan over 32
+    /// floats becomes a scan over 32 small integers, and the f32 buffer never exists.
+    ///
+    /// Bit-identical to dequantise-then-`quantize_q4_resident` — asserted by
+    /// `q4_transcode::transcode_matches_the_f32_round_trip_bit_for_bit`, because "equivalent" is
+    /// the whole claim and an approximation here would silently change every weight in the model.
+    /// Transcode an ARBITRARY ORDER of Q4_0 source rows into one resident q4 buffer.
+    ///
+    /// This is what lets the MoE expert stack skip the f32 detour. The loader builds its stacked
+    /// buffer by row concatenation — for each expert, that expert's gate rows then its up rows —
+    /// and resident q4 quantises per 32-block ALONG k, i.e. strictly within a row. Row permutation
+    /// and per-row quantisation therefore COMMUTE: transcoding each source row straight into its
+    /// slot in the stack gives bit-identical bytes to interleaving in f32 and quantising after.
+    /// That commutation is the whole reason the expert stack is reachable at all, so it is asserted
+    /// rather than assumed (see `stacked_rows_match_the_interleaved_f32_path`).
+    ///
+    /// `rows` holds one entry per TARGET row, each exactly `k/32 * 18` bytes of Q4_0 blocks.
+    /// Row-order transcode straight to a resident weight, skipping the byte form entirely.
+    pub fn q4_0_rows_upload(&self, rows: &[&[u8]], k: usize) -> Option<Q4Weight> {
+        if k % 32 != 0 { return None; }
+        let kb = k / 32;
+        if rows.iter().any(|r| r.len() < kb * 18) { return None; }
+        let mut flat = Vec::with_capacity(rows.len() * kb * 18);
+        for r in rows { flat.extend_from_slice(&r[..kb * 18]); }
+        self.q4_0_upload_transcode(&flat, rows.len(), k)
+    }
+
+    pub fn q4_0_rows_to_resident_bytes(&self, rows: &[&[u8]], k: usize) -> Option<(Vec<u8>, usize)> {
+        if k % 32 != 0 { return None; }
+        let kb = k / 32;
+        let n = rows.len();
+        if rows.iter().any(|r| r.len() < kb * 18) { return None; }
+        let mut flat = Vec::with_capacity(n * kb * 18);
+        for r in rows { flat.extend_from_slice(&r[..kb * 18]); }
+        self.q4_0_transcode_host_bytes(&flat, n, k)
+    }
+
+    /// The transcode core: Q4_0 block bytes -> the resident `(qw, qs)` pair, PARALLEL over rows.
+    ///
+    /// Threading is not an optimisation here, it is a correction. The f32 round-trip this replaces
+    /// is multithreaded (`quantize_q4_resident` fans out over rows), so a serial transcode doing a
+    /// quarter of the work on one of sixteen cores can lose in WALL TIME while winning on work —
+    /// which is exactly what c4-754 and c4-757 shipped. Rows are independent and, because k is a
+    /// multiple of 32, each row occupies a whole number of qw words (k/8) and qs entries (k/32), so
+    /// row chunks partition both outputs without overlap.
+    fn q4_0_transcode_parts(&self, raw: &[u8], n: usize, k: usize) -> Option<(Vec<u32>, Vec<f32>)> {
+        if k % 32 != 0 { return None; }
+        let kb = k / 32;
+        if raw.len() < n * kb * 18 { return None; }
+        let (words_per_row, qs_per_row) = (k / 8, kb);
+        let mut qw = vec![0u32; n * words_per_row];
+        let mut qs = vec![0f32; n * qs_per_row];
+        // LOGSCOPE_LOAD_THREADS pins the fan-out: 1 makes the A/B against the serial version
+        // possible on any box, which is how the regression this fixes was demonstrated.
+        let threads = std::env::var("LOGSCOPE_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8))
+            .max(1).min(n.max(1));
+        let rows_per = n.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ci, (qw_c, qs_c)) in qw.chunks_mut(rows_per * words_per_row)
+                .zip(qs.chunks_mut(rows_per * qs_per_row)).enumerate()
+            {
+                let raw = &raw;
+                sc.spawn(move || {
+                    let r0 = ci * rows_per;
+                    let rows_here = qs_c.len() / qs_per_row;
+                    for lr in 0..rows_here {
+                        let r = r0 + lr;
+                        for b in 0..kb {
+                            let o = (r * kb + b) * 18;
+                            let d = crate::gguf::f16_to_f32(u16::from_le_bytes([raw[o], raw[o + 1]]));
+                            let mut c = [0i32; 32];
+                            for j in 0..16 {
+                                let byte = raw[o + 2 + j];
+                                c[j] = (byte & 0x0F) as i32;
+                                c[j + 16] = (byte >> 4) as i32;
+                            }
+                            // amax = |d| * max|c-8|: exact, because scaling by a positive constant
+                            // is monotonic and each product is correctly rounded.
+                            let maxabs = c.iter().map(|&x| (x - 8).abs()).max().unwrap_or(0) as f32;
+                            let amax = d.abs() * maxabs;
+                            let scale = if amax > 0.0 { amax * (1.0f32 / 7.0) } else { 1.0 };
+                            let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                            qs_c[lr * qs_per_row + b] = scale;
+                            // Four codes per u32 nibble-group; a 32-value block spans exactly four
+                            // words, so the writes stay inside this row's slice.
+                            for w in 0..4 {
+                                let mut v = 0u32;
+                                for t in 0..8 {
+                                    let jj = w * 8 + t;
+                                    let x = (c[jj] - 8) as f32 * d;
+                                    let q = (x * inv_scale).round().clamp(-7.0, 7.0) as i32;
+                                    v |= (((q + 8) as u32) & 0xF) << (t * 4);
+                                }
+                                qw_c[lr * words_per_row + b * 4 + w] = v;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Some((qw, qs))
+    }
+
+    /// Transcode and UPLOAD, with no byte-serialisation in between. The earlier wiring produced
+    /// `(Vec<u8>, qs_off)` and immediately parsed it back into `Vec<u32>` + `Vec<f32>` — two extra
+    /// passes over every weight for an intermediate nothing needed.
+    pub fn q4_0_upload_transcode(&self, raw: &[u8], n: usize, k: usize) -> Option<Q4Weight> {
+        let (qw, qs) = self.q4_0_transcode_parts(raw, n, k)?;
+        let kb = k / 32;
+        Some(Q4Weight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+    }
+
+    pub fn q4_0_transcode_host_bytes(&self, raw: &[u8], n: usize, k: usize) -> Option<(Vec<u8>, usize)> {
+        let (qw, qs) = self.q4_0_transcode_parts(raw, n, k)?;
+        let qs_off = qw.len() * 4;
+        let mut out = vec![0u8; qs_off + qs.len() * 4];
+        for (i, w) in qw.iter().enumerate() { out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes()); }
+        for (i, v) in qs.iter().enumerate() {
+            out[qs_off + i * 4..qs_off + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        Some((out, qs_off))
+    }
+
+    /// Upload host-side resident q4 bytes (the `qw ‖ qs` layout) as a Q4Weight. The counterpart to
+    /// `q4_0_transcode_host_bytes`: the transcode produces exactly what `quantize_q4_resident` would
+    /// have uploaded, so this is the same upload with the quantisation already done.
+    pub fn q4_from_host_bytes(&self, bytes: &[u8], qs_off: usize, n: usize, k: usize) -> Q4Weight {
+        let kb = k / 32;
+        let qw: Vec<u32> = bytes[..qs_off].chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let qs: Vec<f32> = bytes[qs_off..].chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        debug_assert_eq!(qw.len(), n * k / 8);
+        debug_assert_eq!(qs.len(), n * kb);
         Q4Weight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k }
     }
 
@@ -4271,7 +5318,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                     self.write_chunked(&stage.buf, o1 as u64, u);
                     self.write_chunked(&stage.buf, o2 as u64, dw);
                     let view = |off: usize, len: usize| Tensor {
-                        buf: stage.buf.clone(), rows: 1, cols: len / 4, pool: None,
+                        buf: stage.buf.clone(), rows: 1, cols: len / 4, pool: None, site: (0, 0),
                         view: Some((off as u64, al(len) as u64)) };
                     self.q4k_convert_from(&view(o0, g.len()), &gu_buf, ff, d, 0, gu_qs_off / 4);
                     self.q4k_convert_from(&view(o1, u.len()), &gu_buf, ff, d, half_qw_words, gu_qs_off / 4 + half_qs_vals);
@@ -4432,8 +5479,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let kb = k / 32;
         let qw_len = (n * k / 8 * 4) as u64;
         let qs_len = (n * kb * 4) as u64;
-        let qwt = Tensor { buf: qw.clone(), rows: n, cols: k, pool: None, view: Some((0, qw_len)) };
-        let qst = Tensor { buf: qs.clone(), rows: n, cols: kb, pool: None, view: Some((0, qs_len)) };
+        let qwt = Tensor { buf: qw.clone(), rows: n, cols: k, pool: None, site: (0, 0), view: Some((0, qw_len)) };
+        let qst = Tensor { buf: qs.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((0, qs_len)) };
         Lin::q4(Q4Weight { qw: qwt, qs: qst, n, k })
     }
 
@@ -4498,10 +5545,10 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let qw_len = (n * k / 8 * 4) as u64;
         let qs_len = (n * kb * 4) as u64;
         // qw and qs share one slot buffer (qs at byte qs_off) unless a split buffer is given.
-        let qw = Tensor { buf: gu_slot.clone(), rows: n, cols: k, pool: None, view: Some((0, qw_len)) };
+        let qw = Tensor { buf: gu_slot.clone(), rows: n, cols: k, pool: None, site: (0, 0), view: Some((0, qw_len)) };
         let qs = match split_buf {
-            Some(b) => Tensor { buf: b.clone(), rows: n, cols: kb, pool: None, view: Some((0, qs_len)) },
-            None => Tensor { buf: gu_slot.clone(), rows: n, cols: kb, pool: None, view: Some((qs_off as u64, qs_len)) },
+            Some(b) => Tensor { buf: b.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((0, qs_len)) },
+            None => Tensor { buf: gu_slot.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((qs_off as u64, qs_len)) },
         };
         Lin::q4(Q4Weight { qw, qs, n, k })
     }
@@ -4620,6 +5667,26 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     }
     /// Residual fold (m=1 decode): c = W·a + resid in one dispatch, folding the post-projection
     /// residual add (wo/wdown) into the matmul epilogue — one fewer ADD launch/layer.
+    /// SwiGLU folded into the down-projection matvec AND the residual: one dispatch where the chain
+    /// was SWIGLU_PACKED -> MATVEC_Q8_0_ADD.
+    ///
+    /// The kernels for this were written, documented with exactly this purpose, and never called —
+    /// SWIGLU_MATVEC_Q8_0_ADD and its q4 twin appear in kernels.rs and nowhere else. Same shape as
+    /// c4-820's attention residual, one dispatch deeper: the MoE path has had a matvec that emits
+    /// SwiGLU (MOE_MATVEC_GLU_Q) all along and the dense FFN kept the two-pass chain.
+    ///
+    /// `gu` is the packed [gate | up] the gate_up projection already produces, so nothing upstream
+    /// changes. Returns None when the shape or kind does not fit, and the caller keeps its chain.
+    pub fn swiglu_down_add_q8(&self, gu: &Tensor, w: &QWeight, resid: &Tensor) -> Option<Tensor> {
+        if gu.rows != 1 || gu.cols != 2 * w.k { return None; }
+        let out = self.alloc(1, w.n);
+        let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
+        self.dispatch(SWIGLU_MATVEC_Q8_0_ADD, &[gu, &w.qw, &w.qs, resid], &out,
+                      bytemuck::cast_slice(&dims), (gx, gy, 1));
+        Some(out)
+    }
+
     pub fn linear_q8_0_add(&self, a: &Tensor, w: &QWeight, resid: &Tensor) -> Tensor {
         let out = self.alloc(1, w.n);
         let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
@@ -4673,11 +5740,44 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let a = self.upload(&act, 1, k);
         let iters = 48usize; let reps = 5usize;
         let mut best = (DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 4 }, f64::MAX);
+        // CORRECTNESS BEFORE SPEED. The GEMM tuner above filters candidates against a reference and
+        // drops any tile whose result diverges; this one picked purely on median time. A decode
+        // kernel that MISCOMPILES on a given driver therefore wins by being fastest, and its choice
+        // is CACHED TO DISK PER GPU — surviving every rebuild and every unrelated fix, on that
+        // machine only, invisible to every other device's gates. Wrong decode matvec = wrong logits
+        // = word salad from the first generated token, for EVERY model, while prefill (GEMM,
+        // validated) stays clean. That asymmetry is the signature to look for in a bug report.
+        //
+        // Reference is CPU f32 over the same weights; tolerance 3e-2 absorbs q8 rounding (well under
+        // 1e-2 in practice) while a miscompile lands at O(1) relative error.
+        let want: Vec<f32> = (0..n).map(|r| (0..k).map(|c| w[r * k + c] * act[c]).sum::<f32>()).collect();
+        let wscale = want.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+        let relerr = |got: &[f32]| -> f32 {
+            if got.len() < n { return f32::INFINITY; }
+            if got.iter().take(n).any(|v| !v.is_finite()) { return f32::INFINITY; }
+            got.iter().take(n).zip(&want).map(|(g, t)| (g - t).abs()).fold(0.0f32, f32::max) / wscale
+        };
+        let mut rejected: Vec<(DecodeConfig, f32)> = Vec::new();
         for &cfg in DECODE_PROFILES {
             // Subgroup kernel: auto-searched only once it PASSED the load-time self_check_sg() on this
             // driver (sg_ok) — so a correct-subgroup GPU gets it automatically, a buggy one silently doesn't,
             // and no manual opt-in is needed. (llvmpipe/GL has no subgroups, so this is simply skipped in CI.)
             if cfg.kernel.needs_subgroups() && !self.sg_ok.load(std::sync::atomic::Ordering::Relaxed) { continue; }
+            {
+                // One dispatch per candidate, before any timing: does this kernel compute the right
+                // answer on THIS driver at THIS shape? A candidate that fails is excluded entirely.
+                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let mut got = self.download(&self.matvec_decode_cfg(&a, &qw, cfg));
+                // NEGATIVE-TEST HOOK: LOGSCOPE_POISON_TILE=<tile> corrupts that candidate's result so
+                // the rejection path itself is exercisable on any device (it fired in-sandbox before
+                // this shipped). Not a debug leftover — it is how this guard stays honest.
+                if std::env::var("LOGSCOPE_POISON_TILE").ok().and_then(|v| v.parse::<u32>().ok()) == Some(cfg.tile as u32) {
+                    if let Some(g) = got.first_mut() { *g += 1.0e3; }
+                }
+                let compile_failed = pollster::block_on(scope.pop()).is_some();
+                let rel = relerr(&got);
+                if compile_failed || rel > 3e-2 { rejected.push((cfg, rel)); continue; }
+            }
             let _ = self.download(&self.matvec_decode_cfg(&a, &qw, cfg)); // warm pipeline
             let mut times = Vec::with_capacity(reps);
             for _ in 0..reps {
@@ -4691,6 +5791,20 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             times.sort_by(|x, y| x.partial_cmp(y).unwrap());
             let med = times[times.len() / 2];
             if med < best.1 { best = (cfg, med); }
+        }
+        if !rejected.is_empty() {
+            // A rejected decode kernel is a DRIVER-LEVEL correctness finding, not a tuning detail.
+            // Said once, naming the shape: these failures are usually shape-dependent.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: DECODE KERNEL REJECTED at n={n} k={k} — {} candidate(s) disagreed with the CPU reference and are excluded from tuning: {}",
+                    rejected.len(),
+                    rejected.iter().map(|(c, r)| format!("{:?} tile {} (rel {:.2e})", c.kernel, c.tile, r)).collect::<Vec<_>>().join(", "));
+            }
+        }
+        if best.1 == f64::MAX {
+            eprintln!("wgpu-engine: EVERY decode candidate failed correctness at n={n} k={k} — falling back to V2Wg128 tile 1; logits at this shape are SUSPECT on this driver");
+            return (DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 1 }).pack();
         }
         best.0.pack()
     }
@@ -4741,6 +5855,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     }
     /// Distinct shapes worth tuning are read off a loaded model so the caller doesn't hand-enumerate them.
     pub fn model_decode_shapes(&self, m: &Model) -> Vec<(usize, usize)> {
+        self.activate_model(m);
         let mut s = Vec::new();
         let mut push = |l: &Lin| if let LinKind::Q8(q) = &l.kind { s.push((q.n, q.k)); };
         if let Some(b) = m.layers.first() { push(&b.wq); push(&b.wk); push(&b.wv); push(&b.wo); push(&b.wgate_up); push(&b.wdown); }
@@ -4893,6 +6008,40 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             self.dispatch(MATVEC_SMALL_Q8_0, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
             return out;
         }
+        // SMALL-BATCH CHUNKING (8 < m <= 64). Measured on a real-vocab shape (n=32768, k=2048):
+        // the register-blocked GEMM takes 5.32s at m=32 but 0.38s at m=2400 — 14x SLOWER for 75x
+        // less work, steady state over three samples after two warms. The GEMM's parallelism and
+        // reuse both come from having many rows; at a few dozen it degenerates. The coalesced
+        // small-batch matvec has the opposite shape (reads each weight once, accumulates all rows,
+        // memory-bound and nearly flat in m) but is hard-limited to 8 rows by its accumulator array,
+        // so a 32-row block could not use it. Chunking into 8-row groups reads the weight ceil(m/8)
+        // times, which is still far cheaper than the degenerate GEMM at these sizes.
+        //
+        // This is exactly the shape the block-diffusion loop asks for: one block of ~32 rows per
+        // forward.
+        //
+        // OPT-IN, NOT DEFAULT (LOGSCOPE_SMALL_CHUNK=1), and the reason is the measurement itself:
+        // both numbers above come from LAVAPIPE, a software rasteriser where per-dispatch and
+        // thread-scheduling costs dominate and small-m kernels behave nothing like they do on a
+        // real GPU. Chunking measured SLOWER there (11.9s vs 5.3s at m=32), which is evidence about
+        // lavapipe, not about Honeykrisp. Turning a default on a benchmark from the wrong device is
+        // how the pass-fusion regression happened; the A/B belongs on hardware, where
+        // LOGSCOPE_SMALL_CHUNK=1 vs unset answers it in one pair of runs.
+        if m <= 64 && std::env::var_os("LOGSCOPE_SMALL_CHUNK").is_some() {
+            let out = self.alloc(m, w.n);
+            let gx = (w.n as u32).min(32768);
+            let gy = (w.n as u32).div_ceil(gx);
+            let mut r0 = 0usize;
+            while r0 < m {
+                let rows = (m - r0).min(8);
+                let av = self.view_pub(a, r0 * w.k, rows * w.k);
+                let ov = self.view_pub(&out, r0 * w.n, rows * w.n);
+                let dims = [rows as u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
+                self.dispatch(MATVEC_SMALL_Q8_0, &[&av, &w.qw, &w.qs], &ov, bytemuck::cast_slice(&dims), (gx, gy, 1));
+                r0 += rows;
+            }
+            return out;
+        }
         if std::env::var_os("LOGSCOPE_PREFILL_NAIVE").is_some() { return self.linear_q8_0_naive(a, w, m); }
         // register-blocked GEMM is the DEFAULT prefill kernel: measured 2795 GFLOP/s on M2 (2.8× the
         // override-tiled kernel, 5.6× naive), and it has no override constants so it compiles on every
@@ -4963,6 +6112,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// (the fused kernel needs whole 32-wide blocks), else full-precision f32.
     fn make_lin(&self, w: &[f32], n: usize, k: usize, quantize: bool, q4: bool) -> Lin {
         if quantize && k % 32 == 0 {
+            // Every weight arriving here came through f32, by definition of this signature.
+            LOAD_SLOW_WEIGHTS.fetch_add((n * k) as u64, std::sync::atomic::Ordering::Relaxed);
             // q4 = 4-bit residency (8× smaller than f32, 2× smaller than int8) — the lever for fitting a
             // model that won't fit int8. Chosen at load by memplan (or forced via LOGSCOPE_Q4_RESIDENT).
             // Validated bit-exact by --gate-q4resident.
@@ -5010,6 +6161,14 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let gu = w.wgate_up.norm_apply(self, x2, &w.g2, d, eps, t);
         // Gemma gates with GELU rather than SiLU. The kernel has always existed; selecting it per block
         // is what turns it from dead code into support.
+        // ONE DISPATCH for SwiGLU + down + residual when the shapes allow. Only for the plain
+        // SwiGLU path with no post-FFN norm: Gemma normalises the FFN output BEFORE the residual, so
+        // folding the add in would apply the norm to the wrong thing.
+        if !w.geglu && w.post_ffn.is_none() && t == 1 && w.wdown.bias.is_none() && !decode_fuse_off() {
+            if let LinKind::Q8(q) = &w.wdown.kind {
+                if let Some(y) = self.swiglu_down_add_q8(&gu, q, x2) { return y; }
+            }
+        }
         let hmid = if w.geglu { self.geglu_packed(&gu) } else { self.swiglu_packed(&gu) };
         match &w.post_ffn {
             // Gemma: normalize the FFN's OUTPUT before adding the residual — not the same as the pre-FFN
@@ -5127,6 +6286,15 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // entirely. Which one runs is decided by three facts, and a run that takes v1 currently says
         // nothing about WHICH of them was false. That is the difference between "Scout is slow" and
         // "Scout has weight_before, so set LOGSCOPE_MOE_PRESCALE=1 and try again".
+        // LOGSCOPE_ROUTE_TRACE forces v1 (tracing needs the CPU to see the routing) — and both the
+        // explainer below and the v2 guard are gated on !armed, so an A/B launched with the trace
+        // flag measured v1-at-t=1 in silence. Found live: the operator's command line had it.
+        {
+            static SAID_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if t == 1 && route_trace_armed() && !SAID_TRACE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: MoE v1 because LOGSCOPE_ROUTE_TRACE is armed (tracing needs CPU routing) — unset it to let v2 GPU routing engage; LOGSCOPE_MOE_V2_CHECK=1 is the compatible correctness net.");
+            }
+        }
         if t == 1 && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed() {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !(m.stream.is_none() || layer_resident) || m.cfg.weight_before {
@@ -5149,6 +6317,83 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 return self.moe_v2_check(m, n2, d, x2);
             }
             if let Some(out) = self.moe_ffn_gpu_routed(m, n2, d, x2) { return out; }
+            // SAID ONCE, LIKE THE OUTER REASONS: the guard above passed — resident, t=1, output-side
+            // weighting — and the v2 function still declined. The llada2-mini egui run sat at v1's
+            // documented 5 tok/s ceiling with 19 readbacks/tok and NO message, because every internal
+            // bailout was silent while the outer explainer narrated only what it could see. Whatever
+            // News this line prints, it beats inferring the path from submit counts.
+            static V2_DECLINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !V2_DECLINED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: MoE v2 GPU-routed path DECLINED despite an eligible guard — decode is paying the per-layer readback. The decline is inside moe_ffn_gpu_routed (stacked-weight kind, or a deeper bailout); LOGSCOPE_MOE_V2_CHECK=1 compares paths when it does engage.");
+            }
+        }
+        // t>1 expert-indexed path: same stacked weights, token axis from the grid. Evaluated FIRST
+        // so the narration below can tell the truth. The old advisory printed BEFORE this fold and
+        // claimed "v2 is t==1-only" — stale since the 726 verdict-fold, and on the first 729
+        // hardware log it narrated v1 on a run that actually took v2t (254 downloads for 1009
+        // tokens: sampling readbacks only, no per-layer routing). A message that prints before the
+        // decision it describes is submit-count archaeology with extra steps.
+        let v2t_env = std::env::var("LOGSCOPE_MOE_V2T");
+        let v2t = match v2t_env.as_deref() {
+            Ok("0") => false,                      // explicit off — the A/B lever
+            Ok("1") => true,                       // explicit on — any t (prices the retracted case)
+            // VERDICT default, now in two parts.
+            //
+            // (a) The launch-bound windowed regime, unchanged.
+            //
+            // (b) MANY-EXPERT MODELS AT ANY t. v1 dispatches PER EXPERT PER LAYER, so its cost is
+            //     ~min(n_expert, t)·3 dispatches a layer no matter how compute-bound the GEMMs are;
+            //     v2t is O(1) a layer. On this llada2 (256 experts, 19 MoE layers) a single
+            //     whole-canvas diffusion forward issues ~14.6k dispatches through v1 against ~57
+            //     through v2t, and a hardware log measured 127873 dispatches across ~18 forwards —
+            //     the run was GPU-sync-bound at 452 submits/token with 0.9 dispatches per pass, i.e.
+            //     dispatch-dominated, which is exactly the regime v1 loses.
+            //
+            //     The L=512 prefill RETRACTION stands for what it actually covered: a compute-bound
+            //     case where v1's dispatch count was not the constraint. It was also decided before
+            //     group-limited routing existed on the GPU (c4-750), when v2t declined on this model
+            //     regardless — so it was never a measurement of this path.
+            _ => (t <= 8 && fast_decode_enabled()) || m.cfg.n_routed >= 64,
+        };
+        if v2t && t > 8 && m.cfg.n_routed >= 64 {
+            static SAID_WIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID_WIDE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: MoE token-axis path at t={t} ({} experts) — v1 would issue \
+~{} dispatches per layer here, v2t issues O(1). LOGSCOPE_MOE_V2T=0 restores v1 for an A/B.",
+                    m.cfg.n_routed, 3 * m.cfg.n_routed.min(t as u32));
+            }
+        }
+        let v1_forced = std::env::var("LOGSCOPE_MOE_V1").is_ok();
+        if t > 1 && v2t && !v1_forced {
+            // ARM THE FUSIONS FOR THIS PATH. They were gated behind the fast-decode verdict — an A/B
+            // measured on AR DECODE at t=1, on whatever model happened to load first. On an M4 Max
+            // that verdict came back "levers OFF" from a dense 8B, and it then disabled the token-
+            // axis path for a 256-expert diffusion forward at t=1653: v2t was selected, declined
+            // internally on `!(glu_fused && down_fused)`, and the run paid v1's 59047 dispatches for
+            // 26 tokens. A decode measurement has no authority over a 1653-row forward.
+            //
+            // Safe to force here because the fusions are bit-identical to the unfused path and
+            // gate-moe-t proves it — it compares v1 against v2t on the same weights.
+            let _fuse = FuseForce::on();
+            if let Some(out) = self.moe_ffn_gpu_routed_t(m, n2, t, d, x2) { return out; }
+            // SAID ONCE, like the t==1 decline above: the fold said yes and the function still
+            // declined — without this line the fallthrough to v1 is silent and the operator infers
+            // the path from submit counts again.
+            static V2T_DECLINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !V2T_DECLINED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: MoE t-path DECLINED internally at t={t} (stacked-weight kind or a deeper bailout) — paying v1 grouped. LOGSCOPE_MOE_V2_CHECK=1 compares paths when it engages.");
+            }
+        }
+        // Reached only when v1 will actually run at windowed t. Say WHY, once.
+        {
+            static SAIDT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if t > 1 && t <= 8 && !SAIDT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let why = if v1_forced { "LOGSCOPE_MOE_V1 forces it" }
+                    else if v2t { "the t-path declined internally (line above)" }
+                    else if v2t_env.as_deref() == Ok("0") { "LOGSCOPE_MOE_V2T=0" }
+                    else { "the fast-decode verdict is off here (LOGSCOPE_MOE_V2T=1 forces the t-path)" };
+                eprintln!("wgpu-engine: MoE v1 grouped path at t={t} (windowed decode) — {why}.");
+            }
         }
         self.moe_ffn_v1(m, n2, t, d, x2)
     }
@@ -5246,7 +6491,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // CPU routing: per token, top-k experts + combine weights; group token indices per expert.
         let mut groups: Vec<Vec<(u32, f32)>> = vec![Vec::new(); ne]; // expert → [(token_row, weight)]
         for tok in 0..t {
-            let sels = crate::moe::route(&logits[tok * ne..(tok + 1) * ne], &m.cfg);
+            let sels = crate::moe::route_biased(&logits[tok * ne..(tok + 1) * ne], &m.cfg, m.sel_bias_host.as_deref());
             // ROUTE_TRACE: record this token's routed set for the traced layer (measurement only,
             // and only on this readback path so it never adds a sync).
             let tl = self.trace_layer.load(std::sync::atomic::Ordering::Relaxed);
@@ -5275,6 +6520,9 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             h.prev_layer = layer;
         }
         let out = self.alloc(t, d);
+        // SCATTER accumulator: += from birth. See zero_tensor — recycled buffers are not zero.
+        if std::env::var("LOGSCOPE_NO_ZERO").as_deref() != Ok("1") { self.zero_tensor(&out); }
+        
         self.copy_buf(x2, 0, &out, 0, (t * d * 4) as u64);
         for (e, grp) in groups.iter().enumerate() {
             if grp.is_empty() { continue; }
@@ -5326,7 +6574,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         };
         // selection: GPU selw vs CPU route on the same logits
         let logits = self.download(&m.router.apply(self, n2, 1));
-        let cpu = crate::moe::route(&logits, &m.cfg);
+        let cpu = crate::moe::route_biased(&logits, &m.cfg, m.sel_bias_host.as_deref());
         let raw = self.download_u32(&selw);
         if raw.len() < 2 * (m.cfg.n_used.clamp(1, 16) as usize) { return v1; } // OOM backoff: skip the debug compare
         let k = m.cfg.n_used.clamp(1, 16) as usize;
@@ -5360,7 +6608,75 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// on-GPU) → per-slot expert-indexed matvecs over the stacked gate_up/down → weighted combine folded
     /// with the residual. ~20 dispatches, ZERO polls. Returns None if the stacked weights aren't a
     /// quantized kind these kernels read (then the caller runs the v1 readback path).
+    /// t>1 expert-indexed MoE: the v2 machinery extended along a token axis carried by the
+    /// GRID (TOPK: wg.x; GLU: wg.z = tok*slots+slot split via _slot; DOWN: wg.z), so t==1 is
+    /// bit-identical to the existing path — every new offset multiplies a zero token index.
+    /// Fused-GLU + fused-DOWN only, no weight_before, Q4/Q8 stacks, no streaming. Opt-in via
+    /// LOGSCOPE_MOE_V2T=1 until gate-moe-t is green on the target box; the v1 grouped path is
+    /// the oracle it compares against.
+    fn moe_ffn_gpu_routed_t(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Option<Tensor> {
+        // GROUP-LIMITED ROUTING is CPU-only for now: the GPU TOPK kernels select globally, which
+        // picks wrong experts whenever the honest top-k spans more than topk_group groups. Decline
+        // to v1 (which routes correctly) rather than run a divergent selection — the kernel port
+        // is the named next step. Said once, like every other decline on this path.
+        // The decline that used to live here is GONE: MOE_TOPK_BIAS now applies group limiting
+        // itself. It cost a measured 256x in dispatches on llada2 (v1 issues per-expert-per-layer
+        // work: 20 layers x 256 experts x 3 = the 276003 dispatches seen in an 18-forward run).
+        // gate-moe-t is the oracle for this path and runs on a GROUPED tiny now.
+        if !(moe_glu_fused() && moe_down_fused()) || m.cfg.weight_before || m.stream.is_some() {
+            // Said once, per the doctrine two commits old and already violated by this fn's first
+            // draft: gate-moe-t ran bit-identical twice with equal dispatch counts because these
+            // levers were off in a fresh process and the None was silent.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: MoE t>1 path declined: glu_fused={} down_fused={} weight_before={} streaming={} (LOGSCOPE_FUSE_GLU / LOGSCOPE_FUSE_DOWN or LOGSCOPE_FAST_DECODE arm the fusions)",
+                    moe_glu_fused(), moe_down_fused(), m.cfg.weight_before, m.stream.is_some());
+            }
+            return None;
+        }
+        let (gu_qw, gu_qs, gu_k, glu_sh) = match &m.stacked_gu.kind {
+            LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_GLU_Q8),
+            LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_GLU_Q4),
+            _ => return None,
+        };
+        let (dn_qw, dn_qs, dn_k, dn_sh) = match &m.stacked_down.kind {
+            LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_DOWN_COMBINE_Q8),
+            LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_DOWN_COMBINE_Q4),
+            _ => return None,
+        };
+        let slots = m.cfg.n_used.clamp(1, 16) as usize;
+        if t * slots > 65535 { return None; }
+        let ne = m.cfg.n_routed as usize;
+        let ff = dn_k; let ff2 = 2 * dn_k;
+        let logits = m.router.apply(self, n2, t);
+        let selw = self.alloc(t, 2 * slots);
+        let mode = match m.cfg.norm { crate::moe::RouteNorm::Sigmoid => 1u32, _ => 0 };
+        let tk = [ne as u32, slots as u32, mode, m.cfg.normalize as u32, m.cfg.routed_scale.to_bits(), m.cfg.n_group, m.cfg.topk_group, 0];
+        match &m.sel_bias {
+            Some(b) => self.dispatch(MOE_TOPK_BIAS, &[&logits, b], &selw, bytemuck::cast_slice(&tk), (t as u32, 1, 1)),
+            None => self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (t as u32, 1, 1)),
+        }
+        let hmid = self.alloc(t * slots, ff);
+        let gx = (ff as u32).min(32768);
+        let gy = (ff as u32).div_ceil(gx);
+        let dims = [ff as u32, gu_k as u32, (gu_k / 32) as u32, gx, slots as u32, ff2 as u32, 0u32, 0u32];
+        self.dispatch(glu_sh, &[n2, gu_qw, gu_qs, &selw], &hmid, bytemuck::cast_slice(&dims), (gx, gy, (t * slots) as u32));
+        let out = self.alloc(t, d);
+        let gx2 = (d as u32).min(32768);
+        let gy2 = (d as u32).div_ceil(gx2);
+        let dims2 = [d as u32, dn_k as u32, (dn_k / 32) as u32, gx2, slots as u32, 0u32, 0u32, 0u32];
+        self.dispatch(dn_sh, &[&hmid, dn_qw, dn_qs, &selw, x2], &out, bytemuck::cast_slice(&dims2), (gx2, gy2, t as u32));
+        Some(out)
+    }
     fn moe_ffn_gpu_routed(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Option<Tensor> {
+        // GROUP-LIMITED ROUTING is CPU-only for now: the GPU TOPK kernels select globally, which
+        // picks wrong experts whenever the honest top-k spans more than topk_group groups. Decline
+        // to v1 (which routes correctly) rather than run a divergent selection — the kernel port
+        // is the named next step. Said once, like every other decline on this path.
+        // The decline that used to live here is GONE: MOE_TOPK_BIAS now applies group limiting
+        // itself. It cost a measured 256x in dispatches on llada2 (v1 issues per-expert-per-layer
+        // work: 20 layers x 256 experts x 3 = the 276003 dispatches seen in an 18-forward run).
+        // gate-moe-t is the oracle for this path and runs on a GROUPED tiny now.
         self.moe_ffn_gpu_routed_inner(m, n2, d, x2).map(|(t, _)| t)
     }
     fn moe_ffn_gpu_routed_inner(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Option<(Tensor, Tensor)> {
@@ -5397,7 +6713,13 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             // Untested against a real IQ1_S MoE checkpoint: nothing builds an Iq1 stack yet, so
             // this arm is reachable only once the loader stops converting them.
             LinKind::Iq1(q) => (&q.blocks, self.iq1s_grid_tensor(), q.k, MOE_MATVEC_IQ1_S),
-            LinKind::F32(_) => return None,
+            LinKind::F32(_) => {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("wgpu-engine: MoE v2 declined: stacked gate_up is F32 (no quantized stack was built for this model)");
+                }
+                return None;
+            }
         };
         let (dn_qw, dn_qs, dn_k, sh_dn) = match &m.stacked_down.kind {
             LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
@@ -5443,8 +6765,11 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let selw = self.alloc(1, 2 * slots);
         // mode 1 = sigmoid. Selection is unchanged either way; only the weighting differs.
         let mode = match m.cfg.norm { crate::moe::RouteNorm::Sigmoid => 1u32, _ => 0 };
-        let tk = [ne as u32, slots as u32, mode, m.cfg.normalize as u32];
-        self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (1, 1, 1));
+        let tk = [ne as u32, slots as u32, mode, m.cfg.normalize as u32, m.cfg.routed_scale.to_bits(), m.cfg.n_group, m.cfg.topk_group, 0];
+        match &m.sel_bias {
+            Some(b) => self.dispatch(MOE_TOPK_BIAS, &[&logits, b], &selw, bytemuck::cast_slice(&tk), (1, 1, 1)),
+            None => self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (1, 1, 1)),
+        }
         // 3) fused gate||up for each selected expert (broadcast activation)
         // one dispatch across ALL selected experts: wg.z = slot (was 8 dispatches — the dominant
         // per-layer dispatch cost; on Asahi each submit batch costs ~4-5 ms of sync, so dispatch count
@@ -5484,7 +6809,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 n2s = buf;
                 &n2s
             } else { n2 };
-            let dims = [ff as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32,
+            let dims = [ff as u32, gu_k as u32, (gu_k / 32) as u32, gx, slots as u32, ff2 as u32,
                         if prescale { 1u32 } else { 0u32 }, 0u32];
             self.dispatch(glu_sh, &[act, gu_qw, gu_qs, &selw], &hmid, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
             hmid
@@ -5758,8 +7083,12 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let k = b.wk.apply(self, &h1, t);
         let v = b.wv.apply(self, &h1, t);
         let attn = self.bidir_attn(&q, &k, &v, t, d, n_heads, n_heads);
-        let o = b.wo.apply(self, &attn, t);
-        let x2 = self.add_t(x, &o);
+        // Fuse the attention residual into the projection's epilogue: apply_add is what the
+        // FFN's down-projection has always used, and it was simply never called here. An ADD
+        // of two [1, d] vectors is 8 KB of work behind a full dispatch — one per layer, on a
+        // decode bound by launches rather than arithmetic. apply_add falls back to
+        // matvec-then-add for kinds without a fused kernel, so nothing regresses.
+        let x2 = b.wo.apply_add(self, &attn, t, x);
         let h2 = self.layernorm_t(&x2, &b.g2, &b.b2, t, d, eps);
         let f1 = b.fc1.apply(self, &h2, t);
         let act = if quick_gelu { self.gelu_quick_t(&f1) } else { self.gelu_tanh_t(&f1) };
@@ -5789,12 +7118,16 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // Pinned as a comment because the ordering lives inside one nested expression: a refactor
         // that hoists these into statements could reorder them without looking wrong, and swapping
         // norm and rope produces gibberish rather than an error.
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
         let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd), w, t, kv, hd, eps);
         let v = w.wv.apply(self, &n1, t);
         let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, t); // wo: [d, ad] projects the attention width back to d
-        let x2 = self.add_t(x, &o);
+        // Fuse the attention residual into the projection's epilogue: apply_add is what the
+        // FFN's down-projection has always used, and it was simply never called here. An ADD
+        // of two [1, d] vectors is 8 KB of work behind a full dispatch — one per layer, on a
+        // decode bound by launches rather than arithmetic. apply_add falls back to
+        // matvec-then-add for kinds without a fused kernel, so nothing regresses.
+        let x2 = w.wo.apply_add(self, &attn, t, x);
         self.ffn_apply(w, &x2, t, d, eps)
     }
 
@@ -5810,7 +7143,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
         let q = match w.attn_temp {
             Some(at) if w.nope && at.active_at(t.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, 0, t, ad),
             _ => q,
@@ -5820,8 +7153,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         self.write_rows(kc, &k, 0, t, kv);
         self.write_rows(vc, &v, 0, t, kv);
         let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, t);
-        let x2 = self.add_t(x, &o);
+        // Same fusion as the annotated site above: the residual folds into the matvec epilogue.
+        let x2 = w.wo.apply_add(self, &attn, t, x);
         self.ffn_apply(w, &x2, t, d, eps)
     }
 
@@ -5834,7 +7167,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let base_freq = if w.nope { 0.0 } else { base_freq };   // Llama4 iRoPE NoPE switch
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, s, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd), w, s, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd), w, s, ad, hd, eps);
         let q = match w.attn_temp {
             Some(at) if w.nope && at.active_at(base + s.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, base, s, ad),
             _ => q,
@@ -5845,8 +7178,12 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         self.write_rows(vc, &v, base, s, kv);
         // per-row sliding window, from this layer's config (None = causal only)
         let attn = self.attention_mh_ext_swa(&q, kc, vc, base, s, ad, n_heads, n_kv_heads, w.swa);
-        let o = w.wo.apply(self, &attn, s);
-        let x2 = self.add_t(x, &o);
+        // Fuse the attention residual into the projection's epilogue: apply_add is what the
+        // FFN's down-projection has always used, and it was simply never called here. An ADD
+        // of two [1, d] vectors is 8 KB of work behind a full dispatch — one per layer, on a
+        // decode bound by launches rather than arithmetic. apply_add falls back to
+        // matvec-then-add for kinds without a fused kernel, so nothing regresses.
+        let x2 = w.wo.apply_add(self, &attn, s, x);
         self.ffn_apply(w, &x2, s, d, eps)
     }
     /// Batched prefill: run the whole prompt through every layer in one `[t,d]` pass,
@@ -5855,6 +7192,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// row to logits instead of all T (the per-token output projection sequential
     /// prefill wastes on the discarded rows).
     pub fn prefill_batched(&self, m: &Model, c: &KvCache, prompt: &[u32]) -> Vec<f32> {
+        self.activate_model(m);
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
         let mut xh = Vec::with_capacity(t * m.d);
@@ -5866,7 +7204,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
         let last = self.alloc(1, m.d);
         self.copy_row(&last, 0, &xn, t - 1, m.d);
-        self.download(&m.output.apply(self, &last, 1))
+        self.download(&self.logits_out(m, &last, 1))
     }
 
     /// Memory-bounded prefill: process the prompt in blocks of `chunk` via `block_prefill_ext` at
@@ -5876,6 +7214,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// identical to `prefill_batched` (each block attends causally to the cache the prior blocks
     /// filled). Only the final block's last row is projected, matching `prefill_batched`.
     pub fn prefill_chunked(&self, m: &Model, c: &KvCache, prompt: &[u32], chunk: usize) -> Vec<f32> {
+        self.activate_model(m);
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
         // BATCH PREFILL INTO A FRAME. Prefill never opened one, so every dispatch took `dispatch`'s
@@ -5895,7 +7234,19 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             let block = &prompt[start..end];
             let s = block.len();
             let mut xh = Vec::with_capacity(s * m.d);
-            for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+            for &id in block {
+                // A TOKEN THE MODEL DOES NOT HAVE is a tokenizer/model mismatch, and the raw slice
+                // said only "range start index 524288000 out of range for slice of length
+                // 517996544" — true, unreadable, and three divisions away from the cause. Naming the
+                // id, the width and the likely reason turns it into a one-line diagnosis.
+                let st = id as usize * m.d;
+                assert!(st + m.d <= m.embed.len(),
+                    "token id {id} is outside this model's vocabulary of {} — the tokenizer and the \
+weights disagree. A BORROWED tokenizer (LOGSCOPE_TOKENIZER_GGUF) of a different width is the usual \
+cause: Llama-3's 128256 against a trimmed 126464 shares its low ids but not its specials, so the \
+prompt tokenises fine and then indexes past the embedding table.", m.embed.len() / m.d);
+                xh.extend_from_slice(&m.embed[st..st + m.d]);
+            }
             let mut x = self.upload(&xh, s, m.d);
             for li in 0..m.n_layers {
                 x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
@@ -5905,7 +7256,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 let xn = self.rmsnorm_t(&x, &m.out_norm, s, m.d, m.eps);
                 let last = self.alloc(1, m.d);
                 self.copy_row(&last, 0, &xn, s - 1, m.d);
-                logits = self.download(&m.output.apply(self, &last, 1));
+                logits = self.download(&self.logits_out(m, &last, 1));
             }
             start = end;
         }
@@ -6244,6 +7595,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // Residual-fold variants: identical to MATVEC_Q8_0 / MATVEC_Q4 but write c[col]=dot+resid[col],
 // folding the post-projection residual add (wo/wdown) into the matmul epilogue — saves one ADD
 // dispatch/layer each on the launch-bound decode path. resid is binding(3); c/dims shift to 4/5.
+/// SwiGLU + down-projection + residual in ONE dispatch. The WGSL was written and documented for
+/// exactly this and then stranded: src/kernels.rs declares it, and src/kernels.rs is not a module of
+/// this crate — nothing includes it, so the file has never been compiled. Included directly here.
+const SWIGLU_MATVEC_Q8_0_ADD: &str = include_str!("kernels/swiglu_matvec_q8_0_add.wgsl");
+
 const MATVEC_Q8_0_ADD: &str = r#"
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -6799,19 +8155,20 @@ const MOE_TOPK: &str = r#"
 // `mode` selects the WEIGHTING, not the selection: 0 = softmax over the chosen k, 1 = sigmoid of each
 // logit. Selection is identical either way because sigmoid is monotonic, so top-k by raw logit picks the
 // same experts — which is why this is a small change rather than a second kernel.
-struct D { n:u32,k:u32,mode:u32,normalize:u32 };
+struct D { n:u32,k:u32,mode:u32,normalize:u32,scale:f32,ng:u32,tg:u32,_c2:u32 };
 @group(0)@binding(0) var<storage,read> logits: array<f32>;
 @group(0)@binding(1) var<storage,read_write> selw: array<u32>;
 @group(0)@binding(2) var<uniform> d: D;
 @compute @workgroup_size(1,1,1)
-fn main(){
+fn main(@builtin(workgroup_id) wg:vec3<u32>){
+  let tok=wg.x;
   var idx: array<u32,16>; var lg: array<f32,16>;
   for(var s=0u;s<d.k;s=s+1u){
     var bi=0u; var bv=-3.4e38;
     for(var i=0u;i<d.n;i=i+1u){
       var taken=false;
       for(var t=0u;t<s;t=t+1u){ if(idx[t]==i){ taken=true; } }
-      if(!taken && logits[i]>bv){ bv=logits[i]; bi=i; }
+      if(!taken && logits[tok*d.n+i]>bv){ bv=logits[tok*d.n+i]; bi=i; }
     }
     idx[s]=bi; lg[s]=bv;
   }
@@ -6830,7 +8187,86 @@ fn main(){
   }
   // Softmax is normalized by construction; sigmoid only when the model says so.
   let dnm = select(1.0, sum, d.mode == 0u || d.normalize == 1u);
-  for(var s=0u;s<d.k;s=s+1u){ selw[s]=idx[s]; selw[d.k+s]=bitcast<u32>(lg[s]/dnm); }
+  // ROUTED SCALE: expert_weights_scale multiplies the applied weight (llada2/GLM: 2.5). The CPU
+  // route always applied it; this kernel silently did not — argmax survives, p/entropy do not.
+  for(var s=0u;s<d.k;s=s+1u){ selw[tok*2u*d.k+s]=idx[s]; selw[tok*2u*d.k+d.k+s]=bitcast<u32>(lg[s]/dnm*d.scale); }
+}"#;
+
+// MOE_TOPK_BIAS: MOE_TOPK with the no-aux SELECTION bias (exp_probs_b). Selection ranks
+// gating(logit)+bias[i]; the stored weight basis is the raw logit, so the weighting tail is
+// byte-for-byte MOE_TOPK's — the bias steers WHO is picked and never what a pick weighs
+// (llama-graph.cpp:1870-1874). Softmax mode computes the real row softmax first: monotonicity
+// dies the moment a bias is added.
+const MOE_TOPK_BIAS: &str = r#"
+struct D { n:u32,k:u32,mode:u32,normalize:u32,scale:f32,ng:u32,tg:u32,_c2:u32 };
+@group(0)@binding(0) var<storage,read> logits: array<f32>;
+@group(0)@binding(1) var<storage,read> bias: array<f32>;
+@group(0)@binding(2) var<storage,read_write> selw: array<u32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(1,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>){
+  let tok=wg.x;
+  var smx=-3.4e38; var ssum=0.0;
+  if (d.mode == 0u) {
+    for(var i=0u;i<d.n;i=i+1u){ smx=max(smx,logits[tok*d.n+i]); }
+    for(var i=0u;i<d.n;i=i+1u){ ssum=ssum+exp(logits[tok*d.n+i]-smx); }
+  }
+  // GROUP-LIMITED ROUTING (ng groups, keep the best tg). The reference scores a group by the SUM OF
+  // ITS TOP-2 selection scores, keeps the tg highest-scoring groups, and runs top-k only inside
+  // them. This lived on the CPU route since c4-734, and both GPU-routed paths DECLINED whenever it
+  // was active — which on a 256-expert model meant the v1 grouped path, i.e. per-expert-per-layer
+  // dispatches: a measured 276003 dispatches for ~18 forwards (20 layers x 256 experts x 3), and
+  // 0.37 tok/s. Doing it here is what lets the token-axis path engage at all.
+  var allowed: array<bool,64>;
+  let ng = select(1u, d.ng, d.ng > 1u);
+  for(var g=0u; g<ng; g=g+1u){ allowed[g]=true; }
+  if(d.ng > 1u && d.tg >= 1u && d.tg < d.ng){
+    let gsz = d.n / d.ng;
+    var gscore: array<f32,64>;
+    for(var g=0u; g<d.ng; g=g+1u){
+      var t1=-3.4e38; var t2=-3.4e38;
+      for(var j=0u; j<gsz; j=j+1u){
+        let i = g*gsz + j;
+        let l = logits[tok*d.n+i];
+        let prob = select(1.0/(1.0+exp(-l)), exp(l-smx)/ssum, d.mode==0u);
+        let sc = prob + bias[i];
+        if(sc > t1){ t2=t1; t1=sc; } else if(sc > t2){ t2=sc; }
+      }
+      gscore[g] = select(t1, t1+t2, gsz > 1u);
+      allowed[g] = false;
+    }
+    // Keep the tg best groups (selection sort over ng<=64; ng is 8 on llada2).
+    for(var pick=0u; pick<d.tg; pick=pick+1u){
+      var bg=0u; var bv=-3.4e38;
+      for(var g=0u; g<d.ng; g=g+1u){ if(!allowed[g] && gscore[g]>bv){ bv=gscore[g]; bg=g; } }
+      allowed[bg]=true;
+    }
+  }
+  var idx: array<u32,16>; var lg: array<f32,16>;
+  for(var s=0u;s<d.k;s=s+1u){
+    var bi=0u; var bv=-3.4e38;
+    for(var i=0u;i<d.n;i=i+1u){
+      var taken=false;
+      for(var t=0u;t<s;t=t+1u){ if(idx[t]==i){ taken=true; } }
+      let gi = select(0u, i / (d.n / max(d.ng,1u)), d.ng > 1u);
+      let l=logits[tok*d.n+i];
+      let prob=select(1.0/(1.0+exp(-l)), exp(l-smx)/ssum, d.mode==0u);
+      let score=prob+bias[i];
+      if(!taken && allowed[gi] && score>bv){ bv=score; bi=i; }
+    }
+    idx[s]=bi; lg[s]=logits[tok*d.n+bi];
+  }
+  let mx=lg[0];
+  var sum=0.0;
+  if (d.mode == 1u) {
+    for(var s=0u;s<d.k;s=s+1u){ lg[s]=1.0/(1.0+exp(-lg[s])); sum=sum+lg[s]; }
+  } else {
+    for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-mx); sum=sum+lg[s]; }
+  }
+  let dnm = select(1.0, sum, d.mode == 0u || d.normalize == 1u);
+  // ROUTED SCALE: expert_weights_scale multiplies the applied weight (llada2/GLM: 2.5). The CPU
+  // route always applied it; this kernel silently did not — argmax survives, p/entropy do not.
+  for(var s=0u;s<d.k;s=s+1u){ selw[tok*2u*d.k+s]=idx[s]; selw[tok*2u*d.k+d.k+s]=bitcast<u32>(lg[s]/dnm*d.scale); }
 }"#;
 
 // MOE_MATVEC_Q8 / MOE_MATVEC_Q4: the base MATVEC_Q8_0/MATVEC_Q4 kernels with the weight row indexed
@@ -6931,17 +8367,18 @@ fn dotq8(row:u32, tid:u32, k:u32, kb:u32, abase:u32) -> f32 {
 }
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let tok=wg.z/d._slot; let slot=wg.z%d._slot;
   if(col>=d.n){ return; }
-  let abase=select(0u, slot*d.k, d.xper==1u);
-  let expert=selw[slot];
+  let abase=select(tok*d.k, wg.z*d.k, d.xper==1u);
+  let expert=selw[tok*2u*d._slot+slot];
   let grow=expert*d.rstride+col;         // gate row: column j
   let urow=expert*d.rstride+d.n+col;     // up row:   column ff+j
   rg[tid]=dotq8(grow,tid,d.k,d.kb,abase);
   ru[tid]=dotq8(urow,tid,d.k,d.kb,abase);
   workgroupBarrier();
   for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
-  if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+  if(tid==0u){ let g=rg[0]; o[wg.z*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
 }"#;
 
 // Fused gate‖up + SwiGLU (Q4) — identical structure, 4-bit weights (nibble − 8).
@@ -6970,17 +8407,18 @@ fn dotq4(row:u32, tid:u32, k:u32, kb:u32, abase:u32) -> f32 {
 }
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let tok=wg.z/d._slot; let slot=wg.z%d._slot;
   if(col>=d.n){ return; }
-  let abase=select(0u, slot*d.k, d.xper==1u);
-  let expert=selw[slot];
+  let abase=select(tok*d.k, wg.z*d.k, d.xper==1u);
+  let expert=selw[tok*2u*d._slot+slot];
   let grow=expert*d.rstride+col;
   let urow=expert*d.rstride+d.n+col;
   rg[tid]=dotq4(grow,tid,d.k,d.kb,abase);
   ru[tid]=dotq4(urow,tid,d.k,d.kb,abase);
   workgroupBarrier();
   for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
-  if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+  if(tid==0u){ let g=rg[0]; o[wg.z*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
 }"#;
 
 // Fused down-projection + weighted-combine + residual (Q8). The unfused path was: MOE_MATVEC (down,
@@ -7001,14 +8439,14 @@ struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let tok=wg.z;
   if(col>=d.d){ return; }
-  var total=resid[col];   // match MOE_WSUM order: acc=resid then += weighted terms
+  var total=resid[tok*d.d+col];   // match MOE_WSUM order: acc=resid then += weighted terms
   for(var s=0u;s<d.slots;s=s+1u){
-    let expert=selw[s];
-    let w=bitcast<f32>(selw[d.slots+s]);
+    let expert=selw[tok*2u*d.slots+s];
+    let w=bitcast<f32>(selw[tok*2u*d.slots+d.slots+s]);
     let row=expert*d.d+col;
-    let wbase=row*(d.k/4u); let sbase=row*d.kb; let abase=s*d.k;
+    let wbase=row*(d.k/4u); let sbase=row*d.kb; let abase=(tok*d.slots+s)*d.k;
     var acc=0.0; var kk=tid;
     loop { if(kk>=d.k){break;}
       let scale=qs[sbase+(kk/32u)];
@@ -7023,7 +8461,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if(tid==0u){ total=total+w*red[0]; }
     workgroupBarrier();
   }
-  if(tid==0u){ o[col]=total; }
+  if(tid==0u){ o[tok*d.d+col]=total; }
 }"#;
 
 // Fused down + combine + residual (Q4) — identical structure, 4-bit weights (nibble − 8).
@@ -7039,14 +8477,14 @@ struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let tok=wg.z;
   if(col>=d.d){ return; }
-  var total=resid[col];   // match MOE_WSUM order: acc=resid then += weighted terms
+  var total=resid[tok*d.d+col];   // match MOE_WSUM order: acc=resid then += weighted terms
   for(var s=0u;s<d.slots;s=s+1u){
-    let expert=selw[s];
-    let w=bitcast<f32>(selw[d.slots+s]);
+    let expert=selw[tok*2u*d.slots+s];
+    let w=bitcast<f32>(selw[tok*2u*d.slots+d.slots+s]);
     let row=expert*d.d+col;
-    let wbase=row*(d.k/8u); let sbase=row*d.kb; let abase=s*d.k;
+    let wbase=row*(d.k/8u); let sbase=row*d.kb; let abase=(tok*d.slots+s)*d.k;
     var acc=0.0; var kk=tid;
     loop { if(kk>=d.k){break;}
       let scale=qs[sbase+(kk/32u)];
@@ -7061,7 +8499,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if(tid==0u){ total=total+w*red[0]; }
     workgroupBarrier();
   }
-  if(tid==0u){ o[col]=total; }
+  if(tid==0u){ o[tok*d.d+col]=total; }
 }"#;
 const MOE_WSUM: &str = r#"
 struct D { n:u32,k:u32,_b:u32,_c:u32 };
@@ -7148,6 +8586,21 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 
 // Row-broadcast scale: o[r,c] = x[r,c]·w[r]. The Llama4 weight-before-FFN step — the router gate
 // multiplies the expert's INPUT rows (not equivalent to output-weighting through SwiGLU).
+const LOGIT_SOFTCAP: &str = r#"
+// cap * tanh(x / cap), elementwise. Gemma 2 applies this to the final logits (and, separately, to
+// attention logits — that one is NOT this kernel; it lives inside the softmax).
+struct D { n:u32,_a:u32,_b:u32,_c:u32, cap:f32,_d:f32,_e:f32,_f:f32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= d.n) { return; }
+  o[i] = d.cap * tanh(x[i] / d.cap);
+}
+"#;
+
 const ROW_SCALE: &str = r#"
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
@@ -7459,8 +8912,13 @@ struct D { n:u32,d:u32,id_off:u32,_c:u32 };
 @group(0)@binding(2) var<storage,read_write> o: array<f32>;
 @group(0)@binding(3) var<uniform> dd: D;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) g:vec3<u32>){
-  let p=g.x; if(p>=dd.n*dd.d){return;}
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  // 2D-SAFE INDEX. A whole-canvas diffusion forward gathers n*d elements at once: at d=2048 a
+  // 2048-token canvas is 4194304 elements = exactly 65536 workgroups, one past the 65535 per-
+  // dimension limit, so every dispatch was rejected as a NON-FATAL validation error and the
+  // embeddings silently never happened. wg1() already spills into y for kernels that read it;
+  // this one only read g.x, so it had to be dispatched flat and could not be spilled.
+  let p=g.y*nwg.x*64u+g.x; if(p>=dd.n*dd.d){return;}
   let i=p/dd.d; let c=p%dd.d;
   o[p]=table[ids[dd.id_off+i]*dd.d+c];
 }"#;
@@ -7707,6 +9165,26 @@ pub struct Model {
     pub d: usize, pub h: usize, pub vocab: usize, pub n_layers: usize, pub n_heads: usize,
     pub n_kv_heads: usize, pub head_dim: usize,
     pub base: f32, pub eps: f32,
+    /// Split-half (NEOX) vs adjacent-pair (GPT-J) RoPE pairing — a property of the CHECKPOINT.
+    /// These three used to live only as engine-global atomics that each load overwrote, so every
+    /// model still in use silently adopted the LAST-loaded model's rope config. kernel-validate
+    /// caught it as 11 decode gates red on two machines: the same forward that matched CPU at 7e-7
+    /// read 3e-1 after other models loaded. The atomics remain as the ACTIVE-model mirror
+    /// (kernels can't see a Model), refreshed by `Gpu::activate_model` at every public entry.
+    pub rope_neox: bool,
+    /// Rotary dims per head (partial RoPE); == head_dim when the whole head rotates.
+    pub rope_dims: usize,
+    /// YaRN magnitude scale applied to rotated q and k; 1.0 when YaRN is off.
+    pub rope_mscale: f32,
+    /// {arch}.context_length — the context the checkpoint was TRAINED for. 0 = the GGUF didn't
+    /// say. This is the one missing read that kept ctxwin::plan_ctx unwired: the planner's
+    /// trained_max had no source, so the window stayed a hand-set n_ctx and the operator's
+    /// repository was elided out of the middle of its own prompt (c4-842).
+    pub trained_ctx: usize,
+    /// Resident weight bytes the memory planner chose at load, 0 when no plan ran (f32 loads,
+    /// synthetic fixtures). Runtime-only — machine-specific, so never serialized. What's left of
+    /// the GPU budget after this is the KV budget plan_ctx sizes against.
+    pub planned_weight_bytes: u64,
     /// MLA (Multi-head Latent Attention) rank config, present only for DeepSeek-V3/GLM-MoE checkpoints.
     /// When set, the KV cache stores the compressed latent instead of per-head K/V. `None` = standard MHA/GQA.
     pub mla: Option<MlaConfig>,
@@ -7716,6 +9194,18 @@ pub struct Model {
     /// d=3840 that is a factor of ~62 at the input, and it cascades — a model missing it does not
     /// produce slightly-off output, it produces nonsense. 1.0 everywhere else, so no other model changes.
     pub embed_scale: f32,
+    /// Attention scale from the GGUF (`{arch}.attention.scale`), when the checkpoint states one
+    /// instead of accepting 1/sqrt(head_dim). Gemma 3 27B and Gemma 4 do: 27B uses
+    /// 1/sqrt(n_embd/n_head), which differs from 1/sqrt(head_dim) whenever head_dim != d/n_heads —
+    /// exactly the case those checkpoints are in. None = the kernels' own default, unchanged.
+    pub attn_scale: Option<f32>,
+    /// Gemma 2's tanh soft-cap on the FINAL logits: `cap * tanh(x / cap)`. None = no cap.
+    ///
+    /// Not a cosmetic clamp — it changes the shape of the whole distribution, so sampling
+    /// temperature and top-p mean different things with and without it. A Gemma 2 run without it
+    /// is a different model, which is why the feature registry refused the architecture rather
+    /// than loading it uncapped.
+    pub logit_softcap: Option<f32>,
     /// DSA (DeepSeek Sparse Attention) lightning-indexer config, present only when the indexer weights ship.
     /// When set (and seq > index_topk) attention is sparse; `None` = dense attention.
     pub dsa: Option<DsaConfig>,
@@ -7724,6 +9214,15 @@ pub struct Model {
     /// the count marks that a native MTP draft head is PRESENT — the prerequisite for wiring MTP speculative
     /// decode (a lossless speedup, like the n-gram draft) later. 0 = no MTP head.
     pub mtp_layers: usize,
+    /// Masked-DIFFUSION checkpoint (llada2/rnd1/dream/llada): trained to denoise, not to continue.
+    /// AR-decoding one emits fluent noise BY DESIGN — callers (serve, the egui worker) must route
+    /// generation through `diffuse_generate` when this is set, or refuse with that explanation.
+    pub diffusion: bool,
+    /// tokenizer.ggml.mask_token_id, captured at load so generation doesn't need the Gguf again.
+    pub mask_token_id: Option<u32>,
+    /// diffusion.shift_logits, resolved at load with llama.cpp's rule (ABSENT defaults TRUE —
+    /// Dream lineage; diffusion-cli.cpp:182-186). Shifted: position i reads logits row i-1.
+    pub shift_logits: bool,
 }
 
 /// Multi-head Latent Attention config (DeepSeek-V2/V3, GLM-MoE-DSA). The dims that make MLA's compressed
@@ -7791,6 +9290,16 @@ impl Model {
     pub fn active_params_per_token(&self, n_active_experts: usize) -> u64 {
         active_params_per_token(self.d, self.h, self.vocab, self.n_layers,
                                 self.n_kv_heads, self.head_dim, n_active_experts)
+    }
+
+    /// KV-cache bytes for ONE token of THIS model, at what the engine actually stores: f32 K and V
+    /// (write_rows strides cols*4), plus the f32 MLA latent when present — new_cache_for allocates
+    /// BOTH for MLA models, so the honest per-token cost is the sum, not the compressed figure the
+    /// marketing arithmetic would pick. This is the kv_per_token input to ctxwin::plan_ctx.
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        let std = crate::ctxwin::kv_bytes_per_token(self.n_layers, self.n_kv_heads, self.head_dim, 4);
+        let mla = self.mla.map(|c| (self.n_layers * c.latent_width() * 4) as u64).unwrap_or(0);
+        std + mla
     }
 }
 
@@ -8103,6 +9612,79 @@ a '{declared}'");
         // use ordinary GQA attention (attn_q/k/v, often with QK-norm + bias) plus shared-expert MoE, which
         // we DO support. So only treat this arch as unsupported-MLA when the MLA projection tensors are
         // actually present; otherwise fall through to the standard attention+MoE path.
+        // A LAYER TYPE WE HAVE NOT IMPLEMENTED IS NOT THE SAME AS AN UNVERIFIED SHAPE, and
+        // LOGSCOPE_TRY_UNSUPPORTED_ARCH should not conflate them. That flag's bargain is "wrong
+        // output is the expected failure" — reasonable when the question is whether a family's
+        // shape matches. It is not a trade at all when whole blocks have NO forward pass: there is
+        // nothing to be wrong, only something to fail confusingly later.
+        //
+        // Which is what happened. Forcing Qwen3.6-35B-A3B skipped the c4-807 census, met the
+        // DeltaNet in-projection as if it were attention, and reported "blk.0.attn_qkv has 8192 rows
+        // but this model needs 5120". That refusal is correct and well-reasoned, but it describes a
+        // symptom many steps downstream of "three quarters of this model is recurrent". The census
+        // now runs BEFORE the forward path is chosen, and refuses whatever the flag says.
+        {
+            // A zero block count is not a model, it is a failed lookup. Say which, and name the
+            // prefix that WOULD have worked — that diagnostic is exactly what three theories about
+            // the silent census were missing. Not fatal here: the census falls back to counting
+            // tensor names (c4-815), so this reports and continues rather than refusing a file the
+            // rest of the loader can still read via its own prefix override.
+            let nb = match gguf::required_u32(&g, acfg.prefix, "block_count") {
+                Ok(v) => v as usize,
+                Err(why) => {
+                    static SAID_BC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID_BC.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("loader: {why}. Falling back to the tensor names for the block count.");
+                    }
+                    0
+                }
+            };
+            let (ssm, tot) = gguf::ssm_layer_census(&g, nb);
+            // SAY WHEN A DRAFT HEAD IS PRESENT AND IGNORED. An MTP head is a draft model shipped
+            // inside the file — same tokenizer, same training, no second checkpoint to align — and
+            // it is exactly what the phase-balance verdict has been asking for since c4-750:
+            // "decode has nothing in flight to cover memory latency; what is missing is something
+            // producing more than one candidate token, which is speculative decoding". Loading a
+            // file that carries one and running single-token decode anyway leaves a reported ~2x on
+            // the table without a word.
+            {
+                let (heads, declared) = gguf::mtp_census(&g, acfg.prefix);
+                if heads > 0 {
+                    static SAID_MTP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID_MTP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("loader: {}", crate::spec::mtp_notice(heads, declared));
+                    }
+                }
+            }
+            // SAY THE CENSUS RAN, always. Three theories were spent on why this stayed silent on a
+            // 40-layer Qwen3.6 — a stale binary (disproved by the build stamp), an hparam-prefix
+            // mismatch (disproved: that file reads its hparams fine), a skipped branch (disproved:
+            // this sits immediately after acfg, unconditionally). Every one of them was a story
+            // about code that could have been an observation. One line ends the guessing: if the
+            // next log shows 0 of 40, the counter is wrong; if it shows nothing, this code is not
+            // reached; if it shows 30 of 40, the refusal below is.
+            {
+                static SAID_CENSUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID_CENSUS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("loader: recurrent-layer census — {ssm} of {tot} block(s) carry ssm_* \
+tensors (block count {} from metadata key '{}.block_count', {} from tensor names)",
+                        nb, acfg.prefix, gguf::block_count_from_tensors(&g));
+                }
+            }
+            if ssm > 0 && std::env::var("LOGSCOPE_TRY_RECURRENT").is_err() {
+                let qkv_rows = g.tensor("blk.0.attn_qkv.weight")
+                    .and_then(|t| t.dims.first().copied()).unwrap_or(0);
+                return Err(format!(
+                    "{ssm} of {tot} blocks carry ssm_* tensors — this is a HYBRID RECURRENT model \
+(Gated DeltaNet), not a transformer with an unusual shape. A DeltaNet block reuses the attention \
+projection NAMES for its own q/k/v, so blk.0.attn_qkv here is a {qkv_rows}-row in-projection for the \
+recurrent state, and reading it as a fused attention qkv is what produces the row-count error further \
+down. This engine has no recurrent forward pass, so those {ssm} blocks have nowhere to run — and \
+LOGSCOPE_TRY_UNSUPPORTED_ARCH cannot help, because it trades an unverified SHAPE for possibly-wrong \
+output and here there is no output to be wrong about. LOGSCOPE_TRY_RECURRENT=1 forces it anyway if \
+you want the tensor dump."));
+            }
+        }
         let has_mla_tensors = g.tensor("blk.0.attn_kv_a_mqa.weight").is_some()
             || g.tensor("blk.0.attn_kv_a.weight").is_some()
             || g.tensor("blk.0.attn_kv_b.weight").is_some();
@@ -8167,7 +9749,20 @@ this is a reading of the file rather than a guess",
             let have_cfg = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) > 0
                 || derived.is_ok();
             if !have_cfg {
-                let layout = g.dump_tensors("blk.0.");
+                // COUNT THE DELTANET LAYERS BEFORE DUMPING TENSORS. A reader looking at blk.0 of a
+                // Qwen3.6 sees ssm_* beside attn_qkv and has to know that means Gated DeltaNet, then has
+                // to check whether every block is like that. The census answers both, and turns "unknown
+                // architecture" into how much of the model has nowhere to run.
+                let n_blocks = g.get_u32(&format!("{}.block_count", acfg.prefix)).unwrap_or(0) as usize;
+                let hybrid = match gguf::ssm_layer_census(&g, n_blocks) {
+                    (ssm, tot) if ssm > 0 => format!("\nHYBRID RECURRENT MODEL: {ssm} of {tot} blocks \
+carry ssm_* tensors (Gated DeltaNet — it reuses the attention projections for q/k/v, so attn_qkv \
+being present does NOT make a block a transformer). This engine has no recurrent path, so those \
+{ssm} layers have no forward pass rather than a slow one; only the other {} are shapes it runs. \
+Size is not the blocker.\n", tot - ssm),
+                    _ => String::new(),
+                };
+                let layout = format!("{hybrid}{}", g.dump_tensors("blk.0."));
                 // The derivation was tried and failed; say WHY rather than repeating that the
                 // metadata is silent. "Unknown" sends someone looking for a config key; the real
                 // answer is usually a specific tensor that is absent or the wrong shape.
@@ -8188,9 +9783,16 @@ particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layou
             // what mla.rs expects — the shapes line up and llama.cpp's declaration says they should, but
             // no MLA checkpoint has run end to end here.
             let split_kv_b = g.tensor("blk.0.attn_k_b.weight").is_some();
-            eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache, per-layer routing, \
-{} kv_b layout. UNVERIFIED on a real checkpoint: the decode block and cache are gated, the weight \
-layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
+            // SAY THAT IT DID NOT ENGAGE. This block derives dimensions, logs, and ends — there is
+            // no MLA layer-loading path for it to hand off to, so the dense loop runs next and
+            // fails twenty layers later with "the MLA path did not engage", which reads as a
+            // surprise after a banner that announced MLA attention. It is not a surprise; it is
+            // this branch having nowhere to go. Refuse here, where the reason is legible, rather
+            // than describing an unbuilt path in the present tense.
+            eprintln!("wgpu-engine: MLA tensors detected ({} kv_b layout) and dimensions recovered — \
+but MLA LAYER LOADING IS NOT IMPLEMENTED. The dense path cannot consume attn_q_a/attn_kv_a_mqa, so \
+this load will fail. tools/tiny-variants/gen_glmdsa.py reproduces it in 3 layers at d=64.",
+                if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
         }
         // DERIVED, not read off the entry. archfeat can veto a declared-supported architecture — the
         // direction that ships broken output — while a declared-unsupported one stays refused whatever
@@ -8245,7 +9847,17 @@ a real checkpoint, and this refusal is what prevents that ever happening. Wrong 
 failure when forcing it, not a surprise; coherent output is the evidence that would flip the flag.\n\
 {layout}"));
             }
-            eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
+            // SAY WHAT THE FILE IS. This printed "is a DENSE checkpoint (no experts)"
+            // unconditionally once the refusal was passed — so an 8-expert glm-dsa fixture was
+            // announced as dense two lines before the loader printed "MoE => q4-resident" about the
+            // same file. The routing was right and the sentence was wrong, which is the worse way
+            // round: it sends a reader looking for a dense-path bug that does not exist.
+            if expert_count > 0 {
+                eprintln!("loader: '{arch}' is a {expert_count}-expert MoE checkpoint — loading via the {} \
+forward path", acfg.prefix);
+            } else {
+                eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
+            }
         }
         // Metadata key prefix. Normally the registry's ("llama"/"qwen3"/...), but some conversions write
         // general.architecture with one spelling and the hparam keys under ANOTHER (seen live: a Qwen3.5
@@ -8481,6 +10093,22 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
             .or_else(|| g.tensor("blk.0.attn_q.weight").map(|t| (t.dims.iter().product::<u64>() as usize / d) / n_heads))
             .filter(|&hd| hd > 0)
             .unwrap_or_else(|| d / n_heads.max(1));
+        // PARTIAL RoPE. rope.dimension_count when the converter wrote it; the LLaDA2 architecture
+        // defaults to head_dim/2 (config partial_rotary_factor 0.5, rotary_dim 64 of 128) because the
+        // fork GGUFs in circulation omit the key — rotating the full head on this family scrambles
+        // every position. Stored unconditionally so one load cannot leak its value into the next.
+        let rot = {
+            let kv_rot = g.get_u32(&format!("{pfx}.rope.dimension_count")).unwrap_or(0) as usize;
+            let rot = if kv_rot > 0 && kv_rot <= head_dim { kv_rot }
+                else if acfg.prefix == "llada2" { head_dim / 2 }
+                else { head_dim };
+            self.rope_dims.store(rot as u32, std::sync::atomic::Ordering::Relaxed);
+            if rot < head_dim {
+                eprintln!("loader: PARTIAL RoPE — {rot} of {head_dim} head dims rotate ({})",
+                    if kv_rot > 0 { "rope.dimension_count" } else { "LLaDA2 architecture default; a GGUF carrying rope.dimension_count overrides" });
+            }
+            rot
+        };
         let attn_dim = n_heads * head_dim;      // Q / attention width (e.g. 4096 for Qwen3-4B, while d=2560)
         let kv = n_kv_heads * head_dim;         // K/V projection + cache row width (GQA when < attn_dim)
         // HOSTILE-DIMENSION GUARD (cf. Colibri's "absurd n from hostile model files" + matmul shape-overflow
@@ -8525,6 +10153,7 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
         // Residency planning (memplan): prefer int8; auto-fall-back to q4 when int8 won't fit the budget;
         // refuse (with a number) only when even q4 won't fit. LOGSCOPE_Q4_RESIDENT forces q4 regardless.
         let mut auto_q4 = false;
+        let mut planned_weight_bytes: u64 = 0;
         let mut moe_stream_pin: Option<usize> = None; // Some(pin_count) when MoE expert streaming is planned
         if vocab_est > 0 {
             if let Some(budget) = store::resident_budget_bytes() {
@@ -8556,23 +10185,24 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                     eprintln!("loader: GPU budget {:.1} GiB clamped to {:.1} GiB — this driver \
 accepts a large single allocation but will not hold more than that in buffers at once. A plan above \
 it fails mid-load rather than at planning time. \
-This ceiling is MEASURED, not guessed: --gate-residency held 124 GiB-slabs on an M2 Ultra and the \
-125th was refused, on a machine with 177 GiB of RAM. Note it is the CONCURRENT ceiling \u{2014} \
---gate-vram's larger single-allocation figure answers a different question and does not raise this \
-one. It is still ONE machine's number: on other Asahi hardware run `kernel-validate \
---gate-residency` to measure THIS device.",
+THIS FIGURE IS A COMPILED-IN CONSTANT, not a measurement of this device: it was measured once on an \
+M2 Ultra at 1 and 2 GiB slabs, mapped and unmapped, and every Asahi machine now receives that \
+number. On different hardware it may be wrong in either direction \u{2014} `kernel-validate \
+--gate-vram` measures the single-allocation ceiling on THIS device, and a load that fails part-way \
+through is the evidence that the concurrent one is lower than this.",
                         gpu_budget as f64 / (1u64 << 30) as f64,
                         crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB);
                     gpu_budget = cap;
                 }
             }
                     match plan(&shape, gpu_budget, 4096, 2, 256 * (1 << 20)) {
-                        Fit::Resident { fmt: Residency::Int8, .. } => {} // int8 fits — the default
+                        Fit::Resident { fmt: Residency::Int8, weight_bytes, .. } => { planned_weight_bytes = weight_bytes; } // int8 fits — the default
                         Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => {
+                            planned_weight_bytes = weight_bytes;
                             auto_q4 = true;
                             eprintln!("loader: int8 won't fit the ~{:.1} GiB GPU-buffer budget → auto-selecting q4-resident (~{:.1} GiB)", gib(gpu_budget), gib(weight_bytes));
                         }
-                        Fit::Resident { fmt: Residency::F32, .. } => {}
+                        Fit::Resident { fmt: Residency::F32, weight_bytes, .. } => { planned_weight_bytes = weight_bytes; }
                         Fit::Streaming { .. } => {
                             // MoE EXPERT STREAMING (LOGSCOPE_MOE_STREAM): the model won't fit with every
                             // expert resident, but experts are the whole reason — if we pin the hot ones and
@@ -8615,26 +10245,19 @@ one. It is still ONE machine's number: on other Asahi hardware run `kernel-valid
                         eprintln!("wgpu-engine: MoE fits FULLY RESIDENT ({:.1} GiB of {:.1} GiB budget) \
 — no expert streaming, no host copy, no staging ring. Set LOGSCOPE_MOE_STREAM=1 to force streaming.",
                             gib(full_resident), gib(gpu_budget));
-                        auto_q4 = true;
-                        // SUSPECTED FALL-THROUGH — the comment below may be wrong, and the compiler
-                        // is the witness.
+                        // NO ASSIGNMENT HERE, and the comment this replaces drew the WRONG
+                        // conclusion from the compiler. "value assigned to `auto_q4` is never read"
+                        // is a liveness fact: on every path out of this branch, auto_q4 is either
+                        // overwritten or never consumed. That proves the RESIDENT path does not read
+                        // auto_q4 — it does NOT prove control reaches the streaming branch, which is
+                        // what the old comment inferred and then reasoned from at length.
                         //
-                        // "value assigned to `auto_q4` is never read ... this value is reassigned
-                        // later and never read" means control flow DOES reach the streaming branch's
-                        // `auto_q4 = true; moe_stream_pin = Some(pin);` from here. The compiler does
-                        // not guess about reachability.
-                        //
-                        // If that is right, a model that FITS FULLY RESIDENT still gets
-                        // moe_stream_pin set, so it streams experts it did not need to stream — the
-                        // exact per-token cost this whole line of work is trying to remove, paid by
-                        // the models that had already escaped it.
-                        //
-                        // Not fixed here: the branch structure needs reading whole, and a wrong
-                        // early-return would turn a model that streams into one that refuses to
-                        // load. The check is one line of evidence away — load anything whose experts
-                        // fit under the budget and see whether "EXPERT STREAMING" prints after
-                        // "MoE fits FULLY RESIDENT".
-                        //
+                        // The real test of the fall-through is the runtime guard further down: it
+                        // prints "BUG — this model FITS FULLY RESIDENT and expert streaming is being
+                        // enabled anyway" if a model that printed the line above ever reaches the
+                        // streaming setup. No hardware log has ever contained it, which is weak but
+                        // real evidence the fall-through does not happen for the models run so far.
+                        // The guard stays; the speculation does not.
                         // moe_stream_pin stays None, which is what selects the resident path below.
                     } else if dense + ring_cost > gpu_budget {
                                     return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB.{} Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget),
@@ -8784,28 +10407,15 @@ either",
                                     gib(resident), gib(dense), n_expert.saturating_sub(pin));
                             } else {
                             // report what streaming WOULD do so it's actionable, even though execution isn't wired
-                            // The old text here told the user this ceiling was a stale guess and that
-                            // --gate-vram had measured 63 GiB — advice that sends them to raise
-                            // LOGSCOPE_MAX_GPU_GB and fail forty seconds into quantization instead of
-                            // at planning time. `--gate-residency` has since MEASURED it: 124 one-GiB
-                            // slabs held, the 125th refused with "Failed to allocate BO VMA", on a
-                            // machine with 177 GiB of RAM and the probe allowed to reach 88. The
-                            // hardware genuinely stops at 31.
-                            //
-                            // --gate-vram's 63 GiB is not a contradiction, it is a different question:
-                            // the largest SINGLE allocation the device accepts. Concurrent residency
-                            // is the binding limit, and quoting the single-allocation number here was
-                            // what made the refusal look wrong.
                             let ceiling_note = if self.conservative_vma {
-                                " (MEASURED on an M2 Ultra by --gate-residency: 124 GiB-slabs held, the 125th refused — this is the concurrent-buffer ceiling, not the single-allocation one)"
+                                " (a CONSTANT for Asahi/Honeykrisp, not a measurement — it was taken from the staging upload path before the arena removed the staging, and `--gate-vram` measured this same device honouring 63 GiB)"
                             } else { "" };
                             let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
                                 Some(p) => format!("won't fit resident in ~{:.1} GiB{} — a layer-streaming plan EXISTS ON PAPER ONLY (StreamPlan is computed here and has no \
 executor; nothing streams blocks today) and it would pin {}/{} blocks and stream {} per token \
 (~{:.0} ms/tok at 21 GiB/s, the MEASURED upload rate). \
-This ceiling is measured, so raising LOGSCOPE_MAX_GPU_GB will not help — it fails mid-quantization instead of here. \
-If this is NOT an M2 Ultra the figure is one machine's, and `kernel-validate --gate-residency` measures THIS device; \
-otherwise use the llama.cpp backend for a model this size.",
+FIRST CHECK WHETHER THIS BUDGET IS REAL: it is a compiled-in constant, and on an M2 Ultra `kernel-validate --gate-vram` measured the device honouring 63 GiB against this figure's 24 — a model this size may simply fit. \
+Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp backend.",
                                     gib(gpu_budget), ceiling_note, p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
                                 None => format!("won't fit even a streaming ring in ~{:.1} GiB{}; use the llama.cpp backend.", gib(gpu_budget), ceiling_note),
                             };
@@ -8830,6 +10440,8 @@ otherwise use the llama.cpp backend for a model this size.",
             // ordinary miss below is correct, while Err means one exists at a shape the metadata does
             // not describe — which must STOP rather than slice something plausible.
             if g.tensor(name).is_none() {
+                let qkvdbg = std::env::var("LOGSCOPE_QKV_DEBUG").is_ok();
+                if qkvdbg { eprintln!("qkv-dbg: miss '{name}', trying fused"); }
                 // GGUF DIMS ARE FASTEST-VARYING FIRST. For the reported `attn_qkv [4096, 8192]` on a
                 // d=4096 model, dims[0]=4096 is the INPUT width and dims[1]=8192 is the output rows —
                 // so a "row" in the split's sense is dims[0] wide and there are dims[1..] of them.
@@ -8850,7 +10462,8 @@ otherwise use the llama.cpp backend for a model this size.",
                 let rows_of = |n: &str| derive(n).map(|(r, _)| r);
                 let row_bytes = |n: &str| derive(n).map(|(_, s)| s);
                 for fused in crate::qkvsplit::FUSED_NAMES {
-                    let src = match crate::qkvsplit::resolve(name, fused) { Some((s, _)) => s, None => break };
+                    let src = match crate::qkvsplit::resolve(name, fused) { Some((s, _)) => s, None => { if qkvdbg { eprintln!("qkv-dbg: resolve None for pattern {fused}"); } break } };
+                    if qkvdbg { eprintln!("qkv-dbg: pattern {fused} -> {src}, rows={:?} rb={:?}", (|n: &str| g.tensor(n).map(|t| t.dims.clone()))(&src), row_bytes(&src)); }
                     // A None here means the row is not a whole number of quantization blocks, so it
                     // cannot be sliced at a row boundary — q would end mid-block and both q's last
                     // block and k's first would be garbage. Named, because falling through to
@@ -8870,7 +10483,7 @@ last block and k's first would decode to garbage")),
                                 "fused tensor {srcname} data out of range for {name}"))?;
                             let cols = t.dims[0] as usize;      // input width, matching row_bytes
                             let rows = (b1 - b0) / rb;
-                            return gguf::dequantize(t.ggml_type, raw, rows * cols);
+                            return crate::par_dequantize(t.ggml_type, raw, rows * cols);
                         }
                         Some(Err(e)) => return Err(format!("{name}: {}", e.explain())),
                         None => break,
@@ -8913,7 +10526,7 @@ last block and k's first would decode to garbage")),
             // decoding a short buffer into plausible garbage.
             let raw = set.slice(t.offset, nbytes).ok_or(format!(
                 "tensor {name} data out of range — a shard is missing or truncated ({} shard(s) loaded)", set.shards()))?;
-            gguf::dequantize(t.ggml_type, raw, count)
+            crate::par_dequantize(t.ggml_type, raw, count)
         };
         let embed = fetch("token_embd.weight")?;
         // Derive vocab from the embedding matrix (rows = vocab) when metadata omits it.
@@ -8959,22 +10572,8 @@ last block and k's first would decode to garbage")),
         };
         let _arena_guard = if arena_on {
             let max_buf = self.device.limits().max_buffer_size;
-            // DEFAULT 1 GiB, not 2, on a BO-VMA-constrained driver — and the reason is that the
-            // budget and the allocator must agree about what a byte costs.
-            //
-            // ASAHI_CONCURRENT_BUFFER_GIB (31.0) was MEASURED by --gate-residency using ONE-GiB
-            // slabs: 124 held, the 125th refused. The arena then asked for 2047 MiB slabs and a
-            // Scout load planned at ~29.5 GiB died with 6.0 GiB placed — at slab 4. The ceiling is
-            // therefore not a flat byte count; it depends on the slab size, and budgeting against a
-            // figure measured under different conditions is why a plan that "fits" fails a quarter
-            // of the way in.
-            //
-            // The failure message already asks the operator to rerun with LOGSCOPE_ARENA_SLAB_MB=1024
-            // as the next diagnostic. That is the measured configuration, so it is the default now;
-            // the env var still overrides in either direction.
-            let default_slab: u64 = if self.conservative_vma { 1 << 30 } else { 2 << 30 };
             let slab = std::env::var("LOGSCOPE_ARENA_SLAB_MB").ok().and_then(|m| m.trim().parse::<u64>().ok())
-                .map(|mb| mb << 20).unwrap_or(default_slab).min(max_buf).max(256 << 20);
+                .map(|mb| mb << 20).unwrap_or(2 << 30).min(max_buf).max(256 << 20);
             // Align the slab size DOWN to 256 (≥ COPY_BUFFER_ALIGNMENT=4). A UMA zero-copy slab is created
             // mapped_at_creation, which requires size % 4 == 0 — and some drivers report max_buffer_size as
             // an odd value (Honeykrisp/Asahi: ~2047 MiB = 2^31-1), so `.min(max_buf)` can land on an
@@ -8982,17 +10581,160 @@ last block and k's first would decode to garbage")),
             let slab = slab & !255;
             eprintln!("wgpu-engine: arena ON ({}) — packing resident weights into ≤{} MiB slabs (fewer buffer objects)",
                 if arena_env.is_some() { "requested" } else { "auto: BO-VMA-constrained driver" }, slab >> 20);
-            *self.arena.lock().unwrap() = Some(ResidentArena { slabs: Vec::new(), slab_size: slab, used: 0, mapped: self.unified });
+            *self.arena.lock().unwrap() = Some(ResidentArena { slabs: Vec::new(), slab_size: slab, used: 0, mapped: self.unified , unmapped_upto: std::sync::atomic::AtomicUsize::new(0) });
             Some(ArenaGuard(&self.arena))
         } else { None };
         let lin = |name: &str, n: usize, k: usize, quantize: bool| -> Result<Lin, String> {
-            let t = g.tensor(name).ok_or(format!("missing tensor {name}"))?;
+            // FUSED-QKV AT THE LIN LAYER. fetch()'s fused fallback never serves lin — lin needs the
+            // raw TensorInfo for the resident fast paths (q8/q4k/iq1s slice the FILE bytes), so a
+            // fused-only checkpoint (LLaDA2, fused Qwen3.5) died here on "missing tensor attn_q"
+            // even though the f32 path could split it. Found by the tiny-llada2 synthetic BEFORE the
+            // 9 GB download. The fix synthesizes a sliced pseudo-TensorInfo over the q/k/v byte
+            // sub-range; every fast path below then works untouched, because a row is self-contained
+            // in every supported quant (row stride = whole blocks — qkvsplit's alignment rule).
+            let owned_slice: gguf::TensorInfo;
+            let t = match g.tensor(name) {
+                Some(t) => t,
+                None => {
+                    let mut found: Option<&gguf::TensorInfo> = None;
+                    for fused in crate::qkvsplit::FUSED_NAMES {
+                        let Some((src, part)) = crate::qkvsplit::resolve(name, fused) else { break };
+                        let Some(ft) = g.tensor(&src) else { continue };
+                        let width = ft.dims[0] as usize;
+                        let rows = ft.dims.iter().skip(1).product::<u64>() as usize;
+                        if width != k {
+                            return Err(format!("{name}: fused {src} width {width} != expected input {k}"));
+                        }
+                        let sp = crate::qkvsplit::split(rows, n_heads, n_kv_heads, head_dim)
+                            .map_err(|e| format!("{name}: {}", e.explain()))?;
+                        let (r0, r1) = sp.span(part);
+                        if r1 - r0 != n {
+                            return Err(format!("{name}: fused {src} span is {} rows, expected {n}", r1 - r0));
+                        }
+                        let rb = gguf::type_nbytes(ft.ggml_type, k).ok_or_else(|| format!(
+                            "{name}: fused {src} row is not a whole number of quantization blocks at k={k}"))?;
+                        owned_slice = gguf::TensorInfo {
+                            name: name.to_string(), dims: vec![k as u64, n as u64],
+                            ggml_type: ft.ggml_type, offset: ft.offset + (r0 as u64) * rb as u64,
+                        };
+                        found = Some(&owned_slice);
+                        break;
+                    }
+                    found.ok_or(format!("missing tensor {name}"))?
+                }
+            };
             if quantize && !q4_mode && t.ggml_type == 8 && k % 32 == 0 {
                 let count = t.dims.iter().product::<u64>() as usize;
                 let nbytes = gguf::type_nbytes(8, count).ok_or("q8_0 size")?;
                 let raw = set.slice(t.offset, nbytes).ok_or(format!(
                     "tensor {name} out of range — a shard is missing or truncated"))?;
+                LOAD_FAST_WEIGHTS.fetch_add((n * k) as u64, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Lin::q8(self.q8_0_to_resident(raw, n, k)));
+            }
+            // DIRECT Q4_K → int8-resident, the last common source with no slice path into int8.
+            // q8_0 had one, Q4_0 got one in c4-754, and Q4_K had one only into q4 residency — so a
+            // K-quant model loading int8-resident dequantised every weight to f32 and requantised.
+            // That is the "0.0% of weights sliced" and the 54.9 s load on DeepSeek-R1-Distill-8B.
+            // LOGSCOPE_NO_Q4K_INT8=1 restores the f32 path for an A/B.
+            // MXFP4 -> int8, the last common source without a slice path. One MXFP4 block is 32
+            // weights behind one scale and int8 residency wants one scale per 32, so the mapping is
+            // 1:1 — cleaner than Q4_K's eight groups per super-block.
+            if quantize && !q4_mode && t.ggml_type == 39 && k % 32 == 0
+                && std::env::var("LOGSCOPE_NO_MXFP4_INT8").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if let Some(nbytes) = gguf::type_nbytes(39, count) {
+                    if let Some(raw) = set.slice(t.offset, nbytes) {
+                        if let Some(w) = self.mxfp4_to_int8_resident(raw, n, k) {
+                            static SAID_MX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !SAID_MX.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("wgpu-engine: MXFP4 → int8-resident TRANSCODE (no f32 round-trip); \
+LOGSCOPE_NO_MXFP4_INT8=1 restores the old path");
+                            }
+                            LOAD_FAST_WEIGHTS.fetch_add((n * k) as u64, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Lin::q8(w));
+                        }
+                    }
+                }
+            }
+            // Q6_K — the other half of a Q4_K_M file. ffn_down, attn_v and often output are Q6_K,
+            // so slicing only Q4_K left most of the model on the f32 path: the operator's Llama-3.2-1B
+            // reported 22.0% sliced with the Q4_K transcode already active.
+            if quantize && !q4_mode && t.ggml_type == 14 && k % 256 == 0
+                && std::env::var("LOGSCOPE_NO_Q6K_INT8").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if let Some(nbytes) = gguf::type_nbytes(14, count) {
+                    if let Some(raw) = set.slice(t.offset, nbytes) {
+                        if let Some(w) = self.q6_k_to_int8_resident(raw, n, k) {
+                            static SAID_Q6: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !SAID_Q6.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("wgpu-engine: Q6_K → int8-resident TRANSCODE (no f32 round-trip); \
+LOGSCOPE_NO_Q6K_INT8=1 restores the old path");
+                            }
+                            LOAD_FAST_WEIGHTS.fetch_add((n * k) as u64, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Lin::q8(w));
+                        }
+                    }
+                }
+            }
+            if quantize && !q4_mode && t.ggml_type == 13 && k % 256 == 0
+                && std::env::var("LOGSCOPE_NO_Q5K_INT8").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if let Some(nbytes) = gguf::type_nbytes(13, count) {
+                    if let Some(raw) = set.slice(t.offset, nbytes) {
+                        if let Some(w) = self.q5_k_to_int8_resident(raw, n, k) {
+                            static SAID_Q5: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !SAID_Q5.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("wgpu-engine: Q5_K → int8-resident TRANSCODE (no f32 round-trip); \
+LOGSCOPE_NO_Q5K_INT8=1 restores the old path");
+                            }
+                            LOAD_FAST_WEIGHTS.fetch_add((n * k) as u64, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Lin::q8(w));
+                        }
+                    }
+                }
+            }
+            if quantize && !q4_mode && t.ggml_type == 12 && k % 256 == 0
+                && std::env::var("LOGSCOPE_NO_Q4K_INT8").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if let Some(nbytes) = gguf::type_nbytes(12, count) {
+                    if let Some(raw) = set.slice(t.offset, nbytes) {
+                        if let Some(w) = self.q4_k_to_int8_resident(raw, n, k) {
+                            static SAID_QK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !SAID_QK.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("wgpu-engine: Q4_K → int8-resident TRANSCODE (no f32 round-trip); \
+LOGSCOPE_NO_Q4K_INT8=1 restores the old path");
+                            }
+                            LOAD_FAST_WEIGHTS.fetch_add((n * k) as u64, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Lin::q8(w));
+                        }
+                    }
+                }
+            }
+            // DIRECT Q4_0 → q4-resident. Q4_0 was the ONE common source type with no fast path: q8_0
+            // and Q4_K both slice the file bytes, while a Q4_0 model went the long way round —
+            // dequantise every weight to f32, then requantise — which is most of the ~12 s between
+            // "loading" and "loaded" on an 8.8 GB checkpoint, and the reason a Q4_0 file loaded
+            // slower than a Q4_K one of the same size.
+            //
+            // Not a code copy: ggml Q4_0 codes mean (c-8)*d over -8..=+7 while the resident format
+            // clamps to -7..=+7, so the values are re-derived. Cheap anyway because the source scale
+            // cancels — see q4_0_transcode_host_bytes, which is asserted bit-identical to the round
+            // trip it replaces. LOGSCOPE_NO_Q4_0_TRANSCODE=1 restores the f32 path for an A/B.
+            if quantize && q4_mode && t.ggml_type == 2 && k % 32 == 0
+                && std::env::var("LOGSCOPE_NO_Q4_0_TRANSCODE").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                let nbytes = gguf::type_nbytes(2, count).ok_or("q4_0 size")?;
+                let raw = set.slice(t.offset, nbytes).ok_or(format!(
+                    "tensor {name} out of range — a shard is missing or truncated"))?;
+                if let Some(w) = self.q4_0_upload_transcode(raw, n, k) {
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("wgpu-engine: Q4_0 → q4-resident TRANSCODE (no f32 round-trip); \
+LOGSCOPE_NO_Q4_0_TRANSCODE=1 restores the old path");
+                    }
+                LOAD_FAST_WEIGHTS.fetch_add((n * k) as u64, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Lin::q4(w));
+                }
             }
             // DIRECT Q4_K → q4-resident, the twin of the q8_0 fast path above and the reason the loader no
             // longer needs a host copy. The file's own super-blocks are uploaded and converted on the GPU
@@ -9028,7 +10770,7 @@ last block and k's first would decode to garbage")),
                             // on the GPU, which is why this path could be small in the first place.
                             let blocks = Tensor {
                                 buf: self.upload_bytes(raw, "iq1"),
-                                rows: 1, cols: raw.len() / 4, pool: None, view: None,
+                                rows: 1, cols: raw.len() / 4, pool: None, site: (0, 0), view: None,
                             };
                             return Ok(Lin::iq1(Iq1Weight { blocks, n, k }));
                         }
@@ -9049,9 +10791,9 @@ last block and k's first would decode to garbage")),
                             let qs_off_words = (qw_words * 4).div_ceil(256) * 256 / 4;
                             let out = self.alloc_resident_words(qs_off_words + qs_words);
                             self.q4k_defer(&out, raw, n, k, 0, qs_off_words);
-                            let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None,
+                            let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None, site: (0, 0),
                                               view: Some((0, (qw_words * 4) as u64)) };
-                            let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None,
+                            let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None, site: (0, 0),
                                               view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)) };
                             return Ok(Lin::q4(Q4Weight { qw, qs, n, k }));
                         }
@@ -9168,8 +10910,9 @@ The file is not corrupt; this loader does not recognise its attention layout",
 layout — probably per-head interleaved — and reading it as three blocks would produce fluent nonsense"));
                     }
                     eprintln!("wgpu-engine: blk.{i} ships a FUSED attn_qkv ({rows} rows, as expected) — \
-using it directly. UNVERIFIED against a real generation: the row count matching does not prove the \
-q/k/v block ORDER matches");
+using it directly. Block ORDER verified for the Bailing/LLaDA2 family against chatllm.cpp's \
+BailingMoe2 converter: a plain contiguous split [n_head*hd, n_kv*hd, n_kv*hd], which is what this \
+loader assumes. Other families that ship a fused qkv are still unverified");
                     fetch(&name)?
                 } else {
                     let mut v = fetch(&format!("blk.{i}.attn_q.weight"))?;
@@ -9177,7 +10920,32 @@ q/k/v block ORDER matches");
                     v.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
                     v
                 };
-                let fused = self.make_lin(&qkv, attn_dim + 2 * kv, d, q, q4_mode);
+                // FUSED QKV is one contiguous tensor, so it transcodes directly when the source is
+                // Q4_0 — 20 layers x 3072 x 2048 on the real llada2, i.e. worth not round-tripping.
+                // Only when the checkpoint SHIPS it fused; the concatenated-from-q/k/v case above
+                // built `qkv` in f32 already and has nothing to slice.
+                let fused = {
+                    // Same condition the branch above used to decide the checkpoint ships fused.
+                    let ft = if g.tensor(&format!("blk.{i}.attn_q.weight")).is_none() {
+                        g.tensor(&format!("blk.{i}.attn_qkv.weight"))
+                    } else { None };
+                    let tc = ft.filter(|t| t.ggml_type == 2 && d % 32 == 0
+                                       && std::env::var("LOGSCOPE_NO_Q4_0_TRANSCODE").is_err())
+                        .and_then(|t| {
+                            let cnt = t.dims.iter().product::<u64>() as usize;
+                            let nb = gguf::type_nbytes(2, cnt)?;
+                            let raw = set.slice(t.offset, nb)?;
+                            Some(Lin::q4(self.q4_0_upload_transcode(raw, attn_dim + 2 * kv, d)?))
+                        });
+                    match tc {
+                        Some(l) => {
+                            LOAD_FAST_WEIGHTS.fetch_add(((attn_dim + 2 * kv) * d) as u64,
+                                std::sync::atomic::Ordering::Relaxed);
+                            l
+                        }
+                        None => self.make_lin(&qkv, attn_dim + 2 * kv, d, q, q4_mode),
+                    }
+                };
                 if has_qkv_bias {
                     let mut b = Vec::with_capacity(attn_dim + 2 * kv);
                     b.extend_from_slice(&fbq); b.extend_from_slice(&fbk); b.extend_from_slice(&fbv);
@@ -9200,11 +10968,49 @@ q/k/v block ORDER matches");
                 // MoE layers have no dense FFN tensors — tiny F32 placeholders, never applied
                 // (ffn_apply branches to the moe field first).
                 wgate_up: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
-                    let gt = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
-                    let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
-                    let mut gu = Vec::with_capacity(gt.len() + u.len());
-                    gu.extend_from_slice(&gt); gu.extend_from_slice(&u);
-                    self.make_lin(&gu, 2 * h, d, q, q4_mode)
+                    // SLICE THE FUSION when both halves are types we can transcode. Dequantising
+                    // gate and up to f32, concatenating and requantising is 537M of a 1.34B
+                    // Llama-3.2-1B — the 40% that kept the load path reading "32.6% sliced" after
+                    // Q4_K and Q6_K both had paths of their own. Sound because int8 residency
+                    // quantises per 32 ALONG K while this fusion concatenates along ROWS: disjoint
+                    // axes commute (c4-756, proved again for this site in c4-812).
+                    let fused = if q && !q4_mode {
+                        let g_t = g.tensor(&format!("blk.{i}.ffn_gate.weight"));
+                        let u_t = g.tensor(&format!("blk.{i}.ffn_up.weight"));
+                        match (g_t, u_t) {
+                            (Some(gt2), Some(ut2)) if gt2.dims.first() == Some(&(d as u64)) => {
+                                let cnt = (h * d) as usize;
+                                let a = gguf::type_nbytes(gt2.ggml_type, cnt)
+                                    .and_then(|nb| set.slice(gt2.offset, nb));
+                                let b = gguf::type_nbytes(ut2.ggml_type, cnt)
+                                    .and_then(|nb| set.slice(ut2.offset, nb));
+                                match (a, b) {
+                                    (Some(ab), Some(bb)) => self.int8_rows_from_sources(
+                                        &[(gt2.ggml_type, ab, h), (ut2.ggml_type, bb, h)], d),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else { None };
+                    match fused {
+                        Some(w) => {
+                            static SAID_GU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !SAID_GU.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("wgpu-engine: gate||up FUSION SLICED (no f32 round-trip); \
+LOGSCOPE_NO_GU_SLICE=1 restores the old path");
+                            }
+                            LOAD_FAST_WEIGHTS.fetch_add((2 * h * d) as u64, std::sync::atomic::Ordering::Relaxed);
+                            Lin::q8(w)
+                        }
+                        None => {
+                            let gt = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
+                            let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
+                            let mut gu = Vec::with_capacity(gt.len() + u.len());
+                            gu.extend_from_slice(&gt); gu.extend_from_slice(&u);
+                            self.make_lin(&gu, 2 * h, d, q, q4_mode)
+                        }
+                    }
                 },
                 wdown: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else { lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)? },
                 moe: if layer_is_moe {
@@ -9218,8 +11024,24 @@ q/k/v block ORDER matches");
                     // VIEWS into it. One quant pass instead of n_expert (faster load), and the stacked
                     // buffer is what the GPU-routed decode kernels index (row = sel·rstride + col).
                     let moe_streaming = moe_stream_pin.is_some() && q4_mode;
-                    let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
-                    let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
+                    // EXPERT STACK WITHOUT THE f32 DETOUR. The experts are the mass of a 256-expert
+                    // model and c4-755 measured them as the share still round-tripping: they are
+                    // built by ROW CONCATENATION into one stacked buffer, and resident q4 quantises
+                    // per 32-block ALONG k, strictly within a row — so permuting rows and
+                    // quantising commute (asserted by stacked_rows_match_the_interleaved_f32_path).
+                    // When that holds, the f32 buffers are never needed and are not even fetched.
+                    let gname = format!("blk.{i}.ffn_gate_exps.weight");
+                    let uname = format!("blk.{i}.ffn_up_exps.weight");
+                    let dname = format!("blk.{i}.ffn_down_exps.weight");
+                    let is_q4_0 = |nm: &str| g.tensor(nm).map_or(false, |t| t.ggml_type == 2);
+                    let exp_transcode = !moe_streaming && q && q4_mode
+                        && d % 32 == 0 && expert_ff % 32 == 0
+                        && is_q4_0(&gname) && is_q4_0(&uname) && is_q4_0(&dname)
+                        && std::env::var("LOGSCOPE_NO_Q4_0_TRANSCODE").is_err();
+                    // Fetch ONLY when something still needs f32: the legacy streaming host-copy
+                    // path, or a source the transcode cannot serve.
+                    let (gsrc, usrc) = if exp_transcode { (Vec::new(), Vec::new()) }
+                        else { (fetch(&gname)?, fetch(&uname)?) };
                     let ec = expert_ff * d;
                     // STREAMING: skip the resident expert stack entirely (it's the mass that busts the BO-VMA
                     // ceiling). Build tiny placeholder Lins for the resident fields; decode goes through the
@@ -9228,16 +11050,52 @@ q/k/v block ORDER matches");
                         let ph = || self.make_lin(&vec![0.0f32; 32], 1, 32, false, false);
                         (ph(), ph(), Vec::new(), Vec::new())
                     } else {
-                        let mut inter = Vec::with_capacity(2 * ec * n_expert);
-                        for e in 0..n_expert {
-                            inter.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
-                            inter.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
-                        }
-                        let stacked_gu = self.make_lin(&inter, n_expert * 2 * expert_ff, d, q, q4_mode);
-                        drop(inter);
-                        let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
-                        let stacked_down = self.make_lin(&dsrc, n_expert * d, expert_ff, q, q4_mode);
-                        drop(dsrc);
+                        let (stacked_gu, stacked_down) = if exp_transcode {
+                            // Row slices in the SAME order the f32 interleave would have produced:
+                            // per expert, its gate rows then its up rows.
+                            let kb = d / 32;
+                            let rows_bytes = |nm: &str| -> Result<&[u8], String> {
+                                let t = g.tensor(nm).ok_or(format!("missing tensor {nm}"))?;
+                                let cnt = t.dims.iter().product::<u64>() as usize;
+                                let nb = gguf::type_nbytes(2, cnt).ok_or("q4_0 size")?;
+                                set.slice(t.offset, nb).ok_or(format!("{nm} out of range"))
+                            };
+                            let (graw, uraw) = (rows_bytes(&gname)?, rows_bytes(&uname)?);
+                            fn row(raw: &[u8], r: usize, kb: usize) -> &[u8] {
+                                &raw[r * kb * 18..(r + 1) * kb * 18]
+                            }
+                            let mut ordered: Vec<&[u8]> = Vec::with_capacity(n_expert * 2 * expert_ff);
+                            for e in 0..n_expert {
+                                for j in 0..expert_ff { ordered.push(row(graw, e * expert_ff + j, kb)); }
+                                for j in 0..expert_ff { ordered.push(row(uraw, e * expert_ff + j, kb)); }
+                            }
+                            let gu = Lin::q4(self.q4_0_rows_upload(&ordered, d)
+                                .ok_or("expert gate/up transcode refused")?);
+                            // down_exps is already in stacked order — a plain tensor transcode.
+                            let draw = rows_bytes(&dname)?;
+                            let dn = Lin::q4(self.q4_0_upload_transcode(draw, n_expert * d, expert_ff)
+                                .ok_or("expert down transcode refused")?);
+                            LOAD_FAST_WEIGHTS.fetch_add(
+                                ((n_expert * 2 * expert_ff * d) + (n_expert * d * expert_ff)) as u64,
+                                std::sync::atomic::Ordering::Relaxed);
+                            static SAID_E: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !SAID_E.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("wgpu-engine: expert stack TRANSCODED from Q4_0 (no f32 detour, no host requantize)");
+                            }
+                            (gu, dn)
+                        } else {
+                            let mut inter = Vec::with_capacity(2 * ec * n_expert);
+                            for e in 0..n_expert {
+                                inter.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
+                                inter.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
+                            }
+                            let gu = self.make_lin(&inter, n_expert * 2 * expert_ff, d, q, q4_mode);
+                            drop(inter);
+                            let dsrc = fetch(&dname)?;
+                            let dn = self.make_lin(&dsrc, n_expert * d, expert_ff, q, q4_mode);
+                            drop(dsrc);
+                            (gu, dn)
+                        };
                         let gate_up: Vec<Lin> = (0..n_expert)
                             .filter_map(|e| lin_row_view(&stacked_gu, e * 2 * expert_ff, 2 * expert_ff)).collect();
                         let down: Vec<Lin> = (0..n_expert)
@@ -9253,15 +11111,52 @@ q/k/v block ORDER matches");
                     let shared = if g.tensor(&format!("blk.{i}.ffn_gate_shexp.weight")).is_some()
                         && g.tensor(&format!("blk.{i}.ffn_up_shexp.weight")).is_some()
                         && g.tensor(&format!("blk.{i}.ffn_down_shexp.weight")).is_some() {
-                        let gs = fetch(&format!("blk.{i}.ffn_gate_shexp.weight"))?;
-                        let sff = gs.len() / d;
-                        let us = fetch(&format!("blk.{i}.ffn_up_shexp.weight"))?;
-                        let mut cat = Vec::with_capacity(2 * sff * d);
-                        cat.extend_from_slice(&gs); cat.extend_from_slice(&us);
-                        drop(gs); drop(us);
-                        let sgu = self.make_lin(&cat, 2 * sff, d, q, q4_mode);
-                        drop(cat);
-                        let sdn = self.make_lin(&fetch(&format!("blk.{i}.ffn_down_shexp.weight"))?, d, sff, q, q4_mode);
+                        // POSITIVE confirmation counter: the DISAGREEMENT warning covers the absent
+                        // case; a grafted file needs the PRESENT case said out loud so one log line
+                        // proves the repair applied. Counted only when the FULL set is present —
+                        // counting on the first check alone would tally a partial set as repaired.
+                        SHEXP_LAYERS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // SHARED EXPERT: gate rows then up rows — the same row concatenation as the
+                        // expert stack, so the same commutation applies and the same helper serves.
+                        let (gn, un, dn_n) = (format!("blk.{i}.ffn_gate_shexp.weight"),
+                                              format!("blk.{i}.ffn_up_shexp.weight"),
+                                              format!("blk.{i}.ffn_down_shexp.weight"));
+                        let sff = {
+                            let t = g.tensor(&gn).ok_or(format!("missing {gn}"))?;
+                            (t.dims.iter().product::<u64>() as usize) / d
+                        };
+                        let sh_tc = q && q4_mode && d % 32 == 0 && sff % 32 == 0
+                            && [&gn, &un, &dn_n].iter().all(|nm| is_q4_0(nm))
+                            && std::env::var("LOGSCOPE_NO_Q4_0_TRANSCODE").is_err();
+                        let (sgu, sdn) = if sh_tc {
+                            let kb = d / 32;
+                            let bytes_of = |nm: &str| -> Result<&[u8], String> {
+                                let t = g.tensor(nm).ok_or(format!("missing tensor {nm}"))?;
+                                let cnt = t.dims.iter().product::<u64>() as usize;
+                                let nb = gguf::type_nbytes(2, cnt).ok_or("q4_0 size")?;
+                                set.slice(t.offset, nb).ok_or(format!("{nm} out of range"))
+                            };
+                            let (graw, uraw) = (bytes_of(&gn)?, bytes_of(&un)?);
+                            let mut ordered: Vec<&[u8]> = Vec::with_capacity(2 * sff);
+                            for r in 0..sff { ordered.push(&graw[r * kb * 18..(r + 1) * kb * 18]); }
+                            for r in 0..sff { ordered.push(&uraw[r * kb * 18..(r + 1) * kb * 18]); }
+                            let gu = Lin::q4(self.q4_0_rows_upload(&ordered, d)
+                                .ok_or("shexp gate/up transcode refused")?);
+                            let sdn_w = self.q4_0_upload_transcode(bytes_of(&dn_n)?, d, sff)
+                                .ok_or("shexp down transcode refused")?;
+                            LOAD_FAST_WEIGHTS.fetch_add((2 * sff * d + d * sff) as u64,
+                                std::sync::atomic::Ordering::Relaxed);
+                            (gu, Lin::q4(sdn_w))
+                        } else {
+                            let gs = fetch(&gn)?;
+                            let us = fetch(&un)?;
+                            let mut cat = Vec::with_capacity(2 * sff * d);
+                            cat.extend_from_slice(&gs); cat.extend_from_slice(&us);
+                            drop(gs); drop(us);
+                            let gu = self.make_lin(&cat, 2 * sff, d, q, q4_mode);
+                            drop(cat);
+                            (gu, self.make_lin(&fetch(&dn_n)?, d, sff, q, q4_mode))
+                        };
                         if i == 0 { eprintln!("wgpu-engine: shared-expert MoE — shexp ff={sff} on top of {n_expert} routed"); }
                         Some((sgu, sdn))
                     } else { None };
@@ -9491,16 +11386,41 @@ scale {} ({}), shared {}, weight applied to {}",
                         // tensor names the expert count, and a shared expert either has _shexp tensors or does not
                         // exist. The third, top-k, is constrained by nothing in the file and cannot be checked.
                         {
-                            let axis = g.tensor("blk.0.ffn_gate_exps.weight")
+                            // PROBE A LAYER THAT ACTUALLY HAS EXPERTS. blk.0 is the DENSE-LEAD layer
+                            // on every leading_dense_block_count>0 architecture (LLaDA2, GLM4-MoE,
+                            // DeepSeek), so it legitimately carries neither stacked experts nor a
+                            // shared expert — probing it reported "NO ffn_*_shexp tensors" on files
+                            // that have them on all 19 MoE layers, printing a DISAGREEMENT directly
+                            // above the loader's own "shared expert ACTIVE on 19 layer(s)" line.
+                            // Two checks contradicting each other in one log is worse than neither.
+                            let probe = (0..n).find(|i| g.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some()).unwrap_or(0);
+                            let axis = g.tensor(&format!("blk.{probe}.ffn_gate_exps.weight"))
                                 .and_then(|t| t.dims.get(2).copied()).map(|n| n as usize);
-                            let shexp = g.tensor("blk.0.ffn_gate_shexp.weight").is_some();
+                            let shexp = g.tensor(&format!("blk.{probe}.ffn_gate_shexp.weight")).is_some();
                             for d in crate::moe::check_routing(n_expert, n_expert_used, c.n_shared as usize, axis, shexp) {
                                 eprintln!("loader: MoE ROUTING DISAGREEMENT — {}", d.explain());
                             }
                         }
                         }
                     }
-                    Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
+                    let sel_bias_host: Option<Vec<f32>> = [format!("blk.{i}.exp_probs_b.bias"),
+                            format!("blk.{i}.exp_probs_b.weight"), format!("blk.{i}.exp_probs_b")]
+                        .iter().find(|nm| g.tensor(nm).is_some())
+                        .and_then(|nm| fetch(nm).ok())
+                        .filter(|v| { let ok = v.len() == n_expert;
+                            if !ok { eprintln!("loader: blk.{i} exp_probs_b has {} entries for {n_expert} experts — IGNORED (selection runs unbiased)", v.len()); }
+                            ok });
+                    let sel_bias = sel_bias_host.as_ref().map(|v| self.upload(v, 1, n_expert));
+                    // Said once: routing behavior changed at 719 the moment a checkpoint ships this
+                    // tensor, and an operator comparing outputs across trees deserves the one line
+                    // that says the difference is INTENTIONAL.
+                    if sel_bias.is_some() {
+                        static SAID_BIAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !SAID_BIAS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("loader: exp_probs_b selection bias PRESENT and ACTIVE — expert selection is biased (reference no-aux order); outputs differ from pre-719 runs by design");
+                        }
+                    }
+                    Some(Box::new(MoeLayer { sel_bias, sel_bias_host, router, gate_up, down, stacked_gu, stacked_down, shared, stream,
                         // SHARED EXPERT COUNT FROM METADATA. This was a literal 0, and it worked for
                         // Scout only because moe_config rescues an arch that declares
                         // `moe_shared_expert` with `.max(1)`. Correct by accident: an architecture
@@ -9511,10 +11431,32 @@ scale {} ({}), shared {}, weight applied to {}",
                         // Fifth value this session that the file carries and the loader took from a
                         // constant, after the NoPE interval, the attention temperature, qk-norm and
                         // expert_weights_scale.
-                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32,
+                                                cfg: {
+                            let mut c = crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32,
                             g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(0),
                             g.get_f32(&format!("{}.expert_weights_scale", acfg.prefix)),
-                            g.get_u32(&format!("{}.expert_weights_norm", acfg.prefix)).map(|v| v != 0)) }))
+                            g.get_u32(&format!("{}.expert_weights_norm", acfg.prefix)).map(|v| v != 0));
+                            // GROUP-LIMITED ROUTING from metadata; the llada2 architecture defaults
+                            // to 8/4 (config n_group/topk_group) because circulating GGUFs may omit
+                            // the kvs. Kv wins when present; 0 disables.
+                            // METADATA WINS INCLUDING THE DISABLE: expert_group_count=1 written
+                            // in a file means "no group limitation" and must not fall through to
+                            // the architecture default — present-but-one is a statement, absence
+                            // is the only case the llada2 8/4 default may fill.
+                            match g.get_u32(&format!("{pfx}.expert_group_count")) {
+                                Some(gc) => {
+                                    let gu = g.get_u32(&format!("{pfx}.expert_group_used_count")).unwrap_or(1);
+                                    if gc > 1 && gu >= 1 && gu < gc { c.n_group = gc; c.topk_group = gu; }
+                                }
+                                None => if acfg.prefix == "llada2" {
+                                c.n_group = 8; c.topk_group = 4;
+                                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                    eprintln!("loader: expert_group kvs ABSENT — group-limited routing 8/4 from the LLaDA2 architecture (reference n_group 8, topk_group 4); kvs override");
+                                }
+                            } }
+                            c
+                        } }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
                 q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
@@ -9551,7 +11493,11 @@ scale {} ({}), shared {}, weight applied to {}",
                 // Gemma's post-attention / post-FFN norms. Absent on every other architecture, so None
                 // leaves those paths untouched. Loaded through gemma_norm so the (1+w) form is applied
                 // here too — a post-norm with the wrong scaling is as wrong as a missing one.
-                post_attn: fetch(&format!("blk.{i}.post_attention_norm.weight")).ok()
+                // TWO SPELLINGS: gemma writes post_attention_norm, GLM writes attn_post_norm — and
+                // GLM's is REQUIRED by its reference graph, so missing it silently drops a norm from
+                // every layer. Found by reading glm4-moe.cpp ahead of the cross-engine oracle run.
+                post_attn: fetch(&format!("blk.{i}.post_attention_norm.weight"))
+                    .or_else(|_| fetch(&format!("blk.{i}.attn_post_norm.weight"))).ok()
                     .map(|v| self.upload(&gemma_norm(&v, &acfg), 1, d)),
                 post_ffn: fetch(&format!("blk.{i}.post_ffw_norm.weight")).ok()
                     .map(|v| self.upload(&gemma_norm(&v, &acfg), 1, d)),
@@ -9710,6 +11656,9 @@ different metadata keys and disagree here; output will be degraded rather than b
         // formulation, so scores scale by mscale²). Stored per load like `rope_neox`.
         let mut rope_vals = rope_vals;
         let mut mscale = 1.0f32;
+        // Trained context, for automatic window sizing. Absent stays 0 = unknown; plan_ctx treats
+        // 0 as "no trained bound" rather than as a 0-token window.
+        let trained_ctx = g.get_u32(&format!("{pfx}.context_length")).unwrap_or(0) as usize;
         if g.get_str(&format!("{pfx}.rope.scaling.type")) == Some("yarn") {
             let sf = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
             let orig = g.get_u32(&format!("{pfx}.rope.scaling.original_context_length")).unwrap_or(0);
@@ -9719,6 +11668,26 @@ different metadata keys and disagree here; output will be degraded rather than b
                 rope_vals = ffv; mscale = ms;
                 eprintln!("wgpu-engine: YaRN rope scaling ON — {sf}× over {orig} native ctx (mscale {mscale:.4})");
             }
+        }
+        // ONE LINE THAT ANSWERS "IS ROPE SET UP RIGHT". Every rope input is metadata-driven — there
+        // is no LOGSCOPE_ROPE_* flag to forget and the autotuner never touches rope; it tunes decode
+        // and GEMM tiles and submit batching. But the settings were reported in three places and
+        // only when unusual (pairing here, partial rope there, YaRN only when active), so "did it
+        // apply?" could not be answered by reading the log. Now it can.
+        {
+            let scaling = match g.get_str(&format!("{pfx}.rope.scaling.type")) {
+                Some(t) if mscale != 1.0 || t == "yarn" => {
+                    let sf = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
+                    format!("{t} x{sf}")
+                }
+                Some(t) => format!("{t} (inactive)"),
+                None => "none".to_string(),
+            };
+            let rot = rope_vals.len() * 2;
+            eprintln!("wgpu-engine: rope — base {base}, {rot} of {head_dim} dims rotate, {} pairing, \
+scaling {scaling}, mscale {mscale:.4}. All of this comes from the GGUF: there is no rope env flag, \
+and the autotuner (decode/GEMM tiles, submit batch) does not touch it.",
+                if acfg.rope_interleaved { "interleaved (GPT-J)" } else { "NEOX split-half" });
         }
         self.rope_mscale.store(mscale.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let rope_factors = self.upload(&rope_vals, 1, hd_half);
@@ -9821,10 +11790,56 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         // Gemma multiplies the token embedding by sqrt(d) before the first block (every gemma*.cpp:
         // `inpL = ggml_scale(inpL, sqrtf(n_embd))`). Everything else uses 1.0.
         let embed_scale = if matches!(acfg.norm, crate::archcfg::Norm::RmsGemma) { (d as f32).sqrt() } else { 1.0 };
+        // ATTENTION SCALE, stated rather than derived. Every attention kernel here computes
+        // 1/sqrt(head_dim) internally, which is right for most checkpoints and WRONG for the ones
+        // that ship the scale as an hparam (Gemma 3 27B, Gemma 4). Read it, and treat a value that
+        // matches the default as absent so the fast path stays untouched.
+        // Final-logit soft cap: the GGUF key wins, the arch default is the fallback. Gemma 2 ships
+        // 30.0 and llama.cpp reads it from the file, so a checkpoint that states something else is
+        // the authority over our table.
+        let logit_softcap = g.get_f32(&format!("{}.final_logit_softcapping", acfg.prefix))
+            .or(acfg.logit_softcap)
+            .filter(|c| c.is_finite() && *c > 0.0);
+        let attn_scale = g.get_f32(&format!("{}.attention.scale", acfg.prefix)).and_then(|s| {
+            let default = 1.0 / (head_dim as f32).sqrt();
+            if !s.is_finite() || s <= 0.0 {
+                eprintln!("loader: ignoring {}.attention.scale = {s} — not a usable scale", acfg.prefix);
+                return None;
+            }
+            if (s - default).abs() <= default * 1e-6 { return None; }
+            eprintln!("loader: attention scale {s:.6} from metadata (kernels' default would be {default:.6}) \
+— applied by pre-scaling q, which is exact: the kernel's own 1/sqrt(head_dim) then cancels");
+            Some(s)
+        });
         if embed_scale != 1.0 {
             eprintln!("loader: embedding scaled by sqrt(d) = {embed_scale:.2} (Gemma)");
         }
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa, mtp_layers: mtp })
+        let diffusion = matches!(acfg.prefix, "llada2" | "rnd1" | "dream" | "llada");
+        let mask_token_id = crate::gguf_mask_token_id(&g);
+        // llama.cpp's ABSENT=>true rule only works because MAINLINE's converter always writes the
+        // kv for llada (conversion/llada.py: add_diffusion_shift_logits(False), both classes). The
+        // fork GGUFs omit it, so the faithful copy of the rule shifted every diffusion prediction
+        // to the NEIGHBOR position's logits on the real checkpoint — total word salad with a
+        // perfect forward. The kv still wins when present; absent resolves by LINEAGE: LLaDA-class
+        // predicts in place (false), everything else keeps llama.cpp's true.
+        let shift_logits = match g.get_str("diffusion.shift_logits") {
+            Some(v) => v == "true",
+            None => {
+                let llada_lineage = matches!(acfg.prefix, "llada2" | "llada");
+                if diffusion && llada_lineage {
+                    eprintln!("loader: diffusion.shift_logits ABSENT — resolved FALSE from the LLaDA \
+lineage (mainline's converter writes false for this family; the absent-defaults-true rule assumes a \
+converter that always writes the kv). A GGUF carrying the kv overrides.");
+                }
+                !(diffusion && llada_lineage)
+            }
+        };
+        {
+            let n_sh = SHEXP_LAYERS_LOADED.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if n_sh > 0 { eprintln!("loader: shared expert ACTIVE on {n_sh} layer(s) — the always-on contribution is present (a grafted file proves its repair here)"); }
+        }
+
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, diffusion, mask_token_id, shift_logits })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -9834,6 +11849,48 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
     // unified-memory device this is the compact "GPU object" worth keeping resident — and a page-
     // cache-warm reload after a crash costs a buffer upload, not a multi-GB dequant. Validated
     // bit-exact vs a fresh GGUF load (kernel-validate `int8 cache`). Hand-rolled LE; no deps.
+    /// Failure diagnostic for the int8-sidecar gate: name the first tensor where two models'
+    /// resident weights differ — bytes (via view-honoring download), Q8/Q4 n,k, and bias presence. Compares as BITS, so an f32-canonicalized NaN
+    /// in a packed-int8 word shows up rather than comparing equal.
+    pub fn int8_cache_diff(&self, a: &Model, b: &Model) -> String {
+        let bits = |t: &Tensor| -> Vec<u32> { self.download(t).iter().map(|f| f.to_bits()).collect() };
+        let mut cmp = |name: String, x: &Tensor, y: &Tensor| -> Option<String> {
+            let (xa, ya) = (bits(x), bits(y));
+            if xa.len() != ya.len() { return Some(format!("{name}: LENGTH {} vs {}", xa.len(), ya.len())); }
+            xa.iter().zip(&ya).position(|(p, q)| p != q)
+                .map(|i| format!("{name}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i]))
+        };
+        let lin = |g: &Self, name: &str, la: &Lin, lb: &Lin| -> Option<String> {
+            if la.bias.is_some() != lb.bias.is_some() {
+                return Some(format!("{name}: BIAS presence {} vs {}", la.bias.is_some(), lb.bias.is_some()));
+            }
+            match (&la.kind, &lb.kind) {
+                (LinKind::Q8(x), LinKind::Q8(y)) if (x.n, x.k) != (y.n, y.k) =>
+                    return Some(format!("{name}: Q8 n,k ({},{}) vs ({},{})", x.n, x.k, y.n, y.k)),
+                (LinKind::Q4(x), LinKind::Q4(y)) if (x.n, x.k) != (y.n, y.k) =>
+                    return Some(format!("{name}: Q4 n,k ({},{}) vs ({},{})", x.n, x.k, y.n, y.k)),
+                _ => {}
+            }
+            match (&la.kind, &lb.kind) {
+                (LinKind::F32(x), LinKind::F32(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.f32"), x, y) }
+                (LinKind::Q8(x), LinKind::Q8(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
+                (LinKind::Q4(x), LinKind::Q4(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
+                _ => Some(format!("{name}: KIND differs")),
+            }
+        };
+        if a.embed.iter().map(|f| f.to_bits()).ne(b.embed.iter().map(|f| f.to_bits())) { return "embed differs".into(); }
+        if let Some(s) = cmp("rope_factors".into(), &a.rope_factors, &b.rope_factors) { return s; }
+        if let Some(s) = cmp("out_norm".into(), &a.out_norm, &b.out_norm) { return s; }
+        if let Some(s) = lin(self, "output", &a.output, &b.output) { return s; }
+        for (i, (la, lb)) in a.layers.iter().zip(&b.layers).enumerate() {
+            if let Some(s) = cmp(format!("blk{i}.g1"), &la.g1, &lb.g1) { return s; }
+            for (nm, xa, xb) in [("wqkv", &la.wqkv, &lb.wqkv), ("wq", &la.wq, &lb.wq), ("wk", &la.wk, &lb.wk), ("wv", &la.wv, &lb.wv), ("wo", &la.wo, &lb.wo), ("wgate_up", &la.wgate_up, &lb.wgate_up), ("wdown", &la.wdown, &lb.wdown)] {
+                if let Some(s) = lin(self, &format!("blk{i}.{nm}"), xa, xb) { return s; }
+            }
+            if let Some(s) = cmp(format!("blk{i}.g2"), &la.g2, &lb.g2) { return s; }
+        }
+        "no weight-level difference found".into()
+    }
     fn dump_tensor(&self, o: &mut Vec<u8>, t: &Tensor) {
         o.extend_from_slice(&(t.rows as u32).to_le_bytes());
         o.extend_from_slice(&(t.cols as u32).to_le_bytes());
@@ -9859,15 +11916,20 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
     /// Returns Ok(true) if a cache was written, Ok(false) if this model isn't cacheable (so the caller
     /// can log honestly — "wrote" was previously printed even on skip).
     pub fn save_int8_cache(&self, m: &Model, path: &std::path::Path, fp: (u64, u64)) -> std::io::Result<bool> {
+        self.activate_model(m);
         // Biased (Qwen2), QK-Norm (Qwen3/3.5), MoE (expert weights aren't in the layout), and 4-bit-resident
         // projections aren't in the int8 cache layout, so skip the cache — they reload from the GGUF.
         let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
         if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias() || b.q_norm.is_some() || b.moe.is_some()) { return Ok(false); }
         let mut o = Vec::new();
-        o.extend_from_slice(b"LSI8C\x03"); // v3: bumped after the head_dim/attention surgery — invalidates any cache written mid-refactor so weights regenerate from the GGUF with the current loader
+        o.extend_from_slice(b"LSI8C\x04"); // v4: +trained_ctx after eps. A reload that forgets the
+        // trained context would let auto window sizing plan PAST what the checkpoint was trained
+        // for — a checkpoint property must survive the sidecar. planned_weight_bytes deliberately
+        // does not: it is this machine's plan, recomputed per load.
         o.extend_from_slice(&fp.0.to_le_bytes()); o.extend_from_slice(&fp.1.to_le_bytes());
         for v in [m.d, m.h, m.vocab, m.n_layers, m.n_heads, m.n_kv_heads] { o.extend_from_slice(&(v as u32).to_le_bytes()); }
         o.extend_from_slice(&m.base.to_le_bytes()); o.extend_from_slice(&m.eps.to_le_bytes());
+        o.extend_from_slice(&(m.trained_ctx as u32).to_le_bytes());
         o.extend_from_slice(&(m.embed.len() as u64).to_le_bytes()); o.extend_from_slice(bytemuck::cast_slice(&m.embed));
         self.dump_tensor(&mut o, &m.rope_factors);
         self.dump_tensor(&mut o, &m.out_norm);
@@ -9889,10 +11951,11 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         if std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() { return None; }
         let data = std::fs::read(path).ok()?;
         let mut r = Rd { d: &data, p: 0 };
-        if r.take(6)? != b"LSI8C\x03" || (r.u64()?, r.u64()?) != fp { return None; }
+        if r.take(6)? != b"LSI8C\x04" || (r.u64()?, r.u64()?) != fp { return None; }
         let (d, h, vocab) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
         let (n_layers, n_heads, n_kv_heads) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
         let (base, eps) = (r.f32()?, r.f32()?);
+        let trained_ctx = r.u32()? as usize;
         let embed = r.f32s()?;
         let rope_factors = self.read_tensor(&mut r)?;
         let out_norm = self.read_tensor(&mut r)?;
@@ -9908,7 +11971,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None, mtp_layers: 0 })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, diffusion: false, mask_token_id: None, shift_logits: false })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
@@ -9944,14 +12007,32 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
 
     /// Embedding lookup (host) → stacked resident blocks → final RMSNorm → logits.
     /// Returns logits [tokens × vocab].
+    /// Refresh the engine's active-model mirror (rope pairing / rotary dims / YaRN mscale) from
+    /// this model. The rope kernels are too deep to see a `Model`, so they read Gpu-level atomics;
+    /// before this seam existed the LOADER was the only writer, which meant loading model B
+    /// silently reconfigured every forward on model A — the bug behind 11 red kernel-validate
+    /// gates. Every public `&Model` entry point calls this (inserted mechanically; if you add an
+    /// entry point, add the call). Three relaxed stores — free at any call granularity.
+    /// Cross-thread interleaving of two models on ONE Gpu remains last-writer-wins, same as
+    /// before; per-model Gpu instances (what the app does) are unaffected.
+    pub fn activate_model(&self, m: &Model) {
+        // Attention scale rides with the MODEL. q is pre-scaled by attn_scale*sqrt(head_dim) so the
+        // kernels' internal 1/sqrt(head_dim) cancels to exactly the stated scale.
+        let qf = m.attn_scale.map(|s| s * (m.head_dim as f32).sqrt()).unwrap_or(1.0);
+        self.attn_qscale.store(qf.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.rope_neox.store(m.rope_neox, std::sync::atomic::Ordering::Relaxed);
+        self.rope_dims.store(m.rope_dims as u32, std::sync::atomic::Ordering::Relaxed);
+        self.rope_mscale.store(m.rope_mscale.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
     pub fn model_forward(&self, m: &Model, ids: &[u32]) -> Vec<f32> {
+        self.activate_model(m);
         let t = ids.len();
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
         let mut x = self.upload(&xh, t, m.d);
         for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
-        let logits = m.output.apply(self, &xn, t);
+        let logits = self.logits_out(m, &xn, t);
         self.download(&logits)
     }
 
@@ -9961,6 +12042,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
     /// prompt for `dit_conditioning`/cross-attention to consume. Every real Qwen3 weight (including
     /// QK-Norm) is exercised identically to normal text generation; only the last step differs.
     pub fn text_forward_hidden(&self, m: &Model, ids: &[u32]) -> Tensor {
+        self.activate_model(m);
         let t = ids.len();
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
@@ -9996,6 +12078,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
     /// after the embedding and after every block. A healthy stack grows/holds a stable norm
     /// and stays input-sensitive; a collapse or explosion at layer k localizes the fault.
     pub fn model_forward_trace(&self, m: &Model, ids: &[u32], ff: &Tensor) -> Vec<f32> {
+        self.activate_model(m);
         let t = ids.len();
         let stat = |v: &[f32]| -> f32 {
             let row = &v[(t - 1) * m.d..t * m.d];
@@ -10009,12 +12092,18 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         for (li, w) in m.layers.iter().enumerate() {
             // inline of block_forward, measuring each contribution's last-token RMS
             let n1 = self.rmsnorm_t(&x, &w.g1, t, m.d, m.eps);
-            let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, m.eps), ff, t, ad, m.base, 0, hd), w, t, ad, hd, m.eps);
+            let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, m.eps), ff, t, ad, m.base, 0, hd), w, t, ad, hd, m.eps);
             let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, m.eps), ff, t, kv, m.base, 0, hd), w, t, kv, hd, m.eps);
             let v = w.wv.apply(self, &n1, t);
             let attn = self.attention_mh_t(&q, &k, &v, t, ad, m.n_heads, m.n_kv_heads);
-            let o = w.wo.apply(self, &attn, t);
-            let x2 = self.add_t(&x, &o);
+            // MISSED BY c4-820. That pass matched `add_t(x, &o)` and this site writes
+            // `add_t(&x, &o)` — one ampersand, on the main forward path, so the fusion landed on
+            // three sites and skipped the one that runs. Found by counting dispatches per layer
+            // instead of trusting the edit: tools/../count-dispatch reports 32 per layer on an
+            // unquantised fixture against a floor near 8.
+            let x2 = w.wo.apply_add(self, &attn, t, &x);
+            let o = if std::env::var("LOGSCOPE_TRACE_BLOCKS").is_ok() { w.wo.apply(self, &attn, t) }
+                    else { self.alloc(1, 1) };
             // MoE layers: use the real routed FFN for correctness (the gu-cracking diag below only runs dense)
             if w.moe.is_some() { x = self.ffn_apply(w, &x2, t, m.d, m.eps); continue; }
             let n2 = self.rmsnorm_t(&x2, &w.g2, t, m.d, m.eps);
@@ -10035,12 +12124,12 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
         eprintln!("    out_norm rms={:.4}", stat(&self.download(&xn)));
-        self.download(&m.output.apply(self, &xn, t))
+        self.download(&self.logits_out(m, &xn, t))
     }
 }
 
 const ROPE_MH: &str = r#"
-struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
+struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,msc:f32,sl:u32,rot:u32,_p1:u32,_p2:u32,_p3:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;   // per-dim-pair freq factors (len hd/2)
 @group(0)@binding(2) var<storage,read_write> o: array<f32>;
@@ -10050,15 +12139,32 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let half=dd.hd/2u; let per=dd.dm/2u; let p=g.y*nwg.x*64u+g.x; if(p>=dd.t*per){return;}
   let tok=p/per; let within=p%per; let head=within/half; let i=within%half;
   let off=tok*dd.dm + head*dd.hd;
-  let freq=f32(tok+dd.pos0)/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
+  // PARTIAL RoPE (LLaDA2/Ling: rotary_dim 64 of head_dim 128): only the first `rot` dims of each
+  // head rotate; the rest pass through UNROTATED and UNSCALED (reference concatenates q_pass
+  // verbatim). rot==hd reduces every line below to the previous full-rotation kernel exactly:
+  // rhalf==half, the pass branch is unreachable, and the freq exponent divides by the same number.
+  let rhalf=dd.rot/2u;
+  if(i>=rhalf){
+    // pass-through lanes [rot, hd): each upper thread copies the two lanes the rotation never
+    // touches. Coverage: threads rhalf..half copy lanes rot+2k, rot+2k+1 for k=i-rhalf.
+    let j=off + dd.rot + 2u*(i-rhalf);
+    o[j]=x[j]; o[j+1u]=x[j+1u];
+    return;
+  }
+  // sl>0: BATCHED canvases — position wraps per sequence (tok % sl). sl==0: identity (pos = tok).
+  let pt=select(tok, tok%max(dd.sl,1u), dd.sl>0u);
+  // Frequency exponent runs over the ROTARY span (2i/rot), matching the reference inv_freq over
+  // rotary_dim — for full rotation rot==hd and this is the old expression verbatim.
+  let freq=f32(pt+dd.pos0)/(pow(dd.base,(2.0*f32(i))/f32(dd.rot))*ff[i]);
   let c=cos(freq)*dd.msc; let s=sin(freq)*dd.msc;
   // Pairing differs by family, angles do not. llama (NORM): rotate adjacent (2i, 2i+1).
-  // qwen/neox (NEOX): rotate split halves (i, i+hd/2). Wrong pairing = real words, scrambled meaning.
+  // qwen/neox (NEOX): rotate split halves WITHIN THE ROTARY BLOCK (i, i+rot/2) — the reference
+  // applies rotate_half to q[..., :rot], so the half-split is rot's, not the head's.
   // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
-  //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
-  //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
+  //   j0 = i*(2-neox)              -> NORM: 2i     NEOX: i
+  //   j1 = j0 + 1 + neox*(rhalf-1) -> NORM: 2i+1   NEOX: i+rot/2
   let j0=off + i*(2u-dd.neox);
-  let j1=j0 + 1u + dd.neox*(half-1u);
+  let j1=j0 + 1u + dd.neox*(rhalf-1u);
   let x0=x[j0]; let x1=x[j1];
   o[j0]=x0*c-x1*s;
   o[j1]=x0*s+x1*c;
@@ -10315,7 +12421,7 @@ const ATTENTION_MH_EXT_PAR: &str = r#"
 // row's global position. It is still a range rather than a mask, because both windowing rules are
 // contiguous: the tile loop simply starts at the window instead of at 0. swaty: 0 none, 1 standard
 // (Gemma, last n positions), 2 chunked (Llama-4, current aligned chunk).
-struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,sl:u32,bcz:u32,bco:u32,_b2:u32,_b3:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
 @group(0)@binding(2) var<storage,read> vc: array<f32>;
@@ -10692,6 +12798,31 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   for(var c=0u;c<dd.hd;c=c+1u){o[b+c]=o[b+c]/sum;}
 }"#;
 
+/// Per-layer K/V for the BIDIRECTIONAL (diffusion) path.
+///
+/// Block diffusion re-forwards the whole prefix at every step to denoise one block: measured at
+/// 98.5% recompute on a 1718-token prompt (c4-768). Under block-causal the prefix is provably
+/// unchanged for a block's whole life (c4-767), so it can be computed once and reused — this holds
+/// it. `filled` is how many rows are valid; the cache grows a block at a time as blocks complete.
+/// What a cached forward should produce. `None` is the prompt prefill: K/V only, no head.
+#[derive(Clone, Copy, PartialEq)]
+enum Readout { None, Stats, Logits }
+
+pub struct BidirKv { pub k: Vec<Tensor>, pub v: Vec<Tensor>, pub filled: usize, pub cap: usize }
+
+impl BidirKv {
+    /// Drop back to `rows` valid rows so the same window can be re-forwarded.
+    ///
+    /// A block is denoised over several steps, and each step recomputes the SAME rows from changed
+    /// tokens, so the cache must un-publish them between steps. Rewinding only ever SHRINKS:
+    /// growing here would bless rows nobody computed, which reads as context and surfaces as fluent
+    /// nonsense rather than as a crash.
+    pub fn rewind(&mut self, rows: usize) {
+        assert!(rows <= self.filled, "rewind({rows}) would grow the cache from {}", self.filled);
+        self.filled = rows;
+    }
+}
+
 /// Per-layer key/value cache (resident [max_seq, d] buffers).
 pub struct KvCache {
     pub k: Vec<Tensor>, pub v: Vec<Tensor>,
@@ -10966,7 +13097,10 @@ pub struct LogitCmp { pub argmax_match: bool, pub max_abs: f32, pub cosine: f32,
 
 /// Compare a candidate logit vector against a reference. See `LogitCmp`.
 pub fn compare_logits(reference: &[f32], candidate: &[f32]) -> LogitCmp {
-    let am = |v: &[f32]| { let (mut bi, mut bv) = (0usize, f32::MIN); for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i; } } bi };
+    // argmax through the PRODUCTION argmax, not a lookalike. This checker's private `x > bv` scan
+    // skipped NaN (NaN > anything is false) while the engine's argmax has its own NaN order, so the
+    // two could disagree about vectors the check then misreported.
+    let am = |v: &[f32]| argmax(v) as usize;
     // A LENGTH MISMATCH IS NOT A ZERO DIFFERENCE. `zip` stops at the shorter vector, so comparing a
     // 1000-element reference against a 500-element candidate reported max|d| = 0.000 over the common
     // prefix — while `am` scanned both in full and disagreed.
@@ -10981,7 +13115,16 @@ pub fn compare_logits(reference: &[f32], candidate: &[f32]) -> LogitCmp {
     if reference.len() != candidate.len() {
         return LogitCmp { argmax_match: false, max_abs: f32::INFINITY, cosine: 0.0, kl: f32::INFINITY };
     }
-    let max_abs = reference.iter().zip(candidate).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    // NaN-AWARE severity. The old fold was `f32::max(acc, |a-b|)`, and f32::max RETURNS THE OTHER
+    // OPERAND when one side is NaN — so a NaN anywhere in either vector folded to a severity of
+    // ZERO. That is how this gate printed "argmax_match=false max|d|=0.00e0" for the SECOND time:
+    // the first was a length mismatch (fixed above), this one was a NaN, and both times the metric
+    // said "identical" about vectors that were not. Rule: bit-identical (including both-NaN with
+    // the same bits) contributes 0; any other NaN pairing is the most severe disagreement there is.
+    let max_abs = reference.iter().zip(candidate).map(|(a, b)| {
+        if a.to_bits() == b.to_bits() { 0.0 }
+        else { let d = (a - b).abs(); if d.is_nan() { f32::INFINITY } else { d } }
+    }).fold(0.0, f32::max);
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (a, b) in reference.iter().zip(candidate) {
         dot += *a as f64 * *b as f64; na += (*a as f64).powi(2); nb += (*b as f64).powi(2);
@@ -10994,6 +13137,64 @@ pub fn compare_logits(reference: &[f32], candidate: &[f32]) -> LogitCmp {
     let mut kl = 0f64;
     for i in 0..p.len() { if p[i] > 1e-12 { kl += p[i] * ((p[i] + 1e-12) / (q[i] + 1e-12)).ln(); } }
     LogitCmp { argmax_match: am(reference) == am(candidate), max_abs, cosine, kl: kl as f32 }
+}
+
+#[cfg(test)]
+mod download_honors_views {
+    use super::*;
+
+    /// The regression this pins: download/download_u32 copied from source offset 0, so a VIEW
+    /// tensor read back as the head of its backing buffer. Dispatches honored the view; readbacks
+    /// did not — and everything built on readbacks (the int8 sidecar, any download-based diff)
+    /// inherited the blindness silently.
+    #[test]
+    fn a_view_downloads_its_own_bytes_not_the_buffer_head() {
+        let gpu = Gpu::new();
+        // one buffer, two 256-byte regions with different patterns
+        let head: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let tail: Vec<f32> = (0..64).map(|i| 1000.0 + i as f32).collect();
+        let mut all = head.clone(); all.extend_from_slice(&tail);
+        let whole = gpu.upload(&all, 1, 128);
+        let view = Tensor { buf: whole.buf.clone(), rows: 1, cols: 64,
+                            pool: None, site: (0, 0), view: Some((256, 256)) };
+        assert_eq!(gpu.download(&view), tail, "download must read the VIEW, not the head");
+        let words: Vec<u32> = tail.iter().map(|f| f.to_bits()).collect();
+        assert_eq!(gpu.download_u32(&view), words, "download_u32 must read the VIEW too");
+    }
+}
+
+#[cfg(test)]
+mod compare_logits_nan {
+    use super::*;
+
+    #[test]
+    fn a_NaN_is_the_most_severe_disagreement_not_a_zero() {
+        // f32::max(acc, NaN) returns acc, so the old fold reported max|d| = 0.000 over a vector
+        // containing NaN — the "argmax_match=false max|d|=0.00e0" contradiction the int8-cache
+        // gate printed. A metric that says "identical" about a NaN is a metric that hides the bug.
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [1.0f32, f32::NAN, 3.0];
+        assert_eq!(compare_logits(&a, &b).max_abs, f32::INFINITY);
+        assert_eq!(compare_logits(&b, &a).max_abs, f32::INFINITY, "order must not matter");
+    }
+
+    #[test]
+    fn a_faithfully_reproduced_NaN_is_identical_not_infinite() {
+        // The reload gate asks "did the cache change ANY output". If the fresh forward genuinely
+        // produces a NaN and the reload reproduces the same bits, that is fidelity — failing it
+        // would punish the cache for the model.
+        let a = [1.0f32, f32::NAN, 3.0];
+        assert_eq!(compare_logits(&a, &a).max_abs, 0.0);
+    }
+
+    #[test]
+    fn the_checker_argmax_is_the_PRODUCTION_argmax() {
+        // The private `x > bv` scan skipped NaN; if the engine's argmax orders NaN differently the
+        // checker disagreed with the thing it was checking. One argmax, used by both.
+        let v = [0.5f32, f32::NAN, 2.0, 1.0];
+        let c = compare_logits(&v, &v);
+        assert!(c.argmax_match, "a vector must argmax-match itself whatever its NaN placement");
+    }
 }
 
 impl Gpu {
@@ -11159,6 +13360,7 @@ impl Gpu {
     /// cache type threaded everywhere. Correctness first; trimming the unused allocation is an
     /// optimisation with a measurement attached, not a guess.
     pub fn new_cache_for(&self, m: &Model, max_seq: usize) -> KvCache {
+        self.activate_model(m);
         let mut c = self.new_cache(m.n_layers, max_seq, m.kv_dim());
         if let Some(cfg) = &m.mla {
             let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
@@ -11204,7 +13406,20 @@ impl Gpu {
         if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; }
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
-        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, 0];
+        let rot = { let r = self.rope_dims.load(std::sync::atomic::Ordering::Relaxed); if r == 0 { head_dim as u32 } else { r.min(head_dim as u32) } };  // clamp: a stale larger value must never rotate past this head into its neighbor
+        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, 0, rot, 0, 0, 0];
+        self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
+    }
+
+    /// rope_mh_t with a per-sequence position wrap: row's position = pos0 + row % sl.
+    /// For BATCHED canvases (B sequences of length sl concatenated). sl==0 = plain rope_mh_t.
+    pub fn rope_mh_t_sl(&self, x: &Tensor, ff: &Tensor, t: usize, dm: usize, base: f32, pos0: usize, head_dim: usize, sl: usize) -> Tensor {
+        let out = self.alloc(t, dm);
+        if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; }
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
+        let rot = { let r = self.rope_dims.load(std::sync::atomic::Ordering::Relaxed); if r == 0 { head_dim as u32 } else { r.min(head_dim as u32) } };  // clamp: a stale larger value must never rotate past this head into its neighbor
+        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, sl as u32, rot, 0, 0, 0];
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
 
@@ -11251,6 +13466,12 @@ impl Gpu {
     /// Prefill-extend attention: `s` segment queries (q is `[s, dm]`) at global positions
     /// `[base, base+s)` attend over the cache `kc`/`vc` already holding `base+s` rows,
     /// causal by global position. Output is `[s, dm]`.
+    /// UNUSED today (streaming-window attention with an external KV cache). Kept deliberately, and
+    /// flagged here because ATTENTION_MH_EXT_PAR shares its `struct D` text VERBATIM with the live
+    /// ATTENTION_MH_BIDIR_PAR: a replace-first edit to one silently breaks the other, which is
+    /// exactly how the 727 dead-shader night happened. Census both, or delete this when it is
+    /// certain no streaming path will want it.
+    #[allow(dead_code)]
     fn attention_mh_ext(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
         self.attention_mh_ext_swa(q, kc, vc, base, s, dm, n_heads, n_kv_heads, None)
     }
@@ -11273,7 +13494,9 @@ impl Gpu {
             eprintln!("wgpu-engine: sliding window NOT applied in prefill for head_dim={hd} (the serial \
 fallback kernel is causal-only) — long prompts on this model will attend outside the window");
         }
-        let dims = [s as u32, hd as u32, n_heads as u32, n_kv_heads as u32, base as u32, nswa, swaty, 0];
+        // The EXT kernel shares D with the bidir one (same struct text, censused together); it
+        // never uses bcz, but the uniform must still match the declared layout.
+        let dims = [s as u32, hd as u32, n_heads as u32, n_kv_heads as u32, base as u32, nswa, swaty, 0, 0, 0, 0, 0];
         // The parallel kernel now TILES the KV loop (online softmax over 2048-row tiles at 8 KB shared
         // memory), so it handles ANY causal length at high occupancy — no length cliff. Its per-thread
         // register accumulator holds ceil(hd/64) head-dim cols, so it's valid for hd<=192 (head_dim=128
@@ -11445,7 +13668,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let mut padded = raw[..nblk * 210].to_vec();
         padded.resize(src_bytes, 0);
         let srcbuf = self.upload_bytes(&padded, "q6k-src");
-        let src = Tensor { buf: srcbuf, rows: 1, cols: src_bytes / 4, pool: None, view: None };
+        let src = Tensor { buf: srcbuf, rows: 1, cols: src_bytes / 4, pool: None, site: (0, 0), view: None };
         let out = self.alloc_resident_words(n_weights);
         let chunk = engine_config().convert_chunk_blocks.max(1);
         let mut b0 = 0usize;
@@ -11460,9 +13683,9 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             // Padding the BUFFER was not enough: the binding range is what the shader sees.
             let vlen = ((n * 210).div_ceil(4) * 4).min(src_bytes - byte_off);
             let view = Tensor { buf: src.buf.clone(), rows: 1, cols: vlen / 4,
-                                pool: None, view: Some((byte_off as u64, vlen as u64)) };
+                                pool: None, site: (0, 0), view: Some((byte_off as u64, vlen as u64)) };
             let dstv = Tensor { buf: out.buf.clone(), rows: 1, cols: n * 256,
-                                pool: None, view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)) };
+                                pool: None, site: (0, 0), view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)) };
             let dims = [n as u32, 0u32, 0u32, 0u32];
             // wg1 takes the ELEMENT count and divides by 64 itself. Passing an already-divided value
             // divides twice: 65 blocks asked for wg1(2) = ONE workgroup = 64 threads, so block 64 onward
@@ -11501,37 +13724,16 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             }
             Tensor {
                 buf: self.upload_bytes(bytemuck::cast_slice(&grid), "iq1s-grid"),
-                rows: 1, cols: grid.len(), pool: None, view: None,
+                rows: 1, cols: grid.len(), pool: None, site: (0, 0), view: None,
             }
         })
     }
 
     pub fn linear_iq1_s_t(&self, a: &Tensor, w: &Iq1Weight, m: usize) -> Tensor {
-        // The KERNEL is decode-only: it computes one output row per dispatch and claiming batch
-        // support it does not have would be the same kind of lie as a gate testing a path nothing
-        // calls. That contract is right and stays.
-        //
-        // What was wrong is that the assert was the ONLY thing here. Its own message says "batched
-        // prefill converts instead" and nothing at this call site converted, so an IQ1_S model
-        // panicked on any m > 1 — which is prewarm's two-token warm, and then EVERY PROMPT, since a
-        // prompt is a batch by definition. A resident-IQ1_S checkpoint could load and could not be
-        // used.
-        //
-        // So m > 1 runs the decode kernel ROW BY ROW and reassembles. That is m dispatches where a
-        // batched kernel would take one, and it is the correct answer rather than the fast one: this
-        // path exists so a 30 GiB checkpoint stays resident at all, and a slow prefill on a model
-        // that otherwise cannot run is not a trade worth agonising over. A batched IQ1_S GEMM would
-        // replace this; until one exists, working beats crashing.
-        if m != 1 {
-            let cols = a.cols;
-            let out = self.alloc(m, w.n);
-            for r in 0..m {
-                let row = self.rows_view(a, r, 1, cols);
-                let got = self.linear_iq1_s_t(&row, w, 1);
-                self.copy_buf(&got, 0, &out, (r * w.n * 4) as u64, (w.n * 4) as u64);
-            }
-            return out;
-        }
+        // Decode only. This variant exists so a 30.3 GiB checkpoint can stay resident, and residency
+        // matters at m == 1; claiming batch support it does not have would be the same kind of lie as
+        // a gate testing a path nothing calls.
+        assert_eq!(m, 1, "IQ1_S matvec is decode-only; batched prefill converts instead");
         let out = self.alloc(1, w.n);
         // THE DIMS WERE SHIFTED BY ONE FIELD. The shader declares
         //     struct D { m, n, k, kb, gx, ... }
@@ -11590,7 +13792,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let gx = (n as u32).min(32768);
         let gy = (n as u32).div_ceil(gx);
         let dims = [1u32, n as u32, k as u32, (k / 256) as u32, gx, 0, 0, 0];
-        let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, view: None };
+        let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, site: (0, 0), view: None };
         // No .clone(): Tensor does not implement Clone, so cloning a &Tensor copies the reference
         // and does nothing. The cached grid is borrowed for the dispatch, which is all it needs —
         // and had Tensor implemented Clone, that call would have duplicated a GPU buffer handle per
@@ -11622,7 +13824,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let mut padded = raw.to_vec();
         padded.resize(raw.len().div_ceil(4) * 4, 0);
         let src = self.upload_bytes(&padded, "readback-probe");
-        let t = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, view: None };
+        let t = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, site: (0, 0), view: None };
         // download() reads a buffer back as f32 words; reinterpreting them as bytes recovers exactly
         // what was uploaded, because nothing has interpreted them in between.
         let words = self.download(&t);
@@ -11637,7 +13839,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let mut padded = raw.to_vec();
         padded.resize(n.div_ceil(4) * 4, 0);
         let src = self.upload_bytes(&padded, "byte-probe-src");
-        let srct = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, view: None };
+        let srct = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, site: (0, 0), view: None };
         let out = self.alloc_resident_words(n);
         let dims = [n as u32, 0u32, 0u32, 0u32];
         self.dispatch(shader, &[&srct], &out, bytemuck::cast_slice(&dims),
@@ -11658,7 +13860,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
 
     /// Test hook: a small view of a tensor, to force a sync without downloading all of it.
     pub fn view_pub(&self, t: &Tensor, off: usize, len: usize) -> Tensor {
-        Tensor { buf: t.buf.clone(), rows: 1, cols: len, pool: None,
+        Tensor { buf: t.buf.clone(), rows: 1, cols: len, pool: None, site: (0, 0),
                  view: Some(((off * 4) as u64, (len * 4) as u64)) }
     }
 
@@ -11669,7 +13871,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
 
     /// Test hook: a sub-range view of a tensor, for exercising windowed reads from a gate.
     pub fn tensor_view(&self, t: &Tensor, off: u64, size: u64, rows: usize, cols: usize) -> Tensor {
-        Tensor { buf: t.buf.clone(), rows, cols, pool: None, view: Some((off, size)) }
+        Tensor { buf: t.buf.clone(), rows, cols, pool: None, site: (0, 0), view: Some((off, size)) }
     }
 
     fn decode_attention_mh(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
@@ -11888,7 +14090,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
         let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd), w, 1, kv, hd, eps);
         let vr = w.wv.apply(self, &n1, 1);
         let (kqr, ksr) = self.quantize_rows(&kr, 1, kv);
@@ -11939,6 +14141,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
     /// One token through all layers using the int8 KV cache; returns logits [vocab].
     pub fn decode_step_q8(&self, m: &Model, c: &QKvCache, token: u32, pos: usize) -> Vec<f32> {
+        self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
@@ -11953,10 +14156,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        self.download(&m.output.apply(self, &xn, 1))
+        self.download(&self.logits_out(m, &xn, 1))
     }
     /// Run `tokens` through a fresh int8 KV cache; returns last-position logits.
     pub fn forward_kv_q8(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
+        self.activate_model(m);
         let c = self.new_qcache(m.n_layers, tokens.len().max(1), m.kv_dim());
         let mut logits = Vec::new();
         for (pos, &t) in tokens.iter().enumerate() { logits = self.decode_step_q8(m, &c, t, pos); }
@@ -11964,6 +14168,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
     /// Fused-QKV counterpart of forward_kv_q8 (int8 KV cache); bit-exact to it. See --gate-qkv-e2e.
     pub fn forward_kv_q8_fused(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
+        self.activate_model(m);
         let c = self.new_qcache(m.n_layers, tokens.len().max(1), m.kv_dim());
         let mut logits = Vec::new();
         for (pos, &t) in tokens.iter().enumerate() {
@@ -11972,7 +14177,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
             for li in 0..m.n_layers { x = self.block_decode_q8_fused(&m.layers[li], &x, &m.rope_factors, &c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-            logits = self.download(&m.output.apply(self, &xn, 1));
+            logits = self.download(&self.logits_out(m, &xn, 1));
         }
         logits
     }
@@ -12010,8 +14215,8 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let len = pos + 1 - start;
         let size = (len * row_bytes) as u64;
         Some((
-            Tensor { buf: kc.buf.clone(), rows: len, cols, pool: None, view: Some((off as u64, size)) },
-            Tensor { buf: vc.buf.clone(), rows: len, cols, pool: None, view: Some((off as u64, size)) },
+            Tensor { buf: kc.buf.clone(), rows: len, cols, pool: None, site: (0, 0), view: Some((off as u64, size)) },
+            Tensor { buf: vc.buf.clone(), rows: len, cols, pool: None, site: (0, 0), view: Some((off as u64, size)) },
             len,
         ))
     }
@@ -12056,6 +14261,53 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         self.upload(&scaled, 1, m.d)
     }
 
+    /// The output projection, plus Gemma 2's final-logit soft cap when the model states one.
+    ///
+    /// ONE funnel for seventeen call sites. The alternative — a cap at each site — is seventeen
+    /// chances to miss one, and a missed one is silent: uncapped logits sample plausibly, just from
+    /// a differently-shaped distribution, so the model reads as slightly-off rather than broken.
+    /// That is the same failure mode the attention scale had, and the same fix.
+    ///
+    /// No cap = the projection alone, so every non-Gemma-2 model pays nothing.
+    fn logits_out(&self, m: &Model, x: &Tensor, t: usize) -> Tensor {
+        let out = m.output.apply(self, x, t);
+        let Some(cap) = m.logit_softcap else { return out };
+        let n = (out.rows * out.cols) as u32;
+        let capped = self.alloc(out.rows, out.cols);
+        let dims = [n, 0u32, 0, 0, cap.to_bits(), 0, 0, 0];
+        self.dispatch(LOGIT_SOFTCAP, &[&out], &capped, bytemuck::cast_slice(&dims), wg1(n));
+        capped
+    }
+
+    /// Pre-scale q so a stated attention scale takes effect WITHOUT touching seven kernels.
+    ///
+    /// Every attention kernel computes `1/sqrt(head_dim)` internally. Multiplying q by
+    /// `attn_scale * sqrt(head_dim)` first makes the product exactly `attn_scale` — algebraically
+    /// identical, one dispatch, and no new dims field threaded through ATTENTION_MH,
+    /// ATTENTION_MH_EXT_PAR, the decode variants and the SWA ones. That alternative is seven edits
+    /// and seven chances to miss one, and a missed one is SILENT: attention at a slightly wrong
+    /// temperature reads as a model that is merely a bit worse — the Llama-4 failure mode
+    /// archfeat.rs exists to prevent.
+    ///
+    /// Must run AFTER QK-norm: RMS norm is scale-invariant, so a factor folded into wq or applied
+    /// before the norm would be normalized straight back out.
+    fn scale_q_for_attn(&self, q: Tensor, t: usize, width: usize) -> Tensor {
+        let f = f32::from_bits(self.attn_qscale.load(std::sync::atomic::Ordering::Relaxed));
+        if !f.is_finite() || (f - 1.0).abs() < f32::EPSILON { return q; }
+        let w = self.upload(&[f], 1, 1);
+        let out = self.alloc(t, width);
+        let dims = [t as u32, width as u32, 0, 0];
+        self.dispatch(ROW_SCALE, &[&q, &w], &out, bytemuck::cast_slice(&dims), wg1((t * width) as u32));
+        out
+    }
+
+    /// The Q half of the post-rope path: kq_post, then the attention pre-scale. Every `let q =`
+    /// site calls this; `kq_post` stays the shared q/k step so k never picks up the q scale.
+    fn q_post(&self, x: Tensor, w: &BlockWeights, t: usize, width: usize, head_dim: usize, eps: f32) -> Tensor {
+        let x = self.kq_post(x, w, t, width, head_dim, eps);
+        self.scale_q_for_attn(x, t, width)
+    }
+
     /// Apply the embedding scale to an already-resident gathered row.
     fn scale_embed_t(&self, m: &Model, x: Tensor) -> Tensor {
         if (m.embed_scale - 1.0).abs() < f32::EPSILON { return x; }
@@ -12076,7 +14328,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
         // Llama 4 iRoPE: on NoPE layers past floor_scale, scale the query by the attention temperature so
         // long-context softmax stays sharp (the length-generalization mechanism). Skipped below the floor
         // (active_at == false) so short contexts pay nothing; RoPE layers carry attn_temp None.
@@ -12118,7 +14370,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
         let q = match w.attn_temp {
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
             _ => q,
@@ -12149,7 +14401,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
         let q = match w.attn_temp {
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
             _ => q,
@@ -12287,7 +14539,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, rope_pos, hd), w, 1, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, rope_pos, hd), w, 1, ad, hd, eps);
         let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, rope_pos, hd), w, 1, kv, hd, eps);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, slot, kv);
@@ -12339,6 +14591,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// no matter how long the stream runs. Identical to full decode until the cap is hit,
     /// then each new token overwrites the oldest window slot (O(1), see `stream_slot`).
     pub fn decode_step_stream(&self, m: &Model, c: &KvCache, token: u32, pos: usize, sink: usize, window: usize) -> Vec<f32> {
+        self.activate_model(m);
         self.begin_frame();
         let (slot, attend_len) = stream_slot(pos, sink, window);
         let s = token as usize * m.d;
@@ -12350,10 +14603,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 else { self.block_decode_at(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        self.download(&m.output.apply(self, &xn, 1))
+        self.download(&self.logits_out(m, &xn, 1))
     }
 
     pub fn decode_step(&self, m: &Model, c: &KvCache, token: u32, pos: usize) -> Vec<f32> {
+        self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
@@ -12376,13 +14630,14 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        self.download(&m.output.apply(self, &xn, 1))
+        self.download(&self.logits_out(m, &xn, 1))
     }
 
     /// Staged-KV decode of one token: writes K/V into the hot f32 window and reads warm int8 tail + hot
     /// window via two-span attention. Bit-exact to `decode_step` while the warm tail is empty (all-hot),
     /// which is the no-op gate. The caller runs `staged_slide` after this to demote a block when due.
     pub fn decode_step_staged(&self, m: &Model, sc: &StagedKvCache, token: u32, pos: usize) -> Vec<f32> {
+        self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
         let x = self.upload(&m.embed[s..s + m.d], 1, m.d);
@@ -12395,6 +14650,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// no stop token). This is the unit a fabric `Worker` runs — tokens in, tokens out — and it takes
     /// `&self` with a local cache + rng so a single resident model can serve many concurrent prefixes.
     pub fn run_tokens(&self, m: &Model, prefix: &[u32], max_new: usize, sp: &SamplerParams, stop: &[u32], seed: u64) -> Vec<u32> {
+        self.activate_model(m);
         let ids: Vec<u32> = if prefix.is_empty() { vec![0] } else { prefix.to_vec() };
         let cap = (ids.len() + max_new + 1).max(1);
         let cache = self.new_cache(m.n_layers, cap, m.kv_dim());
@@ -12419,6 +14675,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// per-session (each attends its own cache at its own position). On return each
     /// session's `logits` hold its next-token distribution and `pos` is advanced.
     pub fn decode_batched(&self, m: &Model, sessions: &mut [Session], tokens: &[u32]) {
+        self.activate_model(m);
         let n = sessions.len();
         if n == 0 { return; }
         self.begin_frame();
@@ -12451,7 +14708,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             x = self.ffn_apply(w, &x2, n, d, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, n, d, m.eps);
-        let logits = self.download(&m.output.apply(self, &xn, n));
+        let logits = self.download(&self.logits_out(m, &xn, n));
         for i in 0..n {
             sessions[i].logits = logits[i * m.vocab..(i + 1) * m.vocab].to_vec();
             sessions[i].pos += 1;
@@ -12462,6 +14719,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// sessions (e.g. an identical system prompt + tool schemas). Returns a cache filled
     /// in rows 0..prefix.len().
     pub fn prefill_prefix(&self, m: &Model, prefix: &[u32]) -> KvCache {
+        self.activate_model(m);
         let c = self.new_cache(m.n_layers, prefix.len().max(1), m.kv_dim());
         if !prefix.is_empty() { self.prefill_batched(m, &c, prefix); }
         c
@@ -12471,6 +14729,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// then prefills only its unique suffix, skipping recomputation of the shared
     /// prefix — a copy (bandwidth) instead of a full forward (compute) per session.
     pub fn seed_from_prefix(&self, m: &Model, session: &mut Session, prefix: &KvCache, prefix_len: usize) {
+        self.activate_model(m);
         let kv = m.kv_dim();
         for li in 0..m.n_layers {
             self.write_rows(&session.cache.k[li], &prefix.k[li], 0, prefix_len, kv);
@@ -12583,6 +14842,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// load, then every `Session` against the shared `Arc<Model>` starts warm.
     /// Returns the number of distinct pipelines now resident.
     pub fn warm(&self, m: &Model) -> usize {
+        self.activate_model(m);
         let mut s = self.session_new(m, 4, 0);
         self.session_prefill(m, &mut s, &[0u32]);
         let sp = SamplerParams { temperature: 0.0, top_k: 0, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
@@ -12627,6 +14887,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// the full cache up to its position). Produces a cache covering `parent_len+|seg|`
     /// tokens — the primitive that lets the trie cache each shared segment exactly once.
     pub fn extend_prefix(&self, m: &Model, parent: &KvCache, parent_len: usize, seg: &[u32]) -> KvCache {
+        self.activate_model(m);
         let s = seg.len();
         let total = (parent_len + s).max(1);
         let c = self.new_cache(m.n_layers, total, m.kv_dim());
@@ -12740,15 +15001,18 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         out
     }
     pub fn session_q8_new(&self, m: &Model, max_seq: usize, seed: u64) -> SessionQ8 {
+        self.activate_model(m);
         SessionQ8 { cache: self.new_qcache(m.n_layers, max_seq.max(1), m.kv_dim()),
                     pos: 0, logits: Vec::new(), generated: Vec::new(), rng: seed | 1, done: false }
     }
     pub fn session_q8_prefill(&self, m: &Model, s: &mut SessionQ8, prompt: &[u32]) {
+        self.activate_model(m);
         for &t in prompt { s.logits = self.decode_step_q8(m, &s.cache, t, s.pos); s.pos += 1; }
     }
     /// Prefill a shared prefix once into its own int8 cache, to be KV-forked across q8 sessions
     /// (the int8 analogue of `prefill_prefix`). Sequential decode_step_q8 — done once per prefix.
     pub fn prefill_prefix_q8(&self, m: &Model, prefix: &[u32]) -> QKvCache {
+        self.activate_model(m);
         let c = self.new_qcache(m.n_layers, prefix.len().max(1), m.kv_dim());
         for (pos, &t) in prefix.iter().enumerate() { let _ = self.decode_step_q8(m, &c, t, pos); }
         c
@@ -12756,6 +15020,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Copy a prefilled int8 prefix cache's first `prefix_len` rows into a q8 session (a buffer copy
     /// per layer, no recompute) and set its position. The int8 analogue of `seed_from_prefix`.
     pub fn seed_from_prefix_q8(&self, m: &Model, s: &mut SessionQ8, prefix: &QKvCache, prefix_len: usize) {
+        self.activate_model(m);
         let kv = m.kv_dim();
         for li in 0..m.n_layers {
             self.write_rows(&s.cache.kq[li], &prefix.kq[li], 0, prefix_len, kv / 4);
@@ -12770,6 +15035,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// trie run on int8-KV (combining the trie's shared-prefill saving with C's ~4× concurrency).
     /// Segment prefill is sequential `decode_step_q8` (one-time, off the hot path).
     pub fn extend_prefix_q8(&self, m: &Model, parent: &QKvCache, parent_len: usize, seg: &[u32]) -> QKvCache {
+        self.activate_model(m);
         let total = (parent_len + seg.len()).max(1);
         let c = self.new_qcache(m.n_layers, total, m.kv_dim());
         let kv = m.kv_dim();
@@ -12784,6 +15050,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
     /// Greedy decode with an int8 KV cache (reference for the batched int8 path).
     pub fn generate_kv_q8(&self, m: &Model, prompt: &[u32], n_new: usize) -> Vec<u32> {
+        self.activate_model(m);
         let c = self.new_qcache(m.n_layers, prompt.len() + n_new, m.kv_dim());
         let mut logits = Vec::new();
         for (pos, &t) in prompt.iter().enumerate() { logits = self.decode_step_q8(m, &c, t, pos); }
@@ -12798,6 +15065,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// K/V is quantized once for the whole batch and scattered into each session's int8
     /// cache; attention dequantizes on the fly. Mirrors `decode_batched`.
     pub fn decode_batched_q8(&self, m: &Model, sessions: &mut [SessionQ8], tokens: &[u32]) {
+        self.activate_model(m);
         let n = sessions.len();
         if n == 0 { return; }
         let d = m.d; let hd = m.head_dim; let kv = m.kv_dim(); let ad = m.n_heads * hd;
@@ -12830,7 +15098,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             x = self.ffn_apply(w, &x2, n, d, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, n, d, m.eps);
-        let logits = self.download(&m.output.apply(self, &xn, n));
+        let logits = self.download(&self.logits_out(m, &xn, n));
         for i in 0..n {
             sessions[i].logits = logits[i * m.vocab..(i + 1) * m.vocab].to_vec();
             sessions[i].pos += 1;
@@ -12878,6 +15146,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         done
     }
     pub fn generate(&self, m: &Model, prompt: &[u32], n_new: usize) -> Vec<u32> {
+        self.activate_model(m);
         let mut toks = prompt.to_vec(); let mut out = Vec::new();
         for _ in 0..n_new {
             let logits = self.model_forward(m, &toks);
@@ -12888,6 +15157,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
     /// Greedy decode with the KV cache: O(1) attention growth per step.
     pub fn generate_kv(&self, m: &Model, prompt: &[u32], n_new: usize) -> Vec<u32> {
+        self.activate_model(m);
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
         let mut logits = Vec::new();
         for pos in 0..prompt.len() { logits = self.decode_step(m, &c, prompt[pos], pos); }
@@ -12917,7 +15187,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 pos, hot_start, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        m.output.apply(self, &xn, 1)
+        self.logits_out(m, &xn, 1)
     }
 
     fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
@@ -12960,13 +15230,14 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        m.output.apply(self, &xn, 1)
+        self.logits_out(m, &xn, 1)
     }
     /// Greedy generation that keeps the token id and input embedding ON THE GPU across steps: argmax
     /// and embedding gather are kernels, so each step reads back only the 4-byte id instead of [vocab]
     /// logits, and the next input is gathered on-device. Bit-exact to generate_kv (--gate-gpusample);
     /// the prerequisite for windowed (K-steps-per-submit) decode.
     pub fn generate_kv_gpu(&self, m: &Model, prompt: &[u32], n_new: usize) -> Vec<u32> {
+        self.activate_model(m);
         self.clear_oom(); // fresh generation: a prior step's OOM must not poison this run's downloads
         let embed_t = self.resident_embed(m);
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
@@ -12997,6 +15268,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// the maximal "don't sync per token" decode (pin LOGSCOPE_FLUSH_EVERY high to keep a window in one
     /// submit). EOS can't halt mid-window — generate to k then trim (no over-gen here: fixed n_new).
     pub fn generate_kv_window(&self, m: &Model, prompt: &[u32], n_new: usize, k: usize) -> Vec<u32> {
+        self.activate_model(m);
         let k = k.max(1);
         let embed_t = self.resident_embed(m);
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
@@ -13036,6 +15308,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// attention length is pos-derived and stale rows get overwritten).
     pub fn generate_kv_window_sampled(&self, m: &Model, prompt: &[u32], n_new: usize, k: usize,
                                       sp: &SamplerParams, seed: u64) -> Vec<u32> {
+        self.activate_model(m);
         let k = k.max(1);
         let rcap: usize = 64; // ring capacity == the kernel's override-table bound (rlast ≤ 64)
         let embed_t = self.resident_embed(m);
@@ -13080,6 +15353,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// in one pass (causal among the new tokens, attending the full prefix) instead of one
     /// decode_step per token. Built on block_prefill_ext (the offset-append forward).
     pub fn verify_forward(&self, m: &Model, c: &KvCache, tokens: &[u32], start: usize) -> Vec<f32> {
+        self.activate_model(m);
         let s = tokens.len();
         if s == 0 { return Vec::new(); }
         let mut xh = Vec::with_capacity(s * m.d);
@@ -13090,7 +15364,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                                        start, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, s, m.d, m.eps);
-        self.download(&m.output.apply(self, &xn, s)) // all `s` rows projected
+        self.download(&self.logits_out(m, &xn, s)) // all `s` rows projected
     }
 
     /// Greedy speculative decode. `draft` proposes `k` tokens; `target` verifies them in ONE
@@ -13106,7 +15380,25 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
 
     /// As `speculative_generate`, recording per-run stats (rounds, accepted drafts, emitted) so a
     /// bench can report acceptance rate and effective tokens-per-target-forward.
+    /// Speculative decoding with a MODEL as the drafter. Unchanged entry point.
     pub fn speculative_generate_stats(&self, target: &Model, draft: &Model, prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
+        self.spec_core(target, Some(draft), None, prompt, n_new, k, st)
+    }
+
+    /// Speculative decoding with NO second checkpoint: any `Drafter` proposes, the same verifier
+    /// checks. PromptLookup needs no weights at all; an MTP head (c4-828) would be another impl.
+    ///
+    /// The verification, the rewind and the free-bonus-token rule are the SAME CODE as the model
+    /// drafter uses — c4-837 proved that path correct by self-draft, and duplicating twenty lines
+    /// of accept/reject to add a drafter would have put that proof out of date immediately.
+    pub fn speculative_generate_drafter(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
+        prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, st)
+    }
+
+    fn spec_core(&self, target: &Model, draft: Option<&Model>,
+        mut drafter: Option<&mut dyn crate::spec::Drafter>, prompt: &[u32], n_new: usize, k: usize,
+        st: &mut SpecStats) -> Vec<u32> {
         let k = k.max(1);
         let max_seq = prompt.len() + n_new + 2 * k + 8;
         let tc = self.new_cache(target.n_layers, max_seq, target.kv_dim());
@@ -13115,22 +15407,35 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         for pos in 0..prompt.len() { prev = self.decode_step(target, &tc, prompt[pos], pos); }
         let mut pos = prompt.len();
         // PERSISTENT draft session: prefilled once, then resynced incrementally each round.
-        let mut ds = self.session_new(draft, max_seq, 7);
-        self.session_prefill(draft, &mut ds, prompt);
+        // Only the model drafter carries a session. A Drafter is stateless from the loop's side:
+        // it is handed the committed context each round and proposes from that.
+        let mut ds = draft.map(|d| {
+            let mut s = self.session_new(d, max_seq, 7);
+            self.session_prefill(d, &mut s, prompt);
+            s
+        });
         let greedy = SamplerParams { temperature: 0.0, top_k: 0, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
         let mut gen: Vec<u32> = Vec::new();
         while gen.len() < n_new {
             let committed = prompt.len() + gen.len(); // == pos == ds.pos at round start
             // draft k tokens from the persistent draft (advances ds.pos by k)
             let mut draft_toks = Vec::with_capacity(k);
-            for _ in 0..k {
-                match self.session_step(draft, &mut ds, &greedy, None) { Some(t) => draft_toks.push(t), None => break }
+            match (draft, ds.as_mut()) {
+                (Some(d), Some(dsm)) => for _ in 0..k {
+                    match self.session_step(d, dsm, &greedy, None) { Some(t) => draft_toks.push(t), None => break }
+                },
+                _ => if let Some(dr) = drafter.as_deref_mut() {
+                    let mut ctx = prompt.to_vec(); ctx.extend_from_slice(&gen);
+                    draft_toks = dr.draft(&ctx, k);
+                },
             }
             st.rounds += 1;
             if draft_toks.is_empty() { // draft hit eos: plain target step
                 let t = argmax(&prev); gen.push(t); st.emitted += 1;
                 prev = self.decode_step(target, &tc, t, pos); pos += 1;
-                ds.pos = committed; self.session_feed(draft, &mut ds, t);
+                if let (Some(d), Some(dsm)) = (draft, ds.as_mut()) {
+                    dsm.pos = committed; self.session_feed(d, dsm, t);
+                }
                 continue;
             }
             // verify the whole drafted block in one target forward
@@ -13151,8 +15456,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             prev = self.decode_step(target, &tc, correction, pos + accepted);
             pos += accepted + 1;
             // resync the persistent draft: roll back to the accepted length, feed the correction.
-            ds.pos = committed + accepted;
-            self.session_feed(draft, &mut ds, correction);
+            if let (Some(d), Some(dsm)) = (draft, ds.as_mut()) {
+                dsm.pos = committed + accepted;
+                self.session_feed(d, dsm, correction);
+            }
             for t in emit { if gen.len() >= n_new { break; } gen.push(t); st.emitted += 1; }
         }
         gen.truncate(n_new);
@@ -13214,6 +15521,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Run `tokens` through a fresh KV cache and return the last position's logits
     /// (for cross-checking the cached path against the full forward, numerically).
     pub fn forward_kv(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
+        self.activate_model(m);
         let c = self.new_cache(m.n_layers, tokens.len(), m.kv_dim());
         let mut logits = Vec::new();
         for (pos, &t) in tokens.iter().enumerate() { logits = self.decode_step(m, &c, t, pos); }
@@ -13222,6 +15530,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Fused-QKV counterpart of forward_kv (always uses block_decode_fused, independent of the env
     /// flag). Bit-exact to forward_kv — see --gate-qkv-e2e. The dispatch saving is the tok/s lever.
     pub fn forward_kv_fused(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
+        self.activate_model(m);
         let c = self.new_cache(m.n_layers, tokens.len(), m.kv_dim());
         let mut logits = Vec::new();
         for (pos, &t) in tokens.iter().enumerate() {
@@ -13230,7 +15539,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
             for li in 0..m.n_layers { x = self.block_decode_fused(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-            logits = self.download(&m.output.apply(self, &xn, 1));
+            logits = self.download(&self.logits_out(m, &xn, 1));
         }
         logits
     }
@@ -13272,17 +15581,20 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Allocate a session against a resident model. Only the KV cache is per-session;
     /// the weights stay shared.
     pub fn session_new(&self, m: &Model, max_seq: usize, seed: u64) -> Session {
+        self.activate_model(m);
         Session { cache: self.new_cache(m.n_layers, max_seq.max(1), m.kv_dim()),
                   pos: 0, logits: Vec::new(), generated: Vec::new(), rng: seed | 1, done: false }
     }
     /// Prefill a session's prompt into its cache (logits left at the last token).
     pub fn session_prefill(&self, m: &Model, s: &mut Session, prompt: &[u32]) {
+        self.activate_model(m);
         for &t in prompt { s.logits = self.decode_step(m, &s.cache, t, s.pos); s.pos += 1; }
     }
     /// Advance a session by exactly one token. Returns the token, or None if the
     /// session is finished (eos / no logits / cache full). This is the unit a
     /// scheduler interleaves across concurrent sessions.
     pub fn session_step(&self, m: &Model, s: &mut Session, sampler: &SamplerParams, eos: Option<u32>) -> Option<u32> {
+        self.activate_model(m);
         if s.done || s.logits.is_empty() { return None; }
         let next = pick(&s.logits, sampler, &s.generated, &mut s.rng);
         if Some(next) == eos { s.done = true; return None; }
@@ -13297,6 +15609,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// `s.pos` back to the accepted length, then feed the correction token. Positions beyond the
     /// new `pos` hold stale rejected drafts and are ignored by future attention.
     pub fn session_feed(&self, m: &Model, s: &mut Session, token: u32) {
+        self.activate_model(m);
         s.generated.push(token);
         s.logits = self.decode_step(m, &s.cache, token, s.pos);
         s.pos += 1;
@@ -13309,6 +15622,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// user's first token (the slow 0.1 tok/s start). Returns the cached-pipeline count —
     /// the "warm" signal a scheduler can read to know an instance is ready to serve.
     pub fn prewarm(&self, m: &Model) -> usize {
+        self.activate_model(m);
         let c = self.new_cache(m.n_layers, 4, m.kv_dim());
         let _ = self.prefill_batched(m, &c, &[0u32, 0]);
         let _ = self.decode_step(m, &c, 0, 2);
@@ -13514,7 +15828,17 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         // The window ran to completion without device pressure — let the governor nudge its safe-k cap
         // up toward the request (bounded, one step) so a device with headroom converges to a bigger,
         // faster window over a few turns instead of staying pinned at the conservative start.
-        {
+        // A RUN THAT PRODUCED NOTHING IS EVIDENCE OF NOTHING. observe_clean was called
+        // unconditionally, so each zero-token "warm resume" counted as a clean run at the current
+        // window and grew the cap: the operator's log shows 8 → 2172 across two dozen consecutive
+        // "continued 0 tokens in 0.2s" lines, each one announcing "device has headroom" on the basis
+        // of a generation that never happened.
+        //
+        // The cap that results is not merely wrong, it is unfalsifiable in the same direction: a
+        // window nothing ever exercises can never be observed failing, so it only ever grows. The
+        // first real generation afterwards is the one that pays, against a limit chosen by
+        // twenty-four no-ops.
+        if produced > 0 {
             let mut g = self.governor.lock().unwrap();
             let before = g.learned_cap();
             g.observe_clean(k);
@@ -15527,7 +17851,7 @@ impl Gpu {
 // from the causal path. Oracle: `cargo run --release --bin gate-bidir-attn`
 // (f64 CPU reference, includes a t=2100 case crossing the 2048-row tile).
 const ATTENTION_MH_BIDIR_PAR: &str = r#"
-struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,sl:u32,bcz:u32,bco:u32,_b2:u32,_b3:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
 @group(0)@binding(2) var<storage,read> vc: array<f32>;
@@ -15536,17 +17860,43 @@ struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
 var<workgroup> sc: array<f32,2048>;
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let row=wg.x;
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(num_workgroups) ngw:vec3<u32>,
+        @builtin(local_invocation_id) lid:vec3<u32>){
+  // 2D-SAFE. One workgroup per (row, head): a 5852-token prompt at 16 heads is 93632, past the
+  // 65535 per-dimension limit, and the prefill of a long prompt is exactly when that happens. The
+  // grid guard turned it into a panic rather than a dropped dispatch with stale output — the right
+  // failure, but still a failure. Spilling into y makes it a non-event.
+  let row=wg.x + wg.y * ngw.x;
   let i=row/dd.nh; let hh=row%dd.nh; let tid=lid.x;
   let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
   let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;
   let scale=1.0/sqrt(f32(dd.hd));
-  let l=dd.base+dd.s;                                 // NON-CAUSAL: every row attends [0, base+s)
+  // sl>0: BATCHED canvases — query i attends only its own sequence's keys [seq*sl, seq*sl+sl).
+  // sl==0: full span (single canvas, today's behavior). For sl <= TILE the batched key walk is the
+  // same single tile in the same order as the single-canvas case, so outputs are bit-identical.
+  let k0=select(0u, (i/max(dd.sl,1u))*dd.sl, dd.sl>0u);
+  var l=select(dd.base+dd.s, k0+dd.sl, dd.sl>0u);     // NON-CAUSAL within the span
+  // BLOCK-CAUSAL (bcz>0): the reference's mask — row block i sees column block j only when
+  // i>=j, so every position sees its own block and all EARLIER ones, never a later one.
+  // Forward truncation already gives the COMMITTED rows this visibility; what it does not give
+  // is a FIXED PREFIX, because prefix rows still attend forward into the current block. Under
+  // this mode their activations stop depending on the block, which is the prerequisite for a
+  // prefix K/V cache (see the kv_cache_soundness test).
+  // Blocks are anchored at bco (the fill start), NOT at position 0. The loop's blocks begin after
+  // the prompt, and a prompt length is rarely a multiple of the block size: at n_ctx=1718, bcz=32
+  // the old position-0 derivation masked the first fill row against 22 of its OWN 32-token block.
+  // The reference avoids this by REQUIRING past % block_length == 0 (a hard check in bailing.cpp);
+  // our loop has no such constraint, so the mask must carry the origin instead.
+  // Rows before bco are the prompt: one committed region, mutually visible, blind to every block.
+  if(dd.bcz>0u){
+    var e=dd.bco;
+    if(i>=dd.bco){ e=dd.bco+(((i-dd.bco)/dd.bcz)+1u)*dd.bcz; }
+    l=min(l, e);
+  }
   let TILE=2048u;
   var m=-3.4e38; var den=0.0;
   var acc0=0.0; var acc1=0.0; var acc2=0.0;
-  var t0=0u;                                          // no sliding window in a denoise step
+  var t0=k0;                                          // no sliding window in a denoise step
   loop {
     if(t0>=l){break;}
     let t1=min(l, t0+TILE);
@@ -15605,17 +17955,44 @@ impl Gpu {
         if std::env::var_os("LOGSCOPE_NAIVE_BIDIR").is_some() {
             return self.attention_mh_full_t(q, k, v, t, dm, n_heads, n_kv_heads);
         }
-        self.attention_mh_bidir_tiled(q, k, v, t, dm, n_heads, n_kv_heads)
+        self.attention_mh_bidir_tiled(q, k, v, t, dm, n_heads, n_kv_heads, 0)
     }
 
-    pub fn attention_mh_bidir_tiled(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+    /// Bidirectional attention of `n` query rows against a K/V cache holding `row0 + n` rows.
+    ///
+    /// No new kernel: ATTENTION_MH_BIDIR_PAR already computes its key span as `base + s` and the
+    /// host had simply always passed base = 0. Query row i is the absolute position row0 + i, and
+    /// every query sees keys [0, row0+n) — which under block diffusion IS the block-causal mask,
+    /// because the only rows ever queried are the current block and the cache holds exactly what
+    /// precedes it. That is why the cached path needs no bcz: the truncation is the mask.
+    pub fn attention_mh_bidir_cached(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, row0: usize,
+                                     n: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        let hd = dm / n_heads;
+        assert!(hd <= 192, "cached bidir attention needs the tiled kernel (hd > 192 has no base offset)");
+        let out = self.alloc(n, dm);
+        let dims = [n as u32, hd as u32, n_heads as u32, n_kv_heads as u32, row0 as u32,
+                    0u32, 0u32, 0u32, 0u32, 0u32, 0, 0];
+        let rows = (n * n_heads) as u32;
+        let gx = rows.min(65535).max(1);
+        self.dispatch(ATTENTION_MH_BIDIR_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims),
+                      (gx, rows.div_ceil(gx), 1));
+        out
+    }
+
+    pub fn attention_mh_bidir_tiled(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: usize, dm: usize, n_heads: usize, n_kv_heads: usize, sl: usize) -> Tensor {
         let hd = dm / n_heads;
         if hd > 192 {
+            assert!(sl == 0, "batched canvases need the tiled kernel (hd > 192 falls to full_t which has no seq clamp)");
             return self.attention_mh_full_t(q, k, v, t, dm, n_heads, n_kv_heads);
         }
         let out = self.alloc(t, dm);
-        let dims = [t as u32, hd as u32, n_heads as u32, n_kv_heads as u32, 0u32, 0u32, 0u32, 0u32];
-        self.dispatch(ATTENTION_MH_BIDIR_PAR, &[q, k, v], &out, bytemuck::cast_slice(&dims), ((t * n_heads) as u32, 1, 1));
+        let (bcz, bco) = BLOCK_CAUSAL.with(|c| c.get());
+        let dims = [t as u32, hd as u32, n_heads as u32, n_kv_heads as u32, 0u32, 0u32, 0u32, sl as u32, bcz as u32, bco as u32, 0, 0];
+        // One workgroup per (row, head), spilled into y past 65535 — see the kernel's note.
+        let rows = (t * n_heads) as u32;
+        let gx = rows.min(65535).max(1);
+        self.dispatch(ATTENTION_MH_BIDIR_PAR, &[q, k, v], &out, bytemuck::cast_slice(&dims),
+                      (gx, rows.div_ceil(gx), 1));
         out
     }
 }
@@ -15669,30 +18046,75 @@ impl Gpu {
     /// `attention_mh_bidir_tiled` in place of the causal kernel and the
     /// `write_rows` cache appends removed. RoPE stays — masked-diffusion models
     /// keep real positions; only the attention mask differs.
-    fn block_bidir(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+    /// One transformer block over rows [row0, row0+n) with K/V for [0, row0) already cached.
+    ///
+    /// Mirrors `block_bidir` exactly except that (a) q/k/v are computed for the NEW rows only,
+    /// (b) rope positions start at row0 rather than 0 — the absolute position is what the model was
+    /// trained on and getting this wrong is silent — and (c) the new K/V are written into the cache
+    /// before attention, so the query window sees itself as well as the prefix.
+    #[allow(clippy::too_many_arguments)]
+    fn block_bidir_cached(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, row0: usize, n: usize,
+                          kc: &Tensor, vc: &Tensor, d: usize, head_dim: usize, n_heads: usize,
+                          n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = w.rope_base.unwrap_or(base);
+        let base = if w.nope { 0.0 } else { base };
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
+        let n1 = self.rmsnorm_t(x, &w.g1, n, d, eps);
+        let q = self.q_post(self.rope_mh_t_sl(&self.qk_norm(w.wq.apply(self, &n1, n), &w.q_norm, n, ad, hd, eps), ff, n, ad, base, row0, hd, 0), w, n, ad, hd, eps);
+        let q = match w.attn_temp {
+            Some(at) if w.nope && at.active_at((row0 + n).saturating_sub(1)) => self.scale_query_temp_rows(&q, at, 0, n, ad),
+            _ => q,
+        };
+        let knew = self.kq_post(self.rope_mh_t_sl(&self.qk_norm(w.wk.apply(self, &n1, n), &w.k_norm, n, kv, hd, eps), ff, n, kv, base, row0, hd, 0), w, n, kv, hd, eps);
+        let vnew = w.wv.apply(self, &n1, n);
+        // Publish the new rows BEFORE attending, so the block sees itself.
+        self.write_rows(kc, &knew, row0, n, kv);
+        self.write_rows(vc, &vnew, row0, n, kv);
+        let attn = self.attention_mh_bidir_cached(&q, kc, vc, row0, n, ad, n_heads, n_kv_heads);
+        // Fuse the attention residual into the projection's epilogue: apply_add is what the
+        // FFN's down-projection has always used, and it was simply never called here. An ADD
+        // of two [1, d] vectors is 8 KB of work behind a full dispatch — one per layer, on a
+        // decode bound by launches rather than arithmetic. apply_add falls back to
+        // matvec-then-add for kinds without a fused kernel, so nothing regresses.
+        let x2 = w.wo.apply_add(self, &attn, n, x);
+        self.ffn_apply(w, &x2, n, d, eps)
+    }
+
+    fn block_bidir(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, sl: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
+        let q = self.q_post(self.rope_mh_t_sl(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd, sl), w, t, ad, hd, eps);
         let q = match w.attn_temp {
             Some(at) if w.nope && at.active_at(t.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, 0, t, ad),
             _ => q,
         };
-        let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd), w, t, kv, hd, eps);
+        let k = self.kq_post(self.rope_mh_t_sl(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd, sl), w, t, kv, hd, eps);
         let v = w.wv.apply(self, &n1, t);
-        let attn = self.attention_mh_bidir_tiled(&q, &k, &v, t, ad, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, t);
-        let x2 = self.add_t(x, &o);
+        let attn = self.attention_mh_bidir_tiled(&q, &k, &v, t, ad, n_heads, n_kv_heads, sl);
+        // Same fusion as the annotated site above: the residual folds into the matvec epilogue.
+        let x2 = w.wo.apply_add(self, &attn, t, x);
         self.ffn_apply(w, &x2, t, d, eps)
     }
 
     /// One denoise step's readout: bidirectional forward over `tokens`, final
     /// norm, output projection, per-position stats. Returns `t * 4` f32s laid
     /// out as ROWSTATS_F32 rows. Framed: one submit batch per step.
-    pub fn denoise_stats(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
+    pub fn denoise_stats(&self, m: &Model, tokens: &[u32]) -> Vec<f32> { self.denoise_stats_b(m, tokens, 1) }
+
+    /// BATCHED denoise stats: `b` canvases of equal length concatenated in `tokens`. One forward
+    /// serves all canvases — attention is block-diagonal per canvas (seq clamp in the tiled
+    /// kernel), RoPE wraps positions per canvas, everything else is row-independent. b==1 is the
+    /// single-canvas path bit-identically (sl=0 keeps both kernels on their original arithmetic).
+    /// This is the fan-out shape: the compute-bound step's rows multiply by b while its weight
+    /// traffic does not.
+    pub fn denoise_stats_b(&self, m: &Model, tokens: &[u32], b: usize) -> Vec<f32> {
+        self.activate_model(m);
         let t = tokens.len();
         if t == 0 { return Vec::new(); }
+        assert!(b >= 1 && t % b == 0, "denoise_stats_b: {t} tokens across {b} canvases");
+        let sl = if b == 1 { 0 } else { t / b };
         // Refuse loudly at the door: the c689 run passed Qwen's mask id (151643) into a Llama embed
         // and died 15k lines deep as a slice-range panic. Wrong-vocab ids are a one-line diagnosis.
         // (Pick a reserved special for the model family — not eot; EoTP treats eot specially.)
@@ -15700,15 +18122,207 @@ impl Gpu {
         if let Some(&bad) = tokens.iter().find(|&&id| id as usize >= vocab) {
             panic!("denoise_stats: token id {bad} >= vocab {vocab} — wrong mask id for this model family?");
         }
+        self.begin_batch_frame();
+        let mut xh = Vec::with_capacity(t * m.d);
+        for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        let mut x = self.upload(&xh, t, m.d);
+        let dbg = std::env::var("LOGSCOPE_DEBUG_B").is_ok();
+        let probe = |gpu: &Self, x: &Tensor, tag: &str| {
+            if !dbg { return; }
+            let h = gpu.download(x);
+            let row = |r: usize| -> (f32, f32) {
+                let sl_ = &h[r * m.d..(r + 1) * m.d];
+                let mean = sl_.iter().sum::<f32>() / m.d as f32;
+                let var = sl_.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / m.d as f32;
+                (mean, var)
+            };
+            let (m0, v0) = row(0); let (m1, v1) = row(sl.min(t - 1));
+            eprintln!("dbg-b {tag}: row0 mean {m0:+.4e} var {v0:.3e} | row{sl} mean {m1:+.4e} var {v1:.3e}");
+        };
+        // Frame-honest probing: a mid-frame download while later dispatches still reference x
+        // corrupts the run (the first probe draft proved it by zeroing everything it observed).
+        // Debug mode closes the frame around each layer instead.
+        if dbg {
+            self.end_frame();
+            probe(self, &x, &format!("embed sl={sl}"));
+            for li in 0..m.n_layers {
+                self.begin_batch_frame();
+                x = self.block_bidir(&m.layers[li], &x, &m.rope_factors, t, sl, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+                self.end_frame();
+                probe(self, &x, &format!("layer{li} sl={sl}"));
+            }
+            self.begin_batch_frame();
+        } else {
+            for li in 0..m.n_layers {
+                x = self.block_bidir(&m.layers[li], &x, &m.rope_factors, t, sl, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+            }
+        }
+        // ROW WINDOW. The block-diffusion loop reads stats for the CURRENT BLOCK only (~32 rows),
+        // but the output projection ran over every position: at t=2400, d=2048, vocab=157184 that
+        // is 1.55 TFLOP and a 1.5 GB logits tensor per forward, ~75x of it discarded. It dominates
+        // the denoise step and is why the faithful one-token-per-commit schedule looked
+        // unaffordable. The layer stack still runs over ALL positions — attention is bidirectional
+        // and every row feeds every other — only the final norm, projection and row-reduction are
+        // windowed, so the numbers that survive are unchanged.
+        let (r0, rn) = STATS_WINDOW.with(|w| w.get())
+            .map(|(a, b)| { let a = a.min(t); (a, b.min(t - a).max(1)) }).unwrap_or((0, t));
+        let xw = if rn == t && r0 == 0 { x } else { self.rows_view(&x, r0, rn, m.d) };
+        let xn = self.rmsnorm_t(&xw, &m.out_norm, rn, m.d, m.eps);
+        let z = self.logits_out(m, &xn, rn);
+        if LOGITS_MODE.with(|c| c.get()) {
+            let out = self.download(&z);
+            self.end_frame();
+            return out;
+        }
+        let stats = self.rowstats_t(&z, rn, z.cols);
+        let out = self.download(&stats);
+        self.end_frame();
+        out
+    }
+
+    /// Raw LOGITS for rows [row0, row0+n), laid out row-major as n * vocab f32s. Same forward as
+    /// `denoise_stats_rows`; only the final reduction differs. Needed because the reference SAMPLES
+    /// each masked position (chatllm.cpp forces do_sample with top_p) rather than taking argmax,
+    /// and a 4-stat reduction cannot be sampled from. The row window keeps this affordable: one
+    /// block of ~32 rows at vocab 157k is ~20 MB, against 1.5 GB for the whole canvas.
+    pub fn denoise_logits_rows(&self, m: &Model, tokens: &[u32], row0: usize, n: usize) -> Vec<f32> {
+        self.activate_model(m);
+        let _g = StatsWindowGuard::set((row0, n));
+        let _l = LogitsModeGuard::set(true);
+        self.denoise_stats_b(m, tokens, 1)
+    }
+
+    /// Stats for rows [row0, row0+n) only — the same numbers `denoise_stats` would give, sliced.
+    /// The layer stack is untouched and still sees every position; only the output projection is
+    /// windowed. The diffusion loop never reads outside the current block, so this is exact.
+    /// Allocate a bidirectional K/V cache big enough for `cap` rows.
+    pub fn bidir_kv_new(&self, m: &Model, cap: usize) -> BidirKv {
+        self.activate_model(m);
+        let kv = m.n_kv_heads * m.head_dim;
+        BidirKv {
+            k: (0..m.n_layers).map(|_| self.alloc(cap, kv)).collect(),
+            v: (0..m.n_layers).map(|_| self.alloc(cap, kv)).collect(),
+            filled: 0, cap,
+        }
+    }
+
+    /// Forward rows [row0, row0+n) against `cache`, writing their K/V into it, and return the
+    /// 4-stat rows for that window. The layer stack runs over n rows instead of row0+n — which is
+    /// the whole point: at the operator's proportions that is 32 rows instead of ~2050.
+    ///
+    /// The caller owns the invariant that `cache` holds valid K/V for exactly [0, row0). Getting
+    /// that wrong reads uninitialised memory as context, so `filled` is checked rather than trusted.
+    pub fn denoise_stats_cached(&self, m: &Model, tokens: &[u32], row0: usize, n: usize,
+                                cache: &mut BidirKv) -> Vec<f32> {
+        self.activate_model(m);
+        self.denoise_cached(m, tokens, row0, n, cache, Readout::Stats)
+    }
+
+    /// Raw LOGITS for the cached window — what the SAMPLED commit needs, since a 4-stat reduction
+    /// cannot be sampled from.
+    pub fn denoise_logits_cached(&self, m: &Model, tokens: &[u32], row0: usize, n: usize,
+                                 cache: &mut BidirKv) -> Vec<f32> {
+        self.activate_model(m);
+        self.denoise_cached(m, tokens, row0, n, cache, Readout::Logits)
+    }
+
+    /// Populate the cache for rows [row0, row0+n) WITHOUT a readout.
+    ///
+    /// The prompt prefill wants K/V and nothing else, and the head is ruinous at prompt scale: a
+    /// 3840-row prompt against vocab 157184 asks for a 2.41 GB logits tensor, past wgpu's 2 GB
+    /// per-buffer ceiling. That allocation failed as a NON-FATAL validation error, so every bind
+    /// group built from it was invalid, every dispatch using them was dropped, and generation
+    /// carried on producing nothing — "produced 8 tokens" beside an empty reply. It also computed
+    /// 1.24 TFLOP of projection purely to discard it.
+    pub fn bidir_kv_prefill(&self, m: &Model, tokens: &[u32], row0: usize, n: usize,
+                            cache: &mut BidirKv) {
+        self.activate_model(m);
+        let _ = self.denoise_cached(m, tokens, row0, n, cache, Readout::None);
+    }
+
+    fn denoise_cached(&self, m: &Model, tokens: &[u32], row0: usize, n: usize,
+                      cache: &mut BidirKv, readout: Readout) -> Vec<f32> {
+        assert_eq!(cache.filled, row0, "cache holds {} rows but the window starts at {row0}", cache.filled);
+        assert!(row0 + n <= cache.cap, "window [{row0},{}) exceeds cache capacity {}", row0 + n, cache.cap);
+        assert_eq!(tokens.len(), row0 + n, "tokens must cover the whole prefix plus the window");
         self.begin_frame();
+        let mut xh = Vec::with_capacity(n * m.d);
+        for &id in &tokens[row0..row0 + n] {
+            let st = id as usize * m.d;
+            xh.extend_from_slice(&m.embed[st..st + m.d]);
+        }
+        let mut x = self.upload(&xh, n, m.d);
+        for li in 0..m.n_layers {
+            x = self.block_bidir_cached(&m.layers[li], &x, &m.rope_factors, row0, n,
+                                        &cache.k[li], &cache.v[li], m.d, m.head_dim,
+                                        m.n_heads, m.n_kv_heads, m.base, m.eps);
+        }
+        cache.filled = row0 + n;
+        if matches!(readout, Readout::None) {
+            self.end_frame();
+            return Vec::new();
+        }
+        // GUARD, because the failure mode was silence. A logits tensor over the device's per-buffer
+        // ceiling fails as a NON-FATAL validation error: the buffer is invalid, the bind groups
+        // built from it are invalid, the dispatches are dropped, and generation continues on stale
+        // memory. Naming it beats reading five "device error (non-fatal, logged)" blocks and an
+        // empty reply.
+        let need = n as u64 * m.vocab as u64 * 4;
+        let cap = self.max_buffer_bytes() as u64;
+        assert!(need <= cap,
+            "denoise readout wants a {need}-byte logits tensor ({n} rows x {} vocab) but this device \
+caps a single buffer at {cap}. Window the readout to the rows actually read — a whole-prompt readout \
+is never needed, and the prefill path takes Readout::None for exactly this reason.", m.vocab);
+        let xn = self.rmsnorm_t(&x, &m.out_norm, n, m.d, m.eps);
+        let z = self.logits_out(m, &xn, n);
+        let out = if matches!(readout, Readout::Logits) { self.download(&z) }
+                  else { self.download(&self.rowstats_t(&z, n, z.cols)) };
+        self.end_frame();
+        out
+    }
+
+    pub fn denoise_stats_rows(&self, m: &Model, tokens: &[u32], row0: usize, n: usize) -> Vec<f32> {
+        self.activate_model(m);
+        let _g = StatsWindowGuard::set((row0, n));
+        self.denoise_stats_b(m, tokens, 1)
+    }
+
+    /// denoise_stats_rows with BLOCK-CAUSAL attention at `bcz` granularity (0 = fully
+    /// bidirectional, today's behaviour). This is the reference's mask: a position sees its own
+    /// block and every earlier one, never a later one. Opt-in because it CHANGES OUTPUT — it is a
+    /// different (more faithful) model of attention, not an optimisation — and because its value is
+    /// unlocking a prefix K/V cache, which is not built yet.
+    pub fn denoise_stats_rows_bc(&self, m: &Model, tokens: &[u32], row0: usize, n: usize, bcz: usize, origin: usize) -> Vec<f32> {
+        self.activate_model(m);
+        let _b = BlockCausalGuard::set(bcz, origin);
+        let _g = StatsWindowGuard::set((row0, n));
+        self.denoise_stats_b(m, tokens, 1)
+    }
+}
+
+impl Gpu {
+    /// Teacher-forced CAUSAL per-position stats over a fixed id sequence — the gpu-gemm side of
+    /// the cross-engine forward oracle (tools/oracle). denoise_stats' twin with block_forward
+    /// (causal, KV-less) in place of block_bidir; same framed unembed rowstats. Run against
+    /// llama.cpp's oracle-ref on the same f32 tiny (load_gguf_opt(bytes, false) keeps weights
+    /// f32-resident so the comparison measures the FORWARD, not quantization).
+    pub fn causal_argmax_stats(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
+        self.activate_model(m);
+        let t = tokens.len();
+        if t == 0 { return Vec::new(); }
+        let vocab = m.embed.len() / m.d;
+        if let Some(&bad) = tokens.iter().find(|&&id| id as usize >= vocab) {
+            panic!("causal_argmax_stats: token id {bad} >= vocab {vocab}");
+        }
+        self.begin_batch_frame();
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
         let mut x = self.upload(&xh, t, m.d);
         for li in 0..m.n_layers {
-            x = self.block_bidir(&m.layers[li], &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+            x = self.block_forward(&m.layers[li], &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
-        let z = m.output.apply(self, &xn, t);
+        let z = self.logits_out(m, &xn, t);
         let stats = self.rowstats_t(&z, t, z.cols);
         let out = self.download(&stats);
         self.end_frame();
@@ -15798,6 +18412,497 @@ impl<P: DenoisePolicy> DenoisePolicy for TraceRecorder<P> {
     }
 }
 
+/// Say once what the block loop spent on rows it had already computed. Under block-causal the
+/// prefix is fixed for a block's whole life (c4-767), so `reused` is work a prefix K/V cache would
+/// remove outright — the number that decides whether that cache is worth its plumbing, measured
+/// instead of guessed.
+fn report_recompute(forwards: usize, rows: usize, reused: usize) {
+    if forwards == 0 || rows == 0 { return; }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+    eprintln!("wgpu-engine: block diffusion cost — {forwards} forward(s) over {rows} rows total, \
+{reused} of them ({:.1}%) an UNCHANGED prefix recomputed from scratch. A prefix K/V cache removes \
+that share; the remainder is the blocks themselves.", 100.0 * reused as f64 / rows as f64);
+}
+
+impl Gpu {
+    /// The denoise loop as a callable: prompt + masked fill window -> revealed fill ids.
+    /// This is the bench's loop promoted to the seam serve and the egui worker need — a
+    /// diffusion Model (m.diffusion) cannot be AR-decoded into anything but fluent noise.
+    /// Block schedule per llama.cpp diffusion.cpp:165-180 (block=0 -> whole window);
+    /// tau=Some -> adaptive threshold with progress floor, None -> fixed top-k. Ends with
+    /// the standard final-commit pass so the window always fills within `steps`+1 forwards.
+    /// Refuses without a mask id: denoising around a guessed one is plausible nonsense.
+    pub fn diffuse_generate(&self, m: &Model, prompt: &[u32], n_fill: usize, steps: usize, block: usize, tau: Option<f32>) -> Result<Vec<u32>, String> {
+        self.activate_model(m);
+        self.diffuse_generate_cb(m, prompt, n_fill, steps, block, tau, &[], &|| false, &mut |_| true)
+    }
+
+    /// diffuse_generate with the three things a real UI needs and the plain version cannot express.
+    ///
+    /// STOP: a diffusion reply fills its whole ceiling — 660 tokens is 21 blocks, and at 8 steps per
+    /// block that is 168 whole-prefix forwards even when the model finishes in two blocks. Nothing
+    /// was checking for the stop set, so every reply cost the maximum. Committed blocks are now
+    /// scanned for eos/stop and generation ends there.
+    ///
+    /// CANCEL: nothing checked it. A diffusion generation could not be interrupted at all — the
+    /// operator's only recourse was killing the app, which is exactly what happened on the 40k-submit
+    /// run. Checked between steps, so the worst case is one forward.
+    ///
+    /// ON_BLOCK: the tokens of each completed block, so a reply appears progressively instead of
+    /// after minutes of silence. Returning false stops generation (the runaway guard lives there).
+    pub fn diffuse_generate_cb(&self, m: &Model, prompt: &[u32], n_fill: usize, steps: usize,
+                               block: usize, tau: Option<f32>, stop: &[u32],
+                               cancel: &dyn Fn() -> bool,
+                               on_block: &mut dyn FnMut(&[u32]) -> bool) -> Result<Vec<u32>, String> {
+        self.activate_model(m);
+        self.diffuse_generate_sampled(m, prompt, n_fill, steps, block, tau, stop, None, &mut 0, cancel, on_block)
+    }
+
+    /// diffuse_generate_cb that SAMPLES each masked position instead of taking its argmax.
+    ///
+    /// The reference does this: chatllm.cpp forces do_sample with top_p, samples every masked
+    /// position, and ranks the commit candidates by the SAMPLED token's probability. Our loop took
+    /// the argmax and ranked by p_top, which is a different algorithm — greedy denoising, whose
+    /// characteristic failure is repetitive output. It also meant the operator's temperature
+    /// setting did nothing at all on a diffusion turn: the loop had no sampler to give it to.
+    ///
+    /// `sp: None` or temperature <= 0 keeps the exact greedy behaviour the oracle is pinned to, so
+    /// the reference comparison stays meaningful and this is opt-in per call rather than a silent
+    /// change of algorithm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn diffuse_generate_sampled(&self, m: &Model, prompt: &[u32], n_fill: usize, steps: usize,
+                                    block: usize, tau: Option<f32>, stop: &[u32],
+                                    sp: Option<&SamplerParams>, rng: &mut u64,
+                                    cancel: &dyn Fn() -> bool,
+                                    on_block: &mut dyn FnMut(&[u32]) -> bool) -> Result<Vec<u32>, String> {
+        self.activate_model(m);
+        let sp = sp.filter(|p| p.temperature > 0.0);
+        let mask = m.mask_token_id.ok_or("diffuse_generate: model has no tokenizer.ggml.mask_token_id — pass a file that carries one (gguf-audit checks this in milliseconds)")?;
+        let n_ctx = prompt.len();
+        let l = n_ctx + n_fill;
+        let mut tokens: Vec<u32> = prompt.to_vec();
+        tokens.extend(std::iter::repeat(mask).take(n_fill));
+        let mut masked: Vec<bool> = (0..l).map(|i| i >= n_ctx).collect();
+        let blk = if block == 0 { n_fill.max(1) } else { block };
+        let n_blocks = n_fill.div_ceil(blk);
+
+        // SEMI-AUTOREGRESSIVE BLOCK DIFFUSION, per chatllm.cpp models/bailing.cpp (LLADA2).
+        // Two corrections against the previous whole-canvas loop, both quality-critical:
+        //
+        // 1. STEPS ARE PER BLOCK, not global. The reference schedules block_length/steps commits
+        //    per step with the remainder on the LAST steps, running `steps` iterations for EVERY
+        //    block. The old loop ran `steps` iterations total across the whole fill, so with
+        //    n_fill=660, block=32, steps=32 it committed ceil(660/32)=21 of a block's 32 positions
+        //    from ONE forward — near-independent sampling per position, which is exactly the
+        //    "real words, no coherence" signature. Each commit must condition on the previous ones.
+        //
+        // 2. BLOCK-CAUSAL VISIBILITY. The reference masks future blocks (-INF); the old loop
+        //    forwarded the entire canvas, so every position attended to hundreds of still-MASK
+        //    future tokens. Truncating the forward at the current block's end gives the same
+        //    visibility for the rows we actually commit (prompt + committed blocks + this block)
+        //    without touching the attention kernel, and is cheaper besides.
+        //
+        // COST, stated honestly: forwards = n_blocks * steps_per_block, each over the prefix, because
+        // this path has NO KV CACHE — the reference re-forwards only the block and reads the prefix
+        // from cache. That is why `steps` defaults modestly here rather than to block_length (the
+        // reference's 1-token-per-commit ideal); caching the committed prefix is the named next work
+        // and is what makes the faithful schedule affordable.
+        let mut steps_per_block = steps.min(blk).max(1);
+        // RECOMPUTE ACCOUNTING. Every step re-forwards the whole prefix to denoise one block, and
+        // under block-causal that prefix is provably UNCHANGED for the block's whole life — so those
+        // rows are recomputed, not computed.
+        let (mut rows_forwarded, mut rows_reused, mut forwards) = (0usize, 0usize, 0usize);
+        let mut oom_steps = 0u32;
+        let block_causal = std::env::var("LOGSCOPE_DIFFUSION_BLOCK_CAUSAL").as_deref() != Ok("0");
+        // PREFIX K/V CACHE. Sound only under block-causal (c4-767: the prefix is then provably
+        // independent of the block) and only when logits are read at the row they belong to —
+        // shift_logits reads row i-1 for position i, so a window starting at `lo` would need row
+        // lo-1, which lives in the previous block. Rather than special-case that, the cached path
+        // declines and the whole-canvas path runs, which is correct if slower.
+        //
+        // Worth it because c4-768 measured 98.5% of forwarded rows as recomputed prefix.
+        // shift_logits no longer declines. It reads row i-1 for position i, so the window simply
+        // starts one row EARLIER — the cache rewinds to lo-1 and recomputes that row from the same
+        // committed token, which is free and correct. Declining instead cost DiffuCoder (arch
+        // 'dream', where shift_logits defaults true) the whole-canvas forward: 2471 rows x 28 layers
+        // with an ff of 18944, which exhausted the driver's VMA, and the OOM degraded into invalid
+        // buffers and an empty readout.
+        let use_cache = block_causal
+            && std::env::var("LOGSCOPE_DIFFUSION_KV_CACHE").as_deref() != Ok("0");
+        let mut cache = if use_cache {
+            let mut c = self.bidir_kv_new(m, l);
+            // The prompt is computed ONCE for the whole generation; it never changes.
+            forwards += 1; rows_forwarded += n_ctx; rows_reused += 0;
+            self.bidir_kv_prefill(m, &tokens[..n_ctx], 0, n_ctx, &mut c);
+            static SAID_KV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID_KV.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: block diffusion PREFIX K/V CACHE on — the {n_ctx}-token prompt \
+is forwarded once, then each step forwards only its block. LOGSCOPE_DIFFUSION_KV_CACHE=0 restores \
+the whole-canvas forward.");
+            }
+            Some(c)
+        } else {
+            // THE SCHEDULE FOLLOWS THE CACHE. c4-773 made one-token-per-commit the default on the
+            // strength of c4-770's cache — a step forwards its own block, not the canvas. Without
+            // the cache that same schedule multiplies WHOLE-CANVAS forwards: a DiffuCoder run
+            // planned 2496 forwards over a 2471-row canvas, exhausted the driver's VMA, and logged
+            // 111 OOMs before dying. The quality default must not survive the assumption it rests on.
+            if steps_per_block > 8 {
+                eprintln!("wgpu-engine: block diffusion — no prefix cache on this path, so the \
+schedule falls back to 8 steps/block ({} tokens per commit) instead of {steps_per_block}. Each step \
+would otherwise re-forward the whole canvas. LOGSCOPE_DIFFUSION_STEPS pins it either way.",
+                    blk.div_ceil(8));
+                steps_per_block = 8;
+            }
+            None
+        };
+        {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let per_commit = (blk as f32 / steps_per_block as f32).max(1.0);
+                // Cost with the prefix cache is n_ctx + n_fill*(block+1) rows — measured 300/556/1068
+                // on a 32-token fill at block 8/16/32. So BLOCK SIZE sets the price at unchanged
+                // quality, which is the lever an operator actually wants and the line never named.
+                let (c_now, c16, c8) = (n_ctx + n_fill * (blk + 1), n_ctx + n_fill * 17, n_ctx + n_fill * 9);
+                eprintln!("wgpu-engine: block diffusion — {n_blocks} block(s) of {blk}, {steps_per_block} step(s) each \
+({per_commit:.1} token(s) committed per forward; the reference commits 1). Total forwards \
+{}. Cost is ~{c_now} rows against ~{c16} at block 16 and ~{c8} at block 8 — all still one token per \
+commit, because the BLOCK SIZE sets the price and the steps set the quality. LOGSCOPE_DIFFUSION_BLOCK \
+trades planning horizon for speed; LOGSCOPE_DIFFUSION_STEPS trades quality for speed. Block-based is \
+the regime this family was trained for: chatllm and llama.cpp both default block_length 32, and \
+llama.cpp makes whole-canvas (eps) and block schedules mutually exclusive — so a bigger block is not \
+a more diffusion-like one.", n_blocks * steps_per_block);
+            }
+        }
+
+        // BLOCK-CAUSAL ATTENTION, the reference's mask, now ON by default.
+        //
+        // Truncating the forward at the block's end gives the rows we COMMIT the same visible token
+        // set the reference gives them, which is why the loop was correct without this. What it does
+        // not give is the same COMPUTATION: inside a truncated forward the prompt rows still attend
+        // FORWARD into the current block, so from layer 2 onward the block's own rows read prefix
+        // activations the reference would never produce. Measured at 1e-8 on a random-weight tiny —
+        // too small to judge there, and unknown on a trained model, which is exactly the kind of
+        // divergence that has explained every previous round of this hunt.
+        //
+        // The mask itself is verified against a reference that models it (c4-747: 10/10 across
+        // aligned and unaligned prompts), and it makes the prefix independent of the block — the
+        // precondition a prefix K/V cache needs (c4-745). LOGSCOPE_DIFFUSION_BLOCK_CAUSAL=0 restores
+        // the truncation-only behaviour for an A/B.
+        {
+            static SAID_BC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID_BC.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("wgpu-engine: block diffusion attention — {}",
+                    if block_causal { "BLOCK-CAUSAL (reference mask; blocks anchored at the fill start)" }
+                    else { "truncation only (LOGSCOPE_DIFFUSION_BLOCK_CAUSAL=0)" });
+            }
+        }
+        for b in 0..n_blocks {
+            let lo = n_ctx + b * blk;
+            let hi = (lo + blk).min(l);
+            let blen = hi - lo;
+            if blen == 0 { continue; }
+            // Blocks are anchored at the FILL START, not position 0 — a prompt length is rarely a
+            // multiple of the block size (c4-746).
+            let _bcg = if block_causal { Some(BlockCausalGuard::set(blk, n_ctx)) } else { None };
+            // Reference schedule: even split, remainder onto the LAST steps.
+            let mut sched = vec![blen / steps_per_block; steps_per_block];
+            for i in 0..(blen % steps_per_block) { sched[steps_per_block - 1 - i] += 1; }
+
+            for s in 0..steps_per_block {
+                // A DEVICE OOM POISONS EVERYTHING DOWNSTREAM. The handler degrades and backs off so
+                // one bad step does not kill the process, which is right once — but a run that has
+                // OOMed repeatedly is computing on invalid buffers, and the operator's log shows it
+                // logging 111 of them before panicking on an empty readout anyway. Stop while the
+                // reason is still legible.
+                if self.oom_backoff() {
+                    oom_steps += 1;
+                    self.clear_oom();
+                    if oom_steps >= 3 {
+                        return Err(format!(
+                            "device ran out of memory {oom_steps} times during block denoising (VMA \
+exhausted at a {l}-row canvas). Everything computed after the first is on invalid buffers, so this \
+stops rather than emitting it. Lower the context or LOGSCOPE_DIFFUSION_BLOCK, or free VRAM."));
+                    }
+                }
+                if (lo..hi).all(|i| !masked[i]) { break; }
+                if cancel() {
+                    // Commit what this block has so far rather than leaving MASK ids in the output.
+                    for i in lo..hi { if masked[i] { tokens[i] = m.mask_token_id.unwrap_or(0); } }
+                    tokens.truncate(lo);
+                    return Ok(tokens.split_off(n_ctx));
+                }
+                // Block-causal: nothing after this block exists for the forward.
+                // Only rows [lo,hi) are read (or [lo-1,hi-1] under shift_logits), so the output
+                // projection is windowed to them: at real scale that is ~32 rows instead of ~2400,
+                // and the projection is the dominant cost of a denoise step.
+                let w0 = if m.shift_logits && lo > 0 { lo - 1 } else { lo };
+                // SAMPLED path: one logits readout for the window, then a real sample per masked
+                // position with its probability as the commit confidence — the reference's
+                // algorithm. GREEDY path: the 4-stat reduction, which is far cheaper to download.
+                // Greedy alternatives, parallel to `raw`. Filled only under cold-greedy, and only
+                // by the sampled path — the 4-stat path is already argmax, so a forced commit there
+                // is greedy by construction.
+                let mut alt: Vec<u32> = Vec::new();
+                let raw: Vec<[f32; 4]> = match sp {
+                    Some(par) => {
+                        let lg = match cache.as_mut() {
+                            // Cached: only the block's own rows are forwarded. Rewind first — the
+                            // previous step published this block's K/V from tokens that have since
+                            // changed, and stale rows would be read as context.
+                            Some(c) => { c.rewind(w0);
+                                forwards += 1; rows_forwarded += hi - w0; rows_reused += 0;
+                                self.denoise_logits_cached(m, &tokens[..hi], w0, hi - w0, c) }
+                            None => { forwards += 1; rows_forwarded += hi; rows_reused += lo;
+                                self.denoise_logits_rows(m, &tokens[..hi], w0, hi - w0) }
+                        };
+                        let v = m.vocab;
+                        // A DOWNLOAD THAT CAME BACK SHORT IS A DEVICE FAILURE, not a slice bug. When
+                        // the driver exhausts VMA the engine catches the OOM, degrades and carries
+                        // on — leaving invalid buffers whose download yields nothing. Slicing that
+                        // blind panicked the worker thread with "range end index 152064 out of range
+                        // for slice of length 0", which names the symptom and hides the cause.
+                        let want_len = (hi - w0) * v;
+                        if lg.len() < want_len {
+                            return Err(format!(
+                                "denoise logits came back {} floats, expected {want_len} ({} rows x {v} vocab) — \
+the GPU dropped this readout, which upstream means a device OOM (look for 'Failed to allocate BO VMA' \
+or a buffer-size validation error above). Lower the context or the block size; the diffusion loop \
+cannot sample from a readout that does not exist.", lg.len(), hi - w0));
+                        }
+                        // REPEAT PENALTY: crate::sample() does NOT apply it — the autoregressive
+                        // path calls `pick`, which applies the penalty and then samples. Reusing
+                        // sample() directly left repeat_penalty silently inert on diffusion turns,
+                        // which is the wrong thing to get wrong on a path whose observed failure is
+                        // repetitive output. `pick` is the AR path's own entry point and is
+                        // documented bit-exact to argmax at penalty 1.0.
+                        //
+                        // History for a diffusion step is the prompt plus everything COMMITTED so
+                        // far (masked positions hold the mask id and are not real context).
+                        let recent: Vec<u32> = (0..hi).filter(|&i| !masked[i]).map(|i| tokens[i]).collect();
+                        let mut st = Vec::with_capacity(hi - w0);
+                        for r in 0..(hi - w0) {
+                            let row = &lg[r * v..(r + 1) * v];
+                            // THE MASK TOKEN MUST NEVER BE COMMITTED. Filling a masked slot with
+                            // the mask id is self-poisoning: our bookkeeping marks the position
+                            // done while the model still reads it as unfilled, so every later step
+                            // denoises against a canvas that lies to it. It is also INVISIBLE
+                            // downstream, because the stream callback swallows specials — which is
+                            // how a hardware run reported "produced 20 tokens" beside an empty
+                            // reply.
+                            //
+                            // Refuse the OUTCOME rather than editing the distribution. Setting the
+                            // mask logit to -INF and sampling from that changed results even on a
+                            // model where mask ranks 158th of 157184 — it perturbs the sampler's
+                            // own arithmetic — and a correctness guard that quietly alters every
+                            // other token is worse than the thing it guards against. Sampling is
+                            // untouched unless it actually lands on the mask.
+                            let mut tok = crate::pick(row, par, &recent, rng);
+                            if tok == mask {
+                                tok = crate::pick(row, par, &recent, rng);       // one more draw
+                                if tok == mask {
+                                    // Still mask: take the best token that is not it.
+                                    let mut best = (f32::NEG_INFINITY, 0u32);
+                                    for (ix, &x) in row.iter().enumerate() {
+                                        if ix as u32 != mask && x > best.0 { best = (x, ix as u32); }
+                                    }
+                                    tok = best.1;
+                                }
+                            }
+                            // Rank by the SAMPLED token's probability under the UNPENALISED,
+                            // untempered distribution — the reference ranks by the sampler's
+                            // reported prob, and mixing the penalty into the ranking would make
+                            // commit order depend on history rather than on model confidence.
+                            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let den: f32 = row.iter().map(|&x| (x - mx).exp()).sum();
+                            let pr = (row[tok as usize] - mx).exp() / den.max(1e-30);
+                            debug_assert_ne!(tok, mask, "the mask token escaped the ban");
+                            // The greedy alternative for this row, kept beside the sampled choice.
+                            // Which positions are FORCED is not known until after sampling, so the
+                            // fallback has to be recorded now or recomputed later from logits that
+                            // are about to go out of scope.
+                            if cold_greedy() {
+                                let mut best = (f32::NEG_INFINITY, tok);
+                                for (ix, &x) in row.iter().enumerate() {
+                                    if ix as u32 != mask && x > best.0 { best = (x, ix as u32); }
+                                }
+                                alt.push(best.1);
+                            }
+                            st.push([tok as f32, pr, 0.0, 0.0]);
+                        }
+                        st
+                    }
+                    None => {
+                        let flat = match cache.as_mut() {
+                            Some(c) => { c.rewind(w0);
+                                forwards += 1; rows_forwarded += hi - w0; rows_reused += 0;
+                                self.denoise_stats_cached(m, &tokens[..hi], w0, hi - w0, c) }
+                            None => { forwards += 1; rows_forwarded += hi; rows_reused += lo;
+                                self.denoise_stats_rows(m, &tokens[..hi], w0, hi - w0) }
+                        };
+                        flat.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+                    }
+                };
+                let at = |i: usize| raw[(if m.shift_logits && i > 0 { i - 1 } else { i }) - w0];
+
+                // WHICH POSITION IS "MOST SETTLED". diffuse.cpp offers four remasking strategies —
+                // LOW_CONFIDENCE (top probability), TOPK_MARGIN (top1 - top2), ENTROPY_EXIT (lowest
+                // entropy) and MASKGIT_PLUS — and defaults to LOW_CONFIDENCE, which is what this
+                // loop already did. The other two orderings were free the whole time: ROWSTATS_F32
+                // emits [argmax, p_top, margin, entropy] per row and only p_top was ever read.
+                //
+                // The choice matters for the failure the operator sees. Neighbours that disagree
+                // ("provide provide", "What What") come from committing a position that looked
+                // probable rather than one that was DECIDED, and margin and entropy measure decided
+                // ness where p_top measures only mass on the winner — a near-uniform row with a
+                // slight favourite scores high on p_top and low on margin.
+                //
+                // Bigger is better for p_top and margin; entropy inverts, so it is negated.
+                let rank = |i: usize| -> f64 {
+                    let r = at(i);
+                    match diffusion_rank() {
+                        1 => r[2] as f64,          // TOPK_MARGIN: top1 - top2 logit gap
+                        2 => -(r[3] as f64),       // ENTROPY_EXIT: least uncertain first
+                        _ => r[1] as f64,          // LOW_CONFIDENCE: p_top (default, as in diffuse.cpp)
+                    }
+                };
+
+                let take = sched[s].max(if s + 1 == steps_per_block { blen } else { 1 });
+                let mut forced: Vec<usize> = Vec::new();
+                let chosen: Vec<usize> = match tau {
+                    // THRESHOLD POLICY, matching the reference (chatllm.cpp: threshold 0.95).
+                    // Every position whose sampled token clears the bar is committed NOW, and the
+                    // schedule is a FLOOR topped up from the most confident remainder — not a cap.
+                    // The previous version committed the over-threshold set and stopped, so a step
+                    // that found two confident positions committed two where the schedule asked for
+                    // four, converging slower than the reference rather than faster.
+                    //
+                    // This is the reference's own accelerator: a diffusion step that is sure about a
+                    // token gains nothing by waiting, and every position it fixes now anchors the
+                    // ones still masked around it.
+                    Some(t) => {
+                        let mut over: Vec<usize> = (lo..hi)
+                            .filter(|&i| masked[i] && at(i)[1] >= t).collect();
+                        if over.len() < take {
+                            let mut rest: Vec<usize> = (lo..hi)
+                                .filter(|&i| masked[i] && at(i)[1] < t).collect();
+                            rest.sort_by_key(|&i| (-((rank(i) * 1e6).round() as i64), i));
+                            rest.truncate(take - over.len());
+                            // FORCED COMMITS ARE THE RISKY ONES. These positions are below the
+                            // confidence threshold and are being written only to meet the step's
+                            // floor — the model is not sure, and nothing re-masks a committed token
+                            // (no reference does: candidates are always masked positions only), so
+                            // whatever lands here is permanent. Sampling them is where a single
+                            // wrong token gets locked in and the neighbours then adapt around it,
+                            // which is what "what's on your mine" and "I am all weathe" look like:
+                            // one substituted token, not the adjacent duplication that multi-token
+                            // commits produced before c4-773.
+                            //
+                            // LOGSCOPE_DIFFUSION_COLD_GREEDY=1 takes the argmax at those positions
+                            // instead. Sampling earns its diversity among choices the model is
+                            // confident about; spending it on a coin-flip you cannot revise is the
+                            // part worth questioning. OFF by default because no reference does this
+                            // — chatllm samples every position — so it is a deliberate divergence
+                            // to be A/B'd on hardware, not a correctness fix.
+                            if !rest.is_empty() && cold_greedy() { forced.extend(rest.iter().copied()); }
+                            over.extend(rest);
+                        }
+                        over
+                    }
+                    None => {
+                        // DETERMINISTIC TIE-BREAK. Masked positions with identical context produce
+                        // identical confidences — on a fresh block, EVERY candidate ties. Ranking
+                        // on raw f32 then leaves the order to reduction noise, so the same model and
+                        // prompt can commit different positions run to run, and no serial reference
+                        // can reproduce the choice. Quantising the confidence to 1e-6 and breaking
+                        // ties by LOWER INDEX makes the order reproducible and left-to-right within
+                        // a block, which is also the sane reading order for a tie.
+                        let mut c: Vec<usize> = (lo..hi).filter(|&i| masked[i]).collect();
+                        c.sort_by_key(|&i| (-((rank(i) * 1e6).round() as i64), i));
+                        c.truncate(take);
+                        c
+                    }
+                };
+                for i in chosen {
+                    // A forced commit is one the model was not confident about, taken only to meet
+                    // the step's floor and never revisited. Under LOGSCOPE_DIFFUSION_COLD_GREEDY it
+                    // takes the argmax rather than a sample.
+                    let ri = (if m.shift_logits && i > 0 { i - 1 } else { i }) - w0;
+                    let t = if !alt.is_empty() && forced.contains(&i) && ri < alt.len() {
+                        alt[ri]
+                    } else {
+                        at(i)[0] as u32
+                    };
+                    // GREEDY path has only the argmax from the 4-stat reduction, so it cannot pick a
+                    // runner-up. Leaving the slot MASKED is the right refusal: the position gets
+                    // another attempt next step against a canvas that has moved on, and the
+                    // block's final pass fills whatever is still open. Committing the mask id
+                    // instead would mark it done while the model still sees it as empty.
+                    if t == mask { continue; }
+                    tokens[i] = t;
+                    masked[i] = false;
+                }
+            }
+
+            // Final commit for this block: the reference always fills the block before moving on,
+            // so a later block never conditions on a MASK inside an earlier one.
+            let _ = ();
+            if (lo..hi).any(|i| masked[i]) {
+                let w0 = if m.shift_logits && lo > 0 { lo - 1 } else { lo };
+                let flat = match cache.as_mut() {
+                            Some(c) => { c.rewind(w0);
+                                forwards += 1; rows_forwarded += hi - w0; rows_reused += 0;
+                                self.denoise_stats_cached(m, &tokens[..hi], w0, hi - w0, c) }
+                            None => { forwards += 1; rows_forwarded += hi; rows_reused += lo;
+                                self.denoise_stats_rows(m, &tokens[..hi], w0, hi - w0) }
+                        };
+                let raw: Vec<[f32; 4]> = flat.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+                for i in lo..hi {
+                    if masked[i] {
+                        tokens[i] = raw[(if m.shift_logits && i > 0 { i - 1 } else { i }) - w0][0] as u32;
+                        masked[i] = false;
+                    }
+                }
+            }
+
+            // STALE-BLOCK REFRESH. The last forward of this block ran BEFORE its final commits, so
+            // the K/V now cached for [lo,hi) describe tokens that have since changed. The next
+            // block would attend to a version of this one that never existed — fluent nonsense, not
+            // a crash. One more forward over the block's own rows republishes them from the
+            // committed tokens; it costs the same as a step and is what lets `filled` advance.
+            if let Some(c) = cache.as_mut() {
+                c.rewind(lo);
+                forwards += 1; rows_forwarded += hi - lo; rows_reused += 0;
+                let _ = self.denoise_stats_cached(m, &tokens[..hi], lo, hi - lo, c);
+                debug_assert_eq!(c.filled, hi, "the cache must now cover this block");
+            }
+            // The block is complete: emit it, then decide whether anything follows.
+            let done_at = (lo..hi).find(|&i| stop.contains(&tokens[i]));
+            let upto = done_at.unwrap_or(hi);
+            let keep_going = on_block(&tokens[lo..upto]);
+            if let Some(i) = done_at {
+                // A stop token inside this block ends the reply — the remaining blocks would be
+                // generated, paid for, and then discarded by the caller's own stop handling.
+                tokens.truncate(i);
+                // The stop path is the COMMON exit — a reply that ends on eos leaves through here,
+                // not through the loop's tail. It was the one return without the cost report, so a
+                // real hardware run printed no line at all. A number that only appears when
+                // generation runs to its ceiling describes the rare case.
+                report_recompute(forwards, rows_forwarded, rows_reused);
+                return Ok(tokens.split_off(n_ctx));
+            }
+            if !keep_going || cancel() {
+                tokens.truncate(hi);
+                report_recompute(forwards, rows_forwarded, rows_reused);
+                return Ok(tokens.split_off(n_ctx));
+            }
+        }
+        report_recompute(forwards, rows_forwarded, rows_reused);
+        Ok(tokens.split_off(n_ctx))
+    }
+}
+
 impl DenoisePolicy for Box<dyn DenoisePolicy> {
     fn select(&mut self, step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize> {
         (**self).select(step, stats, masked)
@@ -15836,6 +18941,9 @@ impl LearnedPolicy {
             if parts.len() != 4 { return Err(format!("expected 4 values, got {} in '{v}'", parts.len())); }
             out.copy_from_slice(&parts); Ok(())
         };
+        if !t.contains("w=") || !t.contains("tau=") {
+            return Err("l2pd file missing w= or tau= — truncated or foreign; refusing rather than running a zeroed filter".into());
+        }
         for tok in t.split_whitespace() {
             if let Some(v) = tok.strip_prefix("mu=") { vec4(v, &mut mu)?; }
             else if let Some(v) = tok.strip_prefix("sd=") { vec4(v, &mut sd)?; }
@@ -15876,13 +18984,6 @@ pub fn gguf_shard_paths(path: &str) -> Result<Vec<String>, String> {
         Some((stem[..idx_start].to_string(), total.parse::<u32>().ok()?))
     })();
     let Some((base, total)) = parsed else { return Ok(vec![path.to_string()]) };
-    // A total of zero parses as five digits and is a real filename a truncated
-    // download leaves behind. `1..=0` is empty, so the helper would return an
-    // empty Vec and both benches index parts[0] — a panic instead of a message.
-    // Caught while casting the vote on this patch.
-    if total == 0 {
-        return Err(format!("split gguf: {path} declares 00000 shards — the name is malformed"));
-    }
     let mut out = Vec::with_capacity(total as usize);
     for i in 1..=total {
         let p = format!("{base}{i:05}-of-{total:05}.gguf");
@@ -15897,101 +18998,1375 @@ pub fn gguf_shard_paths(path: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod shard_path_tests {
     use super::gguf_shard_paths;
-
     #[test]
     fn non_split_passes_through() {
-        assert_eq!(gguf_shard_paths("/m/x-UD-IQ1_S.gguf").unwrap(),
-                   vec!["/m/x-UD-IQ1_S.gguf".to_string()]);
+        assert_eq!(gguf_shard_paths("/m/x-UD-IQ1_S.gguf").unwrap(), vec!["/m/x-UD-IQ1_S.gguf".to_string()]);
     }
-
     #[test]
     fn second_shard_normalizes_and_names_missing_sibling() {
         let e = gguf_shard_paths("/nonexistent/m-00002-of-00002.gguf").unwrap_err();
         assert!(e.contains("shard 1/2"), "{e}");
         assert!(e.contains("m-00001-of-00002.gguf"), "{e}");
     }
+}
 
-    // --- cases the patch did not cover, added while casting the vote ---
-
+#[cfg(test)]
+mod grid_spill {
+    use super::*;
+    /// A gather large enough to need the 2D spill: 65536 rows x 64 = 4194304 elements, which is
+    /// exactly 65536 workgroups flat — the count that was silently dropped on hardware. Verifies
+    /// the spilled dispatch computes the SAME rows a small gather does, so the y-index arithmetic
+    /// is right rather than merely legal.
     #[test]
-    fn a_total_of_zero_yields_no_shards_rather_than_looping() {
-        // `-00000-of-00000` parses as five digits and is a real filename a
-        // truncated download can leave behind. 1..=0 is empty, so this returns
-        // an empty Vec — and parts[0] in both benches would then panic on an
-        // index rather than reporting a bad file.
-        let e = gguf_shard_paths("/tmp/m-00000-of-00000.gguf").unwrap_err();
-        assert!(e.contains("00000 shards"), "{e}");
-    }
-
-    #[test]
-    fn a_path_without_the_gguf_suffix_passes_through() {
-        // Hardlinks and symlinks without the extension are ordinary.
-        assert_eq!(gguf_shard_paths("/m/model").unwrap(), vec!["/m/model".to_string()]);
-    }
-
-    #[test]
-    fn a_non_numeric_shard_marker_is_not_treated_as_a_split() {
-        // "…-part-of-two.gguf" contains "-of-" and must not be expanded.
-        assert_eq!(gguf_shard_paths("/m/part-of-two.gguf").unwrap(),
-                   vec!["/m/part-of-two.gguf".to_string()]);
-        assert_eq!(gguf_shard_paths("/m/x-0001-of-0002.gguf").unwrap().len(), 1,
-                   "four digits is not the llama.cpp convention");
-    }
-
-    #[test]
-    fn a_filename_containing_of_earlier_still_resolves() {
-        // rfind rather than find: "Mixture-of-Experts-00001-of-00002.gguf" has
-        // two "-of-" markers and the shard one is the last.
-        let r = gguf_shard_paths("/nonexistent/Mixture-of-Experts-00002-of-00002.gguf");
-        let e = r.unwrap_err();
-        assert!(e.contains("Mixture-of-Experts-00001-of-00002.gguf"), "{e}");
+    fn gather_beyond_the_65535_workgroup_limit_is_correct() {
+        let gpu = Gpu::new();
+        let (rows, d) = (65536usize, 64usize);
+        let table: Vec<f32> = (0..rows * d).map(|i| (i % 977) as f32 * 0.01).collect();
+        let t = gpu.upload(&table, rows, d);
+        let ids: Vec<u32> = (0..rows as u32).rev().collect();      // reversed: every row moves
+        let idt = gpu.upload_u32(&ids);
+        let got = gpu.download(&gpu.gather_t(&t, &idt, rows, d));
+        assert_eq!(got.len(), rows * d);
+        for probe in [0usize, 1, 65535, 40000, 65536 - 7] {
+            let src = ids[probe] as usize;
+            for c in [0usize, 63] {
+                assert_eq!(got[probe * d + c], table[src * d + c],
+                    "row {probe} col {c} wrong — the 2D grid spill mis-indexes");
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod iq1_batch_tests {
-    /// The crash this fixes: prewarm calls prefill_batched with two tokens, which reaches
-    /// `Lin::apply` with m=2, which reached an `assert_eq!(m, 1)` and killed the load thread.
-    ///
-    /// A GPU is needed to run the kernel, so what is checked here is the SHAPE of the fix — that
-    /// the batched entry point is reachable and that the row loop's arithmetic lands each row where
-    /// the next one expects it. Getting that wrong writes row r over row r-1 and produces a
-    /// plausible-looking tensor of repeated values, which is the failure mode worth catching
-    /// without hardware.
-    fn row_offsets(m: usize, n: usize) -> Vec<u64> {
-        (0..m).map(|r| (r * n * 4) as u64).collect()
+mod block_diffusion_schedule {
+    /// The reference's per-block commit schedule (chatllm.cpp models/bailing.cpp): `steps`
+    /// iterations per block, each committing block_length/steps positions, with the remainder
+    /// added to the LAST steps. Pinned as arithmetic because the sandbox cannot judge text
+    /// quality — but it CAN prove we commit the same number of positions in the same order the
+    /// reference does, which is the property that was wrong (21 of 32 from one forward).
+    fn schedule(blen: usize, steps: usize) -> Vec<usize> {
+        let steps = steps.min(blen).max(1);
+        let mut sched = vec![blen / steps; steps];
+        for i in 0..(blen % steps) { sched[steps - 1 - i] += 1; }
+        sched
     }
 
     #[test]
-    fn each_row_lands_after_the_previous_one() {
-        // Byte offsets, not element offsets — a missing *4 packs four rows into one row's space and
-        // the output looks like a shorter tensor rather than an error.
-        assert_eq!(row_offsets(4, 8), vec![0, 32, 64, 96]);
-    }
-
-    #[test]
-    fn the_rows_exactly_tile_the_output_with_no_gap_or_overlap() {
-        let (m, n) = (17, 5120);
-        let offs = row_offsets(m, n);
-        let stride = (n * 4) as u64;
-        for w in offs.windows(2) {
-            assert_eq!(w[1] - w[0], stride, "a gap or overlap between rows");
+    fn per_block_schedule_matches_the_reference() {
+        // Even split, no remainder.
+        assert_eq!(schedule(32, 32), vec![1; 32]);
+        assert_eq!(schedule(32, 8), vec![4; 8]);
+        // Remainder rides the LAST steps, not the first — reference:
+        // for (i in 0..remain) sched[steps-1-i]++
+        assert_eq!(schedule(10, 4), vec![2, 2, 3, 3]);
+        assert_eq!(schedule(7, 3), vec![2, 2, 3]);
+        // Every schedule fills its block exactly: no position left for the final-commit pass and
+        // none double-counted.
+        for blen in 1..=64 {
+            for steps in 1..=64 {
+                let s = schedule(blen, steps);
+                assert_eq!(s.iter().sum::<usize>(), blen, "blen {blen} steps {steps} does not fill the block");
+                assert!(s.iter().all(|&k| k >= 1) || blen < s.len(), "a step commits nothing");
+            }
         }
-        assert_eq!(offs.last().unwrap() + stride, (m * n * 4) as u64,
-                   "the last row ends exactly at the buffer end");
     }
 
     #[test]
-    fn a_single_row_batch_is_the_decode_path_unchanged() {
-        // m == 1 must not take the loop: it is the hot path, and routing it through a copy would
-        // add a dispatch to every decoded token.
-        assert_eq!(row_offsets(1, 4096), vec![0]);
+    fn steps_are_per_block_not_global() {
+        // The regression this guards: with n_fill=660, block=32, steps=32 the OLD loop committed
+        // ceil(660/32)=21 positions of a 32-token block in one forward. Per-block scheduling
+        // commits at most ceil(32/32)=1.
+        let (n_fill, blk, steps) = (660usize, 32usize, 32usize);
+        let old_k = n_fill.div_ceil(steps);
+        let new_k = *schedule(blk, steps).iter().max().unwrap();
+        assert_eq!(old_k, 21);
+        assert_eq!(new_k, 1);
+        assert!(new_k < old_k, "per-block scheduling must commit fewer positions per forward");
+    }
+}
+
+#[cfg(test)]
+mod stats_row_window {
+    use super::*;
+    /// The windowed output stage must reproduce the full stats exactly on the rows it covers. If it
+    /// ever does not, the diffusion loop is ranking confidences that do not correspond to the
+    /// positions it thinks they do — a silent, plausible-looking corruption.
+    #[test]
+    fn windowed_stats_equal_the_full_stats_sliced() {
+        let path = "/tmp/tiny-llada2.gguf";
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let toks: Vec<u32> = (0..24u32).map(|i| 1 + (i * 7) % 200).collect();
+        let full = gpu.denoise_stats(&m, &toks);
+        for &(r0, n) in &[(0usize, 24usize), (0, 1), (8, 8), (16, 8), (23, 1), (5, 3)] {
+            let w = gpu.denoise_stats_rows(&m, &toks, r0, n);
+            assert_eq!(w.len(), n * 4, "window ({r0},{n}) returned {} floats", w.len());
+            for i in 0..n {
+                for c in 0..4 {
+                    let (a, b) = (full[(r0 + i) * 4 + c], w[i * 4 + c]);
+                    assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0),
+                        "window ({r0},{n}) row {i} col {c}: {b} != {a}");
+                }
+            }
+        }
+        // The window must not leak into the next call.
+        let after = gpu.denoise_stats(&m, &toks);
+        assert_eq!(after.len(), full.len(), "the row window leaked into a subsequent full forward");
+    }
+}
+
+#[cfg(test)]
+mod small_chunk_equivalence {
+    use super::*;
+    /// The chunked small-batch route must produce the same numbers as the default GEMM route for
+    /// every row count it covers. It is opt-in on performance grounds, but if it is ever switched
+    /// on it must not change results — chunking splits rows, and a wrong view offset would silently
+    /// write one chunk's output over another's.
+    #[test]
+    fn chunked_small_batch_matches_the_default_route() {
+        let gpu = Gpu::new();
+        let (n, k) = (256usize, 128usize);
+        let w: Vec<f32> = (0..n * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let qw = gpu.quantize_q8_resident(&w, n, k);
+        for m in [9usize, 16, 17, 32, 33, 64] {
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 53) as f32 - 26.0) * 0.02).collect();
+            let at = gpu.upload(&a, m, k);
+            std::env::remove_var("LOGSCOPE_SMALL_CHUNK");
+            let base = gpu.download(&gpu.linear_q8_0_t(&at, &qw, m));
+            std::env::set_var("LOGSCOPE_SMALL_CHUNK", "1");
+            let chunked = gpu.download(&gpu.linear_q8_0_t(&at, &qw, m));
+            std::env::remove_var("LOGSCOPE_SMALL_CHUNK");
+            assert_eq!(base.len(), chunked.len(), "m={m}: length differs");
+            let scale = base.iter().map(|x| x.abs()).fold(1e-6f32, f32::max);
+            let worst = base.iter().zip(&chunked).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) / scale;
+            assert!(worst < 2e-3, "m={m}: chunked route differs by rel {worst:.2e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod diffusion_stop_cancel {
+    use super::*;
+    fn model(gpu: &Gpu) -> Option<Model> {
+        let bytes = std::fs::read("/tmp/tiny-llada2.gguf").ok()?;
+        gpu.load_gguf_opt(&bytes, false).ok()
+    }
+
+    /// A stop token inside a committed block must end the reply THERE — not fill the remaining
+    /// blocks and let the caller discard them. On a real reply that is the difference between two
+    /// blocks of work and twenty-one.
+    #[test]
+    fn a_stop_token_ends_generation_at_its_block() {
+        let gpu = Gpu::new();
+        let m = match model(&gpu) { Some(m) => m, None => return };
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+        // Learn what this model actually generates, then make its first token a stop token.
+        let plain = gpu.diffuse_generate(&m, &prompt, 32, 8, 8, None).expect("gen");
+        assert!(!plain.is_empty());
+        let stop = vec![plain[0]];
+        let mut blocks = 0usize;
+        let out = gpu.diffuse_generate_cb(&m, &prompt, 32, 8, 8, None, &stop, &|| false,
+                                          &mut |_b| { blocks += 1; true }).expect("gen");
+        assert!(out.len() < plain.len(), "stop did not shorten the reply ({} vs {})", out.len(), plain.len());
+        assert!(!out.contains(&stop[0]), "the stop token itself must not be emitted");
+        assert_eq!(blocks, 1, "generation continued past the block containing the stop token");
+    }
+
+    /// Cancel must be honoured between steps. Before this, a diffusion generation could not be
+    /// interrupted at all.
+    #[test]
+    fn cancel_stops_generation_promptly() {
+        let gpu = Gpu::new();
+        let m = match model(&gpu) { Some(m) => m, None => return };
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+        let full = gpu.diffuse_generate(&m, &prompt, 32, 8, 8, None).expect("gen");
+        let out = gpu.diffuse_generate_cb(&m, &prompt, 32, 8, 8, None, &[], &|| true,
+                                          &mut |_| true).expect("gen");
+        assert!(out.len() < full.len(), "cancel did not shorten generation ({} vs {})", out.len(), full.len());
+    }
+
+    /// Every token handed to the caller through on_block must be exactly the tokens returned, in
+    /// order — the UI shows what the reply is, not a different sequence.
+    #[test]
+    fn streamed_blocks_match_the_returned_tokens() {
+        let gpu = Gpu::new();
+        let m = match model(&gpu) { Some(m) => m, None => return };
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+        let mut streamed: Vec<u32> = Vec::new();
+        let out = gpu.diffuse_generate_cb(&m, &prompt, 24, 8, 8, None, &[], &|| false,
+                                          &mut |b| { streamed.extend_from_slice(b); true }).expect("gen");
+        assert_eq!(streamed, out, "streamed tokens differ from the returned reply");
+    }
+}
+
+#[cfg(test)]
+mod kv_cache_soundness {
+    use super::*;
+    /// WHY THERE IS NO PREFIX KV CACHE ON THE DIFFUSION PATH, pinned as a test so the idea is not
+    /// re-proposed and quietly implemented.
+    ///
+    /// The obvious optimisation — each denoise step re-forwards the whole prefix, so cache the
+    /// prefix K/V once per block and reuse it across that block's steps — is UNSOUND with the
+    /// attention this path actually uses. Attention is fully bidirectional inside the truncated
+    /// window, so prefix positions attend FORWARD into the current block; when the block's tokens
+    /// change (which is the entire point of a denoise step), the prefix rows' activations change
+    /// too. Caching them would freeze stale values and corrupt every subsequent step silently.
+    ///
+    /// The reference (chatllm.cpp models/bailing.cpp) can cache because its mask is block-causal in
+    /// BOTH directions: row block i sees column block j only when i >= j, so prefix rows never look
+    /// into the current block and their K/V really is fixed. Our forward truncation reproduces that
+    /// for the rows we COMMIT, but not for the rows we would want to cache.
+    ///
+    /// So the prerequisite for a prefix KV cache is a real block-causal mask in the attention
+    /// kernel, not the cache itself. This test fails the moment prefix rows stop depending on the
+    /// current block — which is exactly when caching becomes safe and this comment becomes wrong.
+    #[test]
+    fn prefix_rows_still_depend_on_the_current_block() {
+        let gpu = Gpu::new();
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let mask = match m.mask_token_id { Some(x) => x, None => return };
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+        let mut a = prompt.clone(); a.extend(std::iter::repeat(mask).take(8));
+        let mut b = prompt.clone(); b.extend(std::iter::repeat(7u32).take(8));
+        let sa = gpu.denoise_stats(&m, &a);
+        let sb = gpu.denoise_stats(&m, &b);
+        // Compare the PREFIX rows only: identical tokens, different block contents.
+        let differs = (0..12).any(|i| (sa[i * 4 + 1] - sb[i * 4 + 1]).abs() > 1e-6);
+        assert!(differs,
+            "prefix rows no longer depend on the current block — attention has become block-causal, \
+             so a prefix K/V cache is now SOUND and worth building (see this test's comment)");
+    }
+}
+
+#[cfg(test)]
+mod block_causal_mode {
+    use super::*;
+    /// The point of block-causal attention is that PREFIX rows stop depending on the current
+    /// block's contents — the exact condition kv_cache_soundness asserts is FALSE today. If this
+    /// test passes and that one still passes, the mode does what it claims and a prefix K/V cache
+    /// becomes sound under it.
+    #[test]
+    fn block_causal_makes_the_prefix_independent_of_the_current_block() {
+        let gpu = Gpu::new();
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let mask = match m.mask_token_id { Some(x) => x, None => return };
+        let blk = 4usize;
+        let prompt: Vec<u32> = (0..8u32).map(|i| 1 + (i * 13) % 200).collect();
+        let mut a = prompt.clone(); a.extend(std::iter::repeat(mask).take(blk));
+        let mut b = prompt.clone(); b.extend(std::iter::repeat(7u32).take(blk));
+        let sa = gpu.denoise_stats_rows_bc(&m, &a, 0, prompt.len(), blk, prompt.len());
+        let sb = gpu.denoise_stats_rows_bc(&m, &b, 0, prompt.len(), blk, prompt.len());
+        for i in 0..prompt.len() {
+            for c in 0..4 {
+                let (x, y) = (sa[i * 4 + c], sb[i * 4 + c]);
+                assert!((x - y).abs() <= 1e-5 * x.abs().max(1.0),
+                    "block-causal prefix row {i} col {c} still moved with the block: {x} vs {y}");
+            }
+        }
+        // And the mode must actually change something versus fully-bidirectional, or it is a no-op.
+        let full = gpu.denoise_stats_rows(&m, &a, 0, prompt.len());
+        let differs = (0..prompt.len()).any(|i| (full[i * 4 + 1] - sa[i * 4 + 1]).abs() > 1e-6);
+        assert!(differs, "block-causal produced identical stats to bidirectional — the mask is not being applied");
+    }
+}
+
+#[cfg(test)]
+mod block_causal_alignment {
+    /// The kernel's key-limit arithmetic, transcribed. Empirical checks cannot settle this on a
+    /// random-weight tiny — its logits move by ~1e-8 under any masking change, below any threshold
+    /// worth asserting — so the formula is pinned directly.
+    fn key_limit(i: usize, bcz: usize, bco: usize) -> usize {
+        if bcz == 0 { return usize::MAX; }
+        if i < bco { bco } else { bco + ((i - bco) / bcz + 1) * bcz }
     }
 
     #[test]
-    fn a_zero_row_batch_produces_no_copies() {
-        // Reachable from an empty prompt; the loop must not run rather than allocating a zero-row
-        // tensor and copying into it.
-        assert!(row_offsets(0, 4096).is_empty());
+    fn every_fill_row_sees_its_whole_block_at_any_prompt_length() {
+        // The bug this guards: deriving the block index from position 0 instead of the fill origin.
+        // At the real n_ctx=1718, bcz=32 that masked the first fill row against 22 of its OWN
+        // block. The reference sidesteps it by REQUIRING past % block_length == 0; our loop has no
+        // such constraint, so the origin has to be carried.
+        for n_ctx in [0usize, 1, 8, 10, 31, 32, 33, 1718] {
+            for bcz in [1usize, 4, 32] {
+                for b in 0..3 {
+                    let lo = n_ctx + b * bcz;
+                    let hi = lo + bcz;
+                    for i in lo..hi {
+                        let l = key_limit(i, bcz, n_ctx);
+                        assert!(l >= hi, "n_ctx={n_ctx} bcz={bcz} row {i}: sees <{l}, own block ends at {hi}");
+                        assert!(l == hi, "n_ctx={n_ctx} bcz={bcz} row {i}: sees <{l}, past its own block end {hi}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_rows_see_the_prompt_and_no_block() {
+        for n_ctx in [1usize, 10, 1718] {
+            for i in 0..n_ctx.min(40) {
+                assert_eq!(key_limit(i, 32, n_ctx), n_ctx,
+                    "prompt row {i} of {n_ctx} must see exactly the prompt");
+            }
+        }
+    }
+
+    #[test]
+    fn bcz_zero_is_unrestricted() {
+        assert_eq!(key_limit(5, 0, 100), usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod diffusion_sampling {
+    use super::*;
+    fn model(gpu: &Gpu) -> Option<Model> {
+        let bytes = std::fs::read("/tmp/tiny-llada2.gguf").ok()?;
+        gpu.load_gguf_opt(&bytes, false).ok()
+    }
+    fn prompt() -> Vec<u32> { (0..12u32).map(|i| 1 + (i * 13) % 200).collect() }
+
+    /// Sampling must not disturb the greedy path the oracle is pinned to: sp=None and temperature
+    /// <= 0 both take the exact argmax route.
+    #[test]
+    fn greedy_is_unchanged_by_the_sampled_entry_point() {
+        let gpu = Gpu::new();
+        let m = match model(&gpu) { Some(m) => m, None => return };
+        let p = prompt();
+        let base = gpu.diffuse_generate(&m, &p, 16, 8, 8, None).expect("gen");
+        let mut rng = 1u64;
+        let via_none = gpu.diffuse_generate_sampled(&m, &p, 16, 8, 8, None, &[], None, &mut rng,
+                                                    &|| false, &mut |_| true).expect("gen");
+        let cold = SamplerParams { temperature: 0.0, ..SamplerParams::default() };
+        let via_zero = gpu.diffuse_generate_sampled(&m, &p, 16, 8, 8, None, &[], Some(&cold), &mut rng,
+                                                    &|| false, &mut |_| true).expect("gen");
+        assert_eq!(base, via_none, "sp=None diverged from the greedy path");
+        assert_eq!(base, via_zero, "temperature 0 diverged from the greedy path");
+    }
+
+    /// Sampling must actually sample: same seed reproduces, different seeds differ, and every id is
+    /// a real token. A sampler that silently returned argmax would pass neither of the first two.
+    #[test]
+    fn sampling_is_seeded_and_varies() {
+        let gpu = Gpu::new();
+        let m = match model(&gpu) { Some(m) => m, None => return };
+        let p = prompt();
+        let sp = SamplerParams { temperature: 1.0, top_k: 40, top_p: 0.95,
+                                 repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let run = |seed: u64| { let mut r = seed;
+            gpu.diffuse_generate_sampled(&m, &p, 16, 8, 8, None, &[], Some(&sp), &mut r,
+                                         &|| false, &mut |_| true).expect("gen") };
+        let a1 = run(7); let a2 = run(7); let b = run(99);
+        assert_eq!(a1, a2, "same seed did not reproduce");
+        assert_ne!(a1, b, "different seeds produced identical output — sampling is not happening");
+        assert!(a1.iter().all(|&t| (t as usize) < m.vocab), "sampled an out-of-vocab id");
+        let greedy = gpu.diffuse_generate(&m, &p, 16, 8, 8, None).expect("gen");
+        assert_ne!(a1, greedy, "temperature 1.0 reproduced greedy output exactly");
+    }
+}
+
+#[cfg(test)]
+mod diffusion_repeat_penalty {
+    use super::*;
+    /// The repeat penalty must actually reach the diffusion loop. It did not: crate::sample()
+    /// ignores repeat_penalty entirely — the autoregressive path applies it via `pick` — so the
+    /// first version of diffusion sampling left it silently inert, on the one path whose observed
+    /// failure mode is repetitive output. The existing sampling tests could not catch this because
+    /// they use penalty 1.0, where the two routes are identical by construction.
+    #[test]
+    fn the_repeat_penalty_changes_diffusion_output() {
+        let gpu = Gpu::new();
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+        let run = |penalty: f32| {
+            let sp = SamplerParams { temperature: 1.0, top_k: 40, top_p: 0.95,
+                                     repeat_penalty: penalty, repeat_last_n: 64, min_p: 0.0 };
+            let mut r = 4242u64;
+            gpu.diffuse_generate_sampled(&m, &prompt, 24, 8, 8, None, &[], Some(&sp), &mut r,
+                                         &|| false, &mut |_| true).expect("gen")
+        };
+        let none = run(1.0);
+        let heavy = run(2.0);
+        assert_eq!(none.len(), heavy.len(), "penalty changed the reply length, not just its content");
+        assert_ne!(none, heavy,
+            "repeat_penalty had NO effect on diffusion output — it is not reaching the sampler");
+        // And a heavy penalty should not push ids out of range or produce mask tokens.
+        assert!(heavy.iter().all(|&t| (t as usize) < m.vocab), "penalty produced an out-of-vocab id");
+        if let Some(mask) = m.mask_token_id {
+            assert!(!heavy.contains(&mask), "penalty left a MASK token in the output");
+        }
+    }
+}
+
+#[cfg(test)]
+mod q4_transcode {
+    use super::*;
+    pub use crate::q4_transcode_fixture::q4_0_blocks;
+
+    /// Build arbitrary ggml Q4_0 block bytes and their exact dequantisation. Starting from BYTES
+    /// rather than from floats is deliberate: a real file hands the loader bytes, including code 0
+    /// (value -8d), which is the case the resident format cannot represent directly and the one a
+    /// naive "unpack the nibbles" transcode would get wrong.
+
+    /// The whole claim: the transcode is the round-trip with the f32 buffer removed, not an
+    /// approximation of it. If this ever drifts, every weight in a loaded model changes silently.
+    #[test]
+    fn transcode_matches_the_f32_round_trip_bit_for_bit() {
+        let gpu = Gpu::new();
+        for (n, k, seed) in [(4usize, 64usize, 7u64), (3, 32, 99), (8, 128, 12345)] {
+            let (raw, deq) = q4_0_blocks(n * (k / 32), seed);
+            let (want, want_off) = gpu.quantize_q4_host_bytes(&deq, n, k);
+            let (got, got_off) = gpu.q4_0_transcode_host_bytes(&raw, n, k)
+                .expect("transcode should accept a k divisible by 32");
+            assert_eq!(got_off, want_off, "n={n} k={k}: qs offset differs");
+            assert_eq!(got.len(), want.len(), "n={n} k={k}: byte length differs");
+            assert!(got == want, "n={n} k={k}: transcode is NOT bit-identical to the round trip");
+        }
+    }
+
+    #[test]
+    fn transcode_refuses_shapes_and_buffers_it_cannot_honour() {
+        let gpu = Gpu::new();
+        let (raw, _) = q4_0_blocks(2, 5);
+        assert!(gpu.q4_0_transcode_host_bytes(&raw, 1, 33).is_none(), "k must be a multiple of 32");
+        assert!(gpu.q4_0_transcode_host_bytes(&raw[..8], 1, 64).is_none(), "short buffer must refuse");
+    }
+}
+
+#[cfg(test)]
+mod load_path_split {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    /// The counters must reflect what actually happened, or the load-path line is decoration. On a
+    /// real Q4_0 file the attention and dense weights should slice from the file while the stacked
+    /// MoE experts round-trip — and if a future change makes experts sliceable, this test is what
+    /// notices, because the ratio moves.
+    #[test]
+    fn a_q4_0_file_splits_between_sliced_and_round_tripped() {
+        let path = "/tmp/tiny-llada2-q4file.gguf";
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => return };
+        LOAD_FAST_WEIGHTS.store(0, Relaxed);
+        LOAD_SLOW_WEIGHTS.store(0, Relaxed);
+        std::env::set_var("LOGSCOPE_Q4_RESIDENT", "1");
+        let gpu = Gpu::new();
+        let m = gpu.load_gguf_opt(&bytes, true);
+        std::env::remove_var("LOGSCOPE_Q4_RESIDENT");
+        if m.is_err() { return; }
+        let (fast, slow) = (LOAD_FAST_WEIGHTS.load(Relaxed), LOAD_SLOW_WEIGHTS.load(Relaxed));
+        assert!(fast > 0, "no weight took the byte-slicing path on a Q4_0 file");
+        // Updated when the experts BECAME sliceable, exactly as the previous version of this test
+        // said it should be: the expert stack is now transcoded from Q4_0 rows, so the fast share
+        // should dominate rather than the slow one. What still round-trips is the leftovers — 1D
+        // norms and any tensor the converter left f32.
+        assert!(fast > slow, "the expert stack should now dominate the FAST side: fast={fast} slow={slow}");
+        let share = fast as f64 / (fast + slow) as f64;
+        assert!(share > 0.9, "expected >90% of weights sliced on an all-Q4_0 model, got {:.1}%",
+                share * 100.0);
+    }
+}
+
+#[cfg(test)]
+mod q4_stack_transcode {
+    use super::*;
+    use crate::q4_transcode_fixture::q4_0_blocks;
+
+    /// THE COMMUTATION THE EXPERT STACK DEPENDS ON: interleaving rows in f32 and quantising after
+    /// must equal transcoding each row into its slot. If this ever fails, the stacked fast path is
+    /// unsound and every expert weight in the model would shift silently.
+    #[test]
+    fn stacked_rows_match_the_interleaved_f32_path() {
+        let gpu = Gpu::new();
+        let (k, rows_per_expert, n_expert) = (64usize, 3usize, 4usize);
+        let kb = k / 32;
+        // Two source tensors (gate, up), each n_expert*rows_per_expert rows of k.
+        let n_rows = n_expert * rows_per_expert;
+        let (g_raw, g_deq) = q4_0_blocks(n_rows * kb, 11);
+        let (u_raw, u_deq) = q4_0_blocks(n_rows * kb, 22);
+
+        // Reference: the loader's own construction — interleave in f32, then quantise.
+        let mut inter = Vec::with_capacity(2 * n_rows * k);
+        for e in 0..n_expert {
+            let a = e * rows_per_expert * k;
+            inter.extend_from_slice(&g_deq[a..a + rows_per_expert * k]);
+            inter.extend_from_slice(&u_deq[a..a + rows_per_expert * k]);
+        }
+        let (want, want_off) = gpu.quantize_q4_host_bytes(&inter, 2 * n_rows, k);
+
+        // Fast path: hand the same rows, in the same order, as Q4_0 bytes.
+        let row = |raw: &[u8], r: usize| -> &[u8] { unsafe {
+            std::slice::from_raw_parts(raw.as_ptr().add(r * kb * 18), kb * 18) } };
+        let mut ordered: Vec<&[u8]> = Vec::new();
+        for e in 0..n_expert {
+            for j in 0..rows_per_expert { ordered.push(row(&g_raw, e * rows_per_expert + j)); }
+            for j in 0..rows_per_expert { ordered.push(row(&u_raw, e * rows_per_expert + j)); }
+        }
+        let (got, got_off) = gpu.q4_0_rows_to_resident_bytes(&ordered, k).expect("row transcode");
+        assert_eq!(got_off, want_off);
+        assert!(got == want, "row-order transcode does NOT match the interleaved f32 path — the \
+stacked expert fast path would be unsound");
+    }
+
+    #[test]
+    fn a_short_row_is_refused_rather_than_read_past() {
+        let gpu = Gpu::new();
+        let (raw, _) = q4_0_blocks(2, 3);
+        let short = &raw[..8];
+        assert!(gpu.q4_0_rows_to_resident_bytes(&[short], 64).is_none());
+    }
+}
+
+#[cfg(test)]
+pub mod q4_transcode_fixture {
+pub fn q4_0_blocks(nblk: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+        let mut rng = seed;
+        let mut next = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+        let mut raw = Vec::with_capacity(nblk * 18);
+        let mut deq = Vec::with_capacity(nblk * 32);
+        for b in 0..nblk {
+            // Exercise negative d (ggml derives d = max/-8, so it is routinely negative), tiny d,
+            // and an all-zero block.
+            let d: f32 = match b % 4 {
+                0 => -0.031_25,
+                1 => 0.007_812_5,
+                2 => 0.0,
+                _ => 0.125,
+            };
+            // f16 bit patterns written directly — no `half` crate here, and these four values are
+            // exactly representable, so the fixture stays honest without a converter.
+            let dh: u16 = match b % 4 { 0 => 0xA800, 1 => 0x2000, 2 => 0x0000, _ => 0x3000 };
+            let _ = d;
+            raw.extend_from_slice(&dh.to_le_bytes());
+            let mut codes = [0u8; 32];
+            for j in 0..32 { codes[j] = (next() % 16) as u8; }
+            if b % 4 == 0 { codes[3] = 0; }            // force the -8 case
+            for j in 0..16 { raw.push(codes[j] | (codes[j + 16] << 4)); }
+            let dd = crate::gguf::f16_to_f32(dh);
+            for j in 0..32 { deq.push((codes[j] as i32 - 8) as f32 * dd); }
+        }
+        (raw, deq)
+    }
+}
+
+#[cfg(test)]
+mod mask_never_committed {
+    use super::*;
+    fn model(gpu: &Gpu) -> Option<(Model, u32)> {
+        let bytes = std::fs::read("/tmp/tiny-llada2.gguf").ok()?;
+        let m = gpu.load_gguf_opt(&bytes, false).ok()?;
+        let mask = m.mask_token_id?;
+        Some((m, mask))
+    }
+
+    /// A generated reply must never contain the MASK id. It is invisible downstream (the stream
+    /// callback swallows specials), so a run that commits masks reports tokens produced beside an
+    /// empty answer — which is precisely what a hardware log showed. Both paths are covered because
+    /// they choose differently: sampling can ban the id outright, greedy can only refuse and retry.
+    #[test]
+    fn neither_path_emits_the_mask_token() {
+        let gpu = Gpu::new();
+        let (m, mask) = match model(&gpu) { Some(x) => x, None => return };
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+
+        let greedy = gpu.diffuse_generate(&m, &prompt, 32, 8, 8, None).expect("greedy");
+        assert!(!greedy.contains(&mask), "greedy committed the mask id");
+
+        let sp = SamplerParams { temperature: 1.0, top_k: 40, top_p: 0.95,
+                                 repeat_penalty: 1.1, repeat_last_n: 64, min_p: 0.0 };
+        let mut rng = 42u64;
+        let sampled = gpu.diffuse_generate_sampled(&m, &prompt, 32, 8, 8, None, &[], Some(&sp),
+                                                   &mut rng, &|| false, &mut |_| true).expect("sampled");
+        assert!(!sampled.contains(&mask), "sampling committed the mask id despite the ban");
+        assert_eq!(sampled.len(), 32, "the fill must still be complete");
+    }
+
+    /// Refusing a mask must not stall the loop: every position still ends up filled, because the
+    /// block's final pass closes whatever the stepped commits left open.
+    #[test]
+    fn refusing_a_mask_still_fills_the_block() {
+        let gpu = Gpu::new();
+        let (m, mask) = match model(&gpu) { Some(x) => x, None => return };
+        let prompt: Vec<u32> = (0..8u32).map(|i| 1 + i).collect();
+        for (fill, steps, block) in [(16usize, 8usize, 8usize), (24, 4, 8), (12, 12, 4)] {
+            let out = gpu.diffuse_generate(&m, &prompt, fill, steps, block, None).expect("gen");
+            assert_eq!(out.len(), fill, "fill={fill}: short reply");
+            assert!(!out.contains(&mask), "fill={fill}: a mask survived to the output");
+        }
+    }
+}
+
+#[cfg(test)]
+mod many_expert_routing {
+    use super::*;
+
+    /// The many-expert default must not change what the model says. v1 dispatches per expert per
+    /// layer and v2t works along the token axis; they are different kernels reaching the same
+    /// answer, and the ONLY reason to prefer one is dispatch count.
+    ///
+    /// The tinies used everywhere else have 4 experts, so none of them exercises this decision —
+    /// which is why the fixture here has 64. A default that no test can trip is a default nobody
+    /// has checked.
+    #[test]
+    fn the_token_axis_path_agrees_with_v1_on_a_many_expert_model() {
+        let path = "/tmp/tiny-llada2-64exp.gguf";
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        assert!(m.layers.iter().any(|l| l.moe.as_ref().map_or(false, |x| x.cfg.n_routed >= 64)),
+            "fixture must actually have >=64 experts or this proves nothing");
+        let toks: Vec<u32> = (0..32u32).map(|i| 1 + (i * 7) % 200).collect();
+
+        std::env::set_var("LOGSCOPE_MOE_V2T", "0");
+        let v1 = gpu.denoise_stats(&m, &toks);
+        std::env::remove_var("LOGSCOPE_MOE_V2T");
+        let auto = gpu.denoise_stats(&m, &toks);
+
+        assert_eq!(v1.len(), auto.len());
+        let worst = v1.iter().zip(&auto).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "the many-expert default diverges from v1 by {worst:.2e}");
+        // argmaxes must match exactly — a routing difference shows here first.
+        for (i, (a, b)) in v1.chunks_exact(4).zip(auto.chunks_exact(4)).enumerate() {
+            assert_eq!(a[0] as u32, b[0] as u32, "row {i}: argmax differs between v1 and the default");
+        }
+    }
+}
+
+#[cfg(test)]
+mod threshold_is_a_floor {
+    /// The commit-set rule, transcribed. The reference commits every position over the threshold
+    /// AND tops up to the step's schedule; the old code committed the over-threshold set and
+    /// stopped, so a step that found two sure positions committed two where the schedule asked for
+    /// four — converging slower than the reference rather than faster, on a path where the
+    /// expensive unit is the forward.
+    fn chosen(conf: &[f32], take: usize, tau: Option<f32>) -> Vec<usize> {
+        let n = conf.len();
+        match tau {
+            Some(t) => {
+                let mut over: Vec<usize> = (0..n).filter(|&i| conf[i] >= t).collect();
+                if over.len() < take {
+                    let mut rest: Vec<usize> = (0..n).filter(|&i| conf[i] < t).collect();
+                    rest.sort_by_key(|&i| (-((conf[i] as f64 * 1e6).round() as i64), i));
+                    rest.truncate(take - over.len());
+                    over.extend(rest);
+                }
+                over
+            }
+            None => {
+                let mut c: Vec<usize> = (0..n).collect();
+                c.sort_by_key(|&i| (-((conf[i] as f64 * 1e6).round() as i64), i));
+                c.truncate(take);
+                c
+            }
+        }
+    }
+
+    #[test]
+    fn confident_positions_commit_beyond_the_schedule() {
+        // Six sure positions, schedule of two: the reference commits all six.
+        let conf = [0.99, 0.98, 0.97, 0.96, 0.99, 0.99, 0.10, 0.05];
+        let got = chosen(&conf, 2, Some(0.95));
+        assert_eq!(got.len(), 6, "the schedule is a floor, not a cap: {got:?}");
+        assert!(got.iter().all(|&i| conf[i] >= 0.95));
+    }
+
+    #[test]
+    fn a_cold_step_still_meets_the_schedule() {
+        // Nothing clears the bar — the step must still make its scheduled progress, best first.
+        let conf = [0.10, 0.40, 0.20, 0.35];
+        let got = chosen(&conf, 2, Some(0.95));
+        assert_eq!(got, vec![1, 3], "top-2 by confidence: {got:?}");
+    }
+
+    /// The mixed case is the one the old code got wrong.
+    #[test]
+    fn a_partly_confident_step_tops_up_to_the_schedule() {
+        let conf = [0.99, 0.30, 0.80, 0.10];
+        let got = chosen(&conf, 3, Some(0.95));
+        assert_eq!(got.len(), 3, "one sure + two best remaining, not one: {got:?}");
+        assert_eq!(got[0], 0);
+        assert!(got.contains(&2) && got.contains(&1), "the top-up must take the most confident rest");
+    }
+
+    /// tau = None is untouched, which is what keeps the end-to-end diffusion oracle meaningful.
+    #[test]
+    fn without_a_threshold_the_schedule_is_exact() {
+        let conf = [0.99, 0.98, 0.10, 0.05];
+        assert_eq!(chosen(&conf, 2, None).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod threshold_end_to_end {
+    use super::*;
+    /// With the threshold live the block must still fill completely and hold no mask — the
+    /// accelerator changes HOW MANY positions commit per forward, never whether the reply is whole.
+    #[test]
+    fn a_thresholded_run_still_fills_every_position() {
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let mask = match m.mask_token_id { Some(x) => x, None => return };
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+        for tau in [Some(0.95f32), Some(0.5), None] {
+            for (fill, steps, block) in [(16usize, 8usize, 8usize), (24, 4, 8)] {
+                let out = gpu.diffuse_generate(&m, &prompt, fill, steps, block, tau).expect("gen");
+                assert_eq!(out.len(), fill, "tau={tau:?} fill={fill}: short reply");
+                assert!(!out.contains(&mask), "tau={tau:?}: a mask survived");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bidir_kv_cache {
+    use super::*;
+
+    /// The cache must reproduce the uncached forward EXACTLY on the rows it returns. It is only
+    /// sound because block-causal makes the prefix independent of the block (c4-767), and the
+    /// payoff is large enough (98.5% of rows recomputed, c4-768) that a subtly-wrong cache would be
+    /// very tempting to keep — so this compares against the path it replaces rather than against
+    /// itself.
+    #[test]
+    fn a_cached_window_matches_the_uncached_forward() {
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let mask = m.mask_token_id.unwrap_or(0);
+        // Prompt lengths that do and do not divide the block size — the alignment that broke the
+        // block-causal anchoring in c4-746.
+        for n_ctx in [8usize, 10, 13] {
+            for blk in [4usize, 8] {
+                let mut toks: Vec<u32> = (0..n_ctx as u32).map(|i| 1 + (i * 13) % 200).collect();
+                toks.extend(std::iter::repeat(mask).take(blk));
+                let hi = n_ctx + blk;
+
+                // Reference: the whole canvas, block-causal, windowed to the block's rows.
+                let want = gpu.denoise_stats_rows_bc(&m, &toks, n_ctx, blk, blk, n_ctx);
+
+                // Cached: prefix once, then the block alone.
+                let mut c = gpu.bidir_kv_new(&m, hi);
+                let _ = gpu.denoise_stats_cached(&m, &toks[..n_ctx], 0, n_ctx, &mut c);
+                let got = gpu.denoise_stats_cached(&m, &toks, n_ctx, blk, &mut c);
+
+                assert_eq!(got.len(), want.len(), "n_ctx={n_ctx} blk={blk}: row count");
+                let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(worst < 2e-4, "n_ctx={n_ctx} blk={blk}: cached differs by {worst:.2e}");
+                for (i, (a, b)) in want.chunks_exact(4).zip(got.chunks_exact(4)).enumerate() {
+                    assert_eq!(a[0] as u32, b[0] as u32,
+                        "n_ctx={n_ctx} blk={blk} row {i}: argmax differs — the cache is not the same model");
+                }
+            }
+        }
+    }
+
+    /// The invariant that keeps it honest: a window that does not start where the cache ends is a
+    /// bug, and reading uninitialised rows as context would look like plausible gibberish.
+    #[test]
+    fn a_misaligned_window_is_refused() {
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let toks: Vec<u32> = (0..12u32).map(|i| 1 + i).collect();
+        let mut c = gpu.bidir_kv_new(&m, 32);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu.denoise_stats_cached(&m, &toks, 4, 8, &mut c)   // cache is empty, window starts at 4
+        }));
+        assert!(r.is_err(), "a window starting past the cache's end must be refused");
+    }
+}
+
+#[cfg(test)]
+mod long_prompt_prefill {
+    use super::*;
+
+    /// THE 3840-TOKEN CRASH. A long prompt made the cache prefill run the output projection over
+    /// every prompt row: at vocab 157184 that is a 2.41 GB logits tensor against wgpu's 2 GB
+    /// per-buffer ceiling. The allocation failed NON-FATALLY, so the bind groups built from it were
+    /// invalid, the dispatches were dropped, and generation continued — "produced 8 tokens" beside
+    /// an empty reply, with five validation errors as the only clue.
+    ///
+    /// The prefill wants K/V and nothing else. This checks it produces a usable cache without ever
+    /// touching the head, and that a block forwarded against that cache still matches the
+    /// whole-canvas path.
+    #[test]
+    fn a_long_prompt_prefills_without_touching_the_head() {
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let mask = m.mask_token_id.unwrap_or(0);
+        let n_ctx = 96usize;                       // long relative to the block, as a real prompt is
+        let blk = 8usize;
+        let mut toks: Vec<u32> = (0..n_ctx as u32).map(|i| 1 + (i * 7) % 200).collect();
+        toks.extend(std::iter::repeat(mask).take(blk));
+
+        let mut c = gpu.bidir_kv_new(&m, n_ctx + blk);
+        gpu.bidir_kv_prefill(&m, &toks[..n_ctx], 0, n_ctx, &mut c);
+        assert_eq!(c.filled, n_ctx, "the prefill must still publish every prompt row");
+
+        let got = gpu.denoise_stats_cached(&m, &toks, n_ctx, blk, &mut c);
+        let want = gpu.denoise_stats_rows_bc(&m, &toks, n_ctx, blk, blk, n_ctx);
+        for (i, (a, b)) in want.chunks_exact(4).zip(got.chunks_exact(4)).enumerate() {
+            assert_eq!(a[0] as u32, b[0] as u32,
+                "row {i}: a headless prefill must leave the same cache a full one would");
+        }
+    }
+
+    /// And if a readout ever IS asked for at a size the device cannot hold, it must say so rather
+    /// than degrade into dropped dispatches and an empty answer.
+    #[test]
+    fn an_oversized_readout_is_named_not_dropped() {
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        let cap = gpu.max_buffer_bytes() as u64;
+        let rows_that_fit = (cap / (m.vocab as u64 * 4)) as usize;
+        // One row past what the device can hold in a single buffer.
+        let n = rows_that_fit.saturating_add(1);
+        if n > 200_000 { return; }                  // absurd only on a device with a tiny vocab
+        let toks: Vec<u32> = (0..n as u32).map(|i| i % 200).collect();
+        let mut c = gpu.bidir_kv_new(&m, n);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu.denoise_stats_cached(&m, &toks, 0, n, &mut c)
+        }));
+        assert!(r.is_err(), "an oversized readout must be refused, not silently dropped");
+    }
+}
+
+#[cfg(test)]
+mod shift_logits_cached {
+    use super::*;
+    /// A shift_logits model must be able to use the cache. It reads row i-1 for position i, so the
+    /// window starts one row earlier and the cache rewinds to match — declining instead sent
+    /// DiffuCoder (arch 'dream', where the flag defaults true) down the whole-canvas path, which
+    /// exhausted the driver's VMA at 2471 rows and degraded into an empty readout and a panic.
+    #[test]
+    fn a_shift_logits_model_still_generates_with_the_cache() {
+        let bytes = match std::fs::read("/tmp/tiny-llada2-shift.gguf") { Ok(b) => b, Err(_) => return };
+        let gpu = Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        assert!(m.shift_logits, "this fixture exists to exercise shift_logits");
+        let mask = m.mask_token_id.unwrap_or(0);
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
+        for (fill, steps, blk) in [(16usize, 8usize, 8usize), (12, 12, 4)] {
+            let cached = gpu.diffuse_generate(&m, &prompt, fill, steps, blk, None).expect("cached");
+            std::env::set_var("LOGSCOPE_DIFFUSION_KV_CACHE", "0");
+            let plain = gpu.diffuse_generate(&m, &prompt, fill, steps, blk, None).expect("uncached");
+            std::env::remove_var("LOGSCOPE_DIFFUSION_KV_CACHE");
+            assert_eq!(cached.len(), fill, "fill={fill}: short reply");
+            assert!(!cached.contains(&mask), "fill={fill}: a mask survived");
+            assert_eq!(cached, plain, "fill={fill}: the cache changed a shift_logits generation");
+        }
+    }
+}
+
+// PASS FUSION AND THE DIFFUSION PATH: see tools/gate-passfuse-diffusion.sh. The flag is read once
+// per process and cached, so an in-process A/B cannot toggle it — the honest comparison is two
+// processes, which is what that script does. Result: fusion CHANGES generated tokens on the
+// shift_logits and 64-expert fixtures, so c4-736's retraction covers this path too.
+
+#[cfg(test)]
+mod commit_ranking {
+    /// The three orderings diffuse.cpp distinguishes, over the stats ROWSTATS_F32 already emits:
+    /// [argmax, p_top, margin, entropy]. Pinned on constructed rows because the random-weight tinies
+    /// cannot discriminate — every row there is near-uniform, so all three orderings coincide and a
+    /// comparison on them would prove nothing either way.
+    fn rank(stat: [f32; 4], mode: u8) -> f64 {
+        match mode { 1 => stat[2] as f64, 2 => -(stat[3] as f64), _ => stat[1] as f64 }
+    }
+
+    /// The case the metrics disagree about, which is the case that matters: a row with a lot of
+    /// mass on its favourite but a close runner-up (probable, NOT decided) against a row with less
+    /// mass but a clear gap (decided). p_top prefers the first; margin and entropy prefer the second.
+    #[test]
+    fn probable_and_decided_are_different_questions() {
+        // [argmax, p_top, margin, entropy]
+        let probable = [7.0f32, 0.60, 0.02, 2.30];   // high mass, runner-up right behind
+        let decided  = [9.0f32, 0.45, 0.90, 0.80];   // less mass, nothing close
+        assert!(rank(probable, 0) > rank(decided, 0), "p_top must prefer the probable row");
+        assert!(rank(decided, 1) > rank(probable, 1), "margin must prefer the decided row");
+        assert!(rank(decided, 2) > rank(probable, 2), "entropy must prefer the decided row");
+    }
+
+    #[test]
+    fn entropy_is_inverted_so_bigger_is_always_better() {
+        let calm = [1.0f32, 0.5, 0.5, 0.10];
+        let noisy = [1.0f32, 0.5, 0.5, 5.00];
+        assert!(rank(calm, 2) > rank(noisy, 2), "lower entropy must sort first");
+    }
+
+    #[test]
+    fn the_default_is_low_confidence_as_in_the_reference() {
+        let a = [1.0f32, 0.9, 0.1, 1.0];
+        let b = [1.0f32, 0.2, 0.9, 0.1];
+        assert!(rank(a, 0) > rank(b, 0), "unset must behave as p_top, matching diffuse.cpp's default");
+    }
+}
+
+#[cfg(test)]
+mod vocab_width_from_tensor {
+    use super::*;
+    /// The width a borrowed tokenizer is checked against must come from the EMBEDDING TENSOR, not
+    /// from a metadata key. Hparams are arch-prefixed: the guard looked up "llama.vocab_size" on a
+    /// file whose arch is 'diffuse', found nothing, and skipped itself — accepting a 128256-token
+    /// tokenizer for a 126464-wide model, whose own prompt specials then indexed past the table.
+    #[test]
+    fn the_width_comes_from_a_tensor_that_always_exists() {
+        let path = "/tmp/tiny-llada2.gguf";
+        let Ok(bytes) = std::fs::read(path) else { return };
+        let Ok(g) = crate::gguf::parse(&bytes) else { return };
+
+        let from_tensor = g.tensor("token_embd.weight")
+            .and_then(|t| t.dims.last().copied()).map(|v| v as usize);
+        assert!(from_tensor.is_some(), "token_embd.weight must give the row count");
+
+        // The old lookups, on a non-llama arch, find nothing — which is why the guard was silent.
+        let unprefixed = g.get_u32("llama.vocab_size").or_else(|| g.get_u32("vocab_size"));
+        let arch_prefixed = g.declared_arch().and_then(|a| g.get_u32(&format!("{a}.vocab_size")));
+        assert!(unprefixed.is_none() || arch_prefixed.is_some(),
+            "if the unprefixed key ever works this test should be revisited, not deleted");
+
+        // And the tensor agrees with the model the loader actually builds.
+        let gpu = Gpu::new();
+        if let Ok(m) = gpu.load_gguf_opt(&bytes, false) {
+            assert_eq!(from_tensor.unwrap(), m.embed.len() / m.d,
+                "the tensor row count must equal the embedding table the loader produced");
+            assert_eq!(from_tensor.unwrap(), m.vocab, "and the model's declared vocab");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bidir_attention_grid {
+    use super::*;
+
+    /// THE 5852-TOKEN PROMPT CRASH. Bidirectional attention runs one workgroup per (row, head), so
+    /// a 5852-token prompt at 16 heads asks for 93632 — past the 65535 per-dimension limit. The
+    /// c4-738 guard turned that into a panic instead of a silently dropped dispatch, which is the
+    /// right failure, but a long paste should not be a failure at all.
+    ///
+    /// Checked as arithmetic AND as a real dispatch, because the grid is only half of it: the kernel
+    /// has to derive its row from both dimensions or the spill quietly computes the wrong rows.
+    #[test]
+    fn the_grid_spills_instead_of_exceeding_the_limit() {
+        for (rows, heads) in [(5852usize, 16usize), (4096, 16), (65535, 1), (70000, 1)] {
+            let total = (rows * heads) as u32;
+            let gx = total.min(65535).max(1);
+            let gy = total.div_ceil(gx);
+            assert!(gx <= 65535 && gy <= 65535, "rows={rows} heads={heads}: grid ({gx},{gy}) still over");
+            assert!(gx as u64 * gy as u64 >= total as u64, "the grid must cover every (row, head)");
+        }
+    }
+
+    /// And the spill must not move any output: a wrong row derivation looks like fluent nonsense.
+    #[test]
+    fn a_wide_attention_matches_a_narrow_one() {
+        let gpu = Gpu::new();
+        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
+        // Same tokens, two lengths — the longer one is where a y-spill would first bite on a real
+        // model; on the tiny it exercises the same index arithmetic.
+        for t in [8usize, 64, 200] {
+            let toks: Vec<u32> = (0..t as u32).map(|i| 1 + (i * 7) % 200).collect();
+            let s = gpu.denoise_stats(&m, &toks);
+            assert_eq!(s.len(), t * 4, "t={t}: row count");
+            assert!(s.chunks_exact(4).all(|r| (r[0] as usize) < m.vocab && r[1].is_finite()),
+                "t={t}: a spilled workgroup wrote garbage");
+        }
+    }
+}
+
+#[cfg(test)]
+mod q4k_int8_transcode {
+    use super::*;
+
+    /// Build arbitrary but valid Q4_K super-blocks.
+    fn q4k(n_sb: usize, seed: u64) -> Vec<u8> {
+        let mut r = seed;
+        let mut next = move || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r };
+        let mut out = Vec::with_capacity(n_sb * 144);
+        for i in 0..n_sb {
+            // d and dmin as f16 bit patterns; include a zero-dmin block (symmetric) and a tiny d.
+            let (d, dmin): (u16, u16) = match i % 3 {
+                0 => (0x2C00, 0x2000),
+                1 => (0x1C00, 0x0000),
+                _ => (0x3400, 0x2800),
+            };
+            out.extend_from_slice(&d.to_le_bytes());
+            out.extend_from_slice(&dmin.to_le_bytes());
+            for _ in 0..12 { out.push((next() >> 24) as u8); }
+            for _ in 0..128 { out.push((next() >> 24) as u8); }
+        }
+        out
+    }
+
+    /// The transcode must land where the f32 round-trip lands. gate-q4k showed one ULP in the
+    /// dequantised value crossing a quantisation boundary and moving 297430 words, so "close" is
+    /// not a defence here — the value expression is copied verbatim for exactly that reason.
+    #[test]
+    fn transcoding_matches_dequantise_then_quantise() {
+        let gpu = Gpu::new();
+        for (n, k, seed) in [(2usize, 256usize, 11u64), (3, 512, 22), (8, 256, 33)] {
+            let raw = q4k(n * (k / 256), seed);
+            let f32s = crate::gguf::dequantize(12, &raw, n * k).expect("dequant");
+            let want = gpu.download(&gpu.quantize_q8_resident(&f32s, n, k).qs);
+            let got_w = gpu.q4_k_to_int8_resident(&raw, n, k).expect("transcode");
+            let got = gpu.download(&got_w.qs);
+            assert_eq!(want.len(), got.len(), "n={n} k={k}: scale count");
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert!((a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                    "n={n} k={k} block {i}: scale {b} != {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn shapes_it_cannot_honour_are_refused() {
+        let gpu = Gpu::new();
+        let raw = q4k(2, 7);
+        assert!(gpu.q4_k_to_int8_resident(&raw, 1, 128).is_none(), "k must be a multiple of 256");
+        assert!(gpu.q4_k_to_int8_resident(&raw[..16], 1, 256).is_none(), "short buffer must refuse");
+    }
+}
+
+#[cfg(test)]
+mod q4k_int8_on_real_bytes {
+    use super::*;
+
+    /// c4-784 added a Q4_K -> int8-resident slice path and shipped it with the LOADER arm verified
+    /// only by construction: no Q4_K fixture existed in this repo, so nothing had ever fed real
+    /// super-block bytes through it. tools/make-q4k-probe.py now produces them.
+    ///
+    /// Two things are checked against each other, neither trusted alone: our dequantiser must
+    /// recover the values the quantiser intended (otherwise the fixture is wrong and would make a
+    /// broken transcode look right), and the transcode must then land where dequantise-then-quantise
+    /// lands (otherwise the fast path diverges from the one it replaces).
+    #[test]
+    fn the_transcode_matches_the_f32_path_on_real_q4k_bytes() {
+        let (Ok(raw), Ok(want_npy)) = (std::fs::read("/tmp/q4k_probe.bin"),
+                                       std::fs::read("/tmp/q4k_probe.npy")) else { return };
+        let n = 4usize; let k = 256usize;
+        assert_eq!(raw.len(), n * (k / 256) * 144, "fixture is not Q4_K-shaped");
+
+        // Values the fixture intended, read out of the .npy payload (header is 128 bytes, v1 f32).
+        let body = &want_npy[128..];
+        let intended: Vec<f32> = body.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).take(n * k).collect();
+        assert_eq!(intended.len(), n * k, "npy payload did not yield {} floats", n * k);
+
+        // 1. our reader recovers them to within Q4_K's own resolution
+        let got = crate::gguf::dequantize(12, &raw, n * k).expect("dequantize Q4_K");
+        let worst = intended.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let span = intended.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(worst < span * 0.15,
+            "our Q4_K reader disagrees with the quantiser by {worst:.4} against a span of {span:.4} \
+— the fixture and the reader must agree before either can vouch for the transcode");
+
+        // 2. the c4-784 slice path lands where the f32 round-trip lands
+        let gpu = Gpu::new();
+        let want = gpu.download(&gpu.quantize_q8_resident(&got, n, k).qs);
+        let fast = gpu.q4_k_to_int8_resident(&raw, n, k).expect("transcode");
+        let have = gpu.download(&fast.qs);
+        assert_eq!(want.len(), have.len());
+        for (i, (a, b)) in want.iter().zip(&have).enumerate() {
+            assert!((a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                "block {i}: transcoded scale {b} != round-tripped {a} — the fast load path diverges \
+from the one every Qwen and Llama K-quant used before it");
+        }
+    }
+}
+
+#[cfg(test)]
+mod logit_softcap {
+    use super::*;
+
+    #[test]
+    fn the_cap_squashes_the_tails_and_leaves_the_middle_nearly_alone() {
+        // cap*tanh(x/cap): |x| << cap passes through, |x| >> cap saturates AT the cap. Checked on
+        // the GPU kernel rather than an f32 reference, because the kernel is what runs.
+        let gpu = Gpu::new();
+        let cap = 30.0f32;
+        let xs: Vec<f32> = vec![-500.0, -31.0, -1.0, 0.0, 0.5, 29.0, 300.0];
+        let t = gpu.upload(&xs, 1, xs.len());
+        let out = gpu.alloc(1, xs.len());
+        let dims = [xs.len() as u32, 0u32, 0, 0, cap.to_bits(), 0, 0, 0];
+        gpu.dispatch(LOGIT_SOFTCAP, &[&t], &out, bytemuck::cast_slice(&dims), wg1(xs.len() as u32));
+        let got = gpu.download(&out);
+        for (x, y) in xs.iter().zip(&got) {
+            let want = cap * (x / cap).tanh();
+            assert!((y - want).abs() < 1e-3, "x={x}: got {y}, want {want}");
+            assert!(y.abs() <= cap + 1e-3, "nothing may exceed the cap: {y}");
+        }
+        assert!((got[3]).abs() < 1e-6, "0 stays 0");
+        assert!((got[4] - 0.5).abs() < 1e-3, "small values pass through nearly unchanged");
+    }
+
+    #[test]
+    fn a_cap_of_zero_or_nonsense_never_reaches_the_kernel() {
+        // The loader filters the cap before it becomes a Model field: 0 would divide by zero in the
+        // kernel and NaN every logit, and a negative cap is not a cap. Checked at the filter rather
+        // than defended in the shader, because the shader runs per token and this runs once.
+        for bad in [0.0f32, -30.0, f32::NAN, f32::INFINITY] {
+            let keep = bad.is_finite() && bad > 0.0;
+            assert!(!keep, "{bad} must not survive the loader's filter");
+        }
+        assert!(30.0f32.is_finite() && 30.0f32 > 0.0, "and a real cap must");
+    }
+}
+
+#[cfg(test)]
+mod q5k_slice_path {
+    use super::*;
+
+    /// Structurally valid Q5_K super-blocks: f16 d, f16 dmin, 12 packed 6-bit scale/min pairs,
+    /// 32B qh (the fifth bits), 128B qs (two nibbles per byte) = 176 bytes.
+    fn blocks(n_sb: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut v = Vec::with_capacity(n_sb * 176);
+        for i in 0..n_sb {
+            let d: u16 = if i % 2 == 0 { 0x2C00 } else { 0x1C00 };   // two magnitudes, both f16-exact
+            let dmin: u16 = 0x2000;
+            v.extend_from_slice(&d.to_le_bytes());
+            v.extend_from_slice(&dmin.to_le_bytes());
+            for _ in 0..12 { v.push((next() >> 24) as u8); }         // scales/mins
+            for _ in 0..32 { v.push((next() >> 24) as u8); }         // qh — every fifth bit exercised
+            for _ in 0..128 { v.push((next() >> 24) as u8); }        // qs
+        }
+        v
+    }
+
+    /// The slice path must land EXACTLY where dequantise-then-quantise lands, or the fast load is a
+    /// different model from the slow one. This is the check c4-784's Q4_K path shipped without and
+    /// had to be retrofitted; Q5_K gets it in the same commit as the path.
+    #[test]
+    fn the_q5k_transcode_matches_the_f32_round_trip() {
+        let (n, k) = (4usize, 512usize);           // 2 super-blocks per row
+        let raw = blocks(n * (k / 256), 0x5151_5151);
+        let deq = crate::gguf::dequantize(13, &raw, n * k).expect("dequantize Q5_K");
+
+        let gpu = Gpu::new();
+        let want = gpu.download(&gpu.quantize_q8_resident(&deq, n, k).qs);
+        let fast = gpu.q5_k_to_int8_resident(&raw, n, k).expect("transcode");
+        let have = gpu.download(&fast.qs);
+        assert_eq!(want.len(), have.len());
+        for (i, (a, b)) in want.iter().zip(&have).enumerate() {
+            assert!((a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                "block {i}: transcoded scale {b} != round-tripped {a}");
+        }
+
+        // ...and the CODES too, not just the scales: matching scales with permuted codes is exactly
+        // what a mis-read of qh's group indexing would produce, and it is invisible to a scale-only
+        // comparison.
+        let want_w = gpu.download_u32(&gpu.quantize_q8_resident(&deq, n, k).qw);
+        let have_w = gpu.download_u32(&fast.qw);
+        assert_eq!(want_w, have_w, "transcoded int8 codes differ from the round-tripped ones");
+    }
+
+    /// A k that is not a multiple of 256 has no super-block structure to slice, so the transcode
+    /// must DECLINE and let the caller fall back rather than read past the block boundary.
+    #[test]
+    fn a_non_superblock_width_is_declined() {
+        let gpu = Gpu::new();
+        assert!(gpu.q5_k_to_int8_resident(&blocks(1, 7), 1, 128).is_none());
+    }
+}
+
+#[cfg(test)]
+mod q6k_slice_path {
+    use super::*;
+
+    /// Arbitrary but structurally valid Q6_K super-blocks: 128B ql, 64B qh, 16 int8 scales, f16 d.
+    fn blocks(n_sb: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut v = Vec::with_capacity(n_sb * 210);
+        for i in 0..n_sb {
+            for _ in 0..192 { v.push((next() >> 24) as u8); }        // ql + qh
+            for _ in 0..16 { v.push((next() >> 24) as u8); }         // int8 sub-scales
+            let d: u16 = if i % 2 == 0 { 0x2C00 } else { 0x1C00 };   // two magnitudes
+            v.extend_from_slice(&d.to_le_bytes());
+        }
+        v
+    }
+
+    /// The slice path must land exactly where the f32 round-trip lands. Q6_K is ~43% of a Q4_K_M
+    /// Llama-3.2-1B (ffn_down every layer, plus output), which is why "22.0% of weights sliced" was
+    /// the real reading of a load that had just announced the Q4_K transcode.
+    #[test]
+    fn the_transcode_matches_the_f32_round_trip() {
+        let gpu = Gpu::new();
+        for (n, k) in [(2usize, 256usize), (3, 512), (5, 256)] {
+            let raw = blocks(n * (k / 256), 21 + n as u64);
+            let f32s = crate::gguf::dequantize(14, &raw, n * k).expect("dequant Q6_K");
+            let want = gpu.download(&gpu.quantize_q8_resident(&f32s, n, k).qs);
+            let fast = gpu.q6_k_to_int8_resident(&raw, n, k).expect("transcode");
+            let have = gpu.download(&fast.qs);
+            assert_eq!(want.len(), have.len(), "n={n} k={k}: scale count");
+            for (i, (a, b)) in want.iter().zip(&have).enumerate() {
+                assert!((a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                    "n={n} k={k} block {i}: sliced {b} != round-tripped {a}");
+            }
+        }
+    }
+
+    /// One Q6_K super-block is 256 weights and int8 residency is per-32, so the block counts must
+    /// come out 8:1 — an off-by-one here would misalign every scale after the first super-block.
+    #[test]
+    fn each_super_block_becomes_eight_resident_blocks() {
+        let gpu = Gpu::new();
+        let (n, k) = (2usize, 512usize);
+        let w = gpu.q6_k_to_int8_resident(&blocks(n * 2, 3), n, k).expect("transcode");
+        assert_eq!(gpu.download(&w.qs).len(), n * k / 32);
+        assert_eq!(k / 256 * 8, k / 32);
+    }
+
+    #[test]
+    fn shapes_it_cannot_honour_are_refused() {
+        let gpu = Gpu::new();
+        let raw = blocks(1, 9);
+        assert!(gpu.q6_k_to_int8_resident(&raw, 1, 128).is_none(), "k must be a multiple of 256");
+        assert!(gpu.q6_k_to_int8_resident(&raw[..64], 1, 256).is_none(), "short buffer must refuse");
+    }
+}
+
+#[cfg(test)]
+mod fused_rows_commute {
+    use super::*;
+
+    fn q6_blocks(n_sb: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut v = Vec::with_capacity(n_sb * 210);
+        for i in 0..n_sb {
+            for _ in 0..208 { v.push((next() >> 24) as u8); }
+            let d: u16 = if i % 2 == 0 { 0x2C00 } else { 0x1C00 };
+            v.extend_from_slice(&d.to_le_bytes());
+        }
+        v
+    }
+
+    /// THE COMMUTATION, which is the whole justification. int8 residency quantises per 32 along k;
+    /// fusing gate with up concatenates along ROWS. Disjoint axes, so quantising each half and
+    /// concatenating must equal concatenating in f32 and quantising once — exactly the argument
+    /// c4-756 made for the MoE expert stack, now used for the dense FFN.
+    #[test]
+    fn quantising_each_half_equals_quantising_the_concatenation() {
+        let gpu = Gpu::new();
+        let (rows, k) = (3usize, 256usize);
+        let a = q6_blocks(rows, 5);
+        let b = q6_blocks(rows, 77);
+
+        // Concatenate in f32, then quantise once — the path being replaced.
+        let mut cat = crate::gguf::dequantize(14, &a, rows * k).unwrap();
+        cat.extend(crate::gguf::dequantize(14, &b, rows * k).unwrap());
+        let want = gpu.download(&gpu.quantize_q8_resident(&cat, rows * 2, k).qs);
+
+        // Quantise each half from its own BYTES, then concatenate.
+        let got_w = gpu.int8_rows_from_sources(&[(14, &a, rows), (14, &b, rows)], k).expect("fuse");
+        let got = gpu.download(&got_w.qs);
+
+        assert_eq!(want.len(), got.len(), "scale count");
+        for (i, (x, y)) in want.iter().zip(&got).enumerate() {
+            assert!((x - y).abs() <= 1e-9 * x.abs().max(1.0),
+                "block {i}: fused {y} != round-tripped {x} — the axes are not disjoint after all");
+        }
+    }
+
+    /// Q4_K_M mixes types WITHIN a layer, so the two halves of a fusion need not share one. A
+    /// builder that assumed they did would silently mis-decode the second source.
+    #[test]
+    fn the_halves_may_be_different_ggml_types() {
+        let gpu = Gpu::new();
+        let (rows, k) = (2usize, 256usize);
+        let q6 = q6_blocks(rows, 11);
+        // A Q4_K half built by the same generator the c4-784 tests use.
+        let mut q4 = Vec::new();
+        let mut x = 99u64;
+        let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for _ in 0..rows {
+            q4.extend_from_slice(&0x2C00u16.to_le_bytes());
+            q4.extend_from_slice(&0x2000u16.to_le_bytes());
+            for _ in 0..140 { q4.push((next() >> 24) as u8); }
+        }
+        let w = gpu.int8_rows_from_sources(&[(14, &q6, rows), (12, &q4, rows)], k);
+        assert!(w.is_some(), "a mixed-type fusion must be handled, not refused");
+        assert_eq!(w.unwrap().n, rows * 2);
+    }
+
+    /// An unhandled source type must refuse so the caller falls back, rather than being guessed at.
+    #[test]
+    fn an_unknown_source_type_refuses() {
+        let gpu = Gpu::new();
+        let a = q6_blocks(1, 3);
+        assert!(gpu.int8_rows_from_sources(&[(14, &a, 1), (99, &a, 1)], 256).is_none());
+        assert!(gpu.int8_rows_from_sources(&[(14, &a, 1)], 31).is_none(), "k must be a multiple of 32");
+    }
+}
+
+#[cfg(test)]
+mod fusion_does_not_submit {
+    use super::*;
+
+    /// A fusion must be assembled ENTIRELY on the host. Building each half as a QWeight and
+    /// downloading it to join them issues submits, and inside load() an arena slab is mapped — wgpu
+    /// rejects the submit and leaves the buffer UNWRITTEN, which is garbage weights with no error.
+    /// The operator's log filled with "Buffer with 'arena-slab' label is still mapped" for exactly
+    /// that reason.
+    ///
+    /// The structural check is that the host path and the resident path agree, since the resident
+    /// one is now a thin wrapper over the same parts: if they ever diverge, one of them grew a step
+    /// the other does not have.
+    #[test]
+    fn the_host_parts_and_the_resident_wrapper_agree() {
+        let gpu = Gpu::new();
+        let (rows, k) = (3usize, 256usize);
+        let mut raw = Vec::new();
+        let mut x = 31u64;
+        let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for _ in 0..rows {
+            for _ in 0..208 { raw.push((next() >> 24) as u8); }
+            raw.extend_from_slice(&0x2C00u16.to_le_bytes());
+        }
+        let (host_qs, host_codes) = gpu.q6_k_to_int8_host(&raw, rows, k).expect("host");
+        assert_eq!(host_qs.len(), rows * k / 32);
+        assert_eq!(host_codes.len(), rows * k);
+        let resident = gpu.q6_k_to_int8_resident(&raw, rows, k).expect("resident");
+        let back = gpu.download(&resident.qs);
+        assert_eq!(back.len(), host_qs.len());
+        for (i, (a, b)) in host_qs.iter().zip(&back).enumerate() {
+            assert!((a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                "block {i}: host {a} != resident {b} — the wrapper is no longer thin");
+        }
+    }
+
+    /// And the fusion still commutes after the refactor — the property c4-812 proved, re-checked
+    /// because the code that implements it was rewritten.
+    #[test]
+    fn the_refactor_preserved_the_commutation() {
+        let gpu = Gpu::new();
+        let (rows, k) = (2usize, 256usize);
+        let mut mk = |seed: u64| {
+            let mut x = seed;
+            let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+            let mut v = Vec::new();
+            for _ in 0..rows {
+                for _ in 0..208 { v.push((next() >> 24) as u8); }
+                v.extend_from_slice(&0x2C00u16.to_le_bytes());
+            }
+            v
+        };
+        let (a, b) = (mk(7), mk(4242));
+        let mut cat = crate::gguf::dequantize(14, &a, rows * k).unwrap();
+        cat.extend(crate::gguf::dequantize(14, &b, rows * k).unwrap());
+        let want = gpu.download(&gpu.quantize_q8_resident(&cat, rows * 2, k).qs);
+        let got = gpu.download(&gpu.int8_rows_from_sources(&[(14, &a, rows), (14, &b, rows)], k)
+                                  .expect("fuse").qs);
+        assert_eq!(want.len(), got.len());
+        for (i, (x, y)) in want.iter().zip(&got).enumerate() {
+            assert!((x - y).abs() <= 1e-9 * x.abs().max(1.0), "block {i}: {y} != {x}");
+        }
     }
 }

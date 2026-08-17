@@ -1,5 +1,20 @@
 # Logscope — TODO / roadmap
 
+> **Current priorities live in [`HANDOVER-c4-849.md`](HANDOVER-c4-849.md) §3**, ordered and with the
+> blocker named for each. Summary as of bundle c4-848:
+>
+> | | Task | State |
+> | --- | --- | --- |
+> | T1 | Wire automatic context sizing | written + tested, needs `{arch}.context_length` read at load |
+> | T2 | Cut per-dispatch encode cost | **84% of decode wall time**, largest available win |
+> | T3 | Identify the 27.9% kernel | `LOGSCOPE_DISPATCH_HIST=1 count-dispatch` |
+> | T4 | Gated DeltaNet forward pass | unlocks every current Qwen; gates T5 |
+> | T5 | MTP speculative decoding | detector done, verifier done, blocked on T4 |
+> | T6 | Gemma 4 | not hybrid, so reachable; three named gaps |
+> | T7 | `--gate-qwen3` fails pre-existing; MLA loading absent; Q5_K unsliced; UI unverified visually |
+>
+> Do not tell the operator to raise `n_ctx` by hand — that is T1's job.
+
 Living backlog. Newest asks at top; design notes inline so each item is actionable.
 
 ## Models / testing

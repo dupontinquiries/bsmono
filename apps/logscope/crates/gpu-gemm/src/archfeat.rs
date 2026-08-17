@@ -54,16 +54,28 @@ pub enum Feature {
     /// MLA reconstruction matrices shipped as SEPARATE, THREE-dimensional `attn_k_b` / `attn_v_b`
     /// (`[head_dim x lora x n_head]`) rather than one fused 2-D `attn_kv_b`.
     ///
-    /// Purely a loading concern — the MLA forward itself is implemented and validated — but it blocks
-    /// every checkpoint that uses this layout, which is GLM-4.7-Flash and GLM-5.2 at least.
+    /// IMPLEMENTED since _289 — the loader reads both and concatenates them PER HEAD. This doc said
+    /// "blocks GLM-4.7-Flash and GLM-5.2 at least" for several bundles after the code landed, while
+    /// `implemented()` below correctly said true: prose and table disagreeing about the same fact,
+    /// which is how a fixed gap keeps being reported as a gap by anyone who reads the enum first.
     MlaSplit3dProjections,
     /// GELU-gated FFN instead of SiLU-gated (all Gemma).
     GeGluActivation,
     /// Gemma's RMS norm: `x/rms(x) · (1 + w)`, computed in f32 — the `1 +` is not a detail, it changes
     /// every normalized value.
     GemmaRmsNorm,
-    /// tanh soft-capping on attention logits and final logits (Gemma 2; Gemma 3+ default it off).
-    LogitSoftcap,
+    /// tanh soft-capping on the FINAL logits (Gemma 2; Gemma 3+ default it off).
+    ///
+    /// Split from the attention cap because the two have completely different costs: this one is an
+    /// elementwise pass over the output vector, the other lives inside the softmax. One feature
+    /// covering both meant the cheap half could not be claimed without claiming the expensive one,
+    /// which is how a registry entry ends up lying in whichever direction someone needed.
+    FinalLogitSoftcap,
+    /// tanh soft-capping on ATTENTION logits, before the softmax (Gemma 2).
+    ///
+    /// Cannot be folded into q the way the attention SCALE was — tanh is not linear — so it needs
+    /// the cap inside every attention kernel rather than one dispatch in front of them.
+    AttnLogitSoftcap,
     /// The token embedding is multiplied by sqrt(d) before the first block (all Gemma).
     EmbeddingScale,
     /// Windowed layers rotate at a DIFFERENT rope frequency base than full-attention ones
@@ -107,7 +119,8 @@ impl Feature {
             Feature::MlaSplit3dProjections => "split 3-D attn_k_b / attn_v_b instead of fused attn_kv_b",
             Feature::GeGluActivation => "GELU-gated FFN",
             Feature::GemmaRmsNorm => "Gemma (1+w) RMS norm",
-            Feature::LogitSoftcap => "tanh soft-cap on attention and final logits",
+            Feature::FinalLogitSoftcap => "tanh soft-cap on the final logits",
+            Feature::AttnLogitSoftcap => "tanh soft-cap on attention logits, inside the softmax",
             Feature::EmbeddingScale => "token embedding scaled by sqrt(d)",
             Feature::PerLayerRopeBase => "separate rope base for windowed layers",
             Feature::AttentionScaleHparam => "attention scale from hparams, not 1/sqrt(head_dim)",
@@ -190,10 +203,24 @@ impl Feature {
             Feature::MlaSplit3dProjections => true,
             Feature::GeGluActivation => true,    // selected per block from ArchConfig::act (--gate-gemma)
             Feature::GemmaRmsNorm => true,       // (1+w) folded into the weight at load (--gate-gemma)
-            Feature::LogitSoftcap => false,      // not implemented anywhere
+            // Implemented: Model::logit_softcap, applied by logits_out — one funnel in front of
+            // eighteen call sites, so a model that states a cap cannot get uncapped logits from
+            // some paths and capped ones from others.
+            Feature::FinalLogitSoftcap => true,
+            Feature::AttnLogitSoftcap => false,  // needs the cap inside the attention kernels
             Feature::EmbeddingScale => true,     // Model::embed_scale, set from the arch at load
             Feature::PerLayerRopeBase => true,   // BlockWeights::rope_base, from rope.freq_base_swa
-            Feature::AttentionScaleHparam => false, // 1/sqrt(head_dim) is hardcoded in the kernels
+            // IMPLEMENTED, and this table did not learn — the SIXTH stale entry, after
+            // ExpertWeightsScale, ExpertWeightsNorm, PerLayerRopeFreqs and MlaSplit3dProjections.
+            // The loader reads {arch}.attention.scale and the value is applied by PRE-SCALING q by
+            // scale*sqrt(head_dim) before attention, so the kernels' own 1/sqrt(head_dim) cancels to
+            // exactly the stated scale — one dispatch, no change to seven attention kernels. The
+            // comment this replaces ("hardcoded in the kernels") described the reason it could not
+            // be done, which stopped being true when the pre-scale landed.
+            //
+            // A stale FALSE here is not cosmetic: is_supported vetoes on any gap, so this entry was
+            // refusing Gemma 3 27B and Gemma 4 for a feature the engine has.
+            Feature::AttentionScaleHparam => true,
             // IMPLEMENTED in _369/_370, and this table did not learn — the exact stale-flag shape the
             // Q6_K file-view gate had. `{arch}.expert_weights_scale` is read from metadata and applied
             // in moe::route AFTER normalization (order is load-bearing: scaling first cancels against
@@ -221,15 +248,20 @@ matters most on long contexts"),
 whose windowed and full layers differ cannot be laid out correctly at all"),
             Feature::LayerOutputScale => Some("layer outputs are unscaled; the tensor is present in the \
 file and ignored"),
-            Feature::LogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
+            Feature::FinalLogitSoftcap => Some("Gemma 2 only; implemented — logits_out applies it"),
+            Feature::AttnLogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
             Feature::AttentionScaleHparam => Some("matches the 1/sqrt(head_dim) default on Gemma 3 12B \
 and below; differs only on the 27B, which uses 1/sqrt(n_embd/n_head)"),
             Feature::ExpertWeightsScale => Some("GLM-5.2 sets 2.5; ignoring it scales every MoE layer's \
 output down by that factor — a quietly worse model, not a broken one"),
             Feature::MlaSplit3dProjections => Some("a LOADING gap, not a maths one — the MLA forward is \
 implemented and validated; these checkpoints just store k_b and v_b separately and in 3-D"),
-            Feature::SparseAttentionIndexer => Some("STRUCTURAL: without the indexer there is no dense \
-fallback, because attending to a 1M context in full is not something the engine can do"),
+            Feature::SparseAttentionIndexer => Some("glm-dsa needs sparse attention: an indexer selects top-k keys. NOT a correctness blocker — \
+llama.cpp mainline does not implement DSA either (issues #24730, #20363) and runs GLM-5.2 with a \
+DENSE fallback, and dense attention is EXACT at or below index_topk because selecting the top k \
+of k-or-fewer keys is all of them. Above that bound it is an approximation, and at a 1M context \
+it is unaffordable. The real loader blocker is IndexShare: index_topk_freq 4 means only ~1 layer \
+in 4 carries indexer tensors, which is what breaks stock llama.cpp on converted GGUFs"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
             _ => None,
@@ -258,7 +290,7 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         // Gemma 2/3/4 all use standard SWA on a layer pattern with a separate rope base; 3 and 4 add
         // learned Q/K norms before rope, and 4 adds per-layer rope frequency tensors.
         "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::GeGluActivation,
-                         Feature::GemmaRmsNorm, Feature::LogitSoftcap, Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
+                         Feature::GemmaRmsNorm, Feature::AttnLogitSoftcap, Feature::FinalLogitSoftcap, Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
         "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
                                      Feature::GeGluActivation, Feature::GemmaRmsNorm, Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
         // Gemma 4 (src/models/gemma4.cpp): everything gemma3 needs, plus per-layer rope freqs, a
@@ -380,7 +412,8 @@ mod tests {
             assert!(f.implemented(), "{f:?} should be implemented");
         }
         // and the one thing still genuinely missing is not quietly promoted with them
-        assert!(!Feature::LogitSoftcap.implemented(), "soft-capping is still not implemented");
+        assert!(!Feature::AttnLogitSoftcap.implemented(), "the ATTENTION cap is still not implemented");
+        assert!(Feature::FinalLogitSoftcap.implemented(), "the FINAL cap is, via logits_out");
     }
 
     #[test]
@@ -433,14 +466,22 @@ mod tests {
     #[test]
     fn gemma3_is_down_to_no_gaps_and_gemma2_only_needs_the_softcap() {
         // A LINE-BY-LINE read of gemma3.cpp's graph found two more things after this test first passed:
-        // the sqrt(d) embedding scale and a separate rope base for windowed layers. Both are now
-        // implemented. The third finding, the hparam attention scale, matches our 1/sqrt(head_dim)
-        // default on every Gemma 3 except the 27B — so it is listed as a requirement and NOT implemented,
-        // which is what keeps a 27B from silently loading wrong.
-        assert_eq!(gaps("gemma3", 0), vec![Feature::AttentionScaleHparam]);
+        // the sqrt(d) embedding scale and a separate rope base for windowed layers. The third, the
+        // hparam attention scale, matched our 1/sqrt(head_dim) default on every Gemma 3 EXCEPT the
+        // 27B — which is why it was listed as a requirement and left unimplemented, so a 27B could
+        // not silently load wrong.
+        //
+        // All three are implemented now, so the test's name is finally literal: gemma3 has NO gaps.
+        // The 27B loads with its stated scale, applied by pre-scaling q so the kernels' own
+        // 1/sqrt(head_dim) cancels.
+        assert!(gaps("gemma3", 0).is_empty(), "gemma3 gaps: {:?}", gaps("gemma3", 0));
         assert!(Feature::PerLayerRopeBase.implemented() && Feature::EmbeddingScale.implemented());
         // Gemma 2 shares those but also soft-caps its attention and final logits, which is unimplemented.
-        assert_eq!(gaps("gemma2", 0), vec![Feature::LogitSoftcap, Feature::AttentionScaleHparam]);
+        // Gemma 2 shares those but also soft-caps its attention and final logits, which is
+        // unimplemented — and is now the ONLY thing standing between this engine and Gemma 2.
+        // Gemma 2 needs BOTH caps and now has one: the final cap is implemented, the attention
+        // cap is the single remaining gap for the architecture.
+        assert_eq!(gaps("gemma2", 0), vec![Feature::AttnLogitSoftcap]);
         // Gemma 4's remaining gaps are the structural ones, unchanged by this work.
         let g4 = gaps("gemma4", 0);
         assert!(g4.contains(&Feature::PerLayerHeadDim) && g4.contains(&Feature::LayerOutputScale));
@@ -540,7 +581,15 @@ mod tests {
         // 40% of what it should, which reads as a mediocre model rather than a broken one.
         assert!(Feature::ExpertWeightsScale.note().unwrap().contains("quietly worse"));
         // The indexer is the blocking one, and the report must say why there is no degraded mode.
-        assert!(gap_report("glm-dsa", 0).iter().any(|s| s.contains("STRUCTURAL")));
+        // The gap text used to be asserted on the word STRUCTURAL, which encoded a diagnosis that
+        // turned out to be wrong (c4-785/787): llama.cpp does not implement DSA either and runs this
+        // model dense, and dense attention is EXACT at or below index_topk. What the report must now
+        // carry is the true blocker — IndexShare's per-layer asymmetry — and the honest scope of the
+        // dense fallback. A guard that pins a superseded word keeps the superseded diagnosis alive.
+        let rep = gap_report("glm-dsa", 0).join(" ");
+        assert!(rep.contains("IndexShare"), "the gap must name the loader trap: {rep}");
+        assert!(rep.to_ascii_lowercase().contains("dense"), "and the dense fallback: {rep}");
+        assert!(rep.contains("index_topk"), "and the bound below which dense is exact: {rep}");
     }
 
     #[test]
@@ -606,7 +655,8 @@ mod staleness_tests {
     /// a model that loads and produces wrong text — so these are pinned as firmly as the correction.
     #[test]
     fn the_remaining_gaps_are_still_gaps() {
-        assert!(!Feature::LogitSoftcap.implemented(), "nothing applies a softcap anywhere");
+        assert!(!Feature::AttnLogitSoftcap.implemented(),
+                "no attention kernel caps its logits — that is the half still missing");
         assert!(!Feature::PerLayerHeadDim.implemented(), "head_dim is one model-wide value");
         assert!(!Feature::LayerOutputScale.implemented(), "the tensor is not read");
     }

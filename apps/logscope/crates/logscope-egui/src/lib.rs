@@ -4,8 +4,14 @@
 //! treeexport, script, runner — so those stay ungated; everything that touches egui/eframe/rfd is behind
 //! `gui`, which is what lets the CLI compile without pulling in eframe/vello.
 
-pub mod gen_profile;
 pub mod gitmind_session;
+// GUI-gated: the gesture MACHINE is std-only and lives in shared/touchkit (charge.rs); what is
+// here is the egui drawing, so a headless build must not carry it. Landing the isolation work's
+// ungating is what surfaced this — nothing had built this crate headlessly since these were added.
+#[cfg(feature = "gui")] pub mod holdmenu;
+// GUI-gated for the same reason: replicator's DECISIONS are in logscope::replicator (pure, tested
+// headlessly); this file is the widgets.
+#[cfg(feature = "gui")] pub mod replicatorui;
 pub mod repo;
 // ── CLI closure (egui-free; always built) ────────────────────────────────────
 #[allow(dead_code)] pub mod filescan;
@@ -29,7 +35,9 @@ pub use logscope_fan::consensus;
 pub use logscope_fan::vimmode;
 pub use logscope_fan::treeexport;
 pub use logscope_fan::bestregion;
-#[allow(dead_code)] pub mod kvtree;
+#[allow(dead_code)] pub mod convoprov;
+pub mod diagfeed;
+pub mod kvtree;
 #[cfg(feature = "wgpu-engine")] #[allow(dead_code)] pub mod anchorpool; // tiered warm-resume KV pool (Hot f32 / Warm int8 / Cold host-RAM)
 pub use logscope_fan::decompose;
 #[allow(dead_code)] pub mod devloop;
@@ -103,7 +111,10 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod wizard;
 #[cfg(all(feature = "gui", feature = "gpu-scene"))] pub mod scene_preview;
 #[cfg(feature = "gui")] pub mod filepicker;
-#[cfg(feature = "gui")] pub mod workspace;
+// UNGATED: diag::write_zip calls workspace::zip_store unconditionally, so `--no-default-features`
+// did not compile. zip_store is a hand-rolled stored-ZIP writer over std and needs no egui — the
+// gate was wrong, not the call. (Fix from the agent-isolation work, re-applied on this lineage.)
+pub mod workspace;
 #[cfg(feature = "gui")] pub mod vault;
 #[cfg(feature = "gui")] pub mod ast;
 #[cfg(feature = "gui")] pub mod vertices;
@@ -120,9 +131,25 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod genviz;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod palette;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod corpus;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod merge;
+// UNGATED for the same reason, one layer down: workspace calls merge::scan_items, which is string
+// scanning.
+#[allow(dead_code)] pub mod merge;
 pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan compiles it standalone)
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod sandbox;
+// UNGATED: std::process + std::fs only. Also makes the verifier testable headlessly instead of
+// pulling eframe/glow into a test run.
+#[allow(dead_code)] pub mod sandbox;
+// ── agent isolation (std-only; from the agent/isolation work) ────────────────────────────────
+// Ordered as that work argues they should be: capability first, channel integrity second,
+// neutralisation third, detection last and never as a gate.
+#[allow(dead_code)] pub mod isolate;
+#[allow(dead_code)] pub mod taint;
+#[allow(dead_code)] pub mod audit_log;
+#[allow(dead_code)] pub mod review_gate;
+// governor is declared now that AgentConfig carries gate + audit_log — the whole imported set is
+// live. What remains from the sender's "known incomplete" list: Verdict::Refused needs a match arm
+// in tabs/chat.rs, nothing outside Governor calls review_gate::apply, and the capability lease
+// broker is unbuilt.
+#[allow(dead_code)] pub mod governor;
 #[allow(dead_code)] pub mod convograph; // pure (no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
 #[allow(dead_code)] pub mod spatial; // pure math (no egui) + imported by lean modules → not gui-gated

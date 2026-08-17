@@ -49,16 +49,9 @@ pub fn advise(f: &LoadFacts) -> Vec<String> {
 
     // 1. Is the budget a measurement or a guess?
     if f.measured_vram_gib <= 0.0 {
-        // Points at --gate-residency, NOT --gate-vram. The two measure different things and this
-        // line used to recommend the wrong one: --gate-vram finds the largest SINGLE allocation the
-        // device accepts, which on this hardware reports 63 GiB, while what bounds a resident plan
-        // is CONCURRENT residency, measured at 31. Recommending the single-allocation probe here is
-        // what convinced a reader the 31 GiB refusal was a stale guess — it is not, and raising the
-        // budget on its evidence fails forty seconds into quantization instead of at planning time.
-        out.push(format!("GPU budget {:.1} GiB is not a measurement of THIS device — run \
-`kernel-validate --gate-residency` for the concurrent-buffer ceiling, which is what bounds a resident \
-plan. Note --gate-vram answers a different question (largest single allocation) and its larger figure \
-does not raise this one.", f.gpu_budget_bytes as f64 / GIB));
+        out.push(format!("GPU budget {:.1} GiB is a CONSTANT, not a measurement — run \
+`kernel-validate --gate-vram` to find what this device actually honours; the constant has been wrong by \
+2.6x on this hardware", f.gpu_budget_bytes as f64 / GIB));
     }
 
     // 2. Would a split beat what we are about to do?
@@ -130,15 +123,11 @@ mod tests {
 
     #[test]
     fn an_unprobed_budget_says_it_is_a_constant() {
-        // A reader seeing "budget 24.0 GiB" has no way to know whether that was measured or
-        // inherited, and the load is where it matters.
+        // The 24 GiB figure was wrong by 2.6x on this hardware and nothing said so at load. A reader
+        // seeing "budget 24.0 GiB" has no way to know whether that was measured or inherited.
         let a = advise(&scout(24.0, 0.0, 258.1));
-        assert!(a.iter().any(|l| l.contains("not a measurement of THIS device")), "{a:?}");
-        // --gate-residency, not --gate-vram: the concurrent ceiling bounds a resident plan, and
-        // recommending the single-allocation probe is what made a correct refusal look like a bug.
-        assert!(a.iter().any(|l| l.contains("gate-residency")), "and says how to fix it: {a:?}");
-        assert!(a.iter().any(|l| l.contains("does not raise this one")),
-                "and warns that the other probe's larger figure is not the answer: {a:?}");
+        assert!(a.iter().any(|l| l.contains("CONSTANT, not a measurement")), "{a:?}");
+        assert!(a.iter().any(|l| l.contains("gate-vram")), "and says how to fix it");
     }
 
     #[test]

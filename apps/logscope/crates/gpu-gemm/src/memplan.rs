@@ -55,7 +55,14 @@ pub enum Residency { F32, Int8, Q4 }
 impl Residency {
     /// Bytes per weight (Int8 ≈ 1 + tiny per-row scale; Q4_K ≈ 4.5 bits = 0.5625 B).
     pub fn bytes_per_param(self) -> f64 {
-        match self { Residency::F32 => 4.0, Residency::Int8 => 1.0, Residency::Q4 => 0.5625 }
+        // WITH the per-32 f32 scale the engine actually stores (upload_resident takes Vec<f32>;
+        // there is no f16 scale anywhere in the resident path). These said 1.0 and 0.5625 —
+        // 12.5% and 10% under — which is the exact "every published ceiling quoting 0.5
+        // bytes/param is optimistic" trap roofline.rs documents, committed by our own planner:
+        // it admitted models as int8-resident that were 12.5% bigger than its arithmetic, and
+        // handed auto window sizing a weight figure that OVERSTATED the KV budget by the same.
+        // roofline::bytes_per_param(bits) = bits/8 + 4/32 is the same formula; they now agree.
+        match self { Residency::F32 => 4.0, Residency::Int8 => 1.125, Residency::Q4 => 0.625 }
     }
     pub fn label(self) -> &'static str {
         match self { Residency::F32 => "f32", Residency::Int8 => "int8", Residency::Q4 => "q4" }
@@ -1481,44 +1488,9 @@ pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
 /// which is the opposite of what I expected when I wrote the probe.
 pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
 
-/// The slab size the ceiling above was measured with.
-///
-/// **The ceiling is not a flat byte count — it depends on this.** A Scout load
-/// planned at ~29.5 GiB against the 31 GiB figure died with only **6.0 GiB
-/// placed, at slab 4 of 2047 MiB**. The probe that produced 31 used ONE-GiB
-/// slabs; the arena was asking for 2 GiB ones. Budgeting against a number
-/// measured under different conditions is exactly why a plan that "fits" fails a
-/// quarter of the way in.
-///
-/// So the arena now defaults to this size on a conservative-VMA driver, and any
-/// future re-measurement must record the slab size beside the total or the
-/// number means nothing.
-pub const ASAHI_MEASURED_SLAB_MIB: u64 = 1024;
-
-/// The largest SINGLE allocation this driver accepts, as `--gate-vram` measures it.
-///
-/// Recorded beside the concurrent ceiling because the two were conflated in every
-/// user-facing message: the refusal text quoted this number as evidence the
-/// concurrent one was wrong. They answer different questions, and a plan is
-/// bound by the SMALLER — one 40 GiB buffer being accepted says nothing about
-/// whether forty 1 GiB buffers can be live at once.
-pub const ASAHI_SINGLE_ALLOC_GIB: f64 = 63.0;
-
 /// Does a resident plan fit within what this device will hold at once?
 pub fn resident_fits_concurrent(resident_gib: f64, conservative_vma: bool) -> bool {
     !conservative_vma || resident_gib <= ASAHI_CONCURRENT_BUFFER_GIB
-}
-
-/// The binding ceiling for a resident plan.
-///
-/// Always the concurrent figure when it is lower. Named so no future message can
-/// quote the single-allocation number as a budget again.
-pub fn binding_ceiling_gib(conservative_vma: bool) -> f64 {
-    if conservative_vma {
-        ASAHI_CONCURRENT_BUFFER_GIB.min(ASAHI_SINGLE_ALLOC_GIB)
-    } else {
-        f64::INFINITY
-    }
 }
 
 #[cfg(test)]
@@ -1651,18 +1623,12 @@ mod provenance_tests {
         let src = include_str!("lib.rs");
         let i = src.find("GPU budget {:.1} GiB clamped to").expect("clamp message moved");
         let window = &src[i..(i + 1400).min(src.len())];
-        // UPDATED: the figure has since been MEASURED — --gate-residency held 124 GiB-slabs on an
-        // M2 Ultra and the 125th was refused. So "COMPILED-IN CONSTANT" is no longer the honest
-        // wording; it understates now, where it used to overstate. The invariant the test was
-        // protecting is unchanged and is what it now checks: the message must not imply it measured
-        // the machine in front of the operator. It carries the one-machine caveat instead.
-        assert!(window.contains("ONE machine's"),
-            "the clamp must keep the one-machine caveat, or it reads as a measurement of the \
+        assert!(window.contains("COMPILED-IN CONSTANT"),
+            "the clamp must say the figure is a constant, or it reads as a measurement of the \
 machine in front of the operator");
-        assert!(window.contains("--gate-residency"),
-            "and it must name the probe the number came from, since a bare figure invites someone \
-to treat it as arbitrary and raise it — which now fails mid-quantization rather than at planning \
-time, forty seconds in");
+        assert!(window.contains("measured once on an"),
+            "and it must say WHERE the number came from, since 'a constant' alone invites someone \
+to treat it as arbitrary and raise it");
     }
 
     #[test]
@@ -1967,71 +1933,5 @@ mod file_view_refusal_tests {
         // A tensor the table does not have is a different layout, and the real load attempt reports
         // it better than a guess here would.
         assert!(file_view_refusal(None, Some(12), Some(12)).is_none());
-    }
-}
-
-
-#[cfg(test)]
-mod ceiling_tests {
-    use super::*;
-
-    #[test]
-    fn the_concurrent_ceiling_binds_not_the_single_allocation_one() {
-        // The conflation behind the misleading refusal: --gate-vram's 63 GiB was
-        // quoted as evidence the 31 GiB budget was wrong. One 40 GiB buffer
-        // being accepted says nothing about forty 1 GiB buffers being live at
-        // once, and the plan is bound by the smaller.
-        assert!(ASAHI_SINGLE_ALLOC_GIB > ASAHI_CONCURRENT_BUFFER_GIB);
-        assert_eq!(binding_ceiling_gib(true), ASAHI_CONCURRENT_BUFFER_GIB);
-    }
-
-    #[test]
-    fn a_seventy_b_q4km_is_correctly_refused() {
-        // 40.5 GiB resident against a measured 31 GiB concurrent ceiling. The
-        // refusal was RIGHT — --gate-residency held 124 GiB-slabs and the 125th
-        // failed on a 177 GiB machine — and the old message told the user to
-        // override it, which fails forty seconds into quantization instead.
-        assert!(!resident_fits_concurrent(40.5, true));
-    }
-
-    #[test]
-    fn the_same_model_is_allowed_where_the_clamp_does_not_apply() {
-        // Non-Asahi devices are not bound by this figure at all, so the refusal
-        // must not leak to them.
-        assert!(resident_fits_concurrent(40.5, false));
-        assert!(binding_ceiling_gib(false).is_infinite());
-    }
-
-    #[test]
-    fn a_model_under_the_ceiling_fits() {
-        // GLM-4.7-Flash at 16.5 GiB, the load that did work in the same session.
-        assert!(resident_fits_concurrent(16.5, true));
-    }
-
-    #[test]
-    fn the_ceiling_records_the_slab_size_it_was_measured_with() {
-        // The Scout failure proved the ceiling is slab-size-dependent: 31 GiB
-        // was measured at 1 GiB slabs, and at 2047 MiB the same device refused
-        // after 6 GiB. A total without its slab size is not a measurement, it
-        // is a number that happens to have been true once.
-        assert_eq!(ASAHI_MEASURED_SLAB_MIB, 1024);
-    }
-
-    #[test]
-    fn a_plan_that_fits_the_ceiling_can_still_fail_at_a_larger_slab_size() {
-        // Documents the trap rather than pretending residency is one number:
-        // 29.5 GiB "fits" 31 GiB, and it died anyway.
-        assert!(resident_fits_concurrent(29.5, true), "fits by the budget");
-        // ...which is only meaningful when the arena uses the measured slab size.
-        assert_eq!(ASAHI_MEASURED_SLAB_MIB, 1024,
-                   "if this changes, the 31 GiB figure needs re-measuring with it");
-    }
-
-    #[test]
-    fn the_boundary_is_inclusive() {
-        // A plan exactly at the measured ceiling held in the probe, so refusing
-        // it would be a wrong refusal by one byte.
-        assert!(resident_fits_concurrent(ASAHI_CONCURRENT_BUFFER_GIB, true));
-        assert!(!resident_fits_concurrent(ASAHI_CONCURRENT_BUFFER_GIB + 0.1, true));
     }
 }

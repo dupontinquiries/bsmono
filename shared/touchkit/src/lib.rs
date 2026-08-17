@@ -36,6 +36,9 @@
 //! # fn now_ms() -> f64 { 0.0 }
 //! ```
 
+pub mod charge;
+pub use charge::{Charge, ChargeConfig, ChargeOutcome};
+
 use std::collections::HashMap;
 
 /// Minimal 2D vector so the core stays dependency-free. With the `egui` feature

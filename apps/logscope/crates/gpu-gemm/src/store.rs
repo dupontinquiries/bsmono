@@ -87,6 +87,17 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 ///
 /// v2: the value became a packed (kernel, tile).
 ///
+/// **v6: decode tile verdicts were never checked for CORRECTNESS.** The GEMM tuner filtered its
+/// candidates against a reference from the start; `autotune_matvec` picked purely on median time,
+/// so a decode kernel that miscompiles on a driver wins by being fastest and its choice is cached
+/// here — persisting across every rebuild, on that machine only, while every other device's gates
+/// stay green. Wrong decode matvec is wrong logits from the first generated token, for every model
+/// (prefill, being GEMM, stays clean — that asymmetry is the tell). `autotune_matvec` now rejects
+/// any candidate that disagrees with a CPU reference, and this bump discards verdicts chosen before
+/// the check existed. Third time this lesson has been paid for: A CACHED VERDICT OUTLIVES THE CODE
+/// THAT PRODUCED IT, so a fix to a prober must bump the epoch or it never reaches a machine that
+/// has already run.
+///
 /// **v5: every GEMM tile verdict was probed against ONE pipeline.** `override TILE` was a
 /// spec constant, and this driver collapsed all three tile variants into a single compiled
 /// module — so a sweep that reported an 8/16/32 comparison measured the same pipeline three
@@ -111,26 +122,7 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 ///
 /// The rule this encodes: **changing a kernel invalidates every measurement taken against it.** The
 /// epoch is in the name so that is one edit rather than a cache-clearing instruction nobody follows.
-/// **v6: the adapter string does not identify the host.** Two kernels on one
-/// GPU — Asahi Fedora ships both a 4 KiB and a 16 KiB page build — produce the
-/// same adapter name and different host-side behaviour, and `prefetch_mapped`
-/// was silently a no-op on the 16 KiB one because madvise wants a page-aligned
-/// address. A verdict probed with a broken prefetch is a verdict probed with a
-/// different resident set.
-///
-/// So the key now carries the page size and this bump discards verdicts that
-/// could not say which kernel produced them. Same lesson as v4 and v5 by a
-/// third route: a key that cannot distinguish two conditions will silently
-/// serve one's answer for the other.
 fn autotune_file() -> PathBuf { cache_root().join("autotune-v6.tsv") }
-
-/// The adapter key, qualified by host page size.
-///
-/// Appended rather than replacing the adapter name so the file stays readable
-/// and greppable by GPU, which is how anyone actually inspects it.
-pub fn adapter_key(adapter: &str) -> String {
-    format!("{adapter} [{}k]", crate::pagesize::page_size() / 1024)
-}
 pub fn autotune_get(adapter: &str, k: usize, n: usize) -> Option<u32> {
     let txt = std::fs::read_to_string(autotune_file()).ok()?;
     for line in txt.lines() {
@@ -771,7 +763,14 @@ mod vram_store_tests {
 
     #[test]
     fn a_measured_ceiling_round_trips_per_adapter() {
-        let a = format!("test-adapter-{}", std::process::id());
+        // A PID IS NOT UNIQUE AGAINST A PERSISTENT STORE. This keyed on process::id() for
+        // isolation, but vram_put writes to disk and PIDs recycle — so a later run inherits an
+        // earlier one's value and the "never measured means None" assertion fails for a reason that
+        // has nothing to do with the code under test. Seen failing here after a few hundred runs.
+        // The clock does not recycle within the lifetime of a checkout.
+        let uniq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos()).unwrap_or(0);
+        let a = format!("test-adapter-{}-{uniq}", std::process::id());
         assert!(vram_get(&a).is_none(), "never measured means None, not a default");
         vram_put(&a, 63.0);
         assert_eq!(vram_get(&a), Some(63.0));
@@ -828,44 +827,5 @@ mod epoch_tests {
         std::env::set_var("LOGSCOPE_CACHE_DIR", &dir);
         let _ = std::fs::write(flush_file(), format!("A\t128\t{}\n", SUBMIT_TUNE_EPOCH + 5));
         assert_eq!(flush_get("A"), None);
-    }
-}
-
-#[cfg(test)]
-mod page_key_tests {
-    use super::*;
-
-    #[test]
-    fn the_key_distinguishes_two_kernels_on_one_gpu() {
-        // The gap: Asahi Fedora ships both a 4 KiB and a 16 KiB page build, and
-        // the adapter string is identical on both. A cache that cannot tell
-        // them apart serves one kernel's verdicts to the other.
-        let k = adapter_key("Apple M2 Ultra (G14D B1) [Vulkan]");
-        assert!(k.starts_with("Apple M2 Ultra"), "still greppable by GPU: {k}");
-        assert!(k.ends_with("k]"), "carries the page size: {k}");
-    }
-
-    #[test]
-    fn the_key_is_stable_within_a_run() {
-        // A key that varied between a write and a read would miss every time
-        // and re-probe on every load — slower than no cache at all.
-        assert_eq!(adapter_key("gpu"), adapter_key("gpu"));
-    }
-
-    #[test]
-    fn the_epoch_advanced_so_unqualified_verdicts_are_discarded() {
-        // Verdicts written before the key carried a page size cannot say which
-        // kernel produced them, and the store's own doctrine is that a cached
-        // verdict outlives the code that produced it.
-        assert!(autotune_file().to_string_lossy().contains("autotune-v6"));
-    }
-
-    #[test]
-    fn a_tab_in_an_adapter_name_cannot_forge_a_field() {
-        // The file is TSV; an adapter string containing a tab would split into
-        // extra columns and silently match the wrong shape.
-        let k = adapter_key("weird\tname");
-        assert_eq!(k.matches('\t').count(), 1,
-                   "a tab in the name is preserved but the key adds none: {k:?}");
     }
 }

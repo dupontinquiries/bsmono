@@ -2967,3 +2967,136 @@ OPEN (from prototype renders):
   3. LOD: cluster particle budget scales with projected size / focus (far nodes = single pearl, focused = full
      cluster). Ties into the LOD TODO.
 Run the prototype: `cd docs/prototypes/anamorph && cargo run --release -- "WORD"` → out_{reveal,mid,off}.ppm.
+
+## ⌖ IMAGE GENERATION — two stalled tracks (surveyed 2026-08-16, session after c4-849)
+
+The operator remembers "an attempt that was never finished." Correct, and it is TWO attempts at
+different depths, both stalled at the last step, neither broken. Verified state as of this survey
+(both engine gates re-run green on llvmpipe this session; caller counts by grep, not memory):
+
+TRACK A — DELEGATE TO sd-cli (stable-diffusion.cpp). Built to the waterline and UNWIRED:
+  - `mediagen.rs` (egui crate): pure argv builder, Z-Image-Turbo recipe (8 steps, cfg 1.0, euler,
+    flash-attn), validated against sd.cpp's own docs/z_image.md; flags pinned by unit tests.
+  - `media.rs:115` `generate_image()` and `media.rs:126` `edit_image()` (img2img via
+    `-i init --strength`): resolvers (models/image + models/text_encoders + vae/ae.safetensors,
+    ComfyUI layout) → argv → `run_capture` → PNG path. Resolver tests exist.
+  - ZERO callers of either fn anywhere in the app (grepped chat.rs, backend.rs, all tabs). The
+    loader even documents this as "the path a diffusion gguf actually runs through"
+    (gpu-gemm lib.rs:9359 refuses diffusion checkpoints in the LLM path) — the path exists,
+    nothing walks it.
+  - REMAINING (small, UI-side): (1) a trigger — /image command or docroute intent → generate_image;
+    (2) an sd_cli binary path setting (nothing resolves the binary today); (3) run OFF the UI
+    thread — run_capture blocks, and an 8-step 1024² on the operator's M2 is seconds-to-tens —
+    the tts/vision_cli subprocess pattern is the shape to copy; (4) show the PNG in the transcript
+    (input-image display machinery exists on the vision path; reuse); (5) surface stderr on
+    failure the way the fleet surfaces refusals — named, not swallowed.
+
+TRACK B — NATIVE DiT IN THE ENGINE (gpu-gemm). Primitives real and GATED, model absent:
+  - Validated today: `patchify`/`unpatchify` (lib.rs:6746), AdaLN-Zero `modulate` + gated
+    residuals, `dit_block` (lib.rs:6875, --gate-dit-block ✓), sincos timestep embed +
+    `dit_conditioning` (lib.rs:11828, --gate-dit-conditioning ✓), and `text_forward_hidden`
+    (lib.rs:11799) reusing the REAL Qwen3 forward (QK-norm included) as the text encoder, with
+    pooling + width projection.
+  - MISSING, in ascending size: (1) a z-image GGUF loader — tensor-name map for the DiT blocks;
+    the LLM loader's refusal at 9359 is the branch point; (2) the sampling loop — euler over 8
+    steps is ~a page given the primitives; (3) THE VAE DECODE — ae.safetensors is a conv
+    autoencoder and this engine has NO conv kernels; that is a new kernel family plus a
+    safetensors reader, and it is the reason Track B stalled. Hybrid middle (native DiT, delegate
+    only VAE decode) needs sd-cli to accept latents on stdin, which it does not do stock.
+
+ORDER: finish Track A first — every piece exists, the remainder is hours of UI wiring, and it
+gives the app image generation while Track B stays honest engine work. Track B's decision gate is
+the VAE: either commit to conv2d kernels (sized like a mini engine feature, with its own
+kernel-validate section) or park native generation and keep the DiT primitives as the tested
+foundation they already are. Do NOT delete the primitives as "unwired" — they are gated,
+documented, and the text-encoder half (text_forward_hidden) is exercised by the conditioning gate.
+
+## ⌖ MOBILE OVERCROWDING — the rule exists, one row obeys it (audited 2026-08-16)
+
+`mobilelayout.rs` is written, tested, and documents the cause exactly: `ui.horizontal()` does not
+wrap, so controls past the right edge draw ON TOP of each other, and a phone hits that edge
+immediately while a dev desktop never does. Its `row_mode(available, n_primary, n_secondary, touch)`
+decides Overflow-vs-inline by AVAILABLE WIDTH (not a platform flag, so a narrow desktop window and a
+split-screen tablet get the same treatment), and `fits()`/`min_control_pt()` carry the 44pt touch
+rule.
+
+Audited counts, today, by grep — not from the module header's older numbers:
+
+| file | `ui.horizontal(` | `ui.horizontal_wrapped(` | rows using `row_mode` |
+|---|---|---|---|
+| tabs/chat.rs | 17 | 13 | **1** |
+| tabs/models.rs | 5 | 2 | 0 |
+
+So the policy is applied to exactly ONE row (chat.rs:7124, the scene toolbar). The remaining 21
+unwrapped rows across the two busiest tabs are the overcrowding the operator sees.
+
+NEXT STEP (deliberately not started at the end of a session — it is a wide, shallow edit that wants
+one uninterrupted pass): walk the unwrapped rows in chat.rs and models.rs, classify each row's
+controls into primary (always visible) and secondary (behind the overflow menu), and route each
+through `row_mode`. The scene-toolbar row at chat.rs:7114-7125 is the worked example to copy —
+including the comment explaining why shedding beats wrapping. Rows that are genuinely two controls
+wide need nothing. Verification is `cargo check -p logscope-egui --features wgpu-engine` plus, for
+anything reshaped structurally, the Xvfb+llvmpipe screenshot harness (`status-view.rs` pattern)
+since layout bugs are invisible to a type check.
+
+RELATED, still open: UI drawn OUT OF APP BOUNDS (egui windows/popups clamped to the frame) — same
+class, different mechanism; `Area::constrain_to` is the lever, and the status-bar cluster from
+pass 69 is where it shows.
+
+## ⌖ THINKER + LIAISON / DEBATE — what is actually missing (audited 2026-08-16)
+
+`unwired-check.sh` on the whole tree reports 724 candidates; filtered to these modes, 18. They are
+not evenly dead — the audit matters because the three areas fail for three different reasons.
+
+**Liaison prose surface: WIRED.** `liaisonhud::Hud` is mounted in chat.rs (field, init, fed by
+`hud.observe` from engine counters, rendered at ~7673 with grounding checks). This half works.
+
+**Liaison operator-question API: complete, unreachable, and BLOCKED ON A MISSING INPUT.**
+`briefing` / `briefing_with` / `what_changed` / `what_is_blocked` / `what_remains_uncertain` /
+`what_can_wait` / `what_should_i_review` are written and tested, and every one takes
+`&ExplorationTree`. **Nothing in logscope-egui constructs an ExplorationTree** (grepped: zero
+references in the whole crate). So this is not a missing call — it is a missing data structure. The
+work is deciding what an ExplorationTree IS in the running app: fan branches? agent turns? the chat
+graph? Each is defensible and they are not the same thing, which is exactly why nobody wired it.
+Until that is decided, adding a `:brief` command would mean inventing a tree to feed it, and a
+briefing derived from a tree the operator does not recognise is worse than no briefing — the
+module's own header says an explainer that fabricates is worse than none.
+
+**`ModelStatus` (the second liaison input): blocked on ONE missing field.** `is_fully_supported`
+and `what_is_blocked_with` want `ModelStatus { name, arch, gaps }`, and the engine already produces
+the gaps (`archfeat::gap_report(arch, variant)`, used at lib.rs:9649 and 9837 to PRINT them to
+stderr). But `gpu_kernels::Model` carries no `arch` string — the loader resolves an `ArchConfig`,
+uses it, and drops the name. Smallest real step in this whole area: put `arch: String` on Model
+(the loader has it in hand at construction), expose `model_gaps()` returning the same lines the
+loader prints, build a `ModelStatus` in the backend, and let the HUD show "this model has declared
+gaps: …" — the liaison rule (declare the gap rather than generate garbage) applied where the
+operator can see it instead of in stderr. That is a contained change with a clear verification: the
+HUD line must appear for a model with gaps and be absent for one without.
+
+**Debate: not audited beyond names.** `debaterun::{adjustment, blind, needs_reframe}` and
+`debatepanel::last_complete_line` are uncalled. Whether the panel is mounted at all was not
+checked; do that before assuming the same shape as the liaison.
+
+## ⌖ THE "ASSERTS ABSENCE" CLASS — audited, two found, one seam left
+
+Three times now this tree has told the operator a shipped feature was missing: the replicator mode
+(no menu entry, reachable only by typing `:replicate`), the phase-balance advice ("what is missing
+is speculative decoding" while `LOGSCOPE_SPEC_DRAFT=lookup` was wired), and the MTP-head notice
+(named only the path this engine cannot run). All three are fixed and each fix carries a test that
+fails if the wording drifts.
+
+The audit that found them: grep operator-facing strings for absence claims — "what is missing",
+"is not implemented", "does not exist yet", "not wired", "nothing produces" — and check each
+against the tree. Remaining hits after this pass are ACCURATE and were verified individually:
+  * lib.rs:11131 — the Q6_K file-view fill conversion genuinely has no shader (grepped; the loader
+    plumbing exists, the shader does not).
+  * lib.rs:9528 — MLA down/up projections in that specific arm, still true.
+
+REMAINING SEAM (UI, not stderr): the operator reads the app, and the engine strip never mentions
+speculative decoding. `enginestrip::concerns()` already receives `tok_s` and DISCARDS it
+(`let _ = tok_s;`), which is the hook — but a "decode is starved" concern needs the prefill/decode
+RATIO, not throughput, and concerns() is not given it. Doing this properly means: pass the
+SelfRelative verdict (or its ratio) into concerns(), add `Concern::DecodeStarved { ratio }` to
+logscope::machinery, and render it with the flag to set. Deliberately not faked from tok_s alone —
+a starvation claim derived from throughput without a baseline is exactly the "percentage of a
+number nobody measured" the roofline module refuses to print.

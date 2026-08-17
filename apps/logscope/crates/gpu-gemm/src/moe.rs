@@ -45,6 +45,13 @@ pub struct MoeConfig {
     ///
     /// 1.0 for every architecture that does not set it, so this is inert unless a config asks for it.
     pub routed_scale: f32,
+    /// Group-limited routing (DeepSeek-V3 / LLaDA2): experts partition into n_group groups; group
+    /// score = sum of the top-2 SELECTION scores within; only the topk_group best groups may supply
+    /// experts. 0 or 1 disables. Reference: modeling_llada2_moe.group_limited_topk (top-2 sum is
+    /// hardcoded there, not k-derived) — global top-k picks wrong experts whenever the honest top-k
+    /// spans more than topk_group groups.
+    pub n_group: u32,
+    pub topk_group: u32,
     /// Apply the combine weight to the expert's INPUT instead of its output (Llama4). NOT
     /// equivalent through SwiGLU's nonlinearity: silu(Wg·(w·x))·(Wu·(w·x)) ≠ w·silu(Wg·x)·(Wu·x).
     pub weight_before: bool,
@@ -74,16 +81,53 @@ fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 /// Mathematical note: for softmax gating, "softmax over all → top-k → renormalize" is IDENTICAL to "top-k by
 /// logit → softmax over just the top-k" (the normalizer cancels), so we select by score then normalize the
 /// selected — one code path, numerically stable via the softmax max-subtraction.
-pub fn route(logits: &[f32], cfg: &MoeConfig) -> Vec<Selected> {
+pub fn route(logits: &[f32], cfg: &MoeConfig) -> Vec<Selected> { route_biased(logits, cfg, None) }
+
+/// route() with the no-aux SELECTION bias (DeepSeek-V3 / Ling / llada2, blk.N.exp_probs_b).
+/// Reference order (llama-graph.cpp:1870-1874): probs = gating(logits); selection = top-k of
+/// (probs + bias); combine weights come from the UNBIASED probs of the selected. The bias can
+/// steer WHO is picked; it never changes what a picked expert weighs. Softmax selection loses
+/// its rank-by-logit shortcut under bias (softmax is monotonic, softmax+bias is not), so the
+/// biased path computes real probs before ranking.
+pub fn route_biased(logits: &[f32], cfg: &MoeConfig, bias: Option<&[f32]>) -> Vec<Selected> {
     let n = cfg.n_routed.min(logits.len() as u32) as usize;
     if n == 0 { return Vec::new(); }
     let k = cfg.n_used.clamp(1, n as u32) as usize;
 
     // per-expert gate score (monotonic in logit for both norms, so top-k is by score)
-    let scores: Vec<f32> = match cfg.norm {
-        RouteNorm::Softmax => logits[..n].to_vec(), // softmax is monotonic in logit → rank by logit directly
-        RouteNorm::Sigmoid => logits[..n].iter().map(|&l| sigmoid(l)).collect(),
+    let mut scores: Vec<f32> = match (cfg.norm, bias.is_some()) {
+        (RouteNorm::Softmax, false) => logits[..n].to_vec(), // monotonic → rank by logit directly
+        (RouteNorm::Softmax, true) => { // bias adds to PROBS: need the real softmax before ranking
+            let mut p = logits[..n].to_vec(); softmax_in_place(&mut p); p
+        }
+        (RouteNorm::Sigmoid, _) => logits[..n].iter().map(|&l| sigmoid(l)).collect(),
     };
+    if let Some(b) = bias {
+        for (sc, &bv) in scores.iter_mut().zip(b.iter()) { *sc += bv; }
+    }
+
+    // GROUP LIMITATION runs on the SELECTION scores (biased when bias is active) — the weight
+    // basis below stays the raw per-expert gate, untouched by the -INF ranking mask.
+    if cfg.n_group > 1 && cfg.topk_group >= 1 && (cfg.topk_group as usize) < cfg.n_group as usize
+        && n % cfg.n_group as usize == 0 {
+        let gsz = n / cfg.n_group as usize;
+        let mut gscore: Vec<(f32, usize)> = (0..cfg.n_group as usize).map(|g| {
+            let mut top2 = [f32::NEG_INFINITY; 2];
+            for &sc in &scores[g * gsz..(g + 1) * gsz] {
+                if sc > top2[0] { top2[1] = top2[0]; top2[0] = sc; }
+                else if sc > top2[1] { top2[1] = sc; }
+            }
+            (top2[0] + top2[1], g) // sum of top-2; gsz==1 leaves top2[1] at -INF, repaired below
+        }).collect();
+        // (gsz==1 edge: top2[1] stays -INF; use just top2[0])
+        for gs in gscore.iter_mut() { if !gs.0.is_finite() { gs.0 = scores[gs.1 * gsz]; } }
+        gscore.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut allowed = vec![false; cfg.n_group as usize];
+        for &(_, g) in gscore.iter().take(cfg.topk_group as usize) { allowed[g] = true; }
+        for (i, sc) in scores.iter_mut().enumerate() {
+            if !allowed[i / gsz] { *sc = f32::NEG_INFINITY; }
+        }
+    }
 
     // top-k indices by score (partial selection; n is small — tens to low hundreds)
     let mut idx: Vec<usize> = (0..n).collect();
@@ -162,6 +206,28 @@ pub fn layer_shape(d: usize, n_heads: usize, n_kv_heads: usize, attn_k_out: usiz
 }
 
 #[cfg(test)]
+mod bias_tests {
+    use super::*;
+    fn cfg() -> MoeConfig { MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Sigmoid, normalize: true, routed_scale: 1.0, weight_before: false, n_group: 0, topk_group: 0 } }
+    #[test]
+    fn the_bias_flips_selection_but_weights_stay_unbiased() {
+        let logits = [2.0f32, 1.5, -4.0, 0.5];
+        // route() returns selections sorted for the gather, not in pick order — assert on SETS.
+        let plain: Vec<u32> = route(&logits, &cfg()).iter().map(|x| x.expert).collect();
+        assert!(plain.contains(&0) && plain.contains(&1), "unbiased: two best logits, got {plain:?}");
+        // +3 on expert 2 beats every sigmoid (<1): it must be selected...
+        let sels = route_biased(&logits, &cfg(), Some(&[0.0, 0.0, 3.0, 0.0]));
+        let ids: Vec<u32> = sels.iter().map(|x| x.expert).collect();
+        assert!(ids.contains(&2), "bias steers selection: {ids:?}");
+        assert!(ids.contains(&0) && !ids.contains(&1), "runner-up is the best unbiased score: {ids:?}");
+        // ...but its WEIGHT is the unbiased sigmoid(-4), renormalized against sigmoid(2):
+        let (s2, s0) = (1.0 / (1.0 + 4.0f32.exp()), 1.0 / (1.0 + (-2.0f32).exp()));
+        let w = s2 / (s2 + s0);
+        let w2 = sels.iter().find(|x| x.expert == 2).unwrap().weight;
+        assert!((w2 - w).abs() < 1e-6, "weight from UNBIASED probs: {w2} vs {w}");
+    }
+}
+#[cfg(test)]
 mod tests {
     #[test]
     fn the_routed_scale_is_applied_AFTER_normalization() {
@@ -169,7 +235,7 @@ mod tests {
         // common factor — so scaling BEFORE normalizing cancels the scale completely. The model runs,
         // looks fine, and routed_scaling_factor does nothing.
         let mut cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Sigmoid,
-                                  normalize: true, weight_before: false, routed_scale: 1.0 };
+                                  normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let logits = [2.0f32, 1.0, -1.0, -2.0];
         let plain: f32 = route(&logits, &cfg).iter().map(|s| s.weight).sum();
         assert!((plain - 1.0).abs() < 1e-5, "normalized weights sum to 1, got {plain}");
@@ -186,7 +252,7 @@ scale was applied before the normalize and cancelled");
         // Inert for every architecture that does not set it, so adding the field changes nothing for
         // Llama-4, Qwen or DeepSeek.
         let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax,
-                              normalize: true, weight_before: false, routed_scale: 1.0 };
+                              normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let a = route(&[1.0, 2.0, 3.0, 0.5], &cfg);
         let b = route(&[1.0, 2.0, 3.0, 0.5], &MoeConfig { routed_scale: 1.0, ..cfg });
         assert_eq!(a, b);
@@ -199,7 +265,7 @@ scale was applied before the normalize and cancelled");
     #[test]
     fn softmax_route_picks_top_k_and_normalizes() {
         // 4 experts, top-2. logits favor experts 2 and 0.
-        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let sel = route(&[2.0, 0.5, 3.0, -1.0], &cfg);
         assert_eq!(sel.len(), 2);
         let ids: Vec<u32> = sel.iter().map(|s| s.expert).collect();
@@ -215,7 +281,7 @@ scale was applied before the normalize and cancelled");
     fn softmax_topk_equals_global_softmax_renormalized() {
         // the identity the doc claims: top-k softmax == global softmax restricted to the top-k
         let logits = [1.0f32, 2.0, 0.0, 3.0, -1.0];
-        let cfg = MoeConfig { n_routed: 5, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfg = MoeConfig { n_routed: 5, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let sel = route(&logits, &cfg);
         // global softmax
         let mut g = logits.to_vec(); softmax_in_place(&mut g);
@@ -228,7 +294,7 @@ scale was applied before the normalize and cancelled");
 
     #[test]
     fn sigmoid_route_normalizes_selected_gates() {
-        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let sel = route(&[3.0, -2.0, 1.0, 0.0], &cfg);
         assert_eq!(sel.len(), 2);
         assert_eq!(sel[0].expert, 0, "highest logit → highest sigmoid gate");
@@ -241,7 +307,7 @@ scale was applied before the normalize and cancelled");
     #[test]
     fn k_clamped_and_offsets() {
         // k larger than n clamps to n; offsets index the stacked tensor by row
-        let cfg = MoeConfig { n_routed: 3, n_used: 8, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfg = MoeConfig { n_routed: 3, n_used: 8, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let sel = route(&[0.1, 0.2, 0.3], &cfg);
         assert_eq!(sel.len(), 3, "k clamps to the number of experts");
         assert_eq!(expert_row_offset(0, 4096), 0);
@@ -270,7 +336,7 @@ scale was applied before the normalize and cancelled");
 
     #[test]
     fn dense_config_is_not_moe() {
-        let dense = MoeConfig { n_routed: 0, n_used: 0, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let dense = MoeConfig { n_routed: 0, n_used: 0, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         assert!(!dense.is_moe());
         assert!(route(&[], &dense).is_empty());
     }
@@ -279,7 +345,7 @@ scale was applied before the normalize and cancelled");
     fn llama4_gating_is_raw_sigmoid_top1() {
         // Llama4: top-1 by logit, weight = sigmoid(top logit) UNNORMALIZED (normalizing top-1
         // would always give 1.0 and erase the gate).
-        let cfg = MoeConfig { n_routed: 16, n_used: 1, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: false, weight_before: true, routed_scale: 1.0 };
+        let cfg = MoeConfig { n_routed: 16, n_used: 1, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: false, weight_before: true, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let mut logits = vec![-1.0f32; 16];
         logits[7] = 0.6;
         let sel = route(&logits, &cfg);
@@ -402,5 +468,61 @@ mod routing_check_tests {
     #[test]
     fn a_dense_model_is_not_penalised_for_having_no_expert_tensors() {
         assert!(check_routing(0, 0, 0, None, false).is_empty());
+    }
+}
+#[cfg(test)]
+mod group_routing_reference {
+    use super::*;
+    /// Direct transcription of modeling_llada2_moe.py group_limited_topk + the routing tail:
+    /// sigmoid -> +bias -> group top-2-sum -> top-g groups -> top-k over masked BIASED scores ->
+    /// weights = UNBIASED sigmoid at the winners, normalized (+1e-20 guard), * scale.
+    fn reference(logits: &[f32], bias: &[f32], n_group: usize, topk_group: usize, k: usize, scale: f32) -> Vec<(u32, f32)> {
+        let n = logits.len();
+        let sig: Vec<f32> = logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
+        let biased: Vec<f32> = sig.iter().zip(bias).map(|(s, b)| s + b).collect();
+        let gsz = n / n_group;
+        let mut gs: Vec<(f32, usize)> = (0..n_group).map(|g| {
+            let mut v: Vec<f32> = biased[g * gsz..(g + 1) * gsz].to_vec();
+            v.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            (v.iter().take(2).sum::<f32>(), g)
+        }).collect();
+        gs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let allowed: Vec<bool> = {
+            let mut a = vec![false; n_group];
+            for &(_, g) in gs.iter().take(topk_group) { a[g] = true; }
+            a
+        };
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            let sa = if allowed[a / gsz] { biased[a] } else { f32::NEG_INFINITY };
+            let sb = if allowed[b / gsz] { biased[b] } else { f32::NEG_INFINITY };
+            sb.partial_cmp(&sa).unwrap()
+        });
+        let win: Vec<usize> = order[..k].to_vec();
+        let raw: Vec<f32> = win.iter().map(|&i| sig[i]).collect();
+        let s: f32 = raw.iter().sum::<f32>() + 1e-20;
+        win.iter().zip(raw).map(|(&i, r)| (i as u32, r / s * scale)).collect()
+    }
+
+    #[test]
+    fn group_limited_route_matches_the_reference_transcription() {
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / 16777216.0 * 8.0 - 4.0 };
+        for trial in 0..200 {
+            let n = 32; let (ng, tg, k) = (8, 4, 8);
+            let logits: Vec<f32> = (0..n).map(|_| next()).collect();
+            let bias: Vec<f32> = (0..n).map(|_| next() * 0.5).collect();
+            let cfg = MoeConfig { n_routed: n as u32, n_used: k as u32, n_shared: 1,
+                norm: RouteNorm::Sigmoid, normalize: true, routed_scale: 2.5, weight_before: false,
+                n_group: ng as u32, topk_group: tg as u32 };
+            let got = route_biased(&logits, &cfg, Some(&bias));
+            let want = reference(&logits, &bias, ng, tg, k, 2.5);
+            let mut gs: Vec<(u32, f32)> = got.iter().map(|s| (s.expert, s.weight)).collect();
+            let mut ws = want.clone();
+            gs.sort_by_key(|x| x.0); ws.sort_by_key(|x| x.0);
+            let ids_match = gs.iter().map(|x| x.0).eq(ws.iter().map(|x| x.0));
+            let w_close = gs.iter().zip(&ws).all(|(a, b)| (a.1 - b.1).abs() < 1e-5);
+            assert!(ids_match && w_close, "trial {trial}: got {gs:?} want {ws:?}");
+        }
     }
 }

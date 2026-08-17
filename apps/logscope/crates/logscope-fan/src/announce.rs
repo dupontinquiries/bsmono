@@ -97,7 +97,7 @@ impl Announce {
             return Err(Reject::Malformed("wrong tag"));
         }
         let mut o = 1 + tag.len();
-        let mut field = |o: &mut usize| -> Result<String, Reject> {
+        let field = |o: &mut usize| -> Result<String, Reject> {
             if buf.len() < *o + 4 { return Err(Reject::Malformed("truncated length")); }
             let n = u32::from_le_bytes([buf[*o], buf[*o + 1], buf[*o + 2], buf[*o + 3]]) as usize;
             *o += 4;

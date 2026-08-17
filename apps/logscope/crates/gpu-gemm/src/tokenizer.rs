@@ -261,10 +261,43 @@ impl Tokenizer {
 
     /// Build from GGUF metadata. Byte-level when `tokenizer.ggml.model` is a BPE
     /// type (gpt2 / llama / bpe); raw otherwise (keeps unit fixtures working).
+    /// Build the tokenizer, borrowing one from another GGUF when this file has none.
+    ///
+    /// `expect_vocab` is the model's own output width. A borrowed tokenizer whose vocabulary differs
+    /// is refused rather than warned about: every id would map to the wrong piece, which reads as
+    /// fluent nonsense rather than as an error, and this project has paid for that class repeatedly.
+    pub fn from_gguf_with_fallback(g: &Gguf, expect_vocab: usize) -> Result<Self, String> {
+        match Self::from_gguf(g) {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                let Ok(path) = std::env::var("LOGSCOPE_TOKENIZER_GGUF") else { return Err(e) };
+                let bytes = std::fs::read(&path)
+                    .map_err(|io| format!("LOGSCOPE_TOKENIZER_GGUF={path}: {io}"))?;
+                let donor = crate::gguf::parse(&bytes)
+                    .map_err(|p| format!("LOGSCOPE_TOKENIZER_GGUF={path}: {p}"))?;
+                let t = Self::from_gguf(&donor)
+                    .map_err(|te| format!("LOGSCOPE_TOKENIZER_GGUF={path} has no tokenizer either: {te}"))?;
+                if expect_vocab != 0 && t.vocab_size() != expect_vocab {
+                    return Err(format!(
+                        "LOGSCOPE_TOKENIZER_GGUF={path} has {} tokens but this model's output is {expect_vocab} \
+wide. A borrowed tokenizer must match exactly — a near-miss maps every id to the wrong piece and \
+prints fluent nonsense instead of failing.", t.vocab_size()));
+                }
+                eprintln!("tokenizer: BORROWED from {path} ({} tokens) — this checkpoint ships none. \
+Verified against the model's output width; ids and pieces line up.", t.vocab_size());
+                Ok(t)
+            }
+        }
+    }
+
     pub fn from_gguf(g: &Gguf) -> Result<Self, String> {
         let tokens = match g.metadata.get("tokenizer.ggml.tokens") {
             Some(Value::Arr(a)) => a.iter().map(|v| match v { Value::Str(s) => s.clone().into_bytes(), _ => Vec::new() }).collect(),
-            _ => return Err("missing tokenizer.ggml.tokens".into()),
+            _ => return Err("this GGUF carries NO TOKENIZER (tokenizer.ggml.tokens is absent). \
+Weights-only diffusion checkpoints ship this way — diffuse-cpp's own CLI takes raw ids \
+(--tokens \"128000,3923,...\") for exactly this reason. Point LOGSCOPE_TOKENIZER_GGUF at a file with \
+the SAME vocabulary to borrow one; for LLaDA-8B that is any Llama-3 vocab GGUF (128256 tokens), and \
+the vocab size is cross-checked before it is accepted.".into()),
         };
         let merges = match g.metadata.get("tokenizer.ggml.merges") {
             Some(Value::Arr(a)) => a.iter().filter_map(|v| match v {
@@ -396,3 +429,42 @@ mod control_stop_tests {
         assert!(r.contains("not the text that was typed"));
     }
 
+
+#[cfg(test)]
+mod borrowed_tokenizer {
+    use super::*;
+
+    /// Weights-only checkpoints exist: diffuse-cpp ships LLaDA-8B GGUFs with no tokenizer, which is
+    /// why its CLI takes raw ids (--tokens "128000,3923,..."). Ours reported only the missing key.
+    #[test]
+    fn a_tokenizerless_gguf_can_borrow_one_of_the_same_width() {
+        let (Ok(none), Ok(donor)) = (std::fs::read("/tmp/tiny-notok.gguf"),
+                                     std::fs::read("/tmp/tiny-llada2.gguf")) else { return };
+        let (Ok(gn), Ok(gd)) = (crate::gguf::parse(&none), crate::gguf::parse(&donor)) else { return };
+        let width = Tokenizer::from_gguf(&gd).expect("donor has a tokenizer").vocab_size();
+
+        // Without the override it must still fail, and say what is wrong rather than name a key.
+        std::env::remove_var("LOGSCOPE_TOKENIZER_GGUF");
+        let err = match Tokenizer::from_gguf_with_fallback(&gn, width) { Err(e) => e, Ok(_) => panic!("should not load without a donor") };
+        assert!(err.contains("NO TOKENIZER"), "the error should name the situation: {err}");
+        assert!(err.contains("LOGSCOPE_TOKENIZER_GGUF"), "and the way out: {err}");
+
+        // With a matching donor it loads and lines up.
+        std::env::set_var("LOGSCOPE_TOKENIZER_GGUF", "/tmp/tiny-llada2.gguf");
+        let t = Tokenizer::from_gguf_with_fallback(&gn, width).expect("borrow should succeed");
+        std::env::remove_var("LOGSCOPE_TOKENIZER_GGUF");
+        assert_eq!(t.vocab_size(), width);
+    }
+
+    /// A mismatched donor must be REFUSED, not warned about: every id would map to the wrong piece,
+    /// which reads as fluent nonsense rather than as an error.
+    #[test]
+    fn a_donor_of_the_wrong_width_is_refused() {
+        let Ok(none) = std::fs::read("/tmp/tiny-notok.gguf") else { return };
+        let Ok(gn) = crate::gguf::parse(&none) else { return };
+        std::env::set_var("LOGSCOPE_TOKENIZER_GGUF", "/tmp/tiny-llada2.gguf");
+        let err = match Tokenizer::from_gguf_with_fallback(&gn, 999_999) { Err(e) => e, Ok(_) => panic!("a mismatched donor must be refused") };
+        std::env::remove_var("LOGSCOPE_TOKENIZER_GGUF");
+        assert!(err.contains("must match exactly"), "a near-miss must be refused: {err}");
+    }
+}

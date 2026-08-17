@@ -185,6 +185,68 @@ mod tests {
     }
 
     #[test]
+    fn Q5_K_nibble_LAYOUT_is_low32_then_high32_not_interleaved() {
+        // The bug this pins: a second Q5_K decoder (in gguf.rs, now deleted) read the nibbles as
+        // interleaved pairs — weight j from qs[j/2], low or high by parity — which is Q4_0's
+        // layout. ggml's K-quants put the LOW nibbles of a group's 32 bytes first and the HIGH
+        // nibbles of the SAME bytes second. Both decoders produce 256 finite weights; only a
+        // NON-uniform fixture separates them, which is why every uniform-fixture test passed over
+        // the wrong one while kernel-validate reported max error 18.9 on two machines.
+        let mut raw = vec![0u8; Q5_K_BLOCK];
+        raw[0] = 0x00; raw[1] = 0x3C;      // d = 1.0 (dmin stays 0 so weights are exactly nibbles)
+        raw[4] = 1; raw[5] = 1;             // sub-blocks 0 and 1: scale = 1
+        raw[48] = 0x52;                     // group 0, byte 0: low nibble 2, high nibble 5
+        raw[49] = 0xB7;                     // group 0, byte 1: low nibble 7, high nibble 11
+        let v = dequant_q5_k(&raw, 256).unwrap();
+        assert_eq!(v[0], 2.0,  "weight 0 = LOW nibble of byte 0");
+        assert_eq!(v[1], 7.0,  "weight 1 = LOW nibble of byte 1 — interleaved would say 5");
+        assert_eq!(v[32], 5.0, "weight 32 = HIGH nibble of byte 0, the same byte as weight 0");
+        assert_eq!(v[33], 11.0, "weight 33 = HIGH nibble of byte 1");
+    }
+
+    #[test]
+    fn Q5_K_matches_ggml_on_a_dense_reference_vector() {
+        // The kernel-validate fixture, in miniature: non-uniform scales, mins, nibbles AND high
+        // bits, expected values computed independently from ggml's dequantize_row_q5_K definition.
+        // A decoder wrong in any of the four parts lands off this vector.
+        let sc6: [u8; 8] = [5, 30, 63, 12, 48, 21, 39, 7];
+        let m6: [u8; 8] = [2, 18, 50, 33, 9, 61, 24, 41];
+        // inverse of scale_min_k4, byte-for-byte as gate-q4k established it
+        let mut scales = [0u8; 12];
+        for j in 0..4 { scales[j] = sc6[j] & 63; scales[j + 4] = m6[j] & 63; }
+        for j in 4..8 {
+            scales[j + 4] = (sc6[j] & 0x0F) | ((m6[j] & 0x0F) << 4);
+            scales[j - 4] |= ((sc6[j] >> 4) & 3) << 6;
+            scales[j] |= ((m6[j] >> 4) & 3) << 6;
+        }
+        let qs: Vec<u8> = (0..128).map(|i| (((i * 7 + 3) % 16) | (((i * 2 + 5) % 16) << 4)) as u8).collect();
+        let hb = |g: usize, l: usize, half: usize| ((g + l + half) % 2) as u8;
+        let mut qh = [0u8; 32];
+        for g in 0..4 { for l in 0..32 {
+            qh[l] |= hb(g, l, 0) << (2 * g);
+            qh[l] |= hb(g, l, 1) << (2 * g + 1);
+        }}
+        let mut raw = vec![0u8; Q5_K_BLOCK];
+        raw[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());   // d = 1.0
+        raw[2..4].copy_from_slice(&0x3800u16.to_le_bytes());   // dmin = 0.5
+        raw[4..16].copy_from_slice(&scales);
+        raw[16..48].copy_from_slice(&qh);
+        raw[48..176].copy_from_slice(&qs);
+        let v = dequant_q5_k(&raw, 256).unwrap();
+        for g in 0..4 { for l in 0..32 {
+            let b = qs[g * 32 + l];
+            let lo = ((b & 0xF) + 16 * hb(g, l, 0)) as f32;
+            let hi = ((b >> 4) + 16 * hb(g, l, 1)) as f32;
+            let want_lo = sc6[2 * g] as f32 * lo - 0.5 * m6[2 * g] as f32;
+            let want_hi = sc6[2 * g + 1] as f32 * hi - 0.5 * m6[2 * g + 1] as f32;
+            assert!((v[64 * g + l] - want_lo).abs() < 1e-5,
+                "g={g} l={l} lo: got {} want {want_lo}", v[64 * g + l]);
+            assert!((v[64 * g + 32 + l] - want_hi).abs() < 1e-5,
+                "g={g} l={l} hi: got {} want {want_hi}", v[64 * g + 32 + l]);
+        }}
+    }
+
+    #[test]
     fn Q2_K_puts_d_and_dmin_at_the_END_unlike_the_others() {
         // Assuming the Q4_K layout reads scales as a float and produces garbage with the right
         // length — which passes every size check.

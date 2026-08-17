@@ -32,6 +32,10 @@ pub enum Concern {
     ExpertChurn { hit_pct: u32, pinned: u32, total: u32 },
     /// A tuner wanted to switch and was held.
     TunerHeld { seconds_left: u32 },
+    /// Decode costs far more per token than this model's own prefill — the signature of a decode
+    /// with nothing in flight. Carries the ratio so the strip can say how bad, and because a
+    /// starvation claim without its measurement is the thing roofline.rs refuses to print.
+    DecodeStarved { ratio: f32 },
     /// Nothing is wrong.
     Healthy { tok_s: f32 },
 }
@@ -50,6 +54,12 @@ allocation but will not hold it"),
 every token"),
             Concern::TunerHeld { seconds_left } =>
                 format!("⧗ a faster setting is waiting {seconds_left}s to prove itself"),
+            // Names the lever, because this tree has now told an operator three times that a
+            // feature it ships is missing. The flag is the actionable half; the ratio is the
+            // evidence that acting is worth it.
+            Concern::DecodeStarved { ratio } =>
+                format!("⇶ decode costs {ratio:.0}x prefill per token — try LOGSCOPE_SPEC_DRAFT=lookup \
+(same output, fewer passes)"),
             Concern::Healthy { tok_s } => format!("✦ running clean at {tok_s:.1} tok/s"),
         }
     }
@@ -61,6 +71,9 @@ every token"),
             Concern::MemoryClamped { .. } => 1,
             Concern::ExpertChurn { .. } => 2,
             Concern::TunerHeld { .. } => 3,
+            // Below the acute faults, above the tuner: it is a standing property of the run rather
+            // than a moment, but it is the one with a flag attached.
+            Concern::DecodeStarved { .. } => 2,
             Concern::Healthy { .. } => 9,
         }
     }
@@ -460,6 +473,10 @@ pub fn motion_for(c: &Concern) -> Motion {
         Concern::MemoryClamped { .. } => Motion::Fetching,
         Concern::ExpertChurn { .. } => Motion::Fetching,
         Concern::TunerHeld { .. } => Motion::Deciding,
+        // Stalled, not Fetching: a starved decode IS the machine waiting with nothing in flight,
+        // which is the same picture SyncBound paints for a different reason. Showing it busy would
+        // contradict the sentence beside it.
+        Concern::DecodeStarved { .. } => Motion::Stalled,
         // NOT Deciding. The landmark's job when nothing is wrong is to be worth looking at, which
         // is the opposite of the strip's job in the same situation.
         Concern::Healthy { .. } => Motion::Thriving,

@@ -20,7 +20,7 @@
 //! to assemble the per-unit outputs onto the shared-context file. This module only decides WHAT to run.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Mode { Barebones, Coordinator, Aggressive, LongHorizon, ThinkerLiaison, LiaisonDebate }
+pub enum Mode { Barebones, Coordinator, Aggressive, Replicator, LongHorizon, StatefulGuide, ThinkerLiaison, LiaisonDebate }
 
 impl Mode {
     pub fn label(self) -> &'static str {
@@ -28,7 +28,9 @@ impl Mode {
             Mode::Barebones => "Barebones",
             Mode::Coordinator => "Coordinator",
             Mode::Aggressive => "Aggressive coordinator",
+            Mode::Replicator => "Replicator (parallel chats)",
             Mode::LongHorizon => "Long-horizon engineer",
+            Mode::StatefulGuide => "Stateful engineer (guided)",
             Mode::ThinkerLiaison => "Thinker + liaison",
             Mode::LiaisonDebate => "Liaison + debate panel",
         }
@@ -38,10 +40,23 @@ impl Mode {
             Mode::Barebones => "One model, one prompt — fastest, lowest load.",
             Mode::Coordinator => "Fans the task out to parallel workers (one per unit), each aware of the others, then stitches.",
             Mode::Aggressive => "Like Coordinator, plus best-of-K per unit — more parallel runs for higher quality.",
+            // The widest option, and the only one where the fan is STEERED rather than planned:
+            // Coordinator decomposes one goal, this runs several goals at once and lets you talk to
+            // each. It is listed here rather than left behind a command because a mode reachable
+            // only by knowing its name is a mode nobody finds.
+            Mode::Replicator => "Several independent chats side by side over one workspace — give each \
+worker a different job, message one or all of them, and pair any two so each sees the other's latest. \
+One weights copy, one KV cache per worker. Opens with :replicate N, or here.",
             // The three below vary WHO REASONS, where the three above vary how wide the fan-out is.
             // Two axes, deliberately in one list because an operator picks one thing.
             Mode::LongHorizon => "One large model, unguided. For runs where nobody is watching and the \
 session has to carry itself — it cannot usefully stop and ask, so it does not try.",
+            // Same family as LongHorizon — one large model, nobody watching — but the run carries a
+            // POSITION as well as a goal, and the position is decided by the checker.
+            Mode::StatefulGuide => "Long-horizon, but state-tracked: survey → plan → patch → check → \
+diagnose, with the phase decided by compiler output rather than by the model's opinion. It cannot \
+declare itself finished without a clean check, it stops itself when the error count stops falling, \
+and it reports which patterns actually moved the number on this repo.",
             Mode::ThinkerLiaison => "A large model with a small one relaying and condensing. The \
 default: the liaison keeps the thinker's context clean and answers while it works.",
             Mode::LiaisonDebate => "Several small models debating, with the liaison summarizing. They \
@@ -49,9 +64,13 @@ can pause to ask YOU a question between messages, and one is held blind to your 
 round shows whether your hint drove the conclusion or the question did.",
         }
     }
-    pub fn all() -> [Mode; 6] {
-        [Mode::Barebones, Mode::Coordinator, Mode::Aggressive,
-         Mode::LongHorizon, Mode::ThinkerLiaison, Mode::LiaisonDebate]
+    pub fn all() -> [Mode; 8] {
+        // Grouped by axis, and StatefulGuide sits LAST because it is the only member of a third
+        // axis — the renderer prints a heading per axis change, so an interleaved list would print
+        // "who reasons" twice. The contiguity test below is what enforces this.
+        [Mode::Barebones, Mode::Coordinator, Mode::Aggressive, Mode::Replicator,
+         Mode::LongHorizon, Mode::ThinkerLiaison, Mode::LiaisonDebate,
+         Mode::StatefulGuide]
     }
 
     /// Which axis this mode varies.
@@ -64,8 +83,13 @@ round shows whether your hint drove the conclusion or the question did.",
     /// answers rather than leaving it to be inferred from the names.
     pub fn axis(self) -> &'static str {
         match self {
-            Mode::Barebones | Mode::Coordinator | Mode::Aggressive => "how wide",
+            Mode::Barebones | Mode::Coordinator | Mode::Aggressive | Mode::Replicator => "how wide",
             Mode::LongHorizon | Mode::ThinkerLiaison | Mode::LiaisonDebate => "who reasons",
+            // A THIRD question, and worth its own name rather than being filed under one of the
+            // other two: StatefulGuide uses the same single large model as LongHorizon, so "who
+            // reasons" is unchanged. What differs is who decides the run has progressed — the
+            // checker instead of the narrative.
+            Mode::StatefulGuide => "how it is steered",
         }
     }
 
@@ -78,6 +102,9 @@ round shows whether your hint drove the conclusion or the question did.",
     /// a question nobody answers stalls the run rather than improving it.
     pub fn can_interrupt(self) -> bool {
         !matches!(self, Mode::LongHorizon | Mode::Barebones)
+            // Replicator CAN be interrupted — that is most of the point: you steer each column
+            // mid-run, and a worker you cannot redirect is a batch job.
+    
     }
 }
 
@@ -110,6 +137,19 @@ pub struct Plan {
 fn sys_barebones() -> String {
     "You are a precise coding assistant. Answer directly; lead with the code.".into()
 }
+/// The StatefulGuide base prompt. Deliberately short: it establishes the contract and the fact that
+/// the phase is imposed from outside, and leaves the per-phase instruction to `engmode::prompt_for`
+/// so the two cannot drift apart in two places.
+fn sys_stateful() -> String {
+    "You are a careful engineer working a long task in explicit PHASES. Each message you receive \
+names the current phase and states what it requires; do that and only that. The phase is decided by \
+the CHECKER (compiler and test output), not by you: you cannot advance by asserting progress, and a \
+completion claim without a clean check will be rejected and shown back to you. Prefer the smallest \
+edit that a compile can attribute. When a check fails, state the cause before proposing the fix — \
+an edit without a stated cause is a resample, and resampling has already been tried."
+        .into()
+}
+
 fn sys_worker() -> String {
     "You are one of several parallel workers writing ONE piece of a larger file. Implement ONLY your \
      assigned item as a complete, compilable definition — do not restate or redefine the sibling \
@@ -141,6 +181,18 @@ pub fn plan(mode: Mode, task: &Task) -> Plan {
         // fan-out width it never asked for.
         Mode::Barebones | Mode::LongHorizon | Mode::ThinkerLiaison | Mode::LiaisonDebate =>
             Plan { mode_name: "barebones", workers: vec![single(sys_barebones())], best_of: 1, aggregate: Aggregation::Single },
+        // One worker, like the reasoning modes — the difference is entirely in the loop around it.
+        // This layer supplies the PROTOCOL; the per-phase text comes from engmode::prompt_for at
+        // run time, because the phase is not known until the checker has spoken.
+        Mode::StatefulGuide =>
+            Plan { mode_name: "stateful-guide", workers: vec![single(sys_stateful())], best_of: 1, aggregate: Aggregation::Single },
+        // Replicator plans like Barebones ON PURPOSE. Its fan is not a decomposition of one goal —
+        // it is N goals the operator types separately, one per column, steered live. There is
+        // nothing for a planner to split here, and inventing a decomposition would put words in
+        // workers the operator is about to instruct himself. The width lives in the mode's own
+        // slider and the prompts arrive from the composer, not from this function.
+        Mode::Replicator =>
+            Plan { mode_name: "replicator", workers: vec![single(sys_barebones())], best_of: 1, aggregate: Aggregation::Single },
         Mode::Coordinator | Mode::Aggressive => {
             let best_of = if mode == Mode::Aggressive { 3 } else { 1 };
             let mode_name = if mode == Mode::Aggressive { "aggressive coordinator" } else { "coordinator" };
@@ -188,15 +240,19 @@ mod tests {
                 seen.push(a);
             }
         }
-        assert_eq!(seen.len(), 2, "two axes, two headings");
+        assert_eq!(seen.len(), 3, "three axes, three headings: how wide / who reasons / how it is steered");
     }
 
     #[test]
     fn every_mode_has_an_axis_and_they_are_the_expected_two() {
-        // A third axis is not wrong, but it would need a UI decision rather than appearing silently.
+        // The third axis was taken DELIBERATELY, which is what this guard asked for: StatefulGuide
+        // runs the same single large model as LongHorizon, so filing it under "who reasons" would be
+        // false. What varies is who decides the run advanced — the checker, not the narrative.
         for m in Mode::all() {
-            assert!(matches!(m.axis(), "how wide" | "who reasons"), "{m:?} has axis {:?}", m.axis());
+            assert!(matches!(m.axis(), "how wide" | "who reasons" | "how it is steered"),
+                    "{m:?} has axis {:?}", m.axis());
         }
+        assert_eq!(Mode::StatefulGuide.axis(), "how it is steered");
     }
 
     #[test]
@@ -207,7 +263,13 @@ mod tests {
         assert!(all.contains(&Mode::LongHorizon));
         assert!(all.contains(&Mode::ThinkerLiaison));
         assert!(all.contains(&Mode::LiaisonDebate));
-        assert_eq!(all.len(), 6, "three fan-out widths plus three reasoning shapes");
+        // Replicator repeated the exact failure this test was written for: the mode was built end
+        // to end — slider, columns, dilation matrix, lane dispatch, persistence — and reachable
+        // only by typing :replicate, so the operator went looking in this menu and correctly
+        // concluded it did not exist. A mode you have to already know the name of is a mode nobody
+        // finds.
+        assert!(all.contains(&Mode::Replicator), "a built mode with no menu entry cannot be found");
+        assert_eq!(all.len(), 8, "four fan-out widths, three reasoning shapes, one steering mode");
     }
 
     #[test]

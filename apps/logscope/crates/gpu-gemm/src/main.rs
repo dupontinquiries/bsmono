@@ -380,6 +380,73 @@ fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
     b
 }
 
+/// The count-dispatch / Drafter fixture: qwen3 arch (QK-norm tensors present), Q8_0 weights, GQA.
+///
+/// Deliberately qwen3-with-q8 rather than reusing write_gguf_q8_0 (llama arch, MHA): the tool this
+/// feeds measures dispatches on the path the app decodes through, and QK-norm plus grouped-query
+/// attention each ADD dispatches per layer. A fixture without them would undercount the very
+/// thing being counted.
+fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let q8t = |w: &[f32]| (8u32, enc_q8_0(w));
+    let hd = m.d / m.n_heads;
+    let kv = m.n_kv_heads * hd;
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let (t, by) = f32t(&m.embed); ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), t, by));
+    for (i, b) in m.layers.iter().enumerate() {
+        let (t, by) = f32t(&b.g1); ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = q8t(&b.wq); ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = f32t(&q_norm[i]); ts.push((format!("blk.{i}.attn_q_norm.weight"), v1(hd), t, by));
+        let (t, by) = q8t(&b.wk); ts.push((format!("blk.{i}.attn_k.weight"), mat(kv, m.d), t, by));
+        let (t, by) = f32t(&k_norm[i]); ts.push((format!("blk.{i}.attn_k_norm.weight"), v1(hd), t, by));
+        let (t, by) = q8t(&b.wv); ts.push((format!("blk.{i}.attn_v.weight"), mat(kv, m.d), t, by));
+        let (t, by) = q8t(&b.wo); ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = f32t(&b.g2); ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = q8t(&b.wgate); ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = q8t(&b.wup); ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = q8t(&b.wdown); ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), t, by));
+    }
+    let (t, by) = f32t(&m.out_norm); ts.push(("output_norm.weight".into(), v1(m.d), t, by));
+    let (t, by) = q8t(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    // COUNT AND ENTRIES TOGETHER — 10 keys below, and the count is written here. My T1 fixture
+    // edit put a bump and its key in different functions and the parser EOF'd; the two lines stay
+    // adjacent in every writer for that reason.
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 10);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "qwen3");
+    s(&mut b, "qwen3.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "qwen3.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "qwen3.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "qwen3.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "qwen3.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "qwen3.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "qwen3.context_length"); u32b(&mut b, 4); u32b(&mut b, 32768);
+    s(&mut b, "qwen3.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "qwen3.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 fn write_gguf_qwen2(m: &HostModel, biases: &[(Vec<f32>, Vec<f32>, Vec<f32>)]) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
@@ -510,13 +577,39 @@ fn cpu_qk_rmsnorm(x: &[f32], w: &[f32], t: usize, dm: usize, hd: usize, eps: f32
     o
 }
 
+/// NEOX (split-half) RoPE: rotate element `p` against `p + hd/2`, the pairing qwen/gemma/phi use.
+///
+/// `cpu_rope_mh` rotates the INTERLEAVED pair (2p, 2p+1) — the NORM/GGML convention llama weights
+/// are permuted for — and the two are not interchangeable: same frequencies, different elements
+/// paired, so a model rotated with the wrong one produces plausible-looking but wrong attention.
+/// The qwen3 gate compared a GPU forward that logs "NEOX (split-half) RoPE pairing for 'qwen3'"
+/// against the interleaved reference, which is why it has failed since it was written.
+fn cpu_rope_mh_neox(x: &[f32], t: usize, dm: usize, base: f32, hd: usize) -> Vec<f32> {
+    let half = hd / 2;
+    let mut o = x.to_vec();
+    for tok in 0..t {
+        for head in 0..dm / hd {
+            let off = tok * dm + head * hd;
+            for p in 0..half {
+                let freq = tok as f32 / base.powf(2.0 * p as f32 / hd as f32);
+                let (c, s) = (freq.cos(), freq.sin());
+                let x0 = x[off + p]; let x1 = x[off + p + half];
+                o[off + p] = x0 * c - x1 * s;
+                o[off + p + half] = x0 * s + x1 * c;
+            }
+        }
+    }
+    o
+}
+
 fn cpu_block_mh_qwen3(b: &Block, x: &[f32], t: usize, d: usize, h: usize, n_heads: usize, n_kv_heads: usize, base: f32, q_norm: &[f32], k_norm: &[f32], eps: f32) -> Vec<f32> {
     let hd = d / n_heads; let kv = n_kv_heads * hd;
     let n1 = cpu_rmsnorm(x, &b.g1, t, d, EPS);
     let qp = cpu_qk_rmsnorm(&cpu_linear(&n1, &b.wq, t, d, d), q_norm, t, d, hd, eps);
     let kp = cpu_qk_rmsnorm(&cpu_linear(&n1, &b.wk, t, kv, d), k_norm, t, kv, hd, eps);
-    let q = cpu_rope_mh(&qp, t, d, base, hd);
-    let k = cpu_rope_mh(&kp, t, kv, base, hd);
+    // NEOX pairing: qwen3 is in the qwen/gemma/phi family, and the loader says so on every load.
+    let q = cpu_rope_mh_neox(&qp, t, d, base, hd);
+    let k = cpu_rope_mh_neox(&kp, t, kv, base, hd);
     let v = cpu_linear(&n1, &b.wv, t, kv, d);
     let attn = cpu_mha(&q, &k, &v, t, d, n_heads, n_kv_heads);
     let o = cpu_linear(&attn, &b.wo, t, d, d);
@@ -572,7 +665,7 @@ fn write_gguf(m: &HostModel) -> Vec<u8> {
     let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
 
-    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 10);
     s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
     s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
     s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
@@ -580,6 +673,7 @@ fn write_gguf(m: &HostModel) -> Vec<u8> {
     s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
     s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
     s(&mut b, "llama.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "llama.context_length"); u32b(&mut b, 4); u32b(&mut b, 131072);
     s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
     s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
     for (i, (name, dims, _)) in ts.iter().enumerate() {
@@ -678,7 +772,7 @@ fn serialize_gguf(ts: &[(String, Vec<u64>, u32, Vec<u8>)], m: &HostModel) -> Vec
     let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
     let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
-    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 10);
     s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
     s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
     s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
@@ -686,6 +780,7 @@ fn serialize_gguf(ts: &[(String, Vec<u64>, u32, Vec<u8>)], m: &HostModel) -> Vec
     s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
     s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
     s(&mut b, "llama.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "llama.context_length"); u32b(&mut b, 4); u32b(&mut b, 131072);
     s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
     s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
     for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
@@ -939,6 +1034,75 @@ fn main() {
         // building for THIS model (colibrì measured GLM at 71.6%).
         let path = args.get(i + 1).expect("--route-analyze <trace-file>");
         route_analyze(path);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-spec-lookup") {
+        // Prove the two claims the advice line now makes, on real weights: that prompt-lookup
+        // decoding is BIT-IDENTICAL to plain decoding at temperature 0, and what it costs when the
+        // drafter whiffs. The engine has told operators for several bundles that speculative
+        // decoding is "missing" while shipping it behind a flag; a gate is what turns the
+        // correction into something that stays true.
+        let gpu = Gpu::new();
+        let m = gen_model(64, 128, 2, 96, 4, 2);
+        let bytes = write_gguf_qwen3_q8(&m, &vec![vec![1.0f32; 16]; 2], &vec![vec![1.0f32; 16]; 2]);
+        let model = gpu.load_gguf_opt(&bytes, true).expect("load fixture");
+        // A REPETITIVE prompt is the case prompt-lookup exists for: the suffix has occurred before,
+        // so the drafter can propose what followed it. The random prompt below is the whiff case.
+        let repetitive: Vec<u32> = (0..48).map(|i| (i % 6) as u32 + 1).collect();
+        let arbitrary: Vec<u32> = (0..48).map(|i| ((i * 37 + 11) % 90) as u32 + 1).collect();
+        let mut fails = 0;
+        for (label, prompt) in [("repetitive", &repetitive), ("arbitrary", &arbitrary)] {
+            let n_new = 24usize;
+            let plain = {
+                let c = gpu.new_cache(model.n_layers, prompt.len() + n_new + 8, model.kv_dim());
+                let mut prev = Vec::new();
+                for (pos, &t) in prompt.iter().enumerate() { prev = gpu.decode_step(&model, &c, t, pos); }
+                let mut out = Vec::new();
+                let mut pos = prompt.len();
+                for _ in 0..n_new {
+                    let t = gpu_kernels::argmax(&prev) as u32;
+                    out.push(t);
+                    prev = gpu.decode_step(&model, &c, t, pos);
+                    pos += 1;
+                }
+                out
+            };
+            let mut d = gpu_kernels::spec::PromptLookup { ngram: 2 };
+            let mut st = gpu_kernels::SpecStats::default();
+            let spec = gpu.speculative_generate_drafter(&model, &mut d, prompt, n_new, 4, &mut st);
+            let same = spec.len() >= plain.len() && spec[..plain.len()] == plain[..];
+            let per_pass = if st.rounds > 0 { st.emitted as f64 / st.rounds as f64 } else { 0.0 };
+            println!("  spec-lookup [{label}]: identical={same} tokens/pass={per_pass:.2} \
+(rounds {} accepted {} emitted {})", st.rounds, st.accepted, st.emitted);
+            if !same { fails += 1; }
+        }
+        // Tokens per pass is the speedup; the IDENTITY is the licence to use it at all.
+        println!("gate-spec-lookup: {}", if fails == 0 {
+            "prompt-lookup decoding is bit-identical to plain decoding ✓"
+        } else { "MISMATCH — speculative output diverged from plain decoding ✗" });
+        std::process::exit(if fails == 0 { 0 } else { 1 });
+    }
+    if let Some(i) = args.iter().position(|a| a == "--write-fixture") {
+        // Write the tiny qwen3 fixture that count-dispatch and spec.rs's Drafter tests read.
+        //
+        // That file was /tmp/tiny-qwen3-q8.gguf, created ad hoc by some earlier session and
+        // NOWHERE IN THE TREE — so it evaporated with the sandbox. Two costs: count-dispatch
+        // (the T3 tool) cannot run, and three spec.rs tests that read it `return` silently when
+        // it is missing, which means they have been passing VACUOUSLY in every battery since.
+        // A fixture the battery depends on has to have a writer under version control.
+        //
+        // Q8_0 on disk, not f32: the fixture's whole purpose is exercising the fused int8 path
+        // the app decodes through. Deterministic (gen_model's fixed seeds), so a count taken on
+        // one machine is comparable with a count taken on another.
+        let path = args.get(i + 1).cloned().unwrap_or("/tmp/tiny-qwen3-q8.gguf".to_string());
+        let (d, h, n, vocab, heads, kv_heads) = (64usize, 128usize, 2usize, 96usize, 4usize, 2usize);
+        let m = gen_model(d, h, n, vocab, heads, kv_heads);
+        let hd = d / heads;
+        let ones: Vec<Vec<f32>> = (0..n).map(|_| vec![1.0f32; hd]).collect();
+        let bytes = write_gguf_qwen3_q8(&m, &ones, &ones);
+        std::fs::write(&path, &bytes).expect("write fixture");
+        println!("wrote {} ({} bytes): qwen3, d={d} h={h} layers={n} vocab={vocab} heads={heads} kv={kv_heads}, Q8_0",
+                 path, bytes.len());
         return;
     }
     if let Some(i) = args.iter().position(|a| a == "--inspect") {
@@ -2843,12 +3007,12 @@ fn main() {
         let rw = mk(1, ne * d);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let n2v = mk(7, d); let xin = mk(8, d);
         let n2t = gpu.upload(&n2v, 1, d); let x2t = gpu.upload(&xin, 1, d);
         // streaming auto-forces the v1 path (its intercept lives there); resident uses V1 too for A/B parity.
         std::env::set_var("LOGSCOPE_MOE_V1", "1");
-        let resident = gpu_kernels::MoeLayer {
+        let resident = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -2861,7 +3025,7 @@ fn main() {
         // streaming layer at several pin levels: 0 (all streamed), 4 (half pinned), 8 (all pinned)
         for pin in [0usize, 4, ne] {
             let stream = gpu.build_moe_stream_from_weights(&gus, &dns, ff, d, n_used, pin);
-            let streaming = gpu_kernels::MoeLayer {
+            let streaming = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
                 down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -2900,7 +3064,7 @@ fn main() {
         // already resident and prefetch is a no-op, which is itself worth knowing.)
         let (d, ff, ne, n_used) = (128usize, 256usize, 16usize, 4usize);
         let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         // two layers, each with its own router + experts
         let rw: Vec<Vec<f32>> = (0..2).map(|l| mk(1 + l as u32, ne * d)).collect();
         let gus: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(100 + l as u32 * 50 + e as u32, 2 * ff * d)).collect()).collect();
@@ -2932,7 +3096,7 @@ fn main() {
             let layers: Vec<gpu_kernels::MoeLayer> = (0..2).map(|l| {
                 let mut st = gpu.build_moe_stream_ring(&gus[l], &dns[l], ff, d, n_used, 0, Some(ring));
                 st.layer = l; // cross-layer coupling key
-                gpu_kernels::MoeLayer {
+                gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
                     router: gpu_kernels::Lin::f32(gpu.upload(&rw[l], ne, d)),
                     gate_up: Vec::new(), down: Vec::new(),
                     stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -3008,7 +3172,7 @@ fn main() {
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
         let (d, ff, ne, n_used, ring, pin) = (128usize, 256usize, 8usize, 4usize, 3usize, 2usize);
         let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let rw = mk(1, ne * d);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
@@ -3020,7 +3184,7 @@ fn main() {
         let run = |repin: bool| -> (Vec<f32>, u64, u64, u64, Vec<u32>) {
             if repin { std::env::remove_var("LOGSCOPE_MOE_NOREPIN"); } else { std::env::set_var("LOGSCOPE_MOE_NOREPIN", "1"); }
             let st = gpu.build_moe_stream_ring(&gus, &dns, ff, d, n_used, pin, Some(ring));
-            let layer = gpu_kernels::MoeLayer {
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: Vec::new(), down: Vec::new(),
                 stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -4652,12 +4816,12 @@ reproducible in software and not a fault.", raw_diff - diff);
             gpu_kernels::gguf::dequantize(12, &down[e * dn_nb * 144..(e + 1) * dn_nb * 144], d * ff).unwrap()).collect();
 
         let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
-            norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+            norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let rw: Vec<f32> = (0..ne * d).map(|i| (((i as u32).wrapping_mul(2654435761) >> 9) as f32 / 8_388_608.0) - 1.0).collect();
         let xin: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.023).cos()).collect();
 
         let run = |stream: gpu_kernels::MoeStream| -> Vec<f32> {
-            let layer = gpu_kernels::MoeLayer {
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: Vec::new(), down: Vec::new(),
                 stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -4720,7 +4884,7 @@ reproducible in software and not a fault.", raw_diff - diff);
             (gpu_kernels::moe::RouteNorm::Sigmoid, false, "sigmoid, weight-after (GPU-routed v2)"),
         ] {
             let cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32,
-                n_shared: 0, norm, normalize: true, weight_before: wbefore, routed_scale: 1.0 };
+                n_shared: 0, norm, normalize: true, weight_before: wbefore, routed_scale: 1.0, n_group: 0, topk_group: 0 };
             // ---- CPU reference ----
             let mut logits = vec![0f32; ne];
             for e in 0..ne { logits[e] = (0..d).map(|i| rw[e * d + i] * xin[i]).sum(); }
@@ -4748,7 +4912,7 @@ reproducible in software and not a fault.", raw_diff - diff);
             // hunting a bug in correct code.
             for r in 0..d { want[r] += xin[r]; }
             // ---- GPU ----
-            let layer = gpu_kernels::MoeLayer {
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
                 down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
@@ -4791,14 +4955,14 @@ still pass, which is why this one exists."
 
         // Build with a SHARED expert too — Llama-4 and GLM have one, and a fusion that mishandles the
         // shared path would only show on those models.
-        let build = |shared: bool| gpu_kernels::MoeLayer {
+        let build = |shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
             stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
             stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
             cfg: gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
-                norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 },
+                norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 },
             shared: if shared {
                 Some((gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(31, 2 * ff * d), 2 * ff, d)),
                       gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(32, d * ff), d, ff))))
@@ -5120,7 +5284,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-store  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -5716,7 +5880,7 @@ still pass, which is why this one exists."
     // shared=None (must equal the old routed-only result) and shared=Some (routed + dense SwiGLU).
     {
         let (d, ff, sff, ne, t) = (8usize, 6usize, 10usize, 4usize, 3usize);
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let rw = rnd(ne * d, 51);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 60 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 70 + e)).collect();
@@ -5749,7 +5913,7 @@ still pass, which is why this one exists."
             }
             out
         };
-        let mk_layer = |with_shared: bool| gpu_kernels::MoeLayer {
+        let mk_layer = |with_shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
@@ -5773,7 +5937,7 @@ still pass, which is why this one exists."
         // INPUT (weight-before-FFN), plus the shared expert. CPU reference mirrors HF/llama.cpp
         // semantics directly (FFN(w·x), combined with weight 1).
         let l4cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 1, n_shared: 1,
-            norm: gpu_kernels::moe::RouteNorm::Sigmoid, normalize: false, weight_before: true, routed_scale: 1.0 };
+            norm: gpu_kernels::moe::RouteNorm::Sigmoid, normalize: false, weight_before: true, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let l4_ref = {
             let mut out = xin.clone();
             for tok in 0..t {
@@ -5801,11 +5965,11 @@ still pass, which is why this one exists."
     // fusion — the dispatch count drops, the numbers must not move.
     {
         let (d, ff, ne) = (64usize, 32usize, 4usize);
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0, n_group: 0, topk_group: 0 };
         let rw = rnd(ne * d, 151);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 160 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 170 + e)).collect();
-        let mk_q8 = || gpu_kernels::MoeLayer {
+        let mk_q8 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, d, ff))).collect(),
@@ -5826,7 +5990,7 @@ still pass, which is why this one exists."
         check("MoE fused-GLU kernel == unfused path (bit-identical)", e, 0.0);
 
         // same for Q4-resident (the q4-30B's actual MoE path)
-        let mk_q4 = || gpu_kernels::MoeLayer {
+        let mk_q4 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -5920,6 +6084,10 @@ still pass, which is why this one exists."
         model.n_layers, model.d, model.h, model.n_heads, model.vocab, ids.len(), glog.len(),
         { let last = &glog[glog.len() - model.vocab..]; last.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 });
     check("model forward (load->resident->logits)", maxerr(&glog, &clog), 1e-2);
+    // The one missing read that kept auto context sizing unwired: the loader must surface the
+    // trained context so plan_ctx has a trained_max. The fixture writes 131072.
+    check("loader reads {arch}.context_length into Model.trained_ctx",
+        if model.trained_ctx == 131072 { 0.0 } else { 1.0 }, 0.5);
 
     // Scale-shaped probes. The real Llama-3.2-1B garbles output while every SmolLM2 (any
     // quant) is coherent; the config deltas are GQA group=4, rope_base=500000, and
@@ -6140,6 +6308,12 @@ still pass, which is why this one exists."
         let lc = { let c = gpu.new_cache(cached.n_layers, prompt.len(), cached.kv_dim()); gpu.prefill_batched(&cached, &c, &prompt) };
         let cmp = gpu_kernels::compare_logits(&lf, &lc);
         println!("  int8 cache: reload-vs-fresh argmax_match={} max|d|={:.2e}", cmp.argmax_match, cmp.max_abs);
+        if cmp.max_abs > 0.0 {
+            // Failure-only: name the first tensor whose RESIDENT bytes/shape differ. Reads through
+            // download(), which honors views as of the readback fix — before that fix this diff was
+            // blind to exactly the corruption it was hunting.
+            println!("  int8 cache FIRST WEIGHT DIFF: {}", gpu.int8_cache_diff(&fresh, &cached));
+        }
         check("int8 cache reload == fresh load", cmp.max_abs, 0.0);
         check("int8 cache reload argmax matches", if cmp.argmax_match { 0.0 } else { 1.0 }, 0.5);
         let _ = std::fs::remove_file(path);
@@ -6415,6 +6589,40 @@ still pass, which is why this one exists."
     println!("  decode: prompt {prompt:?} -> recompute {g_rec:?}");
     println!("                          kv-cache  {g_kv:?}");
     println!("                          cpu       {c_ref:?}");
+    if g_rec != c_ref {
+        // Did the model_forward==cpu identity that PASSED at 7e-7 earlier in this run still hold
+        // HERE? If not, some section between the two mutated shared state (an env lever, an
+        // autotune, a degrade flag) and the divergence is that section's, not decode's.
+        let recheck = maxerr(&gpu.model_forward(&model, &[5u32, 0, 17, 3, 9]),
+                             &cpu_model_forward(&hm, &[5u32, 0, 17, 3, 9]));
+        let levers: Vec<String> = std::env::vars()
+            .filter(|(k, _)| k.starts_with("LOGSCOPE")).map(|(k, v)| format!("{k}={v}")).collect();
+        println!("    forward identity RE-CHECKED at gate time: max|gpu-cpu| = {recheck:.3e} \
+(was 7.15e-7 when first checked) | LOGSCOPE env now: {}",
+            if levers.is_empty() { "(none)".into() } else { levers.join(" ") });
+        // Which kind of failure is this? Walk the CPU trajectory and, at each step, compare the
+        // two sides' logits ON THE SAME PREFIX with their top-2 margins. A divergence where both
+        // margins are within float noise of the cross-impl error is an argmax coin-flip over a
+        // near-tie; a divergence with a wide margin is a real numeric bug in one implementation.
+        let mut toks = prompt.to_vec();
+        for step in 0..6 {
+            let cl = cpu_model_forward(&hm, &toks);
+            let gl = gpu.model_forward(&model, &toks);
+            let (cl, gl) = (&cl[cl.len() - hm.vocab..], &gl[gl.len() - hm.vocab..]);
+            let top2 = |s: &[f32]| {
+                let mut ix: Vec<usize> = (0..s.len()).collect();
+                ix.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+                (ix[0], s[ix[0]] - s[ix[1]])
+            };
+            let ((ca, cm), (ga, gm)) = (top2(cl), top2(gl));
+            let xe = cl.iter().zip(gl).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("    step {step} on cpu-prefix {toks:?}: cpu argmax {ca} (margin {cm:.3e}) | \
+gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
+                if ca != ga { "  <<< SPLITS HERE" } else { "" });
+            toks.push(ca as u32);
+            if ca != ga { break }
+        }
+    }
     check("greedy decode (gpu==cpu)", if g_rec == c_ref { 0.0 } else { 1.0 }, 0.5);
     check("kv-cache decode (==recompute)", if g_kv == g_rec { 0.0 } else { 1.0 }, 0.5);
 

@@ -31,6 +31,31 @@
 /// overlap does rather than at the moment of it.
 pub const NARROW_PT: f32 = 380.0;
 
+/// Points of breathing room left on EACH side of a dialog, so a clamped window reads as a window
+/// rather than as content jammed edge to edge.
+pub const DIALOG_MARGIN_PT: f32 = 12.0;
+
+/// The width a dialog should ask for, given the screen it has to live on.
+///
+/// Same failure as the toolbars, different widget: `Window::fixed_size([560, 0])` and
+/// `default_size([660, 480])` are desktop numbers, and on a phone (about 380pt wide) they put the
+/// window's own edges off-screen — controls near the left and right rims become unreachable, which
+/// is the "UI out of app bounds" the operator sees. egui's `constrain` keeps a window's POSITION
+/// inside the viewport but does not shrink a size the caller insisted on.
+///
+/// The rule: never wider than the screen minus a margin on each side, never wider than desired
+/// (a phone-sized dialog must not stretch across a desktop), and never below a floor — a window
+/// squeezed to 40pt is not more usable than one that overflows, so on an absurdly small viewport
+/// the dialog stops shrinking and its own scrolling takes over.
+pub fn dialog_width(screen_pt: f32, desired_pt: f32) -> f32 {
+    const FLOOR_PT: f32 = 240.0;
+    let usable = screen_pt - 2.0 * DIALOG_MARGIN_PT;
+    desired_pt.min(usable).max(FLOOR_PT.min(desired_pt))
+}
+
+/// One fan row's height. Mirrors `holdmenu::ROW_PT`, pinned equal by test.
+pub const FAN_ROW_PT: f32 = 44.0;
+
 /// Minimum touch target, in points. Below this a finger mis-hits adjacent controls.
 pub const TOUCH_MIN_PT: f32 = 44.0;
 /// Minimum for a pointer, where the cursor is exact.
@@ -60,6 +85,28 @@ pub fn row_mode(available_pt: f32, n_primary: usize, n_secondary: usize, touch: 
     // Primaries plus the overflow button itself must still fit, or hiding things has not helped.
     let need_primary = (n_primary + 1) as f32 * unit;
     if need_primary <= available_pt { RowMode::Overflow } else { RowMode::Wrap }
+}
+
+/// How many secondary controls it is reasonable to shed into a hold-to-fan button.
+///
+/// `row_mode` decides WHETHER to shed; this decides how much shedding the destination can carry.
+/// The reason the two are separate: a tap-to-open overflow menu costs a second tap per control, so
+/// a large shed set is a punishment, while `holdmenu`'s press-slide-release costs ONE gesture
+/// however many options are in the fan. What limits the fan is not taps but REACH and MEMORY —
+/// rows stack upward at 44pt each, and a fan taller than the thumb's arc (or longer than a person
+/// will read while holding a finger down) is a list that wants a real menu instead.
+///
+/// Six is the arc: ~264pt of stack, about the reach of a thumb from the bottom bar of a phone held
+/// one-handed, and short enough to scan without releasing. Beyond that, `row_mode`'s Overflow (a
+/// real, tappable, scrollable menu) is the honest answer, and this returns None to say so.
+pub fn fan_capacity(available_height_pt: f32) -> Option<usize> {
+    const MAX_ROWS: usize = 6;
+    // FAN_ROW_PT rather than holdmenu::ROW_PT: this rule is std-only and must survive a headless
+    // build, while holdmenu is egui drawing. The two are pinned equal by a test below — a silent
+    // divergence would make this function's answer wrong rather than merely stale.
+    let rows = (available_height_pt / FAN_ROW_PT).floor().max(0.0) as usize;
+    let n = rows.min(MAX_ROWS);
+    if n >= 2 { Some(n) } else { None }
 }
 
 /// The minimum control size for the current input.
@@ -132,4 +179,44 @@ mod tests {
         // a rule that triggers exactly when controls collide has already failed once.
         assert!(NARROW_PT > 360.0);
     }
+    #[test]
+    fn a_desktop_dialog_keeps_its_desired_width() {
+        assert_eq!(dialog_width(1440.0, 560.0), 560.0, "a wide screen must not stretch the dialog");
+    }
+
+    #[test]
+    fn a_PHONE_shrinks_the_dialog_inside_its_own_edges() {
+        // The actual bug: 560pt of wizard on a 380pt phone put both rims off-screen.
+        let w = dialog_width(380.0, 560.0);
+        assert!(w <= 380.0 - 2.0 * DIALOG_MARGIN_PT, "got {w}");
+        assert!(w > 300.0, "shrunk further than it needed to: {w}");
+    }
+
+    #[test]
+    fn an_ABSURD_viewport_stops_at_the_floor_rather_than_vanishing() {
+        // Below the floor the dialog keeps a usable width and scrolls its own content; a 40pt
+        // window is not a better answer than an overflowing one.
+        assert_eq!(dialog_width(100.0, 560.0), 240.0);
+        // ...but a dialog that only WANTED 180 still gets 180 — the floor must not inflate it.
+        assert_eq!(dialog_width(100.0, 180.0), 180.0);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_fan_row_height_matches_the_widget_that_draws_it() {
+        assert_eq!(FAN_ROW_PT, crate::holdmenu::ROW_PT,
+                   "the layout rule and the drawing must agree on a row's height");
+    }
+
+    #[test]
+    fn a_fan_carries_up_to_the_thumbs_reach_and_then_defers_to_a_real_menu() {
+        // Six rows is ~264pt: about a thumb's arc from a phone's bottom bar, and short enough to
+        // scan without releasing. A taller list is not a fan, it is a menu.
+        assert_eq!(fan_capacity(1000.0), Some(6));
+        assert_eq!(fan_capacity(FAN_ROW_PT * 3.5), Some(3));
+        // Not enough room for two rows: a "fan" of one is just a button that hides itself.
+        assert_eq!(fan_capacity(FAN_ROW_PT), None);
+        assert_eq!(fan_capacity(0.0), None);
+    }
+
 }

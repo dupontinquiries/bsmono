@@ -1,5 +1,9 @@
 # Logscope Project Status — June 2026
 
+> **Current handover: [`HANDOVER-c4-849.md`](HANDOVER-c4-849.md)** — state, measurements and TODOs as
+> of bundle c4-848. Read that first; this file is the older overview and describes the project rather
+> than its current state.
+
 ## What This Is
 
 **Logscope** is a **branching, local-first chat tool** designed to explore how far structure and compact models take you before needing a giant model. The thesis: a small model (360M–1B parameters) + tight workflow automation + KV-cache prefix reuse + context compaction + prompt specialization can outthink brute-force.

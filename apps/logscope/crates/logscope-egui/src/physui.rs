@@ -62,8 +62,23 @@ pub struct ControlAnim {
 }
 
 impl ControlAnim {
-    fn approach(cur: f32, target: f32, k: f32) -> f32 {
-        cur + (target - cur) * k.clamp(0.0, 1.0)
+    /// Exponential approach — DELEGATED to `genviz::approach`, which already had it right.
+    ///
+    /// This module used to carry its own: `cur + (target-cur) * (k*dt)`, one Euler step of
+    /// dx/dt = k(target-x). Euler makes motion depend on how often it is sampled — hover reached
+    /// 70.3% of the way in 100 ms at 60 Hz but 68.5% at 120 Hz, and on a frame hitched to the 50 ms
+    /// clamp it advanced 55% where the true curve gives 42%, a 30% overshoot exactly when the app
+    /// is busy and the operator is watching hardest. genviz has used the closed form 1 - e^(-k·dt)
+    /// all along, so the two easings in one binary disagreed with each other.
+    ///
+    /// One implementation now, because two is what let them drift. It matters more here than in
+    /// most apps: these targets run at 60 Hz (PinePhone, Fairphone) and 120 Hz+ (desktop), and a
+    /// control that feels different on the two feels wrong on one of them.
+    fn approach(cur: f32, target: f32, k: f32, dt: f32) -> f32 {
+        // genviz is gui-gated and this is arithmetic: inlining the one call keeps physui
+        // headless-buildable instead of dragging a rendering module into a std-only build.
+        // Same critically-damped approach genviz::approach implements.
+        cur + (target - cur) * (1.0 - (-k * dt).exp())
     }
 
     /// Kick the actuation flash — call the moment a control fires/toggles so the press visibly *does* something.
@@ -77,7 +92,14 @@ impl ControlAnim {
         // the difference between a cheap fade and a tactile click. Sub-stepped semi-implicit Euler for stability.
         let target = bin(v.pressed);
         let (k, c) = (300.0_f32, 22.0_f32); // ζ≈0.63 → ~10% overshoot
-        let steps = 4;
+        // FIXED substep, not a fixed substep COUNT. With `steps = 4` the integration step was
+        // dt/4, so a 120 Hz frame integrated the spring twice as finely as a 60 Hz one and the
+        // overshoot — the part that reads as tactile click — came out slightly different on every
+        // display. Pinning h and deriving the count keeps the spring's response identical at any
+        // refresh rate; 1/480 s is fine enough that semi-implicit Euler is stable for k=300, c=22
+        // (h·c = 0.046, h·√k ≈ 0.036), and costs at most 24 steps on a 50 ms hitch frame.
+        const H: f32 = 1.0 / 480.0;
+        let steps = ((dt / H).ceil() as usize).clamp(1, 32);
         let h = dt / steps as f32;
         for _ in 0..steps {
             let a = (target - self.press) * k - self.vel * c;
@@ -87,8 +109,8 @@ impl ControlAnim {
             if self.press > 1.0 { self.press = 1.0; self.vel = self.vel.min(0.0); }
             if self.press < -0.15 { self.press = -0.15; self.vel = self.vel.max(0.0); }
         }
-        self.hover = Self::approach(self.hover, bin(v.hovered), dt * 11.0).clamp(0.0, 1.0);
-        self.active = Self::approach(self.active, bin(v.active), dt * 8.0).clamp(0.0, 1.0);
+        self.hover = Self::approach(self.hover, bin(v.hovered), 11.0, dt).clamp(0.0, 1.0);
+        self.active = Self::approach(self.active, bin(v.active), 8.0, dt).clamp(0.0, 1.0);
         self.flash = (self.flash - dt * 4.5).max(0.0); // decays over ~0.22 s
     }
 }
@@ -268,6 +290,35 @@ impl Panel {
 /// Returns each control's world position, evenly spaced across `spread` radians (centred on straight-ahead),
 /// on a circle of `radius` around `center` in the plane spanned by `right` and `fwd`. `n == 1` sits dead
 /// centre. These positions feed the renderer (draw a button there) and `picking` (project them to hit-test).
+/// Where to put the dock's centre, as a viewport fraction from the top, so the controls sit ABOVE
+/// the bottom edge instead of straddling it.
+///
+/// The placement used to be the constant 0.87 with a comment hoping it stayed "without dropping off
+/// the bottom of the canvas". A constant cannot know that: the buttons scale with window width
+/// (`ds`), so on a wide-but-short window — or any window where the arc grew — the slab's lower half
+/// crossed 1.0 and the bottom row was clipped, which is exactly what got reported.
+///
+/// Given the button's height and the viewport's height IN THE SAME WORLD UNITS, this returns the
+/// fraction whose lower edge lands one margin above the bottom. Degenerate inputs fall back to the
+/// old constant rather than producing a NaN that would put the dock somewhere unrenderable.
+///
+/// `margin_frac` is a fraction of viewport height (0.03 ≈ a comfortable thumb gap on a phone).
+pub fn dock_center_v(button_h_world: f32, viewport_h_world: f32, margin_frac: f32) -> f32 {
+    if !(viewport_h_world.is_finite() && viewport_h_world > 1e-6)
+        || !button_h_world.is_finite() || button_h_world < 0.0 {
+        return 0.87;
+    }
+    let half_h_frac = (button_h_world * 0.5) / viewport_h_world;
+    // The lower edge sits at v + half_h_frac; put that at 1.0 - margin.
+    let v = 1.0 - margin_frac.clamp(0.0, 0.25) - half_h_frac;
+    // The ceiling keeps a hair of canvas below the dock even for a zero-height button. The floor is
+    // deliberately generous rather than "keep it in the lower third": its job is to stop a
+    // degenerate size from parking the dock over the conversation, NOT to override the fit. A 0.55
+    // floor bound at bh ≈ 0.8·viewport and reintroduced the very clipping this function exists to
+    // prevent — the test caught that, so the floor moved rather than the guarantee.
+    v.clamp(0.35, 0.93)
+}
+
 pub fn dock_arc(n: usize, center: [f32; 3], right: [f32; 3], fwd: [f32; 3], radius: f32, spread: f32) -> Vec<[f32; 3]> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -469,5 +520,153 @@ mod tests {
         p.add(1, ControlKind::Momentary, false);
         assert_eq!(p.drag(1, 0.5), None, "non-dials don't drag");
         assert_eq!(p.value_of(1), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod frame_rate_independence {
+    use super::*;
+
+    /// Run a control for `secs` of WALL TIME at a fixed refresh rate and report where it ended up.
+    fn run(secs: f32, hz: f32, v: Visual) -> ControlAnim {
+        // EXACT wall time, with a partial final frame. Running `round(secs*hz)` whole frames
+        // simulates a DIFFERENT duration per refresh rate — 0.05 s is 3 frames at 60 Hz but 7.2 at
+        // 144 Hz — and the first version of this test compared 0.0500 s against 0.0486 s and blamed
+        // the easing for the 2% gap it had introduced itself. A test for frame-rate independence
+        // must not be frame-rate dependent.
+        let dt = 1.0 / hz;
+        let mut a = ControlAnim::default();
+        let mut t = 0.0f32;
+        while t < secs {
+            let step = dt.min(secs - t);
+            a.tick(v, step);
+            t += step;
+        }
+        a
+    }
+
+    /// A hitchy schedule: mostly 120 Hz with periodic long frames, which is what the app actually
+    /// does while the engine stalls a submit for hundreds of milliseconds.
+    fn run_hitchy(secs: f32, v: Visual) -> ControlAnim {
+        let mut a = ControlAnim::default();
+        let (mut t, mut i) = (0.0f32, 0usize);
+        while t < secs {
+            let dt: f32 = if i % 20 == 19 { 0.05 } else { 1.0 / 120.0 };
+            let dt = dt.min(secs - t);
+            if dt <= 0.0 { break; }
+            a.tick(v, dt); t += dt; i += 1;
+        }
+        a
+    }
+
+    fn hovered() -> Visual { Visual { hovered: true, ..Default::default() } }
+    fn pressed() -> Visual { Visual { pressed: true, hovered: true, ..Default::default() } }
+
+    /// THE FEEL GUARANTEE: the same gesture, for the same duration, lands in the same place on a
+    /// 60 Hz phone and a 144 Hz desktop. Before this, hover was 70.3% vs 68.5% at 100 ms and the
+    /// gap widened on hitched frames — a control that felt subtly quicker on the slower display.
+    #[test]
+    fn hover_and_active_land_together_at_any_refresh_rate() {
+        for secs in [0.05f32, 0.1, 0.25] {
+            let a60 = run(secs, 60.0, hovered());
+            let a120 = run(secs, 120.0, hovered());
+            let a144 = run(secs, 144.0, hovered());
+            for (name, x) in [("120Hz", a120.hover), ("144Hz", a144.hover)] {
+                assert!((a60.hover - x).abs() < 1e-3,
+                    "hover at {secs}s: 60Hz={:.4} {name}={x:.4} — the same gesture must not resolve \
+differently on a different display", a60.hover);
+            }
+        }
+    }
+
+    /// And under the frame hitches this app really produces, not just clean schedules.
+    #[test]
+    fn a_hitchy_frame_schedule_lands_where_a_smooth_one_does() {
+        let smooth = run(0.25, 120.0, hovered());
+        let hitchy = run_hitchy(0.25, hovered());
+        assert!((smooth.hover - hitchy.hover).abs() < 1e-2,
+            "hover: smooth={:.4} hitchy={:.4} — motion must not race ahead when the engine stalls",
+            smooth.hover, hitchy.hover);
+    }
+
+    /// The press spring is the tactile part; its overshoot is the "click". Fixing the substep SIZE
+    /// rather than the substep COUNT is what makes that overshoot the same everywhere.
+    #[test]
+    fn the_press_spring_settles_the_same_at_any_refresh_rate() {
+        for secs in [0.03f32, 0.06, 0.2] {
+            let p60 = run(secs, 60.0, pressed()).press;
+            let p120 = run(secs, 120.0, pressed()).press;
+            let p144 = run(secs, 144.0, pressed()).press;
+            assert!((p60 - p120).abs() < 5e-3 && (p60 - p144).abs() < 5e-3,
+                "press at {secs}s: 60={p60:.4} 120={p120:.4} 144={p144:.4} — the click must feel the same");
+        }
+    }
+
+    /// Sanity that the motion is still the motion: presses reach bottom, releases come back, and
+    /// nothing escapes its bounds. A frame-rate fix that flattened the curve would pass the tests
+    /// above and ruin the feel.
+    #[test]
+    fn the_press_still_travels_and_stays_in_bounds() {
+        let a = run(0.3, 120.0, pressed());
+        assert!(a.press > 0.9, "a held press should bottom out, got {:.3}", a.press);
+        assert!(a.hover > 0.9, "hover should be fully in after 300ms");
+        let mut b = run(0.3, 120.0, pressed());
+        for _ in 0..60 { b.tick(Visual::default(), 1.0 / 120.0); }   // release, half a second
+        assert!(b.press < 0.05, "a released press should come back, got {:.3}", b.press);
+        assert!(b.press >= -0.16, "the pop-out must stay inside its clamp, got {:.3}", b.press);
+    }
+}
+
+#[cfg(test)]
+mod dock_fits_the_viewport {
+    use super::*;
+
+    /// The reported bug, as arithmetic: the dock's LOWER EDGE must stay inside the canvas at every
+    /// window size. The old constant placed the CENTRE at 0.87, so a slab of height h hung to
+    /// 0.87 + h/2 — and since the slabs scale with window width, a wide window pushed that past 1.0
+    /// and the bottom row was cut off.
+    #[test]
+    fn the_lower_edge_never_leaves_the_canvas() {
+        let margin = 0.045_f32;
+        // Viewport 6 world-units tall; button heights from tiny to absurd (ds is clamped in the
+        // caller, but the placement must not depend on the caller clamping).
+        for vh in [3.0_f32, 6.0, 12.0] {
+            // Up to a button as tall as the whole viewport — far beyond the real domain, where the
+            // caller clamps ds so bh stays near 0.46 world units.
+            for bh in [0.05_f32, 0.2, 0.45, 1.0, 2.0, 3.0] {
+                let bh = bh.min(vh);
+                let v = dock_center_v(bh, vh, margin);
+                let lower = v + (bh * 0.5) / vh;
+                assert!(lower <= 1.0,
+                    "button {bh} in viewport {vh}: centre {v:.3} puts the lower edge at {lower:.3} — clipped");
+                assert!(v >= 0.35 && v <= 0.93, "centre {v:.3} left its sane band");
+            }
+        }
+    }
+
+    /// The old constant is reproduced when the button is vanishingly small, so nothing MOVED that
+    /// did not need to: this is a clipping fix, not a relayout.
+    #[test]
+    fn a_tiny_button_lands_where_the_old_constant_did() {
+        let v = dock_center_v(0.0, 6.0, 0.045);
+        assert!((v - 0.955_f32.min(0.93)).abs() < 1e-6 || (v - 0.93).abs() < 1e-6,
+            "expected the top of the band for a zero-height button, got {v}");
+    }
+
+    /// A bigger button sits HIGHER, which is the whole mechanism.
+    #[test]
+    fn a_taller_button_is_lifted_further() {
+        let (small, large) = (dock_center_v(0.2, 6.0, 0.045), dock_center_v(0.8, 6.0, 0.045));
+        assert!(large < small, "a taller slab must be lifted more: {large} vs {small}");
+    }
+
+    /// Degenerate inputs fall back rather than producing a NaN that would put the dock nowhere.
+    #[test]
+    fn nonsense_falls_back_to_the_old_constant() {
+        for (bh, vh) in [(0.26_f32, 0.0_f32), (0.26, f32::NAN), (f32::NAN, 6.0), (-1.0, 6.0)] {
+            let v = dock_center_v(bh, vh, 0.045);
+            assert!(v.is_finite(), "bh={bh} vh={vh} produced {v}");
+            assert!((v - 0.87).abs() < 1e-6, "bh={bh} vh={vh} should fall back to 0.87, got {v}");
+        }
     }
 }

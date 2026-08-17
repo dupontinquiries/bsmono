@@ -42,6 +42,8 @@
 #[allow(dead_code)] pub mod trustkit;
 #[allow(dead_code)] pub mod workerkit;
 #[allow(dead_code)] pub mod buildfarm;
+pub mod agentscore;
+pub mod engmode;
 #[allow(dead_code)] pub mod stepverify;
 #[allow(dead_code)] pub mod treeexport;
 #[allow(dead_code)] pub mod verdict;

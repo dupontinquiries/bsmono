@@ -79,24 +79,11 @@ pub struct Defaults {
     pub prefill_chunk_max_moe: u32,
     /// Largest total GPU allocation this device was MEASURED to honour, in GiB. 0 = never probed.
     ///
-    /// The alternative is a constant, and nothing in the code distinguished "the driver refuses"
-    /// from "we assumed it would".
-    ///
-    /// ## The 2.6x this used to cite was two different ceilings, not one wrong one
-    ///
-    /// It read: the Asahi cap of 24 GiB was wrong because `--gate-vram` measured 63. That comparison
-    /// does not hold. `--gate-vram` measures the largest SINGLE allocation the device accepts;
-    /// `--gate-residency` measures how much it will hold at once, and it reports **31 GiB** — 124
-    /// one-GiB slabs held, the 125th refused, on a machine with 177 GiB of RAM.
-    ///
-    /// So the old cap was low, but not by 2.6x, and the models refused above 31 GiB were refused
-    /// CORRECTLY. Recording the difference matters because the 63 GiB figure was being used as
-    /// evidence that a correct refusal was a bug — and acting on it fails mid-quantization rather
-    /// than at planning time.
-    ///
-    /// The ceiling also depends on slab size, which is why the arena defaults to the 1 GiB slabs the
-    /// probe used: a plan budgeted at one slab size and allocated at another is how ~29.5 GiB died
-    /// with 6 GiB placed.
+    /// The alternative is a constant, and the constant was wrong by 2.6x: `memplan`'s Asahi cap of
+    /// 24 GiB was an empirical figure from the STAGING upload path, taken before the map-at-creation
+    /// arena existed, and `--gate-vram` measured the same device honouring 63 GiB. Nothing in the code
+    /// distinguished "the driver refuses" from "we assumed it would", and a model that fitted was being
+    /// streamed for no reason.
     ///
     /// Cached because probing costs ~4.5 s and allocates everything on the device — acceptable once per
     /// adapter, not per launch.

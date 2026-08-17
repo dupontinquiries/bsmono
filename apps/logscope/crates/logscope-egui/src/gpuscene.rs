@@ -140,6 +140,34 @@ impl Camera {
             -(r[idx(2,0)]*t[0] + r[idx(2,1)]*t[1] + r[idx(2,2)]*t[2]),
         ]
     }
+    /// The world-space RAY under a screen point — the inverse of `dir_uv`, for the physical UI's
+    /// touch response and picking-by-ray. `uv` is in the same [0,1] ndc-derived space `dir_uv`
+    /// returns (y UP; an egui pointer position must flip y at the call site, where the screen
+    /// convention lives). Returns (origin = eye, normalized direction).
+    ///
+    /// No 4x4 inverse: the projection here is diagonal-plus-w (fx, fy, the z row and w = -z_view),
+    /// so a view-space direction for ndc (nx, ny) is simply (nx/fx, ny/fy, -1), and the view
+    /// rotation transposes out the same way `eye()` already recovers -R^T t. Tested against
+    /// `dir_uv` as the oracle: the round trip must land within a pixel-scale epsilon, roll
+    /// included — an inverse maintained by hand next to its forward drifts the first time only
+    /// one of them is edited.
+    pub fn ray_uv(&self, uv: [f32; 2]) -> ([f32; 3], [f32; 3]) {
+        let (nx, ny) = (uv[0] * 2.0 - 1.0, uv[1] * 2.0 - 1.0);
+        let (fx, fy) = (self.proj[idx(0, 0)], self.proj[idx(1, 1)]);
+        let dv = [nx / fx.max(1e-9), ny / fy.max(1e-9), -1.0f32]; // view-space, onto the near ray
+        // world dir = R^T * dv — column i of the view rotation dotted with dv, the same access
+        // pattern eye() uses for R^T t.
+        let r = &self.view;
+        let mut d = [
+            r[idx(0, 0)] * dv[0] + r[idx(0, 1)] * dv[1] + r[idx(0, 2)] * dv[2],
+            r[idx(1, 0)] * dv[0] + r[idx(1, 1)] * dv[1] + r[idx(1, 2)] * dv[2],
+            r[idx(2, 0)] * dv[0] + r[idx(2, 1)] * dv[1] + r[idx(2, 2)] * dv[2],
+        ];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-9);
+        d = [d[0] / len, d[1] / len, d[2] / len];
+        (self.eye(), d)
+    }
+
     /// View-space depth (distance in front of the camera) of a world point — used to sort triangles.
     fn depth(&self, p: Vec3) -> f32 { -mul_point(&self.view, p)[2] }
 
@@ -853,4 +881,34 @@ mod tests {
             last = d;
         }
     }
+    #[test]
+    fn ray_uv_inverts_dir_uv_roll_included() {
+        // dir_uv is the oracle: a ray cast under a screen point must project back to that point.
+        // Roll is the case a hand-derived inverse most often drops, so one camera here is Dutch.
+        for cam in [
+            Camera::from_orbit(&OrbitCam { yaw: 0.7, pitch: -0.4, roll: 0.0, dist: 12.0,
+                target: Vec3::new(1.0, 2.0, -3.0) }, 800.0, 600.0, 300.0, 0.3, 400.0),
+            Camera::from_orbit(&OrbitCam { yaw: -2.1, pitch: 0.55, roll: 0.35, dist: 5.0,
+                target: Vec3::new(0.0, 0.0, 0.0) }, 390.0, 700.0, 250.0, 0.3, 400.0),
+        ] {
+            for uv in [[0.5, 0.5], [0.1, 0.85], [0.93, 0.07], [0.5, 0.02]] {
+                let (_o, d) = cam.ray_uv(uv);
+                let back = cam.dir_uv(d).expect("a forward ray must project");
+                assert!((back[0] - uv[0]).abs() < 2e-3 && (back[1] - uv[1]).abs() < 2e-3,
+                    "uv {uv:?} -> dir {d:?} -> {back:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_centre_ray_looks_at_the_orbit_target() {
+        // uv (0.5, 0.5) is the view axis: origin + dist * dir must land on the target.
+        let o = OrbitCam { yaw: 1.2, pitch: -0.6, roll: 0.0, dist: 9.0, target: Vec3::new(4.0, 1.0, 7.0) };
+        let cam = Camera::from_orbit(&o, 800.0, 600.0, 300.0, 0.3, 400.0);
+        let (e, d) = cam.ray_uv([0.5, 0.5]);
+        for (i, t) in [o.target.x, o.target.y, o.target.z].iter().enumerate() {
+            assert!((e[i] + o.dist * d[i] - t).abs() < 1e-3, "axis {i}");
+        }
+    }
+
 }

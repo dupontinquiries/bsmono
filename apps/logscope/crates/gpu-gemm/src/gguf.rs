@@ -576,37 +576,6 @@ pub fn dequantize_iq4_nl_block(raw: &[u8], out: &mut [f32]) -> Result<(), String
 /// The fifth bit living in its own plane is the part a reader gets wrong: it is indexed by weight
 /// position across the whole super-block, not per sub-block, so `qh[j % 32] >> (j / 32)` and not
 /// anything local.
-pub fn dequantize_q5_k_block(raw: &[u8], out: &mut [f32]) -> Result<(), String> {
-    if raw.len() < 176 { return Err(format!("Q5_K block is 176 bytes, got {}", raw.len())) }
-    if out.len() < 256 { return Err(format!("Q5_K block yields 256 weights, got {}", out.len())) }
-    let d = f16_to_f32(u16::from_le_bytes([raw[0], raw[1]]));
-    let dmin = f16_to_f32(u16::from_le_bytes([raw[2], raw[3]]));
-    let sc = &raw[4..16];
-    let qh = &raw[16..48];
-    let qs = &raw[48..176];
-
-    for sub in 0..8usize {
-        // The ggml packing: sub-blocks 0..3 take their own byte, 4..7 assemble from two.
-        let (s, m) = if sub < 4 {
-            (sc[sub] & 63, sc[sub + 4] & 63)
-        } else {
-            ((sc[sub + 4] & 0x0F) | ((sc[sub - 4] >> 6) << 4),
-             (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4))
-        };
-        let dl = d * s as f32;
-        let ml = dmin * m as f32;
-        for j in 0..32usize {
-            let idx = sub * 32 + j;
-            let lo = if idx % 2 == 0 { qs[idx / 2] & 0x0F } else { qs[idx / 2] >> 4 };
-            // The fifth bit is indexed across the SUPER-BLOCK, not the sub-block.
-            let hi = (qh[idx % 32] >> (idx / 32)) & 1;
-            let q = (lo | (hi << 4)) as f32;
-            out[idx] = dl * q - ml;
-        }
-    }
-    Ok(())
-}
-
 pub fn type_name(t: u32) -> &'static str {
     match t {
         0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
@@ -615,6 +584,7 @@ pub fn type_name(t: u32) -> &'static str {
         19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S", 22 => "IQ2_S", 23 => "IQ4_XS",
         24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64", 29 => "IQ1_M",
         30 => "BF16", 34 => "TQ1_0", 35 => "TQ2_0",
+        39 => "MXFP4",
         _ => "unknown",
     }
 }
@@ -675,6 +645,9 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         7 => if n % 32 == 0 { Some(n / 32 * 24) } else { None }, // Q5_1: f16 d + f16 m + 4B qh + 16B nibbles
         8 => if n % 32 == 0 { Some(n / 32 * 34) } else { None }, // Q8_0: f16 scale + 32×i8
         12 => if n % 256 == 0 { Some(n / 256 * 144) } else { None }, // Q4_K super-block
+        // MXFP4: E8M0 scale byte + 16B of packed nibbles per 32 weights. The quant the current Qwen
+        // MoE repackagings ship in, so a wrong size here mis-slices every expert tensor in the file.
+        39 => if n % 32 == 0 { Some(n / 32 * crate::mxfp4::MXFP4_BLOCK) } else { None },
         // Q2_K: 84 bytes per 256 — 16 scale bytes, 64 quant bytes, d and dmin as f16.
         // Q3_K: 110 bytes per 256 — 32 high-bit bytes, 64 quant, 12 scale, d as f16.
         //
@@ -900,16 +873,15 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         }
         // Q5_K: a K-quant, no codebook. Present in the Scout UD file AND in GLM-4.7-Flash's
         // ffn_down, so it unblocks two checkpoints rather than one.
-        13 => {
-            if n % 256 != 0 { return Err(format!("Q5_K needs a multiple of 256 weights, got {n}")) }
-            let mut out = vec![0.0f32; n];
-            for (b, chunk) in (0..n / 256).zip(out.chunks_mut(256)) {
-                let off = b * 176;
-                if off + 176 > data.len() { return Err(format!("Q5_K block {b} runs past the data")) }
-                dequantize_q5_k_block(&data[off..off + 176], chunk)?;
-            }
-            return Ok(out);
-        }
+        //
+        // Routed to kquant::dequant_q5_k. A SECOND implementation used to live in this file and it
+        // is the one kernel-validate caught at max|gpu-cpu| = 18.9 on two machines: it read the
+        // nibbles as interleaved pairs (Q4_0's layout — weight j from qs[j/2], low/high by parity)
+        // where ggml's K-quants put the LOW nibbles of 32 bytes first and the HIGH nibbles of the
+        // same 32 bytes second. Every non-uniform Q5_K tensor decoded to scrambled weights. The
+        // uniform-fixture tests below couldn't see it — a layout bug is invisible when every
+        // nibble holds the same value — which is why a non-uniform vector now lives in kquant.
+        13 => return crate::kquant::dequant_q5_k(data, n),
         // IQ4_XS: 21% of a UD-IQ1_S checkpoint by bytes, and the only one of its seven types that
         // needs no codebook grid — sixteen values against IQ2/IQ3's 2048.
         23 => {
@@ -938,6 +910,7 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         // ggml-common.h rather than recalled. 18% of a UD-IQ1_S Scout.
         21 => return crate::iq23::dequant_iq3_s(data, n),
         18 => return crate::iq23::dequant_iq3_xxs(data, n),
+        39 => return crate::mxfp4::dequant_mxfp4(data, n),
         22 => return crate::iq23::dequant_iq2_s(data, n),
         16 => return crate::iq2xxs::dequant_iq2_xxs(data, n),
         29 => return crate::iq1m::dequant_iq1_m(data, n),
@@ -1567,13 +1540,19 @@ mod iq4nl_q5k_tests {
         b
     }
 
+    // These four used to call a private block decoder that lived in THIS file. That decoder read
+    // the nibbles interleaved (Q4_0's layout) and every one of them passed anyway, because a
+    // uniform fixture puts the same value in both nibbles of every byte — a layout bug permutes
+    // weights and a permutation of identical values is invisible. They now go through
+    // `dequantize(13, ...)`, the path the loader ships; the layout itself is pinned by the
+    // non-uniform vector in kquant::tests.
+
     #[test]
     fn EVERY_sub_block_decodes_including_the_last() {
-        // The fifth bit is indexed as qh[idx % 32] >> (idx / 32) — across the SUPER-BLOCK. A
-        // per-sub-block index gives the right answer for the first 32 weights and leaves the rest
-        // untouched, so the last weight is the one that catches it.
-        let mut out = vec![0.0f32; 256];
-        dequantize_q5_k_block(&q5k_uniform(0x11, true), &mut out).unwrap();
+        // The fifth bit is indexed across the SUPER-BLOCK, not the sub-block. A per-sub-block
+        // index gives the right answer for the first 32 weights and leaves the rest untouched,
+        // so the last weight is the one that catches it.
+        let out = dequantize(13, &q5k_uniform(0x11, true), 256).unwrap();
         assert!(out.iter().all(|v| v.is_finite()), "every weight decoded");
         assert_ne!(out[255], 0.0, "the last weight is where a local index would have left a hole");
         assert_ne!(out[128], 0.0, "and the middle, past the sub-block-4 packing boundary");
@@ -1582,10 +1561,8 @@ mod iq4nl_q5k_tests {
     #[test]
     fn the_HIGH_BIT_changes_every_weight() {
         // q = lo | (hi << 4), so setting the plane must move all 256 — not merely the first block.
-        let mut with = vec![0.0f32; 256];
-        let mut without = vec![0.0f32; 256];
-        dequantize_q5_k_block(&q5k_uniform(0x11, true), &mut with).unwrap();
-        dequantize_q5_k_block(&q5k_uniform(0x11, false), &mut without).unwrap();
+        let with = dequantize(13, &q5k_uniform(0x11, true), 256).unwrap();
+        let without = dequantize(13, &q5k_uniform(0x11, false), 256).unwrap();
         assert!(with.iter().zip(&without).all(|(a, b)| a != b), "the fifth bit reached every weight");
     }
 
@@ -1593,15 +1570,14 @@ mod iq4nl_q5k_tests {
     fn Q5_K_subtracts_a_MINIMUM() {
         // dl*q - ml. A decoder that forgets the minimum produces weights offset by a constant —
         // coherent text, subtly wrong, which is this family's specialty.
-        let mut out = vec![0.0f32; 256];
-        dequantize_q5_k_block(&q5k_uniform(0x11, false), &mut out).unwrap();
+        let out = dequantize(13, &q5k_uniform(0x11, false), 256).unwrap();
         assert!(out[0] <= 0.0, "q=0 leaves -min, which cannot be positive: {}", out[0]);
     }
 
     #[test]
     fn both_formats_REFUSE_a_short_block() {
         assert!(dequantize_iq4_nl_block(&vec![0u8; 10], &mut vec![0.0; 32]).is_err());
-        assert!(dequantize_q5_k_block(&vec![0u8; 100], &mut vec![0.0; 256]).is_err());
+        assert!(dequantize(13, &vec![0u8; 100], 256).is_err());
     }
 
     #[test]
@@ -1613,5 +1589,359 @@ mod iq4nl_q5k_tests {
         // Misaligned lengths refused rather than truncated.
         assert!(dequantize(20, &nl, 40).is_err());
         assert!(dequantize(13, &q5k_uniform(0x11, false), 300).is_err());
+    }
+}
+
+/// Elements per block by ggml type CLASS — the only geometry the parallel splitter
+/// needs. F32/F16 are 1; the q*_0/q*_1/q8 row formats are 32; every K-quant and IQ
+/// type is a 256-element superblock. Bytes-per-block is DERIVED from the exact data
+/// length rather than tabulated per type, so this cannot drift from `dequantize`'s
+/// own per-type code above.
+pub fn block_elems(ggml_type: u32) -> usize {
+    match ggml_type {
+        0 | 1 => 1,          // f32, f16
+        2..=9 => 32,         // q4_0/q4_1/q5_0/q5_1/q8_0/q8_1 family
+        _ => 256,            // K-quants and the IQ family
+    }
+}
+
+/// Block-parallel `dequantize`: cut the tensor on block boundaries, run the SERIAL
+/// per-type code on each chunk across the pool, write disjoint output ranges.
+/// Same answer as `dequantize` by construction — each chunk goes through the same
+/// scalar code — measured 5x-per-byte slower than the Q4_K GPU path on the UD-IQ1_S
+/// Scout load (0.26 vs 1.25 GB/s), which is a thread-count problem until the IQ
+/// family gets its GPU dequant (see reference-docs/DIFFUSION_REFERENCE.md).
+pub fn dequantize_par(pool: &crate::cpupool::Pool, ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, String> {
+    let be = block_elems(ggml_type);
+    let nblocks = n / be.max(1);
+    if pool.threads() <= 1 || nblocks < 64 || n % be != 0 || data.len() % nblocks.max(1) != 0 {
+        return dequantize(ggml_type, data, n);
+    }
+    let bpb = data.len() / nblocks; // exact bytes per block, derived not tabulated
+    let mut out = vec![0f32; n];
+    let out_addr = out.as_mut_ptr() as usize;
+    let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let chunks = (pool.threads() * 4).min(nblocks);
+    let per = nblocks.div_ceil(chunks);
+    pool.run(|tid, nt| {
+        let mut c = tid;
+        while c < chunks {
+            let (b0, b1) = (c * per, ((c + 1) * per).min(nblocks));
+            if b0 < b1 {
+                match dequantize(ggml_type, &data[b0 * bpb..b1 * bpb], (b1 - b0) * be) {
+                    Ok(v) => unsafe {
+                        // Disjoint by construction: chunk c owns elements [b0*be, b1*be).
+                        std::ptr::copy_nonoverlapping(v.as_ptr(), (out_addr as *mut f32).add(b0 * be), v.len());
+                    },
+                    Err(e) => { *err.lock().unwrap() = Some(e); }
+                }
+            }
+            c += nt;
+        }
+    });
+    match err.into_inner().unwrap() { Some(e) => Err(e), None => Ok(out) }
+}
+
+/// Per-layer census of GATED DELTANET / SSM blocks: `(ssm_layers, total_layers)`.
+///
+/// Qwen3.5 and Qwen3.6 35B-A3B carry `ssm_a`, `ssm_conv1d`, `ssm_dt`, `ssm_alpha`, `ssm_beta` and
+/// `ssm_out` alongside the usual `attn_qkv`, because a Gated DeltaNet layer reuses the attention
+/// projections for its q/k/v and adds the recurrent state on top. Only about one layer in four is a
+/// real softmax-attention block, and those have no `ssm_*` at all.
+///
+/// This matters because the family name predicts the wrong thing. c4-804 registered `qwen35moe`
+/// against the `qwen3moe` shape on the reasoning that "that is what the family has been", and the
+/// operator's tensor dump falsified it on the first load: blk.0 is a DeltaNet layer. Counting the
+/// blocks turns "unknown architecture" into a number that says how much of the model has nowhere to
+/// run — which is the difference between a missing registry line and a missing forward pass.
+/// How many `blk.N.` blocks the TENSORS describe, regardless of what metadata claims.
+///
+/// `{arch}.block_count` requires knowing the hparam prefix, and the prefix is not reliably the
+/// architecture name: this loader already carries an override for files whose hparams sit under a
+/// different one ("hparam prefix is 'dream.' — using the file's prefix"). That override runs AFTER
+/// the recurrent census, so the census looked up `qwen35moe.block_count`, got None, counted zero
+/// blocks and stayed silent on a model with thirty recurrent layers — which is how the operator got
+/// a row-count error from deep in the attention loader instead of "this model is hybrid".
+///
+/// The tensor names cannot have that problem. They are the thing being loaded.
+pub fn block_count_from_tensors(g: &Gguf) -> usize {
+    let mut max = None;
+    for t in &g.tensors {
+        let Some(rest) = t.name.strip_prefix("blk.") else { continue };
+        let Some((num, _)) = rest.split_once('.') else { continue };
+        if let Ok(i) = num.parse::<usize>() {
+            max = Some(max.map_or(i, |m: usize| m.max(i)));
+        }
+    }
+    max.map_or(0, |m| m + 1)
+}
+
+pub fn ssm_layer_census(g: &Gguf, n_layers: usize) -> (usize, usize) {
+    // A caller that could not resolve the block count gets the tensors' answer rather than zero.
+    // Returning (0, 0) reads as "no recurrent layers", which is the one wrong thing to say.
+    let n_layers = if n_layers == 0 { block_count_from_tensors(g) } else { n_layers };
+    let mut ssm = 0;
+    for i in 0..n_layers {
+        let p = format!("blk.{i}.");
+        if g.tensors.iter().any(|t| t.name.starts_with(&p) && t.name[p.len()..].starts_with("ssm_")) {
+            ssm += 1;
+        }
+    }
+    (ssm, n_layers)
+}
+
+#[cfg(test)]
+mod ssm_census {
+    use super::*;
+
+    fn ti(name: &str) -> TensorInfo {
+        TensorInfo { name: name.to_string(), dims: vec![1], ggml_type: 0, offset: 0 }
+    }
+
+    /// The 3:1 layout the operator's dump implies — three DeltaNet layers then one attention layer.
+    #[test]
+    fn it_counts_only_the_layers_that_carry_ssm_tensors() {
+        let mut g = Gguf { version: 3, metadata: HashMap::new(), tensors: Vec::new(), data_offset: 0 };
+        for i in 0..8 {
+            g.tensors.push(ti(&format!("blk.{i}.attn_qkv.weight")));
+            if i % 4 != 3 {                       // 0,1,2 / 4,5,6 are DeltaNet
+                g.tensors.push(ti(&format!("blk.{i}.ssm_conv1d.weight")));
+                g.tensors.push(ti(&format!("blk.{i}.ssm_a")));
+            }
+        }
+        assert_eq!(ssm_layer_census(&g, 8), (6, 8), "six of eight layers are DeltaNet");
+    }
+
+    /// A plain transformer must census as zero — otherwise every Qwen3 load would claim to be hybrid.
+    #[test]
+    fn a_conventional_model_censuses_as_zero() {
+        let mut g = Gguf { version: 3, metadata: HashMap::new(), tensors: Vec::new(), data_offset: 0 };
+        for i in 0..4 { g.tensors.push(ti(&format!("blk.{i}.attn_qkv.weight"))); }
+        assert_eq!(ssm_layer_census(&g, 4), (0, 4));
+    }
+
+    /// Prefix matching must not confuse blk.1 with blk.10 — an off-by-a-block census would misreport
+    /// the ratio on any model with ten or more layers.
+    #[test]
+    fn block_numbers_do_not_prefix_match_each_other() {
+        let mut g = Gguf { version: 3, metadata: HashMap::new(), tensors: Vec::new(), data_offset: 0 };
+        g.tensors.push(ti("blk.10.ssm_a"));
+        assert_eq!(ssm_layer_census(&g, 2), (0, 2), "blk.10 must not count as blk.1");
+        assert_eq!(ssm_layer_census(&g, 11).0, 1);
+    }
+}
+
+#[cfg(test)]
+mod block_count_from_names {
+    use super::*;
+    fn ti(name: &str) -> TensorInfo {
+        TensorInfo { name: name.to_string(), dims: vec![1], ggml_type: 0, offset: 0 }
+    }
+    fn g_with(names: &[&str]) -> Gguf {
+        Gguf { version: 3, metadata: HashMap::new(),
+               tensors: names.iter().map(|n| ti(n)).collect(), data_offset: 0 }
+    }
+
+    /// The count comes from the highest block index, not the number of blk.* tensors — a layer with
+    /// eleven tensors is still one layer.
+    #[test]
+    fn it_counts_blocks_not_tensors() {
+        let g = g_with(&["blk.0.attn_qkv.weight", "blk.0.ssm_a", "blk.0.ffn_up.weight",
+                         "blk.1.attn_qkv.weight", "token_embd.weight", "output_norm.weight"]);
+        assert_eq!(block_count_from_tensors(&g), 2);
+    }
+
+    /// Double digits must not sort as strings — "blk.9" beating "blk.10" would under-count every
+    /// model with ten or more layers, which is all of them.
+    #[test]
+    fn double_digit_blocks_are_counted_numerically() {
+        let g = g_with(&["blk.9.attn_qkv.weight", "blk.10.attn_qkv.weight", "blk.39.ssm_a"]);
+        assert_eq!(block_count_from_tensors(&g), 40);
+    }
+
+    /// A census given zero must consult the tensors, because zero is exactly what a failed metadata
+    /// lookup produces and (0, 0) reads as "not recurrent".
+    #[test]
+    fn a_zero_block_count_falls_back_to_the_tensors() {
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..40 {
+            names.push(format!("blk.{i}.attn_qkv.weight"));
+            if i < 30 { names.push(format!("blk.{i}.ssm_conv1d.weight")); }
+        }
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let g = g_with(&refs);
+        assert_eq!(ssm_layer_census(&g, 0), (30, 40),
+            "the operator's Qwen3.6 shape: 30 of 40 recurrent, found without any metadata");
+        assert_eq!(ssm_layer_census(&g, 40), (30, 40), "and unchanged when the count IS known");
+    }
+
+    #[test]
+    fn malformed_names_do_not_panic_or_inflate() {
+        let g = g_with(&["blk.notanumber.weight", "blk.", "blkx.3.weight", "blk.2.attn_qkv.weight"]);
+        assert_eq!(block_count_from_tensors(&g), 3);
+    }
+}
+
+/// Read an hparam that CANNOT legitimately be zero, distinguishing absent from present-and-zero.
+///
+/// `get_u32(...).unwrap_or(0)` collapses those two cases, and the collapse is only harmless when
+/// zero is a real answer. For `expert_count` it is — zero means dense. For `block_count` and
+/// `embedding_length` it is not: a model with no layers or no width cannot exist, so zero always
+/// means the key was missing, which in practice means the hparam PREFIX is wrong.
+///
+/// That has cost real time twice. The converter in c4-791 read `n_routed_experts` from a config
+/// that spells it `num_experts`, defaulted to zero, and would have described a 256-expert MoE as
+/// dense. The recurrent census in c4-815 read `{prefix}.block_count`, got nothing, censused zero
+/// blocks and reported a hybrid model as conventional. Both loaded. Neither complained.
+pub fn required_u32(g: &Gguf, prefix: &str, key: &str) -> Result<u32, String> {
+    let full = format!("{prefix}.{key}");
+    match g.get_u32(&full) {
+        Some(v) if v > 0 => Ok(v),
+        Some(_) => Err(format!("{full} is present but ZERO, which is not a possible value — the file \
+is malformed or was written by a converter that did not fill it in")),
+        None => {
+            // Name a prefix that WOULD have worked, because the usual cause is that hparams sit
+            // under a different one than general.architecture (this loader already carries an
+            // override for that: "hparam prefix is 'dream.' — using the file's prefix").
+            let alt: Vec<String> = g.metadata.keys()
+                .filter(|k| k.ends_with(&format!(".{key}")))
+                .map(|k| k[..k.len() - key.len() - 1].to_string())
+                .collect();
+            let hint = if alt.is_empty() {
+                "and no key of that name exists under ANY prefix".to_string()
+            } else {
+                format!("but it IS present as {:?} — the hparam prefix is not the architecture name", alt)
+            };
+            Err(format!("{full} is absent, {hint}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod required_hparams {
+    use super::*;
+
+    fn g_with(pairs: &[(&str, u32)]) -> Gguf {
+        let mut m = HashMap::new();
+        for (k, v) in pairs { m.insert(k.to_string(), Value::U32(*v)); }
+        Gguf { version: 3, metadata: m, tensors: Vec::new(), data_offset: 0 }
+    }
+
+    #[test]
+    fn a_present_value_is_returned() {
+        let g = g_with(&[("qwen3.block_count", 40)]);
+        assert_eq!(required_u32(&g, "qwen3", "block_count"), Ok(40));
+    }
+
+    /// The case that cost two investigations: present under a DIFFERENT prefix. The error must name
+    /// the prefix that would have worked, because "absent" alone sends the reader to the file.
+    #[test]
+    fn a_prefix_mismatch_names_the_prefix_that_works() {
+        let g = g_with(&[("qwen3moe.block_count", 40)]);
+        let e = required_u32(&g, "qwen35moe", "block_count").unwrap_err();
+        assert!(e.contains("qwen3moe"), "must name the working prefix: {e}");
+        assert!(e.contains("not the architecture name"), "and say what that means: {e}");
+    }
+
+    /// Absent everywhere is a different problem from absent-here, and must read differently.
+    #[test]
+    fn absent_everywhere_says_so() {
+        let g = g_with(&[("qwen3.embedding_length", 2048)]);
+        let e = required_u32(&g, "qwen3", "block_count").unwrap_err();
+        assert!(e.contains("under ANY prefix"), "{e}");
+    }
+
+    /// Present-and-zero is malformed, not missing — collapsing the two is the bug this exists for.
+    #[test]
+    fn present_but_zero_is_its_own_error() {
+        let g = g_with(&[("qwen3.block_count", 0)]);
+        let e = required_u32(&g, "qwen3", "block_count").unwrap_err();
+        assert!(e.contains("present but ZERO"), "{e}");
+        assert!(!e.contains("absent"), "a zero is not an absence: {e}");
+    }
+}
+
+/// Which blocks carry an MTP / next-token-prediction head, and how many layers the metadata claims.
+///
+/// MTP is a draft head trained alongside the model and shipped IN the same file, under
+/// `blk.{N}.nextn.*` (eh_proj, enorm, hnorm, shared_head_head, ...) with `{arch}.nextn_predict_layers`
+/// declaring how many. llama.cpp consumes it as `--spec-type draft-mtp`.
+///
+/// This matters here more than for most engines. The phase-balance verdict has been saying the same
+/// thing for a dozen bundles — "decode has nothing in flight to cover memory latency; what is
+/// missing is something producing more than one candidate token, which is speculative decoding" —
+/// and the operator's decode sits at 3% of roofline. Speculative decoding has always been the named
+/// lever and always carried the same cost: finding, loading and aligning a separate draft model.
+///
+/// An MTP head removes that cost. The draft is already in the file, already shares the tokenizer,
+/// already trained on the same data. Qwen3.8-27B-MTP reports 77.9% acceptance and ~2x throughput
+/// from exactly this.
+///
+/// Detection only. Nothing here runs the head — but a file that carries one and is loaded as if it
+/// did not is leaving that factor on the table silently, which is the kind of thing this loader
+/// should say out loud.
+pub fn mtp_census(g: &Gguf, prefix: &str) -> (usize, Option<u32>) {
+    let n_layers = block_count_from_tensors(g);
+    let mut with_head = 0;
+    for i in 0..n_layers {
+        let p = format!("blk.{i}.nextn.");
+        if g.tensors.iter().any(|t| t.name.starts_with(&p)) { with_head += 1; }
+    }
+    (with_head, g.get_u32(&format!("{prefix}.nextn_predict_layers")))
+}
+
+#[cfg(test)]
+mod mtp_detection {
+    use super::*;
+
+    fn ti(name: &str) -> TensorInfo {
+        TensorInfo { name: name.to_string(), dims: vec![1], ggml_type: 0, offset: 0 }
+    }
+    fn g_with(names: &[String], kv: &[(&str, u32)]) -> Gguf {
+        let mut m = HashMap::new();
+        for (k, v) in kv { m.insert(k.to_string(), Value::U32(*v)); }
+        Gguf { version: 3, metadata: m, tensors: names.iter().map(|n| ti(n)).collect(), data_offset: 0 }
+    }
+
+    #[test]
+    fn a_model_with_no_draft_head_reports_none() {
+        let names: Vec<String> = (0..4).map(|i| format!("blk.{i}.attn_qkv.weight")).collect();
+        assert_eq!(mtp_census(&g_with(&names, &[]), "qwen38"), (0, None));
+    }
+
+    /// The real shape: a head on the last block or two, with the count in metadata.
+    #[test]
+    fn the_draft_head_is_found_and_counted() {
+        let mut names: Vec<String> = (0..64).map(|i| format!("blk.{i}.attn_qkv.weight")).collect();
+        for t in ["eh_proj", "enorm", "hnorm", "shared_head_head"] {
+            names.push(format!("blk.63.nextn.{t}"));
+        }
+        let (n, declared) = mtp_census(&g_with(&names, &[("qwen38.nextn_predict_layers", 1)]), "qwen38");
+        assert_eq!(n, 1, "one block carries the head");
+        assert_eq!(declared, Some(1));
+    }
+
+    /// Metadata and tensors can disagree, and the tensors are what would actually run. Reporting
+    /// both is the same discipline the recurrent census learned in c4-815, where trusting a
+    /// prefixed metadata key over the tensor names hid a hybrid model.
+    #[test]
+    fn tensors_and_metadata_are_reported_separately() {
+        let mut names: Vec<String> = (0..8).map(|i| format!("blk.{i}.attn_qkv.weight")).collect();
+        names.push("blk.7.nextn.eh_proj".to_string());
+        // Metadata claims two, only one is present.
+        let (n, declared) = mtp_census(&g_with(&names, &[("x.nextn_predict_layers", 2)]), "x");
+        assert_eq!((n, declared), (1, Some(2)),
+            "the caller must be able to see the disagreement rather than being handed one number");
+    }
+
+    /// A wrong prefix loses the metadata but never the tensors — the failure mode that cost three
+    /// theories in c4-815.
+    #[test]
+    fn the_tensor_count_survives_a_prefix_mismatch() {
+        let mut names: Vec<String> = (0..4).map(|i| format!("blk.{i}.attn_qkv.weight")).collect();
+        names.push("blk.3.nextn.eh_proj".to_string());
+        let (n, declared) = mtp_census(&g_with(&names, &[("right.nextn_predict_layers", 1)]), "wrong");
+        assert_eq!(n, 1, "tensors do not depend on a prefix");
+        assert_eq!(declared, None);
     }
 }

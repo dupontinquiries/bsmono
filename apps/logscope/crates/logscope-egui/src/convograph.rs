@@ -99,10 +99,35 @@ fn human_bytes(b: u64) -> String {
     else { format!("{:.2} GiB", b as f64 / (K * K * K) as f64) }
 }
 
+/// A CROSS edge: one worker's message that was fed into another worker's context.
+///
+/// Distinct from `Node::parent` (this conversation's own history) and from `Node::refers` (a
+/// semantic reference inside one conversation), because it is neither — it is data that moved
+/// BETWEEN conversations, and in replicator mode that is the one thing a reader cannot infer from
+/// a transcript. A worker that suddenly stops rewriting the parser did so because something
+/// crossed; without the edge, the reason lives only in the other column.
+///
+/// Keyed by uuid rather than node index on purpose: each worker owns its own `Graph`, indices are
+/// positional within one of them, and a cross edge by definition has its ends in two different
+/// graphs. Both renderers (the linear spine and the spatial scene) resolve uuid → position with
+/// the lookup they already have.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CrossEdge {
+    pub from: u128,
+    pub to: u128,
+    /// Receiving worker's turn — the renderer fades older edges with this.
+    pub turn: usize,
+    /// Characters carried; edge weight. A status line and a wall of code should not draw alike.
+    pub chars: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub head: Option<usize>, // the current leaf
+    /// Cross-conversation deliveries touching this graph, either direction. Empty outside
+    /// replicator mode, which is why nothing else has to know about them.
+    pub crossings: Vec<CrossEdge>,
 }
 
 impl Graph {
@@ -124,7 +149,7 @@ impl Graph {
             parent = Some(id);
         }
         let head = nodes.last().map(|n| n.id);
-        Graph { nodes, head }
+        Graph { nodes, head, crossings: Vec::new() }
     }
 
     /// Build a branching tree from turns that each name their parent (None = a root). `head` is the
@@ -144,7 +169,7 @@ impl Graph {
         }
         let n = nodes.len();
         let head = head.filter(|&h| h < n).or(if n > 0 { Some(n - 1) } else { None });
-        Graph { nodes, head }
+        Graph { nodes, head, crossings: Vec::new() }
     }
 
     /// Append a live TEXT turn (parent defaults to the current head) and return its uuid — the incremental

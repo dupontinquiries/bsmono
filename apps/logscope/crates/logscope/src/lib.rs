@@ -10,6 +10,7 @@ pub mod persona;
 pub mod gpumetrics;
 pub mod tuneprofile;
 pub mod modelorg;
+pub mod replicator;
 pub mod residency;
 pub mod liaison;
 pub mod liaison_prompt;

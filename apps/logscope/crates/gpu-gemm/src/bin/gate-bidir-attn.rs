@@ -26,6 +26,49 @@
 
 use gpu_kernels::*;
 
+
+/// PARTIAL RoPE vs the reference formula (modeling_llada2_moe.py apply_rotary_pos_emb): the first
+/// `rot` dims of each head rotate with rotate_half pairing over the ROT block (j, j+rot/2), freq
+/// exponent 2j/rot; lanes [rot, hd) pass through untouched. rot==hd must equal the old full path.
+fn rope_reference(x: &[f32], t: usize, dm: usize, hd: usize, rot: usize, base: f32, neox: bool) -> Vec<f32> {
+    let mut o = x.to_vec();
+    let heads = dm / hd;
+    for tok in 0..t { for h in 0..heads {
+        let off = tok * dm + h * hd;
+        for j in 0..rot / 2 {
+            let freq = tok as f32 / (base.powf(2.0 * j as f32 / rot as f32));
+            let (c, s_) = (freq.cos(), freq.sin());
+            let (j0, j1) = if neox { (off + j, off + j + rot / 2) } else { (off + 2 * j, off + 2 * j + 1) };
+            let (x0, x1) = (x[j0], x[j1]);
+            o[j0] = x0 * c - x1 * s_;
+            o[j1] = x0 * s_ + x1 * c;
+        }
+    }}
+    o
+}
+
+fn gate_rope_partial(gpu: &Gpu, ck: &mut dyn FnMut(&str, bool)) {
+    let (t, hd, heads) = (5usize, 16usize, 3usize);
+    let dm = hd * heads;
+    let x: Vec<f32> = (0..t * dm).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013).collect();
+    let ffv = vec![1.0f32; hd / 2];
+    for neox in [true, false] {
+        gpu.rope_neox.store(neox, std::sync::atomic::Ordering::Relaxed);
+        for rot in [hd, hd / 2] {
+            gpu.rope_dims.store(rot as u32, std::sync::atomic::Ordering::Relaxed);
+            let xt = gpu.upload(&x, t, dm);
+            let ff = gpu.upload(&ffv, 1, hd / 2);
+            let got = gpu.download(&gpu.rope_mh_t(&xt, &ff, t, dm, 10000.0, 0, hd));
+            let want = rope_reference(&x, t, dm, hd, rot, 10000.0, neox);
+            let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            ck(&format!("rope {} rot={rot}/{hd} vs reference (worst {worst:.2e})",
+                if neox { "NEOX" } else { "NORM" }), worst < 1e-5);
+        }
+    }
+    gpu.rope_dims.store(0, std::sync::atomic::Ordering::Relaxed);
+    gpu.rope_neox.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn main() {
     let gpu = Gpu::new();
     eprintln!("gate-bidir-attn: adapter = {}", gpu.adapter_name);
@@ -34,6 +77,7 @@ fn main() {
         ok &= v;
         println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" });
     };
+    gate_rope_partial(&gpu, &mut ck);
 
     let mut rng = 0xb1d1_4770_0000_0001u64;
     let mut rnd = || {
@@ -58,7 +102,7 @@ fn main() {
         let q = gpu.upload(&qv, t, dm);
         let k = gpu.upload(&kv, t, kvdm);
         let v = gpu.upload(&vv, t, kvdm);
-        let got = gpu.download(&gpu.attention_mh_bidir_tiled(&q, &k, &v, t, dm, nh, nkv));
+        let got = gpu.download(&gpu.attention_mh_bidir_tiled(&q, &k, &v, t, dm, nh, nkv, 0));
         let naive = gpu.download(&gpu.attention_mh_full_t(&q, &k, &v, t, dm, nh, nkv));
         let mut worst_twin = 0.0f32; // tiled vs naive GPU: the f32-vs-f32 metric class
         for (g, nv) in got.iter().zip(&naive) {

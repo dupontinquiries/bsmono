@@ -1322,6 +1322,13 @@ fn carved_button_impl(ui: &mut egui::Ui, text: &str, accent: Option<Color32>) ->
 /// The accent that suits the current scene — warm amber for the wood/paper/marble libraries, cool teal for
 /// the stone/fog scenes, biological green for Folding@home. Used for forefront highlights so a warm room
 /// never shows a cold blue glow (and vice-versa).
+/// The colour reserved for CROSSED data — a message that moved from one worker's conversation into
+/// another's. Deliberately not the accent (which means "selected") and not a status colour (which
+/// means "good/bad"): a crossing is neither a selection nor a verdict, it is provenance, and it
+/// needs to read as its own category at a glance in both the linear graph and the spatial scene.
+/// Violet sits outside every other role this palette assigns.
+pub fn CROSSING() -> Color32 { Color32::from_rgb(0xA0, 0x7C, 0xE8) }
+
 pub fn accent() -> Color32 {
     let p = active();
     match p.name {

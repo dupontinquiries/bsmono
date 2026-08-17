@@ -444,7 +444,8 @@ impl eframe::App for LogscopeApp {
                         let est = |n: &str| sizes_ref.get(n).copied().unwrap_or(4_000_000_000);
                         egui::Window::new("Active pipeline")
                             .open(&mut open)
-                            .default_width(480.0)
+                            .default_width(crate::mobilelayout::dialog_width(ui.ctx().screen_rect().width(), 480.0))
+                            .max_width(crate::mobilelayout::dialog_width(ui.ctx().screen_rect().width(), 480.0))
                             .show(ui.ctx(), |ui| {
                                 ui.label(RichText::new("pick the model for each stage").color(theme::DIM()).small());
                                 // WHAT YOU ARE ACTUALLY TALKING TO, resolved once and stated here. This
