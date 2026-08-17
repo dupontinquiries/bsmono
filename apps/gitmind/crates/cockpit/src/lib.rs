@@ -17,6 +17,8 @@ pub mod fleet;
 pub mod reroll;
 /// The fleet, remembered between runs: stable ids, IP churn, wipe detection.
 pub mod roster;
+/// A run in progress, folded from the event stream into what a UI draws.
+pub mod runview;
 pub mod flow;
 pub mod identity;
 pub mod importer;
