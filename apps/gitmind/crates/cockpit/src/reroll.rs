@@ -60,6 +60,13 @@ pub struct Device {
     pub triple: String,
     pub enrollment: Enrollment,
     pub reach: Reach,
+    /// The name the roster wants this device to answer to. `None` means the
+    /// operator has not chosen one and the device keeps whatever it has —
+    /// renaming a phone to a name nobody picked is worse than a default.
+    pub desired_hostname: Option<String>,
+    /// Is the package index known-stale? True after a wipe, and after a join,
+    /// until a refresh has run.
+    pub needs_refresh: bool,
 }
 
 /// What a run has to do before it can install anything.
@@ -69,6 +76,20 @@ pub enum Step {
     /// key. Carries the device id, not a password — a plan is a value that
     /// gets logged and compared, and a secret in it would end up in both.
     Enroll { device: String },
+    /// Set the device's hostname to the name the roster gives it.
+    ///
+    /// A fresh image comes up with whatever the distro chose, and several
+    /// identical phones then answer to the same name — which is precisely
+    /// when the operator most needs to tell them apart. Renaming from the
+    /// roster means the naming scheme lives in one place instead of being
+    /// retyped on each handset after each wipe.
+    Rename { device: String, hostname: String },
+    /// Refresh the package index before anything is installed.
+    ///
+    /// A just-imaged phone has a stale apk index, and installing against it
+    /// fails on missing dependencies in a way that reads like a broken
+    /// package rather than an out-of-date list.
+    Refresh { device: String },
     /// Build an app for a target, once, however many devices want it.
     Build { app: String, triple: String },
     /// Copy the built binary and write its `.desktop` entry.
@@ -138,6 +159,20 @@ pub fn plan(devices: &[Device], apps: &[String]) -> Plan {
     // is a build with nowhere to go.
     for d in live.iter().filter(|d| d.enrollment == Enrollment::None) {
         steps.push(Step::Enroll { device: d.id.clone() });
+    }
+
+    // Then rename, then refresh — both before the first install, and in that
+    // order. Renaming after a refresh would leave the operator watching
+    // progress against a name that changes underneath them mid-run.
+    for d in &live {
+        if let Some(want) = &d.desired_hostname {
+            if !want.is_empty() {
+                steps.push(Step::Rename { device: d.id.clone(), hostname: want.clone() });
+            }
+        }
+    }
+    for d in live.iter().filter(|d| d.needs_refresh) {
+        steps.push(Step::Refresh { device: d.id.clone() });
     }
 
     // One build per (app, triple). Three phones on the same architecture is
@@ -260,6 +295,10 @@ pub trait Runner {
     fn build(&mut self, app: &str, triple: &str) -> Result<(), String>;
     /// Copy the binary and write the `.desktop` entry.
     fn install(&mut self, app: &str, device: &str) -> Result<(), String>;
+    /// Set the device's hostname.
+    fn rename(&mut self, device: &str, hostname: &str) -> Result<(), String>;
+    /// Refresh the package index (`apk update`).
+    fn refresh(&mut self, device: &str) -> Result<(), String>;
     /// Which triple a device needs — the executor has the plan, not the
     /// roster, and a failed build has to know which installs it invalidated.
     fn triple_of(&self, device: &str) -> Option<String>;
@@ -300,6 +339,43 @@ pub fn run<R: Runner>(plan: &Plan, r: &mut R, on: &mut dyn FnMut(Event)) -> Repo
                     Err(e) => {
                         dead_devices.insert(device.clone(), e.clone());
                         report.record(device, Outcome::EnrollFailed(e.clone()));
+                        on(Event::StepFailed { step: step.clone(), error: e });
+                    }
+                }
+            }
+            Step::Rename { device, hostname } => {
+                if dead_devices.contains_key(device) {
+                    on(Event::StepSkipped { step: step.clone(),
+                        because: "device not reachable".into() });
+                    continue;
+                }
+                on(Event::StepStarted(step.clone()));
+                match r.rename(device, hostname) {
+                    Ok(()) => on(Event::StepDone(step.clone())),
+                    // A rename that fails must NOT stop the installs. The
+                    // phone works fine under the wrong name; refusing to
+                    // deploy over a cosmetic failure would be the tail
+                    // wagging the dog.
+                    Err(e) => on(Event::StepFailed { step: step.clone(), error: e }),
+                }
+            }
+            Step::Refresh { device } => {
+                if dead_devices.contains_key(device) {
+                    on(Event::StepSkipped { step: step.clone(),
+                        because: "device not reachable".into() });
+                    continue;
+                }
+                on(Event::StepStarted(step.clone()));
+                match r.refresh(device) {
+                    Ok(()) => on(Event::StepDone(step.clone())),
+                    Err(e) => {
+                        // A failed refresh DOES block this device: installing
+                        // against a stale index fails on missing dependencies
+                        // and reads like a broken package instead of an
+                        // out-of-date list.
+                        dead_devices.insert(device.clone(), e.clone());
+                        report.record(device, Outcome::InstallFailed {
+                            app: "apk update".into(), error: e.clone() });
                         on(Event::StepFailed { step: step.clone(), error: e });
                     }
                 }
@@ -376,6 +452,8 @@ mod tests {
             triple: triple.into(),
             enrollment: enr,
             reach,
+            desired_hostname: None,
+            needs_refresh: false,
         }
     }
 
@@ -490,6 +568,8 @@ mod tests {
         fail_enroll: Vec<String>,
         fail_build: Vec<(String, String)>,
         fail_install: Vec<(String, String)>,
+        fail_rename: Vec<String>,
+        fail_refresh: Vec<String>,
         did: Vec<String>,
     }
 
@@ -500,6 +580,8 @@ mod tests {
                 fail_enroll: Vec::new(),
                 fail_build: Vec::new(),
                 fail_install: Vec::new(),
+                fail_rename: Vec::new(),
+                fail_refresh: Vec::new(),
                 did: Vec::new(),
             }
         }
@@ -527,6 +609,20 @@ mod tests {
             }
             Ok(())
         }
+        fn rename(&mut self, device: &str, hostname: &str) -> Result<(), String> {
+            self.did.push(format!("rename {device} {hostname}"));
+            if self.fail_rename.iter().any(|d| d == device) {
+                return Err("hostnamectl missing".into());
+            }
+            Ok(())
+        }
+        fn refresh(&mut self, device: &str) -> Result<(), String> {
+            self.did.push(format!("refresh {device}"));
+            if self.fail_refresh.iter().any(|d| d == device) {
+                return Err("no repositories".into());
+            }
+            Ok(())
+        }
         fn triple_of(&self, device: &str) -> Option<String> {
             self.triples.get(device).cloned()
         }
@@ -536,6 +632,76 @@ mod tests {
         let mut events = Vec::new();
         let report = run(plan, f, &mut |e| events.push(e));
         (report, events)
+    }
+
+    // ── rename and refresh ──
+
+    #[test]
+    fn a_fresh_phone_is_named_and_updated_before_anything_installs() {
+        // The order is the point. A rename after the refresh would move the
+        // name out from under a progress display mid-run, and an install
+        // against a stale index fails on missing dependencies in a way that
+        // reads like a broken package.
+        let mut d = dev("fp5", ARM, Enrollment::None, Reach::Online);
+        d.desired_hostname = Some("fp5-blue".into());
+        d.needs_refresh = true;
+        let p = plan(&[d], &["voiceterm".to_string()]);
+        let idx = |m: fn(&Step) -> bool| p.steps.iter().position(m).unwrap();
+        let enroll = idx(|s| matches!(s, Step::Enroll { .. }));
+        let rename = idx(|s| matches!(s, Step::Rename { .. }));
+        let refresh = idx(|s| matches!(s, Step::Refresh { .. }));
+        let install = idx(|s| matches!(s, Step::Install { .. }));
+        assert!(enroll < rename && rename < refresh && refresh < install);
+        assert_eq!(p.steps[rename],
+                   Step::Rename { device: "fp5".into(), hostname: "fp5-blue".into() });
+    }
+
+    #[test]
+    fn a_device_with_no_chosen_name_is_left_alone() {
+        // Renaming a phone to a name nobody picked is worse than a default.
+        let mut d = dev("pine", ARM, Enrollment::Keyed, Reach::Online);
+        d.desired_hostname = None;
+        let p = plan(&[d.clone()], &["v".to_string()]);
+        assert!(!p.steps.iter().any(|s| matches!(s, Step::Rename { .. })));
+        // An empty string is the same as unset, not a request to blank it.
+        d.desired_hostname = Some(String::new());
+        let p = plan(&[d], &["v".to_string()]);
+        assert!(!p.steps.iter().any(|s| matches!(s, Step::Rename { .. })));
+    }
+
+    #[test]
+    fn an_already_updated_phone_is_not_updated_again() {
+        let mut d = dev("pine", ARM, Enrollment::Keyed, Reach::Online);
+        d.needs_refresh = false;
+        let p = plan(&[d], &["v".to_string()]);
+        assert!(!p.steps.iter().any(|s| matches!(s, Step::Refresh { .. })),
+                "apk update on every reroll is a minute per phone for nothing");
+    }
+
+    #[test]
+    fn a_failed_rename_is_cosmetic_but_a_failed_refresh_stops_the_device() {
+        let mut d = dev("fp5", ARM, Enrollment::Keyed, Reach::Online);
+        d.desired_hostname = Some("fp5-blue".into());
+        d.needs_refresh = true;
+        let devices = vec![d];
+        let p = plan(&devices, &["voiceterm".to_string()]);
+
+        // Rename fails: the phone works fine under the wrong name, so the
+        // install still happens. Refusing to deploy over a cosmetic failure
+        // would be the tail wagging the dog.
+        let mut f = Fake::new(&devices);
+        f.fail_rename.push("fp5".into());
+        let (report, _) = drain(&p, &mut f);
+        assert!(f.did.contains(&"install voiceterm fp5".to_string()));
+        assert!(report.per_device["fp5"].ok());
+
+        // Refresh fails: the index is stale, so the install WOULD fail on a
+        // missing dependency and blame the package. Stop here instead.
+        let mut f = Fake::new(&devices);
+        f.fail_refresh.push("fp5".into());
+        let (report, _) = drain(&p, &mut f);
+        assert!(!f.did.contains(&"install voiceterm fp5".to_string()));
+        assert!(!report.per_device["fp5"].ok());
     }
 
     #[test]

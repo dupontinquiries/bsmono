@@ -301,6 +301,8 @@ mod tests {
             enrollment: crate::reroll::Enrollment::Keyed,
             host_key: Some(r.host_key.clone()),
             online: true,
+            // A phone that just joined was just imaged: its apk index is old.
+            needs_refresh: true,
         };
         let mut roster = crate::roster::Roster::default();
         roster.add(entry).unwrap();

@@ -59,6 +59,10 @@ pub struct Entry {
     pub host_key: Option<String>,
     /// Was it in the most recent scan?
     pub online: bool,
+    /// Package index known-stale. Set on a reflash, cleared by a refresh —
+    /// a just-imaged phone always needs `apk update` before anything installs
+    /// against it.
+    pub needs_refresh: bool,
 }
 
 impl Entry {
@@ -71,6 +75,11 @@ impl Entry {
             triple: self.triple.clone(),
             enrollment: self.enrollment,
             reach: if self.online { Reach::Online } else { Reach::Offline },
+            // The roster's name is the intended one; a device answering to
+            // something else gets renamed rather than the roster relabelling
+            // itself to match whatever the phone happens to say.
+            desired_hostname: Some(self.hostname.clone()),
+            needs_refresh: self.needs_refresh,
         }
     }
 }
@@ -158,6 +167,8 @@ impl Roster {
                         (Some(old), Some(new)) if old != new => {
                             e.host_key = Some(new.clone());
                             e.enrollment = Enrollment::None;
+                            // A new OS means a stale index too.
+                            e.needs_refresh = true;
                             changes.push(Change::Reflashed { id: e.id.clone() });
                         }
                         // First time we have managed to read one: record it,
@@ -220,6 +231,7 @@ mod tests {
             enrollment: Enrollment::Keyed,
             host_key: Some("KEY-A".into()),
             online: true,
+            needs_refresh: false,
         }
     }
 

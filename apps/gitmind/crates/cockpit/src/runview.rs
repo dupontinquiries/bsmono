@@ -30,6 +30,8 @@ pub enum RowState {
     /// On the roster, nothing has happened to it yet this run.
     Waiting,
     Enrolling,
+    Renaming,
+    Refreshing,
     /// Installing an app, named so the row says which.
     Installing(String),
     /// Everything the plan had for it succeeded.
@@ -42,13 +44,16 @@ pub enum RowState {
 impl RowState {
     /// Is this device still going to change?
     pub fn active(&self) -> bool {
-        matches!(self, RowState::Waiting | RowState::Enrolling | RowState::Installing(_))
+        matches!(self, RowState::Waiting | RowState::Enrolling | RowState::Renaming
+                     | RowState::Refreshing | RowState::Installing(_))
     }
 
     pub fn line(&self) -> String {
         match self {
             RowState::Waiting => "waiting".into(),
             RowState::Enrolling => "pairing…".into(),
+            RowState::Renaming => "renaming…".into(),
+            RowState::Refreshing => "updating package index…".into(),
             RowState::Installing(app) => format!("installing {app}…"),
             RowState::Done { apps } => {
                 format!("{apps} app{} installed", if *apps == 1 { "" } else { "s" })
@@ -145,6 +150,12 @@ impl RunView {
                         self.rows.insert(device.clone(), RowState::Installing(app.clone()));
                     }
                     Step::Build { app, .. } => self.building = Some(app.clone()),
+                    Step::Rename { device, .. } => {
+                        self.rows.insert(device.clone(), RowState::Renaming);
+                    }
+                    Step::Refresh { device } => {
+                        self.rows.insert(device.clone(), RowState::Refreshing);
+                    }
                 }
             }
             Event::StepDone(step) => {
@@ -157,9 +168,12 @@ impl RunView {
                         *n += 1;
                         self.rows.insert(device.clone(), RowState::Done { apps: *n });
                     }
-                    // A successful enrolment is not a finished device; it goes
-                    // back to waiting for its installs.
-                    Step::Enroll { device } => {
+                    // Enrolment, rename and refresh are all stages, not
+                    // finish lines: the device goes back to waiting for the
+                    // installs that are the actual point.
+                    Step::Enroll { device }
+                    | Step::Rename { device, .. }
+                    | Step::Refresh { device } => {
                         self.rows.insert(device.clone(), RowState::Waiting);
                     }
                 }
@@ -199,6 +213,8 @@ impl RunView {
 fn device_of(step: &Step) -> Option<String> {
     match step {
         Step::Enroll { device } => Some(device.clone()),
+        Step::Rename { device, .. } => Some(device.clone()),
+        Step::Refresh { device } => Some(device.clone()),
         Step::Install { device, .. } => Some(device.clone()),
         Step::Build { .. } => None,
     }
@@ -207,6 +223,8 @@ fn device_of(step: &Step) -> Option<String> {
 fn describe(step: &Step) -> String {
     match step {
         Step::Enroll { device } => format!("pairing with {device}"),
+    Step::Rename { device, hostname } => format!("renaming {device} to {hostname}"),
+    Step::Refresh { device } => format!("updating package index on {device}"),
         Step::Build { app, triple } => format!("building {app} for {triple}"),
         Step::Install { app, device } => format!("installing {app} on {device}"),
     }
@@ -225,6 +243,8 @@ mod tests {
             triple: "aarch64-unknown-linux-gnu".into(),
             enrollment: enr,
             reach,
+            desired_hostname: None,
+            needs_refresh: false,
         }
     }
 
