@@ -272,6 +272,41 @@ impl Anc {
     }
 }
 
+/// The playbar chip: mode button plus the reason line.
+///
+/// Lives in the transport strip rather than on a page, because the operator
+/// has to be able to kill the anti-noise at any moment — including while
+/// using the sleep engine or the theatre setup, where an ANC page would mean
+/// switching apps to switch it off. Returns the new mode when tapped.
+pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc,
+                c: &uikit_egui::PaletteColors) -> Option<Mode> {
+    let mut changed = None;
+    ui.horizontal(|ui| {
+        let s = a.status();
+        // The dot colours the STATE, not the mode: an operator glancing at
+        // the bar wants to know whether anti-noise is leaving the speakers,
+        // which "Auto" alone does not say.
+        let dot = if s.is_fault() {
+            c.warning
+        } else if s.emitting() {
+            c.accent
+        } else {
+            c.text_weak
+        };
+        ui.colored_label(dot, "●");
+        if ui.selectable_label(a.mode != Mode::Off, format!("ANC {}", a.mode.label()))
+            .on_hover_text("Off · Auto · On")
+            .clicked()
+        {
+            changed = Some(a.cycle());
+        }
+        // The reason, always — a silent canceller with no explanation is the
+        // thing that makes an operator stop trusting the control.
+        ui.colored_label(c.text_weak, egui::RichText::new(a.readout()).small());
+    });
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

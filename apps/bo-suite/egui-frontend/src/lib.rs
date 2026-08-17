@@ -190,6 +190,8 @@ pub struct Controller {
     /// library that forgot its page, or a mixer that forgot its bands, is the
     /// same empty demo by another route.
     pub transport: crate::transport::Transport,
+    /// Active noise cancellation: the operator's mode over the engine's gates.
+    pub anc: crate::anc::Anc,
     pub routing: crate::spaces::Routing,
     /// Search state plus the catalogue it filters. The library module models
     /// SEARCH over a track list rather than owning a paged list, so the tracks
@@ -306,6 +308,7 @@ impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
         Controller { view_idx: 0, devices, scenes, active_scene: 0,
             transport: Default::default(),
+            anc: Default::default(),
             routing: Default::default(),
             search: Default::default(),
             catalog: Default::default(),
@@ -1013,6 +1016,12 @@ impl Controller {
         if let Some(msg) = self.toast.visible() {
             ui.colored_label(c.warning, msg);
         }
+        // THE ANC CHIP, in the playbar. This app is three products over an
+        // ANC mesh, and the operator must be able to reach the anti-noise
+        // from wherever they are — a page for it means switching away from
+        // the sleep engine to turn it off, which is when they most want it.
+        // The engine's own gates decide in Auto; this only says which mode.
+        crate::anc::anc_chip(ui, &mut self.anc, c);
         if self.now.active() { ui.label(self.now.line()); }
         crate::transport::transport_ui(ui, &mut self.transport, c);
     }
@@ -1390,6 +1399,25 @@ mod tests {
         assert!(s.halo() > 0.0, "a real change bloomed");
         // Same shape again — a refresh — must NOT restart the halo.
         assert!(!s.set_shape(crate::product_silhouette::Shape::parse("bar")));
+    }
+
+    #[test]
+    fn the_anc_chip_is_reachable_from_the_playbar_in_every_mode() {
+        // The chip lives in transport_strip, which draws on every page —
+        // that is the whole requirement: the operator can kill the
+        // anti-noise without leaving the sleep engine or the theatre setup.
+        let mut c = Controller::new(vec![], vec![]);
+        assert_eq!(c.anc.mode, crate::anc::Mode::Auto, "auto by default");
+        // Cycling from the bar reaches every mode and comes back.
+        assert_eq!(c.anc.cycle(), crate::anc::Mode::Forced);
+        assert_eq!(c.anc.cycle(), crate::anc::Mode::Off);
+        assert_eq!(c.anc.cycle(), crate::anc::Mode::Auto);
+        // And the strip has something to say in each of them, so the chip is
+        // never a light with no explanation.
+        for _ in 0..3 {
+            assert!(!c.anc.readout().is_empty());
+            c.anc.cycle();
+        }
     }
 
     #[test]
