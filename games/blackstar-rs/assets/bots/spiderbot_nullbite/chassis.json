@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_spiderbot_nullbite.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 60,
+  "vertices": 29261,
+  "triangles": 42488,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.85,
+   "grounded": 0.18
+  }
+ }
+}

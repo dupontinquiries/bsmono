@@ -104,9 +104,13 @@ pub fn ring(ui: &mut Vec<UiVert>, cx: f32, cy: f32, r: f32, w: f32, aspect: f32,
 /// needs, the name is the thing the eye wants only for what it just
 /// pressed.
 pub fn draw_hotbar(ui: &mut Vec<UiVert>, a: f32, hb: &crate::hotbar::Hotbar) {
-    if hb.is_empty() {
-        return; // nothing armed: no furniture on screen
-    }
+    // Used to return here on hb.is_empty() ("nothing armed: no furniture
+    // on screen") -- but a fresh save has no hotbar line at all
+    // (Hotbar::from_line("") assigns nothing), so a brand-new player
+    // never saw the bar exist in the first place, empty or otherwise,
+    // and had no way to discover where assigned weapons would even show
+    // up. Always drawn now: nine numbered, empty-but-visible slots read
+    // as "here is where your kit goes," not as nothing.
     let cells = crate::hotbar::SLOTS;
     let cw = 0.072;
     let gap = 0.008;

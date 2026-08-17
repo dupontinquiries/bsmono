@@ -91,6 +91,7 @@ pub struct Bot {
     /// body and its wounds cannot drift apart — the same reason main.rs gives
     /// for the player holding its own.
     pub body: crate::sections::Body,
+    pub grime: crate::grime::Grime,
     pub car: Car,
     pub team: u8,
     pub model: usize,
@@ -181,6 +182,7 @@ pub fn mk_bot_brain(pos: Vec3, yaw: f32, team: u8, i: usize, brain: Brain) -> Bo
     car.boost = 100.0;
     Bot {
         body: crate::sections::Body::default(),
+        grime: crate::grime::Grime::default(),
         car,
         team,
         model: i % 3,

@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_animal_bot_runningwind.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 56,
+  "vertices": 26714,
+  "triangles": 45117,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.9,
+   "grounded": 0.31
+  }
+ }
+}

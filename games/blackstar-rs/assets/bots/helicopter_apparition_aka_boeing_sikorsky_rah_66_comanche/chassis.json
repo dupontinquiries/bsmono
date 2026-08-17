@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_helicopter_apparition_aka_boeing_sikorsky_rah_66_comanche.iqm",
+ "foldview": {
+  "category": "heli",
+  "poses": 5,
+  "prims": 56,
+  "vertices": 26283,
+  "triangles": 40511,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 2,
+   "symmetry": 0.7,
+   "grounded": 0.52
+  },
+  "caveat": "2 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

@@ -108,6 +108,23 @@ impl Chi {
     pub fn attune_mul(&self, toward: Element) -> f32 {
         (1.0 - 0.08 * self.level(toward) as f32).max(0.60)
     }
+
+    /// How many of the seven pools stand at mastery (level 5). Not tied
+    /// to Photon Man — `watch.rs` owns that gate, and its own doc is
+    /// explicit that Photon Man is reached by a declared last resort at
+    /// resolve cost, not by mastering anything ("not gated by having
+    /// found anything... it is gated by a caller-declared moment of
+    /// last resort"). An earlier version of this doc comment claimed
+    /// the opposite — that mastering all seven opened the ceiling —
+    /// written before `watch.rs` was found in a fuller read of the
+    /// codebase. That was wrong and has been removed rather than left
+    /// to disagree with the module that actually owns the mechanic.
+    /// `mastered()` stays as a plain completion count: how much of the
+    /// Watch's seven pools a save has topped out, useful for a status
+    /// screen or an achievement, nothing more.
+    pub fn mastered(&self) -> u8 {
+        ELEMENTS.iter().filter(|e| self.level(**e) == 5).count() as u8
+    }
 }
 
 /// Which element GOVERNS a mod, read off what the mod does: heat gear
@@ -239,6 +256,20 @@ mod tests {
         for m in MODS.iter().filter(|m| m.fits != BodyFit::Machine) {
             assert!(required(m) >= 1, "{} asks nothing of the body", m.name);
         }
+    }
+
+    #[test]
+    fn mastered_counts_the_pools_at_the_top_of_the_staircase() {
+        let mut c = Chi::default();
+        assert_eq!(c.mastered(), 0);
+        for e in ELEMENTS {
+            c.bank(e, 40); // top of the staircase, every pool
+        }
+        assert_eq!(c.mastered(), 7);
+        let mut some = Chi::default();
+        some.bank(Element::Fire, 40);
+        some.bank(Element::Ice, 15); // level 3, not 5
+        assert_eq!(some.mastered(), 1);
     }
 
     #[test]

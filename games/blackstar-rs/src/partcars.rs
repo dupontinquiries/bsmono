@@ -187,6 +187,7 @@ pub fn assemble(
         sdf_half: Vec3::ZERO,
         half_len: env.z,
         half_h: env.y,
+        ride_h: env.y,
         half_w: env.x,
         wheel_r,
     }

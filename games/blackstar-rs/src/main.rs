@@ -65,6 +65,7 @@ mod campaign;
 mod campsim;
 mod chi;
 mod clones;
+mod exoworlds;
 mod deck;
 mod gear;
 mod gearsim;
@@ -76,7 +77,11 @@ mod energon;
 mod finale;
 mod nightfall;
 mod orient;
+mod partdetect;
+mod loadbearing;
+mod grime;
 mod orientsim;
+mod partsim;
 mod skirmish;
 mod raid;
 mod raidcon;
@@ -715,6 +720,7 @@ struct Game {
     /// theirs on `Bot`; the player's lives here for the same reason —
     /// so a body and its wounds cannot drift apart.
     body: sections::Body,
+    grime: grime::Grime,
     /// the action bar, live during play — loaded once at boot rather
     /// than through a Deck console, since quick-select has to work
     /// without opening a menu. Firing whatever the active slot holds
@@ -1014,6 +1020,12 @@ fn main() {
     if argv.iter().any(|a| a == "--orient") {
         // diagnose or fix a bot pose's orientation; see orient.rs
         orientsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--parts") {
+        // classify a bot pose's prims (leg/wheel/thruster/wing/body);
+        // see partdetect.rs -- read-only, no --commit, nothing to write yet
+        partsim::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--intel") {
@@ -1370,13 +1382,20 @@ fn main() {
         // Categories seed the trait vector; see chassis_traits.rs.
         let tiers_cat = roster::load_categories(&bots_dir);
         bot_categories_loaded = tiers_cat.clone();
+        // SMOOTH ONLY. A chassis fleet.json marks "refused" has no real fold
+        // — Morph::build rejects the strip and the game steps between whole
+        // poses instead of blending them, a slideshow wearing a fold's
+        // clothing. roster::fit excludes these unconditionally now, so this
+        // is only read here to populate the field it checks.
+        let morph = roster::load_morph(&bots_dir);
         let inventory: Vec<roster::Chassis> = bots.iter().map(|name| {
             let n = std::fs::read_dir(bots_dir.join(name))
                 .into_iter().flatten().flatten()
                 .filter(|e| e.path().is_dir() && e.path().join("scene.gltf").is_file())
                 .count();
             roster::Chassis { name: name.clone(), poses: n,
-                              tier: tiers.get(name).copied() }
+                              tier: tiers.get(name).copied(),
+                              morph_ok: morph.get(name).copied() }
         }).collect();
 
         let pick = opts.bots.clone().unwrap_or(roster::Pick::All);
@@ -1440,7 +1459,7 @@ fn main() {
             // permutes the extents but cannot change which is biggest, so the
             // measurement survives the loader's own orientation search.
             let raw_span = |p: &PathBuf| -> f32 {
-                let (_, _, _, s) = model::load_raw_at(p, 1.0, false);
+                let (_, _, _, s, _) = model::load_raw_at(p, 1.0, false);
                 if s > 1e-9 { 1.0 / s } else { 1.0 }
             };
             let span0 = raw_span(&poses[0]);
@@ -1648,6 +1667,7 @@ fn main() {
         deck: None,
         hotbar,
         body: sections::Body::default(),
+        grime: grime::Grime::default(),
         held: HashSet::new(),
         held_mouse: HashSet::new(),
         jump_edge: false,
@@ -1761,7 +1781,22 @@ fn main() {
                                     game.cycle_car(dir);
                                 }
                             }
-                            if !event.repeat {
+                            // ALREADY-HELD GUARD, not just !event.repeat: an
+                            // analog keyboard (Wooting) can send a genuine,
+                            // non-OS-repeat Pressed event more than once for
+                            // what is physically one soft press — the switch
+                            // chatters near its actuation point on a feather
+                            // press, and each chatter transition is a real
+                            // key-down as far as winit/the OS is concerned,
+                            // so event.repeat stays false for every one of
+                            // them. That double-fired every menu nav action
+                            // (arrow keys) on a feather press. The Jump
+                            // action a few lines below already guards this
+                            // exact way for the same reason; key_down's
+                            // call sites (menu navigation, the repeat timer)
+                            // did not, which is why this and not that ever
+                            // double-fired.
+                            if !event.repeat && !game.held.contains(&key) {
                                 game.key_down(key.clone(), elwt, &win);
                             } else if let Mode::Online { .. } = game.mode {
                                 game.key_down(key.clone(), elwt, &win); // key repeat in text fields
@@ -1883,6 +1918,15 @@ fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.wheel_r = (m.wheel_r * size).max(0.05);
     car.drive = m.drive;
     car.hover = m.hover;
+    // The other half of da831f98: that fix updated ride_h every frame
+    // during a smooth-morph blend (xform::Morph::bounds_at) but never
+    // here, in the static per-pose path every chassis switch runs
+    // through — which is the ONLY seating input for a morph-refused
+    // (stepping) chassis, and for any chassis in the instant before its
+    // first blended frame. Same sign convention as bounds_at: negative
+    // means the pose sits entirely above the origin, and the seating
+    // code's own `> 0.0` check already treats that as "leave it be."
+    car.ride_h = m.ride_h * size;
 }
 
 impl Game {
@@ -2315,6 +2359,18 @@ impl Game {
                 // because walking every prim at `t` is the cost and doing it
                 // twice would double it on every folding frame.
                 let (hb, drop) = m.bounds_at(t);
+                // "Expanding the long way, then shrinking back a ton": the
+                // raw lerp's length can overshoot both end poses mid-fold
+                // (a part in transit toward a far-off target pushes the
+                // silhouette out), and it snaps back the moment the fold
+                // finishes. Cap it to the straight-line envelope between
+                // this chassis's own vehicle and robot lengths, and fold
+                // the overflow into height instead of discarding it — see
+                // xform::redistribute_length_to_height's doc comment.
+                let strip = &self.cars.chassis[cid].strip;
+                let veh_len = self.cars.models[strip[0]].half_len;
+                let bot_len = self.cars.models[*strip.last().unwrap()].half_len;
+                let hb = xform::redistribute_length_to_height(hb, veh_len, bot_len, t);
                 let h = hb * self.cfg.car.size;
                 self.car.half_w = h.x.max(0.12);
                 self.car.half_h = h.y.max(0.10);
@@ -2461,6 +2517,12 @@ impl Game {
             let local = bot.car.rot.inverse() * (origin - bot.car.pos);
             let dir_local = (bot.car.rot.inverse() * dv.normalize_or(Vec3::Z)).normalize_or(Vec3::Z);
             let res = bot.body.hit(kind, local, dir_local, amount, radius);
+            // GRIME: scorch the section that actually took the hit,
+            // independent of whether it did lasting hp damage --
+            // armour that shrugged off a shot still shows where it hit.
+            if let Some(s) = res.struck {
+                bot.grime.add_scorch(s, (amount * 0.15).min(0.4));
+            }
             for s in &res.severed {
                 self.toastf(&format!("{} torn off", s.name()));
             }
@@ -4427,6 +4489,20 @@ impl Game {
             if !self.bots.is_empty() {
                 bots::update(&mut self.bots, &mut self.ball, &mut self.car, &self.world, &self.cfg, self.time, dt);
             }
+            // SECTION HEALING/REGROWTH. Gated the same place bots::update
+            // is -- Mode::Play, real dt -- so a body does not quietly
+            // patch itself up while the game is paused or in a menu.
+            // Toasted/fx'd on the frame a section actually comes back,
+            // not polled by checking is_gone every frame: tick() only
+            // returns non-empty on the frame it happens.
+            for s in self.body.tick(dt) {
+                self.toastf(&format!("{} regrown", s.name()));
+            }
+            self.grime.tick(dt);
+            for b in self.bots.iter_mut() {
+                b.body.tick(dt);
+                b.grime.tick(dt);
+            }
             self.fx.update(dt);
             let rear = self.held_mouse.contains(&MouseButton::Middle);
             self.cam.update(&self.car, &self.ball, &self.world, &self.cfg.cam, self.car.flipping(), rear, dt);
@@ -5045,6 +5121,18 @@ impl Game {
             if sp > 2.0 {
                 let n = self.car.ground_n;
                 self.fx.dust(self.car.pos - n * self.car.half_h, n, sp);
+                // GRIME: a hard landing kicks dust up onto the legs,
+                // not the whole body -- only meaningful in robot mode
+                // (sections::Body models a standing figure; a car
+                // landing hard is the arcade base game's own event and
+                // has nothing to do with a robot's legs). Capped low
+                // per landing (0.3 at most) so dirt accumulates over
+                // many landings rather than maxing out on one.
+                if self.car.robot {
+                    let amount = (sp * 0.03).min(0.3);
+                    self.grime.add_dust(sections::Section::LegL, amount);
+                    self.grime.add_dust(sections::Section::LegR, amount);
+                }
             }
         }
 

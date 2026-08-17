@@ -24,6 +24,7 @@
 use glam::Vec3;
 
 use crate::bigbody::{BigBody, Drive, Shape};
+use crate::campaign::CampaignLog;
 use crate::menu::{Fmt, Item, Menu, Row};
 use crate::patrol;
 
@@ -398,7 +399,13 @@ impl Ship {
     /// the same navigation code as every other screen. Unreachable legs stay
     /// VISIBLE and disabled with the reason in the hint, because a course
     /// you cannot take is information.
-    pub fn bridge_menu(&self) -> Menu {
+    ///
+    /// `log` is what gates the four exoworld destinations
+    /// (`exoworlds::EXOWORLDS`) behind `exoworlds::unlocked` — same
+    /// "visible, disabled, and says why" treatment as an empty tank
+    /// rather than hiding them from the list before the bridge has
+    /// actually been flown once.
+    pub fn bridge_menu(&self, log: &CampaignLog) -> Menu {
         let mut rows = vec![Row::heading("NAVIGATION")];
         for d in patrol::ROUTE {
             if d.id == self.at {
@@ -407,7 +414,9 @@ impl Ship {
             let cost = leg_cost(self.at, d.id);
             let fuel = (cost * 0.08 * (self.hull.length / 200.0).max(0.4)).min(1.0);
             let mut r = Row::action(d.id, d.name);
-            if fuel > self.fuel {
+            if crate::exoworlds::find(d.id).is_some() && !crate::exoworlds::unlocked(log) {
+                r = r.disabled().hint("the space bridge has not opened yet");
+            } else if fuel > self.fuel {
                 r = r.disabled().hint("not enough fuel for that leg");
             } else if d.terrain == patrol::Terrain::DeepSpace && !self.hull.can_land() {
                 r = r.hint("drop from orbit; this hull does not set down");
@@ -548,7 +557,8 @@ mod tests {
     fn the_bridge_menu_shows_unreachable_legs_instead_of_hiding_them() {
         let mut s = Ship::new("hawkdrop", "earth");
         s.fuel = 0.05;
-        let m = s.bridge_menu();
+        let log = CampaignLog::default();
+        let m = s.bridge_menu(&log);
         let disabled = m.rows.iter().filter(|r| !r.enabled && r.item == Item::Action).count();
         assert!(disabled > 0, "an empty tank hid every destination");
         // and it never lists where you already are
@@ -556,6 +566,21 @@ mod tests {
         // the disabled ones still say why
         assert!(m.rows.iter().filter(|r| !r.enabled && r.item == Item::Action)
             .all(|r| r.hint.is_some()));
+    }
+
+    #[test]
+    fn the_bridge_hides_no_exoworld_but_blocks_it_before_the_far_gate() {
+        let s = Ship::new("spearhead", "earth");
+        let closed = CampaignLog::default();
+        let m = s.bridge_menu(&closed);
+        let e = m.rows.iter().find(|r| r.id == "trappist1e").expect("trappist1e should be listed");
+        assert!(!e.enabled, "the exoworld was reachable before the bridge opened");
+        assert_eq!(e.hint, Some("the space bridge has not opened yet"));
+        let mut opened = CampaignLog::default();
+        opened.record("the_far_gate");
+        let m2 = s.bridge_menu(&opened);
+        let e2 = m2.rows.iter().find(|r| r.id == "trappist1e").unwrap();
+        assert!(e2.enabled, "clearing the_far_gate should have opened it");
     }
 
     #[test]

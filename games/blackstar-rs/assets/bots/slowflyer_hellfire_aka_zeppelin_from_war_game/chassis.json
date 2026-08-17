@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_slowflyer_hellfire_aka_zeppelin_from_war_game.iqm",
+ "foldview": {
+  "category": "airship",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 32379,
+  "triangles": 30507,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.74,
+   "grounded": 0.23
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.74)"
+ }
+}

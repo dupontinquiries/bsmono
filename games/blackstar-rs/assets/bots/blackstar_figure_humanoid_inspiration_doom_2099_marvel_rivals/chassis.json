@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_blackstar_figure_humanoid_inspiration_doom_2099_marvel_rivals.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 58,
+  "vertices": 29690,
+  "triangles": 44853,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.91,
+   "grounded": 0.25
+  }
+ }
+}

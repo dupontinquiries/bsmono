@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_bot_sazabi.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 49,
+  "vertices": 108822,
+  "triangles": 140357,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 4,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.76,
+   "grounded": 0.25
+  },
+  "caveat": "mid-fold scatter (4 blobs during the burst) even though it lands whole"
+ }
+}

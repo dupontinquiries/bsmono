@@ -75,6 +75,33 @@ pub struct Model {
     #[allow(dead_code)]
     pub half_w: f32,
     pub wheel_r: f32,
+    /// Distance from the body origin to its LOWEST point, static-pose
+    /// equivalent of `xform::Morph::bounds_at`'s second return value.
+    ///
+    /// `da831f98` ("seat bots on their feet, not their bounding-box
+    /// centre") fixed this for the RUNTIME smooth-fold path — `bounds_at`
+    /// samples every prim at the current blend `t` and returns `-lo.y`
+    /// alongside the half-extents, every frame, while a fold is actively
+    /// playing. It never touched this struct, which is the STATIC
+    /// per-pose load path: `apply_car_dims` (main.rs) reads `half_h` off
+    /// whichever `Model` is currently displayed, and that read is the
+    /// ONLY seating input for (a) any chassis whose morph strip was
+    /// refused — the stepping fallback swaps `Model`s and never calls
+    /// `bounds_at` at all, so it never had the fix — and (b) the instant
+    /// a smooth chassis is first loaded or switched to, before
+    /// `advance_xform`'s morph branch has run even once. `car.ride_h`
+    /// defaults to 0.0 and the seating code falls back to `half_h`
+    /// whenever it is `<= 0.0`, so both of those cases were silently
+    /// using the pre-fix, bounding-box-centred number the whole time —
+    /// the same sink `da831f98` measured, just in the other loading path.
+    ///
+    /// `lo`/`hi` are already computed in `load_raw_at` for exactly this
+    /// purpose (`half = (hi - lo) * 0.5`); this is the other half of the
+    /// same bounding box, at zero extra sampling cost. Same sign
+    /// convention as `bounds_at`: negative means the pose sits entirely
+    /// above the origin (a hovering body), which the seating code's own
+    /// `> 0.0` check already treats as "leave it, don't plant it."
+    pub ride_h: f32,
 }
 
 pub struct RawPrim {
@@ -601,7 +628,7 @@ fn declared_orientation(dir: &Path) -> Option<Quat> {
 ///
 /// Returns the normalized prims and the model's half-extents in metres.
 pub fn load_raw(dir: &Path, target_len: f32) -> (Vec<RawPrim>, Vec3) {
-    let (raws, half, _, _) = load_raw_at(dir, target_len, false);
+    let (raws, half, _, _, _) = load_raw_at(dir, target_len, false);
     (raws, half)
 }
 
@@ -656,7 +683,7 @@ pub fn load_raw_unoriented(dir: &Path) -> Vec<RawPrim> {
 
 /// `load_raw` plus the two values the upload path still needs to place wheel
 /// pivots: the pre-scale centre and the scale factor.
-pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Vec3, Vec3, f32) {
+pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Vec3, Vec3, f32, f32) {
     // Two packagings of the same format. A .gltf folder keeps its buffer and
     // textures as sibling files; a .glb is one binary with the buffer inline
     // (and usually the images too). Take whichever is present, so a model
@@ -874,15 +901,85 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
             hi = hi.max(p);
         }
     }
-    let half = if hi.x >= lo.x { (hi - lo) * 0.5 } else { ext * s * 0.5 };
-    (raws, half, center, s)
+    let (half, ride_h) = bounds_from_extent(lo, hi, ext * s * 0.5);
+    (raws, half, center, s, ride_h)
+}
+
+/// Half-extents and the drop from the origin to the lowest point, from a
+/// measured bounding box — the static-load half of `da831f98`'s fix,
+/// factored out so it is checkable without a real chassis directory.
+/// Every real one on disk is packed now (`scene.bin` is gone, and
+/// `load_raw_at` needs it), so a filesystem-backed test can't reach this
+/// computation any more; the formula itself still can.
+///
+/// `lo > hi` on any axis means no vertices were actually measured (an
+/// empty or degenerate raw set) — `ext_half` is the caller's fallback
+/// half-extent for that case, and the drop falls back to `ext_half.y`,
+/// the symmetric assumption, rather than a nonsensical number computed
+/// from an inverted box.
+///
+/// Same convention as `xform::Morph::bounds_at`: the drop (`-lo.y`)
+/// equals the half-extent only when the box is centred on the origin,
+/// which a vehicle pose is and a standing robot pose is not.
+fn bounds_from_extent(lo: Vec3, hi: Vec3, ext_half: Vec3) -> (Vec3, f32) {
+    if hi.x >= lo.x {
+        ((hi - lo) * 0.5, -lo.y)
+    } else {
+        (ext_half, ext_half.y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_drop_matches_half_only_when_the_box_is_centred() {
+        // da831f98's own measurement on `analog`, reused here as the
+        // ground truth: f00 (vehicle) is centred, f04 (robot) is not.
+        //   f00 vehicle   y -0.239..0.239   half 0.239, feet at 0.239
+        //   f04 robot     y -0.400..0.355   half 0.377, feet at 0.400
+        let (half_veh, ride_veh) = bounds_from_extent(
+            Vec3::new(-1.0, -0.239, -1.0), Vec3::new(1.0, 0.239, 1.0), Vec3::ONE);
+        assert!((half_veh.y - 0.239).abs() < 1e-6);
+        assert!((ride_veh - 0.239).abs() < 1e-6, "a centred box should have drop == half");
+
+        let (half_bot, ride_bot) = bounds_from_extent(
+            Vec3::new(-1.0, -0.400, -1.0), Vec3::new(1.0, 0.355, 1.0), Vec3::ONE);
+        assert!((half_bot.y - 0.3775).abs() < 1e-4, "half should be the OLD (wrong) number");
+        assert!((ride_bot - 0.400).abs() < 1e-6, "drop should be the real distance to the feet");
+        assert!(ride_bot > half_bot.y, "this is exactly the sink da831f98 measured and fixed");
+    }
+
+    #[test]
+    fn a_body_floating_entirely_above_the_origin_gets_a_negative_drop() {
+        // da831f98's other named case: flyer_deathstroke and
+        // spaceship_horizon sit entirely above y=0. The seating code's
+        // `> 0.0` check is what turns a negative drop into "leave it be"
+        // — this only checks that the formula actually produces one.
+        let (_, ride) = bounds_from_extent(
+            Vec3::new(-1.0, 0.170, -1.0), Vec3::new(1.0, 0.345, 1.0), Vec3::ONE);
+        assert!(ride < 0.0, "a body entirely above the origin should get a negative drop, got {ride}");
+    }
+
+    #[test]
+    fn a_degenerate_box_falls_back_to_the_symmetric_assumption() {
+        // hi < lo means nothing was actually measured (empty raw set) --
+        // the fallback ext_half is what the caller already had, and the
+        // drop falls back to matching it rather than computing garbage
+        // from an inverted box.
+        let ext_half = Vec3::new(0.5, 0.3, 0.8);
+        let (half, ride) = bounds_from_extent(Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), ext_half);
+        assert_eq!(half, ext_half);
+        assert_eq!(ride, ext_half.y);
+    }
 }
 
 /// As `load`, but `flip` turns the body around its vertical axis. The nose
 /// is inferred from the geometry, and inference is not always right — the
 /// Guardian arrived facing backwards, which is invisible until you drive it.
 pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> Model {
-    let (raws, half, center, s) = load_raw_at(dir, target_len, flip);
+    let (raws, half, center, s, ride_h) = load_raw_at(dir, target_len, flip);
 
     // ---- upload: dedupe textures per model, build prims ----
     let mut tex_cache: HashMap<String, usize> = HashMap::new();
@@ -938,5 +1035,12 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, drive: Drive::Combustion, hover: None, cloud, cloud_n, sdf_half: Vec3::ZERO, half_len: half.z, half_h: half.y, half_w: half.x, wheel_r }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud, cloud_n, sdf_half: Vec3::ZERO,
+            half_len: half.z, half_h: half.y, half_w: half.x, wheel_r,
+            // Same sign convention as xform::Morph::bounds_at: -lo.y, the
+            // distance from the origin to the pose's actual lowest point,
+            // not the symmetric half-extent. See the field's own doc
+            // comment for why this matters (da831f98 fixed this for the
+            // runtime blend path only; this is the static load path).
+            ride_h }
 }

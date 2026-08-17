@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_heli_stiletto_aka_future_drone_1.iqm",
+ "foldview": {
+  "category": "heli",
+  "poses": 5,
+  "prims": 50,
+  "vertices": 24835,
+  "triangles": 40909,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.82,
+   "grounded": 0.22
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.82)"
+ }
+}

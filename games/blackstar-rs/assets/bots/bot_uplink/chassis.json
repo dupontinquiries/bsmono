@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_bot_uplink.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 62,
+  "vertices": 30826,
+  "triangles": 46097,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "low",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.65,
+   "grounded": 0.19
+  },
+  "caveat": "lands whole but reads asymmetric (symmetry 0.65)"
+ }
+}

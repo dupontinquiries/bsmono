@@ -1,0 +1,23 @@
+[package]
+name = "foldview"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Vehicle<->robot fold viewer for blackstar. Rigid motion only, per-joint axes, scheduled choreography — the TRANSFORM_OVERHAUL fixes, wired to pixels."
+
+[dependencies]
+model-verify = { path = "../../game-model-tools/rust/model-verify" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"
+anyhow = "1"
+
+wgpu = { version = "0.19", optional = true }
+winit = { version = "0.29", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1, <1.17", features = ["derive"], optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:env_logger"]

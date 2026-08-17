@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_heli_eclipse_aka_z_10ag_attack_helicopter.iqm",
+ "foldview": {
+  "category": "heli",
+  "poses": 5,
+  "prims": 54,
+  "vertices": 29246,
+  "triangles": 42302,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 4,
+   "blobs_at_robot_worst_view": 2,
+   "symmetry": 0.64,
+   "grounded": 0.18
+  },
+  "caveat": "2 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

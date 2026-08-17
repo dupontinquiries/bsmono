@@ -66,3 +66,7 @@ path = "examples/botshot.rs"
 [[example]]
 name = "rigpose"
 path = "examples/rigpose.rs"
+
+[[example]]
+name = "stripcheck"
+path = "examples/stripcheck.rs"
