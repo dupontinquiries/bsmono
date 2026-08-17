@@ -27,11 +27,15 @@
 //!   two channels nowhere, and the centre channel going missing is exactly the
 //!   thing you notice as "dialogue is quiet" an hour later.
 
-#[path = "../../bo-mux/src/protocol.rs"]
-#[allow(dead_code, unused_imports)]
-pub mod protocol;
+// LINKED, not source-mounted. This was `#[path = "../../bo-mux/src/protocol.rs"]`,
+// which compiles the engine's protocol a SECOND time into this crate: two
+// types with the same name and no relationship, so a value from the real
+// bo-mux could not be passed to anything here and a divergence between the
+// copies would surface as a type error in whichever file noticed first.
+// bo-mux is a dependency now, so this is an import.
+pub use bo_mux::protocol;
 
-pub use protocol::{Layout, Platform, Speaker};
+pub use bo_mux::protocol::{Layout, Platform, Speaker};
 
 use std::collections::BTreeMap;
 

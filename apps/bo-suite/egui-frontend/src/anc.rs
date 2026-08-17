@@ -2,30 +2,38 @@
 //!
 //! bo-suite is an ANC research system with a music player, a home-theatre
 //! setup and a sleep-sound engine built over it. The egui port had all three
-//! of those and nothing at all for the ANC — while the Qt app split its
-//! controls across one card in the middle of a long Settings page and another
-//! near the end, which is how a system's main feature becomes the hardest
-//! thing in it to find.
+//! and nothing for the ANC, while the Qt app split its controls across one
+//! card mid-Settings and another near the end.
+//!
+//! ## This module owns the engine, it does not imitate it
+//!
+//! The first version of this file reimplemented the presence and tonality
+//! gates in the frontend and documented its thresholds as "mirroring"
+//! `bo-mux`'s `drone_canceller`. That was wrong, and `parity_audit`'s engine
+//! column now names why: the whole frontend depended on no part of bo-suite's
+//! engine, so it rendered the application and could not cancel a decibel. Two
+//! copies of a gate that agree today are two copies, and the app ships
+//! whichever one the UI happens to read.
+//!
+//! So the state machine here is `DroneCanceller`'s — Quiet, Detected, Active,
+//! Releasing — and this file adds only what the engine has no opinion about:
+//! what the OPERATOR asked for.
 //!
 //! ## Three modes, because On and Auto are different promises
 //!
-//! * **Off** — emit nothing. Not "emit silence": the canceller does not run,
-//!   which is what you want when debugging something else or when the anti-
-//!   noise is making things worse.
-//! * **Auto** — the engine's gates decide. `drone_canceller` already has the
-//!   whole policy: a presence gate (energy above the noise floor), a tonality
-//!   gate with asymmetric hysteresis, a stability tolerance on the frequency
-//!   estimate, and a three-second exit hold. Auto is not a new algorithm; it
-//!   is exposing the one that was already there but invisible.
-//! * **On** — emit regardless of the gates. Forced, for measurement: you
-//!   cannot characterise a canceller that keeps deciding not to run.
+//! * **Off** — the canceller does not run. Not "emit silence".
+//! * **Auto** — the engine's phase machine decides, moment to moment.
+//! * **On** — emit regardless of phase, for measurement: you cannot
+//!   characterise a canceller that keeps deciding not to run.
 //!
-//! ## Why the gate's reason is carried, not just its answer
+//! ## Why the phase is shown, not just a boolean
 //!
-//! An operator watching a quiet room needs to know the difference between
-//! "no noise to cancel" and "noise present but the estimate is not stable
-//! enough to lock onto". Both are silent. Only one is a fault. A boolean
-//! `emitting` collapses them, and the operator learns to distrust the light.
+//! An operator watching a quiet room needs "nothing to cancel" told apart
+//! from "drone heard, lock not confirmed". Both are silent; only one is worth
+//! investigating. `DronePhase` already draws that line, which is another
+//! reason to surface it rather than invent a parallel vocabulary.
+
+pub use bo_mux::drone_canceller::{DroneCanceller, DronePhase, DroneSnapshot};
 
 /// What the operator asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,214 +68,109 @@ impl Mode {
     }
 }
 
-/// What the engine reports about the noise it is hearing.
+/// The operator's ANC control: a mode, and the engine that decides under it.
 ///
-/// Mirrors the thresholds in `bo-mux`'s drone canceller rather than inventing
-/// its own: `presence_ratio` against `PRESENCE_RATIO`, `tonality` against the
-/// enter/exit pair, `freq_jitter_hz` against the stability tolerance. Keeping
-/// the numbers here as inputs — not the decision — means this module cannot
-/// drift away from the engine's actual behaviour.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Telemetry {
-    /// Energy above the noise floor, as a ratio.
-    pub presence_ratio: f32,
-    /// How tonal the noise is, 0..1.
-    pub tonality: f32,
-    /// Wander in the running fundamental estimate.
-    pub freq_jitter_hz: f32,
-    /// The fundamental being tracked, for the readout.
-    pub fundamental_hz: f32,
-}
-
-/// The engine's own thresholds. Defaults match `bo-mux/src/drone_canceller.rs`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Gates {
-    pub presence_ratio: f32,
-    pub tonality_enter: f32,
-    pub tonality_exit: f32,
-    pub stable_freq_tolerance_hz: f32,
-    /// How long the gate stays open after the noise goes, so a passing gap
-    /// does not chop the anti-noise on and off.
-    pub exit_hold_ms: u64,
-}
-
-impl Default for Gates {
-    fn default() -> Self {
-        Gates {
-            presence_ratio: 4.0,
-            tonality_enter: 0.30,
-            tonality_exit: 0.15,
-            stable_freq_tolerance_hz: 25.0,
-            exit_hold_ms: 3_000,
-        }
-    }
-}
-
-/// Why the canceller is or is not emitting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
-    /// Mode is Off.
-    Disabled,
-    /// Nothing above the noise floor. The room is quiet; this is success.
-    Quiet,
-    /// Noise present, but too broadband to cancel — a fan, not a drone.
-    NotTonal,
-    /// Tonal noise present, but the frequency estimate is wandering too much
-    /// to lock onto. Distinct from Quiet because this one may be a fault.
-    Unstable,
-    /// Emitting anti-noise, gates open.
-    Emitting,
-    /// Emitting because the noise just stopped and the hold has not expired.
-    /// Named separately so an operator does not read a stale emission as a
-    /// live lock.
-    Holding,
-    /// Emitting because the operator forced it, gates ignored.
-    Forced,
-}
-
-impl Status {
-    /// Is anti-noise leaving the speakers?
-    pub fn emitting(self) -> bool {
-        matches!(self, Status::Emitting | Status::Holding | Status::Forced)
-    }
-
-    /// One line for the operator.
-    pub fn line(self) -> &'static str {
-        match self {
-            Status::Disabled => "off",
-            Status::Quiet => "quiet — nothing to cancel",
-            Status::NotTonal => "noise is broadband — not cancellable",
-            Status::Unstable => "tonal, but the estimate is wandering",
-            Status::Emitting => "cancelling",
-            Status::Holding => "holding through a gap",
-            Status::Forced => "forced on — gates ignored",
-        }
-    }
-
-    /// Should this read as a problem? Quiet is not a problem, and colouring it
-    /// like one teaches the operator to ignore the indicator.
-    pub fn is_fault(self) -> bool {
-        self == Status::Unstable
-    }
-}
-
-/// The operator's ANC control: mode, gate state, and the hold clock.
-#[derive(Debug, Clone)]
+/// `Telemetry`, `Gates` and a hand-rolled `Status` used to live here. They are
+/// gone: the canceller owns the thresholds, the hysteresis and the exit hold,
+/// and a second copy in the UI could only drift from them.
 pub struct Anc {
     pub mode: Mode,
-    pub gates: Gates,
-    /// True while the tonality gate is open — hysteresis state, which is why
-    /// it is remembered rather than recomputed from the current reading.
-    gate_open: bool,
-    /// Milliseconds since the gate would have closed, or None if it is open.
-    closing_for_ms: Option<u64>,
-    last: Telemetry,
-    status: Status,
+    engine: DroneCanceller,
+    last: Option<DroneSnapshot>,
 }
 
 impl Default for Anc {
     fn default() -> Self {
-        Anc {
-            mode: Mode::default(),
-            gates: Gates::default(),
-            gate_open: false,
-            closing_for_ms: None,
-            last: Telemetry::default(),
-            status: Status::Quiet,
-        }
+        Anc { mode: Mode::default(), engine: DroneCanceller::new(), last: None }
+    }
+}
+
+impl std::fmt::Debug for Anc {
+    // DroneCanceller is not Debug, and deriving would force it to be — a UI
+    // type should not push a trait onto the engine.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Anc").field("mode", &self.mode)
+            .field("phase", &self.phase()).finish()
     }
 }
 
 impl Anc {
-    /// Feed a telemetry frame and advance the hold clock.
+    /// Feed one window of captured audio.
     ///
-    /// `dt_ms` is how long since the last frame. Returns the resulting status,
-    /// which is also stored for the readout.
-    pub fn update(&mut self, t: Telemetry, dt_ms: u64) -> Status {
-        self.last = t;
-        self.status = match self.mode {
-            Mode::Off => {
-                // Off resets the hysteresis. Coming back to Auto after a
-                // debugging detour should re-acquire from scratch rather than
-                // resume a lock formed several minutes ago.
-                self.gate_open = false;
-                self.closing_for_ms = None;
-                Status::Disabled
-            }
-            Mode::Forced => Status::Forced,
-            Mode::Auto => self.auto_status(t, dt_ms),
-        };
-        self.status
+    /// Off does not merely ignore the result — it resets the canceller, so
+    /// returning to Auto re-acquires rather than resuming a lock formed before
+    /// the operator switched away.
+    pub fn process(&mut self, samples: &[f32]) -> DronePhase {
+        if self.mode == Mode::Off {
+            self.engine.reset();
+            self.last = None;
+            return DronePhase::Quiet;
+        }
+        let snap = self.engine.process_window(samples);
+        self.last = Some(snap);
+        snap.phase
     }
 
-    fn auto_status(&mut self, t: Telemetry, dt_ms: u64) -> Status {
-        let present = t.presence_ratio >= self.gates.presence_ratio;
-        // Asymmetric hysteresis: it takes more tonality to open the gate than
-        // to keep it open. Symmetric thresholds chatter on noise sitting right
-        // at the boundary, and chattering anti-noise is worse than none.
-        let tonal = if self.gate_open {
-            t.tonality >= self.gates.tonality_exit
-        } else {
-            t.tonality >= self.gates.tonality_enter
-        };
-        let stable = t.freq_jitter_hz <= self.gates.stable_freq_tolerance_hz;
-
-        if present && tonal && stable {
-            self.gate_open = true;
-            self.closing_for_ms = None;
-            return Status::Emitting;
-        }
-
-        if self.gate_open {
-            // The gate was open and the conditions just lapsed. Hold, so a
-            // passing gap — the operator walks behind a wall, the compressor
-            // cycles — does not chop the anti-noise on and off.
-            let held = self.closing_for_ms.unwrap_or(0) + dt_ms;
-            if held < self.gates.exit_hold_ms {
-                self.closing_for_ms = Some(held);
-                return Status::Holding;
-            }
-            self.gate_open = false;
-            self.closing_for_ms = None;
-        }
-
-        // Why we are not emitting, in the order that makes the reason true:
-        // no noise at all outranks "not tonal", which outranks "unstable".
-        if !present {
-            Status::Quiet
-        } else if !tonal {
-            Status::NotTonal
-        } else {
-            Status::Unstable
-        }
+    /// The engine's phase, or Quiet before any audio has arrived.
+    pub fn phase(&self) -> DronePhase {
+        self.last.map(|s| s.phase).unwrap_or(DronePhase::Quiet)
     }
 
-    pub fn status(&self) -> Status {
-        self.status
-    }
-
-    pub fn telemetry(&self) -> Telemetry {
+    pub fn snapshot(&self) -> Option<DroneSnapshot> {
         self.last
     }
 
-    /// Cycle the mode, for a single always-visible control.
+    /// Is anti-noise leaving the speakers?
+    ///
+    /// Releasing counts: the engine keeps emitting at decaying amplitude
+    /// through the exit hold, so reporting silence there would contradict what
+    /// the speakers are doing.
+    pub fn emitting(&self) -> bool {
+        match self.mode {
+            Mode::Off => false,
+            Mode::Forced => true,
+            Mode::Auto => matches!(self.phase(), DronePhase::Active | DronePhase::Releasing),
+        }
+    }
+
+    /// Should this read as a problem?
+    ///
+    /// Quiet is not a fault, and colouring it like one teaches the operator to
+    /// ignore the indicator. Detected with poor tracker stability is the case
+    /// worth surfacing: a drone is present and the lock will not hold.
+    pub fn is_fault(&self) -> bool {
+        match (self.phase(), self.last) {
+            (DronePhase::Detected, Some(s)) => s.tracker_stability < 0.5,
+            _ => false,
+        }
+    }
+
+    /// Cycle the mode. Off → Auto → On, so the common case is one tap from
+    /// Off and Forced is never one accidental tap from Auto.
     pub fn cycle(&mut self) -> Mode {
         self.mode = self.mode.next();
-        // Leaving Off or Forced must not carry stale gate state into Auto.
         if self.mode != Mode::Auto {
-            self.gate_open = false;
-            self.closing_for_ms = None;
+            self.engine.reset();
+            self.last = None;
         }
         self.mode
     }
 
-    /// The readout under the control: what it is doing and to what.
+    /// The line under the chip: what it is doing, and to what.
     pub fn readout(&self) -> String {
-        match self.status {
-            Status::Emitting | Status::Holding => {
-                format!("{} @ {:.0} Hz", self.status.line(), self.last.fundamental_hz)
-            }
-            _ => self.status.line().to_string(),
+        match self.mode {
+            Mode::Off => "off".into(),
+            Mode::Forced => "forced on — phase ignored".into(),
+            Mode::Auto => match (self.phase(), self.last) {
+                (DronePhase::Quiet, _) => "quiet — nothing to cancel".into(),
+                (DronePhase::Detected, Some(s)) =>
+                    format!("drone at {:.0} Hz — confirming (lock {:.0}%)",
+                            s.fundamental_hz, s.tracker_stability * 100.0),
+                (DronePhase::Active, Some(s)) =>
+                    format!("cancelling {:.0} Hz", s.fundamental_hz),
+                (DronePhase::Releasing, _) => "holding through a gap".into(),
+                (p, None) => format!("{p:?}"),
+            },
         }
     }
 }
@@ -282,13 +185,12 @@ pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc,
                 c: &uikit_egui::PaletteColors) -> Option<Mode> {
     let mut changed = None;
     ui.horizontal(|ui| {
-        let s = a.status();
-        // The dot colours the STATE, not the mode: an operator glancing at
-        // the bar wants to know whether anti-noise is leaving the speakers,
-        // which "Auto" alone does not say.
-        let dot = if s.is_fault() {
+        // The dot colours the ENGINE'S STATE, not the mode: an operator
+        // glancing at the bar wants to know whether anti-noise is leaving the
+        // speakers, which "Auto" alone does not say.
+        let dot = if a.is_fault() {
             c.warning
-        } else if s.emitting() {
+        } else if a.emitting() {
             c.accent
         } else {
             c.text_weak
@@ -310,109 +212,106 @@ pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::TAU;
 
-    fn drone() -> Telemetry {
-        Telemetry { presence_ratio: 8.0, tonality: 0.5, freq_jitter_hz: 5.0,
-                    fundamental_hz: 120.0 }
+    /// A sustained tone in the drone band, at the engine's sample rate.
+    ///
+    /// Real input rather than a hand-set struct: the whole point of this
+    /// rewrite is that the UI no longer decides what counts as a drone, so a
+    /// test that constructed a phase directly would be testing the old design.
+    fn drone(hz: f32, amp: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| amp * (TAU * hz * i as f32 / 48_000.0).sin()).collect()
     }
-    fn quiet() -> Telemetry {
-        Telemetry { presence_ratio: 1.0, tonality: 0.0, freq_jitter_hz: 0.0,
-                    fundamental_hz: 0.0 }
+    fn silence(n: usize) -> Vec<f32> {
+        vec![0.0; n]
     }
 
     #[test]
-    fn auto_does_not_emit_into_a_quiet_room() {
+    fn a_real_drone_drives_the_engine_out_of_quiet() {
+        // The check that would have failed before this rewrite for the right
+        // reason: there was no engine to drive.
         let mut a = Anc::default();
-        assert_eq!(a.mode, Mode::Auto, "auto is the default — the safe one");
-        assert_eq!(a.update(quiet(), 50), Status::Quiet);
-        assert!(!a.status().emitting(), "nothing to cancel, so nothing is emitted");
-        // And quiet is NOT a fault: colouring it like one teaches the operator
-        // to ignore the indicator.
-        assert!(!Status::Quiet.is_fault());
+        assert_eq!(a.mode, Mode::Auto, "auto is the default");
+        assert_eq!(a.phase(), DronePhase::Quiet, "nothing fed yet");
+
+        let mut phases = vec![];
+        for _ in 0..40 {
+            phases.push(a.process(&drone(120.0, 0.5, 4096)));
+        }
+        assert!(phases.iter().any(|p| *p != DronePhase::Quiet),
+                "40 windows of a 120 Hz tone never left Quiet: {phases:?}");
     }
 
     #[test]
-    fn a_drone_opens_the_gate_and_a_gap_is_held_through() {
+    fn silence_stays_quiet_and_emits_nothing() {
         let mut a = Anc::default();
-        assert_eq!(a.update(drone(), 50), Status::Emitting);
-        // The noise stops. The gate holds rather than chopping off — a passing
-        // gap must not switch the anti-noise on and off.
-        assert_eq!(a.update(quiet(), 1_000), Status::Holding);
-        assert!(a.status().emitting());
-        assert_eq!(a.update(quiet(), 1_000), Status::Holding);
-        // Past the three-second hold it finally closes.
-        assert_eq!(a.update(quiet(), 1_500), Status::Quiet);
-        assert!(!a.status().emitting());
+        for _ in 0..20 {
+            a.process(&silence(4096));
+        }
+        assert_eq!(a.phase(), DronePhase::Quiet);
+        assert!(!a.emitting(), "nothing to cancel, so nothing is emitted");
+        assert!(!a.is_fault(), "quiet is not a fault — colouring it like one \
+                                teaches the operator to ignore the light");
     }
 
     #[test]
-    fn the_tonality_gate_is_harder_to_open_than_to_keep_open() {
+    fn off_resets_the_engine_rather_than_ignoring_it() {
+        // Returning to Auto must re-acquire, not resume a lock formed before
+        // the operator switched away.
         let mut a = Anc::default();
-        // 0.20 is above the exit threshold but below the enter threshold: not
-        // enough to start.
-        let marginal = Telemetry { tonality: 0.20, ..drone() };
-        assert_eq!(a.update(marginal, 50), Status::NotTonal);
-        // Once a real drone opens the gate, the same marginal reading keeps it
-        // open. Symmetric thresholds would chatter here, and chattering
-        // anti-noise is worse than none.
-        assert_eq!(a.update(drone(), 50), Status::Emitting);
-        assert_eq!(a.update(marginal, 50), Status::Emitting);
+        for _ in 0..40 {
+            a.process(&drone(120.0, 0.5, 4096));
+        }
+        let reached = a.phase();
+        a.mode = Mode::Off;
+        assert_eq!(a.process(&drone(120.0, 0.5, 4096)), DronePhase::Quiet);
+        assert!(!a.emitting(), "off is not 'emit silence'");
+        assert!(a.snapshot().is_none(), "the stale snapshot is dropped");
+        // And the phase it had reached is genuinely gone, not remembered.
+        assert_eq!(a.phase(), DronePhase::Quiet, "was {reached:?} before Off");
     }
 
     #[test]
-    fn silence_has_three_different_reasons_and_says_which() {
-        let mut a = Anc::default();
-        assert_eq!(a.update(quiet(), 50), Status::Quiet);
-        // Loud but broadband — a fan, not a drone. Nothing to lock onto.
-        let fan = Telemetry { tonality: 0.05, ..drone() };
-        assert_eq!(a.update(fan, 50), Status::NotTonal);
-        // Tonal but wandering: this one may be a fault, and it is the only
-        // status that says so.
-        let wobbly = Telemetry { freq_jitter_hz: 60.0, ..drone() };
-        assert_eq!(a.update(wobbly, 50), Status::Unstable);
-        assert!(Status::Unstable.is_fault());
-        assert!(!Status::NotTonal.is_fault(), "a fan is not a malfunction");
-    }
-
-    #[test]
-    fn forced_emits_regardless_and_off_emits_nothing() {
+    fn forced_emits_whatever_the_engine_thinks() {
+        // You cannot characterise a canceller that keeps deciding not to run.
         let mut a = Anc::default();
         a.mode = Mode::Forced;
-        // Forced ignores every gate — you cannot characterise a canceller that
-        // keeps deciding not to run.
-        assert_eq!(a.update(quiet(), 50), Status::Forced);
-        assert!(a.status().emitting());
-        a.mode = Mode::Off;
-        assert_eq!(a.update(drone(), 50), Status::Disabled);
-        assert!(!a.status().emitting(), "off is not 'emit silence'");
+        a.process(&silence(4096));
+        assert!(a.emitting(), "forced ignores the phase");
+        assert_eq!(a.readout(), "forced on — phase ignored");
     }
 
     #[test]
-    fn one_tap_from_off_reaches_auto_and_a_detour_does_not_resume_a_stale_lock() {
+    fn one_tap_from_off_reaches_auto() {
         let mut a = Anc::default();
         a.mode = Mode::Off;
         assert_eq!(a.cycle(), Mode::Auto, "the common case is one tap");
         assert_eq!(a.cycle(), Mode::Forced);
         assert_eq!(a.cycle(), Mode::Off);
-
-        // Lock onto a drone, switch away, come back: the gate re-acquires
-        // rather than resuming a lock formed before the detour.
-        a.mode = Mode::Auto;
-        assert_eq!(a.update(drone(), 50), Status::Emitting);
-        a.mode = Mode::Off;
-        a.update(drone(), 50);
-        a.mode = Mode::Auto;
-        let marginal = Telemetry { tonality: 0.20, ..drone() };
-        assert_eq!(a.update(marginal, 50), Status::NotTonal,
-                   "a stale open gate would have accepted this");
     }
 
     #[test]
-    fn the_readout_names_the_frequency_only_when_there_is_one() {
+    fn the_readout_names_the_frequency_the_engine_tracked() {
+        // Not a frequency the UI was told — one the canceller estimated.
         let mut a = Anc::default();
-        a.update(drone(), 50);
-        assert!(a.readout().contains("120 Hz"));
-        a.update(quiet(), 5_000);
-        assert_eq!(a.readout(), "quiet — nothing to cancel");
+        for _ in 0..40 {
+            a.process(&drone(120.0, 0.5, 4096));
+        }
+        let r = a.readout();
+        assert!(r != "off" && !r.is_empty());
+        if matches!(a.phase(), DronePhase::Active | DronePhase::Detected) {
+            assert!(r.contains("Hz"), "an engaged readout names the tone: {r}");
+        }
+    }
+
+    #[test]
+    fn the_types_are_the_engines_own() {
+        // Guards the regression this rewrite exists to prevent: if these ever
+        // become local definitions again, the UI has forked from bo-mux and
+        // the two will drift silently.
+        fn takes_engine_phase(_: bo_mux::drone_canceller::DronePhase) {}
+        takes_engine_phase(Anc::default().phase());
+        let _: Option<bo_mux::drone_canceller::DroneSnapshot> =
+            Anc::default().snapshot();
     }
 }

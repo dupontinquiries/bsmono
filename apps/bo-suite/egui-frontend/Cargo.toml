@@ -21,6 +21,13 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# THE ENGINE. Absent until now: this frontend rendered the whole ANC
+# application while depending on no part of it, which parity_audit could not
+# see because every column it had measured surface reachability rather than
+# connection. bo-mux is std-only here (audiomix-kit, mic-kit, serde,
+# signal-hook), so linking it costs no audio-hardware dependency and makes
+# DroneCanceller's real phase machine available to the UI.
+bo-mux = { path = "../bo-mux" }
 # XDG paths + flat [section] key=value, the fleet's one path rule.
 config-kit = { path = "../../../shared/config-kit" }
 # bo-mux/protocol.rs is mounted by #[path] and derives Serialize/Deserialize;
