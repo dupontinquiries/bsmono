@@ -844,6 +844,23 @@ fn build_battle() -> (Mesh, Vec3) {
     m.set_op(0.3);
     m.cone(v3(g.contention.0, world::height_at(g.contention.0, g.contention.1) + 0.25, g.contention.1), 20.0, 0.2, 28, rgb(0xffd24a));
     m.set_op(1.0);
+    // the Skyrock: the ridge lookout — a tall stone spire, ledge, and a beacon in
+    // the watching clan's colour (white while unclaimed)
+    {
+        let (sx, sz) = g.skyrock;
+        let gy = world::height_at(sx, sz);
+        m.cone(v3(sx, gy + 4.0, sz), 3.2, 9.0, 8, shade(rgb(0x8b8d92), 0.95));
+        m.boxx(v3(sx, gy + 7.6, sz), v3(1.6, 0.35, 1.6), rgb(0xa8917a));   // the watchers' ledge
+        let bcol = match g.skyrock_holder {
+            Some(t) if t == CLAN_A => rgb(0xd8623c),
+            Some(_) => rgb(0x3d7fd8),
+            None => rgb(0xece8e0),
+        };
+        m.segment(v3(sx, gy + 8.0, sz), v3(sx, gy + 12.5, sz), 0.35, 0.1, 5, bcol);
+        m.set_op(0.3);
+        m.cone(v3(sx, gy + 0.25, sz), 14.0, 0.2, 24, rgb(0xece8e0));
+        m.set_op(1.0);
+    }
     // the fords: pale gravel bars where the east trail crosses the river
     for &(fx, fz) in &world::U_FORDS {
         let gy = world::height_at(fx, fz).max(world::WATER_Y);

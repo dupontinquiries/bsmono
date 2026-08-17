@@ -146,7 +146,17 @@ pub fn raw_height(x: f32, z: f32) -> f32 {
         let ends = (1.0 - ((along.abs() - 110.0) / 20.0).clamp(0.0, 1.0));   // fade past the camps
         if d < w { (1.0 - d / w) * 3.4 * ends } else { 0.0 }
     } else { 0.0 };
-    peaks - bowl + causeway + river_carve(x, z) + land_lift()
+    // the U course also TILTS the country: the duo side climbs to a mountain
+    // shoulder while the river keeps the valley floor — one-sided (only the west
+    // rises; a full-plane tilt would drown the solo side's prey camps). The
+    // gradient runs along the anti-diagonal, so the clan-swap reflection fixes
+    // it: lanes differ in height, clans do not.
+    let tilt = if course == RIVER_U_EAST {
+        let u = (z - x) / std::f32::consts::SQRT_2;         // + toward the duo corner
+        let t = (u / 130.0).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t) * 6.0
+    } else { 0.0 };
+    peaks - bowl + causeway + tilt + river_carve(x, z) + land_lift()
 }
 
 // ── stored, eroded heightfield (adapted from unendlich thermal_erosion + water_field) ──

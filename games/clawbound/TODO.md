@@ -136,6 +136,22 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] Walls carved by wind and water: stacked strata narrowing as they rise, grey/rust
   banding, hoodoo spires with capstones off the crest, the pass a worn notch with
   shoulder stones — roughly double the height, true sight blockers in silhouette.
+- [x] The tilted country: the U course now also raises a **one-sided slope** along the
+  anti-diagonal — the duo lane climbs ~5.5m to a mountain shoulder (naturally prey-thin
+  MOUNTAINS biome), mid holds the causeway, the river keeps the valley floor. One-sided
+  because a full-plane tilt would drown the solo side's prey camps; anti-diagonal so the
+  clan-swap reflection fixes it (lanes differ in height, clans do not).
+- [x] High ground is a real sense, not scenery: looking DOWN a slope spots up to 40%
+  farther (pure `downhill_bonus`, capped), and from 4m+ above within 30m a watcher sees
+  down INTO brush and mist — cover is a roof, not a dome; stone still blocks absolutely.
+- [x] The **Skyrock**: a claimable lookout spire on the ridge crest, the reflection's own
+  fixed point (equidistant from both camps, asserted). Holding it (presence, like the
+  contention ground) widens the whole clan's spotting range by a quarter — the reason to
+  climb a lane with no freshkill. Rendered as spire + watchers' ledge + holder-coloured
+  beacon.
+- [ ] Report skew watch: 9-4 clan A on the tilted map (was 7-6). Thirteen deterministic
+  samples is inside coin-flip variance (P(≥9) ≈ 13%) — before tuning, extend the report
+  harness to run each pick under several terrain rolls for real sample size
 - [ ] Landform-carved heightfield (walls/crags as real terrain relief rather than placed
   slabs) would need a per-mode heightfield overlay in world — a bigger seam, deferred
 - [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes

@@ -239,6 +239,13 @@ pub struct Battleground {
     pub medics: [(f32, f32); 2],
     pub contention: (f32, f32),
     pub contention_holder: Option<u8>,
+    /// The Skyrock: a lookout spire on the duo ridge's crest (on the anti-diagonal,
+    /// so it is the clan-swap reflection's own fixed point — equally far from both
+    /// camps). The clan holding it watches the whole territory from above: every
+    /// warrior's spotting range grows by a quarter. The mountain lane is thin on
+    /// freshkill; the Skyrock is why a clan climbs anyway.
+    pub skyrock: (f32, f32),
+    pub skyrock_holder: Option<u8>,
     pub time: f32,
     pub outcome: Option<u8>,          // winning clan, or 2 = draw at full time
     patrol_t: [f32; 2],
@@ -416,6 +423,7 @@ impl Battleground {
                 ClanState { pile: 0.0, herbs: 0, great_tree_hp: GREAT_TREE_HP },
             ],
             camps, medics, contention: (0.0, 0.0), contention_holder: None,
+            skyrock: (-92.0, 92.0), skyrock_holder: None,
             time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], wave_n: [0; 2], tick: 0,
             player_driven: false, input: None,
         }
@@ -490,14 +498,34 @@ impl Battleground {
         w.hp = (w.hp + amount * m).min(w.max_hp);
     }
 
+    /// Spotting-range multiplier for looking DOWN a slope: from `dh` metres above
+    /// the target (3+), eyes carry up to 40% farther. Pure, so it unit-tests.
+    fn downhill_bonus(dh: f32) -> f32 {
+        if dh >= 3.0 { 1.0 + ((dh - 3.0) / 6.0).clamp(0.0, 1.0) * 0.2 + 0.2 } else { 1.0 }
+    }
+    /// From high enough above (4m+), and close enough (30m), a watcher sees down
+    /// INTO brush and mist — cover is a roof, not a dome. Stone is still stone.
+    fn pierces_cover(dh: f32, d: f32) -> bool { dh >= 4.0 && d < 30.0 }
+
     fn nearest_enemy(&self, of: usize, within: f32) -> Option<usize> {
         let (team, x, z) = { let w = &self.warriors[of]; (w.team, w.x, w.z) };
+        let vh = world::height_at(x, z);
+        // the Skyrock's watchers yowl warnings: the holding clan spots a quarter farther
+        let clan_mult = if self.skyrock_holder == Some(team) { 1.25 } else { 1.0 };
         let mut best: Option<(usize, f32)> = None;
         for (i, e) in self.warriors.iter().enumerate() {
             if e.team == team || !e.alive() || e.stealth_t > 0.0 { continue; }
-            if !junglemap::sees(x, z, e.x, e.z) { continue; }   // brush, mist, stone
             let d = dist(x, z, e.x, e.z);
-            if d < within && best.map_or(true, |b| d < b.1) { best = Some((i, d)); }
+            let dh = vh - world::height_at(e.x, e.z);
+            if !junglemap::sees(x, z, e.x, e.z) {
+                // elevation can look down into brush — never through stone
+                let over_cover = junglemap::concealment_at(e.x, e.z).is_some()
+                    && !junglemap::wall_between(x, z, e.x, e.z)
+                    && Self::pierces_cover(dh, d);
+                if !over_cover { continue; }
+            }
+            let reach = within * clan_mult * Self::downhill_bonus(dh);
+            if d < reach && best.map_or(true, |b| d < b.1) { best = Some((i, d)); }
         }
         best.map(|b| b.0)
     }
@@ -946,6 +974,12 @@ impl Battleground {
         let (a, b) = (count(CLAN_A), count(CLAN_B));
         self.contention_holder =
             if a > b { Some(CLAN_A) } else if b > a { Some(CLAN_B) } else { self.contention_holder };
+        let (sx, sz) = self.skyrock;
+        let scount = |team: u8| self.warriors.iter()
+            .filter(|w| w.team == team && w.alive() && dist(w.x, w.z, sx, sz) < 14.0).count();
+        let (sa, sb) = (scount(CLAN_A), scount(CLAN_B));
+        self.skyrock_holder =
+            if sa > sb { Some(CLAN_A) } else if sb > sa { Some(CLAN_B) } else { self.skyrock_holder };
 
         // player input drives warrior 0 directly
         if let Some((mx, mz, claw, ability)) = self.input.take() {
@@ -1777,6 +1811,71 @@ mod tests {
         // restore the default spec for whoever bakes next
         world::set_terrain_pool(1.0, 1);
         world::init_world();
+    }
+
+    #[test]
+    fn the_duo_lane_climbs_and_the_river_keeps_the_valley_floor() {
+        let _guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        world::set_terrain_pool(Battleground::MOUNTAIN_BIAS, 1);
+        world::set_land_lift(Battleground::LAND_LIFT);
+        world::set_river_course(world::RIVER_U_EAST);
+        world::init_world();
+        let duo = world::height_at(-85.0, 85.0);
+        let solo = world::height_at(85.0, -85.0);
+        let mid = world::height_at(0.0, 0.0);
+        assert!(duo > solo + 3.5, "the duo bend must stand on the mountain: duo {duo:.1} solo {solo:.1}");
+        assert!(duo > mid + 2.0, "and above the causeway: duo {duo:.1} mid {mid:.1}");
+        // the river bed is the lowest ground of the three heights of the land
+        let (rx, rz) = (world::U_RIVER_C.0 - world::U_RIVER_R * 0.707, world::U_RIVER_C.1 + world::U_RIVER_R * 0.707);
+        let river = world::height_at(rx, rz);
+        assert!(river < world::WATER_Y && river < solo && river < mid,
+            "the river keeps the bottom: river {river:.1}");
+        world::set_terrain_pool(1.0, 1);
+        world::init_world();
+    }
+
+    #[test]
+    fn high_ground_spots_farther_and_looks_down_into_brush() {
+        // the pure rules first
+        assert_eq!(Battleground::downhill_bonus(0.0), 1.0);
+        assert_eq!(Battleground::downhill_bonus(-5.0), 1.0, "uphill grants nothing");
+        assert!(Battleground::downhill_bonus(4.0) > 1.2);
+        assert!(Battleground::downhill_bonus(20.0) <= 1.4 + 1e-6, "the bonus caps");
+        assert!(Battleground::pierces_cover(5.0, 20.0));
+        assert!(!Battleground::pierces_cover(2.0, 20.0), "not high enough");
+        assert!(!Battleground::pierces_cover(5.0, 40.0), "too far even from above");
+    }
+
+    #[test]
+    fn the_skyrock_watchers_widen_the_whole_clans_eyes() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        // stand a scout on the Skyrock and everyone else far away
+        for w in bg.warriors.iter_mut() { w.x = -140.0; w.z = -140.0; w.mind = Mind::Retreat; }
+        let (sx, sz) = bg.skyrock;
+        // a clan A viewer and a clan B target on the SAME open flat ground, spaced
+        // just past plain engage range — invisible without the Skyrock's warning
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        let (vx, vz) = (30.0, 30.0);   // on the causeway flat, no cover, no wall
+        let d = ENGAGE_R * 1.12;
+        bg.warriors[0].x = vx; bg.warriors[0].z = vz;
+        bg.warriors[e].x = vx + d; bg.warriors[e].z = vz;
+        bg.skyrock_holder = None;
+        let dh = world::height_at(vx, vz) - world::height_at(vx + d, vz);
+        if dh.abs() < 2.9 {   // flat enough that no downhill bonus muddies the comparison
+            assert!(bg.nearest_enemy(0, ENGAGE_R).is_none(), "past plain range, unseen");
+        }
+        // now clan A's scout holds the rock: the whole clan spots a quarter farther
+        bg.warriors[1].x = sx; bg.warriors[1].z = sz; bg.warriors[1].mind = Mind::Retreat;
+        bg.step(1.0 / 30.0);
+        assert_eq!(bg.skyrock_holder, Some(CLAN_A));
+        bg.warriors[0].x = vx; bg.warriors[0].z = vz;
+        bg.warriors[e].x = vx + d; bg.warriors[e].z = vz;
+        assert_eq!(bg.nearest_enemy(0, ENGAGE_R), Some(e), "the watchers yowl their warning");
+        // and the rock is the reflection's fixed point: equally far from both camps
+        let da = dist(sx, sz, bg.camps[0].0, bg.camps[0].1);
+        let db = dist(sx, sz, bg.camps[1].0, bg.camps[1].1);
+        assert!((da - db).abs() < 12.0, "the Skyrock favors neither clan: {da:.0} vs {db:.0}");
     }
 
     #[test]
