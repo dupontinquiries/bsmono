@@ -127,3 +127,57 @@ merge rather than a fast-forward.
   assessment still to do.
 
 * `studio-session.mbox` — an mbox alongside the bundles, unexamined.
+
+---
+
+# Addendum: the two blackstar engines (2026-08-17)
+
+Both engines stay — the C exengine build and blackstar-rs — and the goal is to
+port each one's niceties to the other. Two findings from looking at what is
+already there.
+
+## Rust → C is written and stranded
+
+`games/blackstar/engine_src/botpack.h` is a complete 176-line C reader for
+blackstar-rs's `bots.pack`, with the format documented faithfully (including
+the one-box-per-chassis rule and the u32-index bug that motivated it).
+**Nothing includes it.** Not `game.c`, not `CMakeLists.txt`. It is the same
+unreachable-module problem this session spent most of its time on, in C.
+
+Its own header corrects something we believed: `imported_models.h` lists 1,012
+`data/imported_*.iqm` and **none of them are in the repo** — only 21 survive
+under `data/examples/`. So the C engine's imported roster already loads
+nothing, and has for some time. The 68 IQMs under `engine_src/data` are the
+arena and the survivors, not the roster.
+
+That reframes the IQM question. Removing IQM from the C engine is not the
+prerequisite it looked like: the roster is already dead, and `botpack.h` gives
+it 173 chassis it wants and cannot load, at ~33% of what the IQM would have
+cost. Wiring that header in is the highest-value C-side task available, and it
+needs a machine that can build the CMake target.
+
+## C → Rust is the bigger prize
+
+exengine's IQM pipeline is a mature skeletal path that blackstar-rs does not
+have. blackstar-rs has `rig.rs` (glTF skins, animation channels, measured
+against a real 83-joint clip) and `examples/rigpose.rs` proving runtime pose
+composition works — but its shipped fleet is 1,454 BAKED pose glTFs, because
+the rigged sources are absent.
+
+If blackstar-rs gains a real skinned-model path, baked poses stop being archive
+and become regenerable. That is the 216 MB of `bots.pack` plus 46 MB of pose
+JSON — an order of magnitude more than any compression work discussed here.
+It is blocked on the same missing `.iqm` sources, so it is a question of
+whether those exist outside the repo, not of engine work.
+
+## What was decided and not done
+
+* Clawbound's 17 animal IQMs were shelved (18 MB): the spirits are a staging
+  harness, not a gamemode, and the models are re-obtainable. Loader, roster and
+  parser all stay; three tests skip when the directory is absent and are fully
+  strict when it is present.
+* Applying the parts-web to clawbound was considered and dropped. The web's win
+  is dedup — 40,742 parts from 1,012 vehicles, a roadwheel stored once — and 17
+  unique organic models share nothing. The *encoding* half (16-bit quantisation,
+  varint delta indices) would help, but that is `bsweb` extended with skin data,
+  not a second encoder.
