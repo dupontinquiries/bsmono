@@ -50,10 +50,14 @@ pub fn run(argv: &[String]) {
             };
             stability(bot, pose);
         }
+        Some("sweep") => {
+            sweep();
+        }
         _ => {
             println!("usage:");
             println!("  skydribble --parts check <bot> <pose>");
             println!("  skydribble --parts stability <bot> <pose>");
+            println!("  skydribble --parts sweep");
         }
     }
 }
@@ -182,4 +186,112 @@ fn stability(bot: &str, pose: &str) {
     println!("  {} contact points, stability margin {:.4} ({})",
         st.contact_points, st.margin,
         if st.margin > 0.0 { "stands" } else { "would tip -- centre of mass falls outside its own feet" });
+}
+
+/// Sweep the whole fleet, flagging specific poses where two
+/// INDEPENDENT signals disagree -- not a pass/fail grade on the
+/// classifier, a worklist of what to look at first. Read-only, same
+/// as every other command in this module.
+fn sweep() {
+    let Ok(rd) = std::fs::read_dir(bots_dir()) else {
+        println!("no assets/bots directory found");
+        return;
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+
+    let (mut total, mut loaded, mut leg_pairs_found) = (0usize, 0usize, 0usize);
+    let mut up_confident_low_symmetry: Vec<(String, String, f32)> = Vec::new();
+    let mut forward_confident_flip: Vec<(String, String)> = Vec::new();
+    let mut tips_over: Vec<(String, String, f32)> = Vec::new();
+
+    for name in &names {
+        for pose_dir in crate::orientsim::poses(&bots_dir().join(name)) {
+            total += 1;
+            let pose = pose_dir.file_name().unwrap().to_string_lossy().to_string();
+            let Some(l) = load(name, &pose) else { continue };
+            loaded += 1;
+
+            let kinds: Vec<Kind> = l
+                .raws
+                .iter()
+                .filter(|r| !r.verts.is_empty())
+                .map(|r| partdetect::classify(&r.verts, l.up, l.lo, l.hi, l.center, l.half_width))
+                .collect();
+            let verts_only: Vec<&[crate::meshgen::Vertex]> =
+                l.raws.iter().filter(|r| !r.verts.is_empty()).map(|r| r.verts.as_slice()).collect();
+            let prims: Vec<partdetect::KindedPrim> = verts_only
+                .iter()
+                .zip(kinds.iter())
+                .map(|(v, k)| partdetect::KindedPrim { verts: v, kind: *k })
+                .collect();
+
+            // orient::guess doesn't hand back forward_confident/up_confident
+            // through partsim's own `load` (it only kept the winning axes) --
+            // re-derive the guess once here rather than widen Loaded's
+            // fields for a sweep-only need.
+            let whole = orient::all_verts(&l.raws);
+            let g = orient::guess(&whole);
+
+            let left_right = g.forward.cross(g.up).normalize();
+            if let Some(sym) = partdetect::leg_symmetry_under(&prims, g.up, left_right, l.lo, l.hi, l.center) {
+                leg_pairs_found += 1;
+                if g.up_confident && sym < 0.5 {
+                    up_confident_low_symmetry.push((name.clone(), pose.clone(), sym));
+                }
+            }
+            if let Some(h) = partdetect::forward_sign_hint(&prims, g.up, g.forward, l.lo, l.hi) {
+                if g.forward_confident && h < 0.0 {
+                    forward_confident_flip.push((name.clone(), pose.clone()));
+                }
+            }
+
+            let vec3_and_kind: Vec<(Vec<glam::Vec3>, Kind)> = l
+                .raws
+                .iter()
+                .filter(|r| !r.verts.is_empty())
+                .zip(kinds.iter())
+                .map(|(r, k)| {
+                    let vs: Vec<glam::Vec3> = r.verts.iter().map(|v| glam::Vec3::from_array(v.pos)).collect();
+                    (vs, *k)
+                })
+                .collect();
+            let lb_inputs: Vec<loadbearing::PrimInput> =
+                vec3_and_kind.iter().map(|(vs, k)| loadbearing::PrimInput { verts: vs, kind: *k }).collect();
+            let st = loadbearing::check(&lb_inputs, l.up);
+            if st.contact_points >= 3 && st.margin < 0.0 {
+                tips_over.push((name.clone(), pose.clone(), st.margin));
+            }
+        }
+    }
+
+    println!("swept {loaded}/{total} poses ({} had 2+ leg/wheel candidates to check pairing on)", leg_pairs_found);
+    println!();
+    println!("up_confident=true but legs-mirror<0.5 ({}):", up_confident_low_symmetry.len());
+    for (bot, pose, sym) in up_confident_low_symmetry.iter().take(30) {
+        println!("  {bot}/{pose}  legs-mirror={sym:.2}");
+    }
+    if up_confident_low_symmetry.len() > 30 {
+        println!("  ... and {} more", up_confident_low_symmetry.len() - 30);
+    }
+    println!();
+    println!("forward_confident=true but head-hint says FLIP ({}):", forward_confident_flip.len());
+    for (bot, pose) in forward_confident_flip.iter().take(30) {
+        println!("  {bot}/{pose}");
+    }
+    if forward_confident_flip.len() > 30 {
+        println!("  ... and {} more", forward_confident_flip.len() - 30);
+    }
+    println!();
+    println!("would tip over (3+ contact points, negative stability margin) ({}):", tips_over.len());
+    for (bot, pose, margin) in tips_over.iter().take(30) {
+        println!("  {bot}/{pose}  margin={margin:.3}");
+    }
+    if tips_over.len() > 30 {
+        println!("  ... and {} more", tips_over.len() - 30);
+    }
 }

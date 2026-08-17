@@ -24,7 +24,7 @@ fn bots_dir() -> PathBuf {
 
 /// Every pose directory under a bot family — the fold frames (f00..)
 /// and walk frames (w00..), in the same order the shell loads them.
-fn poses(bot_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn poses(bot_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(bot_dir) else { return out };
     let mut names: Vec<String> = rd
