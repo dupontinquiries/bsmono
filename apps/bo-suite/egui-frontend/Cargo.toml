@@ -28,6 +28,11 @@ app = ["dep:eframe"]
 # signal-hook), so linking it costs no audio-hardware dependency and makes
 # DroneCanceller's real phase machine available to the UI.
 bo-mux = { path = "../bo-mux" }
+# bo-core carries pattern_learner, which is the premise the whole project rests
+# on: periodic noise can be PREDICTED from the previous cycle, so latency stops
+# mattering. It was marked #![allow(dead_code)], vendored from bo-mux (which no
+# longer has a copy), and referenced by nothing anywhere in the tree.
+bo-core = { path = "../bo-core" }
 # XDG paths + flat [section] key=value, the fleet's one path rule.
 config-kit = { path = "../../../shared/config-kit" }
 # bo-mux/protocol.rs is mounted by #[path] and derives Serialize/Deserialize;

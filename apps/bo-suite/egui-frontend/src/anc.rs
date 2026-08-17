@@ -175,6 +175,103 @@ impl Anc {
     }
 }
 
+/// The predictive path: periodic noise the tonal canceller does not cover.
+///
+/// `DroneCanceller` locks a FUNDAMENTAL — a sustained tone. The other half of
+/// this project's premise is different and, until now, unreachable:
+///
+/// > Motor / fan / compressor noise REPEATS with a stable period. If we detect
+/// > that period and learn the per-cycle waveform shape, we can PREDICT the
+/// > next cycle from the previous one … because we're predicting rather than
+/// > reacting, latency only needs to be smaller than one cycle.
+///
+/// That is `bo_core::pattern_learner`, and it was `#![allow(dead_code)]`,
+/// vendored from a bo-mux that no longer has a copy, referenced by nothing in
+/// the tree. It is the reason the whole approach works over a mesh of Bluetooth
+/// speakers with real latency, and it had no way to reach a screen.
+pub struct PatternProbe {
+    /// Estimated cycle length in samples, when one was found.
+    pub period: Option<f32>,
+    /// How much of the signal that period explains, 0..1.
+    pub score: f32,
+    template: Vec<f32>,
+}
+
+impl Default for PatternProbe {
+    fn default() -> Self {
+        PatternProbe { period: None, score: 0.0, template: Vec::new() }
+    }
+}
+
+impl std::fmt::Debug for PatternProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatternProbe").field("period", &self.period)
+            .field("score", &self.score)
+            .field("template_len", &self.template.len()).finish()
+    }
+}
+
+/// Cycle bounds in samples at 48 kHz: 20 Hz to 200 Hz.
+///
+/// Chosen from what the module is FOR — motors, fans, compressors — rather
+/// than from the full audible range. A wider search finds spurious long
+/// periods in ordinary noise, and the cost of a false lock here is anti-noise
+/// predicted from a cycle that does not exist.
+const PERIOD_MIN: usize = 240;
+const PERIOD_MAX: usize = 2400;
+
+impl PatternProbe {
+    /// Feed a window; returns the periodicity score.
+    ///
+    /// The template is relearned whenever a period is found rather than
+    /// averaged across windows: the source changes speed (a mower bogs down in
+    /// thick grass) and a template blended across two speeds predicts neither.
+    pub fn observe(&mut self, samples: &[f32]) -> f32 {
+        match bo_core::pattern_learner::estimate_period(samples, PERIOD_MIN, PERIOD_MAX) {
+            Some(p) => {
+                self.period = Some(p);
+                if let Some(tpl) = bo_core::pattern_learner::learn_template(samples, p) {
+                    self.score = bo_core::pattern_learner::periodicity_score(samples, &tpl);
+                    self.template = tpl;
+                } else {
+                    self.score = 0.0;
+                }
+            }
+            None => {
+                self.period = None;
+                self.score = 0.0;
+                self.template.clear();
+            }
+        }
+        self.score
+    }
+
+    /// Is the cycle explanatory enough to predict from?
+    ///
+    /// A period is always findable in noise; a period that explains most of
+    /// the signal is a real source. The threshold gates prediction, not
+    /// detection, because predicting from a weak template emits anti-noise
+    /// shaped like nothing that is happening.
+    pub fn predictable(&self) -> bool {
+        self.period.is_some() && self.score >= 0.5
+    }
+
+    /// The cycle in milliseconds, for a readout a person can reason about —
+    /// "a 40 ms cycle" is a thing you can hear, 1920 samples is not.
+    pub fn period_ms(&self) -> Option<f32> {
+        self.period.map(|p| p * 1000.0 / 48_000.0)
+    }
+
+    /// What the inverse waveform would be at this phase — the value that
+    /// would actually be played. Exposed so a UI can draw the predicted
+    /// counter-cycle instead of asserting that one exists.
+    pub fn inverse_at(&self, phase_samples: usize) -> Option<f32> {
+        (!self.template.is_empty()).then(|| {
+            bo_core::pattern_learner::inverse_template_at(&self.template, phase_samples)
+        })
+    }
+}
+
 /// The playbar chip: mode button plus the reason line.
 ///
 /// Lives in the transport strip rather than on a page, because the operator
@@ -302,6 +399,71 @@ mod tests {
         if matches!(a.phase(), DronePhase::Active | DronePhase::Detected) {
             assert!(r.contains("Hz"), "an engaged readout names the tone: {r}");
         }
+    }
+
+    /// A motor-like cycle: a sharp repeating pulse, NOT a sine.
+    ///
+    /// A pure tone would prove nothing here — DroneCanceller already handles
+    /// those. The predictive path exists for sources whose cycle has shape,
+    /// which is why the test signal is a decaying pulse train.
+    fn motor(period: usize, cycles: usize) -> Vec<f32> {
+        let mut v = Vec::with_capacity(period * cycles);
+        for _ in 0..cycles {
+            for i in 0..period {
+                let x = i as f32 / period as f32;
+                v.push((-6.0 * x).exp() * (1.0 - 2.0 * x));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn a_repeating_cycle_is_found_and_measured() {
+        // The premise the project rests on, reaching a screen for the first
+        // time: this code was dead in a crate nothing linked.
+        let mut probe = PatternProbe::default();
+        let score = probe.observe(&motor(960, 8));   // 960 samples = 50 Hz
+        let p = probe.period.expect("a pulse train repeating every 960 samples has a period");
+        assert!((p - 960.0).abs() < 40.0, "found {p}, expected ~960");
+        assert!(score > 0.5, "an exact repeat should be well explained, got {score}");
+        assert!(probe.predictable());
+        let ms = probe.period_ms().unwrap();
+        assert!((ms - 20.0).abs() < 1.0, "960 samples at 48 kHz is 20 ms, got {ms}");
+    }
+
+    #[test]
+    fn noise_does_not_become_a_prediction() {
+        // A period is always findable; one that explains the signal is not.
+        // Predicting from a weak template emits anti-noise shaped like
+        // nothing that is happening, which is worse than staying silent.
+        let mut probe = PatternProbe::default();
+        let mut x = 12345u32;
+        let noise: Vec<f32> = (0..8192).map(|_| {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            (x >> 8) as f32 / 8388608.0 - 1.0
+        }).collect();
+        probe.observe(&noise);
+        assert!(!probe.predictable(), "white noise scored {}", probe.score);
+    }
+
+    #[test]
+    fn silence_yields_no_period_at_all() {
+        let mut probe = PatternProbe::default();
+        assert_eq!(probe.observe(&vec![0.0f32; 8192]), 0.0);
+        assert!(probe.period.is_none());
+        assert!(probe.inverse_at(0).is_none(), "no template, no prediction");
+    }
+
+    #[test]
+    fn the_predicted_counter_cycle_is_available_to_draw() {
+        // A UI should be able to show the inverse waveform rather than assert
+        // that one exists.
+        let mut probe = PatternProbe::default();
+        probe.observe(&motor(960, 8));
+        let a = probe.inverse_at(0).expect("template learned");
+        let b = probe.inverse_at(480).expect("template learned");
+        assert!(a.is_finite() && b.is_finite());
+        assert!(a != b, "a shaped cycle should differ across its phase");
     }
 
     #[test]

@@ -199,6 +199,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bo-core"
+version = "0.1.0"
+
+[[package]]
 name = "bo-mux"
 version = "0.1.0"
 dependencies = [
@@ -213,6 +217,7 @@ dependencies = [
 name = "bo-suite-egui"
 version = "0.1.0"
 dependencies = [
+ "bo-core",
  "bo-mux",
  "config-kit",
  "eframe",

@@ -1,3 +1,10 @@
+# parity-audit: service
+#
+# A VERSION SHIM, not an engine. src/lib.rs is three lines re-exporting
+# fao_codec (v1.1, FROZEN); these crates exist so a consumer can pin a codec
+# version, and the code they name lives in fao_codec_lib. A frontend that
+# already links fao_codec_lib reaches every one of these symbols directly —
+# depending on the shim too would add an alias, not a capability.
 [package]
 name = "fao-codec-v1"
 version = "1.1.0"
