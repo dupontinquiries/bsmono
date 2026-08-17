@@ -5,5 +5,6 @@ pub mod app;
 pub mod remote_browse;
 pub mod pages;
 /// The changed-file list's model: porcelain parsing and stage decisions.
+pub mod device_picker;
 pub mod status_rows;
 pub mod task;
