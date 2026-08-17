@@ -110,25 +110,33 @@ fn guess_for(pose_dir: &Path) -> Option<(orient::Guess, Vec<crate::meshgen::Vert
     Some((g, verts))
 }
 
-/// `partdetect::forward_sign_hint`, run against a real pose -- a
-/// second, self-contained load rather than threading raws through
-/// `guess_for`'s six call sites for one diagnostic line. `None` means
-/// either the pose could not load or the hint itself found nothing to
-/// say (see `forward_sign_hint`'s own doc for when that happens).
-fn forward_hint_for(pose_dir: &Path) -> Option<f32> {
+/// Everything both `forward_sign_hint` and `leg_symmetry_under` need
+/// from a pose: the orientation guess, whole-body bounds, and every
+/// prim classified under that guess's own up-axis. One load and one
+/// classify pass shared between both diagnostics, rather than each
+/// repeating it.
+struct Classified {
+    guess: orient::Guess,
+    lo: f32,
+    hi: f32,
+    center: glam::Vec3,
+    kinded: Vec<(Vec<crate::meshgen::Vertex>, crate::partdetect::Kind)>,
+}
+
+fn classify_pose(pose_dir: &Path) -> Option<Classified> {
     let raws = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::model::load_raw_unoriented(pose_dir))).ok()?;
     if raws.is_empty() {
         return None;
     }
     let whole = orient::all_verts(&raws);
-    let g = orient::guess(&whole);
-    let (pa, pb) = orient::perp_pair(g.up);
+    let guess = orient::guess(&whole);
+    let (pa, pb) = orient::perp_pair(guess.up);
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     let (mut a_lo, mut a_hi) = (f32::MAX, f32::MIN);
     let (mut b_lo, mut b_hi) = (f32::MAX, f32::MIN);
     for v in &whole {
         let p = glam::Vec3::from_array(v.pos);
-        let h = p.dot(g.up);
+        let h = p.dot(guess.up);
         lo = lo.min(h);
         hi = hi.max(h);
         let x = p.dot(pa);
@@ -138,19 +146,41 @@ fn forward_hint_for(pose_dir: &Path) -> Option<f32> {
         b_lo = b_lo.min(y);
         b_hi = b_hi.max(y);
     }
-    let center = g.up * ((lo + hi) * 0.5) + pa * ((a_lo + a_hi) * 0.5) + pb * ((b_lo + b_hi) * 0.5);
+    let center = guess.up * ((lo + hi) * 0.5) + pa * ((a_lo + a_hi) * 0.5) + pb * ((b_lo + b_hi) * 0.5);
     let half_width = ((a_hi - a_lo).max(b_hi - b_lo) * 0.5).max(1e-6);
     let kinded: Vec<(Vec<crate::meshgen::Vertex>, crate::partdetect::Kind)> = raws
         .iter()
         .filter(|r| !r.verts.is_empty())
         .map(|r| {
-            let k = crate::partdetect::classify(&r.verts, g.up, lo, hi, center, half_width);
+            let k = crate::partdetect::classify(&r.verts, guess.up, lo, hi, center, half_width);
             (r.verts.clone(), k)
         })
         .collect();
-    let prims: Vec<crate::partdetect::KindedPrim> =
-        kinded.iter().map(|(v, k)| crate::partdetect::KindedPrim { verts: v, kind: *k }).collect();
-    crate::partdetect::forward_sign_hint(&prims, g.up, g.forward, lo, hi)
+    Some(Classified { guess, lo, hi, center, kinded })
+}
+
+fn kinded_prims(c: &Classified) -> Vec<crate::partdetect::KindedPrim> {
+    c.kinded.iter().map(|(v, k)| crate::partdetect::KindedPrim { verts: v, kind: *k }).collect()
+}
+
+/// `partdetect::forward_sign_hint` for a real pose. `None` means
+/// either the pose could not load or the hint itself found nothing to
+/// say (see `forward_sign_hint`'s own doc for when that happens).
+fn forward_hint_for(pose_dir: &Path) -> Option<f32> {
+    let c = classify_pose(pose_dir)?;
+    let prims = kinded_prims(&c);
+    crate::partdetect::forward_sign_hint(&prims, c.guess.up, c.guess.forward, c.lo, c.hi)
+}
+
+/// `partdetect::leg_symmetry_under` for a real pose -- the second
+/// opinion on the chosen up-axis, from leg pairing rather than mass
+/// distribution. `None` when the pose could not load or fewer than 2
+/// leg/wheel candidates were classified (no pairing question to ask).
+fn leg_symmetry_for(pose_dir: &Path) -> Option<f32> {
+    let c = classify_pose(pose_dir)?;
+    let prims = kinded_prims(&c);
+    let left_right = c.guess.forward.cross(c.guess.up).normalize();
+    crate::partdetect::leg_symmetry_under(&prims, c.guess.up, left_right, c.lo, c.hi, c.center)
 }
 
 fn check(bot: &str) {
@@ -171,8 +201,13 @@ fn check(bot: &str) {
                     Some(_) => " head-hint: FLIP".to_string(),
                     None => String::new(),
                 };
+                let sym = leg_symmetry_for(p);
+                let sym_str = match sym {
+                    Some(s) => format!(" legs-mirror: {s:.2}"),
+                    None => String::new(),
+                };
                 println!(
-                    "  {name:4} up={} (conf={}) fwd={} (conf={}){hint_str}",
+                    "  {name:4} up={} (conf={}) fwd={} (conf={}){hint_str}{sym_str}",
                     orient::axis_name(g.up),
                     g.up_confident,
                     orient::axis_name(g.forward),
