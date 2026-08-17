@@ -36,6 +36,11 @@ pub struct State {
     /// frame: a scan takes seconds and the labels are the operator's, not the
     /// network's.
     pub roster: cockpit::roster::Roster,
+    /// Enrolment: choose a device, trust its key, install ours.
+    ///
+    /// The roster remembers devices and the planner emits Step::Enroll; this
+    /// is the only thing in the port that can actually perform one.
+    pub picker: crate::device_picker::Picker,
     /// What the last scan changed, shown so the list does not mutate silently.
     pub last_changes: Vec<cockpit::roster::Change>,
     /// Apps to push in a reroll. Empty is a legitimate state and the plan says
@@ -50,6 +55,71 @@ pub struct State {
 /// Sits on the Fleet page rather than becoming a twelfth tab. This page is
 /// already "get apps onto devices"; a reroll is that for every device at once,
 /// and splitting them would mean two places to learn for one intent.
+/// Draw the enrolment picker.
+///
+/// Every button is gated by the model rather than by what looks reasonable
+/// here: `can_trust` and `can_setup_key` are mutually exclusive by
+/// construction, and neither is offered from a failed state. A widget that
+/// decided this for itself would be a second copy of the rule that keeps a
+/// password off an unverified host.
+fn picker_ui(ui: &mut egui::Ui, p: &mut crate::device_picker::Picker) {
+    use crate::device_picker::Job;
+    ui.separator();
+    ui.label(egui::RichText::new("Enrol a device").strong());
+    ui.label(egui::RichText::new(p.status_line()).weak().small());
+
+    if p.devices.is_empty() {
+        return;
+    }
+    egui::ScrollArea::vertical().max_height(120.0).id_salt("picker").show(ui, |ui| {
+        for (i, d) in p.devices.clone().iter().enumerate() {
+            let label = if d.hostname.is_empty() { d.ip.clone() }
+                        else { format!("{}  ({})", d.hostname, d.ip) };
+            if ui.selectable_label(p.selected == Some(i), label).clicked() {
+                // Trust is READ HERE, at selection, and never cached on the
+                // model — a reflash changes the key and this fleet reflashes
+                // constantly.
+                let trusted = cockpit::deploy::host_trusted(&d.ip);
+                p.select(i, trusted);
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        if p.can_trust() && ui.button("Trust host key").clicked() {
+            if let Some(ip) = p.selected_ip() {
+                p.start(Job::Trust);
+                // Synchronous: ssh-keyscan against one host on the LAN is
+                // sub-second, and a Task here would need a channel for a
+                // result the next line already has.
+                let r = cockpit::deploy::trust_host(&ip);
+                let ok = r.is_ok();
+                let msg = match r { Ok(m) => m, Err(e) => e };
+                p.finished(Job::Trust, ok, &msg, cockpit::deploy::host_trusted(&ip));
+            }
+        }
+        if p.can_setup_key() {
+            ui.label("password:");
+            // Bound to a local, not to the model: Picker derives Debug and
+            // ends up in logs.
+            let pw_id = ui.id().with("pw");
+            let mut pw: String = ui.data(|d| d.get_temp(pw_id).unwrap_or_default());
+            ui.add(egui::TextEdit::singleline(&mut pw).password(true).desired_width(120.0));
+            ui.data_mut(|d| d.insert_temp(pw_id, pw.clone()));
+            if ui.button("Install key").clicked() {
+                if let Some(ip) = p.selected_ip() {
+                    p.start(Job::SetupKey);
+                    let r = cockpit::deploy::setup_key(&p.user, &ip, &pw);
+                    let ok = r.is_ok();
+                    let msg = match r { Ok(m) => m, Err(e) => e };
+                    p.finished(Job::SetupKey, ok, &msg, true);
+                    ui.data_mut(|d| d.insert_temp(pw_id, String::new()));
+                }
+            }
+        }
+    });
+}
+
 fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
     use cockpit::{reroll, roster, runview};
     ui.separator();
@@ -80,10 +150,24 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
                     .collect(),
                 None => Vec::new(),
             };
+            // The SAME scan feeds the picker, so one sweep serves both the
+            // roster's bookkeeping and enrolment. Two scan buttons would race
+            // each other over the same subnet and disagree about what is out
+            // there.
+            st.picker.discovered(
+                seen.iter()
+                    .map(|s| crate::device_picker::Found {
+                        ip: s.ip.clone(),
+                        hostname: s.hostname.clone(),
+                    })
+                    .collect(),
+            );
             st.last_changes = st.roster.observe(&seen);
         }
         ui.label(format!("{} device(s) on the roster", st.roster.len()));
     });
+
+    picker_ui(ui, &mut st.picker);
 
     for c in &st.last_changes {
         let line = match c {
