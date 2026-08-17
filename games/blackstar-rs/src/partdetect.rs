@@ -74,6 +74,40 @@ fn extents(verts: &[Vertex], axis: Vec3) -> (f32, f32, f32, f32, f32, f32) {
 /// wheel hub viewed from the axle. Direction-agnostic on purpose: a
 /// leg lying sideways and a leg standing up are the same shape, so
 /// this checks every candidate long axis and keeps the best one.
+/// Same measurement as `elongation`, for callers that already have
+/// plain positions rather than full `Vertex`es (`loadbearing.rs`,
+/// which works in `Vec3` since it needs no normal/uv data). Small
+/// enough to keep separate rather than route `elongation` itself
+/// through a shared Vec3 core that `extents`/`taper` would also need
+/// touching for no benefit to them.
+pub fn elongation_of_points(points: &[Vec3]) -> f32 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    let mut best = 0.0f32;
+    for axis in AXES {
+        let (pa, pb) = perp_pair(axis);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let (mut a_lo, mut a_hi) = (f32::MAX, f32::MIN);
+        let (mut b_lo, mut b_hi) = (f32::MAX, f32::MIN);
+        for &p in points {
+            let h = p.dot(axis);
+            lo = lo.min(h);
+            hi = hi.max(h);
+            let x = p.dot(pa);
+            a_lo = a_lo.min(x);
+            a_hi = a_hi.max(x);
+            let y = p.dot(pb);
+            b_lo = b_lo.min(y);
+            b_hi = b_hi.max(y);
+        }
+        let long = (hi - lo).max(0.0);
+        let cross = ((a_hi - a_lo).max(b_hi - b_lo)).max(1e-6);
+        best = best.max(long / cross);
+    }
+    best
+}
+
 pub fn elongation(verts: &[Vertex]) -> f32 {
     if verts.is_empty() {
         return 0.0;

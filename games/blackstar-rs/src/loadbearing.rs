@@ -34,6 +34,8 @@
 
 use glam::Vec3;
 
+use crate::partdetect::elongation_of_points;
+
 use crate::orient::perp_pair;
 
 /// A point in the ground plane — `orient::perp_pair`'s two axes, not
@@ -163,7 +165,32 @@ pub fn check(prims: &[PrimInput], up: Vec3) -> Stability {
         }
         centroid /= p.verts.len() as f32;
         let ext = (hi - lo).max(Vec3::splat(1e-4));
-        let mass = (ext.x * ext.y * ext.z).max(1e-6);
+        let bbox_vol = (ext.x * ext.y * ext.z).max(1e-6);
+        // ELONGATION DISCOUNT. A prim's bounding box overestimates its
+        // real material volume most for thin, long shapes -- a gun
+        // barrel, an antenna, a mast -- and barely at all for a
+        // compact blob. Traced this against a real chassis
+        // (antitank_robot_walker_v1/f04, prim 12: elongation 8.04,
+        // ground_fraction 0.37 -- just above classify()'s NEAR_GROUND
+        // cutoff, so it falls through every Leg/Wing/Thruster branch
+        // to the Kind::Body catch-all) and it was getting full
+        // uniform-density mass from a bounding box shaped nothing
+        // like its actual material. That single prim's likely
+        // over-weighting is one concrete, traced contributor to why
+        // `--parts sweep` flagged such a large fraction of the fleet
+        // as unstable across every category, not concentrated in any
+        // one body shape -- a long thin appendage is common everywhere.
+        //
+        // No real cross-section data exists to compute true volume, so
+        // this is a reasoned proxy, not a measurement: a cylinder's
+        // volume is pi/4 (~0.785) of its bounding box at elongation 1,
+        // and real barrels/masts are hollower and thinner than a solid
+        // cylinder as they get longer relative to their cross-section.
+        // sqrt(1/elongation), floored at 0.15 so a very long, thin part
+        // still counts for SOME real mass rather than vanishing.
+        let elong = elongation_of_points(p.verts);
+        let discount = (1.0 / elong.max(1.0).sqrt()).clamp(0.15, 1.0);
+        let mass = (bbox_vol * discount).max(1e-6);
         com += centroid * mass;
         total_mass += mass;
     }
@@ -293,5 +320,58 @@ mod tests {
         let st = check(&inputs, Vec3::Y);
         assert_eq!(st.contact_points, 1);
         assert_eq!(st.margin, f32::MIN);
+    }
+
+    #[test]
+    fn a_thin_elongated_appendage_pulls_the_centre_of_mass_less_than_a_compact_blob_of_the_same_box() {
+        // traced against a real chassis (see the discount's own doc
+        // comment in check()): a long thin mast/barrel/antenna's
+        // bounding box overestimates its real mass and should not
+        // drag the centre of mass toward it as hard as an equally
+        // sized but COMPACT part would.
+        let torso = box_prim(Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5));
+        let leg = |x: f32, z: f32| box_prim(Vec3::new(x - 0.05, -1.0, z - 0.05), Vec3::new(x + 0.05, 0.0, z + 0.05));
+        let legs = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+        let leg_vs: Vec<Vec<Vec3>> = legs.iter().map(|&(x, z)| leg(x, z)).collect();
+
+        // a long, thin mast far to one side -- same bounding-box
+        // footprint area as a squat block would need to have real
+        // heft, but this one is thin (elongation high)
+        let thin_mast = box_prim(Vec3::new(2.9, 0.0, -0.05), Vec3::new(3.1, 6.0, 0.05));
+        // a compact block with the SAME bounding-box volume, same
+        // position, just not elongated -- a fair A/B on volume alone
+        let compact_same_volume = {
+            // thin_mast's box: 0.2 x 6.0 x 0.1 = 0.12 m^3.
+            // a cube of the same volume: side = 0.12^(1/3) ~= 0.493
+            let s = 0.12f32.cbrt() / 2.0;
+            box_prim(Vec3::new(3.0 - s, 3.0 - s, -s), Vec3::new(3.0 + s, 3.0 + s, s))
+        };
+
+        let mut with_mast: Vec<PrimInput> = vec![
+            PrimInput { verts: &torso, kind: crate::partdetect::Kind::Body },
+            PrimInput { verts: &thin_mast, kind: crate::partdetect::Kind::Body },
+        ];
+        for lv in &leg_vs {
+            with_mast.push(PrimInput { verts: lv, kind: crate::partdetect::Kind::Leg });
+        }
+        let st_mast = check(&with_mast, Vec3::Y);
+
+        let mut with_block: Vec<PrimInput> = vec![
+            PrimInput { verts: &torso, kind: crate::partdetect::Kind::Body },
+            PrimInput { verts: &compact_same_volume, kind: crate::partdetect::Kind::Body },
+        ];
+        for lv in &leg_vs {
+            with_block.push(PrimInput { verts: lv, kind: crate::partdetect::Kind::Leg });
+        }
+        let st_block = check(&with_block, Vec3::Y);
+
+        // both bodies have an off-centre mass of equal bounding-box
+        // volume at the same position -- the compact block should
+        // drag the margin down MORE (toward instability) than the
+        // thin mast, because the discount reduces the mast's
+        // effective mass but not the block's
+        assert!(st_mast.margin > st_block.margin,
+            "a thin appendage should tip the body less than an equally-boxed compact mass: mast {} vs block {}",
+            st_mast.margin, st_block.margin);
     }
 }
