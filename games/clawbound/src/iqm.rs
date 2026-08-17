@@ -194,9 +194,28 @@ pub const FELINE_SPIRITS: &[(&str, &str, u32, f32)] = &[
 mod tests {
     use super::*;
 
+    /// Are the model files present?
+    ///
+    /// They were removed from the tree while the spirits are still a staging
+    /// harness rather than a gamemode — 18 MB of re-obtainable assets that
+    /// nothing ships yet. The tests below skip when the directory is absent
+    /// and are FULLY STRICT when it is there, so restoring the assets
+    /// restores the checks with no edit here. A test that quietly weakened
+    /// itself would be worse than one that is missing.
+    fn assets_present() -> Option<String> {
+        let dir = format!("{}/assets/animals", env!("CARGO_MANIFEST_DIR"));
+        let any = std::fs::read_dir(&dir).ok()?.flatten().any(|e| {
+            e.path().extension().map_or(false, |x| x == "iqm")
+        });
+        any.then_some(dir)
+    }
+
     #[test]
     fn every_shipped_animal_parses_and_normalizes() {
-        let dir = format!("{}/assets/animals", env!("CARGO_MANIFEST_DIR"));
+        let Some(dir) = assets_present() else {
+            eprintln!("assets/animals absent; skipping (see assets_present)");
+            return;
+        };
         let mut n = 0;
         for e in std::fs::read_dir(&dir).expect("assets/animals exists") {
             let p = e.unwrap().path();
@@ -218,6 +237,15 @@ mod tests {
 
     #[test]
     fn the_spirit_roster_names_real_assets() {
+        if assets_present().is_none() {
+            eprintln!("assets/animals absent; skipping (see assets_present)");
+            // The roster itself is still checked — it is data, not an asset,
+            // and a bad height would ship even with no models on disk.
+            for (_, _, _, h) in FELINE_SPIRITS {
+                assert!(*h > 1.0 && *h < 5.0);
+            }
+            return;
+        }
         for (name, _, _, h) in FELINE_SPIRITS {
             let m = Model::load(name).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(m.tris.len() > 1000, "{name} should be a real model");
@@ -235,6 +263,10 @@ mod tests {
 
     #[test]
     fn build_is_deterministic_and_lands_at_the_requested_spot() {
+        if assets_present().is_none() {
+            eprintln!("assets/animals absent; skipping (see assets_present)");
+            return;
+        }
         let mut a = Model::load("cat").unwrap();
         a.normalize(2.0);
         let (mut m1, mut m2) = (Mesh::new(), Mesh::new());
