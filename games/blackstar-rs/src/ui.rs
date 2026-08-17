@@ -653,7 +653,7 @@ mod tests {
         // in either wrote an NDC number by hand.
         let s = Screen::new(16.0 / 9.0);
         let ship = crate::ship::Ship::new("spearhead", "earth");
-        let m = ship.bridge_menu();
+        let m = ship.bridge_menu(&crate::campaign::CampaignLog::default());
         let cmds = menu_cmds(&s, &m, 0.02, W, D, [0.2, 0.3, 0.5, 0.5]);
         assert!(!cmds.is_empty(), "the bridge drew nothing");
         // the title is there, and so is at least one destination
