@@ -79,6 +79,7 @@ mod nightfall;
 mod orient;
 mod partdetect;
 mod loadbearing;
+mod grime;
 mod orientsim;
 mod partsim;
 mod skirmish;
@@ -719,6 +720,7 @@ struct Game {
     /// theirs on `Bot`; the player's lives here for the same reason —
     /// so a body and its wounds cannot drift apart.
     body: sections::Body,
+    grime: grime::Grime,
     /// the action bar, live during play — loaded once at boot rather
     /// than through a Deck console, since quick-select has to work
     /// without opening a menu. Firing whatever the active slot holds
@@ -1665,6 +1667,7 @@ fn main() {
         deck: None,
         hotbar,
         body: sections::Body::default(),
+        grime: grime::Grime::default(),
         held: HashSet::new(),
         held_mouse: HashSet::new(),
         jump_edge: false,
@@ -2514,6 +2517,12 @@ impl Game {
             let local = bot.car.rot.inverse() * (origin - bot.car.pos);
             let dir_local = (bot.car.rot.inverse() * dv.normalize_or(Vec3::Z)).normalize_or(Vec3::Z);
             let res = bot.body.hit(kind, local, dir_local, amount, radius);
+            // GRIME: scorch the section that actually took the hit,
+            // independent of whether it did lasting hp damage --
+            // armour that shrugged off a shot still shows where it hit.
+            if let Some(s) = res.struck {
+                bot.grime.add_scorch(s, (amount * 0.15).min(0.4));
+            }
             for s in &res.severed {
                 self.toastf(&format!("{} torn off", s.name()));
             }
@@ -4489,8 +4498,10 @@ impl Game {
             for s in self.body.tick(dt) {
                 self.toastf(&format!("{} regrown", s.name()));
             }
+            self.grime.tick(dt);
             for b in self.bots.iter_mut() {
                 b.body.tick(dt);
+                b.grime.tick(dt);
             }
             self.fx.update(dt);
             let rear = self.held_mouse.contains(&MouseButton::Middle);
@@ -5110,6 +5121,18 @@ impl Game {
             if sp > 2.0 {
                 let n = self.car.ground_n;
                 self.fx.dust(self.car.pos - n * self.car.half_h, n, sp);
+                // GRIME: a hard landing kicks dust up onto the legs,
+                // not the whole body -- only meaningful in robot mode
+                // (sections::Body models a standing figure; a car
+                // landing hard is the arcade base game's own event and
+                // has nothing to do with a robot's legs). Capped low
+                // per landing (0.3 at most) so dirt accumulates over
+                // many landings rather than maxing out on one.
+                if self.car.robot {
+                    let amount = (sp * 0.03).min(0.3);
+                    self.grime.add_dust(sections::Section::LegL, amount);
+                    self.grime.add_dust(sections::Section::LegR, amount);
+                }
             }
         }
 

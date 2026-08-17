@@ -131,6 +131,13 @@ pub struct HitResult {
     pub severed: Vec<Section>,
     /// The bot is down.
     pub killed: bool,
+    /// Which section the impact actually landed on nearest-centre --
+    /// exposed for callers that want to react to WHERE a hit landed
+    /// beyond damage/severing (a scorch decal, a targeted-hit toast),
+    /// not just recompute `nearest` a second time themselves. `None`
+    /// only when the hit did nothing at all (amount <= 0.0 or the body
+    /// was already dead) -- see `hit`'s own early return.
+    pub struck: Option<Section>,
 }
 
 /// A bot's per-section condition.
@@ -223,7 +230,7 @@ impl Body {
         let _ = dir_local; // direction is carried for future angled armour
         let mut severed = Vec::new();
         if amount <= 0.0 || !self.alive() {
-            return HitResult { severed, killed: !self.alive() };
+            return HitResult { severed, killed: !self.alive(), struck: None };
         }
 
         let struck = self.nearest(local);
@@ -247,7 +254,7 @@ impl Body {
         }
 
         let killed = !self.alive();
-        HitResult { severed, killed }
+        HitResult { severed, killed, struck: Some(struck) }
     }
 
     fn apply(&mut self, s: Section, amount: f32, kind: Kind, severed: &mut Vec<Section>) {
