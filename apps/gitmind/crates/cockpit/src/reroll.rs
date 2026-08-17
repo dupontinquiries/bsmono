@@ -76,7 +76,7 @@ pub enum Step {
 }
 
 /// Why a device is not in the run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skipped {
     Offline,
     /// Nothing on the roster's app list targets this device's triple.
@@ -228,6 +228,142 @@ impl Report {
     }
 }
 
+// ── running a plan ───────────────────────────────────────────────────────────
+
+/// What the run is doing, as it happens.
+///
+/// A reroll takes minutes and the operator is looking at a button, not a
+/// terminal — that was the whole complaint. So the executor streams rather
+/// than returning at the end: every step announces itself before it blocks,
+/// and the GUI has something to draw the entire time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Started { steps: usize },
+    /// A step is about to run. Emitted BEFORE the work, so a step that hangs
+    /// is visible as the thing that hung.
+    StepStarted(Step),
+    StepDone(Step),
+    StepFailed { step: Step, error: String },
+    /// A step the plan contained but the run did not attempt, because
+    /// something it depended on failed.
+    StepSkipped { step: Step, because: String },
+    Finished,
+}
+
+/// The effectful half. Implemented over ssh/cargo/scp in the app; faked in
+/// tests, which is the only reason the ordering and failure rules below can
+/// be pinned at all.
+pub trait Runner {
+    /// Pair with a device: password auth, fleet user, key install.
+    fn enroll(&mut self, device: &str) -> Result<(), String>;
+    /// Build one app for one target.
+    fn build(&mut self, app: &str, triple: &str) -> Result<(), String>;
+    /// Copy the binary and write the `.desktop` entry.
+    fn install(&mut self, app: &str, device: &str) -> Result<(), String>;
+    /// Which triple a device needs — the executor has the plan, not the
+    /// roster, and a failed build has to know which installs it invalidated.
+    fn triple_of(&self, device: &str) -> Option<String>;
+}
+
+/// Walk a plan, emitting events, and report per device.
+///
+/// The failure rules are the substance here, and each exists because the
+/// naive version does the wrong thing:
+///
+/// * A device whose **enrolment** fails gets no installs. Attempting them
+///   would produce a second, more confusing error per app against a device we
+///   already know we cannot log into.
+/// * A failed **build** skips that app's installs on every device sharing the
+///   triple — they were all waiting on the one binary — but leaves other apps
+///   and other architectures alone. Aborting the run instead would mean one
+///   broken app costs you the whole fleet.
+/// * A failed **install** is confined to that device and that app. It is the
+///   only failure that says nothing about anything else.
+pub fn run<R: Runner>(plan: &Plan, r: &mut R, on: &mut dyn FnMut(Event)) -> Report {
+    let mut report = Report::default();
+    for (device, why) in &plan.skipped {
+        report.record(device, Outcome::Skipped(*why));
+    }
+    on(Event::Started { steps: plan.steps.len() });
+
+    // Devices we can no longer reach, and (app, triple) pairs with no binary.
+    let mut dead_devices: BTreeMap<String, String> = BTreeMap::new();
+    let mut dead_builds: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut installed: BTreeMap<String, usize> = BTreeMap::new();
+
+    for step in &plan.steps {
+        match step {
+            Step::Enroll { device } => {
+                on(Event::StepStarted(step.clone()));
+                match r.enroll(device) {
+                    Ok(()) => on(Event::StepDone(step.clone())),
+                    Err(e) => {
+                        dead_devices.insert(device.clone(), e.clone());
+                        report.record(device, Outcome::EnrollFailed(e.clone()));
+                        on(Event::StepFailed { step: step.clone(), error: e });
+                    }
+                }
+            }
+            Step::Build { app, triple } => {
+                on(Event::StepStarted(step.clone()));
+                match r.build(app, triple) {
+                    Ok(()) => on(Event::StepDone(step.clone())),
+                    Err(e) => {
+                        dead_builds.insert((app.clone(), triple.clone()), e.clone());
+                        on(Event::StepFailed { step: step.clone(), error: e });
+                    }
+                }
+            }
+            Step::Install { app, device } => {
+                if let Some(why) = dead_devices.get(device) {
+                    on(Event::StepSkipped {
+                        step: step.clone(),
+                        because: format!("enrolment failed: {why}"),
+                    });
+                    continue;
+                }
+                let triple = r.triple_of(device).unwrap_or_default();
+                if let Some(why) = dead_builds.get(&(app.clone(), triple.clone())) {
+                    // The device is fine; the binary does not exist. Recorded
+                    // as a build failure so nobody goes to reflash a phone
+                    // over a missing linker.
+                    report.record(device, Outcome::BuildFailed {
+                        app: app.clone(),
+                        error: why.clone(),
+                    });
+                    on(Event::StepSkipped {
+                        step: step.clone(),
+                        because: format!("build failed: {why}"),
+                    });
+                    continue;
+                }
+                on(Event::StepStarted(step.clone()));
+                match r.install(app, device) {
+                    Ok(()) => {
+                        *installed.entry(device.clone()).or_insert(0) += 1;
+                        on(Event::StepDone(step.clone()));
+                    }
+                    Err(e) => {
+                        report.record(device, Outcome::InstallFailed {
+                            app: app.clone(),
+                            error: e.clone(),
+                        });
+                        on(Event::StepFailed { step: step.clone(), error: e });
+                    }
+                }
+            }
+        }
+    }
+
+    // A device only counts as Installed if nothing already claimed it as a
+    // failure — one broken app out of four is not a green device.
+    for (device, n) in installed {
+        report.per_device.entry(device).or_insert(Outcome::Installed { apps: n });
+    }
+    on(Event::Finished);
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +480,153 @@ mod tests {
         // to reflash a phone that is fine.
         assert!(matches!(r.failures()[0].1, Outcome::BuildFailed { .. }));
         assert_eq!(r.summary(), "1 of 2 devices — 1 need attention");
+    }
+
+    // ── the executor ──
+
+    /// A Runner that does nothing but remember, and fail where told to.
+    struct Fake {
+        triples: BTreeMap<String, String>,
+        fail_enroll: Vec<String>,
+        fail_build: Vec<(String, String)>,
+        fail_install: Vec<(String, String)>,
+        did: Vec<String>,
+    }
+
+    impl Fake {
+        fn new(devices: &[Device]) -> Fake {
+            Fake {
+                triples: devices.iter().map(|d| (d.id.clone(), d.triple.clone())).collect(),
+                fail_enroll: Vec::new(),
+                fail_build: Vec::new(),
+                fail_install: Vec::new(),
+                did: Vec::new(),
+            }
+        }
+    }
+
+    impl Runner for Fake {
+        fn enroll(&mut self, device: &str) -> Result<(), String> {
+            self.did.push(format!("enroll {device}"));
+            if self.fail_enroll.iter().any(|d| d == device) {
+                return Err("bad password".into());
+            }
+            Ok(())
+        }
+        fn build(&mut self, app: &str, triple: &str) -> Result<(), String> {
+            self.did.push(format!("build {app} {triple}"));
+            if self.fail_build.iter().any(|(a, t)| a == app && t == triple) {
+                return Err("linker not found".into());
+            }
+            Ok(())
+        }
+        fn install(&mut self, app: &str, device: &str) -> Result<(), String> {
+            self.did.push(format!("install {app} {device}"));
+            if self.fail_install.iter().any(|(a, d)| a == app && d == device) {
+                return Err("no space left".into());
+            }
+            Ok(())
+        }
+        fn triple_of(&self, device: &str) -> Option<String> {
+            self.triples.get(device).cloned()
+        }
+    }
+
+    fn drain(plan: &Plan, f: &mut Fake) -> (Report, Vec<Event>) {
+        let mut events = Vec::new();
+        let report = run(plan, f, &mut |e| events.push(e));
+        (report, events)
+    }
+
+    #[test]
+    fn a_clean_run_touches_every_device_and_brackets_itself() {
+        let devices = vec![
+            dev("fp5", ARM, Enrollment::Keyed, Reach::Online),
+            dev("pine", ARM, Enrollment::Keyed, Reach::Online),
+        ];
+        let p = plan(&devices, &["voiceterm".to_string()]);
+        let mut f = Fake::new(&devices);
+        let (report, events) = drain(&p, &mut f);
+        assert_eq!(report.summary(), "2 of 2 devices up to date");
+        assert_eq!(events.first(), Some(&Event::Started { steps: p.steps.len() }));
+        assert_eq!(events.last(), Some(&Event::Finished));
+        // One build, two installs — the dedupe survives into the run.
+        assert_eq!(f.did.iter().filter(|s| s.starts_with("build")).count(), 1);
+        assert_eq!(f.did.iter().filter(|s| s.starts_with("install")).count(), 2);
+    }
+
+    #[test]
+    fn a_step_announces_itself_before_it_blocks() {
+        // The operator is watching a button, not a terminal. A step that
+        // hangs has to be visible as the thing that hung, which means the
+        // event goes out BEFORE the work.
+        let devices = vec![dev("pine", ARM, Enrollment::Keyed, Reach::Online)];
+        let p = plan(&devices, &["voiceterm".to_string()]);
+        let (_, events) = drain(&p, &mut Fake::new(&devices));
+        let started = events.iter().position(|e| matches!(e, Event::StepStarted(_))).unwrap();
+        let done = events.iter().position(|e| matches!(e, Event::StepDone(_))).unwrap();
+        assert!(started < done);
+    }
+
+    #[test]
+    fn a_device_we_cannot_enrol_gets_no_installs_attempted() {
+        let devices = vec![dev("pine", ARM, Enrollment::None, Reach::Online)];
+        let p = plan(&devices, &apps());
+        let mut f = Fake::new(&devices);
+        f.fail_enroll.push("pine".into());
+        let (report, events) = drain(&p, &mut f);
+        assert!(matches!(report.per_device["pine"], Outcome::EnrollFailed(_)));
+        // Two apps, and NEITHER was attempted: a second and third error
+        // against a device we already know we cannot log into is noise.
+        assert!(!f.did.iter().any(|s| s.starts_with("install")));
+        assert_eq!(events.iter().filter(|e| matches!(e, Event::StepSkipped { .. })).count(), 2);
+    }
+
+    #[test]
+    fn a_failed_build_spares_other_apps_and_other_architectures() {
+        let devices = vec![
+            dev("pine", ARM, Enrollment::Keyed, Reach::Online),
+            dev("lap", "x86_64-unknown-linux-gnu", Enrollment::Keyed, Reach::Online),
+        ];
+        let p = plan(&devices, &apps());
+        let mut f = Fake::new(&devices);
+        // voiceterm fails on ARM only.
+        f.fail_build.push(("voiceterm".into(), ARM.to_string()));
+        let (report, _) = drain(&p, &mut f);
+        // The arm phone is reported as a BUILD failure, not its own fault —
+        // nobody should reflash a phone over a missing linker.
+        assert!(matches!(report.per_device["pine"], Outcome::BuildFailed { .. }));
+        // The x86 box got voiceterm anyway: a different triple, a different
+        // binary, no reason to punish it.
+        assert!(f.did.contains(&"install voiceterm lap".to_string()));
+        // And snapclone reached BOTH — one broken app must not cost the fleet.
+        assert!(f.did.contains(&"install snapclone pine".to_string()));
+        assert!(f.did.contains(&"install snapclone lap".to_string()));
+    }
+
+    #[test]
+    fn one_bad_install_does_not_make_the_device_green() {
+        let devices = vec![dev("pine", ARM, Enrollment::Keyed, Reach::Online)];
+        let p = plan(&devices, &apps());
+        let mut f = Fake::new(&devices);
+        f.fail_install.push(("snapclone".into(), "pine".into()));
+        let (report, _) = drain(&p, &mut f);
+        // One of two apps landed. That is not a device that is up to date,
+        // and reporting Installed here would hide the failure behind a tick.
+        assert!(matches!(report.per_device["pine"], Outcome::InstallFailed { .. }));
+        assert!(report.succeeded().is_empty());
+    }
+
+    #[test]
+    fn an_offline_device_is_in_the_report_before_the_run_starts() {
+        let devices = vec![
+            dev("pine", ARM, Enrollment::Keyed, Reach::Online),
+            dev("fp5", ARM, Enrollment::Keyed, Reach::Offline),
+        ];
+        let p = plan(&devices, &["voiceterm".to_string()]);
+        let (report, _) = drain(&p, &mut Fake::new(&devices));
+        assert_eq!(report.per_device["fp5"], Outcome::Skipped(Skipped::Offline));
+        assert_eq!(report.summary(), "1 of 2 devices — 1 need attention");
     }
 
     #[test]
