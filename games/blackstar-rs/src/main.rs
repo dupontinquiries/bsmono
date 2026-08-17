@@ -2202,12 +2202,10 @@ impl Game {
         self.switch_car(m);
         let d = self.world.sdf(self.car.pos);
         if d < self.car.half_h {
-            // Seat on the LOWEST POINT, not the half-height. They differ the
-            // moment the body stops being centred on its bounding box, which is
-            // exactly what standing up does — feet hang below centre while the
-            // mass sits high. Falls back to half_h when ride_h is unset so a
-            // model that never folds is unaffected.
-            let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+            // Seat on the LOWEST POINT, not the half-height -- Car::seat_h,
+            // the same helper physics.rs's ground-contact/suspension code
+            // now uses too, rather than each duplicating the fallback.
+            let drop = self.car.seat_h();
             self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
     }
@@ -2400,12 +2398,10 @@ impl Game {
         // lift clear as the body grows, or a standing robot ends up buried
         let d = self.world.sdf(self.car.pos);
         if d < self.car.half_h {
-            // Seat on the LOWEST POINT, not the half-height. They differ the
-            // moment the body stops being centred on its bounding box, which is
-            // exactly what standing up does — feet hang below centre while the
-            // mass sits high. Falls back to half_h when ride_h is unset so a
-            // model that never folds is unaffected.
-            let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+            // Seat on the LOWEST POINT, not the half-height -- Car::seat_h,
+            // the same helper physics.rs's ground-contact/suspension code
+            // now uses too, rather than each duplicating the fallback.
+            let drop = self.car.seat_h();
             self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
         if self.xf.state == xform::State::Idle {

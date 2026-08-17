@@ -210,6 +210,29 @@ impl Default for Hover {
 }
 
 impl Car {
+    /// Distance from centre to the LOWEST point of the body — `ride_h`
+    /// when it has been set by something that measured the actual
+    /// pose (`model.rs`'s static load path, or `xform.rs`'s live blend
+    /// during a fold), `half_h` otherwise (a model that never folds,
+    /// or before anything has measured it yet).
+    ///
+    /// This is the single source of truth `main.rs`'s two seating call
+    /// sites already used inline (duplicated) — and, until this
+    /// change, the one `physics.rs`'s ground-contact/suspension code
+    /// did NOT use at all: `clearance` there was `car.half_h` directly,
+    /// meaning every physics step after a fold finished pulled a
+    /// standing robot back down to sit at its symmetric half-height
+    /// instead of the true distance to its feet, silently undoing the
+    /// fold-time lift `main.rs` had just applied correctly. That is
+    /// the "transforms look fine, then old code puts the feet back
+    /// underground" bug reported multiple times — `main.rs`'s seating
+    /// only runs while a fold is `Transforming`; ordinary standing/
+    /// driving physics runs every frame regardless, via this exact
+    /// clearance value, and had never been taught about `ride_h`.
+    pub fn seat_h(&self) -> f32 {
+        if self.ride_h > 0.0 { self.ride_h } else { self.half_h }
+    }
+
     pub fn new() -> Car {
         Car {
             pos: Vec3::new(0.0, 1.0, 26.0),
@@ -331,7 +354,7 @@ impl Car {
     pub fn reset(&mut self, world: &World) {
         // land on the real surface, not the terrain height: raised decks
         // (DROPSHOT) used to spawn the car INSIDE the platform
-        let clr = self.half_h + 0.05;
+        let clr = self.seat_h() + 0.05;
         let p = world.spawn_at(0.0, 26.0, clr);
         // WHAT SURVIVES A RESET IS THE CAR YOU CHOSE.
         //
@@ -814,7 +837,11 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     }
     let d = world.sdf(car.pos);
     let n = world.normal(car.pos);
-    let clearance = car.half_h;
+    // seat_h(), not half_h directly: this is the clearance every
+    // ground-contact/suspension calculation below is built on, and a
+    // standing robot's feet sit well below its symmetric half-height
+    // (see Car::seat_h's own doc for the bug this silently was).
+    let clearance = car.seat_h();
     // Wheels grip ANY surface (RL-style wall/ceiling driving): contact counts
     // as "grounded" when the car's underside faces the surface. Floors accept
     // any orientation (you land, the align sorts you out); walls and ceilings
@@ -1084,7 +1111,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // A fast deck can outrun the frame in which contact is lost: keep
         // carrying while the car is still within a whisker of one, so a
         // 18 m/s carriage does not leave you standing in the air.
-        let probe = car.pos - Vec3::Y * (car.half_h + 0.12);
+        let probe = car.pos - Vec3::Y * (car.seat_h() + 0.12);
         if let Some(pv) = world.platform_vel(probe, 0.9) {
             car.pos += pv * dt;
             let rel = car.vel - pv;
@@ -1579,7 +1606,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
 
     // hard floor safety
     if car.pos.y < -60.0 {
-        car.pos = Vec3::new(0.0, world.ground_h(0.0, 26.0) + car.half_h + 0.1, 26.0);
+        car.pos = Vec3::new(0.0, world.ground_h(0.0, 26.0) + car.seat_h() + 0.1, 26.0);
         car.vel = Vec3::ZERO;
     }
 }
@@ -2111,5 +2138,30 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         let spin_w = 0.30 * (1.0 - soft);
         ball.ang += n.cross(rel) * spin_w / ball.r;
         ball.ang += car.omega * 0.12 * (1.0 - soft);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seat_h_prefers_ride_h_when_it_is_set() {
+        let mut car = Car::new();
+        car.half_h = 0.377; // the OLD, wrong number for a standing robot
+        car.ride_h = 0.400; // the real distance to the feet
+        assert_eq!(car.seat_h(), 0.400, "seat_h should prefer the real drop over the symmetric half-height");
+    }
+
+    #[test]
+    fn seat_h_falls_back_to_half_h_when_ride_h_is_unset() {
+        let mut car = Car::new();
+        car.half_h = 0.26;
+        car.ride_h = 0.0; // the default -- never measured (a model that
+                           // never folds, or before the static loader ran)
+        assert_eq!(car.seat_h(), 0.26);
+        car.ride_h = -0.1; // a body sitting entirely above the origin --
+                           // model.rs's ride_h can legitimately be negative
+        assert_eq!(car.seat_h(), 0.26, "a negative ride_h should also fall back, not be used directly");
     }
 }
