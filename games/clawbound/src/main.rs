@@ -715,7 +715,9 @@ fn build_battle() -> (Mesh, Vec3) {
         Some("puma") => Ancestor::Puma, Some("serval") | Some("yowler") => Ancestor::Serval,
         Some("cavelion") | Some("oldroar") => Ancestor::CaveLion,
         Some("smilodon") | Some("sabertooth") => Ancestor::Smilodon,
-        Some("suncat") | Some("suneye") => Ancestor::SunCat, _ => Ancestor::Lion,
+        Some("suncat") | Some("suneye") => Ancestor::SunCat,
+        Some("lynx") | Some("snowhush") => Ancestor::Lynx,
+        Some("jaguar") | Some("riptail") => Ancestor::Jaguar, _ => Ancestor::Lion,
     };
     let mut g = Battleground::new(pick);
     // play a couple of minutes so patrols are mid-trail, hunts and herb runs show

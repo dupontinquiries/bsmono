@@ -167,6 +167,7 @@ pub struct Warrior {
     pub stealth_t: f32,   // unseen/untargetable
     pub fear_t: f32,      // fleeing a Great Roar
     pub slow_t: f32,
+    pub root_t: f32,      // held fast (Snowbind / The Long Winter): can claw, cannot move
     pub cds: [f32; 3],    // ability 1, ability 2, ult
     pub respawn_t: f32,
     pub gather_t: f32,
@@ -287,7 +288,18 @@ impl Battleground {
         let mut m = 1.0;
         if w.ancestor == Some(Ancestor::Smilodon) && t.hp < t.max_hp * 0.5 { m *= 1.4; }
         if w.ancestor == Some(Ancestor::Serval) && dist(w.x, w.z, t.x, t.z) > 4.0 { m *= 1.15; }
+        if w.ancestor == Some(Ancestor::Jaguar) && (t.slow_t > 0.0 || t.root_t > 0.0 || t.fear_t > 0.0) {
+            m *= 1.2;   // The River Remembers: the held are already caught
+        }
         m
+    }
+
+    /// On-hit riders that come with a warrior's blows — Snowhush's chill.
+    fn on_hit(&mut self, i: usize, target: usize) {
+        if self.warriors[i].ancestor == Some(Ancestor::Lynx) {
+            let t = &mut self.warriors[target];
+            t.slow_t = t.slow_t.max(0.5);   // Hush of Snows
+        }
     }
 
     fn respawn_time(&self, team: u8) -> f32 {
@@ -365,7 +377,7 @@ impl Battleground {
                     x: cx + slot as f32 * 2.0 - 2.0, z: cz, heading: 0.0,
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
-                    shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
+                    shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
                     cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border,
                     is_player: team == CLAN_A && slot == 0, seg: 0,
                 });
@@ -399,7 +411,7 @@ impl Battleground {
                 hp: PATROL_HP, max_hp: PATROL_HP, attack: PATROL_ATK, speed: PATROL_SPEED, reach: REACH,
                 mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
                 carry: Carry::Nothing,
-                shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
+                shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
                 cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty,
                 is_player: false, seg: 0,
             });
@@ -479,6 +491,7 @@ impl Battleground {
             Verb::Strike => {
                 let Some(t) = target else { return };
                 self.hurt(t, spec.power * atk * self.strike_vs(i, t));
+                self.on_hit(i, t);
                 self.warriors[i].kills += (!self.warriors[t].alive()) as u32;
             }
             Verb::Dash => {
@@ -557,6 +570,31 @@ impl Battleground {
             Verb::Zone => {
                 self.zones.push(Zone { x, z, team, r: spec.range, dps: spec.power * atk / spec.dur.max(0.5), t: spec.dur });
             }
+            Verb::Root => {
+                for j in 0..self.warriors.len() {
+                    let e = &self.warriors[j];
+                    if e.team != team && e.alive() && dist(x, z, e.x, e.z) < spec.range {
+                        self.warriors[j].root_t = self.warriors[j].root_t.max(spec.dur);
+                        if spec.power > 0.0 { self.hurt(j, spec.power * atk); }
+                    }
+                }
+            }
+            Verb::Pull => {
+                // the current takes their legs: drag every enemy near in close
+                let victims: Vec<usize> = self.warriors.iter().enumerate()
+                    .filter(|(_, e)| e.team != team && e.alive() && dist(x, z, e.x, e.z) < spec.range)
+                    .map(|(j, _)| j).collect();
+                if victims.is_empty() { return; }
+                for v in victims {
+                    let (vx, vz) = (self.warriors[v].x, self.warriors[v].z);
+                    let d = dist(x, z, vx, vz);
+                    let (nx, nz) = norm(x - vx, z - vz);
+                    let step = (d - REACH * 0.6).max(0.0);   // in to the claw, not inside the caster
+                    let w = &mut self.warriors[v];
+                    w.x += nx * step; w.z += nz * step;
+                    if spec.power > 0.0 { self.hurt(v, spec.power * atk); }
+                }
+            }
             Verb::Slow => {
                 for j in 0..self.warriors.len() {
                     let e = &self.warriors[j];
@@ -593,6 +631,7 @@ impl Battleground {
     }
 
     fn walk_toward(&mut self, i: usize, tx: f32, tz: f32, dt: f32) {
+        if self.warriors[i].root_t > 0.0 { return; }   // held fast in the drifts
         let s = self.speed_of(i);
         let w = &mut self.warriors[i];
         let (nx, nz) = norm(tx - w.x, tz - w.z);
@@ -609,9 +648,9 @@ impl Battleground {
         let home = self.camps[team as usize];
         let enemy_camp = self.camps[Self::enemy(team) as usize];
 
-        // fear overrides thought: run from the roar, toward home
+        // fear overrides thought: run from the roar, toward home (unless held fast)
         if self.warriors[i].fear_t > 0.0 {
-            self.walk_toward(i, home.0, home.1, dt);
+            self.walk_toward(i, home.0, home.1, dt);   // no-op while rooted
             return;
         }
 
@@ -626,6 +665,7 @@ impl Battleground {
                 else {
                     let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
                     self.hurt(t, dmg);
+                    self.on_hit(i, t);
                 }
                 if role == Role::Ancestor { self.auto_cast(i); }
             }
@@ -737,6 +777,7 @@ impl Battleground {
                         let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
                         let was_alive = self.warriors[t].alive();
                         self.hurt(t, dmg);
+                        self.on_hit(i, t);
                         if was_alive && !self.warriors[t].alive() { self.warriors[i].kills += 1; }
                         // a ranged cat keeps its distance: yowl, and give ground
                         if reach > 4.0 && d < reach * 0.45 {
@@ -823,6 +864,7 @@ impl Battleground {
             w.stealth_t = (w.stealth_t - dt).max(0.0);
             w.fear_t = (w.fear_t - dt).max(0.0);
             w.slow_t = (w.slow_t - dt).max(0.0);
+            w.root_t = (w.root_t - dt).max(0.0);
         }
         for p in self.prey.iter_mut() { p.respawn_t = (p.respawn_t - dt).max(0.0); }
         // land prey bolts from a close hunter, leashed to its home ground
@@ -877,7 +919,7 @@ impl Battleground {
         // player input drives warrior 0 directly
         if let Some((mx, mz, claw, ability)) = self.input.take() {
             if self.warriors[0].alive() {
-                if mx != 0.0 || mz != 0.0 {
+                if (mx != 0.0 || mz != 0.0) && self.warriors[0].root_t <= 0.0 {
                     let (nx, nz) = norm(mx, mz);
                     let s = self.speed_of(0);
                     let w = &mut self.warriors[0];
@@ -966,6 +1008,7 @@ impl Battleground {
         for w in &self.warriors {
             mix(w.x.to_bits()); mix(w.z.to_bits()); mix(w.hp.to_bits());
             mix(w.team as u32 ^ ((w.mind == Mind::Dead) as u32) << 8);
+            mix(w.root_t.to_bits() ^ w.slow_t.to_bits().rotate_left(16));
         }
         for t in &self.heal_trees { mix(t.hp.to_bits()); }
         for z in &self.zones { mix(z.x.to_bits()); mix(z.t.to_bits()); }
@@ -1033,7 +1076,7 @@ mod tests {
             x: cx + 8.0, z: cz, heading: 0.0,
             hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0, reach: REACH,
             mind: Mind::Trail, carry: Carry::Nothing,
-            shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
+            shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
             cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border, is_player: false, seg: 0,
         });
         bg.step(1.0 / 30.0);
@@ -1431,6 +1474,65 @@ mod tests {
         bg.time = DAY_LEN + 1.0;   // night falls
         let night = bg.strike_of(0);
         assert!(day > night * 1.2, "the day belongs to Suneye: {night} vs {day}");
+    }
+
+    #[test]
+    fn snowbind_holds_them_fast_but_not_forever() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Lynx, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Caracal, Ancestor::Leopard, Ancestor::Panther]);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].is_player = false;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = x + 4.0; bg.warriors[e].z = z;
+        bg.cast(0, 0);   // Snowbind
+        assert!(bg.warriors[e].root_t > 0.0);
+        // held fast: the fastest ancestor alive cannot move a whisker
+        let (ex, ez) = (bg.warriors[e].x, bg.warriors[e].z);
+        bg.warriors[e].mind = Mind::Retreat;   // it *wants* to run home
+        bg.step(1.0 / 30.0);
+        assert!(dist(bg.warriors[e].x, bg.warriors[e].z, ex, ez) < 1e-4,
+            "a rooted cat cannot move");
+        // but hard CC always expires
+        for _ in 0..30 * 3 { bg.step(1.0 / 30.0); }
+        assert_eq!(bg.warriors[e].root_t, 0.0);
+        // and Hush of Snows: an ordinary blow from the lynx chills
+        bg.warriors[e].x = x + 1.0; bg.warriors[e].z = z;
+        bg.warriors[e].slow_t = 0.0;
+        bg.on_hit(0, e);
+        assert!(bg.warriors[e].slow_t > 0.0, "every blow carries the cold");
+    }
+
+    #[test]
+    fn undertow_gathers_the_scattered_fight() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Jaguar, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal]);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].is_player = false;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        // scatter the enemy clan around the jaguar at pull range
+        let enemies: Vec<usize> = bg.warriors.iter().enumerate()
+            .filter(|(_, w)| w.team == CLAN_B).map(|(i, _)| i).collect();
+        for (k, &e) in enemies.iter().enumerate() {
+            let a = k as f32 * 2.0;
+            bg.warriors[e].x = x + a.cos() * 8.0;
+            bg.warriors[e].z = z + a.sin() * 8.0;
+        }
+        let before: f32 = enemies.iter().map(|&e| dist(bg.warriors[e].x, bg.warriors[e].z, x, z)).sum();
+        bg.cast(0, 0);   // Undertow
+        let after: f32 = enemies.iter().map(|&e| dist(bg.warriors[e].x, bg.warriors[e].z, x, z)).sum();
+        assert!(after < before * 0.5, "the current gathers them in: {before} -> {after}");
+        for &e in &enemies {
+            assert!(dist(bg.warriors[e].x, bg.warriors[e].z, x, z) > 1.0,
+                "dragged to the claw, not inside the caster");
+        }
+        // The River Remembers: a held target is bitten deeper
+        let e = enemies[0];
+        assert!((bg.strike_vs(0, e) - 1.0).abs() < 1e-6);
+        bg.warriors[e].root_t = 1.0;
+        assert!(bg.strike_vs(0, e) > 1.1, "the held are already caught");
     }
 
     #[test]

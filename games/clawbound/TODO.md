@@ -86,6 +86,18 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] Default rosters now rotate through the 10-pool from the player's pick, so every
   choice faces a different five. Report: 10/10 headless matches end by felling
   (491–658s, no timeouts), outcomes 5–5.
+- [x] The control pair (roster 10 → 12), filling the two missing CC classes — before this,
+  all CC/AoE was ult-locked (55-62s): **Snowhush** the deep-snow lynx owns *hard CC* —
+  Snowbind and The Long Winter (Root verb: can claw, cannot move; fear cannot override it),
+  White Silence, and Hush of Snows chilling on every ordinary blow; **Riptail** the
+  drowned-forest jaguar owns *pulls* — Undertow and The River Takes drag scattered
+  enemies to the claw (never inside the caster), The River Remembers biting +20% into
+  the slowed/rooted/feared. Controller identity enforced by test: their techniques
+  cycle ≤10s, faster than any ultimate. Root/slow timers join the determinism digest.
+- [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes
+  the gather) — both controller-led report matches ran longest and lost their single
+  sample; consider auto_cast coordination (hold Earthshaker/Eclipse for a fresh
+  Undertow) before tuning numbers
 - [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
   camera follow; needs the `app` feature stack (winit/wgpu) compiled
 - [ ] Player-pick draft UI in menu.rs (menu logic is already unit-tested — extend the same way)

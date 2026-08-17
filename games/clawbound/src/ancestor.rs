@@ -18,14 +18,17 @@ pub enum Ancestor {
     Lion, Tiger, Leopard, Panther, Caracal, Puma,
     // the deep roster: the whole Felidae line, and further back than that —
     Serval,     // Faryowl, the ranged caterwauler of the singing grasslands
+    Lynx,       // Snowhush, the deep-snow controller — roots, chills, the long winter
+    Jaguar,     // Riptail, the drowned-forest puller — drags whole fights together
     CaveLion,   // Oldroar, the Ice Age hulk — the more it bleeds, the harder it smashes
     Smilodon,   // Twofang, the saber-toothed executioner of the elder dawn
     SunCat,     // Suneye, the desert sun-priest — the old sun-god fantasy, wild-born
 }
 
-pub const ALL: [Ancestor; 10] = [
+pub const ALL: [Ancestor; 12] = [
     Ancestor::Lion, Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther, Ancestor::Caracal,
     Ancestor::Puma, Ancestor::Serval, Ancestor::CaveLion, Ancestor::Smilodon, Ancestor::SunCat,
+    Ancestor::Lynx, Ancestor::Jaguar,
 ];
 
 /// What an ability *does* when the sim fires it. One mechanic per kind keeps the
@@ -41,6 +44,10 @@ pub enum Verb {
     Fear,     // enemies within `range` turn and flee for `dur` (damages too if `power` > 0)
     Slow,     // enemies within `range` move at half pace for `dur`
     Knockback,// smash enemies within `range` away from the caster (and hurt them)
+    Root,     // hold enemies within `range` fast where they stand for `dur` — they
+              // can still claw, but they cannot move (hard crowd control)
+    Pull,     // drag enemies within `range` in to the caster (and hurt them) — the
+              // setup move: gather a scattered fight into one spot
     Execute,  // a killing strike whose bite grows with the target's missing strength
     Zone,     // scorch the ground for `dur`: enemies inside burn and the veil is seared away
 }
@@ -228,6 +235,44 @@ pub fn kit(a: Ancestor) -> Kit {
             ult: AbilitySpec { name: "The Eye of the Sun", desc: "the sun looks down in anger — a great burning gaze no veil survives",
                 verb: Verb::Zone, power: 1.6, range: 9.0, dur: 6.0, cd: 60.0 },
         },
+        // ── Snowhush — the deep-snow lynx of the white silence ─────────────────
+        // The dedicated *controller*: everything in this kit holds, chills, or slows.
+        // Short cooldowns, modest claws — Snowhush wins by deciding where everyone
+        // else is allowed to stand.
+        Ancestor::Lynx => Kit {
+            name: "Snowhush", legend: "the deep-snow lynxes of the white silence",
+            philosophy: "You need not be the strongest in the fight. Only the one who chooses where it happens.",
+            passive_name: "Hush of Snows",
+            passive: "every blow carries the cold — struck enemies are briefly chilled and slowed",
+            hp: 155.0, attack: 10.5, speed: 6.6, reach: 2.8,
+            abilities: [
+                AbilitySpec { name: "Snowbind", desc: "the drifts close over their paws — held fast where they stand",
+                    verb: Verb::Root, power: 0.5, range: 7.0, dur: 1.6, cd: 9.0 },
+                AbilitySpec { name: "White Silence", desc: "a settling cold that slows every enemy near",
+                    verb: Verb::Slow, power: 0.6, range: 8.0, dur: 3.0, cd: 8.0 },
+            ],
+            ult: AbilitySpec { name: "The Long Winter", desc: "the season itself takes the field — everything near is frozen where it stands",
+                verb: Verb::Root, power: 1.4, range: 11.0, dur: 2.2, cd: 55.0 },
+        },
+        // ── Riptail — the drowned-forest jaguar ────────────────────────────────
+        // The other half of the control pair: Snowhush decides where the fight
+        // stays, Riptail decides where it *gathers* — dragging scattered enemies
+        // into one spot for a packmate's Earthshaker or Eclipse Hunt to land on.
+        Ancestor::Jaguar => Kit {
+            name: "Riptail", legend: "the drowned-forest jaguars of the flooded dark",
+            philosophy: "The river does not chase either. It gathers.",
+            passive_name: "The River Remembers",
+            passive: "the held are already caught — strikes bite deeper into the slowed, rooted, or fleeing",
+            hp: 185.0, attack: 11.0, speed: 6.1, reach: 2.8,
+            abilities: [
+                AbilitySpec { name: "Undertow", desc: "the current takes their legs — every enemy near is dragged in close",
+                    verb: Verb::Pull, power: 0.7, range: 9.0, dur: 0.0, cd: 10.0 },
+                AbilitySpec { name: "Crushing Jaws", desc: "the bite that cracks turtle shells",
+                    verb: Verb::Strike, power: 2.1, range: 3.0, dur: 0.0, cd: 7.5 },
+            ],
+            ult: AbilitySpec { name: "The River Takes", desc: "the flood answers — the whole fight is dragged to one drowning point, battered together",
+                verb: Verb::Pull, power: 2.0, range: 13.0, dur: 0.0, cd: 58.0 },
+        },
         // ── Stonewhisper — the grey ghost of the high crags ────────────────────
         Ancestor::Puma => Kit {
             name: "Stonewhisper", legend: "the grey ghosts of the high crags",
@@ -315,5 +360,23 @@ mod tests {
         assert!(verbs(Ancestor::CaveLion).contains(&Verb::Knockback));
         assert_eq!(ALL.iter().filter(|&&a| verbs(a).contains(&Verb::Execute)).count(), 1);
         assert!(ALL.iter().all(|&a| !verbs(a).contains(&Verb::Zone) || a == Ancestor::SunCat));
+        // the control pair own their crowd-control classes: only the lynx roots,
+        // only the jaguar pulls — and both kits are control through and through
+        assert!(ALL.iter().all(|&a| !verbs(a).contains(&Verb::Root) || a == Ancestor::Lynx));
+        assert!(ALL.iter().all(|&a| !verbs(a).contains(&Verb::Pull) || a == Ancestor::Jaguar));
+        let control = |v: Verb| matches!(v, Verb::Root | Verb::Pull | Verb::Slow | Verb::Fear | Verb::Knockback);
+        assert!(verbs(Ancestor::Lynx).iter().filter(|&&v| control(v)).count() >= 2);
+        assert!(verbs(Ancestor::Jaguar).iter().filter(|&&v| control(v)).count() >= 2);
+    }
+
+    #[test]
+    fn a_controllers_cooldowns_come_back_fast() {
+        // the specialists' techniques cycle faster than anyone's ultimate and
+        // faster than the bruisers' techniques — control has to be *available*
+        for a in [Ancestor::Lynx, Ancestor::Jaguar] {
+            let k = kit(a);
+            assert!(k.abilities[0].cd <= 10.0 && k.abilities[1].cd <= 10.0,
+                "{}: a controller's tools must cycle quickly", k.name);
+        }
     }
 }
