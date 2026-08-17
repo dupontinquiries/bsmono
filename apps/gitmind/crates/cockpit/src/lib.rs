@@ -19,6 +19,8 @@ pub mod fastboot;
 pub mod join;
 /// Trying a kernel on the spare slot, and getting evidence out when it dies.
 pub mod kerneltry;
+/// Kernel output parsed, normalised, and reduced to a crash signature.
+pub mod klog;
 /// One-button reroll across the test fleet: plan, dedupe, report.
 pub mod reroll;
 /// The fleet, remembered between runs: stable ids, IP churn, wipe detection.
