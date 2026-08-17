@@ -33,6 +33,9 @@ pub const ADDABLE_FX: &[(&str, &[(&str, f32)])] = &[
     ("compressor", &[("threshold", -18.0), ("ratio", 4.0)]),
     ("limiter", &[("ceiling", -0.3)]),
     ("color", &[]),
+    // Live note-locking pitch correction. Defaults to A-minor key-lock;
+    // an explicit note set is params notes/note0.. (see the registry).
+    ("autotune", &[("root", 9.0), ("mode", 0.0), ("speed", 30.0)]),
     // The playrate pair — a tape stop on the master and halftime on a drum
     // bus are the two most-asked trap moves, and both are now real DSP
     // behind a chain chip rather than a plugin you must go find.

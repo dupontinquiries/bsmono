@@ -239,7 +239,7 @@ UI: a mod wheel that silently moved an unrelated fader is worse than one
 that does nothing. MIDI clock is not parsed at all — syncing to an
 external clock means resampling against drifting wall time, which belongs
 with the streaming engine, not a 0xF8 match arm. Named, not built, from
-the same wishlist: live-monitor autotune,
+the same wishlist: batch multi-clip editing,
 clip-level chain editing,  
  a playing
 mode for keys — now built, see below — Wooting analog input, and VST/CLAP
@@ -1214,3 +1214,24 @@ neighbour never hears it, that bypass is audible while the effect keeps its
 place, and that clip gain is one undoable gesture. Multi-selection edits the
 first clip and says so rather than pretending — a batch shape this panel
 does not have yet.
+
+
+**Live autotune — the other algorithm, not the same one rewrapped.**
+`studio-fx::realtune` is the streaming counterpart to the offline pass:
+detection on a rolling ring (YIN every ~5 ms), the pitch snapped to a
+`Target` — either a key (`Scale`) or, the point of the exercise, an
+explicit set of MIDI notes so a hook that only lands on chord tones snaps
+to exactly those and a passing note goes to the nearer MEMBER rather than
+to some other in-key degree — and resynthesis by a two-tap crossfading
+delay line rather than PSOLA. A delay ramping at rate `1 - ratio` IS a
+pitch shift; the ramp's wrap hides under Hann windows that sum to unity at
+50% overlap. That is cheaper than PSOLA, needs no lookahead, and has fixed
+reportable latency (~22 ms), which is what a monitoring path must be able
+to state about itself. It IS registered as a chain kind (`"autotune"`),
+because unlike the whole-buffer pass it is honestly an insert. Measured,
+not asserted: the shifter is exact to under a cent, while the LOOP is
+open — the ratio comes from YIN's estimate of the input and is never
+checked against the output — so the detector's own bias (~6 cents at 452
+Hz, ~16 at 554) passes through. Tests measure by zero crossings on
+purpose: verifying with the same YIN that produced the bias would have
+hidden it, which is exactly what the first draft of those tests did.

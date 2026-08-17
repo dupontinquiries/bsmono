@@ -20,6 +20,7 @@ pub mod chain;
 pub mod assistant;
 pub mod retune;
 pub mod psola;
+pub mod realtune;
 pub mod autotune;
 pub mod loudness;
 
@@ -446,6 +447,11 @@ pub enum Instance {
     Retime(Retime),
     /// The trap pair — see `playrate`'s module docs for why they carry
     /// their own per-channel buffers inside a per-sample interface.
+    /// Live, note-locking pitch correction. Unlike `autotune`'s offline
+    /// pass — which is deliberately NOT a kind here, because it needs the
+    /// whole take — this one is streaming with fixed latency, so it is a
+    /// legitimate insert.
+    RealTune(Box<realtune::RealtimeTune>),
     TapeStop(playrate::TapeStop),
     Halftime(playrate::Halftime),
 }
@@ -465,6 +471,7 @@ impl Instance {
             Instance::Multiband(m) => m.process(x),
             Instance::Saturator(s) => s.process(x),
             Instance::Gain(db) => x * from_db_pub(*db),
+            Instance::RealTune(t) => t.process(x),
             Instance::TapeStop(t) => t.process(x),
             Instance::Halftime(h) => h.process(x),
             Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => x,
@@ -565,6 +572,32 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
         }),
         // The playrate pair. `channels` defaults to 2 because that is what
         // mixdown feeds (L then R into one instance); a mono caller says so.
+        "autotune" => {
+            // Notes are given as a packed list: note_count, then note0..N as
+            // MIDI numbers. Params are a flat f32 map (the model's choice),
+            // so a variable-length set has to be encoded somehow; counting
+            // beats a sentinel, and an absent count means key-lock mode.
+            let count = p(q, "notes", 0.0).clamp(0.0, 24.0) as usize;
+            let target = if count > 0 {
+                realtune::Target::Notes(
+                    (0..count).map(|i| p(q, &format!("note{i}"), 60.0)
+                        .clamp(0.0, 127.0) as u8).collect())
+            } else {
+                realtune::Target::Scale(retune::Scale {
+                    root: p(q, "root", 0.0).clamp(0.0, 11.0) as u8,
+                    mode: match p(q, "mode", 0.0) as i32 {
+                        1 => retune::Mode::HarmonicMinor,
+                        2 => retune::Mode::Chromatic,
+                        _ => retune::Mode::Minor,
+                    },
+                })
+            };
+            let mut t = realtune::RealtimeTune::new(
+                target, rate, p(q, "channels", 2.0).clamp(1.0, 8.0) as usize);
+            t.retune_speed_ms = p(q, "speed", 30.0).max(0.0);
+            t.voiced_threshold = p(q, "voiced", 0.15).clamp(0.0, 1.0);
+            Instance::RealTune(Box::new(t))
+        }
         "tapestop" => Instance::TapeStop(playrate::TapeStop::new(
             rate, p(q, "start", 0.0), p(q, "length", 1.0),
             p(q, "channels", 2.0).max(1.0) as usize)),
@@ -950,5 +983,51 @@ mod playrate_registry_tests {
         let out: Vec<f32> = input.iter().map(|&s| ht.process_audio(s)).collect();
         assert_ne!(&out[2 * 24_000..2 * 30_000], &input[2 * 24_000..2 * 30_000],
                    "the second window is replayed, not passed through");
+    }
+}
+
+#[cfg(test)]
+mod realtune_registry_tests {
+    use super::*;
+
+    fn fx(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
+        studio_core::Effect {
+            kind: kind.into(),
+            params: params.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn a_chain_can_hold_a_live_tuner_and_it_corrects_through_the_chain() {
+        // The point of the registry entry: this is reachable as an insert,
+        // which the offline autotune pass deliberately is not.
+        let mut inst = instantiate(&fx("autotune", &[("notes", 1.0), ("note0", 69.0),
+                                                     ("speed", 5.0), ("channels", 1.0)]), 48_000.0)
+            .expect("autotune is a registered kind");
+        let out: Vec<f32> = (0..48_000)
+            .map(|i| (i as f32 / 48_000.0 * 452.0 * std::f32::consts::TAU).sin() * 0.5)
+            .map(|x| inst.process_audio(x))
+            .collect();
+        // Zero crossings, for the reason realtune's own tests give.
+        let (mut first, mut last, mut n) = (None, 0.0f32, 0usize);
+        for i in 24_001..44_000 {
+            if out[i - 1] < 0.0 && out[i] >= 0.0 {
+                let t = i as f32 - 1.0 + (-out[i - 1]) / (out[i] - out[i - 1]);
+                if first.is_none() { first = Some(t); } else { n += 1; }
+                last = t;
+            }
+        }
+        let hz = n as f32 * 48_000.0 / (last - first.unwrap());
+        let cents = 1200.0 * (hz / 440.0).log2();
+        assert!(cents.abs() < 25.0, "chain output at {hz:.1} Hz ({cents:.1} cents off A440)");
+    }
+
+    #[test]
+    fn key_lock_mode_is_what_an_absent_note_count_means() {
+        // Params are a flat f32 map, so the note SET is length-prefixed;
+        // zero (or absent) must mean "use the scale", not "lock to nothing".
+        let inst = instantiate(&fx("autotune", &[("root", 9.0), ("mode", 0.0)]), 48_000.0);
+        assert!(matches!(inst, Some(Instance::RealTune(_))));
     }
 }
