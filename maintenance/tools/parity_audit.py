@@ -178,7 +178,7 @@ def kit_use(pdirs):
     that means something is the comparison: how many files hand-roll pointer
     deltas while these sit unused.
     """
-    hits, rolled = {}, 0
+    hits = {}
     for key, pat in (("a11y", r"a11y::"), ("nav", r"nav::Nav|uikit_egui::nav"),
                      ("adaptive", r"adaptive::"), ("gesture", r"GestureLayer|gesture_layer")):
         n = 0
@@ -196,20 +196,7 @@ def kit_use(pdirs):
                     if re.search(pat, body):
                         n += 1
         hits[key] = n
-    for pd in pdirs:
-        for root, dirs, files in os.walk(pd):
-            dirs[:] = [x for x in dirs if x != "target"]
-            for f in files:
-                if not f.endswith(".rs"):
-                    continue
-                try:
-                    body = open(os.path.join(root, f), encoding="utf-8",
-                                errors="ignore").read()
-                except OSError:
-                    continue
-                if re.search(r"drag_delta|pointer.*delta", body):
-                    rolled += 1
-    return hits, rolled
+    return hits
 
 
 def engine_link(app_dir, pdirs):
@@ -621,14 +608,13 @@ def main():
     # Kit adoption, reported last because it is the softest of the three and
     # the easiest to misread as a defect.
     print()
-    print("kit facilities that exist to be shared (files using each) vs "
-          "files hand-rolling pointer deltas:")
+    print("kit facilities that exist to be shared — files in each port using them:")
     for r in rows:
-        k, rolled = r.get("kit", ({}, 0))
+        k = r.get("kit", {})
         if not k:
             continue
         used = " ".join(f"{name}={n}" for name, n in k.items())
-        print(f"  {r['app']:<16} {used}   hand-rolled={rolled}")
+        print(f"  {r['app']:<16} {used}")
 
     for r in rows:
         if r.get("stranded"):
