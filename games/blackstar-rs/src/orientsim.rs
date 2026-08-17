@@ -110,6 +110,49 @@ fn guess_for(pose_dir: &Path) -> Option<(orient::Guess, Vec<crate::meshgen::Vert
     Some((g, verts))
 }
 
+/// `partdetect::forward_sign_hint`, run against a real pose -- a
+/// second, self-contained load rather than threading raws through
+/// `guess_for`'s six call sites for one diagnostic line. `None` means
+/// either the pose could not load or the hint itself found nothing to
+/// say (see `forward_sign_hint`'s own doc for when that happens).
+fn forward_hint_for(pose_dir: &Path) -> Option<f32> {
+    let raws = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::model::load_raw_unoriented(pose_dir))).ok()?;
+    if raws.is_empty() {
+        return None;
+    }
+    let whole = orient::all_verts(&raws);
+    let g = orient::guess(&whole);
+    let (pa, pb) = orient::perp_pair(g.up);
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    let (mut a_lo, mut a_hi) = (f32::MAX, f32::MIN);
+    let (mut b_lo, mut b_hi) = (f32::MAX, f32::MIN);
+    for v in &whole {
+        let p = glam::Vec3::from_array(v.pos);
+        let h = p.dot(g.up);
+        lo = lo.min(h);
+        hi = hi.max(h);
+        let x = p.dot(pa);
+        a_lo = a_lo.min(x);
+        a_hi = a_hi.max(x);
+        let y = p.dot(pb);
+        b_lo = b_lo.min(y);
+        b_hi = b_hi.max(y);
+    }
+    let center = g.up * ((lo + hi) * 0.5) + pa * ((a_lo + a_hi) * 0.5) + pb * ((b_lo + b_hi) * 0.5);
+    let half_width = ((a_hi - a_lo).max(b_hi - b_lo) * 0.5).max(1e-6);
+    let kinded: Vec<(Vec<crate::meshgen::Vertex>, crate::partdetect::Kind)> = raws
+        .iter()
+        .filter(|r| !r.verts.is_empty())
+        .map(|r| {
+            let k = crate::partdetect::classify(&r.verts, g.up, lo, hi, center, half_width);
+            (r.verts.clone(), k)
+        })
+        .collect();
+    let prims: Vec<crate::partdetect::KindedPrim> =
+        kinded.iter().map(|(v, k)| crate::partdetect::KindedPrim { verts: v, kind: *k }).collect();
+    crate::partdetect::forward_sign_hint(&prims, g.up, g.forward, lo, hi)
+}
+
 fn check(bot: &str) {
     let dir = bots_dir().join(bot);
     let ps = poses(&dir);
@@ -121,13 +164,21 @@ fn check(bot: &str) {
     for p in &ps {
         let name = p.file_name().unwrap().to_string_lossy();
         match guess_for(p) {
-            Some((g, _)) => println!(
-                "  {name:4} up={} (conf={}) fwd={} (conf={})",
-                orient::axis_name(g.up),
-                g.up_confident,
-                orient::axis_name(g.forward),
-                g.forward_confident
-            ),
+            Some((g, _)) => {
+                let hint = forward_hint_for(p);
+                let hint_str = match hint {
+                    Some(h) if h > 0.0 => " head-hint: keep".to_string(),
+                    Some(_) => " head-hint: FLIP".to_string(),
+                    None => String::new(),
+                };
+                println!(
+                    "  {name:4} up={} (conf={}) fwd={} (conf={}){hint_str}",
+                    orient::axis_name(g.up),
+                    g.up_confident,
+                    orient::axis_name(g.forward),
+                    g.forward_confident
+                );
+            }
             None => println!("  {name:4} (could not load)"),
         }
     }
