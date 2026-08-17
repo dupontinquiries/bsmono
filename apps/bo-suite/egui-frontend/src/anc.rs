@@ -278,7 +278,7 @@ impl PatternProbe {
 /// has to be able to kill the anti-noise at any moment — including while
 /// using the sleep engine or the theatre setup, where an ANC page would mean
 /// switching apps to switch it off. Returns the new mode when tapped.
-pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc,
+pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc, scene: &mut uikit_egui::A11yScene,
                 c: &uikit_egui::PaletteColors) -> Option<Mode> {
     let mut changed = None;
     ui.horizontal(|ui| {
@@ -293,10 +293,23 @@ pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc,
             c.text_weak
         };
         ui.colored_label(dot, "●");
-        if ui.selectable_label(a.mode != Mode::Off, format!("ANC {}", a.mode.label()))
-            .on_hover_text("Off · Auto · On")
-            .clicked()
-        {
+        let label = format!("ANC {}", a.mode.label());
+        let resp = ui.selectable_label(a.mode != Mode::Off, &label)
+            .on_hover_text("Off · Auto · On");
+        // REGISTERED FOR VOICE. The kit's a11y module says it is "shared
+        // across every uikit-egui app" and one app used it; this control is
+        // the case it was written for — a cycling button whose meaning is not
+        // in its label, since "ANC Auto" does not say whether anti-noise is
+        // currently leaving the speakers. The spoken value carries the phase,
+        // so the answer is the same by voice as by eye.
+        scene.add(
+            0xa9c_0001,
+            uikit_egui::a11y::Semantics::new(uikit_egui::a11y::Role::Button, "noise cancellation")
+                .with_value(&format!("{}, {}", a.mode.label().to_lowercase(), a.readout()))
+                .with_hint("activates to cycle off, auto, on"),
+            Some(resp.rect),
+        );
+        if resp.clicked() {
             changed = Some(a.cycle());
         }
         // The reason, always — a silent canceller with no explanation is the

@@ -1021,7 +1021,7 @@ impl Controller {
         // from wherever they are — a page for it means switching away from
         // the sleep engine to turn it off, which is when they most want it.
         // The engine's own gates decide in Auto; this only says which mode.
-        crate::anc::anc_chip(ui, &mut self.anc, c);
+        crate::anc::anc_chip(ui, &mut self.anc, &mut self.a11y, c);
         if self.now.active() { ui.label(self.now.line()); }
         crate::transport::transport_ui(ui, &mut self.transport, c);
     }

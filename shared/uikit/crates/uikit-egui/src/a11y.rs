@@ -71,6 +71,19 @@ impl Semantics {
         let v = if text.is_empty() { "empty".to_string() } else { text.to_string() };
         Semantics { value: Some(v), ..Semantics::new(Role::TextField, label) }
     }
+    /// Set the spoken state on any role.
+    ///
+    /// `toggle` and `field` set `value` in their constructors, which covers a
+    /// checkbox and a text box. It does not cover a BUTTON whose state is not
+    /// its label: bo-suite's ANC chip cycles off/auto/on and the thing a
+    /// listener needs — whether anti-noise is currently leaving the speakers —
+    /// is neither the label nor a boolean. Without this, such a control can be
+    /// announced or accurate, not both.
+    pub fn with_value(mut self, value: &str) -> Semantics {
+        self.value = Some(value.to_string());
+        self
+    }
+
     pub fn with_hint(mut self, hint: &str) -> Semantics {
         self.hint = Some(hint.to_string());
         self
