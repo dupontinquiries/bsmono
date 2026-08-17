@@ -157,6 +157,61 @@ def surfaces(app_dir):
              if 'Test' not in n and 'Harness' not in n and not n.endswith('Tests')}
     return found
 
+def kit_use(pdirs):
+    """Which of the kit's SHARED-BY-DESIGN facilities a port actually uses.
+
+    A third axis, after surface reachability and engine linkage, and the one
+    that answers "the ports look about the same and don't function". An app can
+    reach every surface and link its engine while reproducing its Qt original's
+    navigation widget for widget — which is what makes it look unchanged.
+
+    Only four modules are counted, chosen because each one's own header says it
+    exists to be shared:
+
+      a11y          "accessibility voice, shared across every uikit-egui app"
+      nav           "extracted from snapclone into the shared kit"
+      adaptive      one layout description driving phone and desktop
+      gesture_layer the paging/swipe layer
+
+    Reported as counts, NOT as a verdict. A terminal legitimately owns its
+    gestures; nav's two-level page model does not fit every app. The number
+    that means something is the comparison: how many files hand-roll pointer
+    deltas while these sit unused.
+    """
+    hits, rolled = {}, 0
+    for key, pat in (("a11y", r"a11y::"), ("nav", r"nav::Nav|uikit_egui::nav"),
+                     ("adaptive", r"adaptive::"), ("gesture", r"GestureLayer|gesture_layer")):
+        n = 0
+        for pd in pdirs:
+            for root, dirs, files in os.walk(pd):
+                dirs[:] = [x for x in dirs if x != "target"]
+                for f in files:
+                    if not f.endswith(".rs"):
+                        continue
+                    try:
+                        body = open(os.path.join(root, f), encoding="utf-8",
+                                    errors="ignore").read()
+                    except OSError:
+                        continue
+                    if re.search(pat, body):
+                        n += 1
+        hits[key] = n
+    for pd in pdirs:
+        for root, dirs, files in os.walk(pd):
+            dirs[:] = [x for x in dirs if x != "target"]
+            for f in files:
+                if not f.endswith(".rs"):
+                    continue
+                try:
+                    body = open(os.path.join(root, f), encoding="utf-8",
+                                errors="ignore").read()
+                except OSError:
+                    continue
+                if re.search(r"drag_delta|pointer.*delta", body):
+                    rolled += 1
+    return hits, rolled
+
+
 def engine_link(app_dir, pdirs):
     """Does the port link this app's OWN engine crates?
 
@@ -538,6 +593,7 @@ def main():
             "manifest": in_man, "primary": primary, "role": role,
             "missing": sorted(surf - hit)[:8],
             "engine": engine_link(d, port_dirs(d)),
+            "kit": kit_use(port_dirs(d)),
         })
     w = max(len(r["app"]) for r in rows) if rows else 10
     print(f"{'app':<{w}}  {'surfaces':>8} {'named':>6} {'%':>4} {'code':>5} {'%':>4} "
@@ -562,6 +618,18 @@ def main():
             tail = (" (links " + ", ".join(linked) + ")") if linked else " (links none)"
             print(r["app"] + ": NOT LINKED to its own engine — "
                   + ", ".join(missing[:6]) + tail)
+    # Kit adoption, reported last because it is the softest of the three and
+    # the easiest to misread as a defect.
+    print()
+    print("kit facilities that exist to be shared (files using each) vs "
+          "files hand-rolling pointer deltas:")
+    for r in rows:
+        k, rolled = r.get("kit", ({}, 0))
+        if not k:
+            continue
+        used = " ".join(f"{name}={n}" for name, n in k.items())
+        print(f"  {r['app']:<16} {used}   hand-rolled={rolled}")
+
     for r in rows:
         if r.get("stranded"):
             print(f"{r['app']}: STRANDED (named, nothing live mentions it) — "
