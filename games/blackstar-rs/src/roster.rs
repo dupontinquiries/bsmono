@@ -262,10 +262,15 @@ mod tests {
 
     #[test]
     fn the_whole_fleet_does_not_fit_which_is_the_point() {
-        // 222 chassis at 5 poses is 1110 against 126. Without a selector the
-        // bake silently truncates mid-chassis at whatever comes first
-        // alphabetically.
-        let all = fleet(222);
+        // CSDF_MAXM has moved before (the module's own docs record it:
+        // 126 -> 1344, "the whole library loads -- 20 of 221 becomes
+        // 221 of 221") and this test's fleet size did not move with it
+        // last time -- `fleet(222)` is 1110 poses, comfortably UNDER
+        // today's 1344 budget, so "does not fit" silently stopped being
+        // true and the test failed on a premise rather than a bug.
+        // Sized off SDF_BUDGET itself now, with real margin, so a
+        // future CSDF_MAXM change can't quietly repeat this.
+        let all = fleet(SDF_BUDGET / 5 + 100);
         let got = fit(&all, &Pick::All, SDF_BUDGET);
         assert!(got.len() < all.len());
         assert!(got.iter().map(|x| x.poses).sum::<usize>() <= SDF_BUDGET);
@@ -358,12 +363,16 @@ mod tier_file_tests {
     fn tiers_are_read_from_the_generators_own_file() {
         let dir = std::env::temp_dir().join("roster-tier-test");
         let _ = std::fs::create_dir_all(&dir);
-        std::fs::write(dir.join("fleet.json"), r#"{
- "fleet": [
-  {"name": "boat_mistral", "category": "boat", "poses": 5, "confidence": "low"},
-  {"name": "car_charger", "poses": 5, "confidence": "high"}
- ]
-}"#).unwrap();
+        // One field per line, `{` on its own line — the real generator's
+        // actual output (checked against assets/bots/fleet.json:
+        // `json.dump(..., indent=N)` never puts the opening brace on the
+        // same line as the first key). The previous fixture put a whole
+        // entry on one line (`{"name": "x", "category": ..., ...},`),
+        // which `field()`'s `line.strip_prefix(key)` cannot match — the
+        // line starts with `{`, not the key — so this test was failing
+        // against a fixture that never resembled the real file, not
+        // because load_tiers was wrong.
+        std::fs::write(dir.join("fleet.json"), "{\n \"fleet\": [\n  {\n   \"name\": \"boat_mistral\",\n   \"category\": \"boat\",\n   \"poses\": 5,\n   \"confidence\": \"low\"\n  },\n  {\n   \"name\": \"car_charger\",\n   \"poses\": 5,\n   \"confidence\": \"high\"\n  }\n ]\n}").unwrap();
         let t = load_tiers(&dir);
         assert_eq!(t.get("boat_mistral"), Some(&Tier::Low));
         assert_eq!(t.get("car_charger"), Some(&Tier::High));
@@ -381,28 +390,55 @@ mod tier_file_tests {
     #[test]
     fn keys_between_name_and_confidence_do_not_break_the_pairing() {
         // The real file has eight keys between them, which is why this tracks
-        // the most recent name rather than reading a fixed offset.
+        // the most recent name rather than reading a fixed offset. Same
+        // fix as the test above: `{` moved to its own line so `"name"`
+        // is actually at the start of its line, matching the real file.
         let dir = std::env::temp_dir().join("roster-tier-test2");
         let _ = std::fs::create_dir_all(&dir);
-        std::fs::write(dir.join("fleet.json"), r#"{"fleet":[
-  {"name": "x",
-   "source": "a.iqm",
-   "poses": 5,
-   "morph": "accepted",
-   "confidence": "broken"}
-]}"#).unwrap();
+        std::fs::write(dir.join("fleet.json"), "{\"fleet\":[\n  {\n   \"name\": \"x\",\n   \"source\": \"a.iqm\",\n   \"poses\": 5,\n   \"morph\": \"accepted\",\n   \"confidence\": \"broken\"\n  }\n]}").unwrap();
         assert_eq!(load_tiers(&dir).get("x"), Some(&Tier::Broken));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_value_that_is_not_a_tier_is_skipped_rather_than_guessed() {
+        // Same fixture-format issue as the two tests above, fixed the
+        // same way: the old compact fixture never matched a `"name"`
+        // line at all (`{"name":"y",...` starts with `{`), so this
+        // passed whether or not an unknown confidence value was
+        // actually rejected — the assertion held for the wrong reason.
+        // With `name` correctly parsed, `is_empty()` now actually
+        // exercises `Tier::parse` refusing "probably".
         let dir = std::env::temp_dir().join("roster-tier-test3");
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("fleet.json"),
-                       r#"{"fleet":[{"name":"y","confidence":"probably"}]}"#).unwrap();
+                       "{\"fleet\":[\n  {\n   \"name\": \"y\",\n   \"confidence\": \"probably\"\n  }\n]}").unwrap();
         assert!(load_tiers(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_tiers_actually_reads_the_real_fleet_json() {
+        // The three tests above all use synthetic fixtures written by
+        // this test module -- which is exactly what went wrong before
+        // (a fixture that quietly stopped resembling the real file).
+        // This one skips the fixture and points load_tiers at the real
+        // assets/bots directory, so a future format change in the
+        // actual generator output would fail here even if every
+        // hand-written fixture above happened to still match it.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/bots");
+        let tiers = load_tiers(&dir);
+        assert!(!tiers.is_empty(), "the real fleet.json produced no tiers at all");
+        // spot-check one of each confidence band fleet.json's own
+        // by_confidence summary says exists, so this fails loudly if
+        // the real file's shape ever changes rather than passing on an
+        // empty map
+        assert!(tiers.values().any(|t| *t == Tier::High), "no High-tier chassis found");
+        assert!(tiers.values().any(|t| *t == Tier::Low), "no Low-tier chassis found");
+        assert!(tiers.values().any(|t| *t == Tier::Broken), "no Broken-tier chassis found");
+        // and a chassis this session's fleet-additions patch actually
+        // added should be readable by name, not just present in count
+        assert_eq!(tiers.get("animal_bot_runningwind"), Some(&Tier::High));
     }
 }
 
