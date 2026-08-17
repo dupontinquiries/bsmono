@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_bot_t4b_tank_tread_mech_vehicle_form.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 61,
+  "vertices": 24953,
+  "triangles": 34968,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.95,
+   "grounded": 0.26
+  }
+ }
+}

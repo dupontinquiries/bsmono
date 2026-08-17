@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_quadruped_mech_walker.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 60,
+  "vertices": 25851,
+  "triangles": 41933,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "broken",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 3,
+   "blobs_at_robot_worst_view": 2,
+   "symmetry": 0.86,
+   "grounded": 0.21
+  },
+  "caveat": "2 silhouette blobs at t=1 \u2014 a piece separates and does not come back"
+ }
+}

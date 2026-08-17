@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_swimmer_sub_oceanic_hauler.iqm",
+ "foldview": {
+  "category": "sub",
+  "poses": 5,
+  "prims": 53,
+  "vertices": 25116,
+  "triangles": 40096,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.92,
+   "grounded": 0.33
+  }
+ }
+}

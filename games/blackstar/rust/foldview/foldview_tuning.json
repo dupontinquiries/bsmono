@@ -1,0 +1,164 @@
+{
+  "imported_hoverer_blackstar.iqm": {
+    "archetype": "signals",
+    "pitch": 1.12,
+    "stance": 1.15,
+    "palette": [
+      0.16,
+      0.15,
+      0.22
+    ],
+    "note": "the namesake: comms frame, taller stand, void-dark shell",
+    "burst": 1.2
+  },
+  "imported_tank_rollout_aka_sci_fi_tank.iqm": {
+    "archetype": "brawler",
+    "stance": 1.2,
+    "note": "wide brute; tread runs read as forearm mass"
+  },
+  "imported_tank_hawkeye_aka_modern_t_i_k_battle_tank.iqm": {
+    "archetype": "brawler",
+    "note": "default brawler carries it"
+  },
+  "imported_tank_chokepoint_aka_starcraft_inspired_siege_tank_tribute.iqm": {
+    "archetype": "brawler",
+    "stance": 1.25,
+    "note": "siege chassis wants the widest base in the set"
+  },
+  "imported_tank_ebr_105_mad_max_mod.iqm": {
+    "archetype": "sprinter",
+    "note": "wheeled armored car: a tank that runs, so sprint internals"
+  },
+  "imported_flyer_dawnshade.iqm": {
+    "archetype": "raptor",
+    "palette": [
+      0.36,
+      0.37,
+      0.44
+    ],
+    "note": "slate airframe, truss chest"
+  },
+  "imported_flyer_hull.iqm": {
+    "archetype": "raptor"
+  },
+  "imported_flyer_freighter.iqm": {
+    "archetype": "raptor",
+    "stance": 1.1,
+    "note": "heavy lifter needs the wider footing"
+  },
+  "imported_flyer_c_130j_super_hercules.iqm": {
+    "archetype": "raptor",
+    "head": -1,
+    "note": "cockpit is fuselage-integral; no head election, keep the airframe honest"
+  },
+  "imported_racer_grit_aka_rocket_car.iqm": {
+    "archetype": "sprinter",
+    "palette": [
+      0.62,
+      0.17,
+      0.13
+    ],
+    "note": "scuffed racing red; bursts hardest in the set",
+    "burst": 1.1
+  },
+  "imported_racer_nightvent.iqm": {
+    "archetype": "sprinter"
+  },
+  "imported_racer_quickfire.iqm": {
+    "archetype": "sprinter"
+  },
+  "imported_racer_cryofin_aka_slick_mobile.iqm": {
+    "archetype": "sprinter",
+    "stance": 1.1
+  },
+  "imported_hoverer_brutis_aka_hover_tank.iqm": {
+    "archetype": "brawler",
+    "note": "it says hover TANK on the tin; brawler interior over hovercar default"
+  },
+  "imported_hoverer_beetlejuice.iqm": {
+    "archetype": "signals"
+  },
+  "imported_hoverer_analog_aka_weaponless_scout.iqm": {
+    "archetype": "signals",
+    "note": "weaponless scout: all mast and modules, nothing else"
+  },
+  "imported_hovertank_whistlewind_aka_hover_ifv_pbr.iqm": {
+    "archetype": "brawler",
+    "pitch": 1.05,
+    "stance": 1.1
+  },
+  "imported_flyer_alphastar.iqm": {
+    "archetype": "raptor",
+    "flare": 1.3,
+    "note": "show-off wings, extra arm flare"
+  },
+  "imported_flyer_bulwark.iqm": {
+    "archetype": "raptor",
+    "stance": 1.15,
+    "note": "gunship: plant it wider"
+  },
+  "imported_flyer_darkguard.iqm": {
+    "archetype": "raptor",
+    "palette": [
+      0.2,
+      0.2,
+      0.26
+    ],
+    "palette2": [
+      0.3,
+      0.12,
+      0.12
+    ],
+    "note": "night airframe, oxblood limbs"
+  },
+  "imported_flyer_2_modes_viper.iqm": {
+    "archetype": "raptor",
+    "flare": 1.4,
+    "note": "it is called 2 modes; lean into the split"
+  },
+  "imported_hovertank_tempest.iqm": {
+    "archetype": "brawler",
+    "note": "the shell came off and there was a brute underneath"
+  },
+  "imported_tank_lockon.iqm": {
+    "archetype": "brawler",
+    "emblem": false,
+    "note": "all business, no keel"
+  },
+  "imported_tank_patton_aka_scifitank_patton.iqm": {
+    "archetype": "brawler",
+    "stance": 1.15
+  },
+  "imported_tank_vanquish_aka_t_666_concept_tank.iqm": {
+    "archetype": "brawler",
+    "stance": 1.2,
+    "palette2": [
+      0.1,
+      0.1,
+      0.12
+    ]
+  },
+  "imported_tank_lynx_6x6.iqm": {
+    "archetype": "sprinter",
+    "note": "6x6 scout car: runner internals like the EBR"
+  },
+  "imported_tank_boartail.iqm": {
+    "archetype": "brawler",
+    "flare": 0.8,
+    "note": "tusker keeps its arms tight",
+    "burst": 0.5
+  },
+  "imported_flyer_batwing_aka_axis_fighter_plane_wolf_new_order.iqm": {
+    "snap": 3.0,
+    "note": "source damage wider than the default seam radius"
+  },
+  "imported_flyer_ventride.iqm": {
+    "archetype": "raptor",
+    "snap": 2.0,
+    "burst": 0.8,
+    "note": "cracked panels; wider repair, calmer burst"
+  },
+  "imported_flyer_vertigo.iqm": {
+    "snap": 2.0
+  }
+}

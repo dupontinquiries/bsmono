@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_exo_armor_plunger_cameraman_monsterup.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 53,
+  "vertices": 33104,
+  "triangles": 47522,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.88,
+   "grounded": 0.21
+  }
+ }
+}

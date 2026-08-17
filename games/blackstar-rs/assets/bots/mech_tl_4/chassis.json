@@ -1,0 +1,24 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_mech_tl_4.iqm",
+ "foldview": {
+  "category": "walker",
+  "poses": 5,
+  "prims": 52,
+  "vertices": 25726,
+  "triangles": 46206,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "medium",
+  "metrics": {
+   "blobs_at_vehicle": 2,
+   "blobs_mid_burst": 1,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.84,
+   "grounded": 0.26
+  },
+  "caveat": "solid silhouette, moderate symmetry (0.84)"
+ }
+}

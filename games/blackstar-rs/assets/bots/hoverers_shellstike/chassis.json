@@ -1,0 +1,23 @@
+{
+ "scale": 1.0,
+ "boss": false,
+ "source": "imported_hoverers_shellstike.iqm",
+ "foldview": {
+  "category": "hoverer",
+  "poses": 5,
+  "prims": 43,
+  "vertices": 13572,
+  "triangles": 21235,
+  "morph": "accepted",
+  "already_shipped": false,
+  "sweep": "cold",
+  "confidence": "high",
+  "metrics": {
+   "blobs_at_vehicle": 1,
+   "blobs_mid_burst": 2,
+   "blobs_at_robot_worst_view": 1,
+   "symmetry": 0.93,
+   "grounded": 0.4
+  }
+ }
+}
