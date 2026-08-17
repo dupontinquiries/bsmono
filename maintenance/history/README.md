@@ -100,3 +100,25 @@ commit really touched.
 The 449 self-correcting commits are the scarce part: an author saying what they
 got wrong, next to the diff that fixed it. Regenerate any of this with
 `maintenance/tools/commit_corpus.py`.
+
+
+## The c4-882 parallel line
+
+`c4-882-parallel-line.jsonl.gz` — 2,993 commits from the c4-858 -> c4-870 ->
+c4-882 line, which developed in parallel with this one after the rewrites made
+the shas incomparable.
+
+Its logscope work was taken into the tree wholesale (see `ed3abc04`, and the
+check that justified it: this line had touched neither `apps/logscope` nor
+`shared/touchkit` since the shared base). The commits themselves are NOT in
+this repo — fetching them cost 240 MB of objects for a lineage git cannot
+merge, which would have put the bundle back over 500 MB.
+
+So the code is in the tree and the reasoning is in this archive: subjects,
+bodies, labels, diff stats and entailed operations for all 2,993, including
+**396 self-correcting commits**. That is the part worth keeping, at 1.9 MB
+instead of 240.
+
+The objects themselves remain in the uploaded `c4-870.bundle` and
+`c4-882-incremental.bundle`. Re-fetch those if the granular history is ever
+needed; nothing here is the only copy.
