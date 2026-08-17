@@ -110,7 +110,11 @@ lto = true
 codegen-units = 1
 strip = true
 
-[[bin]]
-name = "ambient-learner-egui"
-path = "src/bin/ambient_learner_egui.rs"
-required-features = ["egui-app"]
+# The runnable egui frontend used to be declared here, at
+# src/bin/ambient_learner_egui.rs. It moved to the egui-frontend/ crate —
+# eframe cannot resolve alongside this crate's optional iced 0.12, which caps
+# web-sys below what eframe 0.34 needs — but this declaration stayed behind,
+# pointing at a file that no longer exists. `cargo build --features egui-app`
+# in this crate therefore failed on a missing source rather than building
+# anything. The binary lives in egui-frontend/; there is nothing to declare
+# here.

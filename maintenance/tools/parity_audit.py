@@ -247,6 +247,57 @@ def covered_in_code(name, text):
                 return True
     return False
 
+def covered_live(name, port_dirs_list):
+    """Is this surface named by a file that the app can actually REACH?
+
+    The third reading, and the one that turned out to matter. `code` is a poor
+    proxy for "done" because the house style names the Qt class in the module
+    doc and then writes idiomatic Rust — so snapclone reads 49% in code while
+    every one of the 24 surfaces in that gap lives in a module with tests that
+    the app calls. Chasing that number would have meant re-porting finished
+    work, which the docstring above already warns is the most expensive wrong
+    answer.
+
+    So: find the files that mention the surface and ask whether any of them is
+    live. The crate root is always live; any other module counts only if
+    something outside it references it, which is `wiring_check.reached` — the
+    same question, reused rather than reimplemented, so the two tools cannot
+    drift into disagreeing about what "wired" means.
+
+    A surface that is named ONLY inside a module nothing calls is the real
+    finding: somebody wrote it and it never got connected. That is a different
+    and much shorter list than the `code` gap.
+    """
+    import wiring_check
+    hits = []
+    for src in port_dirs_list:
+        for root, dirs, files in os.walk(src):
+            dirs[:] = [d for d in dirs if d != 'target']
+            for f in files:
+                if not f.endswith('.rs'):
+                    continue
+                try:
+                    t = open(os.path.join(root, f), encoding='utf8').read()
+                except Exception:
+                    continue
+                if name in t or snake(name) in t:
+                    hits.append((src, f[:-3]))
+    if not hits:
+        return False
+    for src, mod in hits:
+        # The crate root and its binaries are live by definition.
+        if mod in ('lib', 'main') or os.path.basename(os.path.dirname(src)) == 'bin':
+            return True
+        # Reachability is asked across EVERY port dir, not just the one the
+        # module lives in. ambient-learner keeps its pages inline at
+        # src/ui/egui and its window in a separate egui-frontend crate, so a
+        # per-directory check called six rendered pages stranded — the same
+        # false alarm this file already fixed once in cargo_state, which is
+        # how I recognised it.
+        if any(wiring_check.reached(other, mod) for other in port_dirs_list):
+            return True
+    return False
+
 def manifest_state(app_id):
     p = os.path.join(ROOT, 'manifest', 'projects.toml')
     try: t = open(p, encoding='utf8').read()
@@ -283,6 +334,10 @@ def main():
         text = port_text(d)
         hit = {s for s in surf if covered(s, text)}
         wired = {s for s in surf if covered_in_code(s, text)}
+        # Named somewhere the app can actually reach. Sits between the two:
+        # not fooled by a mention in prose alone, not fooled by the house
+        # style either.
+        live = {s for s in surf if covered_live(s, port_dirs(d))}
         has_bin, app_default = cargo_state(d)
         in_man, primary, role = manifest_state(name + '-egui')
         rows.append({
@@ -290,22 +345,34 @@ def main():
             "pct": round(100.0 * len(hit) / max(len(surf), 1)),
             "wired": len(wired),
             "wired_pct": round(100.0 * len(wired) / max(len(surf), 1)),
+            "live": len(live),
+            "live_pct": round(100.0 * len(live) / max(len(surf), 1)),
+            # The list worth acting on: somebody named the surface, and
+            # nothing the app calls mentions it.
+            "stranded": sorted(hit - live)[:8],
             "bin": has_bin, "app_default": app_default,
             "manifest": in_man, "primary": primary, "role": role,
             "missing": sorted(surf - hit)[:8],
         })
     w = max(len(r["app"]) for r in rows) if rows else 10
-    print(f"{'app':<{w}}  {'surfaces':>8} {'named':>6} {'%':>4} {'code':>5} {'%':>4}  "
-          f"bin  app-def  manifest  primary")
+    print(f"{'app':<{w}}  {'surfaces':>8} {'named':>6} {'%':>4} {'code':>5} {'%':>4} "
+          f"{'live':>5} {'%':>4}  bin  app-def  manifest  primary")
     for r in rows:
         print(f"{r['app']:<{w}}  {r['surfaces']:>8} {r['covered']:>6} {r['pct']:>3}% "
-              f"{r['wired']:>5} {r['wired_pct']:>3}%  "
+              f"{r['wired']:>5} {r['wired_pct']:>3}% "
+              f"{r['live']:>5} {r['live_pct']:>3}%  "
               f"{'yes' if r['bin'] else ' no':>3}  {'yes' if r['app_default'] else ' no':>6}  "
               f"{'yes' if r['manifest'] else ' NO':>7}  {'yes' if r['primary'] else '  -':>6}")
     print()
     for r in rows:
         if r["missing"]:
             print(f"{r['app']}: next surfaces — {', '.join(r['missing'][:6])}")
+    # Named but not reachable: written and never connected, which is a
+    # different job from porting and usually a much smaller one.
+    for r in rows:
+        if r.get("stranded"):
+            print(f"{r['app']}: STRANDED (named, nothing live mentions it) — "
+                  f"{', '.join(r['stranded'][:6])}")
     # Apps with no port at all — the gap the table above cannot show.
     apps = os.path.join(ROOT, 'apps')
     missing = []

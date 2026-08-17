@@ -6,7 +6,7 @@
 //! than one surface behind a runnable one.
 
 use ambient_learner_egui::{
-    ui::egui::{ambience, chrome, history, locations, map, model, screen_temps, sync},
+    ui::egui::{ambience, chrome, history, live, locations, map, model, screen_temps, sync},
     LiveState,
 };
 
@@ -30,6 +30,16 @@ struct App {
     sparkles: ambience::Sparkles,
     started: std::time::Instant,
     temps: screen_temps::ScreenTempsPage,
+    /// The ported Live page's own model — sensor readings, health, the ramp.
+    /// `LiveState` above draws the big reading; this draws the SENSOR panel
+    /// underneath it, which is the half of `LivePage` that was ported (with
+    /// thirteen tests) and then never called: egui_lib grew its own inline
+    /// version of the headline and stopped there.
+    sensors: live::Live,
+    /// The breathing dot, which stops when nothing is reporting — a dot that
+    /// keeps pulsing while the sensors are dead says the app is fine when it
+    /// is not.
+    dot: live::BreathingDot,
 }
 
 impl App {
@@ -51,6 +61,9 @@ impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        // Clamped: a resumed suspend delivers one enormous delta, and feeding
+        // it to the breath would jump the dot rather than animate it.
+        let dt_ms = ctx.input(|i| i.stable_dt).min(0.1) * 1000.0;
         egui::CentralPanel::default().show(ctx, |ui| {
             // The mood background sits BEHIND everything, and only on Live.
             // On the data pages it would compete with numbers people are
@@ -78,7 +91,20 @@ impl eframe::App for App {
             // title, so the tab bar was the only thing saying where you were.
             chrome::section_header(ui, self.section(), self.colors.accent);
             match self.page {
-                Page::Live => self.live.ui(ui),
+                Page::Live => {
+                    self.live.ui(ui);
+                    // The ported sensor panel below the headline. The dot
+                    // breathes only while something is reporting, so it is
+                    // driven from the readings rather than from a timer.
+                    // readings() is (label, unit, Reading) — the tuple the
+                    // panel draws from, so the availability check reaches into
+                    // it rather than assuming a bare Reading.
+                    self.dot.live = self.sensors.readings().iter()
+                        .any(|(_, _, r)| r.available());
+                    self.dot.tick(dt_ms);
+                    if self.dot.live { ui.ctx().request_repaint(); }
+                    live::live_ui(ui, &self.sensors, &self.dot, &self.colors);
+                }
                 Page::History => history::history_ui(ui, &self.history, &self.colors),
                 Page::Map => map::map_ui(ui, &mut self.map, &self.colors),
                 Page::Model => model::model_ui(ui, &self.model, &self.colors),
@@ -143,6 +169,20 @@ fn main() -> eframe::Result<()> {
             sparkles: ambience::Sparkles { humidity_pct: 60.0 },
             started: std::time::Instant::now(),
             temps: screen_temps::ScreenTempsPage::default(),
+            // The sensor panel, seeded from the same demo snapshot the
+            // headline uses so the two halves of the page agree. Humidity and
+            // light stay Missing: this build reads no sensors, and inventing
+            // values would make the health row claim "locked" while the
+            // device has nothing attached — precisely the lie the row exists
+            // to prevent.
+            sensors: live::Live {
+                temp_c: live::Reading::new(Some(21.4), 1),
+                humidity_pct: live::Reading::missing(),
+                pressure_hpa: live::Reading::new(Some(1008.0), 0),
+                light: live::Reading::missing(),
+                confidence: Some(0.82),
+            },
+            dot: live::BreathingDot::default(),
         }))
     }))
 }
