@@ -13,6 +13,8 @@ pub mod buildsystem;
 pub mod daemons;
 pub mod deploy;
 pub mod fleet;
+/// A LAN apk mirror: what may be cached forever, and what must not be.
+pub mod apkcache;
 /// The fastboot wire protocol and flash-script model, without a subprocess.
 pub mod fastboot;
 /// First contact with a freshly-imaged phone: pairing code and join script.
