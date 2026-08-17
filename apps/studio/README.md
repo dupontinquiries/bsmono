@@ -1235,3 +1235,45 @@ checked against the output — so the detector's own bias (~6 cents at 452
 Hz, ~16 at 554) passes through. Tests measure by zero crossings on
 purpose: verifying with the same YIN that produced the bias would have
 hidden it, which is exactly what the first draft of those tests did.
+
+
+**The tuner, smoothed and made affordable.** Three changes, each with a
+measurement behind it. (1) `analyse()` allocated a Vec every hop — a malloc
+inside the audio path, invisible in tests and audible as a dropout the
+first time the allocator takes a lock; the scratch buffers are now
+preallocated. (2) Detection was full-rate YIN at a 70 Hz floor, ~2M
+multiply-adds per 5 ms hop, most of a core for ONE voice; it is now a
+coarse search on 4× decimated audio followed by a local full-rate
+difference search with parabolic interpolation. The suite time for these
+tests fell from 5.1 s to 0.5 s, and accuracy IMPROVED — the refinement
+closed most of the open-loop bias the previous pass documented, so the
+assertions went from 15–25 cents to under 5. (3) The applied ratio now
+ramps across the hop instead of jumping at each analysis boundary: a step
+in the delay line's read rate is a tick every 5 ms on a sustained note, and
+a test pins that no single sample moves the ratio by more than a thousandth
+even with smoothing set to hard-snap. A cost test asserts 1 s of stereo
+processes in under 0.25 s so a regression shows up as a failure rather
+than as a crackle.
+
+**Adaptive saturation — character from the material.** `studio-fx::
+adaptive_sat` (chain kind `adaptivesat`) drives from two independent
+detectors: REGISTER (the fundamental, via the same coarse+refine detector
+the tuner uses, mapped log-wise between 60 Hz and 600 Hz) and SIBILANCE
+(high-band energy over total, from one-poles — cheap, pitch-free, responds
+in milliseconds like an "s" demands). Low notes get more drive and high
+notes less, because an 808 wants tape and a lead is already bright;
+sibilance always pulls drive DOWN, because a saturator's job is adding
+harmonics and sibilance is the last thing that needs more. Either amount
+set to zero disables that detector alone — plain register-following drive,
+or plain de-essing — and both at zero is bit-identical to the fixed
+`Saturator` it wraps, which is what makes it A/B-able against what it
+replaces. `Link::Tied` scales the sibilance response by register: careful
+up top, relaxed down low, one gesture instead of two knobs kept consistent
+— a mode rather than the default, because material whose sibilance lives
+in the low register (a distorted bass with fret noise) wants them apart.
+Profiles deliberately do NOT crossfade per-sample — different harmonic
+signatures and DC behaviour would smear the very character the stage
+picks; the amount and asymmetry move instead. Unvoiced stretches HOLD the
+register so a drum hit between two sung notes cannot swing the character,
+and `detectors()` exposes both numbers, because an adaptive effect whose
+decisions you cannot see is indistinguishable from a broken one.

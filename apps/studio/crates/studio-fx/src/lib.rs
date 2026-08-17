@@ -19,6 +19,7 @@ pub mod imager;
 pub mod chain;
 pub mod assistant;
 pub mod retune;
+pub mod adaptive_sat;
 pub mod psola;
 pub mod realtune;
 pub mod autotune;
@@ -452,6 +453,8 @@ pub enum Instance {
     /// whole take — this one is streaming with fixed latency, so it is a
     /// legitimate insert.
     RealTune(Box<realtune::RealtimeTune>),
+    /// Saturation whose drive follows register and sibilance.
+    AdaptiveSat(Box<adaptive_sat::AdaptiveSat>),
     TapeStop(playrate::TapeStop),
     Halftime(playrate::Halftime),
 }
@@ -472,6 +475,7 @@ impl Instance {
             Instance::Saturator(s) => s.process(x),
             Instance::Gain(db) => x * from_db_pub(*db),
             Instance::RealTune(t) => t.process(x),
+            Instance::AdaptiveSat(a) => a.process(x),
             Instance::TapeStop(t) => t.process(x),
             Instance::Halftime(h) => h.process(x),
             Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => x,
@@ -572,6 +576,27 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
         }),
         // The playrate pair. `channels` defaults to 2 because that is what
         // mixdown feeds (L then R into one instance); a mono caller says so.
+        "adaptivesat" => {
+            let profile = match p(q, "profile", 0.0) as i32 {
+                1 => saturation::Profile::Tape,
+                2 => saturation::Profile::Console,
+                3 => saturation::Profile::Diode,
+                _ => saturation::Profile::Tube,
+            };
+            let mut a = adaptive_sat::AdaptiveSat::new(
+                profile, rate, p(q, "channels", 2.0).clamp(1.0, 8.0) as usize);
+            a.base_drive = p(q, "drive", 0.35).clamp(0.0, 1.0);
+            a.note_amount = p(q, "note_amount", 0.5).clamp(0.0, 1.0);
+            a.sibilance_amount = p(q, "sib_amount", 0.5).clamp(0.0, 1.0);
+            a.link = if p(q, "tied", 0.0) > 0.5 {
+                adaptive_sat::Link::Tied
+            } else {
+                adaptive_sat::Link::Independent
+            };
+            a.sat.bias = p(q, "bias", 0.0);
+            a.sat.mix = p(q, "mix", 1.0).clamp(0.0, 1.0);
+            Instance::AdaptiveSat(Box::new(a))
+        }
         "autotune" => {
             // Notes are given as a packed list: note_count, then note0..N as
             // MIDI numbers. Params are a flat f32 map (the model's choice),
@@ -1029,5 +1054,58 @@ mod realtune_registry_tests {
         // zero (or absent) must mean "use the scale", not "lock to nothing".
         let inst = instantiate(&fx("autotune", &[("root", 9.0), ("mode", 0.0)]), 48_000.0);
         assert!(matches!(inst, Some(Instance::RealTune(_))));
+    }
+}
+
+#[cfg(test)]
+mod adaptive_sat_registry_tests {
+    use super::*;
+
+    fn fx(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
+        studio_core::Effect {
+            kind: kind.into(),
+            params: params.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn the_chain_can_hold_an_adaptive_saturator_and_it_adapts() {
+        // Through the registry, not the struct: the same 808 and lead a
+        // producer would put on two channels must come out with different
+        // character from ONE setting.
+        let params = [("profile", 1.0), ("drive", 0.5), ("note_amount", 0.8),
+                      ("sib_amount", 0.5), ("channels", 1.0)];
+        let mut low = instantiate(&fx("adaptivesat", &params), 48_000.0).expect("registered");
+        let mut high = instantiate(&fx("adaptivesat", &params), 48_000.0).expect("registered");
+        let tone = |hz: f32| (0..24_000)
+            .map(|i| (i as f32 / 48_000.0 * hz * std::f32::consts::TAU).sin() * 0.4)
+            .collect::<Vec<f32>>();
+        let l: Vec<f32> = tone(55.0).iter().map(|x| low.process_audio(*x)).collect();
+        let h: Vec<f32> = tone(660.0).iter().map(|x| high.process_audio(*x)).collect();
+
+        let harm = |buf: &[f32], f0: f32| {
+            let mut t = 0.0f32;
+            for k in 2..=5 {
+                let f = f0 * k as f32;
+                let (mut re, mut im) = (0.0f32, 0.0f32);
+                for (i, x) in buf.iter().enumerate() {
+                    let a = std::f32::consts::TAU * f * i as f32 / 48_000.0;
+                    re += x * a.cos();
+                    im += x * a.sin();
+                }
+                t += (re * re + im * im).sqrt() / buf.len() as f32;
+            }
+            t / buf.iter().map(|v| v.abs()).sum::<f32>().max(1e-9) * buf.len() as f32
+        };
+        assert!(harm(&l, 55.0) > harm(&h, 660.0) * 1.5,
+                "the low note came out dirtier: {:.4} vs {:.4}",
+                harm(&l, 55.0), harm(&h, 660.0));
+    }
+
+    #[test]
+    fn tied_is_reachable_from_params() {
+        let a = instantiate(&fx("adaptivesat", &[("tied", 1.0)]), 48_000.0);
+        assert!(matches!(a, Some(Instance::AdaptiveSat(_))));
     }
 }

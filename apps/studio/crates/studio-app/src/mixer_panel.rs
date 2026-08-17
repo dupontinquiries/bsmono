@@ -36,6 +36,10 @@ pub const ADDABLE_FX: &[(&str, &[(&str, f32)])] = &[
     // Live note-locking pitch correction. Defaults to A-minor key-lock;
     // an explicit note set is params notes/note0.. (see the registry).
     ("autotune", &[("root", 9.0), ("mode", 0.0), ("speed", 30.0)]),
+    // Saturation that follows the material: more drive down low, less on
+    // sibilance. `tied` 1.0 makes the de-essing register-dependent.
+    ("adaptivesat", &[("profile", 1.0), ("drive", 0.4),
+                      ("note_amount", 0.5), ("sib_amount", 0.5), ("tied", 0.0)]),
     // The playrate pair — a tape stop on the master and halftime on a drum
     // bus are the two most-asked trap moves, and both are now real DSP
     // behind a chain chip rather than a plugin you must go find.

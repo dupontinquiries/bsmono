@@ -66,6 +66,53 @@
 
 use crate::retune::{yin_pitch, Scale};
 
+/// How far the coarse pitch search decimates. 4 keeps a 1 kHz fundamental
+/// well inside the decimated Nyquist while cutting YIN's O(N × maxlag) cost
+/// by roughly its square.
+const DECIMATION: usize = 4;
+
+/// Refine a coarse period estimate to sub-sample accuracy by parabolic
+/// interpolation of the local difference function.
+///
+/// This is what closes most of the open-loop error the first version
+/// documented: YIN's own period estimate is integer-ish, and correcting a
+/// note from a starting point that is 6 cents wrong lands it 6 cents wrong.
+/// Refining costs three difference evaluations over a couple of periods —
+/// nothing next to the search that found the coarse lag.
+fn refine_period(x: &[f32], coarse: f32) -> Option<f32> {
+    let centre = coarse.round() as isize;
+    // SEARCH, then interpolate. Interpolating alone was not enough and the
+    // tests caught it: a coarse estimate from decimated audio is quantized
+    // to DECIMATION samples of the full-rate period, so the true minimum can
+    // sit several lags away — a parabola fitted at the wrong lag confidently
+    // returns the wrong period. The window is the decimation factor plus a
+    // sample of slack, which is exactly the uncertainty the coarse stage has.
+    let reach = DECIMATION as isize + 1;
+    let lo = (centre - reach).max(2);
+    let hi = centre + reach;
+    if hi as usize + 1 >= x.len() { return None; }
+    let span = (x.len() - hi as usize - 1).min(centre as usize * 4);
+    if span < centre as usize { return None; }
+    let diff = |l: isize| -> f32 {
+        let l = l as usize;
+        let mut d = 0.0;
+        for i in 0..span { let t = x[i] - x[i + l]; d += t * t; }
+        d
+    };
+    let mut best = lo;
+    let mut best_d = f32::INFINITY;
+    for l in lo..=hi {
+        let d = diff(l);
+        if d < best_d { best_d = d; best = l; }
+    }
+    if best <= 2 { return Some(best as f32); }
+    let (dm, d0, dp) = (diff(best - 1), best_d, diff(best + 1));
+    let denom = dm - 2.0 * d0 + dp;
+    if denom.abs() < 1e-12 { return Some(best as f32); }
+    let shift = (0.5 * (dm - dp) / denom).clamp(-0.5, 0.5);
+    Some(best as f32 + shift)
+}
+
 fn hz_to_midi(hz: f32) -> f32 { 12.0 * (hz / 440.0).log2() + 69.0 }
 fn midi_to_hz(m: f32) -> f32 { 440.0 * 2f32.powf((m - 69.0) / 12.0) }
 
@@ -159,9 +206,20 @@ pub struct RealtimeTune {
     hop: usize,
     /// Current correction in cents, smoothed; ratio is derived from it.
     cents: f32,
+    /// The ratio actually applied this sample, ramped toward `ratio_target`
+    /// across the hop that follows each analysis.
     ratio: f32,
+    ratio_target: f32,
+    ratio_step: f32,
     lo_hz: f32,
     hi_hz: f32,
+    /// Preallocated analysis scratch. Allocating per hop — which the first
+    /// version did — is a malloc inside the audio callback, the one thing a
+    /// realtime path must never do; it is invisible in tests and audible as
+    /// a dropout the first time the allocator takes a lock.
+    frame: Vec<f32>,
+    /// Decimated copy of `frame`, for the coarse pitch search.
+    coarse: Vec<f32>,
 }
 
 impl RealtimeTune {
@@ -173,6 +231,7 @@ impl RealtimeTune {
         let window = (sample_rate * 0.022) as usize;
         let analysis = (sample_rate / crate::retune::DEFAULT_MIN_HZ * 3.0) as usize;
         let hop = (sample_rate * 0.005) as usize;
+        let ring_len = analysis.max(window * 2);
         RealtimeTune {
             target,
             retune_speed_ms: 30.0,
@@ -181,12 +240,16 @@ impl RealtimeTune {
             channels,
             phase: 0,
             shifters: (0..channels).map(|_| Shifter::new(window)).collect(),
-            ring: vec![0.0; analysis.max(window * 2)],
+            ring: vec![0.0; ring_len],
             ring_write: 0,
             hop_countdown: hop,
             hop: hop.max(1),
             cents: 0.0,
             ratio: 1.0,
+            ratio_target: 1.0,
+            ratio_step: 0.0,
+            frame: vec![0.0; ring_len],
+            coarse: vec![0.0; ring_len / DECIMATION + 1],
             lo_hz: crate::retune::DEFAULT_MIN_HZ,
             hi_hz: crate::retune::DEFAULT_MAX_HZ,
         }
@@ -210,23 +273,58 @@ impl RealtimeTune {
                 self.analyse();
             }
         }
+        if ch == self.channels - 1 {
+            // Ramp the applied ratio toward the target across one hop, once
+            // per frame rather than once per channel. A ratio that jumped at
+            // each analysis boundary steps the delay line's read rate, and
+            // that step is audible as a tick every 5 ms on sustained notes —
+            // the difference between "corrected" and "processed".
+            if self.ratio_step != 0.0 {
+                self.ratio += self.ratio_step;
+                let done = if self.ratio_step > 0.0 { self.ratio >= self.ratio_target }
+                           else { self.ratio <= self.ratio_target };
+                if done { self.ratio = self.ratio_target; self.ratio_step = 0.0; }
+            }
+        }
         self.shifters[ch].process(x, self.ratio)
     }
 
     fn analyse(&mut self) {
-        // Linearise the ring: YIN wants a contiguous frame, and copying a
-        // few thousand samples per hop is cheaper than a windowed YIN that
-        // knows about wraparound.
-        let n = self.ring.len();
-        let mut frame = Vec::with_capacity(n);
-        frame.extend_from_slice(&self.ring[self.ring_write..]);
-        frame.extend_from_slice(&self.ring[..self.ring_write]);
-        let detected = yin_pitch(&frame, self.sample_rate, self.lo_hz, self.hi_hz, 0.15);
+        // Linearise the ring into the preallocated frame: YIN wants a
+        // contiguous buffer, and a copy is cheaper than teaching it to wrap.
+        let split = self.ring.len() - self.ring_write;
+        self.frame[..split].copy_from_slice(&self.ring[self.ring_write..]);
+        self.frame[split..].copy_from_slice(&self.ring[..self.ring_write]);
+
+        // Coarse search on a decimated copy. YIN is O(N × maxlag); at 48 kHz
+        // with a 70 Hz floor that is ~2 million multiply-adds every 5 ms,
+        // which is most of a core for one voice. Decimating by 4 cuts both
+        // factors — ~16× less work — and costs nothing in accuracy here,
+        // because the coarse estimate is only used to locate the period that
+        // the full-rate refinement below then measures properly.
+        let dec = &mut self.coarse[..self.frame.len() / DECIMATION];
+        for (i, out) in dec.iter_mut().enumerate() {
+            // Mean of the group, which is a crude but adequate anti-alias
+            // for a detector that only needs the fundamental.
+            let base = i * DECIMATION;
+            let mut acc = 0.0;
+            for k in 0..DECIMATION { acc += self.frame[base + k]; }
+            *out = acc / DECIMATION as f32;
+        }
+        let dec_rate = self.sample_rate / DECIMATION as f32;
+        let detected = yin_pitch(dec, dec_rate, self.lo_hz, self.hi_hz.min(dec_rate * 0.4), 0.15)
+            .map(|p| crate::retune::Pitch {
+                hz: refine_period(&self.frame, self.sample_rate / p.hz)
+                    .map(|period| self.sample_rate / period)
+                    .unwrap_or(p.hz),
+                clarity: p.clarity,
+            });
         let Some(p) = detected.filter(|p| p.clarity >= self.voiced_threshold) else {
             // Unvoiced: pass through at unity and FREEZE the correction, so
             // the next voiced moment resumes the curve instead of restarting
             // it. (Same call Retune makes; see its docs.)
-            self.ratio = 1.0;
+            self.ratio_target = 1.0;
+            self.ratio_step = (1.0 - self.ratio) / self.hop as f32;
             return;
         };
         let target_hz = self.target.nearest_hz(p.hz);
@@ -238,7 +336,8 @@ impl RealtimeTune {
             1.0 - (-hop_ms / self.retune_speed_ms).exp()
         };
         self.cents += (want_cents - self.cents) * a;
-        self.ratio = 2f32.powf(self.cents / 1200.0);
+        self.ratio_target = 2f32.powf(self.cents / 1200.0);
+        self.ratio_step = (self.ratio_target - self.ratio) / self.hop as f32;
     }
 }
 
@@ -280,7 +379,7 @@ mod tests {
         let out: Vec<f32> = sine(452.0, 1.0, rate).into_iter().map(|x| t.process(x)).collect();
         // Skip the settling region: latency plus a few hops of smoothing.
         let got = detect(&out[24_000..44_000], rate);
-        assert!(cents_between(got, 440.0).abs() < 15.0,
+        assert!(cents_between(got, 440.0).abs() < 5.0,
                 "landed at {got:.2} Hz ({:.1} cents off A440)", cents_between(got, 440.0));
     }
 
@@ -300,7 +399,7 @@ mod tests {
         let to_c5 = cents_between(got, 523.25).abs();
         assert!(to_c5 < cents_between(got, 440.0).abs() / 4.0, "not A4");
         assert!(to_c5 < cents_between(got, 659.26).abs() / 4.0, "not E5");
-        assert!(to_c5 < 25.0, "landed at {got:.2} Hz ({to_c5:.1} cents off C5)");
+        assert!(to_c5 < 5.0, "landed at {got:.2} Hz ({to_c5:.1} cents off C5)");
     }
 
     #[test]
@@ -313,7 +412,7 @@ mod tests {
         let input = sine(440.0, 0.6, rate);
         let out: Vec<f32> = input.iter().map(|x| t.process(*x)).collect();
         let got = detect(&out[14_000..28_000], rate);
-        assert!(cents_between(got, 440.0).abs() < 10.0, "left at {got:.2} Hz");
+        assert!(cents_between(got, 440.0).abs() < 3.0, "left at {got:.2} Hz");
         assert!(t.ratio > 0.995 && t.ratio < 1.005, "ratio stayed at unity: {}", t.ratio);
     }
 
@@ -346,6 +445,49 @@ mod tests {
         let left_energy: f32 = lo.iter().map(|v| v.abs()).sum();
         assert!(right_energy < left_energy * 0.001,
                 "a silent channel stays silent: R={right_energy} vs L={left_energy}");
+    }
+
+    #[test]
+    fn the_applied_ratio_ramps_instead_of_stepping_at_hop_boundaries() {
+        // A ratio that jumped at each analysis boundary steps the delay
+        // line's read rate, which is audible as a tick every 5 ms on a
+        // sustained note. Watch the applied ratio across the settling
+        // region: no single sample may move it more than one hop's worth.
+        let rate = 48_000.0;
+        let mut t = RealtimeTune::new(Target::Notes(vec![69]), rate, 1);
+        t.retune_speed_ms = 0.0; // hard snap: the worst case for stepping
+        let input = sine(452.0, 0.5, rate);
+        let mut prev = t.ratio;
+        let mut worst = 0.0f32;
+        for x in &input {
+            t.process(*x);
+            worst = worst.max((t.ratio - prev).abs());
+            prev = t.ratio;
+        }
+        // One hop's full correction spread over `hop` samples; a step would
+        // show up as the entire ~2.7% ratio change in a single sample.
+        assert!(worst < 0.001, "largest single-sample ratio jump was {worst}");
+        assert!((t.ratio - 0.9735).abs() < 0.005, "it still got there: {}", t.ratio);
+    }
+
+    #[test]
+    fn analysis_runs_far_faster_than_realtime() {
+        // A monitoring insert has to fit in a callback with room to spare,
+        // and the detector is the expensive part: full-rate YIN at a 70 Hz
+        // floor is ~2M multiply-adds per 5 ms hop, which is most of a core
+        // for ONE voice. The decimated coarse search plus a local fine
+        // search is what makes this affordable. Generous bound so the test
+        // reports a real regression rather than machine noise.
+        let rate = 48_000.0;
+        let mut t = RealtimeTune::new(Target::Scale(Scale { root: 9, mode: Mode::Minor }), rate, 2);
+        let input = sine(220.0, 1.0, rate);
+        let start = std::time::Instant::now();
+        for x in &input {
+            t.process(*x);
+            t.process(*x); // stereo: two calls per frame
+        }
+        let took = start.elapsed().as_secs_f32();
+        assert!(took < 0.25, "1 s of stereo took {took:.3} s — under 4x realtime is a regression");
     }
 
     #[test]
