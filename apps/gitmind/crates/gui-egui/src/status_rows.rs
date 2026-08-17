@@ -196,15 +196,22 @@ pub fn counts(rows: &[Row]) -> (usize, usize, usize) {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "\
- M src/main.rs
-M  src/lib.rs
-MM src/both.rs
-?? notes.txt
-A  src/added.rs
-R  old/name.rs -> new/name.rs
-D  src/gone.rs
-";
+    /// Porcelain, with the leading column preserved.
+    ///
+    /// Written as `concat!` and not as a `"\` continuation literal: that form
+    /// strips leading whitespace on each line, which silently turned
+    /// " M main.rs" into "M main.rs" — an unstaged edit read as a staged one.
+    /// The X column IS the leading space here, so the one thing this fixture
+    /// exists to test was the thing the literal ate.
+    const SAMPLE: &str = concat!(
+        " M src/main.rs\n",
+        "M  src/lib.rs\n",
+        "MM src/both.rs\n",
+        "?? notes.txt\n",
+        "A  src/added.rs\n",
+        "R  old/name.rs -> new/name.rs\n",
+        "D  src/gone.rs\n",
+    );
 
     #[test]
     fn the_two_letters_decide_what_the_row_can_do() {
