@@ -5,9 +5,56 @@ the old history depends on the old objects still existing.
 
 ```
 commits-pre-rewrite.jsonl.gz   3,400 records, one per commit, OLD shas
-commit-map.tsv                 old sha -> new sha (0000… means the commit
-                               became empty and was dropped)
+commit-multimap.tsv            original -> every later sha  <- USE THIS
+commit-map.tsv                 rewrite 1 only; superseded, kept as evidence
 ```
+
+`commit-multimap.tsv` has four columns: `original`, `gen1_paths_removed`,
+`current`, `provenance`. Resolve an archive record against the tree by joining
+`sha` to `original` and reading `current`.
+
+## Why a multimap, and what went wrong
+
+There have been two rewrites: paths removed, then the superseded v3 pack blobs
+removed by content. `commit-map.tsv` only covers the first, so after the second
+its "new" column names commits that no longer exist — the archive pointed at a
+generation that had itself been rewritten away.
+
+The chain should have been composed from both runs' maps. It could not be:
+`.git/filter-repo/commit-map` is **overwritten by the next run**, and filter-repo
+was run more than twice here (one of those runs was a no-op caused by a
+malformed blob callback, which still rewrote). The intermediate map was never
+copied out and is gone. Only 291 of 3,428 shas overlap between the two maps
+that survive, which is how the break was found — not by the tooling reporting
+an error.
+
+**Copy `.git/filter-repo/commit-map` out immediately after every run.** That is
+the whole lesson.
+
+## How `current` was recovered
+
+By content, not by derivation. A rewrite that removes blobs leaves subjects and
+author dates untouched, so archive records were matched to current commits on
+`(author_date, subject)`.
+
+That key is not unique here — about 1,165 keys are held by two commits each,
+genuine duplicates committed in the same second. Order breaks the tie: both
+lists are in commit order, so the i-th occurrence of a key maps to the i-th
+occurrence. Exact whenever the rewrite preserved order, which a blob filter
+does.
+
+3,395 of 3,400 resolved; 30 of 30 sampled had matching subjects. The five that
+did not are all explicable and are marked `dropped` or `unmatched` rather than
+guessed:
+
+* `2be36f0e` — deleted the fold `scene.bin`; rewrite 1 removed those files from
+  all history, so the commit had nothing left to do.
+* `16047d2314`, `f934144e0c` — content was entirely v3 pack blobs, emptied by
+  rewrite 2.
+* two `paperbound` commits sharing a subject and second, where one copy no
+  longer exists.
+
+Regenerate with `maintenance/tools/commit_multimap.py`.
 
 ## Why both files
 
