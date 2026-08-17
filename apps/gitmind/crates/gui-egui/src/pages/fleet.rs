@@ -30,6 +30,108 @@ pub struct State {
     /// The entry the primary port replaced, kept so "use the original instead" can put it
     /// back. A default you cannot undo is a trap.
     pub legacy: Option<SuiteApp>,
+
+    // ── the reroll section ──
+    /// The remembered fleet. Lives here rather than being rediscovered each
+    /// frame: a scan takes seconds and the labels are the operator's, not the
+    /// network's.
+    pub roster: cockpit::roster::Roster,
+    /// What the last scan changed, shown so the list does not mutate silently.
+    pub last_changes: Vec<cockpit::roster::Change>,
+    /// Apps to push in a reroll. Empty is a legitimate state and the plan says
+    /// so rather than pretending to have work.
+    pub reroll_apps: Vec<String>,
+    /// A run in progress, or the last one that finished.
+    pub run: Option<cockpit::runview::RunView>,
+}
+
+/// The reroll section: roster, what a run WOULD do, and a run's progress.
+///
+/// Sits on the Fleet page rather than becoming a twelfth tab. This page is
+/// already "get apps onto devices"; a reroll is that for every device at once,
+/// and splitting them would mean two places to learn for one intent.
+fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
+    use cockpit::{reroll, roster, runview};
+    ui.separator();
+    ui.heading("Reroll the fleet");
+    ui.label(egui::RichText::new(
+        "one pass: pair what needs pairing, build once per architecture, install everywhere")
+        .weak().small());
+
+    let st = &mut app.fleet;
+
+    ui.horizontal(|ui| {
+        if ui.button("Scan LAN").clicked() {
+            // Real discovery through the code that already exists. The roster
+            // absorbs it — a device that moved is updated, one that vanished
+            // goes offline, one that was reflashed loses its enrolment.
+            let seen: Vec<roster::Seen> = match cockpit::deploy::local_subnet24() {
+                Some(prefix) => cockpit::deploy::scan_ssh(
+                    &prefix, std::time::Duration::from_millis(300), 64)
+                    .into_iter()
+                    .map(|d| roster::Seen {
+                        ip: d.ip,
+                        hostname: d.hostname,
+                        // The scan does not read host keys yet, and None means
+                        // "unchanged" rather than "reflashed" — inventing a key
+                        // here would reset enrolment on every scan.
+                        host_key: None,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            st.last_changes = st.roster.observe(&seen);
+        }
+        ui.label(format!("{} device(s) on the roster", st.roster.len()));
+    });
+
+    for c in &st.last_changes {
+        let line = match c {
+            roster::Change::Appeared { id } => format!("{id} is back"),
+            roster::Change::Vanished { id } => format!("{id} went offline"),
+            roster::Change::MovedTo { id, ip } => format!("{id} moved to {ip}"),
+            roster::Change::Reflashed { id } => format!("{id} looks reflashed — will re-pair"),
+            roster::Change::Unknown { hostname, ip } =>
+                format!("unclaimed: {hostname} at {ip}"),
+        };
+        ui.label(egui::RichText::new(line).weak().small());
+    }
+
+    // WHAT A RUN WOULD DO, before committing to it. The plan is cheap and
+    // pure, so showing it costs nothing and turns a button press from a leap
+    // into a confirmation.
+    let devices = st.roster.devices();
+    let plan = reroll::plan(&devices, &st.reroll_apps);
+    ui.label(format!(
+        "plan: {} pairing, {} build(s), {} install(s)",
+        plan.enroll_count(), plan.build_count(), plan.install_count()));
+    for (id, why) in &plan.skipped {
+        let reason = match why {
+            reroll::Skipped::Offline => "offline",
+            reroll::Skipped::NothingToInstall => "no apps selected",
+        };
+        ui.label(egui::RichText::new(format!("skipping {id} — {reason}")).weak().small());
+    }
+
+    // The run, when there is one. Driven entirely by the tested view-model, so
+    // this is only drawing.
+    if let Some(run) = &st.run {
+        ui.add(egui::ProgressBar::new(run.fraction()).text(run.headline()));
+        for (id, row) in &run.rows {
+            ui.horizontal(|ui| {
+                ui.label(id);
+                ui.label(egui::RichText::new(row.line()).weak().small());
+            });
+        }
+    } else if !plan.steps.is_empty() {
+        // No dead button: the executor needs a Runner over ssh/cargo/scp and
+        // that is not wired yet. Saying so is better than a control that does
+        // nothing when pressed.
+        ui.label(egui::RichText::new(
+            "run: not wired yet — needs the ssh/cargo runner")
+            .weak().small());
+        let _ = runview::RunView::with_devices(&[]);
+    }
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
@@ -271,4 +373,6 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(egui::RichText::new(&app.fleet.note).monospace().small());
     }
+    // The batch layer, under the single-app controls above.
+    reroll_ui(app, ui);
 }
