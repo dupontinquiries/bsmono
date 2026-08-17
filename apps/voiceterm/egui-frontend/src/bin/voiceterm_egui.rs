@@ -534,6 +534,16 @@ struct VoicetermApp {
     /// eviction rule that keep the index from growing without bound.
     phonetics: voiceterm_egui::phonetic_store::Store,
     glow_active: bool,
+    /// The left rail's width state. Collapsed to an icon strip rather than
+    /// hidden: a rail that vanishes takes the tab list with it, and the tabs
+    /// are how you get back. Vertical because it costs width once instead of
+    /// height per row — on a phone the terminal wants every scanline.
+    rail_open: bool,
+    /// The command palette: open state and query. Everything not on the rail
+    /// is reachable here or by voice, which is what replaces eleven tabs.
+    palette_open: bool,
+    palette_query: String,
+    palette_sel: usize,
     workspaces_open: bool,
     workspaces_filter: String,
     bar_state: voiceterm_egui::bars::BarState,
@@ -554,6 +564,86 @@ struct VoicetermApp {
     pane_apps: std::collections::HashMap<u64, uikit_term::App>,
     /// Which pane `self.app` currently belongs to — the swap's other half.
     pane_focus: u64,
+}
+
+impl VoicetermApp {
+    /// Carry out a palette/voice command.
+    ///
+    /// One place, so a command means the same thing however it arrived. The
+    /// placement half runs FIRST — a new pane or tab has to exist before the
+    /// view can be assigned to it, and assigning then splitting would leave
+    /// the content on the pane the user was looking at.
+    fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
+        use voiceterm_egui::gesture_menus::WsCall;
+        use voiceterm_egui::palette::{Command, Target};
+        match cmd {
+            Command::OpenView { view, target } => {
+                match target {
+                    Target::Focused => {}
+                    Target::NewPane => { self.workspace.apply(&WsCall::Command("split right".into())); }
+                    Target::NewTab => { self.workspace.apply(&WsCall::Command("new tab".into())); }
+                }
+                self.workspace.open_view(view);
+            }
+            Command::Split { vertical } => {
+                self.workspace.apply(&WsCall::Command(
+                    if vertical { "split down".into() } else { "split right".to_string() }));
+            }
+            Command::ClosePane => { self.workspace.apply(&WsCall::Command("close pane".into())); }
+            Command::NewTab => { self.workspace.apply(&WsCall::Command("new tab".into())); }
+            Command::NextTab => { self.workspace.apply(&WsCall::Command("next tab".into())); }
+            Command::PrevTab => { self.workspace.apply(&WsCall::Command("previous tab".into())); }
+            Command::ShowPalette => { self.palette_open = true; }
+            Command::ToggleRail => { self.rail_open = !self.rail_open; }
+        }
+    }
+
+    /// The palette overlay: type to filter, Enter to run, Escape to dismiss.
+    fn palette_ui(&mut self, ctx: &egui::Context) {
+        let entries = voiceterm_egui::palette::vocabulary();
+        let mut chosen = None;
+        let mut close = false;
+        egui::Window::new("Commands")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
+            .show(ctx, |ui| {
+                let resp = ui.text_edit_singleline(&mut self.palette_query);
+                // Focused on open, because a palette you have to click into
+                // costs the keystroke it exists to save.
+                resp.request_focus();
+                let hits = voiceterm_egui::palette::search(&entries, &self.palette_query);
+                if self.palette_sel >= hits.len() { self.palette_sel = 0; }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    self.palette_sel = (self.palette_sel + 1).min(hits.len().saturating_sub(1));
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    self.palette_sel = self.palette_sel.saturating_sub(1);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for (i, e) in hits.iter().enumerate() {
+                        if ui.selectable_label(i == self.palette_sel, &e.title).clicked() {
+                            chosen = Some(e.command.clone());
+                        }
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(e) = hits.get(self.palette_sel) {
+                        chosen = Some(e.command.clone());
+                    }
+                }
+            });
+        if let Some(cmd) = chosen {
+            self.run_command(cmd);
+            close = true;
+        }
+        if close {
+            self.palette_open = false;
+            self.palette_query.clear();
+            self.palette_sel = 0;
+        }
+    }
 }
 
 impl eframe::App for VoicetermApp {
@@ -846,6 +936,19 @@ impl eframe::App for VoicetermApp {
                         // an index of tldr pages". A phrase that is not an
                         // editor action may well be a shell command.
                         None => {
+                            // SHELL COMMANDS FIRST, before the tldr index.
+                            // "show me my mail in a new pane" is a request the
+                            // app can carry out exactly, and scoring it against
+                            // man pages instead would offer `mail(1)` — a
+                            // plausible wrong answer, which is the worst kind.
+                            // The grammar declines anything it does not fully
+                            // understand, so the fall-through below still gets
+                            // everything it used to.
+                            if let Some(cmd) = voiceterm_egui::palette::parse_phrase(&phrase) {
+                                self.run_command(cmd);
+                                self.cmd_hits.clear();
+                                return;
+                            }
                             self.cmd_hits = voiceterm_egui::command_search::search(
                                 &phrase, &self.cmd_docs, 3);
                             if self.cmd_hits.is_empty() {
@@ -1136,15 +1239,56 @@ impl eframe::App for VoicetermApp {
             }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // The view switcher. Terminal stays the default and is always one
-            // tap away — voiceterm is a terminal first.
-            ui.horizontal(|ui| {
-                for v in CentralView::ALL {
-                    if ui.selectable_label(self.view == v, v.label()).clicked() { self.view = v; }
-                }
-            });
+        // THE COMMAND PALETTE, above everything. Ctrl+P or "open command
+        // palette" — the eleven-tab switcher's replacement, and the reason the
+        // rail only needs to carry tabs.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
+            self.palette_open = !self.palette_open;
+            self.palette_query.clear();
+            self.palette_sel = 0;
+        }
+        if self.palette_open {
+            self.palette_ui(ctx);
+        }
+
+        // THE LEFT RAIL: workspace tabs, vertically, collapsible. The Qt app
+        // is a tiling workspace and its tabs are workspace tabs — not a list
+        // of surfaces. Surfaces live in panes now, so this rail stays short
+        // however many views exist.
+        let rail_w = if self.rail_open { 132.0 } else { 34.0 };
+        egui::SidePanel::left("rail").exact_width(rail_w).show(ctx, |ui| {
+            let c = self.colors;
+            if ui.small_button(if self.rail_open { "‹" } else { "›" })
+                .on_hover_text("Toggle sidebar")
+                .clicked()
+            {
+                self.rail_open = !self.rail_open;
+            }
             ui.separator();
+            let tabs: Vec<(String, bool)> = self.workspace.tabs.iter().enumerate()
+                .map(|(i, t)| (t.name.clone(), i == self.workspace.active)).collect();
+            for (i, (name, active)) in tabs.iter().enumerate() {
+                // Collapsed, a tab is its first character: enough to count
+                // them and to see which is live, which is what the strip is
+                // for at that width.
+                let label = if self.rail_open { name.clone() }
+                            else { name.chars().next().unwrap_or('•').to_string() };
+                if uikit_egui::dock::list_row(ui, &label, *active, 26.0, &c).clicked() {
+                    self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
+                        format!("go to tab {}", i + 1)));
+                }
+            }
+            ui.separator();
+            if self.rail_open {
+                if ui.small_button("+ tab").clicked() {
+                    self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
+                        "new tab".into()));
+                }
+                if ui.small_button("⌘ commands").clicked() { self.palette_open = true; }
+            }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
             if self.view != CentralView::Terminal {
                 let c = self.colors;
                 match self.view {
@@ -2512,6 +2656,10 @@ fn main() -> eframe::Result<()> {
                 summary_text: std::collections::HashMap::new(),
                 phonetics: Default::default(),
                 glow_active: false,
+                rail_open: true,
+                palette_open: false,
+                palette_query: String::new(),
+                palette_sel: 0,
                 workspaces_open: false,
                 workspaces_filter: String::new(),
                 bar_state: Default::default(),

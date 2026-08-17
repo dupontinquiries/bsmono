@@ -43,6 +43,8 @@ pub mod blocks;
 pub mod chrome_mode;
 pub mod mail;
 pub mod voice_routing;
+/// One command vocabulary for the palette and the recogniser.
+pub mod palette;
 pub mod iio_accel;
 
 /// Double-flick commands, bound to tab management.
