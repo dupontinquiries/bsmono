@@ -24,6 +24,11 @@ analog = ["dep:libloading"]
 # than flate2 because this only ever DECOMPRESSES, and flate2 pulls a C zlib
 # backend by default.
 miniz_oxide = "0.8"
+# zstd inflate for v4 packs (src/botpack.rs). Pure Rust for the same reason as
+# miniz_oxide: decode-only, and no C toolchain in the cross builds. Pinned to
+# 0.7: 0.8 moves StreamingDecoder into ruzstd::decoding and requires cargo
+# resolver 3 (rustc >= 1.85-era tooling) — upgrade both together.
+ruzstd = "0.7"
 # Same proven combo as the reference repo's games (clawbound/soldier): wgpu 22 + winit 0.29.
 wgpu = "22"
 winit = "0.29"

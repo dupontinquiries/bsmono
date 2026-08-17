@@ -346,10 +346,13 @@ def verify_chassis(cdir, prefix="f", out="bots.pack"):
         return ("bad", cdir, "wrong magic")
     ver, npose = struct.unpack_from("<HH", blob, 4)
     if ver != VERSION:
-        # A v1 pack in a v2 tree. Reported rather than parsed: v1 wrote ONE
-        # shared range table and a flat u16 stream, so reading it as v2 walks
-        # off the end of the buffer — which is how this was found.
-        return ("stale", cdir, ver)
+        # Two different situations share this branch and should not share a
+        # message. ver < 3 is a STALE pack (v1 wrote ONE shared range table
+        # and a flat u16 stream, so reading it as v2 walks off the end of the
+        # buffer — which is how this was found). ver == 4 is a NEWER pack:
+        # tools/pack_v4.py has transcoded this strip to the solid-zstd
+        # envelope, and its --verify is the one that checks it.
+        return ("v4", cdir, ver) if ver > VERSION else ("stale", cdir, ver)
     lo, hi = struct.unpack_from("<ff", blob, 8)
     off = 16
     # Per-pose ranges, matching the writer.
@@ -418,7 +421,7 @@ def main():
     raw_t = pack_t = 0
     packed = skipped = 0
     worst_err = worst_rel = 0.0
-    stale = 0
+    stale = v4 = 0
 
     for d in dirs:
         if a.verify:
@@ -427,6 +430,9 @@ def main():
                 continue
             if r[0] == "stale":
                 stale += 1
+                continue
+            if r[0] == "v4":
+                v4 += 1
                 continue
             if r[0] == "bad":
                 print(f"FAIL {r[1]}: {r[2]}")
@@ -458,6 +464,9 @@ def main():
               f"({worst_rel*100:.5f}% of span)")
         if stale:
             print(f"  {stale} pack(s) are an older version and were not checked")
+        if v4:
+            print(f"  {v4} pack(s) are v4 (solid zstd) — verify those with "
+                  f"tools/pack_v4.py --verify")
         return 0
 
     if raw_t:
