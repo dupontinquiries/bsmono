@@ -139,6 +139,12 @@ pub struct Body {
     hp: [f32; 6],
     /// Already severed, so a part cannot come off twice.
     gone: [bool; 6],
+    /// Seconds since this section last took damage. Healing and
+    /// regrowth are both gated on this — a bot mid-fight should not
+    /// visibly patch itself up between incoming rounds, and a limb
+    /// that just came off should not spring back before the fight that
+    /// took it is even over.
+    since_hit: [f32; 6],
 }
 
 impl Default for Body {
@@ -147,7 +153,7 @@ impl Default for Body {
         for (i, s) in Section::ALL.iter().enumerate() {
             hp[i] = s.max_hp();
         }
-        Body { hp, gone: [false; 6] }
+        Body { hp, gone: [false; 6], since_hit: [f32::MAX; 6] }
     }
 }
 
@@ -247,6 +253,7 @@ impl Body {
     fn apply(&mut self, s: Section, amount: f32, kind: Kind, severed: &mut Vec<Section>) {
         let i = Self::idx(s);
         if self.gone[i] { return; }
+        self.since_hit[i] = 0.0; // a fresh hit restarts the healing clock
         self.hp[i] = (self.hp[i] - amount).max(0.0);
         if self.hp[i] > 0.0 { return; }
         // At zero: a limb comes OFF only to a kind that cuts. Everything else
@@ -256,12 +263,117 @@ impl Body {
             severed.push(s);
         }
     }
+
+    /// Seconds of quiet (no hits to a section) before it starts
+    /// regenerating hp. A bot mid-fight should not visibly patch itself
+    /// up between incoming rounds — healing is a claim about having
+    /// disengaged, not a passive tick that fights alongside the damage.
+    pub const REGEN_DELAY: f32 = 4.0;
+    /// hp/second once regen has started.
+    pub const REGEN_RATE: f32 = 0.4;
+    /// Seconds of quiet before a SEVERED section regrows. Longer than
+    /// REGEN_DELAY on purpose: a limb coming back mid-fight should read
+    /// as a cheat, not a mechanic, and REGROW_DELAY is what keeps a
+    /// regrow from ever landing before REGEN_DELAY has already let
+    /// every attached section start healing first.
+    pub const REGROW_DELAY: f32 = 10.0;
+    /// hp a regrown section comes back with — a fraction of max, not
+    /// full: the part is new, not undamaged history.
+    const REGROW_HP_FRACTION: f32 = 0.5;
+
+    /// Advance the healing clock. Returns the sections that regrew this
+    /// tick, in `Section::ALL` order, for a caller that wants to spawn
+    /// the "grown back" animation/fx on exactly the frame it happens
+    /// rather than polling `is_gone` every frame to notice.
+    ///
+    /// A dead body does not heal — `alive()` gates the whole tick, same
+    /// as `hit` already refuses to apply further damage to one.
+    pub fn tick(&mut self, dt: f32) -> Vec<Section> {
+        let mut regrown = Vec::new();
+        if !self.alive() || dt <= 0.0 {
+            return regrown;
+        }
+        for (i, s) in Section::ALL.iter().enumerate() {
+            // saturating rather than unbounded: a body that sat untouched
+            // for an hour should not regrow the INSTANT it takes a single
+            // scratch, which is what an f32 that overflowed toward
+            // infinity and then got reset to 0.0 by the next hit would
+            // otherwise risk if some future caller compared it oddly
+            self.since_hit[i] = (self.since_hit[i] + dt).min(f32::MAX / 2.0);
+            if self.gone[i] {
+                if self.since_hit[i] >= Self::REGROW_DELAY {
+                    self.gone[i] = false;
+                    self.hp[i] = s.max_hp() * Self::REGROW_HP_FRACTION;
+                    regrown.push(*s);
+                }
+                continue;
+            }
+            if self.since_hit[i] >= Self::REGEN_DELAY && self.hp[i] < s.max_hp() {
+                self.hp[i] = (self.hp[i] + Self::REGEN_RATE * dt).min(s.max_hp());
+            }
+        }
+        regrown
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::weapons::Verb;
+
+    #[test]
+    fn healing_waits_for_regen_delay_then_caps_at_max_hp() {
+        let mut b = Body::default();
+        b.hit(Kind::Kinetic, Section::ArmL.centre(), Vec3::Z, 1.0, 0.0);
+        assert!(b.hp_of(Section::ArmL) < Section::ArmL.max_hp(), "the hit should have done damage");
+        // before REGEN_DELAY: no change
+        let hp_before = b.hp_of(Section::ArmL);
+        b.tick(Body::REGEN_DELAY - 0.1);
+        assert_eq!(b.hp_of(Section::ArmL), hp_before, "healed before the quiet period elapsed");
+        // past it: healing resumes and caps at max, does not overshoot
+        b.tick(100.0);
+        assert_eq!(b.hp_of(Section::ArmL), Section::ArmL.max_hp(), "healing overshot or never capped");
+    }
+
+    #[test]
+    fn a_fresh_hit_restarts_the_healing_clock() {
+        let mut b = Body::default();
+        b.hit(Kind::Kinetic, Section::ArmL.centre(), Vec3::Z, 1.0, 0.0);
+        b.tick(Body::REGEN_DELAY + 0.5); // healing would have started
+        let mid_heal = b.hp_of(Section::ArmL);
+        b.hit(Kind::Kinetic, Section::ArmL.centre(), Vec3::Z, 0.01, 0.0); // any hit, even tiny
+        b.tick(Body::REGEN_DELAY - 0.1); // same short wait as before
+        assert!(b.hp_of(Section::ArmL) <= mid_heal, "healing continued through a fresh hit's cooldown");
+    }
+
+    #[test]
+    fn a_severed_section_regrows_after_the_longer_delay_at_partial_hp() {
+        let mut b = Body::default();
+        b.hit(Kind::Melee, Section::ArmL.centre(), Vec3::Z, 99.0, 0.0); // sever it
+        assert!(b.is_gone(Section::ArmL));
+        // regrow delay is longer than regen delay on purpose -- confirm
+        // it does not come back at the shorter interval
+        let regrown = b.tick(Body::REGEN_DELAY + 0.1);
+        assert!(b.is_gone(Section::ArmL), "regrew before REGROW_DELAY");
+        assert!(regrown.is_empty());
+        let regrown = b.tick(Body::REGROW_DELAY);
+        assert!(!b.is_gone(Section::ArmL), "did not regrow after REGROW_DELAY");
+        assert_eq!(regrown, vec![Section::ArmL]);
+        let expected = Section::ArmL.max_hp() * 0.5;
+        assert!((b.hp_of(Section::ArmL) - expected).abs() < 1e-5,
+            "a regrown limb should come back partial, not full: got {}", b.hp_of(Section::ArmL));
+    }
+
+    #[test]
+    fn a_dead_body_does_not_heal() {
+        let mut b = Body::default();
+        b.hit(Kind::Melee, Section::Torso.centre(), Vec3::Z, 99.0, 0.0);
+        assert!(!b.alive());
+        let hp_before = b.hp_of(Section::ArmL);
+        let regrown = b.tick(1000.0);
+        assert!(regrown.is_empty());
+        assert_eq!(b.hp_of(Section::ArmL), hp_before, "a dead body's untouched sections should not heal either");
+    }
 
     #[test]
     fn kind_follows_the_verbs_own_delivery() {

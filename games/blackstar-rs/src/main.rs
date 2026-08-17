@@ -4471,6 +4471,18 @@ impl Game {
             if !self.bots.is_empty() {
                 bots::update(&mut self.bots, &mut self.ball, &mut self.car, &self.world, &self.cfg, self.time, dt);
             }
+            // SECTION HEALING/REGROWTH. Gated the same place bots::update
+            // is -- Mode::Play, real dt -- so a body does not quietly
+            // patch itself up while the game is paused or in a menu.
+            // Toasted/fx'd on the frame a section actually comes back,
+            // not polled by checking is_gone every frame: tick() only
+            // returns non-empty on the frame it happens.
+            for s in self.body.tick(dt) {
+                self.toastf(&format!("{} regrown", s.name()));
+            }
+            for b in self.bots.iter_mut() {
+                b.body.tick(dt);
+            }
             self.fx.update(dt);
             let rear = self.held_mouse.contains(&MouseButton::Middle);
             self.cam.update(&self.car, &self.ball, &self.world, &self.cfg.cam, self.car.flipping(), rear, dt);
