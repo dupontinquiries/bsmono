@@ -23,6 +23,8 @@ pub mod reroll;
 pub mod roster;
 /// A run in progress, folded from the event stream into what a UI draws.
 pub mod runview;
+/// A/B slots: flash a kernel to the spare half and keep a way back.
+pub mod slots;
 pub mod flow;
 pub mod identity;
 pub mod importer;
