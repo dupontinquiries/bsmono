@@ -88,10 +88,15 @@ const HERB_HEAL_BONUS: f32 = 0.15;   // each delivered herb: +15% to all clan he
 const HERB_HEAL_MAX: f32 = 2.0;      // …capped at double
 const HERB_RESPAWN_CUT: f32 = 0.8;   // and each herb multiplies respawn time by this
 
+const DAY_LEN: f32 = 90.0;           // day and night alternate, this long each
+const LEAFBARE_AT: f32 = 300.0;      // late game: auras thin, patrols grow desperate
+const LEAFBARE_AURA: f32 = 0.5;      // aura healing multiplier once leaf-bare comes
+const LEAFBARE_PATROL: usize = 3;    // patrol size in leaf-bare
+
 const RESPAWN_BASE: f32 = 14.0;
 const REACH: f32 = 2.8;              // claw range
 const ENGAGE_R: f32 = 16.0;          // how far a warrior will break trail to fight
-const MATCH_LEN: f32 = 8.0 * 60.0;
+const MATCH_LEN: f32 = 12.0 * 60.0;
 
 fn hashf(mut h: u32) -> f32 {
     h ^= h >> 16; h = h.wrapping_mul(0x7feb352d);
@@ -125,6 +130,11 @@ fn land_near(ax: f32, az: f32) -> (f32, f32) {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role { Ancestor, Patrol }
+
+/// The two patrols of the books: a **border patrol** walks the trail and holds the
+/// line; a **hunting patrol** works the prey camps and carries freshkill home.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Duty { Border, Hunting }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Carry { Nothing, Freshkill(f32), Herb }
@@ -160,6 +170,7 @@ pub struct Warrior {
     pub respawn_t: f32,
     pub gather_t: f32,
     pub kills: u32,
+    pub duty: Duty,
     pub is_player: bool,
     seg: usize,           // trail waypoint progress
 }
@@ -172,8 +183,27 @@ impl Warrior {
 pub struct HealTree { pub team: u8, pub lane: usize, pub x: f32, pub z: f32, pub hp: f32 }
 impl HealTree { pub fn alive(&self) -> bool { self.hp > 0.0 } }
 
-pub struct Prey { pub x: f32, pub z: f32, pub hp: f32, pub worth: f32, pub respawn_t: f32, pub rich: bool }
-impl Prey { pub fn alive(&self) -> bool { self.respawn_t <= 0.0 } }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreyKind { Mouse, Rabbit, Fish, Rich }
+
+impl PreyKind {
+    pub fn worth(self) -> f32 { match self { PreyKind::Mouse => 1.0, PreyKind::Rabbit => 2.0, PreyKind::Fish => 2.0, PreyKind::Rich => RICH_WORTH } }
+    pub fn hp(self) -> f32 { match self { PreyKind::Mouse => 18.0, PreyKind::Rabbit => 30.0, PreyKind::Fish => 24.0, PreyKind::Rich => PREY_HP * 1.5 } }
+    /// Land prey bolts from a close hunter; fish just hold to deep water.
+    pub fn flees(self) -> bool { matches!(self, PreyKind::Mouse | PreyKind::Rabbit) }
+}
+
+pub struct Prey {
+    pub x: f32, pub z: f32,
+    pub home: (f32, f32),     // spawn anchor it never strays far from
+    pub kind: PreyKind,
+    pub hp: f32, pub respawn_t: f32,
+}
+impl Prey {
+    pub fn alive(&self) -> bool { self.respawn_t <= 0.0 }
+    pub fn rich(&self) -> bool { self.kind == PreyKind::Rich }
+    pub fn worth(&self) -> f32 { self.kind.worth() }
+}
 
 pub struct HerbPatch { pub x: f32, pub z: f32, pub regrow_t: f32 }
 impl HerbPatch { pub fn ready(&self) -> bool { self.regrow_t <= 0.0 } }
@@ -197,6 +227,7 @@ pub struct Battleground {
     pub time: f32,
     pub outcome: Option<u8>,          // winning clan, or 2 = draw at full time
     patrol_t: [f32; 2],
+    wave_n: [u32; 2],     // per-team wave counter — duty/lane rotation must be symmetric
     tick: u32,
     player_driven: bool,   // becomes true on the first set_input; until then the player's warrior is AI-driven
     input: Option<(f32, f32, bool, Option<usize>)>,   // move dir, claw, ability index
@@ -213,12 +244,52 @@ impl Battleground {
     pub fn herb_heal(&self, team: u8) -> f32 {
         (1.0 + self.clans[team as usize].herbs as f32 * HERB_HEAL_BONUS).min(HERB_HEAL_MAX)
     }
+    /// Night falls every other watch; the ambush ancestors were made for it.
+    pub fn is_night(&self) -> bool { (self.time / DAY_LEN) as u32 % 2 == 1 }
+    /// Leaf-bare: the late game. Auras thin and border patrols grow desperate.
+    pub fn leafbare(&self) -> bool { self.time >= LEAFBARE_AT }
+
+    /// A warrior's melee/ability damage per point of attack — where the passives
+    /// live. Freshkill growth, Goldenmane's Pride's Warmth beside a packmate,
+    /// Night's Hunger / Silent Footfall in the dark or from the veil.
+    fn strike_of(&self, i: usize) -> f32 {
+        let w = &self.warriors[i];
+        let mut m = self.growth(w.team);
+        let near_lion = self.warriors.iter().any(|a|
+            a.team == w.team && a.alive() && a.ancestor == Some(Ancestor::Lion)
+            && dist(a.x, a.z, w.x, w.z) < 8.0);
+        if near_lion { m *= 1.15; }
+        if matches!(w.ancestor, Some(Ancestor::Tiger) | Some(Ancestor::Panther))
+            && (self.is_night() || w.stealth_t > 0.0) { m *= 1.3; }
+        // leaf-bare desperation: with prey thin and auras failing, patrols press the
+        // attack — this is what finally fells trees instead of a full-time stalemate
+        if w.role == Role::Patrol && self.leafbare() { m *= 1.5; }
+        w.attack * m
+    }
+
     fn respawn_time(&self, team: u8) -> f32 {
-        RESPAWN_BASE * HERB_RESPAWN_CUT.powi(self.clans[team as usize].herbs.min(6) as i32)
+        // MOBA death timers: they grow as the match ages, so a late lost fight is a
+        // real window at the camp — herbs claw some of that time back
+        let age = 1.0 + self.time / 240.0;
+        RESPAWN_BASE * age * HERB_RESPAWN_CUT.powi(self.clans[team as usize].herbs.min(6) as i32)
     }
     fn enemy(team: u8) -> u8 { 1 - team }
 
+    /// Default rosters: the player leads clan A; the rest fill from the pool.
     pub fn new(player: Ancestor) -> Battleground {
+        let pool = ancestor::ALL;
+        let mut a = [player; 3];
+        let mut i = 0usize;
+        for slot in 1..3 {
+            while pool[i] == player { i = (i + 1) % pool.len(); }
+            a[slot] = pool[i]; i += 1;
+        }
+        Battleground::new_draft(a, [pool[3], pool[4], pool[5]])
+    }
+
+    /// A drafted match: each clan fields exactly the three ancestors picked for it.
+    /// Clan A's first pick is the player's warrior.
+    pub fn new_draft(picks_a: [Ancestor; 3], picks_b: [Ancestor; 3]) -> Battleground {
         let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         let camps = [land_near(CAMP_ANCHOR[0].0, CAMP_ANCHOR[0].1), land_near(CAMP_ANCHOR[1].0, CAMP_ANCHOR[1].1)];
@@ -237,25 +308,33 @@ impl Battleground {
             }
         }
 
-        // Prey camps + the contention ground's rich prey.
-        let mut prey: Vec<Prey> = PREY_CAMPS.iter()
-            .map(|&(x, z)| Prey { x, z, hp: PREY_HP, worth: PREY_WORTH, respawn_t: 0.0, rich: false })
+        // Prey camps (mice and rabbits alternating), a fish run at the nearest
+        // water to the centre, and the contention ground's rich prey.
+        let mut prey: Vec<Prey> = PREY_CAMPS.iter().enumerate()
+            .map(|(i, &(x, z))| {
+                let kind = if i % 2 == 0 { PreyKind::Mouse } else { PreyKind::Rabbit };
+                Prey { x, z, home: (x, z), kind, hp: kind.hp(), respawn_t: 0.0 }
+            })
             .collect();
-        prey.push(Prey { x: 0.0, z: 0.0, hp: PREY_HP * 1.5, worth: RICH_WORTH, respawn_t: 0.0, rich: true });
+        {
+            // two fishing runs, sought from mirrored anchors so neither clan's side
+            // of the river eats better by construction
+            let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            for anchor in [(-40.0, 40.0), (40.0, -40.0)] {
+                if let Some((fx, fz)) = world::nearest_water(anchor, 100.0) {
+                    prey.push(Prey { x: fx, z: fz, home: (fx, fz), kind: PreyKind::Fish, hp: PreyKind::Fish.hp(), respawn_t: 0.0 });
+                }
+            }
+        }
+        prey.push(Prey { x: 0.0, z: 0.0, home: (0.0, 0.0), kind: PreyKind::Rich, hp: PreyKind::Rich.hp(), respawn_t: 0.0 });
 
         let herb_patches = HERB_SPOTS.iter().map(|&(x, z)| HerbPatch { x, z, regrow_t: 0.0 }).collect();
 
-        // Rosters: three ancestors a side; the player leads clan A on the middle trail.
-        let pool = ancestor::ALL;
+        // Rosters: the drafted three a side; the player leads clan A.
         let mut warriors = Vec::new();
         for team in 0..2u8 {
             for slot in 0..3usize {
-                let a = if team == CLAN_A && slot == 0 { player } else {
-                    // fill without duplicating the player's pick on their own side
-                    let mut i = (team as usize * 3 + slot) % pool.len();
-                    while team == CLAN_A && pool[i] == player { i = (i + 1) % pool.len(); }
-                    pool[i]
-                };
+                let a = if team == CLAN_A { picks_a[slot] } else { picks_b[slot] };
                 let k = ancestor::kit(a);
                 let (cx, cz) = camps[team as usize];
                 warriors.push(Warrior {
@@ -264,7 +343,7 @@ impl Battleground {
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed,
                     mind: Mind::Trail, carry: Carry::Nothing,
                     shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
-                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0,
+                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border,
                     is_player: team == CLAN_A && slot == 0, seg: 0,
                 });
             }
@@ -277,7 +356,7 @@ impl Battleground {
                 ClanState { pile: 0.0, herbs: 0, great_tree_hp: GREAT_TREE_HP },
             ],
             camps, medics, contention: (0.0, 0.0), contention_holder: None,
-            time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], tick: 0,
+            time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], wave_n: [0; 2], tick: 0,
             player_driven: false, input: None,
         }
     }
@@ -287,19 +366,29 @@ impl Battleground {
         self.input = Some((mx, mz, claw, ability));
     }
 
-    fn spawn_patrol(&mut self, team: u8, lane: usize) {
+    fn spawn_patrol(&mut self, team: u8, lane: usize, duty: Duty) {
         let (cx, cz) = self.camps[team as usize];
-        for i in 0..PATROL_SIZE {
+        let size = if self.leafbare() && duty == Duty::Border { LEAFBARE_PATROL } else { PATROL_SIZE };
+        for i in 0..size {
             self.warriors.push(Warrior {
                 team, role: Role::Patrol, ancestor: None, lane,
                 x: cx + i as f32 * 1.5, z: cz + 1.5, heading: 0.0,
                 hp: PATROL_HP, max_hp: PATROL_HP, attack: PATROL_ATK, speed: PATROL_SPEED,
-                mind: Mind::Trail, carry: Carry::Nothing,
+                mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
+                carry: Carry::Nothing,
                 shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
-                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0,
+                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty,
                 is_player: false, seg: 0,
             });
         }
+    }
+
+    /// Where the border broke: the lane of a fallen enemy Heal Tree, if any. Once a
+    /// breach exists the clan masses its attack there — patrols spawn onto it and
+    /// warriors returning to the trail adopt it — which is what turns a three-lane
+    /// stalemate into a decisive push on the Great Tree.
+    fn breach_lane(&self, team: u8) -> Option<usize> {
+        self.heal_trees.iter().find(|t| t.team != team && !t.alive()).map(|t| t.lane)
     }
 
     /// The trail waypoints for a lane, in this team's marching order.
@@ -361,7 +450,7 @@ impl Battleground {
         if self.warriors[i].cds[slot] > 0.0 { return; }
         let k = ancestor::kit(a);
         let spec = if slot == 2 { k.ult } else { k.abilities[slot] };
-        let atk = self.warriors[i].attack * self.growth(team);
+        let atk = self.strike_of(i);
         let target = self.nearest_enemy(i, spec.range.max(REACH));
         match spec.verb {
             Verb::Strike => {
@@ -404,7 +493,10 @@ impl Battleground {
                     }
                 }
             }
-            Verb::Stealth => { self.warriors[i].stealth_t = spec.dur; }
+            Verb::Stealth => {
+                let dur = if a == Ancestor::Panther { spec.dur * 1.5 } else { spec.dur };   // Silent Footfall
+                self.warriors[i].stealth_t = dur;
+            }
             Verb::Fear => {
                 for j in 0..self.warriors.len() {
                     let e = &self.warriors[j];
@@ -417,7 +509,8 @@ impl Battleground {
                 for j in 0..self.warriors.len() {
                     let e = &self.warriors[j];
                     if e.team != team && e.alive() && dist(x, z, e.x, e.z) < spec.range {
-                        self.warriors[j].slow_t = spec.dur;
+                        let dur = if e.ancestor == Some(Ancestor::Puma) { spec.dur * 0.5 } else { spec.dur };   // Sure-Footed
+                        self.warriors[j].slow_t = dur;
                         if spec.power > 0.0 { self.hurt(j, spec.power * atk); }
                     }
                 }
@@ -431,8 +524,16 @@ impl Battleground {
         let w = &self.warriors[i];
         let mut s = w.speed;
         if world::height_at(w.x, w.z) < world::WATER_Y + 0.2 {
-            // water slows everyone except the Riverborn
-            s *= if w.ancestor == Some(Ancestor::Leopard) { 1.1 } else { 0.55 };
+            // water slows everyone except the Riverborn; Sure-Footed paws barely notice
+            s *= match w.ancestor {
+                Some(Ancestor::Leopard) => 1.1,
+                Some(Ancestor::Puma) => 0.75,
+                _ => 0.55,
+            };
+        }
+        if w.ancestor == Some(Ancestor::Panther) && self.is_night() { s *= 1.1; }   // Silent Footfall
+        if w.ancestor == Some(Ancestor::Caracal) {                                   // Skyward Hunger
+            s *= 1.0 + (w.kills as f32 * 0.04).min(0.4);
         }
         if w.carry != Carry::Nothing { s *= CARRY_SLOW; }
         if w.slow_t > 0.0 { s *= 0.5; }
@@ -471,7 +572,7 @@ impl Battleground {
                 let (tx, tz) = (self.warriors[t].x, self.warriors[t].z);
                 if dist(x, z, tx, tz) > REACH { self.walk_toward(i, tx, tz, dt); }
                 else {
-                    let dmg = self.warriors[i].attack * self.growth(team) * dt;
+                    let dmg = self.strike_of(i) * dt;
                     self.hurt(t, dmg);
                 }
                 if role == Role::Ancestor { self.auto_cast(i); }
@@ -497,6 +598,7 @@ impl Battleground {
             Mind::AtMedic => {
                 self.heal(i, MEDIC_HEAL * dt);
                 if self.warriors[i].power_frac() >= REJOIN {
+                    if let Some(l) = self.breach_lane(team) { self.warriors[i].lane = l; }
                     self.warriors[i].mind = Mind::Trail;
                     self.warriors[i].seg = 0;
                 }
@@ -509,7 +611,10 @@ impl Battleground {
                         Carry::Nothing => {}
                     }
                     self.warriors[i].carry = Carry::Nothing;
-                    self.warriors[i].mind = Mind::Trail;
+                    if let Some(l) = self.breach_lane(team) { self.warriors[i].lane = l; }
+                    self.warriors[i].mind =
+                        if role == Role::Patrol && self.warriors[i].duty == Duty::Hunting { Mind::Hunt }
+                        else { Mind::Trail };
                     self.warriors[i].seg = 0;
                 } else {
                     self.walk_toward(i, home.0, home.1, dt);
@@ -540,8 +645,13 @@ impl Battleground {
                 }
             }
             Mind::Hunt => {
-                let target = self.prey.iter().position(|p| p.alive() && dist(p.x, p.z, x, z) < 40.0
-                    && (!p.rich || self.contention_holder == Some(team) || self.contention_holder.is_none()));
+                // a hunting patrol ranges the whole territory; an ancestor only detours nearby
+                let reach = if role == Role::Patrol { 1e9 } else { 40.0 };
+                let target = self.prey.iter().enumerate()
+                    .filter(|(_, p)| p.alive() && dist(p.x, p.z, x, z) < reach
+                        && (!p.rich() || self.contention_holder == Some(team) || self.contention_holder.is_none()))
+                    .min_by(|a, b| dist(a.1.x, a.1.z, x, z).total_cmp(&dist(b.1.x, b.1.z, x, z)))
+                    .map(|(j, _)| j);
                 match target {
                     Some(p) => {
                         let (px, pz) = (self.prey[p].x, self.prey[p].z);
@@ -549,11 +659,14 @@ impl Battleground {
                         else {
                             self.prey[p].hp -= self.warriors[i].attack * dt;
                             if self.prey[p].hp <= 0.0 {
-                                let worth = self.prey[p].worth;
+                                let kind = self.prey[p].kind;
                                 self.prey[p].respawn_t = PREY_RESPAWN;
-                                self.prey[p].hp = if self.prey[p].rich { PREY_HP * 1.5 } else { PREY_HP };
-                                self.warriors[i].carry = Carry::Freshkill(worth);
+                                self.prey[p].hp = kind.hp();
+                                let (hx0, hz0) = self.prey[p].home;
+                                self.prey[p].x = hx0; self.prey[p].z = hz0;
+                                self.warriors[i].carry = Carry::Freshkill(kind.worth());
                                 self.warriors[i].mind = Mind::CarryHome;
+                                self.warriors[i].kills += 1;
                             }
                         }
                     }
@@ -567,7 +680,7 @@ impl Battleground {
                     let (tx, tz) = (self.warriors[t].x, self.warriors[t].z);
                     if dist(x, z, tx, tz) > REACH { self.walk_toward(i, tx, tz, dt); }
                     else {
-                        let dmg = self.warriors[i].attack * self.growth(team) * dt;
+                        let dmg = self.strike_of(i) * dt;
                         let was_alive = self.warriors[t].alive();
                         self.hurt(t, dmg);
                         if was_alive && !self.warriors[t].alive() { self.warriors[i].kills += 1; }
@@ -592,14 +705,16 @@ impl Battleground {
                 }
 
                 // gnaw enemy structures on the way: heal tree on this lane, then the Great Tree
-                let atk = self.warriors[i].attack * self.growth(team);
+                let atk = self.strike_of(i);
                 let etarget = self.heal_trees.iter().position(|t|
-                    t.team != team && t.alive() && t.lane == lane && dist(t.x, t.z, x, z) < REACH + 1.5);
+                    t.team != team && t.alive()
+                    && (t.lane == lane || dist(t.x, t.z, x, z) < 6.0)
+                    && dist(t.x, t.z, x, z) < REACH + 3.0);
                 if let Some(t) = etarget {
                     self.heal_trees[t].hp -= atk * dt;
                     return;
                 }
-                if dist(x, z, enemy_camp.0, enemy_camp.1) < REACH + 2.5 {
+                if dist(x, z, enemy_camp.0, enemy_camp.1) < REACH + 4.0 {
                     let e = Self::enemy(team) as usize;
                     let roots = self.heal_trees.iter().any(|t| t.team != team && t.alive());
                     let dmg = atk * dt * if roots { 1.0 - ROOT_GUARD } else { 1.0 };
@@ -651,6 +766,32 @@ impl Battleground {
             w.slow_t = (w.slow_t - dt).max(0.0);
         }
         for p in self.prey.iter_mut() { p.respawn_t = (p.respawn_t - dt).max(0.0); }
+        // land prey bolts from a close hunter, leashed to its home ground
+        for pi in 0..self.prey.len() {
+            let p = &self.prey[pi];
+            if !p.alive() || !p.kind.flees() { continue; }
+            let threat = self.warriors.iter()
+                .filter(|w| w.alive() && dist(w.x, w.z, p.x, p.z) < 8.0)
+                .map(|w| (w.x, w.z))
+                .min_by(|a, b| dist(a.0, a.1, p.x, p.z).total_cmp(&dist(b.0, b.1, p.x, p.z)));
+            let p = &mut self.prey[pi];
+            if let Some((tx, tz)) = threat {
+                let (mut nx, mut nz) = norm(p.x - tx, p.z - tz);
+                if nx == 0.0 && nz == 0.0 {   // paw right on its tail: bolt any which way
+                    let a = hashf(self.tick.wrapping_add(pi as u32 * 131)) * std::f32::consts::TAU;
+                    nx = a.cos(); nz = a.sin();
+                }
+                p.x += nx * 4.0 * dt; p.z += nz * 4.0 * dt;
+            } else if dist(p.x, p.z, p.home.0, p.home.1) > 1.0 {
+                let (nx, nz) = norm(p.home.0 - p.x, p.home.1 - p.z);   // drift home
+                p.x += nx * 1.5 * dt; p.z += nz * 1.5 * dt;
+            }
+            let d = dist(p.x, p.z, p.home.0, p.home.1);
+            if d > 12.0 {   // the leash: prey never abandons its ground
+                let (nx, nz) = norm(p.x - p.home.0, p.z - p.home.1);
+                p.x = p.home.0 + nx * 12.0; p.z = p.home.1 + nz * 12.0;
+            }
+        }
         for h in self.herb_patches.iter_mut() { h.regrow_t = (h.regrow_t - dt).max(0.0); }
 
         // patrols march out, one lane after another
@@ -658,8 +799,11 @@ impl Battleground {
             self.patrol_t[team as usize] -= dt;
             if self.patrol_t[team as usize] <= 0.0 {
                 self.patrol_t[team as usize] = PATROL_INTERVAL;
-                let lane = (self.tick as usize / 7 + team as usize) % LANES;
-                self.spawn_patrol(team, lane);
+                let wave = self.wave_n[team as usize] as usize;
+                self.wave_n[team as usize] += 1;
+                let lane = self.breach_lane(team).unwrap_or(wave % LANES);
+                let duty = if wave % 3 == 2 { Duty::Hunting } else { Duty::Border };
+                self.spawn_patrol(team, lane, duty);
             }
         }
 
@@ -685,7 +829,7 @@ impl Battleground {
                 if let Some(slot) = ability { self.cast(0, slot.min(2)); }
                 if claw {
                     if let Some(t) = self.nearest_enemy(0, REACH) {
-                        let dmg = self.warriors[0].attack * self.growth(CLAN_A) * dt * 60.0 * (1.0 / 60.0);
+                        let dmg = self.strike_of(0) * dt;
                         self.hurt(t, dmg);
                     }
                 }
@@ -698,10 +842,16 @@ impl Battleground {
             self.think(i, dt);
         }
 
-        // Heal Tree auras mend every ally sheltering under them
+        // Heal Tree auras mend every ally sheltering under them (thinner in leaf-bare);
+        // the Riverborn mends wherever there is water
+        let aura_heal = AURA_HEAL * if self.leafbare() { LEAFBARE_AURA } else { 1.0 };
         for i in 0..self.warriors.len() {
-            let (team, x, z, alive) = { let w = &self.warriors[i]; (w.team, w.x, w.z, w.alive()) };
-            if alive && self.under_aura(team, x, z) { self.heal(i, AURA_HEAL * dt); }
+            let (team, x, z, alive, anc) = { let w = &self.warriors[i]; (w.team, w.x, w.z, w.alive(), w.ancestor) };
+            if !alive { continue; }
+            if self.under_aura(team, x, z) { self.heal(i, aura_heal * dt); }
+            if anc == Some(Ancestor::Leopard) && world::height_at(x, z) < world::WATER_Y + 0.2 {
+                self.heal(i, 3.0 * dt);
+            }
         }
 
         // respawns (ancestors return; fallen patrol cats are mourned, not replaced)
@@ -711,9 +861,11 @@ impl Battleground {
                 let t = (self.warriors[i].respawn_t - dt).max(0.0);
                 self.warriors[i].respawn_t = t;
                 if t <= 0.0 {
-                    let (cx, cz) = self.camps[self.warriors[i].team as usize];
+                    let team = self.warriors[i].team;
+                    let (cx, cz) = self.camps[team as usize];
+                    let lane = self.breach_lane(team).unwrap_or(self.warriors[i].lane);
                     let w = &mut self.warriors[i];
-                    w.x = cx; w.z = cz;
+                    w.x = cx; w.z = cz; w.lane = lane;
                     w.hp = w.max_hp; w.mind = Mind::Trail; w.seg = 0;
                 }
             }
@@ -773,7 +925,7 @@ mod tests {
     fn a_patrol_retreats_when_wounded_and_heals_at_the_medic() {
         let mut bg = Battleground::new(Ancestor::Lion);
         quiet(&mut bg);
-        bg.spawn_patrol(CLAN_A, 1);
+        bg.spawn_patrol(CLAN_A, 1, Duty::Border);
         let p = bg.warriors.iter().position(|w| w.role == Role::Patrol).unwrap();
         // wound it past its nerve, away from home
         bg.warriors[p].x = 0.0; bg.warriors[p].z = 0.0;
@@ -794,7 +946,7 @@ mod tests {
         let mut bg = Battleground::new(Ancestor::Lion);
         bg.patrol_t = [1e9; 2];
         bg.warriors.retain(|w| w.team == CLAN_A);
-        bg.spawn_patrol(CLAN_A, 1);
+        bg.spawn_patrol(CLAN_A, 1, Duty::Border);
         let p = bg.warriors.iter().position(|w| w.role == Role::Patrol).unwrap();
         let (cx, cz) = bg.camps[CLAN_A as usize];
         bg.warriors[p].x = cx + 2.0; bg.warriors[p].z = cz;
@@ -806,7 +958,7 @@ mod tests {
             hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0,
             mind: Mind::Trail, carry: Carry::Nothing,
             shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0,
-            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, is_player: false, seg: 0,
+            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, duty: Duty::Border, is_player: false, seg: 0,
         });
         bg.step(1.0 / 30.0);
         assert_eq!(bg.warriors[p].mind, Mind::LastStand, "at the Great Tree a warrior stands");
@@ -959,6 +1111,115 @@ mod tests {
         bg.warriors[seen].x = bg.warriors[0].x; bg.warriors[seen].z = bg.warriors[0].z;
         assert!(bg.nearest_enemy(seen, 50.0).map(|t| bg.warriors[t].stealth_t <= 0.0).unwrap_or(true),
             "a veiled cat cannot be picked as a target");
+    }
+
+    #[test]
+    fn hunting_patrols_feed_the_pile_without_orders() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        quiet(&mut bg);
+        bg.warriors.clear();   // only the patrol works
+        bg.spawn_patrol(CLAN_A, 0, Duty::Hunting);
+        for _ in 0..30 * 180 {
+            bg.step(1.0 / 30.0);
+            if bg.clans[CLAN_A as usize].pile > 0.0 { break; }
+        }
+        assert!(bg.clans[CLAN_A as usize].pile > 0.0,
+            "a hunting patrol should kill, carry home, and deposit on its own");
+        assert!(bg.warriors.iter().any(|w| w.duty == Duty::Hunting && matches!(w.mind, Mind::Hunt | Mind::CarryHome)),
+            "after depositing, a hunting patrol goes back out");
+    }
+
+    #[test]
+    fn prey_flees_the_hunter_but_never_abandons_its_ground() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        quiet(&mut bg);
+        let p = bg.prey.iter().position(|p| p.kind.flees()).unwrap();
+        let (hx, hz) = bg.prey[p].home;
+        bg.warriors[1].x = hx; bg.warriors[1].z = hz;
+        bg.warriors[1].mind = Mind::Retreat;   // stand there menacingly, don't hunt
+        bg.warriors[1].hp = bg.warriors[1].max_hp;
+        for w in bg.warriors.iter_mut() { if !w.is_player { w.mind = Mind::Retreat; } }
+        bg.warriors[1].mind = Mind::AtMedic;   // hold position (medic check fails far away → stays)
+        bg.warriors[1].x = hx + 1.0; bg.warriors[1].z = hz;
+        let d0 = dist(bg.prey[p].x, bg.prey[p].z, hx, hz);
+        for _ in 0..30 * 10 { bg.warriors[1].x = hx + 1.0; bg.warriors[1].z = hz; bg.step(1.0 / 30.0); }
+        let d1 = dist(bg.prey[p].x, bg.prey[p].z, hx, hz);
+        assert!(d1 > d0 + 2.0, "prey should bolt from a lurking cat: {d0} -> {d1}");
+        assert!(d1 <= 12.0 + 1e-3, "but the leash holds it to its ground");
+        assert!(!bg.prey.iter().any(|q| q.kind == PreyKind::Fish && q.kind.flees()),
+            "fish hold to the water instead of bolting overland");
+    }
+
+    #[test]
+    fn night_belongs_to_the_ambush_ancestors() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Tiger, Ancestor::Lion, Ancestor::Leopard],
+            [Ancestor::Puma, Ancestor::Caracal, Ancestor::Panther]);
+        quiet(&mut bg);
+        assert!(!bg.is_night());
+        let day = bg.strike_of(0);
+        bg.time = DAY_LEN + 1.0;   // the first night watch
+        assert!(bg.is_night());
+        let night = bg.strike_of(0);
+        assert!(night > day * 1.2, "Night's Hunger: {day} vs {night}");
+        // and the veil counts as night even at noon
+        bg.time = 0.0;
+        bg.warriors[0].stealth_t = 2.0;
+        assert!(bg.strike_of(0) > day * 1.2);
+    }
+
+    #[test]
+    fn prides_warmth_strengthens_packmates_near_goldenmane() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Lion, Ancestor::Puma, Ancestor::Caracal],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther]);
+        quiet(&mut bg);
+        let (lx, lz) = (bg.warriors[0].x, bg.warriors[0].z);
+        bg.warriors[1].x = lx + 100.0; bg.warriors[1].z = lz;
+        let far = bg.strike_of(1);
+        bg.warriors[1].x = lx + 2.0; bg.warriors[1].z = lz;
+        let near = bg.strike_of(1);
+        assert!(near > far * 1.1, "beside the lion, allies strike harder: {far} vs {near}");
+    }
+
+    #[test]
+    fn leafbare_thins_the_auras_and_swells_the_patrols() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        quiet(&mut bg);
+        assert!(!bg.leafbare());
+        bg.time = LEAFBARE_AT + 1.0;
+        assert!(bg.leafbare());
+        let before = bg.warriors.len();
+        bg.spawn_patrol(CLAN_A, 0, Duty::Border);
+        assert_eq!(bg.warriors.len() - before, LEAFBARE_PATROL,
+            "leaf-bare border patrols march {LEAFBARE_PATROL} strong");
+        // aura mending is thinner in leaf-bare
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_A).unwrap();
+        let (tx, tz) = (bg.heal_trees[t].x, bg.heal_trees[t].z);
+        bg.warriors[1].x = tx; bg.warriors[1].z = tz;
+        bg.warriors[1].mind = Mind::AtMedic;   // hold still (far from the medic → stays put)
+        bg.warriors[1].hp = 10.0;
+        bg.step(1.0);
+        let gained_bare = bg.warriors[1].hp - 10.0 - MEDIC_HEAL * 0.0;
+        bg.time = 0.0;
+        bg.warriors[1].hp = 10.0;
+        bg.step(1.0);
+        let gained_green = bg.warriors[1].hp - 10.0;
+        assert!(gained_bare < gained_green, "leaf-bare aura {gained_bare} vs greenleaf {gained_green}");
+    }
+
+    #[test]
+    fn a_draft_fields_exactly_the_picked_ancestors() {
+        let a = [Ancestor::Caracal, Ancestor::Caracal, Ancestor::Puma];
+        let b = [Ancestor::Lion, Ancestor::Tiger, Ancestor::Leopard];
+        let bg = Battleground::new_draft(a, b);
+        let picks = |team: u8| -> Vec<Ancestor> {
+            bg.warriors.iter().filter(|w| w.team == team && w.role == Role::Ancestor)
+                .map(|w| w.ancestor.unwrap()).collect()
+        };
+        assert_eq!(picks(CLAN_A), a.to_vec());
+        assert_eq!(picks(CLAN_B), b.to_vec());
+        assert!(bg.warriors[0].is_player);
     }
 
     #[test]

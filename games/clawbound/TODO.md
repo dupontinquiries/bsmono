@@ -50,12 +50,33 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   90%; last-stand only at the Great Tree), herb patches (gather + deliver → faster healing and
   respawns). 13 unit tests + determinism digest; `examples/battleground_report.rs` prints match
   timelines per ancestor.
-- [ ] Render mode in main.rs (`battle`): stage camps/trees/warriors like `game`/`capture` do
-- [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp)
-- [ ] Balance pass: legend-trio draft (Lion/Tiger/Leopard) wins ~5/6 headless vs the far-wild trio;
-  matches currently resolve on full-time structure hp, rarely a fell — consider longer matches or
-  a late-game patrol surge
+- [x] Passives made real (they were flavor text): Pride's Warmth aura, Night's Hunger +
+  Silent Footfall in the dark or from the veil, Riverborn water-mending, Skyward Hunger
+  kill-stacks, Sure-Footed half-slows and shallow-water striding. Day/night watches
+  (90s each) so the ambush ancestors have a rhythm; unit-tested per passive.
+- [x] Patrol duties from the books: **border patrols** walk the trail, **hunting patrols**
+  (every third wave) work the prey camps and carry freshkill home on their own. Prey has
+  kinds now (mouse/rabbit/fish/rich) — land prey bolts from a close hunter on a 12m leash,
+  fish hold to mirrored fishing runs.
+- [x] Leaf-bare late game (300s): auras thin, border patrols march 3 strong and press 1.5x —
+  plus MOBA death timers that grow with match age. Together these turned the 8-minute
+  full-time stalemate into real fells (4/6 headless matches end at a Great Tree now).
+- [x] Breach-lane massing: once an enemy Heal Tree falls, patrol spawns and warriors
+  rejoining the trail funnel onto the breach — the three-lane stalemate breaker.
+- [x] Balance debugging via the report harness: found and fixed a *systematic* economy bias —
+  patrol duty was derived from the global tick (`tick/7 + team`), which handed clan B its
+  hunting patrols ~78s before clan A every cycle; per-team wave counters fixed it
+  (was 6-0 sweeps, now 4-2 with piles comparable). Also mirrored the fish runs.
+- [x] Render mode in main.rs (`battle`): runs the sim ~2 min, prints the war report, stages
+  camps/Great Trees (canopy scales with hp), Heal Trees + aura rings, prey camps, herb
+  patches, warriors with crests/collars/carries. Verified headless via llvmpipe GL → PNG.
+- [x] `new_draft(picks_a, picks_b)` — engine-side draft API for a future pick screen
+- [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
+  camera follow; needs the `app` feature stack (winit/wgpu) compiled
 - [ ] Player-pick draft UI in menu.rs (menu logic is already unit-tested — extend the same way)
+- [ ] Map fairness: the mid trail crosses the wide river basin (a genuine "river lane" —
+  Rainspots country) — extend mapeval to grade lane water-fractions per clan side
+- [ ] Ancestor crest colours per-kit in the battle render (hook left in build_battle)
 
 ## Roadmap (multi-turn)
 -29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an

@@ -13,7 +13,7 @@ web build all run the exact same deterministic logic.
 | **Survive** | 6 cats vs 1 hunter | Outlast the hunter for the round using cover |
 | **Prowl** | 1 cat vs 1 stalker | Clear rotating objectives (Reach / Rendezvous / Survive / Forage), hunt prey, survive a shrinking ring; respawn on catch |
 | **Pop Island** | 3 vs 3 teams | "Yarn Ball Capture" — carry yarn to your base; most captures over two periods wins (sudden-death overtime on a tie) |
-| **Battleground** | clan vs clan | "Battleground of the Ancestors" — legendary First Warriors, three trails, Trees of Healing; fell the enemy Great Tree (headless sim; render/app wiring pending) |
+| **Battleground** | clan vs clan | "Battleground of the Ancestors" — legendary First Warriors, three trails, Trees of Healing; fell the enemy Great Tree (`battle` render mode; --play wiring pending) |
 
 Prowl and Pop Island are ports of two browser prototypes onto the native engine,
 sharing the `class` / `powerup` / `ring` primitives.
@@ -69,7 +69,7 @@ Shared library (`lib.rs`):
 - `prowl` — the Prowl mode (rotating objectives, prey pounce, exposure ring, respawn)
 - `capture` — the Pop Island mode (teams, yarn, firecracker stuns, power-ups, periods + overtime, role-based AI)
 - `ancestor` — the six legendary ancestors of the great clans of legend (kits: passive + two techniques + an ultimate), pure data
-- `battleground` — the clan-war mode: Trees of Healing instead of towers, a freshkill economy instead of a shop (prey carried home from camps and the contention ground), cat AI patrols instead of minion waves (fewer, stronger, and they retreat to the medic cat rather than die — except defending the Great Tree), herb-gathering side objectives. A world with **no humans**: no thunderpaths, no twoleg places (a deliberate deviation from novel canon)
+- `battleground` — the clan-war mode: Trees of Healing instead of towers, a freshkill economy instead of a shop (border vs hunting patrols; mouse/rabbit/fish prey that flees on a leash; carry kills home for saturating clan growth), cat AI patrols instead of minion waves (fewer, stronger, retreat to the medic cat rather than die — except defending the Great Tree), herb-gathering side objectives, day/night watches feeding the ancestors' passives, a leaf-bare late game with aging death timers, and breach-lane massing once a border falls. A world with **no humans**: no thunderpaths, no twoleg places (a deliberate deviation from novel canon)
 - `objectives` — Reach / Rendezvous / Survive / Forage, placed by terrain
 - `mapeval` — map scoring (openness/flow/cover/verticality → S–F) + hunter-vs-cat fairness
 - `menu` — screen/cursor/settings UI logic + mode/hunter/class selection (tested)
