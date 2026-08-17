@@ -1,3 +1,12 @@
+# parity-audit: service
+#
+# Not a library the UI links. This is a phone-to-desktop streaming service:
+# server.rs captures and sends over TLS, client.rs receives and exposes a
+# PipeWire Video/Source node. Linking it from an egui frontend would drag
+# gstreamer and tract-onnx into a UI crate to reach something that belongs on
+# the other end of a socket — and snapclone's own camera_source.rs already
+# states the rule: capture stays in the host, because a UI crate that opens
+# /dev/video0 cannot be tested.
 [package]
 name = "camera-bridge"
 version = "0.1.0"

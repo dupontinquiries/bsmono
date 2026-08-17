@@ -1,3 +1,11 @@
+# parity-audit: service
+#
+# A SPIKE, not a dependency. src/main.rs proves Burn's wgpu backend runs on
+# Vulkan here by checking a real tensor matmul against the known CPU answer —
+# it exists to answer a question about a possible route for the Wgpu Backend
+# seam, not to be linked. No lib.rs, and nothing should grow one: if the Burn
+# route is taken, the code moves into logscope's own crates rather than the
+# frontend depending on a probe.
 [package]
 name = "burn-probe"
 version = "0.1.0"

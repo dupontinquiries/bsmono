@@ -189,10 +189,57 @@ def engine_link(app_dir, pdirs):
         except OSError:
             continue
         m = re.search(r'(?m)^name\s*=\s*"([^"]+)"', txt)
-        if m:
-            sibs.append(m.group(1))
+        if not m:
+            continue
+        # A SERVICE is not a missing link. camera-bridge has main.rs, a
+        # server, a client and a TLS protocol: it streams frames from the
+        # phone to a desktop PipeWire node, and a UI crate linking it would
+        # pull gstreamer and tract-onnx to reach something it should talk to
+        # over a socket. snapclone's own camera_source.rs says capture "stays
+        # in the host, because a UI crate that opens /dev/video0 cannot be
+        # tested" — the port is right and the audit was wrong.
+        #
+        # A [[bin]] with no [lib] is unlinkable, full stop.
+        has_bin = "[[bin]]" in txt
+        has_lib = "[lib]" in txt or os.path.isfile(os.path.join(sub, "src", "lib.rs"))
+        if has_bin and not has_lib:
+            continue
+        # A crate that ships BOTH — camera-bridge has lib.rs and main.rs — is
+        # linkable in principle, and whether the port should link it is a
+        # design decision no heuristic can make. So it is DECLARED, in the
+        # crate itself:
+        #
+        #     # parity-audit: service
+        #
+        # camera-bridge is the case: it streams frames phone-to-desktop over
+        # TLS into a PipeWire node, and a UI crate linking it would pull
+        # gstreamer and tract-onnx to reach something it talks to over a
+        # socket. An opt-out in the manifest keeps the judgement next to the
+        # crate instead of in a list inside this tool, where it would rot.
+        if re.search(r"(?m)^\s*#\s*parity-audit:\s*service\b", txt):
+            continue
+        sibs.append(m.group(1))
     if not sibs:
         return None, None
+    # TRANSITIVE. fao-codec's frontend links fao_codec_lib, which itself
+    # depends on fao-codec-core — the engine IS reachable, and reporting it
+    # missing because the edge is one hop away is a false positive that would
+    # send someone to add a dependency that already exists. So a sibling
+    # counts as linked if any DIRECTLY linked sibling depends on it.
+    def deps_of(pkg):
+        for nm in sorted(os.listdir(app_dir)):
+            man = os.path.join(app_dir, nm, "Cargo.toml")
+            if not os.path.isfile(man):
+                continue
+            try:
+                body = open(man, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            m2 = re.search(r'(?m)^name\s*=\s*"([^"]+)"', body)
+            if m2 and m2.group(1) == pkg:
+                return body
+        return ""
+
     linked, missing = [], []
     for pd in pdirs:
         try:
@@ -206,7 +253,15 @@ def engine_link(app_dir, pdirs):
                 linked.append(pkg)
             else:
                 missing.append(pkg)
-    return sorted(set(linked)), sorted(set(missing) - set(linked))
+    # Close over one hop: anything a linked sibling itself pulls in.
+    reached = set(linked)
+    for pkg in list(linked):
+        body = deps_of(pkg)
+        for cand in sibs:
+            stem = re.escape(cand).replace(r"\-", "[-_]")
+            if re.search(r"(?m)^\s*" + stem + r"\s*=", body):
+                reached.add(cand)
+    return sorted(reached), sorted(set(missing) - reached)
 
 
 def port_dirs(app_dir):
