@@ -539,6 +539,15 @@ struct VoicetermApp {
     /// are how you get back. Vertical because it costs width once instead of
     /// height per row — on a phone the terminal wants every scanline.
     rail_open: bool,
+    /// Swipe-to-switch-tab, from the kit rather than hand-rolled.
+    ///
+    /// The rail keeps the screen space; this is how you move between tabs
+    /// without reaching for it, which is the half a vertical rail on a phone
+    /// otherwise loses. GestureLayer's own header promises "zero per-app
+    /// gesture code" — the app supplies a rect each frame and reads back what
+    /// the shared model decided, so voiceterm does not grow its own
+    /// drag-delta arithmetic and gets the same swipe feel as every other app.
+    tab_swipe: uikit_egui::GestureLayer,
     /// The command palette: open state and query. Everything not on the rail
     /// is reachable here or by voice, which is what replaces eleven tabs.
     palette_open: bool,
@@ -1289,6 +1298,24 @@ impl eframe::App for VoicetermApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // SWIPE BETWEEN TABS. The surface is the whole central area, and
+            // at_limit is false because the workspace wraps — there is no edge
+            // to bounce off, so the barrier never needs painting here.
+            //
+            // Routed through run_command rather than calling the workspace
+            // directly, so a swipe, the palette and the voice grammar all
+            // reach tabs by one path. A second route would be a second place
+            // for tab switching to diverge.
+            let frame = self.tab_swipe.update(ui, ui.max_rect(), false);
+            match frame.page_jump {
+                Some(uikit_gesture::Direction::Next) => {
+                    self.run_command(voiceterm_egui::palette::Command::NextTab)
+                }
+                Some(uikit_gesture::Direction::Prev) => {
+                    self.run_command(voiceterm_egui::palette::Command::PrevTab)
+                }
+                None => {}
+            }
             if self.view != CentralView::Terminal {
                 let c = self.colors;
                 match self.view {
@@ -2657,6 +2684,10 @@ fn main() -> eframe::Result<()> {
                 phonetics: Default::default(),
                 glow_active: false,
                 rail_open: true,
+                // One page = one tab. 320 px matches the snapclone convention
+                // the layer was written against, so the detent lands where a
+                // thumb expects it on every app in the fleet.
+                tab_swipe: uikit_egui::GestureLayer::horizontal_page(320.0),
                 palette_open: false,
                 palette_query: String::new(),
                 palette_sel: 0,

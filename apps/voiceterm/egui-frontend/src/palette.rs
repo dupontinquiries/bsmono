@@ -266,6 +266,27 @@ mod tests {
                    Some(Command::OpenView { view: PaneView::Mail, target: Target::NewTab }));
     }
 
+    /// A swipe must reach tabs by the same route as the palette and the voice
+    /// grammar.
+    ///
+    /// The bin maps `GestureFrame::page_jump` onto these two commands rather
+    /// than calling the workspace directly. That is the property worth
+    /// pinning: three input paths, one command vocabulary. If someone later
+    /// wires a swipe straight to `WsCall::Command("next tab")`, tab switching
+    /// has two implementations and they will drift — which is exactly what
+    /// happened to the ANC gates in bo-suite.
+    #[test]
+    fn a_swipe_has_a_command_to_land_on() {
+        let v = vocabulary();
+        for cmd in [Command::NextTab, Command::PrevTab] {
+            assert!(v.iter().any(|e| e.command == cmd),
+                    "{cmd:?} must exist in the one vocabulary a swipe routes through");
+        }
+        // And they are reachable by voice too, so the three paths agree.
+        assert_eq!(parse_phrase("next tab"), Some(Command::NextTab));
+        assert_eq!(parse_phrase("previous tab"), Some(Command::PrevTab));
+    }
+
     #[test]
     fn typing_and_speaking_reach_the_same_commands() {
         let v = vocabulary();

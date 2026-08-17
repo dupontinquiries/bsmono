@@ -2454,6 +2454,7 @@ dependencies = [
  "settings-kit",
  "snapclone-theme",
  "uikit-egui",
+ "uikit-gesture",
  "uikit-term",
  "uikit-web",
 ]

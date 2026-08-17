@@ -47,6 +47,10 @@ app-wayland = ["dep:eframe", "wayland"]
 config-kit = { path = "../../../shared/config-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+# GestureLayer's adapter needs the model crate behind it. Added so the
+# workspace can be swiped between tabs on a phone — the vertical rail keeps
+# the screen space, and the gesture is how you move without reaching for it.
+uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
 uikit-term = { path = "../../../shared/uikit/crates/uikit-term" }
 uikit-web = { path = "../../../shared/uikit/crates/uikit-web" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
