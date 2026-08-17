@@ -1,0 +1,21 @@
+#!/bin/sh
+# Attach the commands run since the previous commit to this one, as a note.
+# Silent and non-fatal by design: a capture failure must never break a commit.
+[ -n "${CAPTURE_LOG:-}" ] || exit 0
+[ -f "$CAPTURE_LOG" ] || exit 0
+# The mark records BOTH the log it refers to and the position in it. Storing
+# only the position was wrong: each session opens a new log starting at line
+# 1, so a stale mark from a previous session pointed past the end and the
+# commit silently got no note. Same log -> resume; different log -> start over.
+mark="$(git rev-parse --git-dir)/capture-mark"
+start=1
+if [ -f "$mark" ]; then
+  prev_log=$(sed -n 1p "$mark")
+  [ "$prev_log" = "$CAPTURE_LOG" ] && start=$(sed -n 2p "$mark")
+fi
+total=$(wc -l < "$CAPTURE_LOG")
+[ "$total" -ge "$start" ] || exit 0
+sed -n "${start},\$p" "$CAPTURE_LOG" > "$(git rev-parse --git-dir)/capture-slice"
+git notes --ref=refs/notes/toolcalls add -F "$(git rev-parse --git-dir)/capture-slice" -f HEAD 2>/dev/null
+printf '%s\n%s\n' "$CAPTURE_LOG" "$((total + 1))" > "$mark"
+exit 0
