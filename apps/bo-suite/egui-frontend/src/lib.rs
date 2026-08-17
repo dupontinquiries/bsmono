@@ -27,6 +27,8 @@ pub mod settings_page;
 pub mod chrome;
 pub mod scrollfeel;
 pub mod anticipation;
+/// The ANC operator control: Off / Auto / On over the engine's own gates.
+pub mod anc;
 pub mod safety;
 pub mod dialogs;
 pub mod soundscape;
