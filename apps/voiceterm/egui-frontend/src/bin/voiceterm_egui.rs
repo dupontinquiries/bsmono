@@ -2193,15 +2193,21 @@ impl eframe::App for VoicetermApp {
                 // its own terminal, dimmed by the unfocused frame around it; web panes have no
                 // pty and stay a label until the reader is wired in.
                 match self.pane_apps.get_mut(&p.id) {
-                    Some(a) if !p.web => {
+                    // Only a terminal pane draws a grid. The check is on the
+                    // pane's VIEW rather than a web flag, so a mail or docs
+                    // pane cannot fall through to a terminal renderer.
+                    Some(a) if p.view.is_terminal() => {
                         a.fit_to(r.size());
                         a.render_at(ui, &colors, r.min);
                     }
                     _ => {
+                        // The pane says what it is. Until each view's renderer
+                        // is called from here, naming it is honest and a blank
+                        // box is not — an unlabelled pane reads as broken.
                         ui.painter().text(
                             r.center(),
                             egui::Align2::CENTER_CENTER,
-                            if p.web { "web pane" } else { "pane" },
+                            p.view.label(),
                             egui::FontId::proportional(12.0),
                             colors.text_weak,
                         );

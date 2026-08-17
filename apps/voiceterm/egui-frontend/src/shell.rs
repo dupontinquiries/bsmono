@@ -429,6 +429,11 @@ pub struct Workspace {
     /// Projection of `model.active_tab`.
     pub active: usize,
     model: TermWorkspace,
+    /// Content for panes the model has no kind for. Keyed by pane id and
+    /// pruned when panes go, so a recycled id cannot inherit the last pane's
+    /// view — the model reuses ids from a counter, and a stale entry would
+    /// make a fresh terminal open as somebody's old mailbox.
+    views: std::collections::HashMap<u64, PaneView>,
 }
 
 impl Default for Workspace {
@@ -452,7 +457,8 @@ impl Workspace {
     }
 
     fn from_model(model: TermWorkspace) -> Self {
-        let mut w = Workspace { tabs: Vec::new(), active: 0, model };
+        let mut w = Workspace { tabs: Vec::new(), active: 0, model,
+                                views: std::collections::HashMap::new() };
         w.sync();
         w
     }
@@ -460,6 +466,7 @@ impl Workspace {
     /// Rebuild the projection from the model. One direction only, so the two cannot disagree.
     /// A fence boundary `b` sits between tab `b-1` and tab `b`, hence `fence_after(i) == b(i+1)`.
     fn sync(&mut self) {
+        self.prune_views();
         let fences = &self.model.fences;
         self.tabs = self
             .model
@@ -584,6 +591,56 @@ impl Workspace {
     ///
     /// The inset is clamped to a third of each axis, so a pane never inverts when the
     /// area is tiny or the tree is deep.
+    /// What a pane shows. The model wins where it has an opinion.
+    pub fn pane_view(&self, id: u64) -> PaneView {
+        if matches!(self.model.pane_kind(id), Some(PaneKind::Web { .. })) {
+            return PaneView::Web;
+        }
+        self.views.get(&id).copied().unwrap_or(PaneView::Terminal)
+    }
+
+    /// Give a pane a view.
+    ///
+    /// Returns false for a pane that is not in the active tab: assigning
+    /// content to a pane the user cannot see is a change with no visible
+    /// cause, and it is how "the wrong pane changed" happens.
+    pub fn set_pane_view(&mut self, id: u64, view: PaneView) -> bool {
+        if !self.model.active().root.pane_ids().contains(&id) {
+            return false;
+        }
+        // Web belongs to the model — routing it through here would give the
+        // pane a view the model still calls a terminal.
+        if view == PaneView::Web {
+            return false;
+        }
+        if view == PaneView::Terminal {
+            self.views.remove(&id);
+        } else {
+            self.views.insert(id, view);
+        }
+        true
+    }
+
+    /// Show `view` in the focused pane. The tiling equivalent of a tab switch:
+    /// the user picks a surface and it lands where they are looking.
+    pub fn open_view(&mut self, view: PaneView) -> bool {
+        let id = self.focused_pane();
+        self.set_pane_view(id, view)
+    }
+
+    /// Drop content for panes that no longer exist, across every tab.
+    ///
+    /// Called after any structural change. Pane ids come from a counter the
+    /// model reuses, so without this a new pane can be born showing whatever
+    /// the last holder of its id was showing.
+    fn prune_views(&mut self) {
+        let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for t in &self.model.tabs {
+            live.extend(t.root.pane_ids());
+        }
+        self.views.retain(|id, _| live.contains(id));
+    }
+
     pub fn pane_boxes(&self, w: f32, h: f32, gutter: f32) -> Vec<PaneBox> {
         let focused = self.focused_pane();
         self.model
@@ -599,7 +656,7 @@ impl Workspace {
                     w: (r.w - ix * 2.0).max(0.0),
                     h: (r.h - iy * 2.0).max(0.0),
                     focused: id == focused,
-                    web: matches!(self.model.pane_kind(id), Some(PaneKind::Web { .. })),
+                    view: self.pane_view(id),
                 }
             })
             .collect()
@@ -785,8 +842,71 @@ pub struct PaneBox {
     pub h: f32,
     /// The pane that owns keyboard input and hosts the live terminal grid.
     pub focused: bool,
-    /// A web pane (renders a page, has no pty).
-    pub web: bool,
+    /// WHAT this pane shows. The Qt app is a tiling workspace whose panes
+    /// carry content — `PaneKind { Terminal, Web { url } }` in the model, and
+    /// its own comments describe web panes living beside terminal panes. The
+    /// egui port had flattened that to a `web: bool` and moved every other
+    /// surface into a top-level tab switcher the original does not have, so
+    /// the tiling could only ever tile terminals.
+    pub view: PaneView,
+}
+
+/// What a pane shows.
+///
+/// The model's `PaneKind` is the authority for Terminal and Web, because the
+/// GTK build shares it and a second opinion about which pane is a web pane
+/// would drift. The remaining variants are egui-side content the model has no
+/// vocabulary for yet; they live in `Workspace::views`, keyed by pane id, so
+/// adding one here does not force a match-arm change in a 32k-line QML app's
+/// backend that cannot be compiled or tested from this frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneView {
+    #[default]
+    Terminal,
+    Web,
+    Mail,
+    Graph,
+    Table,
+    Docs,
+    Archive,
+    Models,
+    Chat,
+    Notes,
+    Build,
+}
+
+impl PaneView {
+    /// Every view a pane can be given, for a menu.
+    pub const ALL: [PaneView; 11] = [
+        PaneView::Terminal, PaneView::Web, PaneView::Mail, PaneView::Graph,
+        PaneView::Table, PaneView::Docs, PaneView::Archive, PaneView::Models,
+        PaneView::Chat, PaneView::Notes, PaneView::Build,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneView::Terminal => "Terminal",
+            PaneView::Web => "Web",
+            PaneView::Mail => "Mail",
+            PaneView::Graph => "Graph",
+            PaneView::Table => "Table",
+            PaneView::Docs => "Docs",
+            PaneView::Archive => "Archive",
+            PaneView::Models => "Models",
+            PaneView::Chat => "Chat",
+            PaneView::Notes => "Notes",
+            PaneView::Build => "Build",
+        }
+    }
+
+    /// Does this pane own the keyboard and a pty?
+    ///
+    /// Only the terminal. A pane showing mail must not swallow Ctrl-C into a
+    /// shell that is not there, which is the bug a bool called `web` was one
+    /// content type away from causing.
+    pub fn is_terminal(self) -> bool {
+        self == PaneView::Terminal
+    }
 }
 
 /// v0.1.803's "N more" pill math: how many whole rows are hidden above and below a scrolled
@@ -1026,12 +1146,60 @@ mod tests {
     }
 
     #[test]
+    fn a_view_lands_in_the_focused_pane_and_only_there() {
+        let mut ws = Workspace::default();
+        let first = ws.focused_pane();
+        assert_eq!(ws.pane_view(first), PaneView::Terminal, "a fresh pane is a terminal");
+        assert!(ws.open_view(PaneView::Mail));
+        assert_eq!(ws.pane_view(first), PaneView::Mail);
+        // Splitting leaves the original pane's content alone and gives the new
+        // pane a terminal — the same rule the model states for web panes.
+        ws.apply(&WsCall::Command("split right".into()));
+        let boxes = ws.pane_boxes(400.0, 300.0, 0.0);
+        assert_eq!(boxes.len(), 2);
+        let other = boxes.iter().map(|b| b.id).find(|id| *id != first).unwrap();
+        assert_eq!(ws.pane_view(first), PaneView::Mail, "the split did not move the content");
+        assert_eq!(ws.pane_view(other), PaneView::Terminal);
+        // A pane in another tab cannot be reassigned from here.
+        assert!(!ws.set_pane_view(9_999, PaneView::Docs));
+    }
+
+    #[test]
+    fn a_closed_panes_content_does_not_haunt_the_next_pane() {
+        // Pane ids come from a counter the model reuses. Without pruning, a
+        // new pane can be born showing whatever the last holder of its id was
+        // showing — which reads as the app opening the wrong thing.
+        let mut ws = Workspace::default();
+        ws.apply(&WsCall::Command("split right".into()));
+        let ids: Vec<u64> = ws.pane_boxes(400.0, 300.0, 0.0).iter().map(|b| b.id).collect();
+        let victim = ids[1];
+        assert!(ws.set_pane_view(victim, PaneView::Notes));
+        ws.focus_pane(victim);
+        ws.apply(&WsCall::Command("close pane".into()));
+        // Whatever ids exist now, none of them is showing Notes.
+        for b in ws.pane_boxes(400.0, 300.0, 0.0) {
+            assert_ne!(ws.pane_view(b.id), PaneView::Notes,
+                       "a dead pane's content came back on pane {}", b.id);
+        }
+    }
+
+    #[test]
+    fn only_a_terminal_pane_owns_the_keyboard() {
+        // The bool this replaced was one content type away from letting a
+        // mail pane swallow Ctrl-C into a shell that is not there.
+        assert!(PaneView::Terminal.is_terminal());
+        for v in PaneView::ALL.iter().filter(|v| **v != PaneView::Terminal) {
+            assert!(!v.is_terminal(), "{} must not take pty input", v.label());
+        }
+    }
+
+    #[test]
     fn pane_boxes_tile_the_area_and_mark_focus() {
         let mut ws = Workspace::new(&["main"]);
         // one pane fills the area (minus the gutter inset)
         let b = ws.pane_boxes(400.0, 300.0, 0.0);
         assert_eq!(b.len(), 1);
-        assert!(b[0].focused && !b[0].web);
+        assert!(b[0].focused && b[0].view.is_terminal());
         assert_eq!((b[0].x, b[0].y, b[0].w, b[0].h), (0.0, 0.0, 400.0, 300.0));
 
         // split right => side by side, halving the width
@@ -1095,10 +1263,10 @@ mod tests {
         ws.apply(&WsCall::OpenWebPane);
         let b = ws.pane_boxes(400.0, 300.0, 0.0);
         assert_eq!(b.len(), 2);
-        assert_eq!(b.iter().filter(|p| p.web).count(), 1);
+        assert_eq!(b.iter().filter(|p| p.view == PaneView::Web).count(), 1);
         // the terminal keeps focus; the web pane is not focused
-        assert!(b.iter().any(|p| p.focused && !p.web));
-        assert!(b.iter().all(|p| !(p.web && p.focused)));
+        assert!(b.iter().any(|p| p.focused && p.view.is_terminal()));
+        assert!(b.iter().all(|p| !(p.view == PaneView::Web && p.focused)));
     }
 
     /// f32 ratio maths lands a hair off exact pixels (240.00002); compare with a tolerance
