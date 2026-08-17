@@ -1352,9 +1352,20 @@ mod sdf_capacity_tests {
 
     #[test]
     fn a_bigger_device_gets_a_bigger_roster() {
-        // The point of asking the adapter: 4096 is common on desktop.
-        assert_eq!(sdf_capacity(4096), 256);
-        assert_eq!(sdf_capacity(8192), 512);
+        // The point of asking the adapter: a big enough device should
+        // get more than the floor. 4096/8192 used to demonstrate this
+        // (256, 512) back when CSDF_MAXM was 126 -- it moved to 1344
+        // ("the whole library loads"), and by_device.max(CSDF_MAXM)
+        // now clamps BOTH of those old device sizes to the same
+        // floor, so the test's own premise silently stopped holding.
+        // Sized off CSDF_MAXM itself now, comfortably past the floor
+        // in slab terms, so this can't go stale the same way again.
+        let small = (CSDF_MAXM + 200) * CSDF_SLAB;
+        let big = (CSDF_MAXM + 400) * CSDF_SLAB;
+        let cap_small = sdf_capacity(small);
+        let cap_big = sdf_capacity(big);
+        assert!(cap_small > CSDF_MAXM, "should exceed the floor once past it: {cap_small}");
+        assert!(cap_big > cap_small, "a bigger device should get a bigger roster: {cap_big} vs {cap_small}");
     }
 
     #[test]
@@ -1370,8 +1381,15 @@ mod sdf_capacity_tests {
     fn capacity_is_a_whole_number_of_slabs() {
         // A partial slab is a model whose field is truncated mid-depth, which
         // reads as a silhouette with a slice missing rather than as an error.
-        for d in [2048u32, 3000, 4096, 5000, 8192] {
-            assert_eq!(sdf_capacity(d) * CSDF_SLAB <= d.max(2016), true, "{d}");
+        // The bound is CSDF_MAXM * CSDF_SLAB, not a literal 2016 -- 2016 was
+        // 126 * CSDF_SLAB, the floor's OLD value before it moved to 1344.
+        // A device below the floor is EXPECTED to have capacity exceed its
+        // own reported limit (that's what the floor means, by design — see
+        // sdf_capacity's own doc comment), so this only tests devices at or
+        // above the floor in slab terms, where the property is meaningful.
+        let floor_bytes = CSDF_MAXM * CSDF_SLAB;
+        for d in [floor_bytes, floor_bytes + 1000, floor_bytes * 2, floor_bytes * 3, floor_bytes * 4] {
+            assert!(sdf_capacity(d) * CSDF_SLAB <= d.max(floor_bytes), "{d}");
         }
     }
 }
