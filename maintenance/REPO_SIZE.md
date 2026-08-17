@@ -101,3 +101,23 @@ already the compressed form, and archive rather than cache until the `.iqm`
 sources turn up. If they do, that 216 MB becomes regenerable and the arithmetic
 changes completely. That is the one question worth answering before any of
 this: **where are the rigged sources?**
+
+## Correction: what the "checkpoint4" bundle was
+
+I asserted in the merge commit (`6da5908f7`) that
+`c4-858-wired-checkpoint4.bundle` was "not that checkpoint, despite the
+filename". That was wrong, and the bundle prerequisites proved it.
+
+It IS checkpoint 4 — `a9a8cb0b` is an ancestor of it — with 23 further commits
+of blackstar work built on top: grime, loadbearing, partsim against real
+chassis, exoworlds, the Watch's ceiling. So the "29 commits" I counted for that
+branch included my own from earlier in the same session.
+
+Nothing about the merge changes; the content is what I described and the tests
+that ran are the tests that ran. But the provenance in that commit message is
+wrong, and a future reader chasing where blackstar work came from should read
+this instead.
+
+The general lesson for shipping bundles: `git bundle verify` prints the
+prerequisites, and those name the base a branch was actually built on. Reading
+them first would have caught this before it reached a commit message.
