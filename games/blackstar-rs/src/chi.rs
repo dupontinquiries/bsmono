@@ -109,32 +109,21 @@ impl Chi {
         (1.0 - 0.08 * self.level(toward) as f32).max(0.60)
     }
 
-    /// How many of the seven pools stand at mastery (level 5). The
-    /// script's Watch names twelve reliable forms — six elements each
-    /// with a base and an amplified tier (Ice/Blizzard, Water/Tsunami,
-    /// Fire/Magma, Metal/Titanium, Wind/Tornado) plus Electricity alone
-    /// — which this engine's seven-element system folds into one
-    /// staircase per element: level 3 opens the base shift
-    /// (`can_shift`), level 5 is the amplified tier. Nothing new to
-    /// track; mastery is just the top of a ladder that already exists.
+    /// How many of the seven pools stand at mastery (level 5). Not tied
+    /// to Photon Man — `watch.rs` owns that gate, and its own doc is
+    /// explicit that Photon Man is reached by a declared last resort at
+    /// resolve cost, not by mastering anything ("not gated by having
+    /// found anything... it is gated by a caller-declared moment of
+    /// last resort"). An earlier version of this doc comment claimed
+    /// the opposite — that mastering all seven opened the ceiling —
+    /// written before `watch.rs` was found in a fuller read of the
+    /// codebase. That was wrong and has been removed rather than left
+    /// to disagree with the module that actually owns the mechanic.
+    /// `mastered()` stays as a plain completion count: how much of the
+    /// Watch's seven pools a save has topped out, useful for a status
+    /// screen or an achievement, nothing more.
     pub fn mastered(&self) -> u8 {
         ELEMENTS.iter().filter(|e| self.level(**e) == 5).count() as u8
-    }
-
-    /// THE CEILING — Photon Man, form thirteen. Per `TF_TRILOGY_TWO_
-    /// FRAMEWORK.md`: not a form the bearer chooses, one the Watch
-    /// decides he is ready for. The game's version of "ready": every
-    /// element mastered, nothing left the Watch hasn't already taught
-    /// through the other twelve. Eligibility is necessary, not
-    /// sufficient — the framework is explicit that the Watch, not the
-    /// bearer, picks the moment, so this gates the trigger check a
-    /// combat system adds later rather than something the player can
-    /// press directly. That trigger (a desperation surge when eligible
-    /// and the fight is otherwise lost, with the three-day blackout
-    /// the script names as its cost) is not wired into `skirmish.rs`
-    /// yet — this is the seam, not the mechanic.
-    pub fn photon_eligible(&self) -> bool {
-        self.mastered() == ELEMENTS.len() as u8
     }
 }
 
@@ -270,23 +259,17 @@ mod tests {
     }
 
     #[test]
-    fn mastery_counts_and_photon_needs_all_seven() {
+    fn mastered_counts_the_pools_at_the_top_of_the_staircase() {
         let mut c = Chi::default();
         assert_eq!(c.mastered(), 0);
-        assert!(!c.photon_eligible());
         for e in ELEMENTS {
             c.bank(e, 40); // top of the staircase, every pool
         }
         assert_eq!(c.mastered(), 7);
-        assert!(c.photon_eligible());
-        // six of seven is not the ceiling -- the framework is explicit
-        // that the Watch shows a door with no handle, not a discount
-        let mut almost = Chi::default();
-        for e in ELEMENTS.iter().take(6) {
-            almost.bank(*e, 40);
-        }
-        assert_eq!(almost.mastered(), 6);
-        assert!(!almost.photon_eligible());
+        let mut some = Chi::default();
+        some.bank(Element::Fire, 40);
+        some.bank(Element::Ice, 15); // level 3, not 5
+        assert_eq!(some.mastered(), 1);
     }
 
     #[test]
