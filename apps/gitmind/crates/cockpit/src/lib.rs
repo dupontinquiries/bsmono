@@ -13,6 +13,8 @@ pub mod buildsystem;
 pub mod daemons;
 pub mod deploy;
 pub mod fleet;
+/// The fastboot wire protocol and flash-script model, without a subprocess.
+pub mod fastboot;
 /// First contact with a freshly-imaged phone: pairing code and join script.
 pub mod join;
 /// One-button reroll across the test fleet: plan, dedupe, report.
