@@ -78,6 +78,7 @@ mod finale;
 mod nightfall;
 mod orient;
 mod partdetect;
+mod loadbearing;
 mod orientsim;
 mod partsim;
 mod skirmish;
