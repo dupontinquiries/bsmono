@@ -3,6 +3,20 @@
 //! fighting in. Three kinds of feature, every one mirrored under a half-turn so
 //! neither clan's side of the territory hides better:
 //!
+//! **The symmetry, and why it is this one.** Every feature is mirrored across the
+//! **anti-diagonal** — the reflection (x, z) -> (-z, -x), which swaps the two
+//! camps and fixes each lane onto itself. That is the same map the river course,
+//! the causeway, the mountain tilt and (since it started granting sight
+//! advantage) the terrain noise itself are folded on.
+//!
+//! It was a half-turn until it was measured. A half-turn is *also* a clan-swap
+//! symmetry, so each layer looked fair alone — but the two conventions disagree
+//! about the lanes (a half-turn sends your duo lane to their solo lane, a mirror
+//! sends it to their duo lane), and a map built half from one and half from the
+//! other is fair under neither. The symptom was a mirror match — identical
+//! drafts, both sides, eight lands — coming back 8.0 deaths to 4.2. One
+//! convention, chosen to match the river.
+//!
 //! * **Thickets** — stands of brush so dense a cat inside is *unseen* from outside
 //!   until you are almost on top of it (the books' undergrowth ambush; a MOBA's
 //!   brush). Placed beside prey camps, at the trail bends, and at the contention
@@ -63,14 +77,29 @@ fn mirrored<T: Copy, const N: usize>(base: [T; N], flip: impl Fn(T) -> T) -> Vec
     base.iter().copied().chain(base.iter().map(|&f| flip(f))).collect()
 }
 
+/// The clan-swap reflection: across the anti-diagonal, swapping the camps and
+/// fixing every lane. `reflect(reflect(p)) == p`, and the trail bends are its
+/// fixed points.
+pub fn reflect(x: f32, z: f32) -> (f32, f32) { (-z, -x) }
+
 pub fn thickets() -> Vec<Thicket> {
-    mirrored(THICKETS_BASE, |t| Thicket { x: -t.x, z: -t.z, r: t.r })
+    mirrored(THICKETS_BASE, |t| {
+        let (x, z) = reflect(t.x, t.z);
+        Thicket { x, z, r: t.r }
+    })
 }
 pub fn walls() -> Vec<Wall> {
-    mirrored(WALLS_BASE, |w| Wall { ax: -w.ax, az: -w.az, bx: -w.bx, bz: -w.bz })
+    mirrored(WALLS_BASE, |w| {
+        let (ax, az) = reflect(w.ax, w.az);
+        let (bx, bz) = reflect(w.bx, w.bz);
+        Wall { ax, az, bx, bz }
+    })
 }
 pub fn mists() -> Vec<Mist> {
-    mirrored(MISTS_BASE, |m| Mist { x: -m.x, z: -m.z, r: m.r })
+    mirrored(MISTS_BASE, |m| {
+        let (x, z) = reflect(m.x, m.z);
+        Mist { x, z, r: m.r }
+    })
 }
 
 fn dist(ax: f32, az: f32, bx: f32, bz: f32) -> f32 { ((ax - bx).powi(2) + (az - bz).powi(2)).sqrt() }
@@ -150,18 +179,32 @@ mod tests {
 
     #[test]
     fn the_jungle_is_mirrored_so_neither_clan_hides_better() {
+        let same = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3;
         for t in thickets() {
-            assert!(thickets().iter().any(|u|
-                (u.x + t.x).abs() < 1e-4 && (u.z + t.z).abs() < 1e-4 && (u.r - t.r).abs() < 1e-4));
+            let r = reflect(t.x, t.z);
+            assert!(
+                thickets().iter().any(|u| same((u.x, u.z), r) && (u.r - t.r).abs() < 1e-4),
+                "thicket at ({}, {}) has no mirror", t.x, t.z
+            );
         }
         for w in walls() {
-            assert!(walls().iter().any(|u|
-                (u.ax + w.ax).abs() < 1e-4 && (u.az + w.az).abs() < 1e-4
-                && (u.bx + w.bx).abs() < 1e-4 && (u.bz + w.bz).abs() < 1e-4));
+            let (ra, rb) = (reflect(w.ax, w.az), reflect(w.bx, w.bz));
+            assert!(
+                walls().iter().any(|u| (same((u.ax, u.az), ra) && same((u.bx, u.bz), rb))
+                    || (same((u.ax, u.az), rb) && same((u.bx, u.bz), ra))),
+                "wall has no mirror"
+            );
         }
         for m in mists() {
-            assert!(mists().iter().any(|u| (u.x + m.x).abs() < 1e-4 && (u.z + m.z).abs() < 1e-4));
+            assert!(mists().iter().any(|u| same((u.x, u.z), reflect(m.x, m.z))));
         }
+        // the reflection is an involution and fixes the trail bends
+        for p in [(-85.0f32, 85.0f32), (0.0, 0.0), (85.0, -85.0)] {
+            assert!(same(reflect(p.0, p.1), p), "{p:?} should be a fixed point");
+        }
+        assert!(same(reflect(reflect(12.0, -5.0).0, reflect(12.0, -5.0).1), (12.0, -5.0)));
+        // and it swaps the camps
+        assert!(same(reflect(-118.0, -118.0), (118.0, 118.0)));
     }
 
     #[test]

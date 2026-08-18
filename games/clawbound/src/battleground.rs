@@ -71,7 +71,11 @@ const MEDIC_R: f32 = 10.0;
 const MEDIC_HEAL: f32 = 16.0;        // hp/s at the medic's den, before herbs
 
 // freshkill economy
-const PREY_CAMPS: [(f32, f32); 4] = [(-70.0, 20.0), (70.0, -20.0), (-20.0, -70.0), (20.0, 70.0)];
+/// Two hunting camps on clan A's side of the anti-diagonal; the other two are
+/// their reflections, generated rather than typed, so the prey cannot drift out
+/// of symmetry the way it had (the old list was half-turn symmetric while the
+/// river and the land were mirror symmetric — fair under neither).
+const PREY_CAMPS_BASE: [(f32, f32); 2] = [(-70.0, 20.0), (-20.0, -70.0)];
 const PREY_HP: f32 = 26.0;
 const PREY_RESPAWN: f32 = 22.0;
 const PREY_WORTH: f32 = 1.0;
@@ -82,7 +86,12 @@ const GROWTH_CAP: f32 = 0.8;         // pile can add at most +80% power
 const GROWTH_HALF: f32 = 16.0;       // pile worth at which half the cap is reached
 
 // herbs
-const HERB_SPOTS: [(f32, f32); 2] = [(-45.0, -5.0), (45.0, 5.0)];
+/// One herb patch on clan A's side; the other is its reflection, generated —
+/// the typed pair was half-turn symmetric like the old prey list, and the mirror
+/// probe caught the consequence directly: both clans' seat-0 warriors decided to
+/// gather on the same tick and walked to patches that were not each other's
+/// mirror.
+const HERB_SPOTS_BASE: [(f32, f32); 1] = [(-45.0, -5.0)];
 const HERB_REGROW: f32 = 30.0;
 const HERB_GATHER: f32 = 2.0;        // seconds crouched over the patch
 const HERB_HEAL_BONUS: f32 = 0.15;   // each delivered herb: +15% to all clan healing…
@@ -173,6 +182,14 @@ pub struct Warrior {
     pub respawn_t: f32,
     pub gather_t: f32,
     pub kills: u32,
+    /// Which seat this warrior holds **within its own clan** — 0..2 for the
+    /// ancestors, then patrol cats by wave. Every per-warrior random roll hashes
+    /// on the seat rather than on the index into `warriors`, so a warrior and
+    /// its mirror counterpart make the same decisions. Hashing on the index was
+    /// worth real games: clan A's warriors are indices 0..2 and clan B's 3..5,
+    /// so the two clans rolled different economy decisions from the same state,
+    /// and the economy decides matches.
+    pub seat: u32,
     pub still_t: f32,     // seconds spent seated (The Seated Mountain gathers here)
     pub duty: Duty,
     pub is_player: bool,
@@ -300,6 +317,12 @@ impl Battleground {
         w.attack * m
     }
 
+    /// How hard this warrior bites wood. Patrol cats gnaw like anyone else; an
+    /// ancestor brings its kit's siege trait.
+    fn siege_of(&self, i: usize) -> f32 {
+        self.warriors[i].ancestor.map(|a| ancestor::kit(a).siege).unwrap_or(1.0)
+    }
+
     /// Per-strike bonus that depends on the *target* — Twofang's finishing bite,
     /// Faryowl's Far Song landing hardest from a distance.
     fn strike_vs(&self, i: usize, target: usize) -> f32 {
@@ -354,15 +377,30 @@ impl Battleground {
     pub const LAND_LIFT: f32 = 1.2;
 
     pub fn new_draft(picks_a: [Ancestor; 3], picks_b: [Ancestor; 3]) -> Battleground {
+        Battleground::new_on(picks_a, picks_b, 0)
+    }
+
+    /// A drafted match on a re-rolled land. `seed` salts the terrain noise (see
+    /// [`world::set_terrain_seed`]) — the same camps, trails, river course and
+    /// jungle layout, over different country. This is what lets a balance run
+    /// vary the map instead of replaying one map thirteen times.
+    pub fn new_on(picks_a: [Ancestor; 3], picks_b: [Ancestor; 3], seed: u32) -> Battleground {
         let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::set_terrain_pool(Self::MOUNTAIN_BIAS, 1);
         world::set_land_lift(Self::LAND_LIFT);
         world::set_river_course(world::RIVER_U_EAST);   // the U on the solo-lane side; the camp line stays dry
+        world::set_terrain_seed(seed);
         world::init_world();
-        let camps = [land_near(CAMP_ANCHOR[0].0, CAMP_ANCHOR[0].1), land_near(CAMP_ANCHOR[1].0, CAMP_ANCHOR[1].1)];
+        // Clan B's camp is clan A's, reflected — not a second independent search.
+        // `land_near`'s slope probe is one-sided (it looks +x and +z), so two
+        // searches on mirrored ground can still settle a metre or two apart, and
+        // every Heal Tree and medic den is placed relative to a camp.
+        let a_camp = land_near(CAMP_ANCHOR[0].0, CAMP_ANCHOR[0].1);
+        let camps = [a_camp, junglemap::reflect(a_camp.0, a_camp.1)];
         drop(_terrain_guard);
 
-        let medics = [(camps[0].0 + 4.0, camps[0].1), (camps[1].0 - 4.0, camps[1].1)];
+        let medic_a = (camps[0].0 + 4.0, camps[0].1);
+        let medics = [medic_a, junglemap::reflect(medic_a.0, medic_a.1)];
 
         // Heal Trees: one per lane, a third of the way out from each camp.
         let mut heal_trees = Vec::new();
@@ -377,7 +415,12 @@ impl Battleground {
 
         // Prey camps (mice and rabbits alternating), a fish run at the nearest
         // water to the centre, and the contention ground's rich prey.
-        let mut prey: Vec<Prey> = PREY_CAMPS.iter().enumerate()
+        let camps_of_prey: Vec<(f32, f32)> = PREY_CAMPS_BASE
+            .iter()
+            .copied()
+            .chain(PREY_CAMPS_BASE.iter().map(|&(x, z)| junglemap::reflect(x, z)))
+            .collect();
+        let mut prey: Vec<Prey> = camps_of_prey.iter().enumerate()
             .map(|(i, &(x, z))| {
                 let kind = if i % 2 == 0 { PreyKind::Mouse } else { PreyKind::Rabbit };
                 Prey { x, z, home: (x, z), kind, hp: kind.hp(), respawn_t: 0.0 }
@@ -387,7 +430,7 @@ impl Battleground {
             // two fishing runs, sought from mirrored anchors so neither clan's side
             // of the river eats better by construction
             let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            for anchor in [(60.0, -110.0), (110.0, -60.0)] {   // the U's two arms, mirrored across the anti-diagonal
+            for anchor in [(60.0, -110.0), junglemap::reflect(60.0, -110.0)] {   // the U's two arms, mirrored
                 if let Some((fx, fz)) = world::nearest_water(anchor, 100.0) {
                     prey.push(Prey { x: fx, z: fz, home: (fx, fz), kind: PreyKind::Fish, hp: PreyKind::Fish.hp(), respawn_t: 0.0 });
                 }
@@ -395,7 +438,12 @@ impl Battleground {
         }
         prey.push(Prey { x: 0.0, z: 0.0, home: (0.0, 0.0), kind: PreyKind::Rich, hp: PreyKind::Rich.hp(), respawn_t: 0.0 });
 
-        let herb_patches = HERB_SPOTS.iter().map(|&(x, z)| HerbPatch { x, z, regrow_t: 0.0 }).collect();
+        let herb_patches = HERB_SPOTS_BASE
+            .iter()
+            .copied()
+            .chain(HERB_SPOTS_BASE.iter().map(|&(x, z)| junglemap::reflect(x, z)))
+            .map(|(x, z)| HerbPatch { x, z, regrow_t: 0.0 })
+            .collect();
 
         // Rosters: the drafted three a side; the player leads clan A.
         let mut warriors = Vec::new();
@@ -404,13 +452,19 @@ impl Battleground {
                 let a = if team == CLAN_A { picks_a[slot] } else { picks_b[slot] };
                 let k = ancestor::kit(a);
                 let (cx, cz) = camps[team as usize];
+                // Spawn offsets are REFLECTED for clan B, not copied. The mirror
+                // probe caught this at tick zero: both clans fanning out along
+                // +x put clan B's line across its own camp instead of along it,
+                // a 2.8 m break in the mirror before a single step was taken.
+                let d = slot as f32 * 2.0 - 2.0;
+                let (sx, sz) = if team == CLAN_A { (cx + d, cz) } else { (cx, cz - d) };
                 warriors.push(Warrior {
                     team, role: Role::Ancestor, ancestor: Some(a), lane: slot % LANES,
-                    x: cx + slot as f32 * 2.0 - 2.0, z: cz, heading: 0.0,
+                    x: sx, z: sz, heading: 0.0,
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
                     shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, still_t: 0.0, duty: Duty::Border,
+                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: slot as u32, still_t: 0.0, duty: Duty::Border,
                     is_player: team == CLAN_A && slot == 0, seg: 0,
                 });
             }
@@ -436,16 +490,24 @@ impl Battleground {
 
     fn spawn_patrol(&mut self, team: u8, lane: usize, duty: Duty) {
         let (cx, cz) = self.camps[team as usize];
+        let wave_seat = self.wave_n[team as usize];
         let size = if self.leafbare() && duty == Duty::Border { LEAFBARE_PATROL } else { PATROL_SIZE };
         for i in 0..size {
+            // reflected for clan B, like the ancestors' spawns
+            let (px, pz) = if team == CLAN_A {
+                (cx + i as f32 * 1.5, cz + 1.5)
+            } else {
+                (cx - 1.5, cz - i as f32 * 1.5)
+            };
             self.warriors.push(Warrior {
                 team, role: Role::Patrol, ancestor: None, lane,
-                x: cx + i as f32 * 1.5, z: cz + 1.5, heading: 0.0,
+                x: px, z: pz, heading: 0.0,
                 hp: PATROL_HP, max_hp: PATROL_HP, attack: PATROL_ATK, speed: PATROL_SPEED, reach: REACH,
                 mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
                 carry: Carry::Nothing,
                 shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, still_t: 0.0, duty,
+                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0,
+                seat: 100 + wave_seat * 8 + i as u32, still_t: 0.0, duty,
                 is_player: false, seg: 0,
             });
         }
@@ -741,9 +803,36 @@ impl Battleground {
             Mind::Dead => {}
             Mind::LastStand => {}   // handled above
             Mind::Retreat => {
+                // A wounded cat makes for the nearest sanctuary, not the far
+                // camp. This is what the Trees of Healing are FOR, and it was
+                // measured missing: a diagnostic match had Oldroar spending 79s
+                // retreating and 7s actually healing — the slow kits were dying
+                // on the walk home, then dying again, 67s of a 506s match spent
+                // dead, and never once reaching the economy. Shelter under a
+                // living Heal Tree mends more slowly than the medic cat's den
+                // but it is *reachable*, which for a heavy kit is the whole
+                // difference.
                 let (mx, mz) = self.medics[team as usize];
-                if dist(x, z, mx, mz) < MEDIC_R { self.warriors[i].mind = Mind::AtMedic; }
-                else { self.walk_toward(i, mx, mz, dt); }
+                let mut best = (mx, mz, dist(x, z, mx, mz));
+                for t in self.heal_trees.iter() {
+                    if t.team != team || !t.alive() { continue; }
+                    let d = dist(x, z, t.x, t.z);
+                    if d < best.2 { best = (t.x, t.z, d); }
+                }
+                let (tx, tz, d) = best;
+                let at_camp = (tx, tz) == (mx, mz);
+                if at_camp && d < MEDIC_R {
+                    self.warriors[i].mind = Mind::AtMedic;
+                } else if !at_camp && d < AURA_R * 0.5 {
+                    // sheltering: the aura pass in step() does the mending
+                    if self.warriors[i].power_frac() >= REJOIN {
+                        if let Some(l) = self.breach_lane(team) { self.warriors[i].lane = l; }
+                        self.warriors[i].mind = Mind::Trail;
+                        self.warriors[i].seg = 0;
+                    }
+                } else {
+                    self.walk_toward(i, tx, tz, dt);
+                }
             }
             Mind::AtMedic => {
                 self.heal(i, MEDIC_HEAL * dt);
@@ -849,8 +938,18 @@ impl Battleground {
                 self.warriors[i].mind = Mind::Trail;
 
                 // ancestors sometimes peel off the trail for the economy objectives
-                if role == Role::Ancestor && !self.warriors[i].is_player && carry == Carry::Nothing {
-                    let r = hashf(self.tick.wrapping_mul(2654435761).wrapping_add(i as u32 * 97));
+                // `is_player` gates the AI economy detour so a human's warrior is
+                // never yanked off to hunt — but when nobody is driving, that
+                // gate is pure asymmetry: clan A's seat 0 was the only warrior on
+                // the field that never left the trail to farm. The mirror probe
+                // found it as a 0.6 m break at tick 34, and it is worth more than
+                // that over a match, since the economy is what wins them.
+                let hands_off = self.warriors[i].is_player && self.player_driven;
+                if role == Role::Ancestor && !hands_off && carry == Carry::Nothing {
+                    let r = hashf(
+                        self.tick.wrapping_mul(2654435761)
+                            .wrapping_add(self.warriors[i].seat.wrapping_mul(97)),
+                    );
                     if r < 0.005 {
                         if r < 0.0015 && self.herb_patches.iter().any(|p| p.ready()) {
                             self.warriors[i].mind = Mind::Gather;
@@ -869,13 +968,13 @@ impl Battleground {
                     && (t.lane == lane || dist(t.x, t.z, x, z) < 6.0)
                     && dist(t.x, t.z, x, z) < REACH + 3.0);
                 if let Some(t) = etarget {
-                    self.heal_trees[t].hp -= atk * dt;
+                    self.heal_trees[t].hp -= atk * self.siege_of(i) * dt;
                     return;
                 }
                 if dist(x, z, enemy_camp.0, enemy_camp.1) < REACH + 4.0 {
                     let e = Self::enemy(team) as usize;
                     let roots = self.heal_trees.iter().any(|t| t.team != team && t.alive());
-                    let dmg = atk * dt * if roots { 1.0 - ROOT_GUARD } else { 1.0 };
+                    let dmg = atk * self.siege_of(i) * dt * if roots { 1.0 - ROOT_GUARD } else { 1.0 };
                     self.clans[e].great_tree_hp -= dmg;
                     return;
                 }
@@ -1005,8 +1104,19 @@ impl Battleground {
         // The Seated Mountain: note where every cat stood before this tick's minds run
         let seats: Vec<(f32, f32)> = self.warriors.iter().map(|w| (w.x, w.z)).collect();
 
-        // minds (skip the player's warrior — the player is the mind)
-        for i in 0..self.warriors.len() {
+        // Minds. The ORDER alternates every tick, and that is not a detail: a
+        // warrior who thinks second sees the positions the first one just moved
+        // to, so a fixed order hands one clan a permanent half-tick of fresher
+        // information. Clan A's ancestors are indices 0..2 and clan B's are
+        // 3..5, so "always ascending" meant clan B always reacted to clan A.
+        // Measured over 140 games, that alone was worth about thirteen points of
+        // win rate. Alternating cancels it without introducing randomness, which
+        // a deterministic sim cannot afford.
+        // (The player's warrior is skipped — the player is its mind.)
+        let n = self.warriors.len();
+        let ascending = self.tick % 2 == 0;
+        for k in 0..n {
+            let i = if ascending { k } else { n - 1 - k };
             if !self.warriors[i].alive() || (self.warriors[i].is_player && self.player_driven) { continue; }
             self.think(i, dt);
         }
@@ -1170,7 +1280,7 @@ mod tests {
             hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0, reach: REACH,
             mind: Mind::Trail, carry: Carry::Nothing,
             shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
+            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: 999, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
         });
         bg.step(1.0 / 30.0);
         assert_eq!(bg.warriors[p].mind, Mind::LastStand, "at the Great Tree a warrior stands");
@@ -1876,6 +1986,54 @@ mod tests {
         let da = dist(sx, sz, bg.camps[0].0, bg.camps[0].1);
         let db = dist(sx, sz, bg.camps[1].0, bg.camps[1].1);
         assert!((da - db).abs() < 12.0, "the Skyrock favors neither clan: {da:.0} vs {db:.0}");
+    }
+
+    #[test]
+    fn the_heavy_kits_bring_the_wood_down_faster() {
+        // Their whole compensation for having no tempo — so it is asserted, not
+        // assumed. Same tree, same seconds, a bruiser against a skirmisher.
+        let gnaw = |a: Ancestor| {
+            let mut bg = Battleground::new_draft(
+                [a, Ancestor::Lion, Ancestor::Puma],
+                [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther],
+            );
+            bg.patrol_t = [1e9; 2];
+            bg.warriors.retain(|w| w.team == CLAN_A);
+            let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+            let (tx, tz, lane) =
+                (bg.heal_trees[t].x, bg.heal_trees[t].z, bg.heal_trees[t].lane);
+            let before = bg.heal_trees[t].hp;
+            for _ in 0..30 * 3 {
+                bg.warriors[0].x = tx + 1.0;
+                bg.warriors[0].z = tz;
+                bg.warriors[0].lane = lane;
+                bg.warriors[0].mind = Mind::Trail;
+                bg.warriors[0].is_player = false;
+                bg.step(1.0 / 30.0);
+            }
+            before - bg.heal_trees[t].hp
+        };
+        let hulk = gnaw(Ancestor::CaveLion);
+        let skirmisher = gnaw(Ancestor::Caracal);
+        assert!(
+            hulk > skirmisher * 1.4,
+            "the Ice Age hulk should out-gnaw the skirmisher: {hulk} vs {skirmisher}"
+        );
+        // and it is wood-specific: warriors take the same claws from either
+        let strike = |a: Ancestor| {
+            let mut bg = Battleground::new_draft(
+                [a, Ancestor::Lion, Ancestor::Puma],
+                [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Panther],
+            );
+            quiet(&mut bg);
+            bg.warriors[0].x = 60.0;
+            bg.warriors[0].z = -60.0; // away from the lion's Pride's Warmth
+            bg.strike_of(0) / ancestor::kit(a).attack
+        };
+        assert!(
+            (strike(Ancestor::CaveLion) - strike(Ancestor::Caracal)).abs() < 1e-5,
+            "siege must not leak into flesh damage"
+        );
     }
 
     #[test]

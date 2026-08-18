@@ -42,6 +42,7 @@ const HILL: f32 = 7.0;
 static MOUNTAIN_BIAS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F800000); // 1.0
 static LAND_LIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0.0
 static RIVER_COURSE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // classic meander
+static TERRAIN_SEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TERRAIN_SEASON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1); // Greenleaf
 
 /// Configure the terrain pool before `init_world()`. `mountain_bias` scales how much of
@@ -58,6 +59,7 @@ pub fn set_terrain_pool(mountain_bias: f32, season: u8) {
     // waterline or move the river out from under the next sim/prowl bake
     LAND_LIFT.store(0.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
     RIVER_COURSE.store(RIVER_MEANDER, std::sync::atomic::Ordering::Relaxed);
+    TERRAIN_SEED.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 fn mountain_bias() -> f32 { f32::from_bits(MOUNTAIN_BIAS.load(std::sync::atomic::Ordering::Relaxed)) }
 /// Raise (or sink) the whole land relative to the waterline, in metres. The
@@ -78,6 +80,15 @@ fn land_lift() -> f32 { f32::from_bits(LAND_LIFT.load(std::sync::atomic::Orderin
 ///   east lane's territory, centered on the anti-diagonal so it treats both clans
 ///   alike while leaving the mid line between the camps **dry**. Two paw-deep fords
 ///   where the east trail crosses it — gravel bars, not bridges.
+/// Re-roll the land. Salts the height noise, so the same pool and course give a
+/// different (equally valid) country — which is what a balance harness needs to
+/// tell a real map bias from thirteen coin flips on one map. Reset by
+/// `set_terrain_pool` like the other opt-ins.
+pub fn set_terrain_seed(seed: u32) {
+    TERRAIN_SEED.store(seed, std::sync::atomic::Ordering::Relaxed);
+}
+fn terrain_seed() -> u32 { TERRAIN_SEED.load(std::sync::atomic::Ordering::Relaxed) }
+
 pub const RIVER_MEANDER: u8 = 0;
 pub const RIVER_U_EAST: u8 = 1;
 pub fn set_river_course(course: u8) {
@@ -121,11 +132,12 @@ fn river_carve(x: f32, z: f32) -> f32 {
 }
 
 /// Raw procedural height (pre-erosion). The grid is baked from this.
-pub fn raw_height(x: f32, z: f32) -> f32 {
+fn raw_height_raw(x: f32, z: f32) -> f32 {
     let (wx, wz) = warp(x, z, 22.0);
+    let salt = terrain_seed();
     let (mut h, mut amp, mut freq, mut sum) = (0.0, 1.0, 1.0 / 34.0, 0.0);
     for _ in 0..4 {
-        h += vnoise(wx * freq, wz * freq, 0) * amp;
+        h += vnoise(wx * freq, wz * freq, salt) * amp;
         sum += amp; amp *= 0.5; freq *= 2.05;
     }
     h /= sum;
@@ -157,6 +169,28 @@ pub fn raw_height(x: f32, z: f32) -> f32 {
         t * t * (3.0 - 2.0 * t) * 6.0
     } else { 0.0 };
     peaks - bowl + causeway + tilt + river_carve(x, z) + land_lift()
+}
+
+/// Height, with the battleground's clan-swap symmetry enforced.
+///
+/// The authored features of the U course — the river arc, the causeway, the
+/// mountain tilt — were each built symmetric under the anti-diagonal reflection
+/// (x, z) -> (-z, -x), the map that swaps the two camps and fixes every lane.
+/// The **noise underneath them never was**, and that was invisible right up
+/// until height started granting advantage: with downhill spotting and the
+/// Skyrock in, a mirror match (identical drafts on both sides, eight lands) came
+/// back with clan A retreating 195s to clan B's 130s and dying 8.0 times to 4.2.
+/// A fair map cannot be built on unfair ground, so the ground is folded onto
+/// itself: every point is the mean of itself and its reflection, which makes
+/// `height_at(x, z) == height_at(-z, -x)` an identity rather than an aspiration.
+/// Only the battleground pays for it — the other modes want their asymmetric
+/// wild land and never call `set_river_course`.
+pub fn raw_height(x: f32, z: f32) -> f32 {
+    if RIVER_COURSE.load(std::sync::atomic::Ordering::Relaxed) == RIVER_U_EAST {
+        0.5 * (raw_height_raw(x, z) + raw_height_raw(-z, -x))
+    } else {
+        raw_height_raw(x, z)
+    }
 }
 
 // ── stored, eroded heightfield (adapted from unendlich thermal_erosion + water_field) ──

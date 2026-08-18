@@ -149,9 +149,44 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   contention ground) widens the whole clan's spotting range by a quarter — the reason to
   climb a lane with no freshkill. Rendered as spire + watchers' ledge + holder-coloured
   beacon.
-- [ ] Report skew watch: 9-4 clan A on the tilted map (was 7-6). Thirteen deterministic
-  samples is inside coin-flip variance (P(≥9) ≈ 13%) — before tuning, extend the report
-  harness to run each pick under several terrain rolls for real sample size
+- [x] Report skew resolved, and it was not variance after all. `world::set_terrain_seed` +
+  `Battleground::new_on` let the harness re-roll the land; `examples/battleground_balance.rs`
+  plays random drafts, both sides of every draft, across several rolls (140 games).
+  - First version scored each kit leading its *default* draft — worthless, because the
+    default fills teammates and opponents by pool order, so a kit's record mostly reported
+    which trio it faced (Twofang 88% while facing the bottom three). Random drafts with
+    presence-based scoring collapsed the spread from 12-88% to 33-59%.
+  - `examples/mirror_probe.rs`: identical drafts both sides on folded terrain, asserting the
+    match stays a perfect mirror image. It found four real asymmetries (below) and now holds
+    until first contact, which is irreducibly symmetry-breaking.
+- [x] **The map mixed two symmetry conventions.** River/causeway/tilt were anti-diagonal
+  (mirror, each lane fixed); jungle/prey/herbs were half-turn (swaps duo and solo lanes).
+  Each fair alone, fair under neither together. Unified on the mirror via
+  `junglemap::reflect`; prey camps and herb spots are now base-plus-generated-reflection
+  rather than typed pairs that can drift.
+- [x] **Terrain noise was never symmetric** — cosmetic until downhill spotting and the
+  Skyrock made height grant advantage. The battleground folds its land onto its own
+  reflection: `height_at(x,z) == height_at(-z,-x)` is now an identity. Other modes keep
+  their asymmetric wild land.
+- [x] **Spawns, camps, medics reflected rather than copied/re-searched** (both clans fanned
+  along +x: a 2.8m mirror break at tick zero; `land_near`'s one-sided slope probe settles
+  differently on mirrored ground).
+- [x] **Per-index randomness** — the economy peel-off roll hashed on the index into
+  `warriors` (A = 0..2, B = 3..5), so the clans made different farming decisions from
+  identical states; now hashed on a per-clan `seat`. Same class: `is_player` gated the AI
+  economy detour even with nobody driving, so clan A's seat 0 never farmed.
+  Net: clan A 37% -> 46% of 140 games.
+- [x] Wounded warriors retreat to the nearest living **Heal Tree** instead of the far camp —
+  what those trees are for. Found by diagnostic tally (`examples/battleground_diag.rs`):
+  Oldroar spent 79s retreating, 7s healing, 67s dead and *zero* seconds on the economy.
+  Took the Ice Age hulk from 31% to 48%.
+- [x] `siege` kit trait (data-driven, budget-costed): heavy kits bite wood harder. Honest
+  negative result — it moved Oldroar 33% -> 31% on its own; the retreat loop was the cure.
+  Kept because the archetype should have the job, and it is tested.
+- [ ] Remaining spread (Faryowl 61%, Goldenmane 39%) is inside +-6% standard error at
+  n=42..82 games per kit — needs a longer run before anyone touches a number
+- [ ] `--play` wiring still blocked here: the `app` feature needs rustc >= 1.76 (emath
+  0.28), sandbox is pinned at 1.75, so none of that glue can be compiled or verified
 ## Asset compression (the parts-web pipeline, from blackstar-rs)
 - [x] Measured first, per `blackstar-rs/docs/COMPRESSION.md` doctrine. 17 IQMs = 19.0 MB;
   `iqm.rs` reads positions + indices only (10.7 MB) and throws away texcoords/normals on

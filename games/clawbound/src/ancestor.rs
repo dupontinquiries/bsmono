@@ -77,6 +77,14 @@ pub struct Kit {
     pub hp: f32,
     pub attack: f32,                 // damage per second at the claw (or at the yowl)
     pub speed: f32,
+    /// How hard this ancestor bites **wood** — Heal Trees and the Great Tree.
+    /// The heavy kits' job, and the answer to a measured problem: over 140
+    /// balance games the two slow bruisers sat at 33% and 38% while the fast and
+    /// ranged kits sat at 59%, because a large map with a carry-it-home economy
+    /// pays for tempo and they have none. Rather than making them faster (which
+    /// deletes the archetype), they are paid in the currency that actually ends
+    /// matches. A siege multiplier costs budget like any other power.
+    pub siege: f32,
     pub reach: f32,                  // how far the basic attack carries — melee ≈ 2.8; the
                                      // yowlers and sun-priests strike from many lengths away.
                                      // Reach applies to warriors and prey only: no cat ever
@@ -93,7 +101,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "A warrior alone is a whisker; a pride is a storm.",
             passive_name: "Pride's Warmth",
             passive: "allies fighting beside Goldenmane strike harder",
-            hp: 190.0, attack: 11.0, speed: 6.0, reach: 2.8,
+            hp: 190.0, attack: 11.0, speed: 6.0, siege: 1.2, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Sunstrike Pounce", desc: "leap the gap and rake on landing",
                     verb: Verb::Dash, power: 1.6, range: 9.0, dur: 0.0, cd: 8.0 },
@@ -109,7 +117,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "Strike once, from where they never looked.",
             passive_name: "Night's Hunger",
             passive: "unseen or from behind, the first blow bites far deeper",
-            hp: 170.0, attack: 13.0, speed: 6.2, reach: 2.8,
+            hp: 170.0, attack: 13.0, speed: 6.2, siege: 1.0, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Shadow Maul", desc: "a heavy double-paw blow",
                     verb: Verb::Strike, power: 2.4, range: 3.0, dur: 0.0, cd: 7.0 },
@@ -125,7 +133,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "The river never argues; it goes around, and wins.",
             passive_name: "Riverborn",
             passive: "water is home ground — swim fast, and wounds close in the shallows",
-            hp: 160.0, attack: 11.5, speed: 6.8, reach: 2.8,
+            hp: 160.0, attack: 11.5, speed: 6.8, siege: 1.0, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Spotted Blur", desc: "flicker through the enemy, claws trailing",
                     verb: Verb::Dash, power: 1.3, range: 11.0, dur: 0.0, cd: 6.0 },
@@ -141,7 +149,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "Never chase. Become where the prey chooses to run.",
             passive_name: "Silent Footfall",
             passive: "moving through shadow leaves no scent and quickens the step",
-            hp: 150.0, attack: 12.5, speed: 6.6, reach: 2.8,
+            hp: 150.0, attack: 12.5, speed: 6.6, siege: 1.0, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Pounce of Midnight", desc: "drop onto prey and pin it",
                     verb: Verb::Dash, power: 1.8, range: 10.0, dur: 0.0, cd: 9.0 },
@@ -157,7 +165,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "The sky itself can be hunted.",
             passive_name: "Skyward Hunger",
             passive: "every kill quickens the paws — speed stacks with the tally",
-            hp: 145.0, attack: 10.5, speed: 7.4, reach: 2.8,
+            hp: 145.0, attack: 10.5, speed: 7.4, siege: 1.0, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Sky Snap", desc: "a vertical snatch that plucks the quick out of the air",
                     verb: Verb::Strike, power: 2.0, range: 4.5, dur: 0.0, cd: 6.5 },
@@ -175,7 +183,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "Why cross the clearing when your voice already has?",
             passive_name: "The Far Song",
             passive: "a yowl bites deepest from a distance — far strikes land harder",
-            hp: 130.0, attack: 11.0, speed: 6.4, reach: 11.0,
+            hp: 130.0, attack: 11.0, speed: 6.4, siege: 1.0, reach: 11.0,
             abilities: [
                 AbilitySpec { name: "Piercing Yowl", desc: "one note, aimed like a claw",
                     verb: Verb::Strike, power: 1.9, range: 13.0, dur: 0.0, cd: 6.5 },
@@ -192,8 +200,8 @@ pub fn kit(a: Ancestor) -> Kit {
             name: "Oldroar", legend: "the cave-lions of the frozen long-ago",
             philosophy: "The old world did not fall. It is only sleeping in me.",
             passive_name: "Deep Wounds, Deep Fury",
-            passive: "every wound feeds the fury — the closer to falling, the harder the blows",
-            hp: 240.0, attack: 10.5, speed: 5.4, reach: 2.8,
+            passive: "every wound feeds the fury — the closer to falling, the harder the blows, and no wood stands long under those paws",
+            hp: 240.0, attack: 10.5, speed: 5.4, siege: 1.7, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Boulder Paw", desc: "a paw like falling stone — the struck are hurled away",
                     verb: Verb::Knockback, power: 1.5, range: 4.5, dur: 0.0, cd: 9.0 },
@@ -210,7 +218,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "Claws begin the hunt. The fangs only ever end it.",
             passive_name: "The Saber Finishes",
             passive: "a wounded foe is a finished foe — strikes bite far deeper below half strength",
-            hp: 175.0, attack: 12.5, speed: 6.0, reach: 3.2,
+            hp: 175.0, attack: 12.5, speed: 6.0, siege: 1.0, reach: 3.2,
             abilities: [
                 AbilitySpec { name: "Saber Lunge", desc: "the whole weight behind both fangs",
                     verb: Verb::Dash, power: 1.7, range: 9.0, dur: 0.0, cd: 8.5 },
@@ -229,7 +237,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "The night hides many things. The sun keeps none of them.",
             passive_name: "The Sun's Favor",
             passive: "under the open sun every strike burns brighter — the day belongs to Suneye",
-            hp: 125.0, attack: 10.8, speed: 6.2, reach: 12.0,
+            hp: 125.0, attack: 10.8, speed: 6.2, siege: 1.0, reach: 12.0,
             abilities: [
                 AbilitySpec { name: "Sunspear", desc: "a lance of noon light, thrown from the eye",
                     verb: Verb::Strike, power: 1.8, range: 14.0, dur: 0.0, cd: 6.0 },
@@ -248,7 +256,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "You need not be the strongest in the fight. Only the one who chooses where it happens.",
             passive_name: "Hush of Snows",
             passive: "every blow carries the cold — struck enemies are briefly chilled and slowed",
-            hp: 155.0, attack: 10.5, speed: 6.6, reach: 2.8,
+            hp: 155.0, attack: 10.5, speed: 6.6, siege: 1.0, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Snowbind", desc: "the drifts close over their paws — held fast where they stand",
                     verb: Verb::Root, power: 0.5, range: 7.0, dur: 1.6, cd: 9.0 },
@@ -267,7 +275,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "The river does not chase either. It gathers.",
             passive_name: "The River Remembers",
             passive: "the held are already caught — strikes bite deeper into the slowed, rooted, or fleeing",
-            hp: 185.0, attack: 11.0, speed: 6.1, reach: 2.8,
+            hp: 185.0, attack: 11.0, speed: 6.1, siege: 1.0, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Undertow", desc: "the current takes their legs — every enemy near is dragged in close",
                     verb: Verb::Pull, power: 0.7, range: 9.0, dur: 0.0, cd: 10.0 },
@@ -295,7 +303,7 @@ pub fn kit(a: Ancestor) -> Kit {
             philosophy: "Sit still long enough, and even the storm will come to ask your leave.",
             passive_name: "The Seated Mountain",
             passive: "stillness gathers the storm — the longer unmoving, the harder every strike, released on the move",
-            hp: 145.0, attack: 10.8, speed: 5.8, reach: 8.0,
+            hp: 145.0, attack: 10.8, speed: 5.8, siege: 1.0, reach: 8.0,
             abilities: [
                 AbilitySpec { name: "Cloud Breath", desc: "a slow exhalation of mountain smoke — all it touches wades as through deep water",
                     verb: Verb::Slow, power: 0.7, range: 8.0, dur: 2.5, cd: 8.0 },
@@ -310,8 +318,8 @@ pub fn kit(a: Ancestor) -> Kit {
             name: "Stonewhisper", legend: "the grey ghosts of the high crags",
             philosophy: "The mountain does not hurry, and the mountain is never late.",
             passive_name: "Sure-Footed",
-            passive: "slopes and scree cost nothing; blows barely shift those paws",
-            hp: 210.0, attack: 10.0, speed: 5.6, reach: 2.8,
+            passive: "slopes and scree cost nothing, blows barely shift those paws, and patient weight brings any tree down",
+            hp: 210.0, attack: 10.0, speed: 5.6, siege: 1.5, reach: 2.8,
             abilities: [
                 AbilitySpec { name: "Crag Leap", desc: "a boulder-to-boulder leap ending in a landslide of a landing",
                     verb: Verb::Dash, power: 1.5, range: 8.0, dur: 0.0, cd: 9.0 },
@@ -334,7 +342,7 @@ impl Ancestor {
 pub fn budget(a: Ancestor) -> f32 {
     let k = kit(a);
     // reach beyond the claw is safety, and safety is power — it costs budget
-    k.hp / 30.0 + k.attack + k.speed * 1.5 + (k.reach - 2.8) * 0.5
+    k.hp / 30.0 + k.attack + k.speed * 1.5 + (k.reach - 2.8) * 0.5 + (k.siege - 1.0) * 4.0
 }
 
 #[cfg(test)]
@@ -369,6 +377,15 @@ mod tests {
         assert!(ALL.iter().all(|&a| kit(Ancestor::CaveLion).hp >= kit(a).hp));
         assert!(ALL.iter().all(|&a| kit(Ancestor::Caracal).speed >= kit(a).speed));
         assert!(ALL.iter().all(|&a| kit(Ancestor::Tiger).attack >= kit(a).attack));
+        // the siegers are the slow ones — speed and wood-breaking are traded
+        for a in ALL {
+            let k = kit(a);
+            if k.siege > 1.4 {
+                assert!(k.speed <= 5.8, "{}: a sieger must be slow", k.name);
+                assert!(k.hp >= 200.0, "{}: a sieger must be heavy", k.name);
+            }
+            assert!(k.siege >= 1.0, "{}: siege never penalises", k.name);
+        }
         let ranged: Vec<Ancestor> = ALL.iter().copied().filter(|&a| kit(a).reach > 4.0).collect();
         assert_eq!(ranged.len(), 3, "three ranged kits: the yowler, the sun-priest, the ninth son");
         for a in ranged { assert!(kit(a).hp < 150.0, "{} must pay for reach in hp", kit(a).name); }
