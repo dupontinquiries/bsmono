@@ -1339,10 +1339,44 @@ was evicted)", prompt_ids.len())
             // prefix `l`. Under-reporting to `l` capped continuation reuse: a child resuming from this tip got
             // clamped to the seed and blew past the 256 suffix window into a full prefill (the 3/24 ceiling).
             let mut prefill_len = prompt_ids.len();
-            // Self-heal: anchor reuse that stops at 0 tokens (with no cancel) may have hit residual
-            // reuse drift tipping a near-tied eos — retry once with a clean full prefill. If that
-            // also yields nothing, the model genuinely stopped (nothing more to be done here).
-            if reuse && produced == 0 && !cancel() {
+            // Was the empty reply the model cleanly stopping, or something going wrong?
+            //
+            // `stream_session` breaks on eos BEFORE calling `on_token`, so an eos-first reply leaves
+            // `produced == 0` and `stop_tok == None` — indistinguishable from a cap, a guard trip or
+            // a cancel. `s.logits` is left at the distribution eos was drawn from, so the answer is
+            // right there: top-1 and its margin over the runner-up.
+            //
+            // The retry below justifies itself as recovering a NEAR-TIED eos tipped by reuse drift.
+            // That is a good hypothesis and it was never checked — the retry fired on the token count
+            // alone. When the model wants to stop by a wide margin a clean prefill reproduces it
+            // exactly, and the retry is a full redundant prefill for nothing: three of them in one
+            // observed session at 17.2s, 17.3s and 17.7s, which the operator experiences as the app
+            // hanging and the model "being fussy".
+            let stop_margin = |lg: &[f32]| -> Option<(u32, f32)> {
+                if lg.is_empty() { return None; }
+                let (mut i1, mut v1, mut v2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for (i, v) in lg.iter().enumerate() {
+                    if *v > v1 { v2 = v1; v1 = *v; i1 = i; } else if *v > v2 { v2 = *v; }
+                }
+                Some((i1 as u32, v1 - v2))
+            };
+            // Below this the two candidates really could swap under a different prefill path, which
+            // is the only case the retry was ever meant to cover.
+            const NEAR_TIE_LOGITS: f32 = 0.5;
+            let stopped_decisively = match stop_margin(&s.logits) {
+                Some((top, margin)) => stop.contains(&top) && margin >= NEAR_TIE_LOGITS,
+                None => false,
+            };
+            if reuse && produced == 0 && stopped_decisively && !cancel() {
+                if let Some((top, margin)) = stop_margin(&s.logits) {
+                    crate::diag!("wgpu-engine: reuse produced 0 tokens, but the model chose stop token {top} \
+                                  by {margin:.2} logits over the runner-up — that is the model stopping, not \
+                                  reuse drift, and a clean prefill would reproduce it. Retry SKIPPED (it costs \
+                                  a full prefill); LOGSCOPE_ALWAYS_REPREFILL=1 forces it anyway.");
+                }
+            }
+            let force_retry = std::env::var("LOGSCOPE_ALWAYS_REPREFILL").as_deref() == Ok("1");
+            if reuse && produced == 0 && (!stopped_decisively || force_retry) && !cancel() {
                 crate::diag!("wgpu-engine: reuse produced 0 tokens — retrying with a clean full prefill…");
                 let mut s2 = self.gpu.session_new(&self.model, cap, self.rng);
                 s2.logits = self.gpu.prefill_chunked(&self.model, &s2.cache, &prompt_ids, prefill_chunk_for_streaming(self.model.d, self.model.h, self.model.streams_experts(), self.model.moe_counts()));
@@ -1664,12 +1698,24 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name, bgh as f64 / per);
             // argmax of the final logits is what the model wanted next (its stop token, if it stopped).
             if produced < 24 {
                 let tail: Vec<u32> = s.generated.iter().rev().take(16).rev().copied().collect();
+                let next_argmax = s.logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i);
                 let why = match stop_tok.get() {
                     Some(t) if Some(t) == self.eos => format!("model emitted EOS {t}"),
                     Some(t) => format!("model emitted stop token {t}"),
-                    None => "token cap / runaway guard / cancel (no stop token seen)".to_string(),
+                    // `stream_session` breaks on eos before `on_token` runs, so an eos-first reply
+                    // arrives here with stop_tok unset. Reporting it as a cap or a guard trip sends
+                    // the reader looking for a limit that was never hit — the observed log said
+                    // "no stop token seen" on the same line as "argmax=Some(128009)", which IS a
+                    // stop token. `s.logits` is the distribution eos was drawn from, so read it.
+                    None => match next_argmax.map(|i| i as u32) {
+                        Some(t) if Some(t) == self.eos =>
+                            format!("model emitted EOS {t} as its FIRST token (uncounted: stream_session \
+                                     breaks on eos before the stop callback)"),
+                        Some(t) if self.stop_ids.contains(&t) =>
+                            format!("model chose stop token {t} first (uncounted, same path as EOS)"),
+                        _ => "token cap / runaway guard / cancel (no stop token seen)".to_string(),
+                    },
                 };
-                let next_argmax = s.logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i);
                 let decoded = String::from_utf8_lossy(&self.tok.decode_bytes(&s.generated)).replace('\n', "\\n");
                 crate::diag!("wgpu-engine: [{}] SHORT REPLY ({produced} tok) — stop: {why}; stop_set={:?}; next-token argmax={:?}",
                     self.name, self.stop_ids, next_argmax);
