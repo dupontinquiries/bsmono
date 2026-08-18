@@ -7,6 +7,8 @@
 //! the shell, ranking/launching gets iterated (and tested) here, and a bug
 //! report can be pinned to one side in a sentence.
 
+pub mod anim;
+pub mod grid;
 pub mod entry;
 pub mod exec;
 pub mod icons;

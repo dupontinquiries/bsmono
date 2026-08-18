@@ -86,9 +86,20 @@ they could reproduce it.
 
 ## Status
 
-**hatch is merged** (`8444e17b`), clean, 42 core + 24 egui tests passing on
-the merged tree. Step 1 of the port is done. Steps 2-4 — the animation Board,
-the plasmoid config surface, and deleting `apps/launcher` — remain.
+**hatch is merged** (`8444e17b`), clean. Steps 1 and 2 are done: `icontheme`
+and now the animation `Board` plus its `grid`, in `hatch-core` at 67 tests.
+Steps 3 and 4 — the plasmoid config surface, and deleting `apps/launcher` —
+remain.
+
+The Board moved with one change. It imported `uikit_egui::motion::ease`, and
+`motion.rs` pulls `egui::{Color32, Context, Id, Response}` at file scope — so
+importing it would put the whole UI crate into a crate that is headless on
+purpose. It uses exactly ONE curve, `out_cubic`, four lines of arithmetic,
+which is inlined with a test pinning it to the shared values. If `ease` is
+ever split into an egui-free module the copy should go away; two copies of a
+curve is a real cost, just smaller than the dependency.
+
+`grid` needed no change at all — 257 lines with no egui import.
 
 `incoming/launcher` stays as a ref until they are, because it is still the
 only copy of that work:
