@@ -26,6 +26,11 @@ pub struct Config {
     pub system_actions: Vec<String>,
     /// Hide the window when it loses focus (launcher behaviour).
     pub auto_hide: bool,
+    /// Master switch. Off sets every duration in `anim` to zero rather than
+    /// bypassing the board — see the loader.
+    pub animations: bool,
+    /// Tile motion, the plasmoid's Appearance group.
+    pub anim: crate::anim::BoardConfig,
 }
 
 impl Default for Config {
@@ -38,6 +43,8 @@ impl Default for Config {
             terminal_wrap: vec!["konsole".into(), "-e".into()],
             system_actions: vec!["lock".into(), "reboot".into(), "poweroff".into()],
             auto_hide: true,
+            animations: true,
+            anim: crate::anim::BoardConfig::default(),
         }
     }
 }
@@ -58,6 +65,37 @@ impl Config {
         if let Some(v) = ini.top("opacity").and_then(|v| v.parse().ok()) { c.opacity = v; }
         if let Some(v) = ini.top("icon_theme") { c.icon_theme = v.to_string(); }
         if let Some(v) = ini.top("auto_hide") { c.auto_hide = v != "false" && v != "0"; }
+        // Animation tunables. BoardConfig's own comment has said "tunables the
+        // settings page exposes; defaults follow the plasmoid schema" since it
+        // was written, and no settings page ever reached it — the plasmoid's
+        // main.xml carried tileSlideStyle, restackDuration and restackStagger
+        // and only QML could read them.
+        if let Some(v) = ini.top("animations") { c.animations = v != "false" && v != "0"; }
+        if let Some(v) = ini.top("slide_style") {
+            // By NAME, not the plasmoid's integer. main.xml stores
+            // tileSlideStyle=1 and only the QML knew which pattern that was;
+            // an ini a person edits by hand should not need that table.
+            if let Some(p) = crate::grid::SlidePattern::from_name(v) { c.anim.pattern = p; }
+        }
+        if let Some(v) = ini.top("enter_ms").and_then(|v| v.parse().ok()) { c.anim.enter_ms = v; }
+        if let Some(v) = ini.top("stagger_ms").and_then(|v| v.parse().ok()) { c.anim.stagger_ms = v; }
+        if let Some(v) = ini.top("restack_ms").and_then(|v| v.parse().ok()) { c.anim.restack_ms = v; }
+        if let Some(v) = ini.top("restack_stagger_ms").and_then(|v| v.parse().ok()) {
+            c.anim.restack_stagger_ms = v;
+        }
+        if let Some(v) = ini.top("exit_ms").and_then(|v| v.parse().ok()) { c.anim.exit_ms = v; }
+        // Animations off means DURATIONS OF ZERO, not a separate code path.
+        // The board still ticks, tiles still enter and leave and get removed
+        // on the tick that finishes their fade — they just arrive instantly.
+        // A second path that skips the board would drift from the animated one
+        // and only be exercised by whoever turned animations off.
+        if !c.animations {
+            c.anim.enter_ms = 0.0;
+            c.anim.stagger_ms = 0.0;
+            c.anim.restack_ms = 0.0;
+            c.anim.restack_stagger_ms = 0.0;
+            c.anim.exit_ms = 0.0;
+        }
         if let Some(v) = ini.top("terminal_wrap") {
             c.terminal_wrap = v.split_whitespace().map(str::to_string).collect();
         }
@@ -69,7 +107,9 @@ impl Config {
 
     pub fn save(&self) -> std::io::Result<()> {
         let text = format!(
-            "columns={}\nicon_px={}\nopacity={}\nicon_theme={}\nauto_hide={}\nterminal_wrap={}\nsystem_actions={}\n",
+            "columns={}\nicon_px={}\nopacity={}\nicon_theme={}\nauto_hide={}\nterminal_wrap={}\nsystem_actions={}\n\
+             animations={}\nslide_style={}\nenter_ms={}\nstagger_ms={}\nrestack_ms={}\n\
+             restack_stagger_ms={}\nexit_ms={}\n",
             self.columns,
             self.icon_px,
             self.opacity,
@@ -77,6 +117,13 @@ impl Config {
             self.auto_hide,
             self.terminal_wrap.join(" "),
             self.system_actions.join(","),
+            self.animations,
+            self.anim.pattern.name(),
+            self.anim.enter_ms,
+            self.anim.stagger_ms,
+            self.anim.restack_ms,
+            self.anim.restack_stagger_ms,
+            self.anim.exit_ms,
         );
         config_kit::save(APP, "config.ini", &text)
     }
@@ -149,5 +196,61 @@ mod tests {
         let rec = load_recents();
         let ids: Vec<_> = rec.iter().map(|(i, _)| i.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
+    }
+}
+#[cfg(test)]
+mod anim_config_tests {
+    use super::*;
+    use crate::grid::SlidePattern;
+
+    #[test]
+    fn the_slide_pattern_round_trips_by_name() {
+        // config.ini is hand-editable, so the text form is the contract. The
+        // plasmoid's integer discriminants stay for its own wire format.
+        for p in [SlidePattern::None, SlidePattern::FromBelow, SlidePattern::FromEdges,
+                  SlidePattern::Cascade, SlidePattern::Ripple, SlidePattern::Scatter,
+                  SlidePattern::Wave] {
+            assert_eq!(SlidePattern::from_name(p.name()), Some(p), "{}", p.name());
+        }
+    }
+
+    #[test]
+    fn an_unknown_pattern_name_keeps_the_default() {
+        // A typo must not silently select an arbitrary animation.
+        assert_eq!(SlidePattern::from_name("from-bellow"), None);
+        assert_eq!(SlidePattern::from_name(""), None);
+        // Case and underscore spellings are accepted, since both are natural
+        // to type.
+        assert_eq!(SlidePattern::from_name("From_Below"), Some(SlidePattern::FromBelow));
+    }
+
+    #[test]
+    fn animations_off_means_zero_durations_not_a_second_code_path() {
+        // The board still ticks, tiles still enter, restack and get removed on
+        // the tick that finishes their fade — they just arrive instantly. A
+        // bypass would drift from the animated path and only be exercised by
+        // whoever turned animations off.
+        let ini = "animations=false\n";
+        let parsed = config_kit::Ini::parse(ini);
+        let mut c = Config::default();
+        if let Some(v) = parsed.top("animations") { c.animations = v != "false" && v != "0"; }
+        assert!(!c.animations);
+        // Mirror the loader's clamp.
+        if !c.animations {
+            c.anim.enter_ms = 0.0;
+            c.anim.stagger_ms = 0.0;
+            c.anim.restack_ms = 0.0;
+            c.anim.restack_stagger_ms = 0.0;
+            c.anim.exit_ms = 0.0;
+        }
+        let mut b = crate::anim::Board::new(c.anim);
+        let g = crate::grid::GridSpec::fit(800.0, 600.0, 96.0, 0.0);
+        b.retarget(&["a", "b"], &g, 0.0);
+        b.tick(0.0);
+        // With zero durations the FIRST tick must land every tile at rest. An
+        // "instant" animation that still needs a frame to settle is the bug
+        // this shape avoids, and is_settled is the board's own word for it.
+        assert_eq!(b.len(), 2);
+        assert!(b.is_settled(), "zero durations must settle on the first tick");
     }
 }

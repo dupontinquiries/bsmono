@@ -64,6 +64,42 @@ pub enum SlidePattern {
 }
 
 impl SlidePattern {
+    /// The name used in hatch's config.ini.
+    ///
+    /// The plasmoid stored `tileSlideStyle=1` and only its QML knew that 1
+    /// meant from-below. An ini a person edits by hand should not require that
+    /// lookup table, so the discriminants stay (they are the plasmoid's wire
+    /// format) and the text form is what hatch reads and writes.
+    pub fn name(self) -> &'static str {
+        use SlidePattern::*;
+        match self {
+            None => "none",
+            FromBelow => "from-below",
+            FromEdges => "from-edges",
+            Cascade => "cascade",
+            Ripple => "ripple",
+            Scatter => "scatter",
+            Wave => "wave",
+        }
+    }
+
+    /// Parse the config form. Unknown names return `None` so the caller keeps
+    /// its default rather than silently animating differently — a typo in a
+    /// hand-edited ini should not pick an arbitrary pattern.
+    pub fn from_name(s: &str) -> Option<SlidePattern> {
+        use SlidePattern::*;
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "none" => None,
+            "from-below" | "from_below" => FromBelow,
+            "from-edges" | "from_edges" => FromEdges,
+            "cascade" => Cascade,
+            "ripple" => Ripple,
+            "scatter" => Scatter,
+            "wave" => Wave,
+            _ => return Option::None,
+        })
+    }
+
     pub fn from_index(i: usize) -> SlidePattern {
         use SlidePattern::*;
         [None, FromBelow, FromEdges, Cascade, Ripple, Scatter, Wave]

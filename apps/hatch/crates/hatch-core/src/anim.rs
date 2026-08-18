@@ -72,7 +72,7 @@ struct Tile {
 }
 
 /// Tunables the settings page exposes; defaults follow the plasmoid schema.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoardConfig {
     pub pattern: SlidePattern,
     pub enter_ms: f32,
@@ -186,12 +186,26 @@ impl Board {
                     t.pose = TilePose { x: t.home.0, y: t.home.1, scale: 1.0, alpha: 1.0, rot: 0.0 };
                 }
                 Phase::EnterPending { at_ms } => {
-                    moving = true;
                     if now_ms >= at_ms {
-                        t.phase = Phase::Entering { t0: at_ms };
-                        // fall through next tick; set pose now for this frame
-                        Self::ease_to_home(t, cfg.enter_ms, at_ms, now_ms, true);
+                        // ease_to_home reports whether it ARRIVED. Taking that
+                        // answer matters when the duration is zero: the tile
+                        // lands at home on this very tick, and claiming the
+                        // board is still moving would cost a frame and leave
+                        // is_settled false with nothing left to animate.
+                        //
+                        // That is not hypothetical — hatch turns animations
+                        // off by setting every duration to zero rather than
+                        // bypassing the board, precisely so there is one code
+                        // path. Unconditional `moving = true` here made the
+                        // disabled case never settle.
+                        if Self::ease_to_home(t, cfg.enter_ms, at_ms, now_ms, true) {
+                            t.phase = Phase::Settled;
+                        } else {
+                            t.phase = Phase::Entering { t0: at_ms };
+                            moving = true;
+                        }
                     } else {
+                        moving = true;
                         t.pose = t.from; // parked, alpha 0
                     }
                 }
@@ -230,7 +244,16 @@ impl Board {
     /// Ease `t` from `t.from` toward home over `dur_ms` starting at `t0`.
     /// Returns true when arrived. `fade_in` also ramps alpha 0→1.
     fn ease_to_home(t: &mut Tile, dur_ms: f32, t0: f64, now_ms: f64, fade_in: bool) -> bool {
-        let u = (((now_ms - t0) as f32) / dur_ms.max(1.0)).clamp(0.0, 1.0);
+        // A zero duration is DONE, not one millisecond long. `dur_ms.max(1.0)`
+        // guards the divide, and it also turned "instant" into "next frame":
+        // at now_ms == t0 the progress was 0/1 = 0, so a tile with animations
+        // disabled sat at its start pose for a tick. The guard stays for the
+        // divide; the zero case answers before reaching it.
+        let u = if dur_ms <= 0.0 {
+            1.0
+        } else {
+            (((now_ms - t0) as f32) / dur_ms).clamp(0.0, 1.0)
+        };
         let e = out_cubic(u);
         t.pose = TilePose {
             x: t.from.x + (t.home.0 - t.from.x) * e,
