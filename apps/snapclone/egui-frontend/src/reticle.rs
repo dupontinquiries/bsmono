@@ -170,6 +170,42 @@ pub fn reticle_ui(ui: &mut egui::Ui, r: &Reticle, view: egui::Rect,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_viewfinder_draws_this_reticle_and_not_a_timer() {
+        // The changeover was started and left one call short: Viewfinder held
+        // a Reticle, tap() called trigger_at, tick() advanced it — and the
+        // paint still used a fixed-timer fade, so this module never reached a
+        // screen. The old path is gone; this fails if it comes back.
+        let cam = include_str!("camera.rs");
+        assert!(cam.contains("reticle::reticle_ui("), "the reticle is not drawn");
+        assert!(!cam.contains("let a = vf.reticle_alpha();"),
+                "the timer-based fade is back alongside the reticle");
+    }
+
+    #[test]
+    fn a_result_outlives_a_search() {
+        // Why the timer version was not good enough: it faded on a schedule
+        // whatever the camera did, so it could not tell "focused" from "gave
+        // up". A result must linger long enough to read.
+        let mut searching = Reticle::default();
+        searching.trigger_at(0.5, 0.5);
+        let mut locked = Reticle::default();
+        locked.trigger_at(0.5, 0.5);
+        locked.set_state(FocusState::Locked);
+
+        // Advance both by the same amount and the settled one must still be
+        // showing when the searching one has faded further.
+        for _ in 0..12 {
+            searching.tick(100.0);
+            locked.tick(100.0);
+        }
+        assert!(locked.state().is_result());
+        assert!(!searching.state().is_result());
+        assert!(locked.alpha() >= searching.alpha(),
+                "a result faded faster than an unresolved search: {} vs {}",
+                locked.alpha(), searching.alpha());
+    }
+
     use super::*;
 
     fn triggered() -> Reticle {

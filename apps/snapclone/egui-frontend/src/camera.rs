@@ -154,6 +154,16 @@ impl Viewfinder {
     }
 
     /// Reticle opacity 0..1, or 0 when there is nothing to show.
+    ///
+    /// SUPERSEDED and no longer drawn — `reticle::Reticle` is what the
+    /// viewfinder paints. Kept because `focus`/`focus_age` still gate the
+    /// tap logic and its tests, and because this timer is what decides when
+    /// `focus` clears. Removing it means deciding what clears the focus point
+    /// instead, which is a behaviour change and not a tidy-up; it should
+    /// happen when the reticle also owns that lifetime.
+    ///
+    /// Nothing new should call this. The reason is in the draw site: a fade on
+    /// a fixed schedule cannot say whether the camera focused.
     pub fn reticle_alpha(&self) -> f32 {
         match self.focus {
             None => 0.0,
@@ -201,20 +211,16 @@ pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::Texture
     if let Some(pos) = resp.interact_pointer_pos() {
         if resp.clicked() { vf.tap(pos, rect); }
     }
-    let a = vf.reticle_alpha();
-    if a > 0.0 {
-        if let Some(s) = vf.focus {
-            let c = vf.to_screen(s, rect);
-            let col = colors.accent.gamma_multiply(a);
-            let r = 26.0 - 6.0 * (1.0 - a);       // settles inward as it fades
-            p.circle_stroke(c, r, Stroke::new(2.0_f32, col));
-            for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-                p.line_segment([Pos2::new(c.x + dx * r, c.y + dy * r),
-                                Pos2::new(c.x + dx * (r + 6.0), c.y + dy * (r + 6.0))],
-                               Stroke::new(2.0_f32, col));
-            }
-        }
-    }
+    // THE REAL RETICLE. `Viewfinder` has held a `reticle::Reticle` since the
+    // changeover started, `tap()` already calls `trigger_at`, and the comment
+    // on that field says new drawing should use it — then the drawing here
+    // stayed on the old fixed-timer fade, so nothing ever rendered the module.
+    //
+    // The difference is not cosmetic. The timer version fades on a schedule
+    // whatever the camera did, so it cannot tell "focused" from "gave up";
+    // reticle::Reticle carries Searching / Locked / Failed and lingers on a
+    // RESULT, which is the whole reason it was written.
+    crate::reticle::reticle_ui(ui, &vf.reticle, rect, colors);
     if let Some(name) = &vf.recipient {
         p.text(Pos2::new(rect.min.x + 10.0, rect.min.y + 8.0), egui::Align2::LEFT_TOP,
                format!("to {name}"), egui::FontId::proportional(13.0), colors.text);
