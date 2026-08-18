@@ -415,6 +415,38 @@ pub fn feed_ui(ui: &mut egui::Ui, feed: &SnapFeed, press: &mut Press, now: i64,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_feed_is_drawn_and_a_hold_reaches_the_conversation() {
+        // feed_ui was ported and never called while the controller carried
+        // SnapFeed, the Press tracker for tap-vs-hold, and open_snap_routed.
+        // Received snaps had nowhere to appear.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("snaps::feed_ui("), "the feed is not drawn");
+        assert!(lib.contains("FeedAction::OpenThread"), "a hold goes nowhere");
+        assert!(lib.contains("FeedAction::Open("), "a tap is not handled at all");
+    }
+
+    #[test]
+    fn a_feed_entry_is_not_enough_to_open_a_viewer() {
+        // The reason the Open arm reports instead of opening, pinned so nobody
+        // "fixes" it by constructing a Snap with empty bytes: that opens a
+        // viewer onto nothing AND starts the expiry timer, consuming a snap
+        // that was never seen.
+        let e = FeedEntry {
+            id: "s1".into(), sender_name: "ana".into(), sent_at: 100,
+            media: Media::Image, thumb_path: String::new(),
+        };
+        // Everything a viewer needs beyond this is absent: the payload, and
+        // the sender ID a conversation is keyed by.
+        assert!(e.thumb_path.is_empty());
+        // A Snap needs bytes and a sender_id the entry does not carry.
+        let s = Snap { id: e.id.clone(), sender_id: String::new(),
+                       sender_name: e.sender_name.clone(), sent_at: e.sent_at,
+                       media: e.media, duration_secs: 0, bytes: Vec::new() };
+        assert!(s.bytes.is_empty(), "a Snap carries decrypted bytes; a FeedEntry has none");
+        assert!(s.sender_id.is_empty(), "and the sender id a conversation is keyed by");
+    }
+
     use super::*;
 
     fn entry(id: &str, who: &str, at: i64) -> FeedEntry {

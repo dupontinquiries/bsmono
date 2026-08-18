@@ -126,6 +126,9 @@ pub struct Snapclone {
     /// toast system: this app has none, and adding one to report a duration
     /// would be the tail wagging the dog.
     pub shutter_note: String,
+    /// Why the last feed tap did not open a viewer. Empty when there is
+    /// nothing to say.
+    pub feed_note: String,
     /// This device's sc-ID, for the code somebody else scans.
     ///
     /// Held rather than derived: the identity belongs to the crypto layer and
@@ -517,6 +520,7 @@ impl Snapclone {
             cam_selection: None,
             shutter: Default::default(),
             shutter_note: String::new(),
+            feed_note: String::new(),
             local_id: String::new(),
             frames: Default::default(),
             cam_texture: None,
@@ -3148,6 +3152,47 @@ impl Snapclone {
             self.inbox.mark_read(id);
             self.conversation_peer = id.to_string();
         }
+        // THE SNAP FEED. feed_ui was ported and never called, while the
+        // controller carried the SnapFeed, a Press tracker for its
+        // tap-vs-hold, and open_snap_routed for what a tap leads to. Received
+        // snaps had nowhere to appear.
+        if !self.feed.is_empty() {
+            ui.separator();
+            let now = self.now_secs;
+            if let Some(act) = crate::snaps::feed_ui(ui, &self.feed, &mut self.feed_press, now, c) {
+                match act {
+                    crate::snaps::FeedAction::OpenThread(sender) => {
+                        // A HOLD opens the sender's conversation, which is
+                        // already the page's own mechanism just below.
+                        self.conversation_peer = sender;
+                    }
+                    crate::snaps::FeedAction::Open(id) => {
+                        // A TAP should open the ephemeral viewer, and cannot
+                        // yet. open_snap_routed takes a Snap with its
+                        // DECRYPTED BYTES; a FeedEntry carries an id, a
+                        // sender, a timestamp and a thumbnail path. Fetching
+                        // and decrypting the payload is the host's job and
+                        // there is no request path for it here.
+                        //
+                        // Constructing a Snap with empty bytes would open a
+                        // viewer onto nothing and start its expiry timer — the
+                        // snap would be consumed without ever being seen,
+                        // which is worse than not opening.
+                        // Said in place rather than through a toast: this
+                        // controller has no general message channel
+                        // (shutter_note is the camera's), and inventing one
+                        // for a single line would be a mechanism with one
+                        // caller.
+                        self.feed_note = format!("{id}: waiting on the host to fetch this snap");
+                    }
+                }
+            }
+        }
+
+        if !self.feed_note.is_empty() {
+            ui.colored_label(c.text_weak, &self.feed_note);
+        }
+
         // The conversation itself, below the list: a tap on a row should show
         // the thread rather than only marking it read.
         if !self.conversation_peer.is_empty() {
