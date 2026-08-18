@@ -71,6 +71,7 @@ pub mod micresponse; // sound -> physical motion: leaf inertia, rune onsets, fra
 pub mod textsurface; // which scene object carries words, and which shapes legibly can
 pub mod chatgesture; // swipe -> variant/branch, with the guards that keep it from fighting the scroller
 pub mod mobilelayout; // width rules: egui horizontal() does not wrap, so narrow rows overlap
+pub mod replicatorlayout; // where the fan's columns go, and what Enter does when it is open (pure)
 pub use logscope_fan::stepverify; // per-step verification: the feedback signal the coordinator lacked
 pub mod docorg; // document-organization convention: front-matter, generated index, branch merge
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
