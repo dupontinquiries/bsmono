@@ -264,4 +264,39 @@ mod tests {
         assert!(c.can_send(true));
         assert!(!c.can_send(false), "but there has to be an image");
     }
+
+    #[test]
+    fn the_caption_leaves_the_keyboard_alone_when_nothing_is_focused() {
+        // The state the app is in most of the time. An inset applied
+        // unconditionally would push the caption up permanently, which is a
+        // worse bug than the one it fixes because it is always on.
+        let mut c = Composer::default();
+        c.caption_y = 0.9;
+        c.apply_keyboard_inset(false, 0.45);
+        assert_eq!(c.keyboard_inset, 0.0);
+        assert!(c.effective_caption_y() > 0.8, "no keyboard, no lift");
+    }
+
+    #[test]
+    fn a_caption_at_the_bottom_is_lifted_clear_of_the_panel() {
+        // The whole point: typing at text you cannot see.
+        let mut c = Composer::default();
+        c.caption_y = 0.95;
+        c.apply_keyboard_inset(true, 0.45);
+        let y = c.effective_caption_y();
+        assert!(y <= 1.0 - 0.45 - 0.08 + 1e-6, "caption at {y} still under the keyboard");
+        assert!(y > 0.0);
+    }
+
+    #[test]
+    fn an_absurd_panel_height_cannot_push_the_caption_off_screen() {
+        // A compositor reporting a bad fraction, or a fallback guess on a
+        // device with a very tall panel. The clamp keeps the caption on the
+        // canvas rather than trading one invisible caption for another.
+        let mut c = Composer::default();
+        c.caption_y = 0.5;
+        c.apply_keyboard_inset(true, 5.0);
+        assert!(c.keyboard_inset <= 0.9, "clamped");
+        assert!(c.effective_caption_y() >= 0.05, "still on screen");
+    }
 }

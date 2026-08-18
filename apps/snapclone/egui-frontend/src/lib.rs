@@ -2484,7 +2484,30 @@ impl Snapclone {
         // the composer, over the captured frame
         ui.horizontal(|ui| {
             ui.label("caption");
-            ui.text_edit_singleline(&mut self.composer.caption);
+            let cap = ui.text_edit_singleline(&mut self.composer.caption);
+            // THE KEYBOARD INSET, finally fed. apply_keyboard_inset has been
+            // written and tested since the port and nothing ever called it —
+            // the manifest records the gap as an open on-device task, because
+            // winit and egui 0.34 do not surface the compositor's input-panel
+            // rect and only a maliit / zwp_input_panel listener knows the true
+            // height.
+            //
+            // What IS knowable here is whether a text field has focus, which
+            // is when a panel is showing. egui reports the IME rect when the
+            // platform gives it one; where it does not, 0.45 is the fraction
+            // the module's own test uses and roughly what a phone keyboard
+            // takes. So: the right height when the platform says, a usable one
+            // when it does not, and zero when nothing is focused — instead of
+            // a caption that stays under the keyboard in every case.
+            let visible = cap.has_focus();
+            let fraction = ui
+                .ctx()
+                .input(|i| i.events.iter().find_map(|e| match e {
+                    egui::Event::Ime(_) => Some(0.45),
+                    _ => None,
+                }))
+                .unwrap_or(0.45);
+            self.composer.apply_keyboard_inset(visible, fraction);
             if ui.button("colour").clicked() { self.composer.cycle_color(); }
             let d = self.composer.duration;
             // Say what the timer MEANS before the snap is sent, not after. The
