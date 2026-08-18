@@ -121,3 +121,47 @@ this instead.
 The general lesson for shipping bundles: `git bundle verify` prints the
 prerequisites, and those name the base a branch was actually built on. Reading
 them first would have caught this before it reached a commit message.
+
+---
+
+# Addendum: what "the ports don't function" turned out to be (2026-08-18)
+
+Four measurements were built to find why the egui ports looked finished and
+were not. Recording what each found, because the ratio is the useful part and
+the next person should not rebuild them.
+
+| question | real defects | false positives |
+|---|---:|---:|
+| does the port link its own engine? | 1 | 4 |
+| does it use the shared kit? | 1 | (deleted — unmeasurable) |
+| is a ported surface unreachable? | 1 | 5 |
+| is a public mutator never called? | 2 | (253 unfiltered) |
+| is a module referenced only by tests? | 0 | 1 |
+
+**The one that mattered.** bo-suite's egui frontend depended on no part of
+bo-suite's engine — not bo-core, not bo-mux — while rendering the whole
+application. 47 surfaces, 396 tests, and it could not cancel a decibel. Fixed
+by linking bo-mux and deleting the gates `anc.rs` had reimplemented. That find
+alone justified the exercise.
+
+**The near-miss worth remembering.** `bo_core::pattern_learner` — the premise
+the project rests on, predicting periodic noise from the previous cycle so
+latency stops mattering — was `#![allow(dead_code)]`, vendored from a bo-mux
+that no longer had a copy, and referenced by NOTHING in the tree. No metric
+found it. It surfaced from reading a crate that a metric had pointed at for a
+different reason.
+
+**The failure mode of every false positive was the same.** A rule that infers
+INTENT from a name is wrong often enough to be unusable: a `render()` that
+renders text, a `GestureHost` nothing references, a service that should stay
+behind a socket, a `CargoTab` fully ported as `tabs/cargo.rs`. Rules that check
+a FACT — is this path in that manifest, does this file exist, does this
+function take a UI context — survived. One of these cost a duplicated 300-line
+port before it was caught.
+
+**Where that leaves the question.** Every port is 100% live with no dead
+modules and no unlinked engines, and none of that means the apps work. The
+metrics available from source are exhausted; what remains needs a device, a
+display, and someone using them. `code%` is explicitly NOT the gap — see the
+docstring on `covered_live`, which warns that chasing it means re-porting
+finished work.
