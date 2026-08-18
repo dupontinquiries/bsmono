@@ -2078,6 +2078,17 @@ impl Snapclone {
             }
         }
 
+        // THE SCRIMS, under the dialogs and over the page. ModalSurface is
+        // used for ORDERING already — dialogs present onto it and dismiss off
+        // it, and `topmost` decides which body to draw — but scrims_ui was
+        // never called, so a dialog appeared over a page at full brightness
+        // with nothing saying the page behind it was inert.
+        //
+        // Drawn here rather than at the end of the frame: a scrim painted
+        // after the dialogs would cover them, which is the one placement that
+        // turns a fix into a black screen.
+        crate::modal::scrims_ui(ui, &self.modal);
+
         // THE DELETE CONFIRMATION. Third of the six modals to get a body.
         if self.confirm.is_some() {
             let want = format!("confirm-delete:{}", self.confirm_id);

@@ -266,6 +266,38 @@ pub fn scrims_ui(ui: &mut egui::Ui, s: &ModalSurface) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_scrims_are_drawn_beneath_the_dialogs() {
+        // ModalSurface was used for ORDERING — dialogs present onto it,
+        // dismiss off it, and `topmost` picks which body to draw — while
+        // scrims_ui was never called. A dialog appeared over a page at full
+        // brightness with nothing saying the page behind it was inert.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("modal::scrims_ui("), "no scrim under the dialogs");
+        // And it must come BEFORE the dialog bodies. A scrim painted after
+        // them covers them, which is the one placement that turns this fix
+        // into a black screen.
+        let scrim = lib.find("modal::scrims_ui(").unwrap();
+        let confirm = lib.find("THE DELETE CONFIRMATION").unwrap();
+        assert!(scrim < confirm, "the scrim is painted over the dialog it should sit under");
+    }
+
+    #[test]
+    fn a_heavier_layer_dims_harder_and_the_light_ones_not_at_all() {
+        // The ordering is the point: a Critical modal must not be easier to
+        // ignore than a Dialog behind it.
+        assert!(Layer::Critical.scrim_alpha() > Layer::Confirm.scrim_alpha());
+        assert!(Layer::Confirm.scrim_alpha() > Layer::Dialog.scrim_alpha());
+        assert!(Layer::Dialog.has_scrim());
+        // Layers below Dialog carry none — a sheet or a toast that dimmed the
+        // page would claim a modality it does not have.
+        for l in Layer::ALL {
+            if !matches!(l, Layer::Critical | Layer::Confirm | Layer::Dialog) {
+                assert_eq!(l.scrim_alpha(), 0, "{l:?} should not dim the page");
+            }
+        }
+    }
+
     fn r() -> Rect { Rect::new(100.0, 100.0, 200.0, 150.0) }
 
     fn surface_with_dialog() -> ModalSurface {
