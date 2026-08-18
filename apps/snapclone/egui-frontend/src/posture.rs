@@ -296,6 +296,33 @@ pub fn dim_overlay_ui(ui: &mut egui::Ui, out: Output, screen: egui::Rect) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_engine_runs_in_the_app_and_not_only_in_tests() {
+        // tick_posture was reached ONLY from tests, so the fleet's one sensor
+        // integration never advanced in the running app: no dim at your ear,
+        // and the push-to-talk flip to gated talk never fired. Both halves are
+        // asserted, because ticking without painting was the previous state
+        // and painting without ticking would freeze the overlay.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("let posture = self.tick_posture(dt_ms);"),
+                "the engine is not advanced per frame");
+        assert!(lib.contains("posture::dim_overlay_ui("), "the dim is never painted");
+    }
+
+    #[test]
+    fn a_clear_screen_costs_nothing_to_draw() {
+        // The overlay runs every frame, and the phone is almost never at your
+        // ear — so the zero case must be an early return rather than a
+        // full-screen transparent rect composited for nothing.
+        let out = Output { dim: 0.0, screensaver: false, gated_talk: false };
+        assert_eq!(out.dim, 0.0);
+        // And a disarmed engine reports exactly that rather than freezing at
+        // whatever depth it had reached.
+        let mut e = PostureEngine::default();
+        let o = e.tick(16.0);
+        assert_eq!(o.dim, 0.0, "an unarmed engine must clear, not hold");
+    }
+
     fn armed_engine() -> PostureEngine {
         let mut e = PostureEngine::default();
         e.set_armed(true);

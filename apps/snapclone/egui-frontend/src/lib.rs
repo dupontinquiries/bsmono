@@ -1937,6 +1937,15 @@ impl Snapclone {
         self.feedback.set_enabled(adaptive.is_compact());
         let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
         let pointer_down = ui.input(|i| i.pointer.any_down());
+        // POSTURE. The fleet's only sensor integration — proximity from
+        // iio-sensor-proxy, motion from raw IIO counts — and tick_posture was
+        // reached ONLY from tests, so in the running app the engine never
+        // advanced: no screensaver dim at your ear, and the push-to-talk flip
+        // to gated talk never fired. Ticked here because it is per-frame state
+        // like the rest, and the returned dim is painted at the end of this
+        // function over everything else.
+        let posture = self.tick_posture(dt_ms);
+
         if self.tick_feedback(dt_ms, pointer_down) {
             ui.ctx().request_repaint();
         }
@@ -2215,6 +2224,12 @@ impl Snapclone {
             3 => self.wayfinder_page(ui, &colors),
             _ => self.settings_page(ui, &colors),
         }
+
+        // THE DIM, painted last so it covers the page rather than being
+        // covered by it. dim_overlay_ui returns immediately at zero, so this
+        // costs nothing on the overwhelming majority of frames — the phone is
+        // not at your ear.
+        crate::posture::dim_overlay_ui(ui, posture, ui.ctx().screen_rect());
     }
 
     /// Advance the interaction layer. Called once per frame from `ui` so the
