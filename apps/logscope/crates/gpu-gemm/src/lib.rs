@@ -27,6 +27,7 @@ pub mod tourney;
 pub mod reap;
 pub mod round;
 pub mod corpus;
+pub mod scope;
 pub mod recover;
 pub mod specverify;
 pub mod batchplan;
