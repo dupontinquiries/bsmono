@@ -582,3 +582,340 @@ mod real_bundle_tests {
         assert!(!crate::ops::has_commit("not-a-sha"));
     }
 }
+
+// ── driving a real `git am -3` ───────────────────────────────────────────────
+
+use std::path::Path;
+
+fn git(repo: &Path, args: &[&str]) -> (bool, String, String) {
+    match std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("PATH", crate::ops::tool_path_env())
+        // `am` opens an editor on some configurations; a GUI has none, and a
+        // blocked editor looks exactly like a hung apply.
+        .env("GIT_EDITOR", "true")
+        .output()
+    {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        ),
+        Err(e) => (false, String::new(), e.to_string()),
+    }
+}
+
+/// Files with conflict markers right now.
+pub fn conflicted_paths(repo: &Path) -> Vec<String> {
+    let (_, out, _) = git(repo, &["diff", "--name-only", "--diff-filter=U"]);
+    out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+}
+
+/// Files git still calls unmerged that STILL CONTAIN conflict markers.
+///
+/// The distinction from [`conflicted_paths`] is the whole guard: that reports
+/// the index, which only staging clears, while this reports the bytes, which
+/// is what the operator actually fixes.
+pub fn unresolved_markers(repo: &Path) -> Vec<String> {
+    conflicted_paths(repo)
+        .into_iter()
+        .filter(|p| {
+            std::fs::read_to_string(repo.join(p))
+                .map(|s| s.contains("<<<<<<<") || s.contains(">>>>>>>"))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Is an `am` already in progress?
+///
+/// Checked before starting rather than after failing: `git am` refuses to
+/// begin while a previous one is unfinished, and its message ("previous
+/// rebase directory ... still exists") reads as a bug in this tool rather than
+/// as a state the operator can resolve.
+pub fn am_in_progress(repo: &Path) -> bool {
+    repo.join(".git/rebase-apply").exists()
+}
+
+/// Start applying a series with three-way merge.
+///
+/// `-3` is not optional here. Without it `am` needs the exact blobs the patch
+/// was written against and fails on anything that has moved; with it, the
+/// patch applies by content — which is the entire reason a patch series
+/// survives a history rewrite when a bundle does not.
+pub fn am_start(repo: &Path, patches: &[String], s: &mut Session) -> Apply {
+    if am_in_progress(repo) {
+        s.state = Apply::Aborted {
+            at: 0,
+            reason: "an apply is already in progress — finish or abort it first".into(),
+        };
+        return s.state.clone();
+    }
+    if patches.is_empty() {
+        s.state = Apply::Done { applied: 0 };
+        return s.state.clone();
+    }
+    s.start();
+    let mut args: Vec<&str> = vec!["am", "-3", "--keep-non-patch"];
+    args.extend(patches.iter().map(String::as_str));
+    let (ok, _, err) = git(repo, &args);
+    settle(repo, s, ok, &err)
+}
+
+/// Continue, skip or abort, then report where the run ended up.
+pub fn am_resolve(repo: &Path, s: &mut Session, r: Resolution) -> Apply {
+    let verb = match r {
+        Resolution::Continue => "--continue",
+        Resolution::Skip => "--skip",
+        Resolution::Abort => "--abort",
+    };
+    if r == Resolution::Continue {
+        // Refused on MARKERS IN THE CONTENT, not on an unmerged index.
+        //
+        // The first version checked `diff --diff-filter=U`, which reports the
+        // index — and editing a file does not clear that, staging does. So a
+        // correctly resolved conflict was refused forever: the operator fixes
+        // the file, presses continue, and is told the file is still
+        // conflicted. Caught by the test that resolves and continues.
+        //
+        // What must actually be prevented is committing markers, and that is a
+        // question about the bytes. `am --continue` with `<<<<<<<` in a file
+        // commits it, which is the one irreversible mistake available here.
+        let unresolved = unresolved_markers(repo);
+        if !unresolved.is_empty() {
+            if let Apply::Conflicted { at, total, .. } = s.state {
+                s.state = Apply::Conflicted { at, total, paths: unresolved };
+            }
+            return s.state.clone();
+        }
+    }
+    if r == Resolution::Continue {
+        // Everything resolved has to be staged, or `am` reports an empty patch
+        // and stops again on the same one.
+        let _ = git(repo, &["add", "-A"]);
+    }
+    let (ok, _, err) = git(repo, &[ "am", verb ]);
+    if r == Resolution::Abort {
+        s.state = Apply::Aborted { at: applied_so_far(repo, s), reason:
+            "aborted; the tree is back where it started".into() };
+        return s.state.clone();
+    }
+    settle(repo, s, ok, &err)
+}
+
+fn applied_so_far(_repo: &Path, s: &Session) -> usize {
+    match s.state {
+        Apply::Running { at, .. } | Apply::Conflicted { at, .. } => at,
+        _ => 0,
+    }
+}
+
+/// Read the outcome from the repo rather than from the exit code.
+///
+/// `git am` exits non-zero both for a conflict the operator can fix and for a
+/// refusal they cannot, and the difference is whether an apply is still in
+/// progress. Trusting the exit code alone reports a resolvable conflict as a
+/// failure.
+fn settle(repo: &Path, s: &mut Session, ok: bool, err: &str) -> Apply {
+    if ok && !am_in_progress(repo) {
+        s.state = Apply::Done { applied: s.total };
+        return s.state.clone();
+    }
+    if am_in_progress(repo) {
+        let paths = conflicted_paths(repo);
+        let at = current_patch_index(repo).unwrap_or_else(|| applied_so_far(repo, s));
+        s.state = Apply::Conflicted { at, total: s.total, paths };
+        return s.state.clone();
+    }
+    s.state = Apply::Aborted {
+        at: applied_so_far(repo, s),
+        reason: if err.is_empty() { "apply failed".into() } else { err.to_string() },
+    };
+    s.state.clone()
+}
+
+/// Which patch `am` is holding, from its own bookkeeping.
+///
+/// `.git/rebase-apply/next` is 1-based and counts the patch being attempted.
+fn current_patch_index(repo: &Path) -> Option<usize> {
+    let n = std::fs::read_to_string(repo.join(".git/rebase-apply/next")).ok()?;
+    n.trim().parse::<usize>().ok().map(|v| v.saturating_sub(1))
+}
+
+#[cfg(test)]
+mod real_am_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Build a repo, a patch series from a divergent branch, and return both.
+    ///
+    /// The scenario is the one this module exists for: patches authored against
+    /// a base the target no longer has at its tip, which is what a history
+    /// rewrite leaves behind.
+    fn scenario(name: &str, conflicting: bool) -> Option<(PathBuf, Vec<String>)> {
+        let dir = std::env::temp_dir().join(format!("am-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args).current_dir(&dir)
+                .env("GIT_EDITOR", "true")
+                .output().ok()
+        };
+        g(&["init", "-q", "-b", "main", "."])?;
+        g(&["config", "user.email", "t@t"])?;
+        g(&["config", "user.name", "t"])?;
+        std::fs::write(dir.join("f.txt"), "base\n").ok()?;
+        g(&["add", "-A"])?;
+        g(&["commit", "-q", "-m", "base"])?;
+
+        // A feature branch with two commits, exported as patches.
+        g(&["checkout", "-q", "-b", "feature"])?;
+        std::fs::write(dir.join("f.txt"), "base\nfeature one\n").ok()?;
+        g(&["commit", "-q", "-am", "feature one"])?;
+        std::fs::write(dir.join("g.txt"), "second file\n").ok()?;
+        g(&["add", "-A"])?;
+        g(&["commit", "-q", "-m", "feature two"])?;
+        let pdir = dir.join("patches");
+        std::fs::create_dir_all(&pdir).ok()?;
+        g(&["format-patch", "-o", pdir.to_str()?, "main..feature"])?;
+
+        // main moves on. With `conflicting`, it touches the same line the first
+        // patch does, so `am -3` must stop.
+        g(&["checkout", "-q", "main"])?;
+        if conflicting {
+            std::fs::write(dir.join("f.txt"), "base\nmain went its own way\n").ok()?;
+        } else {
+            std::fs::write(dir.join("unrelated.txt"), "elsewhere\n").ok()?;
+            g(&["add", "-A"])?;
+        }
+        g(&["commit", "-q", "-am", "main moves"])?;
+        g(&["branch", "-q", "-D", "feature"])?;
+
+        let mut patches: Vec<String> = std::fs::read_dir(&pdir).ok()?
+            .flatten()
+            .map(|e| e.path().to_string_lossy().to_string())
+            .filter(|p| p.ends_with(".patch"))
+            .collect();
+        patches.sort();
+        Some((dir, patches))
+    }
+
+    #[test]
+    fn a_clean_series_applies_onto_a_moved_head() {
+        // The property that makes patches the right re-send: the base they were
+        // written against is no longer HEAD, and they still apply.
+        let Some((dir, patches)) = scenario("clean", false) else { return };
+        assert_eq!(patches.len(), 2, "two patches expected");
+        let mut s = Session::new(vec!["feature one".into(), "feature two".into()]);
+        let st = am_start(&dir, &patches, &mut s);
+        assert_eq!(st, Apply::Done { applied: 2 }, "{}", s.status_line());
+        assert!(!am_in_progress(&dir));
+        // And the work really landed.
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline", "-3", "--format=%s"])
+            .current_dir(&dir).output().unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(log.contains("feature two") && log.contains("feature one"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_conflict_stops_and_reports_the_file_and_the_patch() {
+        let Some((dir, patches)) = scenario("conflict", true) else { return };
+        let mut s = Session::new(vec!["feature one".into(), "feature two".into()]);
+        let st = am_start(&dir, &patches, &mut s);
+        match st {
+            Apply::Conflicted { at, total, ref paths } => {
+                assert_eq!(at, 0, "the FIRST patch is the one that conflicts");
+                assert_eq!(total, 2);
+                assert!(paths.iter().any(|p| p.contains("f.txt")), "{paths:?}");
+                assert_eq!(s.current_subject(), Some("feature one"));
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert!(am_in_progress(&dir), "am should still be holding the series");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn continue_is_refused_while_markers_remain() {
+        // `am --continue` with markers in the tree COMMITS them. That is the
+        // one irreversible mistake available here, so it must be refused rather
+        // than attempted.
+        let Some((dir, patches)) = scenario("markers", true) else { return };
+        let mut s = Session::new(vec!["feature one".into(), "feature two".into()]);
+        am_start(&dir, &patches, &mut s);
+        assert!(matches!(s.state, Apply::Conflicted { .. }));
+
+        let st = am_resolve(&dir, &mut s, Resolution::Continue);
+        assert!(matches!(st, Apply::Conflicted { .. }),
+                "continue went ahead with conflicts unresolved: {st:?}");
+        // Nothing was committed.
+        let body = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        assert!(body.contains("<<<<<<<"), "the markers should still be there");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_the_conflict_then_continuing_finishes_the_series() {
+        let Some((dir, patches)) = scenario("resolve", true) else { return };
+        let mut s = Session::new(vec!["feature one".into(), "feature two".into()]);
+        am_start(&dir, &patches, &mut s);
+        // The operator fixes the file.
+        std::fs::write(dir.join("f.txt"), "base\nboth ways\n").unwrap();
+        let st = am_resolve(&dir, &mut s, Resolution::Continue);
+        assert_eq!(st, Apply::Done { applied: 2 }, "{}", s.status_line());
+        assert!(!am_in_progress(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abort_puts_the_tree_back() {
+        let Some((dir, patches)) = scenario("abort", true) else { return };
+        let before = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        let mut s = Session::new(vec!["feature one".into(), "feature two".into()]);
+        am_start(&dir, &patches, &mut s);
+        let st = am_resolve(&dir, &mut s, Resolution::Abort);
+        assert!(matches!(st, Apply::Aborted { .. }));
+        assert!(!am_in_progress(&dir));
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), before,
+                   "abort left the working tree changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skipping_the_conflicting_patch_applies_the_rest() {
+        let Some((dir, patches)) = scenario("skip", true) else { return };
+        let mut s = Session::new(vec!["feature one".into(), "feature two".into()]);
+        am_start(&dir, &patches, &mut s);
+        let st = am_resolve(&dir, &mut s, Resolution::Skip);
+        assert_eq!(st, Apply::Done { applied: 2 }, "{}", s.status_line());
+        // The second patch's file is there; the first patch's change is not.
+        assert!(dir.join("g.txt").exists(), "the skipped-past patch did not apply");
+        let f = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        assert!(!f.contains("feature one"), "the skipped patch was applied anyway");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_start_while_one_is_in_progress_is_refused_with_a_reason() {
+        // git am's own message ("previous rebase directory still exists") reads
+        // as a bug in this tool rather than a state the operator can fix.
+        let Some((dir, patches)) = scenario("busy", true) else { return };
+        let mut s = Session::new(vec!["one".into(), "two".into()]);
+        am_start(&dir, &patches, &mut s);
+        assert!(am_in_progress(&dir));
+
+        let mut s2 = Session::new(vec!["one".into(), "two".into()]);
+        let st = am_start(&dir, &patches, &mut s2);
+        match st {
+            Apply::Aborted { ref reason, .. } => {
+                assert!(reason.contains("already in progress"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
