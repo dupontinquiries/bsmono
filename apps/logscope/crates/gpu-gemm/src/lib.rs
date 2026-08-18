@@ -12989,6 +12989,19 @@ impl SteerBank {
     }
 }
 
+/// How a speculative run gets the prompt into the target's KV cache.
+///
+/// Not an internal detail: `PerPosition` costs one full decode step per prompt token, which on a
+/// measured 139 ms/token device is 227 s of time-to-first-token for a 1626-token prompt against
+/// 14.7 s chunked. It is what the correctness gates compare against and it is unusable in a chat.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpecPrefill {
+    /// One `decode_step` per prompt token. Bit-identical to `generate_kv`; O(prompt) decode steps.
+    PerPosition,
+    /// Batched prefill at this chunk size — the same call ordinary streaming makes.
+    Chunked(usize),
+}
+
 /// One independent generation session: its own KV cache, stream position and RNG,
 /// sharing the `Model`'s resident weights. Many `Session`s run concurrently against
 /// a single resident `Model` — the per-session GPU cost is just the KV cache.
@@ -15574,7 +15587,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// bench can report acceptance rate and effective tokens-per-target-forward.
     /// Speculative decoding with a MODEL as the drafter. Unchanged entry point.
     pub fn speculative_generate_stats(&self, target: &Model, draft: &Model, prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
-        self.spec_core(target, Some(draft), None, prompt, n_new, k, st)
+        self.spec_core(target, Some(draft), None, prompt, n_new, k, SpecPrefill::PerPosition, st)
     }
 
     /// Speculative decoding with NO second checkpoint: any `Drafter` proposes, the same verifier
@@ -15585,18 +15598,50 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// of accept/reject to add a drafter would have put that proof out of date immediately.
     pub fn speculative_generate_drafter(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
         prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
-        self.spec_core(target, None, Some(drafter), prompt, n_new, k, st)
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, SpecPrefill::PerPosition, st)
+    }
+
+    /// As `speculative_generate_drafter`, choosing how the prompt is prefilled.
+    ///
+    /// The per-position prefill is not a performance detail, it is the difference between the
+    /// feature being usable and not. It runs one full decode step per prompt token: on a measured
+    /// 139 ms/token device a 1626-token prompt costs 227 SECONDS before the first output token,
+    /// against 14.7 s for the same prompt through `prefill_chunked` and 1.12 s when the prefix tree
+    /// hits. Nobody enabling speculation ever reaches the point of finding out whether the
+    /// acceptance rate is any good.
+    pub fn speculative_generate_drafter_with(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
+        prompt: &[u32], n_new: usize, k: usize, prefill: SpecPrefill, st: &mut SpecStats) -> Vec<u32> {
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, prefill, st)
     }
 
     fn spec_core(&self, target: &Model, draft: Option<&Model>,
         mut drafter: Option<&mut dyn crate::spec::Drafter>, prompt: &[u32], n_new: usize, k: usize,
-        st: &mut SpecStats) -> Vec<u32> {
+        prefill: SpecPrefill, st: &mut SpecStats) -> Vec<u32> {
         let k = k.max(1);
         let max_seq = prompt.len() + n_new + 2 * k + 8;
         let tc = self.new_cache(target.n_layers, max_seq, target.kv_dim());
-        // prefill the target like generate_kv (per-position) so the running logits match bit-for-bit.
+        // How the prompt gets into the target's KV.
+        //
+        // PerPosition matches `generate_kv` bit-for-bit, which is what the correctness gates compare
+        // against, and costs one full decode step per prompt token — 227 s for a 1626-token prompt on
+        // a 139 ms/token device. Chunked is the path ordinary streaming already uses and is what the
+        // "identical output, only faster" claim is measured against in practice; it is the only one
+        // that makes speculation reachable on a real prompt.
+        //
+        // Whether the two agree bit-for-bit is a question about the prefill GEMM against the matvec,
+        // not about speculation, and it is unmeasured here — `spec_prefill_paths_agree` in the gate
+        // set answers it on hardware. If they diverge, the divergence is already present in ordinary
+        // streaming and speculation only makes it visible.
         let mut prev = Vec::new();
-        for pos in 0..prompt.len() { prev = self.decode_step(target, &tc, prompt[pos], pos); }
+        match prefill {
+            SpecPrefill::PerPosition => {
+                for pos in 0..prompt.len() { prev = self.decode_step(target, &tc, prompt[pos], pos); }
+            }
+            // The chunk size is the CALLER's, not recomputed here: `prefill_chunk_for_streaming`
+            // already owns that rule and the codebase's own note on it is that two copies of a
+            // tuning rule is how they drift.
+            SpecPrefill::Chunked(chunk) => { prev = self.prefill_chunked(target, &tc, prompt, chunk.max(1)); }
+        }
         let mut pos = prompt.len();
         // PERSISTENT draft session: prefilled once, then resynced incrementally each round.
         // Only the model drafter carries a session. A Drafter is stateless from the loop's side:

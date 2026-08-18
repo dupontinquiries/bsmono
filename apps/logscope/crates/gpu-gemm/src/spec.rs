@@ -436,6 +436,35 @@ mod drafter_against_the_real_engine {
         }
     }
 
+    /// Do the two prefill paths agree?
+    ///
+    /// `spec_core` originally prefilled one decode step per prompt token so its logits matched
+    /// `generate_kv` bit-for-bit, and the correctness gate above compares against exactly that. But
+    /// ORDINARY STREAMING has always used `prefill_chunked`, so the user-facing claim — "output is
+    /// identical to plain decoding, only the speed differs" — is a claim about the chunked path, and
+    /// nothing checked it. Meanwhile the per-position prefill costs one decode step per prompt token,
+    /// which on a measured 139 ms/token device is 227 seconds before the first output token.
+    ///
+    /// This runs both and compares. A failure here is NOT a speculation bug: it means the prefill
+    /// GEMM and the matvec disagree, which ordinary streaming has been living with unnoticed, and
+    /// speculation only made it visible.
+    #[test]
+    fn spec_prefill_paths_agree() {
+        let Ok(bytes) = std::fs::read("/tmp/tiny-qwen3-q8.gguf") else { return };
+        let gpu = Gpu::new();
+        let Ok(m) = gpu.load_gguf_opt(&bytes, true) else { return };
+        let prompt: Vec<u32> = (1..40u32).map(|i| i % (m.vocab as u32).max(1)).collect();
+        for chunk in [8usize, 16, 64] {
+            let (mut a, mut b) = (SpecStats::default(), SpecStats::default());
+            let per = gpu.speculative_generate_drafter(&m, &mut PromptLookup { ngram: 2 }, &prompt, 12, 4, &mut a);
+            let chk = gpu.speculative_generate_drafter_with(&m, &mut PromptLookup { ngram: 2 }, &prompt,
+                12, 4, crate::SpecPrefill::Chunked(chunk), &mut b);
+            assert_eq!(per, chk,
+                "chunk={chunk}: the prefill GEMM and the per-position matvec disagree, so ordinary \
+                 streaming has been producing different tokens from generate_kv all along");
+        }
+    }
+
     /// A drafter proposing nothing must still generate — the case that hits on the first rounds,
     /// before any n-gram has repeated, and the one where a loop that assumes a non-empty draft
     /// would stall forever rather than fail loudly.

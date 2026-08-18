@@ -962,8 +962,16 @@ names which)",
                 let mut d = gpu_kernels::spec::PromptLookup { ngram: ng };
                 let mut st = gpu_kernels::SpecStats::default();
                 let td = Instant::now();
-                let ids = self.gpu.speculative_generate_drafter(&self.model, &mut d, &prompt_ids,
-                                                                n_new, k, &mut st);
+                // CHUNKED, not per-position. `speculative_generate_drafter` prefills one decode step
+                // per prompt token: on the measured 139 ms/token Asahi run that is 227 s of
+                // time-to-first-token for a 1626-token prompt, against 14.7 s here — so the operator
+                // who follows the engine's own advice to set LOGSCOPE_SPEC_DRAFT=lookup waits four
+                // minutes for a first token and concludes the feature is broken. Same chunk rule as
+                // ordinary streaming, from the one helper that owns it.
+                let chunk = prefill_chunk_for_streaming(self.model.d, self.model.h,
+                    self.model.streams_experts(), self.model.moe_counts());
+                let ids = self.gpu.speculative_generate_drafter_with(&self.model, &mut d, &prompt_ids,
+                    n_new, k, gpu_kernels::SpecPrefill::Chunked(chunk), &mut st);
                 let secs = td.elapsed().as_secs_f32().max(1e-3);
                 let mut produced = 0usize;
                 let mut pending: Vec<u8> = Vec::new();
@@ -982,6 +990,12 @@ names which)",
                 // Tokens per verification pass is the speedup, NOT the acceptance rate: a high rate
                 // on short drafts can be worth less than a mediocre one on long drafts (c4-829).
                 let per_pass = if st.rounds > 0 { st.emitted as f64 / st.rounds as f64 } else { 0.0 };
+                // The prefix tree is NOT reused on this path: spec_core builds a fresh cache from the
+                // raw prompt every turn, where ordinary streaming reused 1626 of 1684 tokens (1.12 s
+                // against 14.7 s) in the same session. That is the next thing to fix and it needs
+                // spec_core to accept a prefilled Session rather than a prompt.
+                crate::diag!("wgpu-engine: [{}] speculative prefill — {} prompt tokens, chunk {chunk}, \
+no prefix reuse on this path (ordinary streaming would have reused most of it)", self.name, prompt_ids.len());
                 crate::diag!("wgpu-engine: [{}] speculative (prompt-lookup, k={k}, ngram={ng}) — \
 {} tokens in {:.1}s = {:.2} tok/s | {} accepted of {} drafted over {} rounds = {:.2} tokens per \
 verification pass (1.00 means the drafter paid for nothing)",
