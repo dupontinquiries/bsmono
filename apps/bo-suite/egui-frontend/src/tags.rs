@@ -315,6 +315,31 @@ pub fn tag_editor_ui(ui: &mut egui::Ui, e: &mut TagEditor,
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_stars_are_drawn_on_the_playing_track() {
+        // stars_ui was ported, rate and confirm_rating were written with their
+        // optimistic-echo reasoning, and the ratings map was keyed and
+        // reachable — with no way to press a star.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("tags::stars_ui("), "the star row is not drawn");
+        assert!(lib.contains("self.rate(id, stars)"),
+                "a tap does not go through the optimistic path");
+        assert!(lib.contains("self.now_playing_id = Some(e.track_id)"),
+                "nothing records which track is playing, so ratings have no key");
+    }
+
+    #[test]
+    fn tapping_the_current_rating_clears_it() {
+        // A five-star track tapped on its fifth star means "not that after
+        // all". Without the toggle the only way down from five is to pick
+        // four, which is a different claim.
+        let mut r = StarRating::new(7, 0);
+        assert_eq!(r.tap(4), Some(4));
+        assert_eq!(r.tap(4), Some(0), "the same star again clears");
+        assert_eq!(r.tap(0), None, "zero is not a star to press");
+        assert_eq!(r.tap(MAX_STARS + 1), None, "beyond the row is not a rating");
+    }
+
     fn tag(id: i64, name: &str, color: &str, n: u32) -> Tag {
         Tag { id, name: name.into(), color: color.into(), track_count: n }
     }

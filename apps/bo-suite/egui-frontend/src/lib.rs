@@ -256,6 +256,10 @@ pub struct Controller {
     pub tag_editor: crate::tags::TagEditor,
     /// Ratings by track id, so a row can show one without owning it.
     pub ratings: std::collections::HashMap<i64, crate::tags::StarRating>,
+    /// The track the transport is playing, for the rating to attach to.
+    /// `ratings` is keyed by track id and NowPlaying carries only strings, so
+    /// without this there is nothing to key on at the moment of rating.
+    pub now_playing_id: Option<i64>,
     /// The tag whose tracks are being shown, if any.
     pub open_tag: Option<i64>,
     /// The device switcher above the output controls. The sink picker itself
@@ -263,6 +267,10 @@ pub struct Controller {
     pub device_selector: crate::outputs::DeviceSelector,
     /// The route the user last committed; the host applies it.
     pub pending_route: Option<crate::settings_page::Route>,
+    /// The rating the user last set; the host applies it and echoes back
+    /// through `confirm_rating`. Same shape as `pending_route` — this view
+    /// owns no library.
+    pub pending_rating: Option<(i64, u8)>,
     /// The input source the user last picked; the host applies it.
     ///
     /// Same shape as `pending_route` and for the same reason: this view owns
@@ -347,10 +355,12 @@ impl Controller {
             tags: Vec::new(),
             tag_editor: Default::default(),
             ratings: Default::default(),
+            now_playing_id: None,
             open_tag: None,
             device_selector: Default::default(),
             pending_route: None,
             pending_source: None,
+            pending_rating: None,
             active_device_url: String::new(),
             sources_page: Default::default(),
             playlists_page: Default::default(),
@@ -754,6 +764,10 @@ impl Controller {
             title: e.title.clone(), artist: e.artist.clone(),
             source: String::new(), playing: true,
         };
+        // Recorded here because this is where a track id exists. QueueEntry
+        // has one and NowPlaying does not — it carries display strings, since
+        // line-in and radio have no track to name.
+        self.now_playing_id = Some(e.track_id);
     }
 
     fn play_browse_track(&mut self, id: i64) {
@@ -1080,6 +1094,28 @@ impl Controller {
         // and for the same reason you should be able to see what is next.
         self.breath.tick(ui.input(|i| i.stable_dt) * 1000.0);
         crate::queue::now_playing_ui(ui, &self.now_playing, &self.breath, c);
+
+        // THE STAR ROW, on the track being played. stars_ui was ported, `rate`
+        // and `confirm_rating` were written with their optimistic-echo
+        // reasoning, and the ratings map was keyed and reachable — with no way
+        // to press a star.
+        //
+        // Here rather than in the track list: TracksAction has Load, Play and
+        // Enqueue and no Rate, so putting it there means changing that
+        // contract. Rating what you are hearing needs no new verb, and is the
+        // moment you actually have an opinion.
+        if let Some(id) = self.now_playing_id {
+            let r = self.ratings.entry(id)
+                .or_insert_with(|| crate::tags::StarRating::new(id, 0));
+            if let Some(stars) = crate::tags::stars_ui(ui, r, c) {
+                // rate() re-enters the map to apply the tap and returns what to
+                // send. Going through it rather than writing here keeps the
+                // optimistic path in one place.
+                if let Some(send) = self.rate(id, stars) {
+                    self.pending_rating = Some((id, send));
+                }
+            }
+        }
 
         if !self.queue.is_empty() {
             let n = self.queue.len();
