@@ -161,6 +161,34 @@ pub fn send_summary_ui(ui: &mut egui::Ui, s: &SendSummary,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_receipt_is_shown_before_a_send() {
+        // It was ported and never drawn: prepare_send filled all three facts
+        // and can_send gated on blocks_send, both reached only from tests. The
+        // receipt was computed for nobody and the encryption gate protected
+        // nothing.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("send_summary::send_summary_ui("),
+                "the receipt is not drawn");
+        assert!(lib.contains("self.can_send()"),
+                "nothing consults the gate the receipt exists to expose");
+    }
+
+    #[test]
+    fn a_thread_with_nobody_in_it_blocks_the_send() {
+        // blocks_send is RECIPIENTS == 0, and the Encryption facet is what
+        // renders red for it: "sealed to everyone in the thread" is
+        // unsatisfiable when the thread holds nobody, so there is no one to
+        // seal to. I first assumed it meant a missing encryption fact and
+        // wrote a label to match; the code says otherwise and the label now
+        // says what the code checks.
+        let mut s = SendSummary::default();
+        s.set_dedup(400_000, 1_000_000);
+        assert!(s.blocks_send(), "no recipients means nothing to send to");
+        s.set_recipients(3);
+        assert!(!s.blocks_send(), "a populated thread may send");
+    }
+
     use super::*;
 
     fn summary() -> SendSummary {

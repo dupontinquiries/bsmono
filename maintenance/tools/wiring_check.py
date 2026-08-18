@@ -118,8 +118,16 @@ def uncalled_renderers(src):
     for q, name in defs:
         called = False
         for r, u in texts.items():
-            if r == q: continue
-            if re.search(r'\b' + re.escape(name) + r'\s*\(', u.split('#[cfg(test)]')[0]):
+            prod = u.split('#[cfg(test)]')[0]
+            if r == q:
+                # SAME-FILE CALLERS COUNT. Excluding them was wrong: krapper
+                # defines its eframe::App impl beside writer_ui in one lib.rs
+                # and calls it there, which is normal for a small crate and was
+                # reported as never drawn. A definition is not a call, so the
+                # definition line is skipped and anything else counts.
+                prod = re.sub(r'pub fn ' + re.escape(name) + r'\s*(?:<[^>]*>)?\s*\(',
+                              '', prod)
+            if re.search(r'\b' + re.escape(name) + r'\s*\(', prod):
                 called = True
                 break
         if not called:

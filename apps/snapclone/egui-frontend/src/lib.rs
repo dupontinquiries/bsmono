@@ -2533,6 +2533,26 @@ impl Snapclone {
         let delivery = crate::outbox::Delivery::of(self.composer.duration);
         ui.label(egui::RichText::new(delivery.explain())
             .color(if delivery.replicates() { c.warning } else { c.text_weak }).small());
+
+        // THE SEND RECEIPT, beside the delivery line it belongs with. The Qt
+        // header calls it "a quiet send receipt for group media — three plain
+        // facts, one line each, that make the snapclone-mediashare guarantees
+        // visible BEFORE you send": metadata stripped, only un-shared bytes go
+        // out, sealed to everyone in the thread.
+        //
+        // send_summary_ui was ported and never called. prepare_send fills all
+        // three facts in one call and can_send gates on blocks_send, and both
+        // were reached only from tests — so the receipt was computed for
+        // nobody and the encryption gate protected nothing.
+        crate::send_summary::send_summary_ui(ui, &self.send_summary, c);
+        if !self.can_send() {
+            // blocks_send is RECIPIENTS == 0 — "sealed to everyone in the
+            // thread" cannot be satisfied when the thread holds nobody. Said
+            // as the reason the send is unavailable rather than left as a
+            // disabled button, which is the failure the receipt exists to
+            // prevent.
+            ui.colored_label(c.warning, "nobody in this thread to send to");
+        }
     }
 
     /// Route one action from the requests list. Accept and Decline apply
