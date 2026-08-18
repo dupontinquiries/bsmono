@@ -505,4 +505,35 @@ mod tests {
         }
         assert!(ever_differed);
     }
+
+    /// Every QueueAction must have a handler in the controller.
+    ///
+    /// queue_ui returns an intent and the controller applies it — the split
+    /// that lets this module be tested without a Controller. The risk of that
+    /// split is a new variant with no arm, which compiles on the renderer side
+    /// and silently does nothing when clicked.
+    ///
+    /// Reading the source is a blunt check, but the alternative is a
+    /// controller in this crate's tests, and the failure being guarded is
+    /// exactly "somebody added a variant and forgot the other half" — which a
+    /// text search catches.
+    #[test]
+    fn every_queue_action_is_handled_by_the_controller() {
+        let lib = include_str!("lib.rs");
+        for variant in ["PlayNow", "Remove", "Clear", "SetMode"] {
+            assert!(
+                lib.contains(&format!("QueueAction::{variant}")),
+                "QueueAction::{variant} has no arm in lib.rs — clicking it does nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_queue_renderers_are_actually_called() {
+        // Both were built, tested and never invoked: the controller filled a
+        // queue no screen showed. This fails if either call is removed.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("queue::now_playing_ui("), "now playing is not drawn");
+        assert!(lib.contains("queue::queue_ui("), "the queue list is not drawn");
+    }
 }

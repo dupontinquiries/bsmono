@@ -229,6 +229,11 @@ pub struct Controller {
     /// the tracks and reported them instead; this is that somewhere.
     pub queue: crate::queue::Queue,
     pub now_playing: crate::queue::NowPlaying,
+    /// The "this is alive" oscillation behind the now-playing equaliser.
+    /// A value type, ticked by the frame clock like every other motion here.
+    breath: uikit_egui::motion::Breath,
+    /// Is the queue list expanded under the transport bar?
+    queue_open: bool,
     /// The hero volume wheel. Held across frames so a flick keeps coasting
     /// through the redraws it is animating.
     pub dial: crate::dial::VolumeDial,
@@ -307,6 +312,8 @@ pub struct Controller {
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
         Controller { view_idx: 0, devices, scenes, active_scene: 0,
+            breath: uikit_egui::motion::Breath::new(2200.0, 0.35, 1.0),
+            queue_open: false,
             transport: Default::default(),
             anc: Default::default(),
             routing: Default::default(),
@@ -1015,6 +1022,42 @@ impl Controller {
     fn transport_strip(&mut self, ui: &mut Ui, c: &PaletteColors) {
         if let Some(msg) = self.toast.visible() {
             ui.colored_label(c.warning, msg);
+        }
+
+        // NOW PLAYING AND THE QUEUE. Both renderers were built and tested and
+        // neither was ever called: the controller adds tracks (add, add_all,
+        // advance, both enqueue modes) into a queue no screen showed. Tracks
+        // accumulated where the operator could not see or reorder them.
+        //
+        // They live in the transport strip rather than a seventh page for the
+        // reason the strip exists: whatever page you are on, you can pause —
+        // and for the same reason you should be able to see what is next.
+        self.breath.tick(ui.input(|i| i.stable_dt) * 1000.0);
+        crate::queue::now_playing_ui(ui, &self.now_playing, &self.breath, c);
+
+        if !self.queue.is_empty() {
+            let n = self.queue.len();
+            let label = if self.queue_open { format!("▾ queue ({n})") }
+                        else { format!("▸ queue ({n})") };
+            if ui.small_button(label).clicked() {
+                self.queue_open = !self.queue_open;
+            }
+            if self.queue_open {
+                if let Some(act) = crate::queue::queue_ui(ui, &self.queue, c) {
+                    // Applied HERE rather than inside the renderer: queue_ui
+                    // takes &Queue and returns an intent, which is what lets
+                    // it be tested without a controller. Honouring that split
+                    // means the mutation happens on this side.
+                    match act {
+                        crate::queue::QueueAction::PlayNow(id) => {
+                            if let Some(tr) = self.queue.play_now(id) { self.start_playing(&tr); }
+                        }
+                        crate::queue::QueueAction::Remove(id) => { self.queue.remove(id); }
+                        crate::queue::QueueAction::Clear => self.queue.clear(),
+                        crate::queue::QueueAction::SetMode(m) => self.queue.mode = m,
+                    }
+                }
+            }
         }
         // THE ANC CHIP, in the playbar. This app is three products over an
         // ANC mesh, and the operator must be able to reach the anti-noise
