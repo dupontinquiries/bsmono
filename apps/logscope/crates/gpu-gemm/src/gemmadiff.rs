@@ -319,8 +319,10 @@ pub mod blockrefine {
         /// regardless of the entropy budget (scheduler_config threshold: 0.95 — the same
         /// accelerator the existing loop calls tau).
         pub commit_threshold: Option<f32>,
-        /// Adaptive stop, condition 1: mean entropy over the still-masked canvas below this
-        /// (generation_config confidence_threshold: 0.005, in nats).
+        /// Adaptive stop, condition 1: mean entropy over the CANVAS below this
+        /// (generation_config confidence_threshold: 0.005, in nats). The card says "average model
+        /// entropy over the canvas" — the whole canvas, committed rows included, which is what the
+        /// loop feeds `StopTracker::observe`.
         pub stop_entropy: f32,
         /// Adaptive stop, condition 2: argmax predictions identical across this many CONSECUTIVE
         /// steps (generation_config stability_threshold: 1 → one repeat, i.e. two equal reads).
