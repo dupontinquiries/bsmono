@@ -192,3 +192,45 @@ whether those exist outside the repo, not of engine work.
   unique organic models share nothing. The *encoding* half (16-bit quantisation,
   varint delta indices) would help, but that is `bsweb` extended with skin data,
   not a second encoder.
+
+---
+
+# voiceterm: terminal-output-as-menu is disconnected, not just undrawn
+
+`detect::picker_ui` shows on the uncalled-renderer list, and wiring it would
+have been building on nothing. The gap is a level deeper.
+
+`entity_extract` — 1,700 lines in `apps/voiceterm/src/`, with
+`resolve_reference`, `extract_block`, `extract_top_processes`, `parse_verb` —
+is the engine behind "run `bluetoothctl devices`, then say *connect to the
+headphones*". In the egui port, the only file that mentions it is `detect.rs`
+itself, and `detect.rs` mounts it by `#[path]`.
+
+So the chain is broken at the first link:
+
+```
+terminal output  ──X──>  extract_block / extract_top_processes
+                         (never called from the port)
+                              │
+                         resolve_reference
+                              │
+                         detect::decide  ──>  EntityPicker::ask
+                                                   │
+                                              picker_ui  (never called)
+```
+
+`EntityPicker` is not a field on the app, no command output is fed to an
+extractor, and no voice phrase reaches `resolve_reference`. Drawing the picker
+would give an empty dialog that can never open — `ask` refuses fewer than two
+rows on purpose, so it would refuse every time.
+
+**What it needs, in order.** Hold the last N `ExtractedBlock`s as command
+output arrives; route an unresolved reference from the voice grammar through
+`resolve_reference`; then `decide` picks between acting, asking and refusing,
+and only the ASK case draws the picker. That is a feature, and it should be
+built as one rather than reached by wiring a renderer to state that does not
+exist.
+
+Noted here rather than fixed because the honest version is a session's work,
+and a picker wired to nothing would look finished on the audit while being
+less useful than the current state, where at least nothing claims to work.
