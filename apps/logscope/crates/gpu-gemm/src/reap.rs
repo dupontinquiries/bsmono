@@ -182,8 +182,14 @@ pub fn solutions_lost(slots: usize, false_kill_rate: f32, good_fraction: f32) ->
 pub fn worth_it(slots: usize, reaped: f32, at_fraction: f32, false_kill_rate: f32, success_rate: f32) -> (f32, f32) {
     let base = slots as f32;
     let gained = population_yield(slots, reaped, at_fraction) - base;
-    let expected_extra_solutions = gained * success_rate;
-    let lost = solutions_lost(slots, false_kill_rate, success_rate);
+    // The EXTRA hypotheses a fast detector buys are subject to that same detector, so they are
+    // false-killed at the same rate. Omitting this made a detector measured at a 70.8% false-kill
+    // rate report that it "pays" at every success rate, because the gain term grew untouched while
+    // only the loss term was discounted. A reaper that destroys seven good branches in ten cannot
+    // pay, and the arithmetic has to be able to say so.
+    let fk = false_kill_rate.clamp(0.0, 1.0);
+    let expected_extra_solutions = gained * success_rate * (1.0 - fk);
+    let lost = solutions_lost(slots, fk, success_rate);
     (expected_extra_solutions, lost)
 }
 
@@ -272,6 +278,16 @@ mod tests {
         let (g2, l2) = worth_it(32, 0.9, 0.2, 0.03, 0.10);
         assert!(g2 > l2);
         assert!(g2 / l2 < gained / lost * 1.01, "the ratio cannot improve as successes get commoner");
+    }
+
+    #[test]
+    fn a_detector_that_kills_most_good_branches_cannot_pay() {
+        // The measured rate of the first, unusable version of corpus.rs: 70.8%.
+        let (gained, lost) = worth_it(32, 0.9, 0.2, 0.708, 0.01);
+        assert!(gained < lost * 4.0, "gained {gained} lost {lost}");
+        // Against the rate after the fixes: 0.8%.
+        let (g2, l2) = worth_it(32, 0.9, 0.2, 0.008, 0.01);
+        assert!(g2 > l2 * 100.0, "gained {g2} lost {l2}");
     }
 
     #[test]
