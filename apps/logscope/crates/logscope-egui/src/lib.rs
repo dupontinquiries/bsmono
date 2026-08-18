@@ -4,6 +4,7 @@
 //! treeexport, script, runner — so those stay ungated; everything that touches egui/eframe/rfd is behind
 //! `gui`, which is what lets the CLI compile without pulling in eframe/vello.
 
+pub mod cargo_tab;
 pub mod gitmind_session;
 // GUI-gated: the gesture MACHINE is std-only and lives in shared/touchkit (charge.rs); what is
 // here is the egui drawing, so a headless build must not carry it. Landing the isolation work's
