@@ -145,10 +145,32 @@ static botpack_buf botpack_decode(const uint8_t *blob, size_t n, unsigned idx) {
 
     size_t off = 16;
     if (off + 4 > n) return out;
-    uint32_t nranges = bp_u32(blob + off); off += 4;
-    if (nranges > 4096 || off + (size_t)nranges * 8 > n) return out;
-    const uint8_t *ranges = blob + off;
-    off += (size_t)nranges * 8;
+    /* ONE RANGE TABLE PER POSE, not one shared by all of them.
+     *
+     * This read a single count and skipped a single table, which put every
+     * later offset — the lens, the streams, v4's frame — hundreds of bytes
+     * early. On a real pack it read nranges=39 and landed at 332 where the
+     * format's tables end at 1616; the v4 path then handed zstd the middle of
+     * the range data and got "Unknown frame descriptor".
+     *
+     * The Rust decoder has always had it right (`all_ranges: Vec<Vec<..>>`).
+     * This was never caught because nothing had run the C reader against a
+     * real pack: it was written from the format description, compiled, and
+     * left. Found the first time it decoded a file.
+     *
+     * The tables are walked to reach the offset AFTER them, and the wanted
+     * pose's table is kept.
+     */
+    const uint8_t *ranges = NULL;
+    uint32_t nranges = 0;
+    for (unsigned i = 0; i < poses; i++) {
+        if (off + 4 > n) return out;
+        uint32_t cnt = bp_u32(blob + off); off += 4;
+        if (cnt > 4096 || off + (size_t)cnt * 8 > n) return out;
+        if (i == idx) { ranges = blob + off; nranges = cnt; }
+        off += (size_t)cnt * 8;
+    }
+    if (!ranges) return out;
 
     if (off + (size_t)poses * 4 > n) return out;
     const uint8_t *lens = blob + off;
@@ -201,9 +223,17 @@ static botpack_buf botpack_decode(const uint8_t *blob, size_t n, unsigned idx) {
 
         /* The non-float bytes first: they are the frame the floats sit in. */
         if (bp_ver == 4) {
-            /* Already raw inside the frame — copy, do not inflate. */
-            if (v4rlen != want) { free(buf); free(v4frame); return out; }
-            memcpy(buf, v4r, want);
+            /* Already raw inside the frame — copy, do not inflate.
+             *
+             * The r stream may be SHORTER than the pose buffer, and demanding
+             * equality here refused every real pack. v3 inflates r into a
+             * calloc'd `want` buffer and tinfl reports DONE having written
+             * fewer bytes; the remainder stays zero and the quantised floats
+             * are written over it. Copying min(rraw, want) reproduces that
+             * exactly. Longer than the buffer is still refused — that is a
+             * corrupt pack, not a short stream. */
+            if (v4rlen > want) { free(buf); free(v4frame); return out; }
+            memcpy(buf, v4r, v4rlen);
         } else if (!bp_inflate(blob + off + qlen, rlen, buf, want)) {
             free(buf); free(v4frame);
             return out;
