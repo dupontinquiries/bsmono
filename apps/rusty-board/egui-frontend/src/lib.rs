@@ -391,6 +391,22 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
 /// this is for a caller that wants shared app logic (something both the GTK and egui front-ends
 /// can subscribe to identically) to also see key presses, without threading the return value
 /// through by hand at every call site.
+/// ## Not called yet, and that is not an oversight
+///
+/// `wiring_check` lists this as a renderer nothing calls. It is an ALTERNATIVE
+/// to `keyboard_ui`, not a missing surface: `demo_app` calls the plain one and
+/// gets the pressed key back directly, which is all a single front-end needs.
+///
+/// The signal shape exists because the GTK side really uses it —
+/// `src/ui/key_widget.rs` holds a `signal_kit::Signal<Key>`, with its own
+/// comment noting the two binaries follow "the same `Signal<Key>` pattern even
+/// though they're separate binaries, not a live shared bus". This function is
+/// what lets an egui caller subscribe identically when there IS shared app
+/// logic to subscribe.
+///
+/// Wiring it today would mean inventing a subscriber: nothing in this app owns
+/// a `SignalRegistry`, and a registry with one publisher and no listener is
+/// indirection, not architecture. Left for the caller that needs it.
 pub fn keyboard_ui_with_signal(
     ui: &mut Ui,
     layout: &Layout,

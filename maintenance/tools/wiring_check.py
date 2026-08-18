@@ -113,6 +113,21 @@ def uncalled_renderers(src):
     for q, txt in texts.items():
         prod = txt.split('#[cfg(test)]')[0]
         for m in re.finditer(r'pub fn (\w+)\s*(?:<[^>]*>)?\s*\([^)]*&mut\s+(?:egui::)?Ui', prod):
+            # A function may DECLARE why it is uncalled, in the doc comment
+            # directly above it. rusty-board's keyboard_ui_with_signal is the
+            # case: an alternative to keyboard_ui for a caller that wants the
+            # press on a shared signal, where the GTK side really does use
+            # Signal<Key> — but nothing in the egui app owns a registry, and
+            # one publisher with no listener is indirection rather than
+            # architecture.
+            #
+            # The marker goes in the doc rather than a list here, for the same
+            # reason parity_audit's service opt-out does: the reasoning belongs
+            # where the next reader of that function will find it, and a list
+            # inside the tool rots the first time something moves.
+            doc_start = prod.rfind('\n\n', 0, m.start())
+            if 'Not called yet, and that is not an oversight' in prod[doc_start:m.start()]:
+                continue
             defs.append((q, m.group(1)))
     out = []
     for q, name in defs:

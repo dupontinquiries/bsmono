@@ -234,3 +234,40 @@ exist.
 Noted here rather than fixed because the honest version is a session's work,
 and a picker wired to nothing would look finished on the audit while being
 less useful than the current state, where at least nothing claims to work.
+
+---
+
+# voiceterm: three bottom bars, one drawn, none of them the fan-out one
+
+`archived_view::bar_ui` is the last renderer on the uncalled list that is not
+blocked on a missing feature, and wiring it would add a fourth path rather than
+finish a third.
+
+What exists:
+
+| path | state | drawn |
+|---|---|---|
+| `shell::keycap_bar_ui` | `TERMINAL_KEYCAPS`, a const | **yes** |
+| `bars::BarState` | field on the app, constructed | no — never read after `Default::default()` |
+| `archived_view::bar_ui` | takes a `&BottomBar` | no |
+
+`archived_view` and `bars` both `pub use` the same engine types from
+`src/bottom_bar.rs`, so the two are views over one model, and neither is
+reached. The bar the app actually draws is the keycap row, which is a different
+thing: fixed keys that send, not buttons that fan out into option lists.
+
+**Why this is not a wiring job.** `bar_ui` takes a `&BottomBar` — a set of
+buttons with their options — and nothing in the app builds one. There is no
+`BottomBar` anywhere outside the two view modules and their tests. Supplying
+one means deciding what the buttons ARE, which is a product question about what
+voiceterm's bottom bar should offer, not a missing call.
+
+The engine's rule is worth keeping in view when that decision is made: *a button
+with no options must not fan out into an empty popup — an empty popup reads as a
+broken button, where a disabled one reads as "nothing here"*. Any invented
+button set would hit that immediately, which is a good sign the set has to come
+from someone who knows what the bar is for.
+
+`bars::BarState` should probably go at the same time. Two view modules over one
+engine model, both unreached, is a duplicate to resolve rather than two things
+to wire.
