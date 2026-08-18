@@ -165,3 +165,36 @@ metrics available from source are exhausted; what remains needs a device, a
 display, and someone using them. `code%` is explicitly NOT the gap — see the
 docstring on `covered_live`, which warns that chasing it means re-porting
 finished work.
+
+---
+
+# Verifying bots.pack v4 on hardware (2026-08-18)
+
+The v4 transcode landed with one gap: `cargo test` had never run on
+blackstar-rs itself. The recorded reason — "wgpu 22 needs rustc ≥1.76 and the
+sandbox has 1.75" — **is no longer true**. This sandbox is on rustc 1.96, and
+whoever picks this up should not skip the check for that reason.
+
+Two real obstacles remain, and both are environmental rather than code:
+
+* **ALSA headers.** `cpal` is a default feature and `alsa-sys` needs
+  `libasound2-dev`. The manifest already anticipates this: *"Build with
+  `--no-default-features` for a silent binary with zero extra system deps."*
+  That works — 73 crates compiled clean, warnings only.
+* **Disk.** wgpu's build tree reached 6.1 GB and filled the volume before the
+  test binary linked. Nothing was corrupted (`git fsck` clean afterwards), but
+  the run cannot complete here.
+
+So the command to run on hardware is:
+
+```sh
+cd games/blackstar-rs
+cargo test --no-default-features botpack
+```
+
+What that would confirm, beyond what is already verified: the v4 decode path
+inside the real engine, over the real 296 packs. The transcode itself is
+verified three ways already — every pose byte-compared in Python, 13 strips
+cross-checked through the Rust decoder in a standalone harness, and
+`pack_v4.py --revert` reproducing the v3 files byte-for-byte. The gap is
+narrow, and it is the last one on that work.
