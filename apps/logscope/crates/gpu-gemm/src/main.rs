@@ -2729,6 +2729,63 @@ fn main() {
         println!("gate-dit-primitives: {}", if ok { "DiT modulation/patchify/timestep primitives validated \u{2713}" } else { "FAIL \u{2717} — see failing checks above" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-gemmadiff") {
+        // DiffusionGemma header gate — no GPU. Takes the GGUF path after the flag (converter
+        // output today, a real checkpoint on the M2 later) and validates everything that can be
+        // validated without kernels: the arch resolves, gemmadiff::read_shape accepts the header
+        // and its per-layer plan matches the weight census (attn_v absent exactly on full
+        // layers), the diffusion routing facts hold (mask id present, shift_logits false for
+        // this lineage), the file-aware preflight prices it, and the gap report NAMES what still
+        // blocks a forward. Green here means "the file is what the plan expects", not "it runs".
+        let path = args.iter().position(|a| a == "--gate-gemmadiff")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| { eprintln!("usage: --gate-gemmadiff <model.gguf>"); std::process::exit(2) });
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| { eprintln!("read {path}: {e}"); std::process::exit(2) });
+        let g = gpu_kernels::gguf::parse(&bytes).unwrap_or_else(|e| { eprintln!("parse: {e}"); std::process::exit(2) });
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let arch = g.get_str("general.architecture").unwrap_or("").to_string();
+        ck("general.architecture = diffusion_gemma", arch == "diffusion_gemma");
+        let cfg = gpu_kernels::archcfg::for_arch(&arch);
+        ck("registry: recognised, MoE + shared expert, Gemma norms", matches!(cfg.arch, gpu_kernels::archcfg::Arch::DiffusionGemma) && cfg.moe && cfg.moe_shared_expert);
+        match gpu_kernels::gemmadiff::read_shape(&g) {
+            Err(e) => ck(&format!("read_shape: {e}"), false),
+            Ok(s) => {
+                ck("shape validates", s.validate().is_ok());
+                // the census invariant: attn_v exists exactly on the NON-full layers
+                let census_ok = (0..s.n_layer).all(|il| {
+                    let has_v = g.tensor(&format!("blk.{il}.attn_v.weight")).is_some();
+                    has_v != s.v_from_k(il)
+                });
+                ck("attn_v absent exactly on the full-attention layers (V-from-K census)", census_ok);
+                ck("encoder scalar set present (layer_output_scale_enc)",
+                   (0..s.n_layer).all(|il| g.tensor(&format!("blk.{il}.layer_output_scale_enc.weight")).is_some()));
+                ck("self-conditioning FFN present (self_cond.*)",
+                   ["self_cond.pre_norm.weight", "self_cond.ffn_gate.weight",
+                    "self_cond.ffn_up.weight", "self_cond.ffn_down.weight"]
+                       .iter().all(|t| g.tensor(t).is_some()));
+                let est = gpu_kernels::store::estimate_resident_for_load(&g);
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                // GiB for the real 51 GB checkpoint, raw bytes alongside so the selfcheck fixture
+                // (~50 KB) prints a figure instead of five zeros — a line of all zeros reads as
+                // "the estimator returned nothing", which is the opposite of what happened.
+                println!("  preflight: native {:.3} GiB | f32 {:.3} | int8-rest {:.3} | plan int8 {:.3} / q4 {:.3} GiB \
+                          ({} / {} / {} B; plans {} / {} B)",
+                    gib(est.native_view_bytes), gib(est.f32_bytes), gib(est.int8_rest_bytes),
+                    gib(est.plan_int8()), gib(est.plan_q4()),
+                    est.native_view_bytes, est.f32_bytes, est.int8_rest_bytes,
+                    est.plan_int8(), est.plan_q4());
+            }
+        }
+        ck("mask token id present (tokenizer.ggml.mask_token_id)", gpu_kernels::gguf_mask_token_id(&g).is_some());
+        ck("diffusion.shift_logits = false (in-place lineage)", g.get_str("diffusion.shift_logits") == Some("false"));
+        let gaps = gpu_kernels::archfeat::gap_report(&arch, g.get_u32("diffusion_gemma.expert_count").unwrap_or(0));
+        println!("  declared gaps ({} — a forward needs each):", gaps.len());
+        for l in &gaps { println!("    - {l}"); }
+        ck("gaps are declared, not hidden", !gaps.is_empty());
+        println!("gate-gemmadiff: {}", if ok { "header checks \u{2713} (recognition + plan; NOT a forward)" } else { "FAIL \u{2717}" });
+        if !ok { std::process::exit(1); }
+        return;
+    }
     if args.iter().any(|a| a == "--gate-memplan") {
         // Pure footprint/fit planner — no GPU. Asserts param counts, the int8 estimate matches the
         // store.rs estimator + the M2 anchor, and the graded verdict (≤32B fits int8, 70B does not).
@@ -5284,7 +5341,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
