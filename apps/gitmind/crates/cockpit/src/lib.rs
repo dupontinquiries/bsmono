@@ -17,6 +17,7 @@ pub mod fleet;
 pub mod apkcache;
 /// The fastboot wire protocol and flash-script model, without a subprocess.
 pub mod fastboot;
+pub mod fbdiag;
 /// First contact with a freshly-imaged phone: pairing code and join script.
 pub mod join;
 /// Trying a kernel on the spare slot, and getting evidence out when it dies.

@@ -1,0 +1,404 @@
+➜  ~ lsusb -t
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 3, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 4, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 003.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 1, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 2, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 3, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 004.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 005.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 480M
+    |__ Port 001: Dev 003, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 003, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 003, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 006.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 10000M
+/:  Bus 007.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 008.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+➜  ~ now unplug from 7 and try to find 5 no idea which one
+➜  ~ lsusb -t
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 3, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 4, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 003.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 1, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 2, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 3, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 004.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 005.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 480M
+    |__ Port 001: Dev 003, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 003, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 003, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 006.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 10000M
+➜  ~ now I accidentally unplugged another cable and reinserted it so that might shuffle things... let's try plugging back in the fp5 two ports to the left to see if 5,6,7 is ordered on the back of the mac studio
+➜  ~ 2 slots left (rigt when facing the machine from behind) was where my keyboard was plugged in wooting... moving that to where the fp5 was plugged in and plugging the fp5 in now
+➜  ~ lsusb -t
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 3, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 4, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 003.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 1, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 2, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 3, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 004.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 005.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 480M
+    |__ Port 001: Dev 003, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 003, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 003, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 006.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 10000M
+/:  Bus 007.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 008.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+➜  ~ udevadm test $(udevadm info -q path -n /dev/bus/usb/005/001) 2>&1 | grep -Ei 'uaccess|GROUP|MODE|adb_' 
+Reading rules file: /usr/lib/udev/rules.d/40-usb_modeswitch.rules
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"clock","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"clock","gid":103,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tty","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tty","gid":5,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"dialout","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"dialout","gid":18,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kmem","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kmem","gid":9,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"input","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"input","gid":104,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"video","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"video","gid":39,"members":["cosmic-greeter","ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"render","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"render","gid":105,"members":["ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"sgx","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"sgx","gid":106,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"audio","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"audio","gid":63,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"lp","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"lp","gid":7,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"disk","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"disk","gid":6,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"cdrom","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"cdrom","gid":11,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tape","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tape","gid":33,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kvm","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kvm","gid":36,"members":["qemu"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"adbusers","service":"io.systemd.Multiplexer"}}
+/etc/udev/rules.d/51-android.rules:1076 Unknown group 'adbusers', ignoring.
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tss","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tss","gid":59,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"colord","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"colord","gid":988,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+Reading rules file: /usr/lib/udev/rules.d/70-uaccess.rules
+Reading rules file: /usr/lib/udev/rules.d/80-libinput-device-groups.rules
+Reading rules file: /usr/lib/udev/rules.d/91-drm-modeset.rules
+usb5: /usr/lib/udev/rules.d/50-udev-default.rules:71 MODE="0664": Set mode: 0664
+usb5: /usr/lib/udev/rules.d/60-autosuspend.rules:11 ATTR{power/control}="auto": Running in test mode, skipping writing "auto" to sysfs attribute "power/control".
+  ID_MODEL=xHCI_Host_Controller
+  ID_MODEL_ENC=xHCI\x20Host\x20Controller
+  ID_MODEL_FROM_DATABASE=2.0 root hub
+  ID_MODEL_ID=0002
+  ID_USB_MODEL=xHCI_Host_Controller
+  ID_USB_MODEL_ENC=xHCI\x20Host\x20Controller
+  ID_USB_MODEL_ID=0002
+➜  ~ udevadm test $(udevadm info -q path -n /dev/bus/usb/005/002) 2>&1 | grep -Ei 'uaccess|GROUP|MODE|adb_'
+Unknown device "/dev/bus/usb/005/002": No such device
+➜  ~ udevadm test $(udevadm info -q path -n /dev/bus/usb/005/003) 2>&1 | grep -Ei 'uaccess|GROUP|MODE|adb_'
+Reading rules file: /usr/lib/udev/rules.d/40-usb_modeswitch.rules
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"clock","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"clock","gid":103,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tty","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tty","gid":5,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"dialout","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"dialout","gid":18,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kmem","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kmem","gid":9,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"input","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"input","gid":104,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"video","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"video","gid":39,"members":["cosmic-greeter","ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"render","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"render","gid":105,"members":["ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"sgx","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"sgx","gid":106,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"audio","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"audio","gid":63,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"lp","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"lp","gid":7,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"disk","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"disk","gid":6,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"cdrom","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"cdrom","gid":11,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tape","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tape","gid":33,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kvm","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kvm","gid":36,"members":["qemu"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"adbusers","service":"io.systemd.Multiplexer"}}
+/etc/udev/rules.d/51-android.rules:1076 Unknown group 'adbusers', ignoring.
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tss","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tss","gid":59,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"colord","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"colord","gid":988,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+Reading rules file: /usr/lib/udev/rules.d/70-uaccess.rules
+Reading rules file: /usr/lib/udev/rules.d/80-libinput-device-groups.rules
+Reading rules file: /usr/lib/udev/rules.d/91-drm-modeset.rules
+5-1: /usr/lib/udev/rules.d/50-udev-default.rules:71 MODE="0664": Set mode: 0664
+5-1: Running in test mode, skipping execution of '/usr/lib/udev/mtp-probe /sys/devices/platform/soc@200000000/580000000.pcie/pci0000:00/0000:00:03.0/0000:04:00.0/usb5/5-1 5 3'.
+  ID_MODEL=2.4G_Wireless_Mouse
+  ID_MODEL_ENC=2.4G\x20Wireless\x20Mouse
+  ID_MODEL_ID=402d
+  ID_USB_MODEL=2.4G_Wireless_Mouse
+  ID_USB_MODEL_ENC=2.4G\x20Wireless\x20Mouse
+  ID_USB_MODEL_ID=402d
+➜  ~ ok let me unplug my mouse to make this simpler                                                        
+➜  ~ lsusb -t
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 3, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 4, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 003.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 1, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 2, Class=Audio, Driver=snd-usb-audio, 480M
+    |__ Port 001: Dev 002, If 3, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 004.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 005.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 480M
+/:  Bus 006.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 10000M
+/:  Bus 007.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 008.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+➜  ~ so maybe that is port 3...maybe port5 is on the front or something  
+➜  ~ udevadm test $(udevadm info -q path -n /dev/bus/usb/003/002) 2>&1 | grep -Ei 'uaccess|GROUP|MODE|adb_'
+Reading rules file: /usr/lib/udev/rules.d/40-usb_modeswitch.rules
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"clock","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"clock","gid":103,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tty","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tty","gid":5,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"dialout","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"dialout","gid":18,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kmem","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kmem","gid":9,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"input","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"input","gid":104,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"video","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"video","gid":39,"members":["cosmic-greeter","ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"render","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"render","gid":105,"members":["ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"sgx","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"sgx","gid":106,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"audio","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"audio","gid":63,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"lp","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"lp","gid":7,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"disk","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"disk","gid":6,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"cdrom","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"cdrom","gid":11,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tape","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tape","gid":33,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kvm","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kvm","gid":36,"members":["qemu"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"adbusers","service":"io.systemd.Multiplexer"}}
+/etc/udev/rules.d/51-android.rules:1076 Unknown group 'adbusers', ignoring.
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tss","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tss","gid":59,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"colord","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"colord","gid":988,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+Reading rules file: /usr/lib/udev/rules.d/70-uaccess.rules
+Reading rules file: /usr/lib/udev/rules.d/80-libinput-device-groups.rules
+Reading rules file: /usr/lib/udev/rules.d/91-drm-modeset.rules
+3-1: /usr/lib/udev/rules.d/50-udev-default.rules:71 MODE="0664": Set mode: 0664
+3-1: Running in test mode, skipping execution of '/usr/lib/udev/mtp-probe /sys/devices/platform/soc@200000000/b02280000.usb/xhci-hcd.1.auto/usb3/3-1 3 2'.
+  ID_MODEL=Scarlett_Solo_USB
+  ID_MODEL_ENC=Scarlett\x20Solo\x20USB
+  ID_MODEL_FROM_DATABASE=Scarlett Solo (3rd Gen.)
+  ID_MODEL_ID=8211
+  ID_USB_MODEL=Scarlett_Solo_USB
+  ID_USB_MODEL_ENC=Scarlett\x20Solo\x20USB
+  ID_USB_MODEL_ID=8211
+➜  ~ oh so thats audio interface let me unplug that
+➜  ~ 
+➜  ~ lsusb -t                                                                                              
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 3, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 4, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 005.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 480M
+/:  Bus 006.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 10000M
+/:  Bus 007.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 008.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+➜  ~ fastboot devices    
+c1146e6f         fastboot
+➜  ~ lsusb -t
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 3, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 4, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 005.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 480M
+/:  Bus 006.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 10000M
+/:  Bus 007.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 008.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+➜  ~ udevadm test $(udevadm info -q path -n /dev/bus/usb/007/002) 2>&1 | grep -Ei 'uaccess|GROUP|MODE|adb_' 
+Reading rules file: /usr/lib/udev/rules.d/40-usb_modeswitch.rules
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"clock","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"clock","gid":103,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tty","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tty","gid":5,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"dialout","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"dialout","gid":18,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kmem","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kmem","gid":9,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"input","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"input","gid":104,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"video","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"video","gid":39,"members":["cosmic-greeter","ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"render","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"render","gid":105,"members":["ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"sgx","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"sgx","gid":106,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"audio","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"audio","gid":63,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"lp","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"lp","gid":7,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"disk","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"disk","gid":6,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"cdrom","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"cdrom","gid":11,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tape","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tape","gid":33,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kvm","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kvm","gid":36,"members":["qemu"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"adbusers","service":"io.systemd.Multiplexer"}}
+/etc/udev/rules.d/51-android.rules:1076 Unknown group 'adbusers', ignoring.
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tss","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tss","gid":59,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"colord","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"colord","gid":988,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+Reading rules file: /usr/lib/udev/rules.d/70-uaccess.rules
+Reading rules file: /usr/lib/udev/rules.d/80-libinput-device-groups.rules
+Reading rules file: /usr/lib/udev/rules.d/91-drm-modeset.rules
+7-1: /usr/lib/udev/rules.d/50-udev-default.rules:71 MODE="0664": Set mode: 0664
+7-1: Running in test mode, skipping execution of '/usr/lib/udev/mtp-probe /sys/devices/platform/soc@200000000/702280000.usb/xhci-hcd.2.auto/usb7/7-1 7 2'.
+7-1: /usr/lib/udev/rules.d/73-seat-late.rules:16 RUN{builtin}+="uaccess": Set command: uaccess
+  uaccess
+  CURRENT_TAGS=:seat:uaccess:
+  ID_MODEL=Android
+  ID_MODEL_ENC=Android
+  ID_MODEL_FROM_DATABASE=Xiaomi Mi/Redmi 2 (fastboot)
+  ID_MODEL_ID=d00d
+  ID_USB_MODEL=Android
+  ID_USB_MODEL_ENC=Android
+  ID_USB_MODEL_ID=d00d
+  TAGS=:seat:uaccess:
+  adb_adb=yes
+  adb_adbfast=yes
+  adb_fast=yes
+  adb_user=yes
+  RUN{builtin} : uaccess
+➜  ~ so it's still 7
+➜  ~ moved it two to the right (from front 
+➜  ~ lsusb -t
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 1, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 2, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 3, Class=Human Interface Device, Driver=usbhid, 480M
+    |__ Port 001: Dev 002, If 4, Class=Human Interface Device, Driver=usbhid, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 003.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Vendor Specific Class, Driver=[none], 480M
+/:  Bus 004.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 10000M
+/:  Bus 005.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 480M
+/:  Bus 006.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/2p, 10000M
+➜  ~ fastboot devices
+c1146e6f         fastboot
+➜  ~ udevadm test $(udevadm info -q path -n /dev/bus/usb/003/002) 2>&1 | grep -Ei 'uaccess|GROUP|MODE|adb_' 
+Reading rules file: /usr/lib/udev/rules.d/40-usb_modeswitch.rules
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"clock","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"clock","gid":103,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tty","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tty","gid":5,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"dialout","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"dialout","gid":18,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kmem","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kmem","gid":9,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"input","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"input","gid":104,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"video","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"video","gid":39,"members":["cosmic-greeter","ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"render","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"render","gid":105,"members":["ollama"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"sgx","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"sgx","gid":106,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"audio","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"audio","gid":63,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"lp","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"lp","gid":7,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"disk","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"disk","gid":6,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"cdrom","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"cdrom","gid":11,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tape","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tape","gid":33,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"kvm","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"kvm","gid":36,"members":["qemu"],"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":false}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"adbusers","service":"io.systemd.Multiplexer"}}
+/etc/udev/rules.d/51-android.rules:1076 Unknown group 'adbusers', ignoring.
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"tss","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"tss","gid":59,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+/run/systemd/userdb/io.systemd.Multiplexer: Sending message: {"method":"io.systemd.UserDatabase.GetGroupRecord","parameters":{"groupName":"colord","service":"io.systemd.Multiplexer"}}
+/run/systemd/userdb/io.systemd.Multiplexer: Received message: {"parameters":{"record":{"groupName":"colord","gid":988,"status":{"eddc8e9b89ac4c46bcc538144b2d49a6":{"service":"io.systemd.NameServiceSwitch"}}},"incomplete":true}}
+Reading rules file: /usr/lib/udev/rules.d/70-uaccess.rules
+Reading rules file: /usr/lib/udev/rules.d/80-libinput-device-groups.rules
+Reading rules file: /usr/lib/udev/rules.d/91-drm-modeset.rules
+3-1: /usr/lib/udev/rules.d/50-udev-default.rules:71 MODE="0664": Set mode: 0664
+3-1: Running in test mode, skipping execution of '/usr/lib/udev/mtp-probe /sys/devices/platform/soc@200000000/f02280000.usb/xhci-hcd.1.auto/usb3/3-1 3 2'.
+3-1: /usr/lib/udev/rules.d/73-seat-late.rules:16 RUN{builtin}+="uaccess": Set command: uaccess
+  uaccess
+  CURRENT_TAGS=:uaccess:seat:
+  ID_MODEL=Android
+  ID_MODEL_ENC=Android
+  ID_MODEL_FROM_DATABASE=Xiaomi Mi/Redmi 2 (fastboot)
+  ID_MODEL_ID=d00d
+  ID_USB_MODEL=Android
+  ID_USB_MODEL_ENC=Android
+  ID_USB_MODEL_ID=d00d
+  TAGS=:seat:uaccess:
+  adb_adb=yes
+  adb_adbfast=yes
+  adb_fast=yes
+  adb_user=yes
+  RUN{builtin} : uaccess
+➜  ~ fastboot getvar all
+getvar:all                                         FAILED (Write to device failed (No such file or directory))
+Finished. Total time: 0.011s
+➜  ~ sudo fastboot getvar all
+[sudo] password for kesslerd: 
+< waiting for any device >
+^C
+➜  ~ plugging back in
+➜  ~ all my mouse and stuff
+➜  ~ 
+
