@@ -202,6 +202,11 @@ impl eframe::App for Feel {
                                 self.service.commit_text(&text);
                                 self.typed.push_str(&text);
                             }
+                            // RELEASED. The keyboard comes back now the voice
+                            // session is over, in the same place the session
+                            // ends — a release that lived anywhere else would
+                            // eventually be reached by a path that skipped it.
+                            let _ = self.service.set_suppressed(false);
                         } else {
                             // The broker decides. On device the host supplies a
                             // real one; until then the state stays Idle rather
@@ -209,6 +214,23 @@ impl eframe::App for Feel {
                             // claiming to be listening when nothing is captured
                             // is exactly the dud-demo failure.
                             self.dictation.start();
+                            // SUPPRESSED. keyboard_service::set_suppressed has
+                            // existed since the port with nothing calling it,
+                            // and its own doc names this trigger: "a keyboard
+                            // left on screen after the reason for suppressing
+                            // it arrived — glove mode starting, a voice session
+                            // opening — is the failure the suppression exists
+                            // to prevent, arriving one state later."
+                            //
+                            // A voice session is exactly that reason, and the
+                            // two services have sat in the same struct without
+                            // a wire between them.
+                            // The Hidden event is dropped deliberately: this
+                            // app reads service STATE directly (is_visible,
+                            // suppressed) and consumes no ServiceEvent
+                            // anywhere, so routing one event alone would be a
+                            // second mechanism for one reader.
+                            let _hidden = self.service.set_suppressed(true);
                         }
                     }
                     if listening {

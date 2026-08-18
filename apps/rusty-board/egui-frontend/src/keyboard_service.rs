@@ -411,4 +411,40 @@ mod suppressor_tests {
         s.set(Suppressor::Glove, true);
         assert_eq!(s.apply(&mut k), Some(ServiceEvent::Hidden));
     }
+
+    #[test]
+    fn suppressing_takes_a_visible_keyboard_down_immediately() {
+        // The failure this exists to prevent, in the module's own words: a
+        // keyboard left on screen after the reason for suppressing it arrived,
+        // arriving one state later. A voice session starting while the
+        // keyboard is up must hide it now, not at the next show().
+        let mut s = KeyboardService::default();
+        assert!(s.show("demo").is_ok());
+        assert!(s.visible());
+        let ev = s.set_suppressed(true);
+        assert!(!s.visible(), "still up after suppression");
+        assert_eq!(ev, Some(ServiceEvent::Hidden), "the hide is reported");
+    }
+
+    #[test]
+    fn suppressing_an_already_hidden_keyboard_reports_nothing() {
+        // No event, because nothing changed. An event here would make a
+        // listener redraw or announce a hide that never happened.
+        let mut s = KeyboardService::default();
+        assert!(!s.visible());
+        assert_eq!(s.set_suppressed(true), None);
+    }
+
+    #[test]
+    fn a_suppressed_keyboard_refuses_to_come_back_until_released() {
+        // The other half: suppression is not just a one-time hide. While a
+        // voice session owns the screen, a client asking for the keyboard is
+        // refused rather than fighting it.
+        let mut s = KeyboardService::default();
+        s.set_suppressed(true);
+        assert!(s.show("demo").is_err(), "shown while suppressed");
+        s.set_suppressed(false);
+        assert!(s.show("demo").is_ok(), "released, so it may return");
+        assert!(s.visible());
+    }
 }
