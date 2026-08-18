@@ -273,14 +273,35 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
             // otherwise let the loader pick. LOGSCOPE_FORCE_LOAD=1 bypasses; LOGSCOPE_MAX_RESIDENT_GB sets
             // the budget; LOGSCOPE_Q4_RESIDENT=1 forces q4 up front.
             if std::env::var("LOGSCOPE_FORCE_LOAD").is_err() {
-                if let (Some(est), Some(budget)) = (gpu_kernels::store::estimate_int8_resident(&g), gpu_kernels::store::resident_budget_bytes()) {
-                    let q4_est = est / 2; // q4-resident is ≈half of int8
-                    if q4_est > budget {
-                        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                // FILE-AWARE, ARCH-INDEPENDENT. The previous check read `llama.*` metadata keys —
+                // so a qwen2/gemma3/diffusion_gemma header returned None and the guard silently
+                // skipped itself (the "a guard that cannot find its input" class, already fixed
+                // once below for vocab width) — and it priced EVERYTHING as int8, which refuses
+                // an IQ1_S checkpoint the native path holds at 1.5625 bpw. The estimator walks
+                // the tensor table instead: no arch knowledge, and type-19 tensors are priced at
+                // the file's own bytes exactly when the loader will keep them that way.
+                let est = gpu_kernels::store::estimate_resident_for_load(&g);
+                if let Some(budget) = gpu_kernels::store::resident_budget_bytes() {
+                    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                    if est.native_view_bytes > 0 {
+                        // `load` is a constructor — no self yet, so the model is named by its file.
+                        let fname = std::path::Path::new(path).file_name()
+                            .map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+                        crate::diag!("wgpu-engine: [{}] {}", fname,
+                            gpu_kernels::memplan::iq1s_load_plan(
+                                gib(est.native_view_bytes) as f32, gib(budget) as f32,
+                                std::env::var("LOGSCOPE_NO_IQ1_NATIVE").is_err()));
+                    }
+                    if est.plan_q4() > budget {
                         return Err(format!(
-                            "won't fit: ~{:.1} GiB needed even at q4-resident, ~{:.1} GiB available. Try a \
+                            "won't fit: ~{:.1} GiB needed even at q4-resident{}, ~{:.1} GiB available. Try a \
                              smaller model, free memory, or LOGSCOPE_FORCE_LOAD=1 to try anyway (likely OOM).",
-                            gib(q4_est), gib(budget)));
+                            gib(est.plan_q4()),
+                            if est.native_view_bytes > 0 {
+                                format!(" (of which {:.1} GiB is IQ1_S held in the file's own bytes)",
+                                        gib(est.native_view_bytes))
+                            } else { String::new() },
+                            gib(budget)));
                     }
                 }
             }
@@ -939,9 +960,35 @@ names which)",
                     orig - tail_start, tail_start - head,
                     pl.head - head, tail_start - (orig - pl.tail));
             }
-            // Reply budget = ceiling, capped to the room left after the prompt (continuous decode fits
-            // the window instead of forcing prompt truncation).
-            let n_new = ceiling.min(window.saturating_sub(prompt_ids.len()).max(1));
+            // Reply budget. This USED to be a bare `ceiling.min(window - prompt)`, which never
+            // errors and never narrates — a real session walked 2470 -> 2050 -> 1832 -> 1187 ->
+            // 874 -> 814 over seventeen turns with nothing said, and the turn that wanted a long
+            // answer got exactly its cap and stopped mid-thought. ctxwin::relief makes the same
+            // arithmetic a DECISION: it says when the squeeze has crossed into costing an answer,
+            // and under the long-horizon policy it asks for a compaction instead of shrinking
+            // every reply forever.
+            let policy = if p.summarize_instead_of_squeeze {
+                gpu_kernels::ctxwin::ReliefPolicy::SummarizeAndContinue
+            } else { gpu_kernels::ctxwin::ReliefPolicy::Autotune };
+            let relief = gpu_kernels::ctxwin::relief(policy, prompt_ids.len(), window, ceiling);
+            let n_new = match &relief {
+                gpu_kernels::ctxwin::Relief::Proceed { n_new } => *n_new,
+                gpu_kernels::ctxwin::Relief::Squeeze { n_new, note } => {
+                    if let Some(n) = note { crate::diag!("wgpu-engine: [{}] {n}", self.name); }
+                    *n_new
+                }
+                gpu_kernels::ctxwin::Relief::Summarize { summarize_upto, keep_recent, reason } => {
+                    // The engine does not summarize: that is a turn, and turns belong to the
+                    // caller. Publish the request and fall back to the squeeze for THIS reply, so
+                    // a caller that ignores the signal degrades exactly as before rather than
+                    // hanging or producing nothing.
+                    crate::backend::COMPACT_REQUEST.store(
+                        crate::backend::compact_pack(*summarize_upto, *keep_recent),
+                        std::sync::atomic::Ordering::Relaxed);
+                    crate::diag!("wgpu-engine: [{}] COMPACTION REQUESTED — {reason}", self.name);
+                    window.saturating_sub(prompt_ids.len()).max(1)
+                }
+            };
             let cap = (prompt_ids.len() + n_new).max(1);
             // ── Speculative-decode path (opt-in: a draft model was loaded) ───────────────────────────
             // Draft proposes a block; target verifies the whole block in one forward (engine
@@ -1942,6 +1989,31 @@ pub struct Inference { tx: Sender<Cmd>, pub rx: Receiver<Evt>, cancel: Arc<Atomi
 /// would show one turn's prompt against another turn's window.
 pub(crate) static CTX_FIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The engine's standing request for a compaction, published the same way and for the same
+/// reason as CTX_FIT: the decision is made where the arithmetic is (`ctxwin::relief`), and the
+/// ACTION belongs to the caller, because summarizing is a turn and the engine does not own turns.
+/// Packed (summarize_upto:21 | keep_recent:21 | seq:22) — the sequence number rises on every
+/// request so the UI can tell "still the same unanswered request" from "asked again this turn".
+/// Zero means no request outstanding.
+pub(crate) static COMPACT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the engine wants folded, and what must survive verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactRequest { pub summarize_upto: usize, pub keep_recent: usize, pub seq: usize }
+
+pub(crate) fn compact_pack(summarize_upto: usize, keep_recent: usize) -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & ((1 << 22) - 1);
+    ((summarize_upto.min((1 << 21) - 1) as u64) << 43)
+        | ((keep_recent.min((1 << 21) - 1) as u64) << 22)
+        | seq
+}
+pub(crate) fn compact_unpack(v: u64) -> CompactRequest {
+    CompactRequest { summarize_upto: (v >> 43) as usize,
+                     keep_recent: ((v >> 22) & ((1 << 21) - 1)) as usize,
+                     seq: (v & ((1 << 22) - 1)) as usize }
+}
+
 /// Prompt tokens, window size, and how many tokens were dropped from the middle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CtxFit { pub prompt: usize, pub window: usize, pub elided: usize }
@@ -1967,6 +2039,15 @@ impl Inference {
         let v = CTX_FIT.load(Ordering::Relaxed);
         if v == 0 { None } else { Some(ctxfit_unpack(v)) }
     }
+
+    /// The engine's outstanding compaction request, if the long-horizon policy asked for one.
+    pub fn compact_request(&self) -> Option<CompactRequest> {
+        let v = COMPACT_REQUEST.load(Ordering::Relaxed);
+        if v == 0 { None } else { Some(compact_unpack(v)) }
+    }
+    /// Clear it once the caller has read it — an unanswered request left set would re-offer on
+    /// every frame, and the UI holds its own copy (with the seq) once it has one.
+    pub fn clear_compact_request(&self) { COMPACT_REQUEST.store(0, Ordering::Relaxed); }
 }
 impl Inference {
     pub fn spawn() -> Self {
@@ -2501,5 +2582,76 @@ mod ctxfit_packing {
         let f = ctxfit_unpack(ctxfit_pack(1_048_576, 1_048_576, 0));
         assert_eq!(f.prompt, 1_048_576);
         assert_eq!(f.window, 1_048_576);
+    }
+}
+
+// ── the zero-caller guard ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod published_signals {
+    //! Three times in one session a SIGNAL was published with nothing reading it:
+    //! `memplan::iq1s_load_plan` (tests, no callers, and a doc asserting a gap that had closed),
+    //! `COMPACT_REQUEST` (the long-horizon policy publishing a request no UI consumed), and
+    //! `context_fit()` (the engine measuring prompt/window/elision for nobody). Each looked
+    //! implemented and did nothing, and none of them could fail a test, because the code was
+    //! correct — it simply was not reached.
+    //!
+    //! This is the guard for that class, scoped to where it keeps happening: the atomics
+    //! `backend.rs` publishes for the UI. A signal nothing loads is dead; an accessor the chat
+    //! never calls is a measurement taken and thrown away. Source-scanning rather than
+    //! type-checking because the defect is precisely the thing a compiler is happy about — the
+    //! same reason `perfverdict` reads `main.rs` with `include_str!` to check the gate list.
+
+    const BACKEND: &str = include_str!("backend.rs");
+    const CHAT: &str = include_str!("tabs/chat.rs");
+
+    /// Names of the atomics `backend.rs` publishes for consumption (`pub`/`pub(crate)` statics).
+    fn published() -> Vec<String> {
+        BACKEND.lines().filter_map(|l| {
+            let t = l.trim_start();
+            let rest = t.strip_prefix("pub(crate) static ").or_else(|| t.strip_prefix("pub static "))?;
+            let (name, ty) = rest.split_once(':')?;
+            ty.contains("Atomic").then(|| name.trim().to_string())
+        }).collect()
+    }
+
+    #[test]
+    fn every_published_signal_is_both_stored_and_loaded() {
+        let names = published();
+        assert!(names.len() >= 3, "the scan found {} — it stopped matching the declarations", names.len());
+        for n in &names {
+            assert!(BACKEND.contains(&format!("{n}.store(")),
+                    "{n} is published but never written — nothing can be signalled through it");
+            let loaded = BACKEND.contains(&format!("{n}.load(")) || CHAT.contains(&format!("{n}\n"))
+                || CHAT.contains(&format!("{n}."));
+            assert!(loaded, "{n} is written and never read — a signal with no consumer, which is \
+what COMPACT_REQUEST was until the compaction banner landed");
+        }
+    }
+
+    #[test]
+    fn every_accessor_over_a_published_signal_has_a_caller_in_the_chat() {
+        // `pub fn foo(&self)` in backend.rs whose body loads one of the published atomics is an
+        // accessor built FOR the UI; if its name never appears in chat.rs, the measurement is
+        // taken and discarded. This is exactly how context_fit() sat unused.
+        let names = published();
+        let mut checked = 0;
+        for (i, line) in BACKEND.lines().enumerate() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("pub fn ") else { continue };
+            let Some(fname) = rest.split(['(', '<']).next() else { continue };
+            // body = until the next line at the same indent starting with '}'
+            let body: String = BACKEND.lines().skip(i + 1).take(12).collect::<Vec<_>>().join("\n");
+            if !names.iter().any(|n| body.contains(&format!("{n}.load("))) { continue; }
+            checked += 1;
+            // `fname(` — a CALL, not a mention. The first draft accepted `CHAT.contains(fname)`
+            // and a deliberate mutation (deleting the only call to `context_fit`) did NOT trip it,
+            // because a comment three lines away still named the function. A guard against dead
+            // code that a comment can satisfy is itself dead.
+            assert!(CHAT.contains(&format!("{fname}(")),
+                    "backend::{fname} reads a published signal and nothing in the chat calls it — \
+either wire it up or delete it, but a measurement nobody reads is not a feature");
+        }
+        assert!(checked >= 1, "the accessor scan matched nothing — it has stopped working");
     }
 }

@@ -39,6 +39,10 @@ pub struct Tokenizer {
     byte_level: bool,
     byte_encoder: Vec<char>,        // byte -> printable unicode char (GPT-2 table)
     byte_decoder: HashMap<char, u8>, // inverse
+    /// SentencePiece-BPE mode (Gemma): `▁` space convention + `<0xNN>` byte fallback.
+    sp: bool,
+    /// Byte-fallback piece id per byte value in sp mode (`<0xNN>` lookups, resolved once).
+    sp_bytes: Vec<Option<u32>>,
     /// Control/added tokens (e.g. "<|eot_id|>") matched verbatim in input and
     /// emitted as a single id, longest-first; their text is NOT byte-remapped.
     specials: Vec<(String, u32)>,
@@ -110,8 +114,23 @@ impl Tokenizer {
         }
         let byte_encoder = byte_to_unicode();
         let byte_decoder = byte_encoder.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
-        Self { tokens, vocab, merges, byte_level, byte_encoder, byte_decoder,
+        Self { tokens, vocab, merges, byte_level, byte_encoder, byte_decoder, sp: false, sp_bytes: Vec::new(),
             specials: Vec::new(), special_ids: std::collections::HashSet::new() }
+    }
+
+    /// SentencePiece-BPE (Gemma family): pieces use `▁` for space and `<0xNN>` byte-fallback
+    /// tokens; merges carry the segmentation (Gemma's SP model is BPE-TYPE — merges, not unigram
+    /// scores, so a faithful encode needs no score table). This is a THIRD mode, not a flavor of
+    /// byte_level: the GPT-2 byte↔unicode remap would rewrite `▁` itself, and the raw mode's
+    /// single-byte symbol init can never form a 3-byte `▁` piece — both mangle this vocabulary
+    /// while looking like they worked.
+    pub fn new_spm_bpe(tokens: Vec<Vec<u8>>, merge_pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        let mut t = Self::build(tokens, merge_pairs, false);
+        t.sp = true;
+        // byte-fallback table: id of "<0xNN>" per byte, or None — resolved once, not per char
+        t.sp_bytes = (0..=255u16).map(|b| t.vocab.get(format!("<0x{b:02X}>").as_bytes()).copied())
+            .collect();
+        t
     }
 
     /// Register control/added tokens (id → exact text) matched verbatim during
@@ -202,6 +221,7 @@ impl Tokenizer {
     }
 
     fn encode_inner(&self, text: &str) -> Vec<u32> {
+        if self.sp { return self.encode_inner_sp(text); }
         if !self.byte_level {
             let mut syms = Vec::new();
             for &b in text.as_bytes() { if let Some(&id) = self.vocab.get(&vec![b]) { syms.push(id); } }
@@ -227,6 +247,51 @@ impl Tokenizer {
         out
     }
 
+    /// SP-BPE encode: normalizer maps every space to `▁` (that is the WHOLE normalizer in the
+    /// shipped tokenizer.json — no dummy-prefix prepend), initial symbols are one piece per
+    /// UNICODE CHARACTER (not per byte: multi-byte pieces like `▁` and `é` are single symbols),
+    /// a character absent from the vocab falls back to its UTF-8 bytes as `<0xNN>` pieces, and
+    /// the rank merge is the same greedy loop BPE always was. Pinned against the reference
+    /// implementation by the converter's probe kvs — the gate re-encodes strings the HF
+    /// `tokenizers` pipeline encoded and demands id equality, so this comment being wrong is a
+    /// test failure, not a latent divergence.
+    fn encode_inner_sp(&self, text: &str) -> Vec<u32> {
+        let mut syms: Vec<u32> = Vec::new();
+        let mut buf = [0u8; 4];
+        for c in text.chars() {
+            let piece: &[u8] = if c == ' ' { "\u{2581}".as_bytes() } else { c.encode_utf8(&mut buf).as_bytes() };
+            match self.vocab.get(piece) {
+                Some(&id) => syms.push(id),
+                None => {
+                    for &b in piece {
+                        match self.sp_bytes.get(b as usize).copied().flatten() {
+                            Some(id) => syms.push(id),
+                            // no <0xNN> piece for this byte: same silent-drop class the byte-level
+                            // path counts — a vocab with byte fallback has all 256 and this stays 0
+                            None => { ENCODE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                        }
+                    }
+                }
+            }
+        }
+        self.bpe_merge(syms)
+    }
+
+    /// SP-mode decode for one non-special piece: `<0xNN>` emits the byte, everything else emits
+    /// its bytes with `▁` (E2 96 81) restored to a space.
+    fn sp_piece_bytes(piece: &[u8], out: &mut Vec<u8>) {
+        if piece.len() == 6 && piece.starts_with(b"<0x") && piece[5] == b'>' {
+            if let Ok(s) = std::str::from_utf8(&piece[3..5]) {
+                if let Ok(b) = u8::from_str_radix(s, 16) { out.push(b); return; }
+            }
+        }
+        let mut i = 0;
+        while i < piece.len() {
+            if piece[i..].starts_with(&[0xE2, 0x96, 0x81]) { out.push(b' '); i += 3; }
+            else { out.push(piece[i]); i += 1; }
+        }
+    }
+
     pub fn decode(&self, ids: &[u32]) -> String {
         String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
@@ -235,6 +300,14 @@ impl Tokenizer {
     /// character (common in byte-level BPE / non-ASCII text) doesn't become garbage.
     pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::new();
+        if self.sp {
+            for &id in ids {
+                let Some(t) = self.tokens.get(id as usize) else { continue };
+                if self.special_ids.contains(&id) { bytes.extend_from_slice(t); }
+                else { Self::sp_piece_bytes(t, &mut bytes); }
+            }
+            return bytes;
+        }
         if !self.byte_level {
             for &id in ids { if let Some(t) = self.tokens.get(id as usize) { bytes.extend_from_slice(t); } }
             return bytes;
@@ -306,8 +379,20 @@ the vocab size is cross-checked before it is accepted.".into()),
             }).collect(),
             _ => Vec::new(),
         };
-        let byte_level = matches!(g.get_str("tokenizer.ggml.model"), Some("gpt2") | Some("llama") | Some("bpe"));
-        let mut tk = Self::build(tokens, merges, byte_level);
+        // Mode selection. "gpt2"/"bpe" are the GPT-2 byte-remap family as before. "llama" is the
+        // SentencePiece FAMILY: when the file carries MERGES it is an SP-BPE vocabulary (Gemma —
+        // `▁` spaces, `<0xNN>` byte fallback) and gets the sp mode; the old code byte-remapped it,
+        // which rewrites `▁` itself and mangles every space. "llama" WITHOUT merges is a
+        // score-based SPM file this tokenizer has never actually supported — it keeps the previous
+        // (wrong-but-unchanged) byte_level path rather than pretending a new capability exists.
+        let model = g.get_str("tokenizer.ggml.model");
+        let tk_tokens: Vec<Vec<u8>> = tokens;
+        let mut tk = if matches!(model, Some("llama")) && !merges.is_empty() {
+            Self::new_spm_bpe(tk_tokens, merges)
+        } else {
+            let byte_level = matches!(model, Some("gpt2") | Some("llama") | Some("bpe"));
+            Self::build(tk_tokens, merges, byte_level)
+        };
         // Register control (3) / user-defined (4) tokens as verbatim specials so
         // chat markers like "<|eot_id|>" tokenize to a single id and decode literally.
         let mut specials = Vec::new();
@@ -466,5 +551,72 @@ mod borrowed_tokenizer {
         let err = match Tokenizer::from_gguf_with_fallback(&gn, 999_999) { Err(e) => e, Ok(_) => panic!("a mismatched donor must be refused") };
         std::env::remove_var("LOGSCOPE_TOKENIZER_GGUF");
         assert!(err.contains("must match exactly"), "a near-miss must be refused: {err}");
+    }
+}
+
+#[cfg(test)]
+mod sp_tests {
+    use super::*;
+
+    /// A miniature SP-BPE vocab in the Gemma shape: `▁` space pieces, `<0xNN>` byte fallback,
+    /// a control token, and merges that build both a plain and a `▁`-prefixed word.
+    fn tiny_sp() -> Tokenizer {
+        let pieces: Vec<&str> = vec![
+            "<pad>", "<mask>", "a", "b", "\u{2581}", "ab", "\u{2581}b", "<0xC3>", "<0xA9>", "\n",
+        ];
+        let tokens: Vec<Vec<u8>> = pieces.iter().map(|p| p.as_bytes().to_vec()).collect();
+        let merges = vec![
+            (b"a".to_vec(), b"b".to_vec()),
+            ("\u{2581}".as_bytes().to_vec(), b"b".to_vec()),
+        ];
+        let mut t = Tokenizer::new_spm_bpe(tokens, merges);
+        t.set_specials(vec![("<mask>".into(), 1)]);
+        t
+    }
+
+    #[test]
+    fn spaces_become_underbar_pieces_and_come_back_as_spaces() {
+        let t = tiny_sp();
+        assert_eq!(t.encode("ab"), vec![5], "merge builds the word");
+        assert_eq!(t.encode("a b"), vec![2, 6], "space maps to \u{2581}, then \u{2581}+b merges");
+        assert_eq!(t.decode(&[2, 6]), "a b", "decode restores the space, not the \u{2581}");
+    }
+
+    #[test]
+    fn a_character_outside_the_vocab_falls_back_to_its_bytes() {
+        let t = tiny_sp();
+        // 'é' is not a piece; its UTF-8 (C3 A9) is covered by byte-fallback pieces
+        assert_eq!(t.encode("\u{e9}"), vec![7, 8]);
+        assert_eq!(t.decode(&[7, 8]), "\u{e9}", "<0xNN> pieces reassemble the character");
+    }
+
+    #[test]
+    fn specials_encode_verbatim_and_survive_decode() {
+        let t = tiny_sp();
+        assert_eq!(t.encode("a<mask>b"), vec![2, 1, 3]);
+        assert_eq!(t.decode(&[2, 1, 3]), "a<mask>b");
+    }
+
+    #[test]
+    fn from_gguf_routes_llama_with_merges_to_sp_mode() {
+        use crate::gguf::{Gguf, Value};
+        let pieces = ["<pad>", "<mask>", "a", "b", "\u{2581}", "ab", "\u{2581}b"];
+        let mut md = std::collections::HashMap::new();
+        md.insert("tokenizer.ggml.model".into(), Value::Str("llama".into()));
+        md.insert("tokenizer.ggml.tokens".into(),
+                  Value::Arr(pieces.iter().map(|p| Value::Str((*p).into())).collect()));
+        md.insert("tokenizer.ggml.merges".into(), Value::Arr(vec![
+            Value::Str("a b".into()), Value::Str("\u{2581} b".into()),
+        ]));
+        md.insert("tokenizer.ggml.token_type".into(),
+                  Value::Arr(vec![Value::I32(3), Value::I32(3), Value::I32(1), Value::I32(1),
+                                  Value::I32(1), Value::I32(1), Value::I32(1)]));
+        let g = Gguf { version: 3, metadata: md, tensors: Vec::new(), data_offset: 0 };
+        let t = Tokenizer::from_gguf(&g).unwrap();
+        // the behavioral proof of sp mode: a space becomes a ▁-piece and comes back as a space —
+        // under the old byte_level routing this exact string mangled
+        assert_eq!(t.encode("a b"), vec![2, 6]);
+        assert_eq!(t.decode(&[2, 6]), "a b");
+        assert_eq!(t.special_id("<mask>"), Some(1), "token_type 3 registered the special");
     }
 }

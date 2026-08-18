@@ -170,8 +170,10 @@ pub struct ColumnView<'a> {
     pub id: usize,
     pub host: &'a str,
     pub assignment: &'a mut String,
-    pub lines: &'a [String],
+    pub lines: &'a [crate::replicatorlayout::LaneLine],
     pub turn: usize,
+    /// True while this column's last line is a reply still arriving.
+    pub streaming: bool,
 }
 
 /// What the operator did in the panel this frame.
@@ -182,6 +184,9 @@ pub struct PanelAction {
     /// The slider moved.
     pub want: Option<usize>,
     pub toggle_matrix: bool,
+    /// Enter was pressed in an assignment field: the aim has been set, now put the keyboard back
+    /// in the composer so the operator can type the task without reaching for the mouse.
+    pub focus_composer: bool,
 }
 
 /// Draw the replicator panel: the track, the columns, and the wires between them.
@@ -191,37 +196,49 @@ pub struct PanelAction {
 /// fades over the following turns. The difference matters because "why did this worker change
 /// direction" is answered by what crossed, not by what was configured — and those come apart
 /// exactly when a partner had nothing to say.
+///
+/// WIDTH IS THE CONTAINER'S, NOT THE COLUMNS'. Every horizontal extent here comes from
+/// `replicatorlayout::columns`, which cannot return a set wider than what it was given; columns
+/// that do not fit are reached by scrolling. The previous version sized columns with
+/// `(avail / n).max(120.0)` in a plain `horizontal_top`, and egui neither wraps nor clips that —
+/// past four workers the headers and transcripts were drawn off the right edge of the app.
 pub fn panel(ui: &mut egui::Ui, slots: &Slots, want: usize, aim: Option<usize>,
              cols: &mut [ColumnView<'_>], grid: &ShareGrid,
              log: &logscope::replicator::CrossingLog, model: &str) -> PanelAction {
     let mut act = PanelAction::default();
 
-    ui.horizontal(|ui| {
+    // The control row WRAPS. It is the same row that overflowed on a phone in the composer bar,
+    // and it is not exempt from that rule just because it belongs to a mode.
+    ui.horizontal_wrapped(|ui| {
         let v = slot_slider(ui, slots, want);
         if v != want { act.want = Some(v); }
         ui.vertical(|ui| {
             ui.label(egui::RichText::new(format!("{want} worker(s)")).strong());
             ui.label(egui::RichText::new(slots.explain(model)).color(crate::theme::DIM()).small());
         });
-        if crate::theme::carved_button(ui, if aim.is_some() { "aim: one" } else { "aim: all" }).clicked() {
+        if crate::theme::carved_button(ui, if aim.is_some() { "aim: one" } else { "aim: all" })
+            .on_hover_text("What the composer is addressing. Click a column header to aim at it; \
+click here to go back to broadcasting.").clicked() {
             act.aim = Some(None);   // clicking the badge always returns to broadcast
         }
         if crate::theme::carved_button(ui, "links").clicked() { act.toggle_matrix = true; }
     });
 
-    // Column headers first, so their centres are known before the wires are drawn under them.
-    let n = cols.len().max(1);
-    let full = ui.available_width();
-    let col_w = (full / n as f32).max(120.0);
-    let wire_h = 18.0;
-    let (wire_rect, _) = ui.allocate_exact_size(egui::vec2(full, wire_h), egui::Sense::hover());
-    let centre = |i: usize| wire_rect.left() + col_w * (i as f32 + 0.5);
+    let n = cols.len();
+    if n == 0 { return act; }
+    let avail = ui.available_width();
+    let fit = crate::replicatorlayout::columns(avail - crate::replicatorlayout::FAN_CHROME_PT, n);
+    let strip_w = fit.col_w * fit.visible as f32;
 
-    // the wires
-    let p = ui.painter();
+    // The wires span the VISIBLE strip. Drawing them at the full fan's pitch put the far end of
+    // every edge outside the panel — the same overflow as the columns, in paint form.
+    let wire_h = 16.0;
+    let (wire_rect, _) = ui.allocate_exact_size(egui::vec2(strip_w, wire_h), egui::Sense::hover());
+    let centre = |i: usize| wire_rect.left() + fit.col_w * (i as f32 + 0.5);
+    let p = ui.painter_at(wire_rect);
     let newest_turn = cols.iter().map(|c| c.turn).max().unwrap_or(0);
-    for to in 0..cols.len() {
-        for from in 0..cols.len() {
+    for to in 0..fit.visible.min(n) {
+        for from in 0..fit.visible.min(n) {
             if to == from || grid.dilation(to, from) == 0 { continue; }
             let (x0, x1) = (centre(from), centre(to));
             let heat = log.last_on(from, to)
@@ -250,31 +267,102 @@ pub fn panel(ui: &mut egui::Ui, slots: &Slots, want: usize, aim: Option<usize>,
         }
     }
 
-    // the columns
-    ui.horizontal_top(|ui| {
-        for (i, c) in cols.iter_mut().enumerate() {
-            ui.allocate_ui(egui::vec2(col_w - 6.0, ui.available_height()), |ui| {
-                let aimed = aim == Some(c.id);
-                let head = format!("{} · {}", c.id, c.host);
-                if crate::theme::carved_button_tinted(ui, &head,
-                        if aimed { crate::theme::accent() } else { crate::theme::DIM() }).clicked() {
-                    act.aim = Some(if aimed { None } else { Some(c.id) });
+    if fit.scroll {
+        ui.label(egui::RichText::new(format!("showing {} of {n} — scroll sideways for the rest",
+                                             fit.visible)).color(crate::theme::DIM()).small());
+    }
+
+    // One scroller for the strip. `horizontal` is what makes an over-wide fan REACHABLE instead
+    // of drawn past the edge; when everything fits it costs nothing and shows no bar.
+    egui::ScrollArea::horizontal().id_salt("replicant_strip").auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                for (i, c) in cols.iter_mut().enumerate() {
+                    column(ui, i, c, fit.col_w, aim, &mut act);
                 }
-                ui.add(egui::TextEdit::singleline(c.assignment)
-                    .hint_text("what this one works on").desired_width(col_w - 16.0));
-                ui.label(egui::RichText::new(format!("turn {}", c.turn))
-                    .color(crate::theme::DIM()).small());
-                egui::ScrollArea::vertical().id_salt(("replicant_lane", i)).max_height(220.0)
-                    .show(ui, |ui| {
-                        for line in c.lines.iter().rev().take(12) {
-                            ui.label(egui::RichText::new(line).small());
-                            ui.separator();
-                        }
-                    });
             });
-        }
-    });
+        });
     act
+}
+
+/// One column: header (aim), assignment field (Enter aims + hands the keyboard back), then its
+/// transcript in the linear chat view's own language.
+fn column(ui: &mut egui::Ui, i: usize, c: &mut ColumnView<'_>, col_w: f32,
+          aim: Option<usize>, act: &mut PanelAction) {
+    let inner = col_w - 8.0;
+    ui.allocate_ui(egui::vec2(inner, ui.available_height()), |ui| {
+        // Hard stop: nothing inside a column may negotiate itself wider than the column. A
+        // TextEdit asking for `desired_width` past this is exactly how the fan grew past the app.
+        ui.set_max_width(inner);
+        ui.vertical(|ui| {
+            let aimed = aim == Some(c.id);
+            let head = format!("{} · {}{}", c.id, c.host, if c.streaming { " ·" } else { "" });
+            if crate::theme::carved_button_tinted(ui, &head,
+                    if aimed { crate::theme::accent() } else { crate::theme::DIM() })
+                .on_hover_text(if aimed { "aimed — click to broadcast again" } else { "aim the composer at this worker" })
+                .clicked() {
+                act.aim = Some(if aimed { None } else { Some(c.id) });
+            }
+            let resp = ui.add(egui::TextEdit::singleline(c.assignment)
+                .id(egui::Id::new(("replicant_assignment", c.id)))
+                .hint_text("what this one works on")
+                .desired_width(inner - 8.0));
+            // Enter here is not a dead key: the pure rule turns it into "aim at this column and
+            // put the keyboard in the composer", so naming a worker flows straight into
+            // describing its task.
+            if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let m = ui.input(|i| crate::replicatorlayout::Mods {
+                    shift: i.modifiers.shift, ctrl: i.modifiers.command || i.modifiers.ctrl });
+                if let crate::replicatorlayout::EnterAction::AimAndCompose(id) =
+                    crate::replicatorlayout::enter_action(
+                        true, aim, crate::replicatorlayout::Focus::Assignment(c.id), m) {
+                    act.aim = Some(Some(id));
+                    act.focus_composer = true;
+                }
+            }
+            ui.label(egui::RichText::new(format!("turn {}", c.turn))
+                .color(crate::theme::DIM()).small());
+            // The transcript, oldest at the top and pinned to the bottom — the linear chat view's
+            // reading order. The old panel drew `.rev().take(12)`, i.e. newest-first with the
+            // reply above the prompt that caused it, which reads as a different conversation.
+            egui::ScrollArea::vertical().id_salt(("replicant_lane", i))
+                .max_height(260.0).stick_to_bottom(true).auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_max_width(inner - 8.0);
+                    if c.lines.is_empty() {
+                        ui.label(egui::RichText::new("no turns yet").color(crate::theme::FAINT()).small());
+                    }
+                    for line in c.lines.iter() { lane_bubble(ui, line); }
+                });
+        });
+    });
+}
+
+/// One transcript line as a chat bubble, in the main log's visual language: the operator's words
+/// on PANEL2 in amber, the worker's on PANEL in green. Role comes from the LINE, not from its
+/// index — a lane whose reply never arrived would otherwise flip every following bubble's
+/// attribution, and a worker's words shown as the operator's is a lie the fan cannot afford
+/// (partners quote each other by exactly this text).
+fn lane_bubble(ui: &mut egui::Ui, line: &crate::replicatorlayout::LaneLine) {
+    let (who, col, fill) = if line.from_operator {
+        ("you", crate::theme::AMBER(), crate::theme::PANEL2())
+    } else {
+        ("worker", crate::theme::GREEN(), crate::theme::PANEL())
+    };
+    egui::Frame {
+        fill,
+        corner_radius: crate::theme::r(8),
+        inner_margin: egui::Margin::symmetric(6, 4),
+        outer_margin: egui::Margin { bottom: 4, ..Default::default() },
+        stroke: egui::Stroke::new(1.0_f32, crate::theme::LINE()),
+        ..Default::default()
+    }.show(ui, |ui| {
+        ui.label(egui::RichText::new(who)
+            .color(crate::theme::ensure_contrast(col, fill, 4.5)).small().strong());
+        // wrapping label, not a single line: a column is narrow by construction and prose must
+        // reflow into it rather than extend past it
+        ui.add(egui::Label::new(egui::RichText::new(line.text.as_str()).small()).wrap());
+    });
 }
 
 fn label_head(s: &str) -> String {

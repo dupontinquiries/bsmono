@@ -1024,6 +1024,56 @@ fn route_analyze(path: &str) {
     }
 }
 
+/// The tokenizer contract checks shared by --gate-gemmadiff (optional section) and
+/// --gate-tokenizer (required): engine SP-BPE loads, widths and the mask agree, and every
+/// cross-implementation probe the converter embedded — strings encoded by the HF `tokenizers`
+/// reference at convert time — re-encodes to the SAME ids here and decodes back to the same text.
+/// A near-miss tokenizer prints fluent nonsense, never an error; id equality is the only verdict.
+fn tokenizer_checks(g: &gpu_kernels::gguf::Gguf, ck: &mut dyn FnMut(&str, bool)) {
+            match gpu_kernels::tokenizer::Tokenizer::from_gguf(&g) {
+                Err(e) => ck(&format!("tokenizer from_gguf: {e}"), false),
+                Ok(tk) => {
+                    if let Some(t) = g.tensor("token_embd.weight") {
+                        ck("tokenizer width == token_embd width",
+                           t.dims.get(1).copied() == Some(tk.vocab_size() as u64));
+                    }
+                    let mask_ok = gpu_kernels::gguf_mask_token_id(&g)
+                        .map(|id| tk.decode(&[id]).contains("<mask>") && tk.encode("<mask>") == vec![id])
+                        .unwrap_or(false);
+                    ck("mask id ↔ \"<mask>\" both directions", mask_ok);
+                    let mut i = 0u32;
+                    let mut n_probe = 0u32;
+                    let mut all_ok = true;
+                    loop {
+                        let (tkey, ikey) = (format!("__fixture.tok_probe.{i}.text"),
+                                            format!("__fixture.tok_probe.{i}.ids"));
+                        let Some(gpu_kernels::gguf::Value::Str(text)) = g.metadata.get(&tkey) else { break };
+                        let want: Vec<u32> = match g.metadata.get(&ikey) {
+                            Some(gpu_kernels::gguf::Value::Arr(a)) => a.iter().filter_map(|v| match v {
+                                gpu_kernels::gguf::Value::U32(x) => Some(*x),
+                                gpu_kernels::gguf::Value::I32(x) => Some(*x as u32),
+                                _ => None,
+                            }).collect(),
+                            _ => { all_ok = false; break }
+                        };
+                        let got = tk.encode(text);
+                        if got != want {
+                            all_ok = false;
+                            println!("    probe {i} {text:?}: engine {got:?} != reference {want:?}");
+                        }
+                        if tk.decode(&want) != *text {
+                            all_ok = false;
+                            println!("    probe {i} {text:?}: decode diverged: {:?}", tk.decode(&want));
+                        }
+                        i += 1; n_probe += 1;
+                    }
+                    if n_probe > 0 {
+                        ck(&format!("{n_probe} cross-implementation probes: engine ids == HF reference ids, decode round-trips"), all_ok);
+                    }
+                }
+            }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--route-analyze") {
@@ -2727,6 +2777,167 @@ fn main() {
         ck("timestep_embedding values are bounded (cos/sin ⇒ within [-1,1])", e_t1.iter().all(|v| v.abs() <= 1.0001));
 
         println!("gate-dit-primitives: {}", if ok { "DiT modulation/patchify/timestep primitives validated \u{2713}" } else { "FAIL \u{2717} — see failing checks above" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-gemmadiff") {
+        // DiffusionGemma header gate — no GPU. Takes the GGUF path after the flag (converter
+        // output today, a real checkpoint on the M2 later) and validates everything that can be
+        // validated without kernels: the arch resolves, gemmadiff::read_shape accepts the header
+        // and its per-layer plan matches the weight census (attn_v absent exactly on full
+        // layers), the diffusion routing facts hold (mask id present, shift_logits false for
+        // this lineage), the file-aware preflight prices it, and the gap report NAMES what still
+        // blocks a forward. Green here means "the file is what the plan expects", not "it runs".
+        let path = args.iter().position(|a| a == "--gate-gemmadiff")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| { eprintln!("usage: --gate-gemmadiff <model.gguf>"); std::process::exit(2) });
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| { eprintln!("read {path}: {e}"); std::process::exit(2) });
+        let g = gpu_kernels::gguf::parse(&bytes).unwrap_or_else(|e| { eprintln!("parse: {e}"); std::process::exit(2) });
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let arch = g.get_str("general.architecture").unwrap_or("").to_string();
+        ck("general.architecture = diffusion_gemma", arch == "diffusion_gemma");
+        let cfg = gpu_kernels::archcfg::for_arch(&arch);
+        ck("registry: recognised, MoE + shared expert, Gemma norms", matches!(cfg.arch, gpu_kernels::archcfg::Arch::DiffusionGemma) && cfg.moe && cfg.moe_shared_expert);
+        match gpu_kernels::gemmadiff::read_shape(&g) {
+            Err(e) => ck(&format!("read_shape: {e}"), false),
+            Ok(s) => {
+                ck("shape validates", s.validate().is_ok());
+                // the census invariant: attn_v exists exactly on the NON-full layers
+                let census_ok = (0..s.n_layer).all(|il| {
+                    let has_v = g.tensor(&format!("blk.{il}.attn_v.weight")).is_some();
+                    has_v != s.v_from_k(il)
+                });
+                ck("attn_v absent exactly on the full-attention layers (V-from-K census)", census_ok);
+                ck("encoder scalar set present (layer_output_scale_enc)",
+                   (0..s.n_layer).all(|il| g.tensor(&format!("blk.{il}.layer_output_scale_enc.weight")).is_some()));
+                ck("self-conditioning FFN present (self_cond.*)",
+                   ["self_cond.pre_norm.weight", "self_cond.ffn_gate.weight",
+                    "self_cond.ffn_up.weight", "self_cond.ffn_down.weight"]
+                       .iter().all(|t| g.tensor(t).is_some()));
+                let est = gpu_kernels::store::estimate_resident_for_load(&g);
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                // GiB for the real 51 GB checkpoint, raw bytes alongside so the selfcheck fixture
+                // (~50 KB) prints a figure instead of five zeros — a line of all zeros reads as
+                // "the estimator returned nothing", which is the opposite of what happened.
+                println!("  preflight: native {:.3} GiB | f32 {:.3} | int8-rest {:.3} | plan int8 {:.3} / q4 {:.3} GiB \
+                          ({} / {} / {} B; plans {} / {} B)",
+                    gib(est.native_view_bytes), gib(est.f32_bytes), gib(est.int8_rest_bytes),
+                    gib(est.plan_int8()), gib(est.plan_q4()),
+                    est.native_view_bytes, est.f32_bytes, est.int8_rest_bytes,
+                    est.plan_int8(), est.plan_q4());
+            }
+        }
+        ck("mask token id present (tokenizer.ggml.mask_token_id)", gpu_kernels::gguf_mask_token_id(&g).is_some());
+        ck("diffusion.shift_logits = false (in-place lineage)", g.get_str("diffusion.shift_logits") == Some("false"));
+        let gaps = gpu_kernels::archfeat::gap_report(&arch, g.get_u32("diffusion_gemma.expert_count").unwrap_or(0));
+        println!("  declared gaps ({} — the ENGINE forward needs each):", gaps.len());
+        for l in &gaps { println!("    - {l}"); }
+        ck("gaps are declared, not hidden", !gaps.is_empty());
+        // ── CPU reference forward: the fixture actually RUNS, end to end ─────────────────────
+        // Weights::load reads f32/f16 files (fixture and unquantized real drops); a quantized
+        // file skips this section by design and the header verdict above still stands.
+        let all_plain = g.tensors.iter().all(|t| matches!(t.ggml_type, 0 | 1)
+            || t.name.starts_with("__fixture."));
+        if all_plain {
+            match gpu_kernels::gemmadiffcpu::Weights::load(&g, &bytes) {
+                Err(e) => ck(&format!("CPU weights load: {e}"), false),
+                Ok(w) => {
+                    ck("CPU weights load (every tensor, dims checked by name)", true);
+                    use gpu_kernels::gemmadiffcpu::{forward, KvCache};
+                    use gpu_kernels::gemmadiff::{blockrefine, Pass};
+                    // causality on FILE weights, both passes — the same pins the unit tests hold
+                    // on synthetic weights, now against what the converter wrote
+                    let run = |toks: &[u32], pass| {
+                        let mut c = KvCache::new(&w.shape);
+                        forward(&w, &mut c, toks, 0, pass)
+                    };
+                    let (a, b) = ([1u32, 2, 3], [1u32, 2, 7]);
+                    let causal = match (run(&a, Pass::Encode), run(&b, Pass::Encode)) {
+                        (Ok(ea), Ok(eb)) => ea[0] == eb[0] && ea[2] != eb[2],
+                        _ => false,
+                    };
+                    ck("encode is causal on the file's weights", causal);
+                    let bidir = match (run(&a, Pass::Denoise), run(&b, Pass::Denoise)) {
+                        (Ok(da), Ok(db)) => da[0] != db[0],
+                        _ => false,
+                    };
+                    ck("denoise is bidirectional on the file's weights", bidir);
+                    let sched = blockrefine::Schedule { max_steps: 8, ..blockrefine::Schedule::shipped() };
+                    match gpu_kernels::gemmadiffcpu::denoise_canvas(&w, &sched, &[1, 2, 3], w.shape.block_len as usize) {
+                        Err(e) => ck(&format!("block-AR denoise: {e}"), false),
+                        Ok(toks) => {
+                            ck("block-AR denoise: encode → denoise → commit → encode, one block",
+                               toks.len() == w.shape.block_len as usize
+                                   && toks.iter().all(|t| *t != w.mask_id && (*t as usize) < w.vocab));
+                            println!("    committed: {toks:?}");
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("  [–] CPU forward skipped: file carries quantized tensors (header verdict only)");
+        }
+        // ── IQ1_S pathway probe (fixture-only tensor written by convert.py --selfcheck) ──────
+        // The pathway the estimator and the MoE slicer stand on, exercised against FILE bytes:
+        // native pricing counts exactly the probe's bytes, the kill-switch flips it to zero, and
+        // per-row slices of the mmapped bytes dot bit-identically to the whole-tensor offsets.
+        if let Some(t) = g.tensor("__fixture.iq1s_probe") {
+            ck("probe is ggml type 19 (IQ1_S)", t.ggml_type == 19);
+            let (k, n) = (t.dims[0] as usize, t.dims[1] as usize);
+            let nbytes = gpu_kernels::gguf::type_nbytes(19, n * k).unwrap_or(0);
+            let est = gpu_kernels::store::estimate_resident_for_load(&g);
+            ck("preflight prices the probe natively, to the byte",
+               est.native_view_bytes == nbytes as u64);
+            std::env::set_var("LOGSCOPE_NO_IQ1_NATIVE", "1");
+            let est_off = gpu_kernels::store::estimate_resident_for_load(&g);
+            std::env::remove_var("LOGSCOPE_NO_IQ1_NATIVE");
+            ck("LOGSCOPE_NO_IQ1_NATIVE flips the same tensor out of native pricing",
+               est_off.native_view_bytes == 0 && est_off.plan_int8() > est.plan_int8());
+            let rb = gpu_kernels::Iq1Weight::row_bytes(k);
+            ck("row_bytes accepts the probe width", rb.is_some());
+            if let Some(rb) = rb {
+                // two INDEPENDENT size computations must agree on this tensor: gguf::type_nbytes
+                // over the element count vs row_bytes × rows — the disagreement class that made
+                // the resident path read shifted fields
+                ck("row_bytes × rows == type_nbytes (independent size paths agree)", n * rb == nbytes);
+                let off = (g.data_offset + t.offset) as usize;
+                let data = &bytes[off..off + nbytes];
+                let act: Vec<f32> = (0..k).map(|i| (i as f32 * 0.37).sin()).collect();
+                let rows_decode = (0..n).all(|r| {
+                    gpu_kernels::cpumatvec::dot_iq1_s(&data[r * rb..(r + 1) * rb], &act)
+                        .map(|f| f.is_finite()).unwrap_or(false)
+                });
+                ck("every per-row slice of the FILE bytes decodes finitely via dot_iq1_s", rows_decode);
+            }
+        }
+        // ── tokenizer: the engine's SP-BPE against the reference implementation's own ids ────
+        // Optional here (a weights-only conversion has none); --gate-tokenizer is the standalone,
+        // REQUIRED version of the same checks for tokenizer-carrying files.
+        if g.metadata.contains_key("tokenizer.ggml.tokens") {
+            tokenizer_checks(&g, &mut ck);
+        }
+        println!("gate-gemmadiff: {}", if ok {
+            "\u{2713} header + CPU reference forward (the ENGINE forward is still the declared gaps)"
+        } else { "FAIL \u{2717}" });
+        if !ok { std::process::exit(1); }
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-tokenizer") {
+        // Standalone tokenizer contract gate — any GGUF that claims to carry a tokenizer. The
+        // gemmadiff gate runs the same checks as an optional section; here they are REQUIRED, so
+        // "no tokenizer" is a failure, not a shrug. Built for the tokenizer-only GGUFs
+        // convert.py --emit-tokenizer produces from a real drop (262k pieces, half a million
+        // merges, probes encoded by the HF reference at emit time).
+        let path = args.iter().position(|a| a == "--gate-tokenizer")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| { eprintln!("usage: --gate-tokenizer <file.gguf>"); std::process::exit(2) });
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| { eprintln!("read {path}: {e}"); std::process::exit(2) });
+        let g = gpu_kernels::gguf::parse(&bytes).unwrap_or_else(|e| { eprintln!("parse: {e}"); std::process::exit(2) });
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let has = g.metadata.contains_key("tokenizer.ggml.tokens");
+        ck("tokenizer.ggml.tokens present", has);
+        if has { tokenizer_checks(&g, &mut ck); }
+        println!("gate-tokenizer: {}", if ok { "\u{2713}" } else { "FAIL \u{2717}" });
+        if !ok { std::process::exit(1); }
         return;
     }
     if args.iter().any(|a| a == "--gate-memplan") {
@@ -5284,7 +5495,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }

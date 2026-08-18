@@ -415,7 +415,10 @@ struct ReplicatorMode {
 #[derive(Default, Clone)]
 struct ReplicaLane {
     assignment: String,
-    lines: Vec<String>,
+    /// Role-tagged so the panel never has to infer a speaker from an index (see
+    /// `replicatorlayout::LaneLine` — a lane whose reply never arrived would flip every
+    /// following attribution).
+    lines: Vec<crate::replicatorlayout::LaneLine>,
     turn: usize,
     /// True while the last line is a reply still streaming — so a second token stream cannot be
     /// appended onto a finished reply, and `last` (what partners quote) is never a half sentence
@@ -425,15 +428,25 @@ struct ReplicaLane {
 
 impl ReplicaLane {
     fn append_token(&mut self, t: &str) {
-        if !self.streaming { self.lines.push(String::new()); self.streaming = true; }
-        if let Some(last) = self.lines.last_mut() { last.push_str(t); }
+        if !self.streaming {
+            self.lines.push(crate::replicatorlayout::LaneLine::worker(""));
+            self.streaming = true;
+        }
+        if let Some(last) = self.lines.last_mut() { last.text.push_str(t); }
     }
 
     fn finish_reply(&mut self, full: &str) {
         let text = full.trim().to_string();
-        if self.streaming { if let Some(last) = self.lines.last_mut() { *last = text; } }
-        else { self.lines.push(text); }
+        if self.streaming { if let Some(last) = self.lines.last_mut() { last.text = text; } }
+        else { self.lines.push(crate::replicatorlayout::LaneLine::worker(text)); }
         self.streaming = false;
+    }
+
+    /// What this worker last SAID — its own most recent reply, never the operator's prompt to it.
+    /// `peer_context` labels this "[w2 last said]" and puts it in a partner's prompt, so handing
+    /// it the operator's broadcast would quote the operator back as if a worker had written it.
+    fn last_said(&self) -> Option<String> {
+        self.lines.iter().rev().find(|l| !l.from_operator).map(|l| l.text.clone())
     }
 }
 
@@ -502,20 +515,28 @@ impl ReplicatorMode {
     /// mode that both decides and dispatches is a mode that cannot be tested without a GPU. The
     /// caller feeds these to the same lane machinery a normal turn uses.
     fn submit(&mut self, text: &str) -> Vec<logscope::replicator::Dispatchable> {
+        let aim = self.aim;
+        self.submit_to(text, aim)
+    }
+
+    /// As `submit`, with the aim supplied explicitly — Ctrl+Enter broadcasts one message without
+    /// clearing the standing aim, so the field stays the operator's setting rather than something
+    /// a keystroke silently rewrote.
+    fn submit_to(&mut self, text: &str, aim: Option<usize>) -> Vec<logscope::replicator::Dispatchable> {
         for (i, w) in self.workers.iter().enumerate() {
             if let Some(l) = self.lanes.get_mut(i) { l.assignment = w.assignment.clone(); }
         }
-        let aim = match self.aim { Some(i) => logscope::replicator::Aim::One(i),
-                                   None => logscope::replicator::Aim::All };
+        let aim = match aim { Some(i) => logscope::replicator::Aim::One(i),
+                              None => logscope::replicator::Aim::All };
         let lanes = self.lanes.clone();
         let out = logscope::replicator::compose_turn(
             &self.workers, &self.grid, &aim, text,
             |id| lanes.get(id).map(|l| l.turn).unwrap_or(0),
-            |id| lanes.get(id).and_then(|l| l.lines.last().cloned()),
+            |id| lanes.get(id).and_then(|l| l.last_said()),
             &mut self.crossings);
         for d in &out {
             if let Some(l) = self.lanes.get_mut(d.to) {
-                l.lines.push(text.trim().to_string());
+                l.lines.push(crate::replicatorlayout::LaneLine::operator(text.trim()));
                 l.turn += 1;
             }
         }
@@ -1016,6 +1037,22 @@ pub struct Chat {
     verify_job: Option<VerifyJob>, // running sandbox build-check of the generated files
     image_job: Option<ImageJob>,   // running :image generation (sd-cli, off-thread)
     replicator: Option<ReplicatorMode>, // :replicate — parallel worker columns over the workspace
+    /// The engine's outstanding compaction request, seq included so a request already declined is
+    /// not re-offered every frame. None = nothing pending.
+    compact_offer: Option<crate::backend::CompactRequest>,
+    /// Seq of the last request the operator dismissed — dismissing means "not this one", not
+    /// "never again", so a LATER request (higher seq) still asks.
+    compact_declined: usize,
+    /// Long-horizon: when the reply budget would be squeezed below the usable floor, stop and ask
+    /// for a summary of the older turns instead of shrinking this reply (and every one after it).
+    summarize_on_squeeze: bool,
+    /// Set by Ctrl+Enter with an aimed fan: the NEXT dispatch goes to every column, then the aim
+    /// resumes. One-shot rather than a mode, because "say this to everyone" is a sentence, not a
+    /// state the operator has to remember to leave.
+    fan_broadcast_once: bool,
+    /// Narrow screens only: the fan takes the central area instead of the message log. On a width
+    /// that can hold a real split this is inert (replicatorlayout::split returns Side).
+    fan_fullscreen: bool,
     replica_jobs: std::collections::HashMap<crate::lanes::JobId, usize>, // lane job → replicator column
     verify_net: bool,              // allow the verify to fetch missing deps from crates.io (opt-in)
     show_files: bool,              // expand the generated-files drawer (toggled from the composer)
@@ -1208,6 +1245,11 @@ impl Default for Chat {
             verify_job: None,
             image_job: None,
             replicator: None,
+            summarize_on_squeeze: false,
+            compact_offer: None,
+            compact_declined: 0,
+            fan_broadcast_once: false,
+            fan_fullscreen: false,
             replica_jobs: Default::default(),
             instance_bytes: 0,
             verify_net: false,
@@ -1755,7 +1797,12 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         // value stays the per-chunk / manual-continue size.
         let ceiling = if self.auto_continue { self.ctx.max_tokens * (1 + MAX_AUTO_CONTINUE) } else { self.ctx.max_tokens };
         GenParams { max_tokens: self.ctx.max_tokens as usize, reply_ceiling: ceiling as usize, n_ctx: self.ctx.n_ctx, n_batch: self.ctx.n_ctx,
-            temperature: self.ctx.temperature, repeat_penalty: self.ctx.repeat_penalty, min_p: self.ctx.min_p, n_threads: 4, n_gpu_layers: -1 }
+            temperature: self.ctx.temperature, repeat_penalty: self.ctx.repeat_penalty, min_p: self.ctx.min_p,
+            // Long-horizon relief: only meaningful when auto-continue is on (that is the mode
+            // whose replies are long enough for the squeeze to cost an answer), so the toggle is
+            // gated on it rather than being a second setting that silently does nothing.
+            summarize_instead_of_squeeze: self.auto_continue && self.summarize_on_squeeze,
+            n_threads: 4, n_gpu_layers: -1 }
     }
 
     /// The loaded model's template, preferring the worker's live value over the per-frame copy.
@@ -5516,7 +5563,16 @@ them to", patches.len());
     /// mode cannot fill. The seam is `Vec<Host>` precisely so that adding peers later is a change
     /// to this function and nothing else.
     fn replicator_hosts(&self) -> Vec<logscope::replicator::Host> {
+        // `resident_budget_bytes` lives in the engine crate, which the default build does not link
+        // (wgpu-engine is opt-in) — this call un-gated is what broke `cargo check` with no features.
+        // Without the engine, `instance_bytes` never leaves 0 (it is set from the lane pool's Ready
+        // event), and `replicator::slots` reads per-instance 0 as "no memory bound" — so the budget
+        // is never consulted and 0 is inert rather than a lie. Duplicating the meminfo parse here to
+        // fake a figure would just be a second copy of the rule waiting to drift.
+        #[cfg(feature = "wgpu-engine")]
         let budget = gpu_kernels::store::resident_budget_bytes().unwrap_or(0);
+        #[cfg(not(feature = "wgpu-engine"))]
+        let budget = 0u64;
         vec![logscope::replicator::Host { id: "local".into(), budget_bytes: budget }]
     }
 
@@ -5586,8 +5642,10 @@ them to", patches.len());
     /// half-wired.
     fn dispatch_replicator(&mut self, text: &str) {
         let params = self.params();
+        let broadcast_once = std::mem::take(&mut self.fan_broadcast_once);
         let Some(m) = &mut self.replicator else { return };
-        let jobs = m.submit(text);
+        let aim = if broadcast_once { None } else { m.aim };
+        let jobs = m.submit_to(text, aim);
         if jobs.is_empty() {
             self.note = "replicator: nothing aimed at — the column you targeted is gone".into();
             return;
@@ -5618,7 +5676,7 @@ them to", patches.len());
         let mut views: Vec<crate::replicatorui::ColumnView<'_>> = m.workers.iter()
             .zip(m.lanes.iter_mut())
             .map(|(w, l)| crate::replicatorui::ColumnView {
-                id: w.id, host: w.host.as_str(), turn: l.turn,
+                id: w.id, host: w.host.as_str(), turn: l.turn, streaming: l.streaming,
                 // The assignment edits IN PLACE through the view; the panel owns no copy that
                 // could go stale between frames.
                 assignment: &mut l.assignment,
@@ -5630,6 +5688,7 @@ them to", patches.len());
         if let Some(a) = act.aim { m.aim = a; }
         if act.toggle_matrix { m.show_matrix = !m.show_matrix; }
         if let Some(v) = act.want { m.resize(v); }
+
         if m.show_matrix {
             let labels: Vec<String> = m.workers.iter().zip(m.lanes.iter())
                 .map(|(w, l)| if l.assignment.is_empty() { format!("w{}", w.id) } else { l.assignment.clone() })
@@ -5638,6 +5697,14 @@ them to", patches.len());
             // newest lane turn is the operator's "now".
             let now = m.lanes.iter().map(|l| l.turn).max().unwrap_or(0) as u32;
             crate::replicatorui::dilation_matrix(ui, &mut m.grid, &labels, now);
+        }
+        // Applied AFTER the `m` borrow ends: Enter in an assignment field aimed the composer, and
+        // this hands it the keyboard so the operator types the task immediately instead of
+        // hunting for the box. (Setting self.mode inside the borrow does not compile — the same
+        // shape as poll_image's deferred dismissal.)
+        if act.focus_composer {
+            ui.ctx().memory_mut(|mm| mm.request_focus(egui::Id::new("logscope_chat_composer")));
+            self.mode = crate::vimmode::Mode::Insert;
         }
     }
 
@@ -7287,6 +7354,18 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
             });
         }
 
+        // ── the engine's compaction request, picked up once per frame ──
+        // ctxwin::relief publishes this when the long-horizon policy decides the reply budget has
+        // been squeezed below a usable answer. The ACTION is `:compact`, which already exists —
+        // student/teacher self-compaction with a pinnable KV checkpoint — so this offers that
+        // rather than growing a second folding path beside it.
+        if let Some(req) = infer.compact_request() {
+            if req.seq != self.compact_declined && self.stream.is_none() {
+                self.compact_offer = Some(req);
+            }
+            infer.clear_compact_request();
+        }
+        let mut do_compact = false;
         let mut do_send = false;
         let mut do_continue = false;
         let mut do_checkpoint = false;
@@ -7416,6 +7495,25 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
             if let Some((msg, at)) = &self.ws_note {
                 let a = 1.0 - theme::appear(*at, 8.0);
                 if a > 0.0 { ui.ctx().request_repaint(); theme::fade(ui, a, |ui| { ui.label(RichText::new(msg).color(theme::GREEN()).small()); }); }
+            }
+            // WHAT ACTUALLY HAPPENED, above what might. `ctx_suggestion` below is an ESTIMATE of
+            // the next prompt (est() over the text); `context_fit` is the engine's MEASUREMENT of
+            // the last one, and when it reports tokens elided from the middle that is not a
+            // prediction to hedge — it is a fact about the reply already on screen. It had no
+            // callers at all until now, which is why a session could quietly lose the middle of
+            // every prompt with nothing in the UI saying so.
+            if let Some(fit) = infer.context_fit().filter(|f| f.elided > 0) {
+                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
+                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::AMBER()), ..Default::default() }
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("✂").color(theme::AMBER()).small());
+                        ui.label(RichText::new(format!(
+                            "Last turn: {} tokens of prompt into a {}-token window — {} elided from the middle \
+(head and tail kept, the cut marked in the prompt).",
+                            fit.prompt, fit.window, fit.elided)).color(theme::DIM()).small());
+                    });
+                });
             }
             // context-overflow suggestion: the next prompt won't fit the window, so it'd be trimmed
             if let Some(want) = self.ctx_suggestion(doc) {
@@ -7576,7 +7674,30 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     .frame(egui::Frame::NONE)
                     .text_color(egui::Color32::TRANSPARENT)   // invisible text — the pearl cells are the visual
                     .font(egui::FontId::new(14.0, egui::FontFamily::Monospace)));
-                let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                // ENTER IS ROUTED, not hardcoded. With a fan open the composer is addressing one
+                // column or all of them, and the keystroke has to say which — the rule (and the
+                // reason Shift stays a newline and Ctrl only means something when aimed) is in
+                // replicatorlayout::enter_action, tested headlessly.
+                let fan_open = self.replicator.is_some();
+                let fan_aim = self.replicator.as_ref().and_then(|m| m.aim);
+                let pressed = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let mods = ui.input(|i| crate::replicatorlayout::Mods {
+                    shift: i.modifiers.shift, ctrl: i.modifiers.command || i.modifiers.ctrl });
+                let mut enter = false;
+                if pressed {
+                    match crate::replicatorlayout::enter_action(
+                        fan_open, fan_aim, crate::replicatorlayout::Focus::Composer, mods) {
+                        crate::replicatorlayout::EnterAction::Newline => {}
+                        crate::replicatorlayout::EnterAction::SendAimed => enter = true,
+                        crate::replicatorlayout::EnterAction::SendBroadcast => {
+                            // one message to everyone WITHOUT dropping the aim: the operator is
+                            // interrupting a focused exchange, not ending it
+                            enter = true;
+                            self.fan_broadcast_once = true;
+                        }
+                        _ => {}
+                    }
+                }
                 if enter && self.input.ends_with('\n') { self.input.pop(); }
                 // Plasma Mobile / IME robustness: on some mobile stacks (Wayland + Maliit) the soft-keyboard
                 // commit drops widget focus right after the FIRST character — the empty→non-empty layout change
@@ -7614,7 +7735,11 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     }
                 }
                 ui.add_space(theme::PAD_XS as f32);
-                self.draw_replicator(ui);
+                // NOT the replicator fan. It used to be drawn here, inside the composer's vertical
+                // flow — a second chat area stacked under the first, growing downward as workers
+                // replied and pushing the composer toward the bottom edge. A fan is a parallel
+                // view of the conversation, not a continuation of it, so it now SPLITS the chat
+                // area (side panel below) and both halves scroll under one composer.
                 self.poll_image(ui);
                 // MOBILE OVERLAP. egui's horizontal() does not wrap: controls past the right edge are drawn
                 // anyway, on top of each other. On a desktop this bar never reaches the edge, so the failure is
@@ -7675,6 +7800,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     // would be a policy expressed twice, which is how the watchdog tables drifted.
                     let (mut panel_mode, mut stepwise) = (self.panel_mode, self.stepwise);
                     let (mut auto_continue, mut patch_mode) = (self.auto_continue, self.patch_mode);
+                    let mut summarize_on_squeeze = self.summarize_on_squeeze;
                     {
                         let mut modes = |ui: &mut egui::Ui| {
                         ui.checkbox(&mut panel_mode, RichText::new("debate panel").small())
@@ -7685,6 +7811,17 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
                         ui.checkbox(&mut auto_continue, RichText::new("auto-continue").small())
                             .on_hover_text("When a reply hits the length cap, keep generating to finish it");
+                        // The relief policy, next to the mode it modifies. Enabled only with
+                        // auto-continue on: that is the mode whose replies are long enough for the
+                        // budget squeeze to cost an answer, and a checkbox that silently does
+                        // nothing is worse than one that is visibly unavailable.
+                        ui.add_enabled_ui(auto_continue, |ui| {
+                            ui.checkbox(&mut summarize_on_squeeze, RichText::new("summarize, don't squeeze").small())
+                                .on_hover_text("Long-horizon: when the prompt has grown enough that the reply \
+budget would drop below a usable answer, STOP and summarize the older turns, then continue with the \
+freed room — instead of silently shrinking every reply from here on (the default, which walked one \
+session's budget from 2470 down to 814 tokens over seventeen turns without saying so).");
+                        });
                         ui.checkbox(&mut patch_mode, RichText::new("patch mode").small())
                             .on_hover_text("edit mode: the model emits unified-diff patches (only changed lines) instead of rewriting whole files — fewer tokens per edit, applied context-anchored and committed via gitmind.");
                         };
@@ -7692,6 +7829,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     }
                     self.panel_mode = panel_mode; self.stepwise = stepwise;
                     self.auto_continue = auto_continue; self.patch_mode = patch_mode;
+                    self.summarize_on_squeeze = summarize_on_squeeze;
                     if self.hit_cap && !streaming {
                         if theme::action_button(ui, "⏭ Continue", theme::CYAN(), true)
                             .on_hover_text("The last reply hit the length cap — resume it").clicked() { do_continue = true; }
@@ -7719,7 +7857,14 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             if !self.queue.is_empty() { ui.label(RichText::new(format!("{} queued", self.queue.len())).color(theme::CYAN()).small()); }
                         } else {
                             let can = !self.input.trim().is_empty();
-                            if theme::action_button(ui, "Send ▶", theme::AMBER(), can).clicked() { do_send = true; }
+                            // The label is the same decision the key makes, from the same
+                            // function: a composer aimed at one worker while the button reads
+                            // "Send" is how a message meant for w2 gets broadcast to four.
+                            let label = crate::replicatorlayout::enter_hint(
+                                self.replicator.is_some(),
+                                self.replicator.as_ref().and_then(|m| m.aim),
+                                self.replicator.as_ref().map(|m| m.workers.len()).unwrap_or(0));
+                            if theme::action_button(ui, &label, theme::AMBER(), can).clicked() { do_send = true; }
                             if !self.queue.is_empty() { ui.label(RichText::new(format!("{} queued", self.queue.len())).color(theme::CYAN()).small()); }
                         }
                         // collapsed in from the old top bar: checkpoint · history · tree · export
@@ -7762,7 +7907,64 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
         });
         }
 
+        let mut close_fan = false;
+        // ── the replicator fan SPLITS the chat area, when one is open ──
+        // Panel before CentralPanel: the fan claims a column beside the log, both stopping above
+        // the composer, so the operator reads the main thread and the workers side by side and
+        // types into one box. `replicatorlayout::split` decides whether that is honest at this
+        // width — on a phone it is not (two 190pt ribbons of prose are worse than either alone),
+        // and Stacked shows the fan in place of the log with a way back.
+        if self.replicator.is_some() {
+            let window_w = ui.available_width();
+            let n = self.replicator.as_ref().map(|m| m.workers.len()).unwrap_or(1);
+            match crate::replicatorlayout::split(window_w, n) {
+                crate::replicatorlayout::Split::Side { fan_pt } => {
+                    egui::SidePanel::right("replicator_fan")
+                        .resizable(true)
+                        .default_width(fan_pt)
+                        // The clamp is the container's, not the content's: dragging the splitter
+                        // can starve the log but never past its floor, and cannot widen the fan
+                        // past the window.
+                        .width_range(crate::replicatorlayout::MIN_COL_PT
+                            ..=(window_w - crate::replicatorlayout::MIN_LOG_PT)
+                                .max(crate::replicatorlayout::MIN_COL_PT))
+                        .show_inside(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("⑃ fan").color(theme::accent()).strong());
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("✕").on_hover_text("Close replicator mode").clicked() {
+                                        close_fan = true;
+                                    }
+                                });
+                            });
+                            self.draw_replicator(ui);
+                        });
+                }
+                crate::replicatorlayout::Split::Stacked => {
+                    // Too narrow to split. One at a time, with the toggle stating which is showing
+                    // — a fan drawn at 190pt per column is not a view, it is a stack of ribbons.
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.selectable_label(self.fan_fullscreen, RichText::new("⑃ fan").small()).clicked() {
+                            self.fan_fullscreen = true;
+                        }
+                        if ui.selectable_label(!self.fan_fullscreen, RichText::new("chat").small()).clicked() {
+                            self.fan_fullscreen = false;
+                        }
+                        if ui.small_button("✕").on_hover_text("Close replicator mode").clicked() { close_fan = true; }
+                    });
+                    if self.fan_fullscreen {
+                        egui::CentralPanel::default().show_inside(ui, |ui| { self.draw_replicator(ui); });
+                    }
+                }
+            }
+        }
+        if close_fan { self.replicator = None; self.note = "replicator: closed".into(); }
+
         // ── center: the message log fills whatever height remains above the pinned bottom ──
+        if !(self.replicator.is_some() && self.fan_fullscreen
+             && matches!(crate::replicatorlayout::split(ui.available_width(),
+                         self.replicator.as_ref().map(|m| m.workers.len()).unwrap_or(1)),
+                         crate::replicatorlayout::Split::Stacked)) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if self.spatial_view {
                 let want_send = self.spatial_ui(ui, Some(model));
@@ -7771,6 +7973,34 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
             } // aggressive: spatial graph replaces the linear log
             egui::ScrollArea::vertical().id_salt("chat_log").auto_shrink([false, false]).stick_to_bottom(true)
                 .show(ui, |ui| {
+                    // CONTEXT IS FULL. The alternative is the default: shrink this reply, and the
+                    // next, and the one after that, without saying so. One session's budget walked
+                    // 2470 → 814 tokens over seventeen turns that way.
+                    if let Some(req) = self.compact_offer {
+                        egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
+                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::AMBER()), ..Default::default() }
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("🗜").color(theme::AMBER()).strong());
+                                ui.label(RichText::new(format!(
+                                    "The context is full: replies from here would be cut short. Fold the older \
+turns into a briefing (~{} tokens of history) and keep the most recent {} verbatim?",
+                                    req.summarize_upto, req.keep_recent)).color(theme::INK()));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if theme::action_button(ui, "Summarize & continue", theme::AMBER(), true)
+                                    .on_hover_text("Stages the :compact teacher turn — fold the older turns into a \
+dense briefing that replaces them as the working context, then carry on with room to answer").clicked() {
+                                    do_compact = true;
+                                }
+                                if ui.button("Keep squeezing").on_hover_text(
+                                    "Shrink this reply instead. The offer returns if it gets worse.").clicked() {
+                                    self.compact_declined = req.seq;
+                                    self.compact_offer = None;
+                                }
+                            });
+                        });
+                    }
                     if let Some(n) = self.recover {
                         egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
                             outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::CYAN()), ..Default::default() }
@@ -8081,6 +8311,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                     }
                 });
         });
+        } // narrow + fan-fullscreen: the fan took the central area instead of the log
 
         // ── picker modals + their outcomes ──
         if let Some(crate::filepicker::Outcome::Picked(dir)) = self.save_picker.ui(ui.ctx()) {
@@ -8127,6 +8358,38 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                 }
             }
             self.continue_generation(infer, doc);
+        }
+        // Accepting the offer runs the SAME `:compact` the operator could type, with the fold sized
+        // from the engine's request instead of the command's default ratio — one folding path, two
+        // ways in. A checkpoint first, because a compaction rewrites the working context and the
+        // operator's next thought may be that it dropped something.
+        if do_compact {
+            let req = self.compact_offer.take();
+            self.checkpoint("before compaction");
+            let mut chain = Vec::new();
+            let mut cur = self.active_leaf;
+            while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
+            chain.reverse();
+            let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
+                .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(),
+                          m.text().to_string()))
+                .collect();
+            if turns.len() < 2 {
+                self.note = "compaction: need at least two turns of history to fold".into();
+            } else {
+                let keep_tokens = req.map(|r| r.keep_recent).unwrap_or(1024);
+                let (keep, ratio) = crate::refresh::plan_for_request(
+                    &turns, keep_tokens, self.ctx.n_ctx as usize,
+                    crate::refresh::REPLY_FLOOR);
+                let plan = crate::refresh::plan(&turns, keep, ratio);
+                let folded: Vec<(String, String)> = turns[..plan.fold].to_vec();
+                self.input = crate::refresh::teacher_turn(&folded, plan.target_tokens);
+                self.note = format!(
+                    "🗜 compaction staged from the engine's request: fold {} turns → ~{} tok, keep {} \
+recent → context {}→{} tok (−{:.0}%). Send it; the briefing becomes the working context.",
+                    plan.fold, plan.target_tokens, plan.keep, plan.before_tokens, plan.after_tokens,
+                    plan.ratio_saved() * 100.0);
+            }
         }
         if do_checkpoint { self.checkpoint(format!("manual · {} msgs", self.msgs.len())); }
         if do_export {

@@ -66,6 +66,13 @@ in 1..=64, and only genuine garbage is discarded.
 
 ## Known voids (open, honest)
 
+* **DiffusionGemma engine forward** — recognized, CPU-oracle'd, and gated in-sandbox
+  (`--gate-gemmadiff` runs a whole-model CPU forward + one block of the denoise loop on the
+  converter's fixture; `--gate-tokenizer` holds the SP-BPE tokenizer to the HF reference's own
+  ids, 11/11 on the real 262k vocab) — but the GPU forward is all eight declared archfeat gaps
+  on EVERY platform, two of them structural (per-layer head_dim/KV width; V-from-K). Nothing
+  GPU-side has run anywhere. Dossier: `crates/gpu-gemm/DIFFUSION_GEMMA.md`.
+
 * **MoE prefill speed on Metal** — 188–350 s for 2–3 k tokens on Scout Q4_K even with the
   1024-token chunk raise. Unmeasured on Asahi for models this size. The frame fix does not
   address prefill; this is the next perf target for big MoE.

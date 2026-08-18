@@ -136,3 +136,116 @@ mod tests {
         assert_eq!(&staged[1..], &kept[..], "kept turns follow verbatim");
     }
 }
+
+/// The reply-token floor below which an answer is a fragment, mirroring `ctxwin::REPLY_FLOOR`.
+///
+/// Duplicated rather than imported because the engine crate is behind the `wgpu-engine` feature
+/// and this planner is always built — importing it un-gated is exactly the break that had
+/// `cargo check` failing on the default build once already. The two are pinned equal by a test
+/// under the feature, same belt-and-suspenders as `mobilelayout::FAN_ROW_PT` vs `holdmenu::ROW_PT`:
+/// a silent divergence would make this planner aim at a floor the engine does not use.
+pub const REPLY_FLOOR: usize = 512;
+
+/// Turn the engine's TOKEN-shaped compaction request into this planner's TURN-shaped inputs.
+///
+/// `ctxwin::relief` decides in tokens, because that is what a context window is measured in; this
+/// planner folds whole TURNS, because half a turn is not a thing to summarize. The translation is
+/// its own function rather than an inline division at the call site for the reason every seam in
+/// this file exists: the two units met, and whichever side did the conversion silently would own a
+/// rule the other side could not see.
+///
+/// `keep_recent_tokens` is the engine's floor on what must survive verbatim. Turns are counted
+/// from the newest backward until adding one more would exceed it, and AT LEAST ONE recent turn is
+/// always kept — a compaction that folds the turn the next reply continues has summarized away the
+/// thread it was supposed to pick up, which is the failure this whole path exists to avoid.
+///
+/// The ratio is chosen so the projected context actually clears `want_room`: a fold that
+/// recommends itself and still leaves the reply squeezed has spent a round trip for nothing (the
+/// same mistake `ctxwin::relief` prices the summary against, one layer up).
+pub fn plan_for_request(turns: &[(String, String)], keep_recent_tokens: usize, window: usize,
+                        want_room: usize) -> (usize, f32) {
+    let n = turns.len();
+    if n == 0 { return (0, 0.3); }
+    let mut keep = 0usize;
+    let mut kept_tokens = 0usize;
+    for (_, t) in turns.iter().rev() {
+        let e = est(t);
+        if keep > 0 && kept_tokens + e > keep_recent_tokens { break; }
+        kept_tokens += e;
+        keep += 1;
+        if keep >= n.saturating_sub(1) { break; }   // always leave something to fold
+    }
+    let folded: usize = turns[..n - keep].iter().map(|(_, t)| est(t)).sum();
+    // Budget left for the summary after the kept tail and the reply headroom are paid for.
+    let budget = window.saturating_sub(kept_tokens + want_room);
+    let ratio = if folded == 0 { 0.3 } else { (budget as f32 / folded as f32).clamp(0.1, 0.9) };
+    (keep, ratio)
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn turns(sizes: &[usize]) -> Vec<(String, String)> {
+        // est() is ~chars/4, so a turn of n tokens is ~4n characters
+        sizes.iter().enumerate()
+            .map(|(i, n)| ((if i % 2 == 0 { "user" } else { "assistant" }).to_string(),
+                           "x".repeat(n * 4)))
+            .collect()
+    }
+
+    #[test]
+    fn the_newest_turn_always_survives_verbatim() {
+        // Even when the engine's keep budget is smaller than the last turn alone: folding the turn
+        // the next reply continues is the failure the whole path exists to avoid.
+        let t = turns(&[100, 100, 900]);
+        let (keep, _) = plan_for_request(&t, 50, 4096, 1024);
+        assert!(keep >= 1, "kept {keep}");
+        let p = plan(&t, keep, 0.3);
+        assert!(p.fold >= 1, "and there is still something to fold");
+    }
+
+    #[test]
+    fn turns_are_counted_backward_until_the_token_floor_binds() {
+        let t = turns(&[500, 500, 300, 200, 100]);
+        // 1433 tokens of keep budget: 100 + 200 + 300 = 600, adding 500 would make 1100 (still
+        // under), adding the next 500 makes 1600 — over, so 4 turns are kept.
+        let (keep, _) = plan_for_request(&t, 1433, 4096, 1024);
+        assert_eq!(keep, 4);
+        // and a tight budget keeps fewer: the last turn (100) is kept unconditionally, then +200
+        // would exceed 250, so the count stops at one
+        let (keep_tight, _) = plan_for_request(&t, 250, 4096, 1024);
+        assert_eq!(keep_tight, 1);
+    }
+
+    #[test]
+    fn the_ratio_is_chosen_so_the_fold_actually_clears_the_reply_floor() {
+        let t = turns(&[1500, 1000, 400, 200]);
+        let (keep, ratio) = plan_for_request(&t, 800, 4096, 1024);
+        let p = plan(&t, keep, ratio);
+        assert!(p.after_tokens + 1024 <= 4096 + 1,
+                "projected {} + reply room must fit the window", p.after_tokens);
+        assert!(ratio >= 0.1 && ratio <= 0.9);
+    }
+
+    #[test]
+    fn a_single_turn_has_nothing_to_fold_and_says_so_by_arithmetic() {
+        let t = turns(&[500]);
+        let (keep, _) = plan_for_request(&t, 4000, 4096, 1024);
+        let p = plan(&t, keep, 0.3);
+        assert_eq!(p.keep, 0, "plan() itself leaves a turn to fold rather than folding nothing");
+    }
+
+    #[cfg(feature = "wgpu-engine")]
+    #[test]
+    fn the_reply_floor_matches_the_engine_it_is_planning_for() {
+        assert_eq!(REPLY_FLOOR, gpu_kernels::ctxwin::REPLY_FLOOR);
+    }
+
+    #[test]
+    fn an_empty_history_does_not_divide_by_zero() {
+        let (keep, ratio) = plan_for_request(&[], 1000, 4096, 512);
+        assert_eq!(keep, 0);
+        assert!(ratio > 0.0);
+    }
+}

@@ -161,7 +161,18 @@ impl Governor {
         let step = (self.learned_cap / 4).max(2);
         let mut next = self.learned_cap + step;
         if let Some(pc) = self.pressure_ceiling { next = next.min(pc); }
-        self.learned_cap = next.min(self.budget.soft_object_cap); // absolute sanity bound
+        // ANCHOR THE CREEP TO WHAT ACTUALLY RAN. Compounding on `learned_cap` means the cap is its
+        // own evidence: a session where the live object budget clamped every window to k=2 still
+        // walked the cap 8 → 10 → 12 → 15 → 18 → 22 → 27 → … → 293 across seventeen turns, each
+        // step announcing "device has headroom" on the strength of a window the device never ran.
+        // Same defect as the zero-token runs the caller already guards — a cap nothing exercises
+        // cannot be observed failing, so it only ever grows — and it is unfalsifiable in the same
+        // direction. The probe still climbs geometrically when there IS headroom, because each
+        // larger window that completes raises `proven_safe` and with it the ceiling on the next
+        // step; what it can no longer do is climb on evidence about a smaller window.
+        let evidence_bound = self.proven_safe + (self.proven_safe / 4).max(2);
+        self.learned_cap = next.min(evidence_bound).min(self.budget.soft_object_cap)
+            .max(self.learned_cap.min(evidence_bound));
     }
 
     /// Report that the device signalled allocation pressure at window size `k` (an alloc failed, or the
@@ -300,6 +311,33 @@ mod tests {
         assert!(g.learned_cap() < at);
         for _ in 0..12 { g.observe_clean(g.learned_cap()); }
         assert!(g.learned_cap() < at, "the ceiling holds: {} vs {at}", g.learned_cap());
+    }
+
+    #[test]
+    fn the_cap_cannot_climb_on_evidence_about_a_smaller_window() {
+        // The observed session, 2026-08-18, Llama-3.2-3B on Asahi Vulkan: the live AllocationCount
+        // budget clamped every window to k=2, and the cap still walked 8 → 293 over seventeen
+        // turns, printing "device has headroom" each time. It was inert (window_for re-clamps to
+        // the live cap) but it was also a number nobody could refute: a window never run cannot be
+        // observed failing, so it only ever grew, and the first turn with real headroom would have
+        // been sized by seventeen reports about k=2.
+        let mut g = Governor::new(Budget::for_backend(WgpuBackend::Vulkan, false, false));
+        let start = g.learned_cap();
+        for _ in 0..17 { g.observe_clean(2); }
+        assert!(g.learned_cap() <= start.max(4),
+                "clean runs at k=2 must not license a cap of {}", g.learned_cap());
+        assert_eq!(g.proven_safe(), 2, "and only k=2 is actually proven — proven_safe starts at 2");
+
+        // But a device that really does run larger windows still converges upward, geometrically:
+        // each window that completes raises proven_safe and with it the next step's ceiling.
+        let mut g2 = Governor::new(Budget::for_backend(WgpuBackend::Vulkan, false, false));
+        let mut ran = g2.learned_cap();
+        for _ in 0..12 {
+            g2.observe_clean(ran);
+            ran = g2.learned_cap();            // the device honours the probe next turn
+        }
+        assert!(g2.learned_cap() > start * 3,
+                "with real headroom the climb is unchanged: {}", g2.learned_cap());
     }
 
     #[test]
