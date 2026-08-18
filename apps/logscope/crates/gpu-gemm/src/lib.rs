@@ -1192,8 +1192,10 @@ fn pass_fuse_enabled() -> bool {
 fn bind_group_cache_enabled() -> bool {
     fast_decode_enabled() || std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
-/// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
-/// scratch). Bit-identical to the unfused path; enabled by the magical A/B (or LOGSCOPE_FUSE_GLU=1).
+// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
+// scratch). Bit-identical to the unfused path; enabled by the magical A/B (or LOGSCOPE_FUSE_GLU=1).
+// Plain comment, not doc: rustdoc does not attach documentation to a macro invocation, so `///`
+// here is silently discarded and warns.
 thread_local! {
     /// Force the MoE fusions on inside a scope, independent of the decode verdict.
     static FUSE_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1280,6 +1282,11 @@ type Pending = (wgpu::ComputePipeline, std::sync::Arc<wgpu::BindGroup>, (u32, u3
 /// allocation-free (amortized Vec growth aside). Measured-by-construction: 2 heap allocations per
 /// dispatch -> 0. The latency delta is deliberately UNCLAIMED — llvmpipe timings in this sandbox
 /// say nothing about the operator's M2, where encode was profiled at 84% of decode wall time.
+/// dead_code fires on both fields and rustc suggests replacing them with `()`. Taking that
+/// suggestion would drop the Arc at push time and free a bind group the GPU is still reading —
+/// the "Buffer 'dims' is invalid" failure `pending_keep` exists to prevent. The field is read by
+/// Drop, which the lint cannot see.
+#[allow(dead_code)]
 enum Keep { Bg(std::sync::Arc<wgpu::BindGroup>), Buf(std::sync::Arc<wgpu::Buffer>) }
 
 struct Frame { enc: wgpu::CommandEncoder, pending: Vec<Pending>, keep: Vec<Keep>, passes: u32,
@@ -11862,7 +11869,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
     /// in a packed-int8 word shows up rather than comparing equal.
     pub fn int8_cache_diff(&self, a: &Model, b: &Model) -> String {
         let bits = |t: &Tensor| -> Vec<u32> { self.download(t).iter().map(|f| f.to_bits()).collect() };
-        let mut cmp = |name: String, x: &Tensor, y: &Tensor| -> Option<String> {
+        let cmp = |name: String, x: &Tensor, y: &Tensor| -> Option<String> {
             let (xa, ya) = (bits(x), bits(y));
             if xa.len() != ya.len() { return Some(format!("{name}: LENGTH {} vs {}", xa.len(), ya.len())); }
             xa.iter().zip(&ya).position(|(p, q)| p != q)
@@ -11880,9 +11887,9 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
                 _ => {}
             }
             match (&la.kind, &lb.kind) {
-                (LinKind::F32(x), LinKind::F32(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.f32"), x, y) }
-                (LinKind::Q8(x), LinKind::Q8(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
-                (LinKind::Q4(x), LinKind::Q4(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
+                (LinKind::F32(x), LinKind::F32(y)) => { let c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.f32"), x, y) }
+                (LinKind::Q8(x), LinKind::Q8(y)) => { let c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
+                (LinKind::Q4(x), LinKind::Q4(y)) => { let c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
                 _ => Some(format!("{name}: KIND differs")),
             }
         };
