@@ -77,6 +77,56 @@ def placeholder_feeds(src):
                             hits.append((os.path.relpath(p, src), i + 1, why))
     return hits
 
+def uncalled_renderers(src):
+    """Drawing functions nothing calls.
+
+    A finer question than `reached`: a module can be called for one of its
+    functions while another — a whole page — is never drawn. Six real defects
+    today were exactly that, in modules the module-level check called wired:
+
+      bo-suite   queue_ui / now_playing_ui: the controller filled a queue no
+                 screen showed, toast included.
+      bo-suite   playlists_ui: state on the controller, apply_playlist handling
+                 Create with its own test, and no tab to reach it.
+      bo-suite   sources_ui: the device's inputs, beside an outputs page that
+                 was drawn.
+      snapclone  feed_ui: received snaps had nowhere to appear.
+      snapclone  reticle_ui: a changeover that wired the state, the trigger and
+                 the tick, and left the paint on the old timer.
+      voiceterm  mail_view::list_ui in a pane: a Mail pane painting the word
+                 "Mail" with the renderer one module away.
+
+    A `pub fn` taking `&mut Ui` exists to put something on a screen. If no
+    production code outside its own file calls it, nothing does.
+
+    Test code is excluded on BOTH sides: a renderer called only from a test is
+    exercised, not shipped, and that is the case worth reporting.
+    """
+    defs, texts = [], {}
+    for dp, dn, fn in os.walk(src):
+        dn[:] = [d for d in dn if d != 'target']
+        for f in fn:
+            if not f.endswith('.rs'): continue
+            q = os.path.join(dp, f)
+            try: texts[q] = open(q, encoding='utf8', errors='replace').read()
+            except OSError: continue
+    for q, txt in texts.items():
+        prod = txt.split('#[cfg(test)]')[0]
+        for m in re.finditer(r'pub fn (\w+)\s*(?:<[^>]*>)?\s*\([^)]*&mut\s+(?:egui::)?Ui', prod):
+            defs.append((q, m.group(1)))
+    out = []
+    for q, name in defs:
+        called = False
+        for r, u in texts.items():
+            if r == q: continue
+            if re.search(r'\b' + re.escape(name) + r'\s*\(', u.split('#[cfg(test)]')[0]):
+                called = True
+                break
+        if not called:
+            out.append((os.path.relpath(q, src), name))
+    return sorted(out)
+
+
 def main():
     apps = os.path.join(ROOT, 'apps')
     rows = []
@@ -96,6 +146,24 @@ def main():
         if dead: print(f"\n{name}: never called — {', '.join(dead)}")
     if total_dead:
         print(f"\n{total_dead} ported modules are unreachable from their app.")
+
+    # Called is not the same as DRAWN. A module can be reached for one function
+    # while a whole page inside it is never painted.
+    total_unrendered = 0
+    for name in sorted(os.listdir(apps)):
+        src = os.path.join(apps, name, 'egui-frontend', 'src')
+        if not os.path.isdir(src): continue
+        hits = uncalled_renderers(src)
+        if not hits: continue
+        total_unrendered += len(hits)
+        print(f"\n{name}: renderers nothing calls —")
+        for rel, fn in hits:
+            print(f"  {rel:<28} {fn}")
+    if total_unrendered:
+        print(f"\n{total_unrendered} drawing functions are never called. Each is a "
+              f"surface that exists and cannot be seen — CHECK each one before "
+              f"acting: some are helpers a caller inlines, and a few today were "
+              f"whole pages with no route in.")
 
     # Reachable is not the same as FED.
     total_stub = 0
