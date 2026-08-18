@@ -45,79 +45,21 @@ pub const BREATH_MS: f32 = 3_200.0;
 
 // ── segmented tab strip ─────────────────────────────────────────────────────
 
-/// One tab.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tab {
-    pub label: String,
-    /// `None` draws no pill. Zero is normalised to `None` on the way in.
-    pub badge: Option<u32>,
-}
-
-/// The strip.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct TabStrip {
-    tabs: Vec<Tab>,
-    selected: usize,
-}
-
-impl TabStrip {
-    pub fn new(labels: &[&str]) -> Self {
-        TabStrip {
-            tabs: labels.iter().map(|l| Tab { label: (*l).into(), badge: None }).collect(),
-            selected: 0,
-        }
-    }
-
-    pub fn tabs(&self) -> &[Tab] { &self.tabs }
-    pub fn len(&self) -> usize { self.tabs.len() }
-    pub fn is_empty(&self) -> bool { self.tabs.is_empty() }
-    pub fn selected(&self) -> usize { self.selected }
-
-    /// Select a tab. Out-of-range is ignored rather than clamped: a caller
-    /// asking for tab 7 of 3 has a bug, and silently landing on tab 2 hides it.
-    pub fn select(&mut self, i: usize) -> bool {
-        if i >= self.tabs.len() { return false; }
-        self.selected = i;
-        true
-    }
-
-    /// `setBadge`. Zero removes the pill — a tab reporting zero unread is
-    /// telling you about nothing, and the pill is then pure noise.
-    pub fn set_badge(&mut self, i: usize, count: u32) {
-        if let Some(t) = self.tabs.get_mut(i) {
-            t.badge = if count == 0 { None } else { Some(count) };
-        }
-    }
-
-    pub fn badge(&self, i: usize) -> Option<u32> { self.tabs.get(i).and_then(|t| t.badge) }
-
-    /// The badge's text. Large counts cap rather than widening the pill past
-    /// the tab it sits on.
-    pub fn badge_text(&self, i: usize) -> Option<String> {
-        // Shared cap: two bars in one app disagreeing about what a large count
-        // looks like is visible on a single screen.
-        self.badge(i).and_then(|n| uikit_egui::fmt::badge_count(n, 99))
-    }
-
-    /// Equal widths, which is what makes it a SEGMENTED strip rather than a row
-    /// of buttons: the segments stay put as labels change length.
-    pub fn tab_width(&self, total: f32) -> f32 {
-        if self.tabs.is_empty() { return 0.0; }
-        total / self.tabs.len() as f32
-    }
-
-    /// Where the underline sits, as (left, width).
-    pub fn underline(&self, total: f32) -> (f32, f32) {
-        let w = self.tab_width(total);
-        (w * self.selected as f32, w)
-    }
-}
+// The strip moved to the kit: three apps were hand-rolling the same row, and a
+// badge cap that differs between two apps is as visible as one differing
+// between two bars in one app. snapclone keeps the peel hint, which is about
+// page-swipe discovery on a phone rather than a general widget.
+pub use uikit_egui::segmented_tabs::{strip_ui, Tab, TabStrip};
 
 // ── page peel hint ──────────────────────────────────────────────────────────
 
 /// Which edges should show a peel.
+///
+/// Belongs to the hint, not the strip — it was caught in the same cut when the
+/// strip moved to the kit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Edges { pub left: bool, pub right: bool }
+
 
 /// The hint's state.
 #[derive(Debug, Clone)]
@@ -195,36 +137,6 @@ impl PeelHint {
         if !self.visible() { return 0.0; }
         self.breath.value()
     }
-}
-
-/// Draw the strip. Returns the index if a tab was chosen.
-pub fn strip_ui(ui: &mut egui::Ui, s: &TabStrip, c: &uikit_egui::PaletteColors) -> Option<usize> {
-    if s.is_empty() { return None; }
-    let mut picked = None;
-    let total = ui.available_width();
-    let w = s.tab_width(total);
-    let start = ui.cursor().min;
-    ui.horizontal(|ui| {
-        for (i, t) in s.tabs().iter().enumerate() {
-            let sel = i == s.selected();
-            let label = match s.badge_text(i) {
-                Some(b) => format!("{}  {}", t.label, b),
-                None => t.label.clone(),
-            };
-            let resp = ui.add_sized([w - 4.0, 28.0],
-                egui::SelectableLabel::new(sel, egui::RichText::new(label)
-                    .color(if sel { c.text } else { c.text_weak })));
-            if resp.clicked() { picked = Some(i); }
-        }
-    });
-    // The underline, drawn under the selected segment rather than around it:
-    // a box would fight the card borders every page already has.
-    let (x, uw) = s.underline(total);
-    let y = ui.cursor().min.y - 2.0;
-    ui.painter().line_segment(
-        [egui::pos2(start.x + x + 2.0, y), egui::pos2(start.x + x + uw - 2.0, y)],
-        egui::Stroke::new(2.0_f32, c.accent));
-    picked
 }
 
 /// Draw the peel hints at the page edges.

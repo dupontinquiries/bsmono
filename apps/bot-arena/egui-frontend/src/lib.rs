@@ -49,6 +49,8 @@ pub fn page(idx: usize, sign: i32, n: usize) -> usize {
 /// their live models. The bin owns one of these and nothing else.
 pub struct Dashboard {
     pub view_idx: usize,
+    /// The kit's segmented strip, built once from VIEWS.
+    strip: uikit_egui::segmented_tabs::TabStrip,
     gesture: GestureLayer,
     palette: String,
     /// Run configuration (Setup page).
@@ -69,6 +71,7 @@ impl Default for Dashboard {
     fn default() -> Self {
         Dashboard {
             view_idx: 0,
+            strip: uikit_egui::segmented_tabs::TabStrip::new(&VIEWS),
             gesture: GestureLayer::horizontal_page(320.0),
             palette: String::new(),
             form: SetupForm::default(),
@@ -138,14 +141,15 @@ impl Dashboard {
 
         // desktop shows a tab row; phone swipes
         if !adaptive.is_compact() {
-            ui.horizontal(|ui| {
-                for (i, name) in VIEWS.iter().enumerate() {
-                    let selected = i == self.view_idx;
-                    if ui.selectable_label(selected, *name).clicked() {
-                        self.view_idx = i;
-                    }
-                }
-            });
+            // The kit's strip, not a selectable_label row. Three apps were
+            // hand-rolling the same thing and getting none of what the strip
+            // gives: equal segments instead of tabs that resize with their
+            // labels, an underline instead of a box that fights card borders,
+            // and a shared badge cap.
+            self.strip.select(self.view_idx);
+            if let Some(i) = uikit_egui::segmented_tabs::strip_ui(ui, &self.strip, &colors) {
+                self.view_idx = i;
+            }
             ui.separator();
         } else {
             // a small "swipe" affordance + current view name for the compact layout
