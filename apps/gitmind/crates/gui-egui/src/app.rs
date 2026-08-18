@@ -57,6 +57,14 @@ impl Tab {
 
 pub struct App {
     pub tab: Tab,
+    /// Accessibility scene, rebuilt each frame.
+    ///
+    /// The kit's a11y module says it is "shared across every uikit-egui app"
+    /// and one app used it. gitmind's nav is the case that most needs it: on a
+    /// phone the buttons are ICON ONLY, so a control's entire meaning is a
+    /// glyph, and a fleet manager is where pressing the wrong thing reflashes
+    /// a device.
+    pub a11y: uikit_egui::A11yScene,
     pub prefs: settings_kit::Prefs,
     pub task: Task,
     pub net: pages::network::State,
@@ -78,6 +86,7 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            a11y: Default::default(),
             artifacts: Default::default(),
             share: Default::default(),
             tab: Tab::Network,
@@ -115,6 +124,10 @@ impl App {
     #[allow(deprecated)]
     pub fn ui(&mut self, ctx: &egui::Context) {
         uikit_egui::apply_prefs(ctx, &self.prefs);
+        // The scene is per-frame: it collects what is focusable NOW, so a
+        // stale item from a page the user has left cannot be focused or
+        // spoken.
+        self.a11y.begin_frame();
         // Adopt the user's gesture feel (incl. the detent animation) for swipe-between-tabs nav.
         *self.nav_gesture.config_mut() = self.prefs.gesture_config(320.0);
         let adaptive = uikit_egui::adaptive::Adaptive::detect(ctx);
@@ -154,6 +167,10 @@ impl App {
             ctx.request_repaint();
         }
 
+        // The focus ring, over the page. paint_focus_ring is the module's one
+        // egui touch and NEITHER app that uses the scene had ever called it —
+        // focus was tracked and invisible, which is the half that makes voice
+        // navigation usable by someone who can also see the screen.
         egui::CentralPanel::default().show(ctx, |ui| {
             let surface = ui.max_rect();
             // EVERY page scrolls, and it is done HERE rather than in each page.
@@ -196,6 +213,9 @@ impl App {
             if let Some(dir) = frame.page_jump {
                 self.switch_tab(dir.sign());
             }
+            // Painted last so it sits over the page rather than under it.
+            let accent = uikit_egui::palette_colors(&self.prefs.palette).accent;
+            self.a11y.paint_focus_ring(ui, accent);
         });
 
         // ── Desktop keyboard nav ───────────────────────────────────────────────────────────
@@ -237,14 +257,27 @@ impl App {
     }
 
     fn nav_buttons(&mut self, ui: &mut egui::Ui, compact: bool) {
-        for t in Tab::ALL {
+        for (i, t) in Tab::ALL.iter().enumerate() {
+            let t = *t;
             // Icon-only on the phone's bottom bar; icon + label on the desktop sidebar.
             let text = if compact {
                 t.icon().to_string()
             } else {
                 format!("{}  {}", t.icon(), t.label())
             };
-            if ui.selectable_label(self.tab == t, text).clicked() {
+            let resp = ui.selectable_label(self.tab == t, text);
+            // ALWAYS the full label, whatever the button shows. Compact draws a
+            // glyph and a glyph read aloud is a name nobody chose — the spoken
+            // form should not get smaller because the screen did.
+            self.a11y.add(
+                0x6e61_7600 + i as u64,
+                uikit_egui::a11y::Semantics::new(
+                    uikit_egui::a11y::Role::Button, t.label())
+                    .with_value(if self.tab == t { "current" } else { "" })
+                    .with_hint("activates to open this page"),
+                Some(resp.rect),
+            );
+            if resp.clicked() {
                 self.tab = t;
             }
         }
@@ -285,6 +318,29 @@ pub fn app_icon(name: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_nav_is_tagged_for_voice_and_the_focus_ring_is_painted() {
+        // The kit's a11y module says it is "shared across every uikit-egui
+        // app" and one app used it — and even that one never called
+        // paint_focus_ring, so focus was tracked and invisible. Both halves
+        // are asserted: a scene with no ring is the state bo-suite was in.
+        let src = include_str!("app.rs");
+        assert!(src.contains("self.a11y.begin_frame()"), "the scene is never reset");
+        assert!(src.contains("self.a11y.add("), "no widget is tagged");
+        assert!(src.contains("paint_focus_ring"), "focus is tracked and invisible");
+    }
+
+    #[test]
+    fn a_compact_nav_button_still_announces_its_full_name() {
+        // Compact draws the icon ALONE, so a control's whole meaning is a
+        // glyph. The spoken form must not shrink with the screen — and this is
+        // a fleet manager, where pressing the wrong thing reflashes a device.
+        for t in Tab::ALL {
+            assert!(!t.label().is_empty(), "{t:?} has no spoken name");
+            assert_ne!(t.label(), t.icon(), "{t:?} would be announced as its glyph");
+        }
+    }
+
     use super::*;
 
     #[test]

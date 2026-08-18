@@ -597,6 +597,14 @@ impl Controller {
                 });
             });
         }
+
+        // THE FOCUS RING, after both layout branches. paint_focus_ring is
+        // the a11y module's one egui touch and this app — the only one that
+        // used the scene at all — never called it, so focus was tracked and
+        // invisible. That is the half that makes voice navigation usable by
+        // someone who can also see the screen: without it, nothing on the
+        // display says where the voice focus is.
+        self.a11y.paint_focus_ring(ui, colors.accent);
     }
 
     fn devices_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
