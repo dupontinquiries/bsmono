@@ -707,6 +707,42 @@ mod tests {
     }
 
     #[test]
+    fn the_ui_asks_the_question_and_listens_for_the_answer() {
+        // A question nothing listens for is worse than no question: the
+        // operator presses keep and the document silently stays reverted.
+        let bin = include_str!("bin/voiceterm_egui.rs");
+        assert!(bin.contains("toasts.ask("), "the confirm question is never raised");
+        assert!(bin.contains("ui_actions("), "the answer is never heard");
+        assert!(bin.contains(r#"Some("keep") =>"#), "keep does nothing");
+        assert!(bin.contains(r#"Some("revert") =>"#), "revert does nothing");
+        assert!(bin.contains("self.ingest.accept()"), "accepting does not apply");
+    }
+
+    #[test]
+    fn every_level_is_offered_as_a_button_and_the_ai_one_is_labelled() {
+        // The recommendation is marked and FIRST, not preselected — advice
+        // rather than a decision made on the operator's behalf — and the level
+        // that can invent text says so before it is pressed.
+        let bin = include_str!("bin/voiceterm_egui.rs");
+        assert!(bin.contains("self.ingest.options()"), "levels are not enumerated");
+        assert!(bin.contains(r#"format!("★ {}", lvl.label())"#), "the recommendation is unmarked");
+        assert!(bin.contains("can add words that were not captured"),
+                "the AI pass is not flagged to the operator");
+    }
+
+    #[test]
+    fn an_assisted_run_without_a_model_says_so_rather_than_pretending() {
+        // The seam is chunk_for_model and what fills it is a logscope engine
+        // this binary does not own. Running something lesser under the name
+        // "AI pass" would be the dishonest option.
+        let bin = include_str!("bin/voiceterm_egui.rs");
+        assert!(bin.contains("no local model attached"),
+                "an assisted run with no model is silent about it");
+        assert!(bin.contains("chunk_for_model(&self.ingest.original"),
+                "the chunks are not prepared, so the seam is not real");
+    }
+
+    #[test]
     fn a_clean_document_is_left_alone() {
         // "Keep as captured" is a real answer, and for a quotation the only
         // correct one.

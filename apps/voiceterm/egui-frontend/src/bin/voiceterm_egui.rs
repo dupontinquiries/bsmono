@@ -28,6 +28,107 @@ use voiceterm_egui::App;
 enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models, Chat, Notes, Build }
 
 impl VoicetermApp {
+    /// The document ingest surface: diagnose, choose, confirm.
+    ///
+    /// Every level is a button, recommended first, because the checker guesses
+    /// and the operator knows — a capture kept verbatim is the right answer
+    /// for a quotation and no score can tell that from a bad one.
+    fn ingest_ui(&mut self, ui: &mut egui::Ui, c: &uikit_egui::PaletteColors) {
+        use voiceterm_egui::docingest::{self, Level, Phase};
+        let now = ui.input(|i| i.time);
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("ingest").weak().size(11.0));
+            if ui.small_button("load capture").clicked() {
+                // The captured text is already in the app; ingest measures it.
+                let n = self.captured.len();
+                self.ingest.load(self.captured.clone(), 0);
+                if n == 0 {
+                    self.toasts.warning("nothing captured to ingest", now);
+                }
+            }
+        });
+
+        match self.ingest.phase.clone() {
+            Phase::Idle => {}
+            Phase::Diagnosed { damage, rec } => {
+                ui.label(egui::RichText::new(&rec.because).color(
+                    if damage.is_clean() { c.text_weak } else { c.warning }).small());
+                ui.horizontal_wrapped(|ui| {
+                    for (i, lvl) in self.ingest.options().into_iter().enumerate() {
+                        // The recommendation is FIRST and marked, not
+                        // preselected — the difference between advice and a
+                        // decision made on the operator's behalf.
+                        let label = if i == 0 {
+                            format!("★ {}", lvl.label())
+                        } else {
+                            lvl.label().to_string()
+                        };
+                        if ui.small_button(label).clicked() {
+                            self.run_ingest_level(lvl, now);
+                        }
+                    }
+                });
+                if rec.level != Level::None {
+                    ui.label(egui::RichText::new(
+                        "the AI pass can add words that were not captured")
+                        .color(c.text_weak).size(10.0));
+                }
+            }
+            Phase::Running(l) => {
+                ui.label(egui::RichText::new(format!("running {}…", l.label())).small());
+            }
+            Phase::Confirming(_) => {
+                // The question lives in the toast, which is sticky, so the
+                // panel says nothing here — two copies of one question is one
+                // too many.
+            }
+        }
+        let _ = docingest::Level::ALL;
+    }
+
+    /// Run a level and raise the confirm question.
+    fn run_ingest_level(&mut self, lvl: voiceterm_egui::docingest::Level, now: f64) {
+        use voiceterm_egui::docingest::{self, Level, Verdict};
+        let verdict = match lvl {
+            Level::None => {
+                self.ingest.revert();
+                self.toasts.info("kept as captured", now);
+                return;
+            }
+            Level::Tidy => self.ingest.run(lvl, |s| docingest::tidy(s)),
+            Level::Structural => self.ingest.run(lvl, |s| docingest::structural(s)),
+            Level::Assisted => {
+                // THE LOGSCOPE BACKEND, in chunks. Not wired to a model here:
+                // the seam is chunk_for_model and what fills it is a logscope
+                // engine this binary does not own. Running the structural pass
+                // and SAYING the AI half is unavailable is honest; silently
+                // doing something lesser under the name "AI pass" is not.
+                let chunks = docingest::chunk_for_model(&self.ingest.original, 4000);
+                self.toasts.warning(
+                    format!("no local model attached — {} chunk(s) ready, ran the \
+                             structural pass instead", chunks.len()), now);
+                self.ingest.run(Level::Structural, |s| docingest::structural(s))
+            }
+        };
+        match verdict {
+            Verdict::Failed => {
+                // No question: there is nothing to keep. The toast reports and
+                // expires, because a failure the operator cannot act on should
+                // not need dismissing.
+                if let Some(msg) = self.ingest.confirm_prompt() {
+                    self.toasts.error(msg, now);
+                }
+                self.ingest.revert();
+            }
+            _ => {
+                if let Some(msg) = self.ingest.confirm_prompt() {
+                    self.toasts.ask(msg, &["keep", "revert"], now);
+                }
+            }
+        }
+    }
+
     /// Feed PTY bytes to the screen.
     ///
     /// term_grid deliberately takes SEMANTIC operations — print, newline, sgr —
@@ -449,6 +550,8 @@ struct VoicetermApp {
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
     toasts: uikit_egui::toast::Toasts,
+    /// Document ingest: diagnose a captured page, repair it, confirm or revert.
+    ingest: voiceterm_egui::docingest::Ingest,
     /// WHICH SURFACE the central panel shows. voiceterm had twelve ported
     /// modules — mail, browser, graph, cards, viz, model picker, setup wizard,
     /// chat panel and more — and the central panel always drew the terminal, so
@@ -777,7 +880,20 @@ impl eframe::App for VoicetermApp {
         }
 
         // toast above the bottom chrome (keycap bar ~76px + margin, the QML bind-to-chrome idea)
-        self.toasts.ui(ctx, 84.0);
+        // ui_actions rather than ui: the ingest asks "keep this version?" and
+        // the answer has to come back. A question nothing listens for is worse
+        // than no question — the operator presses keep and the document
+        // silently stays reverted.
+        match self.toasts.ui_actions(ctx, 84.0).as_deref() {
+            Some("keep") => {
+                self.ingest.accept();
+                // The accepted document becomes the capture the cards split
+                // from, which is the point of the whole flow.
+                self.captured = self.ingest.original.clone();
+            }
+            Some("revert") => self.ingest.revert(),
+            _ => {}
+        }
         egui::TopBottomPanel::bottom("keycaps").show(ctx, |ui| {
             // The pipe/brace gesture chips sit on their own row above the keycaps (the QML toolbar
             // put them in modRow): hold + drag to a cell + release. The brace menu's deadband makes
@@ -1993,6 +2109,8 @@ impl eframe::App for VoicetermApp {
                         // (the deck keeps its selection BY IDENTITY, which is
                         // why a re-split does not silently move it).
                         use voiceterm_egui::{backlinks_view as bl, cards_view as cv};
+                        self.ingest_ui(ui, &c);
+                        ui.separator();
                         ui.label(egui::RichText::new("captured text").weak().size(11.0));
                         let changed = ui.add(
                             egui::TextEdit::multiline(&mut self.captured)
@@ -2679,6 +2797,7 @@ fn main() -> eframe::Result<()> {
     },
         Box::new(move |_cc| {
             Ok(Box::new(VoicetermApp {
+                ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning
                 // /sys/bus/iio/devices every repaint is a directory walk at 60
                 // Hz for a device that does not appear mid-session.

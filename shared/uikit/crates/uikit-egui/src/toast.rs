@@ -48,6 +48,13 @@ struct Msg {
     text: String,
     severity: Severity,
     shown_at: f64,
+    /// Buttons, left to right. Empty for a plain toast.
+    ///
+    /// An action toast does NOT expire. A question that vanishes while the
+    /// reader is deciding is worse than no question: they saw something
+    /// happen, reached for it, and it was gone — and for a "keep this
+    /// version?" the silent default is then whatever the code happened to do.
+    actions: Vec<String>,
 }
 
 /// The single-slot toast host. Hold one per app shell; call `ui` every frame.
@@ -63,7 +70,40 @@ impl Toasts {
 
     /// Show a message (replaces any current toast and restarts its timer — newest wins).
     pub fn show(&mut self, text: impl Into<String>, severity: Severity, now: f64) {
-        self.current = Some(Msg { text: text.into(), severity, shown_at: now });
+        self.current = Some(Msg {
+            text: text.into(), severity, shown_at: now, actions: Vec::new(),
+        });
+    }
+
+    /// Ask a question with buttons.
+    ///
+    /// Added for voiceterm's document ingest, which must ask "keep this
+    /// version?" after every repair — including a successful one, because a
+    /// formatter that is right about its score can still be wrong about the
+    /// document. A text-only toast could report the outcome and could not
+    /// offer the undo, so every app wanting a confirm was going to draw its
+    /// own bar.
+    ///
+    /// Sticky by construction: see `Msg::actions`.
+    pub fn ask(&mut self, text: impl Into<String>, actions: &[&str], now: f64) {
+        self.current = Some(Msg {
+            text: text.into(),
+            severity: Severity::Info,
+            shown_at: now,
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+        });
+    }
+
+    /// Is a question waiting? Callers gate other prompts on this so two
+    /// questions cannot stack in one slot — the host holds ONE toast, and a
+    /// second would silently replace the first.
+    pub fn awaiting_answer(&self) -> bool {
+        self.current.as_ref().is_some_and(|m| !m.actions.is_empty())
+    }
+
+    /// Dismiss whatever is showing.
+    pub fn clear(&mut self) {
+        self.current = None;
     }
     pub fn info(&mut self, text: impl Into<String>, now: f64) {
         self.show(text, Severity::Info, now);
@@ -82,7 +122,9 @@ impl Toasts {
     /// messages are dropped on query.
     pub fn visible_at(&mut self, now: f64) -> Option<(&str, Severity)> {
         if let Some(m) = &self.current {
-            if now - m.shown_at > m.severity.dwell() {
+            // An action toast never expires — it is a question, and the
+            // answer has to come from the operator rather than from a timer.
+            if m.actions.is_empty() && now - m.shown_at > m.severity.dwell() {
                 self.current = None;
             }
         }
@@ -93,12 +135,23 @@ impl Toasts {
     /// the actual bottom-chrome height, as the reference does, so the toast clears keycaps/bars
     /// without wasting space). Call every frame.
     pub fn ui(&mut self, ctx: &egui::Context, bottom_margin: f32) {
+        let _ = self.ui_actions(ctx, bottom_margin);
+    }
+
+    /// Paint, and report which action was pressed this frame.
+    ///
+    /// The plain `ui` delegates here and drops the answer, so existing callers
+    /// are unchanged and a caller that asked a question can hear it.
+    pub fn ui_actions(&mut self, ctx: &egui::Context, bottom_margin: f32) -> Option<String> {
         let now = ctx.input(|i| i.time);
+        let actions: Vec<String> = self.current.as_ref()
+            .map(|m| m.actions.clone()).unwrap_or_default();
+        let mut pressed: Option<String> = None;
         let showing = self.visible_at(now).map(|(t, s)| (t.to_string(), s));
         // 180 ms fade, eased — both directions, as the QML Behavior on opacity did
         let opacity = crate::motion::animate_eased(ctx, Id::new("uikit-toast-fade"), showing.is_some(), 0.18, crate::motion::ease::out_quad);
         if opacity <= 0.01 {
-            return;
+            return None;
         }
         // While fading out the message is gone from state; remember the last text for the tail
         // of the fade via egui temp memory.
@@ -120,7 +173,7 @@ impl Toasts {
             }
         };
         if text.is_empty() {
-            return;
+            return None;
         }
         let screen = ctx.screen_rect();
         egui::Area::new(Id::new("uikit-toast"))
@@ -131,7 +184,16 @@ impl Toasts {
                 let font = FontId::proportional(12.0);
                 let galley = painter.layout_no_wrap(text.clone(), font.clone(), Color32::WHITE);
                 let strip = severity.accent();
-                let w = galley.size().x + 28.0 + if strip.is_some() { 4.0 } else { 0.0 };
+                // Room for the buttons. Measured rather than guessed: a
+                // question whose answer is clipped off the edge cannot be
+                // answered, and these strings are app-supplied.
+                let btn_w: f32 = actions.iter()
+                    .map(|a| painter.layout_no_wrap(a.clone(), font.clone(), Color32::WHITE)
+                             .size().x + 20.0)
+                    .sum::<f32>()
+                    + if actions.is_empty() { 0.0 } else { 12.0 };
+                let w = galley.size().x + 28.0 + btn_w
+                    + if strip.is_some() { 4.0 } else { 0.0 };
                 let h = galley.size().y + 16.0;
                 let center_x = screen.center().x;
                 let rect = egui::Rect::from_center_size(
@@ -151,21 +213,103 @@ impl Toasts {
                     painter.rect_filled(s, CornerRadius::same(2), a(sc));
                 }
                 let dx = if strip.is_some() { 2.0 } else { 0.0 }; // the reference's centering nudge
-                painter.text(
-                    egui::pos2(rect.center().x + dx, rect.center().y),
-                    Align2::CENTER_CENTER,
-                    text,
-                    font,
-                    a(Color32::from_rgb(0xf0, 0xf0, 0xf0)),
-                );
+                // With buttons the text is LEFT-aligned: centring it and then
+                // hanging buttons off the right makes the label drift as the
+                // answer strings change length.
+                if actions.is_empty() {
+                    painter.text(
+                        egui::pos2(rect.center().x + dx, rect.center().y),
+                        Align2::CENTER_CENTER,
+                        text,
+                        font.clone(),
+                        a(Color32::from_rgb(0xf0, 0xf0, 0xf0)),
+                    );
+                } else {
+                    painter.text(
+                        egui::pos2(rect.left() + 14.0 + dx, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        text,
+                        font.clone(),
+                        a(Color32::from_rgb(0xf0, 0xf0, 0xf0)),
+                    );
+                    let mut x = rect.right() - 8.0;
+                    for label in actions.iter().rev() {
+                        let lg = painter.layout_no_wrap(
+                            label.clone(), font.clone(), Color32::WHITE);
+                        let bw = lg.size().x + 20.0;
+                        let br = egui::Rect::from_min_size(
+                            egui::pos2(x - bw, rect.top() + 5.0),
+                            egui::vec2(bw, rect.height() - 10.0));
+                        let resp = ui.interact(
+                            br, Id::new(("uikit-toast-act", label.as_str())),
+                            egui::Sense::click());
+                        let bg = if resp.hovered() {
+                            Color32::from_rgb(60, 60, 70)
+                        } else {
+                            Color32::from_rgb(44, 44, 52)
+                        };
+                        ui.painter().rect_filled(br, CornerRadius::same(5), a(bg));
+                        ui.painter().text(br.center(), Align2::CENTER_CENTER, label,
+                            font.clone(), a(Color32::from_rgb(0xf0, 0xf0, 0xf0)));
+                        if resp.clicked() {
+                            pressed = Some(label.clone());
+                        }
+                        x -= bw + 6.0;
+                    }
+                }
             });
+        // Answered: the question goes away. Leaving it would let the same
+        // answer fire every frame until something else replaced it.
+        if pressed.is_some() {
+            self.current = None;
+        }
         ctx.request_repaint(); // keep the fade/dwell timeline moving
+        pressed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_does_not_expire() {
+        // The whole reason ask() exists. A question that vanishes while the
+        // reader is deciding is worse than no question: they saw something
+        // happen, reached for it, and it was gone — and the silent default
+        // becomes whatever the code happened to do.
+        let mut t = Toasts::new();
+        t.ask("keep this version?", &["keep", "revert"], 0.0);
+        assert!(t.awaiting_answer());
+        // Far past any dwell.
+        assert!(t.visible_at(600.0).is_some(), "the question timed out");
+        assert!(t.awaiting_answer());
+    }
+
+    #[test]
+    fn a_plain_toast_still_expires() {
+        // The change must not make every toast sticky — an info line that
+        // needs dismissing is a worse app than one that fades.
+        let mut t = Toasts::new();
+        t.info("saved", 0.0);
+        assert!(t.visible_at(0.1).is_some());
+        assert!(t.visible_at(600.0).is_none(), "an info toast became sticky");
+        assert!(!t.awaiting_answer());
+    }
+
+    #[test]
+    fn awaiting_answer_lets_a_caller_avoid_stacking_questions() {
+        // The host holds ONE toast, so a second ask() silently replaces the
+        // first — and the first question's answer is then lost. Callers gate
+        // on this.
+        let mut t = Toasts::new();
+        assert!(!t.awaiting_answer());
+        t.ask("first?", &["yes"], 0.0);
+        assert!(t.awaiting_answer());
+        t.clear();
+        assert!(!t.awaiting_answer());
+        assert!(t.visible_at(0.0).is_none());
+    }
 
     #[test]
     fn severity_contract_matches_the_reference() {
