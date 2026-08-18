@@ -1946,6 +1946,12 @@ impl Snapclone {
         // function over everything else.
         let posture = self.tick_posture(dt_ms);
 
+        // The manual's idle countdown. tick_help was never called, so an open
+        // manual stayed open forever — the auto-dismiss the module was built
+        // around simply did not happen, and `interacted()` reset a timer that
+        // was not running.
+        self.tick_help(dt_ms);
+
         if self.tick_feedback(dt_ms, pointer_down) {
             ui.ctx().request_repaint();
         }
@@ -3098,6 +3104,28 @@ impl Snapclone {
 
     fn inbox_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Messages");
+
+        // WHY NOTHING IS SENDING. outbox_deferred's own doc says it is
+        // "surfaced rather than silent: a message that has not sent for an
+        // hour looks broken, and 'waiting for power' is the difference between
+        // a bug and a decision the user can act on by plugging in" — and
+        // nothing called it, so the app had the second behaviour while
+        // claiming the first.
+        //
+        // tick_outbox was unreached too. It does not drain anything: the
+        // comment inside says the gate is the decision and the count is only
+        // what makes it visible. Both halves are needed, and neither was here.
+        let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+        let stalled = self.tick_outbox(now_ms);
+        if let Some(reason) = self.outbox_deferred() {
+            ui.colored_label(c.warning, reason);
+        } else if stalled > 0 {
+            // Not deferred and still waiting is a different situation — the
+            // network, not the battery — and saying "waiting for power" there
+            // would send the user to plug in a phone that is already charged.
+            ui.colored_label(c.text_weak,
+                format!("{stalled} waiting to send"));
+        }
         // THE TILE STRIP, above the list. Three tiles — prev, active, next —
         // because rendering the whole 24h window would decode dozens of
         // thumbnails to show three.
