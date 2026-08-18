@@ -7496,6 +7496,25 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 let a = 1.0 - theme::appear(*at, 8.0);
                 if a > 0.0 { ui.ctx().request_repaint(); theme::fade(ui, a, |ui| { ui.label(RichText::new(msg).color(theme::GREEN()).small()); }); }
             }
+            // WHAT ACTUALLY HAPPENED, above what might. `ctx_suggestion` below is an ESTIMATE of
+            // the next prompt (est() over the text); `context_fit` is the engine's MEASUREMENT of
+            // the last one, and when it reports tokens elided from the middle that is not a
+            // prediction to hedge — it is a fact about the reply already on screen. It had no
+            // callers at all until now, which is why a session could quietly lose the middle of
+            // every prompt with nothing in the UI saying so.
+            if let Some(fit) = infer.context_fit().filter(|f| f.elided > 0) {
+                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
+                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::AMBER()), ..Default::default() }
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("✂").color(theme::AMBER()).small());
+                        ui.label(RichText::new(format!(
+                            "Last turn: {} tokens of prompt into a {}-token window — {} elided from the middle \
+(head and tail kept, the cut marked in the prompt).",
+                            fit.prompt, fit.window, fit.elided)).color(theme::DIM()).small());
+                    });
+                });
+            }
             // context-overflow suggestion: the next prompt won't fit the window, so it'd be trimmed
             if let Some(want) = self.ctx_suggestion(doc) {
                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
