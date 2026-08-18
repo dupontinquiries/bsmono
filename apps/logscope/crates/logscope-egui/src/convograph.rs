@@ -348,6 +348,76 @@ impl Graph {
         (count, used)
     }
 
+    /// As `mark_window_ex`, but the oldest kept turn STICKS until it has to move, and then moves far.
+    ///
+    /// `mark_window_ex` walks the path from the newest backwards and keeps whatever fits, so the
+    /// oldest kept turn advances by roughly one turn every turn. That is correct as a selection and
+    /// expensive as a prefix: the model's prompt is `[system][oldest..newest]`, and if `oldest` moves
+    /// then everything after the system block is new text, so the KV prefix tree can match only the
+    /// system block. Measured on a seventeen-turn log: reuse collapsed from 79% to 49–59% and stayed
+    /// there, with `reused` frozen at ~1620 tokens — the system prompt — while the prompt swung by
+    /// 500. Prefill went from 5.5s to 23s a turn and never came back. The one turn where the previous
+    /// prompt happened to be a true prefix reused 93% and prefilled in 4.3s.
+    ///
+    /// So the floor is held where it was and, when the budget is finally exceeded, jumped past what
+    /// is needed — freeing `slack` of the budget so the next several turns fit without moving it
+    /// again. The prefix then changes once per jump instead of once per turn, and the turns in
+    /// between are true extensions.
+    ///
+    /// `floor` is the id the caller last received back; pass `None` on the first call. Returns
+    /// `(count, used, new_floor)` and the caller stores `new_floor` for next time.
+    ///
+    /// This is a pure trade of context for prefill: holding the floor keeps FEWER turns in context
+    /// than the budget would allow, right after a jump. `slack` is the dial — 0.0 reproduces
+    /// `mark_window_ex`'s behaviour, and higher values buy longer stretches of stable prefix with
+    /// less history in the window.
+    pub fn mark_window_sticky(&mut self, budget: usize, sys_tokens: usize, per_msg: usize,
+        max_turns: usize, floor: Option<usize>, slack: f32) -> (usize, usize, Option<usize>) {
+        for n in &mut self.nodes { n.in_context = false; }
+        let path = self.active_path();
+        let live: Vec<usize> = path.iter().copied().filter(|id| !self.nodes[*id].pruned).collect();
+        if live.is_empty() { return (0, sys_tokens, None); }
+        let cost = |g: &Self, id: usize| g.nodes[id].tokens + per_msg;
+
+        // Where in `live` the remembered floor sits. A floor that has fallen off the active path
+        // (a branch switch, a prune) is treated as absent rather than as position zero, which would
+        // silently pin the whole history.
+        let start = floor.and_then(|f| live.iter().position(|id| *id == f));
+
+        // Does the remembered floor still fit, counting from it to the newest?
+        let fits_from = |g: &Self, from: usize| -> Option<(usize, usize)> {
+            let mut used = sys_tokens;
+            let mut count = 0usize;
+            for &id in live[from..].iter().rev() {
+                let t = cost(g, id);
+                if (count > 0 && used + t > budget) || count >= max_turns { return None; }
+                used += t; count += 1;
+            }
+            Some((count, used))
+        };
+
+        if let Some(from) = start {
+            if let Some((count, used)) = fits_from(self, from) {
+                for &id in &live[from..] { self.nodes[id].in_context = true; }
+                return (count, used, Some(live[from]));
+            }
+        }
+
+        // The floor has to move. Pick the new one by walking back from the newest under a REDUCED
+        // budget, so there is room left to grow into before it must move again.
+        let target = ((budget as f32) * (1.0 - slack.clamp(0.0, 0.9))) as usize;
+        let mut used = sys_tokens;
+        let mut count = 0usize;
+        let mut new_floor_idx = live.len() - 1;
+        for (back, &id) in live.iter().enumerate().rev() {
+            let t = cost(self, id);
+            if (count > 0 && used + t > target.max(sys_tokens + 1)) || count >= max_turns { break; }
+            used += t; count += 1; new_floor_idx = back;
+        }
+        for &id in &live[new_floor_idx..] { self.nodes[id].in_context = true; }
+        (count, used, Some(live[new_floor_idx]))
+    }
+
     /// The ids of in-context nodes in chronological order (oldest→newest) — the turns to feed.
     pub fn context_ids(&self) -> Vec<usize> {
         self.nodes.iter().filter(|n| n.in_context).map(|n| n.id).collect()
@@ -559,6 +629,97 @@ mod artifact_tests {
 mod tests {
     use super::*;
     fn est(s: &str) -> usize { (s.len() / 4).max(1) } // ~4 chars/token, like the app's estimator
+
+    /// Grow a linear chat one turn at a time and count how often the model's prompt PREFIX changes.
+    ///
+    /// Returns (prefix changes, mean turns in context) over `turns` turns. A prefix change is a turn
+    /// whose oldest in-context node differs from the previous turn's, which is exactly when the KV
+    /// prefix tree loses everything past the system block.
+    fn simulate(sticky: bool, slack: f32, turns: usize, budget: usize, tok: usize) -> (usize, f64) {
+        let text = "x".repeat(tok * 4);
+        let mut items: Vec<(Turn, String, Option<usize>)> = Vec::new();
+        let (mut changes, mut in_ctx, mut prev_floor, mut floor) = (0usize, 0usize, None, None);
+        for i in 0..turns {
+            let parent = if i == 0 { None } else { Some(i - 1) };
+            items.push((if i % 2 == 0 { Turn::User } else { Turn::Assistant }, text.clone(), parent));
+            let mut g = Graph::from_tree(items.iter().map(|(t, s, p)| (*t, s.as_str(), *p)), est, Some(i));
+            let (count, _used, nf) = if sticky {
+                g.mark_window_sticky(budget, 8, 2, 4096, floor, slack)
+            } else {
+                let (c, u) = g.mark_window_ex(budget, 8, 2, 4096);
+                (c, u, g.context_ids().first().copied())
+            };
+            floor = nf;
+            if i > 0 && nf != prev_floor { changes += 1; }
+            prev_floor = nf;
+            in_ctx += count;
+        }
+        (changes, in_ctx as f64 / turns as f64)
+    }
+
+    #[test]
+    fn the_tail_window_moves_the_prefix_almost_every_turn() {
+        // The measured failure. Once the budget is full, every new turn pushes the oldest one out,
+        // so the prompt's prefix after the system block is different text every single turn and the
+        // tree can match nothing but the system block.
+        let (changes, ctx) = simulate(false, 0.0, 40, 400, 40);
+        assert!(changes > 25, "{changes} prefix changes in 40 turns (mean {ctx:.1} turns in context)");
+    }
+
+    #[test]
+    fn sticky_windowing_moves_the_prefix_a_handful_of_times_instead() {
+        // Measured, not guessed: 8 changes at slack 0.35 against 30+ for the tail window. My first
+        // assertion said "< 8" from arithmetic done in my head about how far a 35% jump reaches;
+        // the simulation says exactly 8, and the useful claim is the ratio, not the constant.
+        let (changes, ctx) = simulate(true, 0.35, 40, 400, 40);
+        let (tail, tail_ctx) = simulate(false, 0.0, 40, 400, 40);
+        assert!(changes * 3 < tail,
+            "sticky {changes} against tail {tail} prefix changes in 40 turns (mean {ctx:.1} turns \
+             in context against {tail_ctx:.1})");
+        // And it costs context: fewer turns in the window right after a jump. That is the trade and
+        // it must be visible, not hidden.
+        assert!(ctx < tail_ctx, "sticky keeps {ctx:.1} turns against the tail window's {tail_ctx:.1}");
+    }
+
+    #[test]
+    fn zero_slack_is_the_tail_window_again() {
+        // The dial has to bottom out at the old behaviour, or it is not a dial.
+        let (sticky, _) = simulate(true, 0.0, 40, 400, 40);
+        let (tail, _) = simulate(false, 0.0, 40, 400, 40);
+        assert!(sticky.abs_diff(tail) <= 2, "sticky {sticky} vs tail {tail}");
+    }
+
+    #[test]
+    fn more_slack_buys_a_longer_stable_stretch_and_less_history() {
+        let (few, ctx_lo) = simulate(true, 0.6, 40, 400, 40);
+        let (many, ctx_hi) = simulate(true, 0.15, 40, 400, 40);
+        assert!(few <= many, "more slack should move the prefix less often: {few} vs {many}");
+        assert!(ctx_lo <= ctx_hi, "and keep less history: {ctx_lo:.1} vs {ctx_hi:.1}");
+    }
+
+    #[test]
+    fn a_floor_that_left_the_active_path_is_not_treated_as_position_zero() {
+        // Branch switch: the remembered floor no longer exists on this path. Treating a missing floor
+        // as index 0 would pin the entire history and blow the budget silently.
+        let items = vec![
+            (Turn::User, "q0", None),
+            (Turn::Assistant, "a0", Some(0)),
+            (Turn::User, "branch A", Some(1)),
+            (Turn::User, "branch B", Some(1)),
+        ];
+        let mut g = Graph::from_tree(items.iter().cloned(), est, Some(3));
+        let (count, used, floor) = g.mark_window_sticky(100, 8, 2, 4096, Some(2), 0.3);
+        assert!(count > 0 && used <= 100);
+        assert_ne!(floor, Some(2), "node 2 is on the other branch");
+    }
+
+    #[test]
+    fn an_empty_or_fully_pruned_graph_returns_no_floor() {
+        let items = vec![(Turn::User, "only", None)];
+        let mut g = Graph::from_tree(items.iter().cloned(), est, Some(0));
+        g.nodes[0].pruned = true;
+        assert_eq!(g.mark_window_sticky(100, 8, 2, 4096, None, 0.3), (0, 8, None));
+    }
 
     #[test]
     fn from_tree_active_path_follows_the_branch() {

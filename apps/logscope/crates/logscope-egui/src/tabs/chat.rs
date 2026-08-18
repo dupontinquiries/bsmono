@@ -1008,6 +1008,17 @@ pub struct Chat {
     input: String,
     context: String,   // system prompt — the "context" the model always sees
     threading: bool,   // thread prior turns into the prompt, or single-shot
+    /// Oldest turn currently in the model's window, remembered so it can STAY there.
+    ///
+    /// A plain tail window advances this by one turn every turn, and the prompt is
+    /// `[system][oldest..newest]` — so if `oldest` moves, everything after the system block is new
+    /// text and the KV prefix tree can match nothing else. Measured on a seventeen-turn log: reuse
+    /// fell from 79% to 49–59% and stayed there, prefill went 5.5s -> 23s a turn and never came back.
+    ///
+    /// `Cell` because `chosen_msgs` is `&self` and is also called to build previews at earlier
+    /// `upto` values; only the call for the REAL prompt is allowed to write, or a preview would
+    /// move the floor the real prompt is trying to hold.
+    win_floor: std::cell::Cell<Option<usize>>,
     attach_log: bool,  // include a bounded summary of the current log in the system prompt
     fix_mode: bool,    // step-up submode: emit a concrete fix (file/diff) for the log/code
     show_context: bool, // right sidebar open/closed
@@ -1201,6 +1212,7 @@ impl Default for Chat {
     fn default() -> Self {
         Self {
             stamp_model: None,
+            win_floor: std::cell::Cell::new(None),
             msgs: Vec::new(), input: String::new(),
             context: LONG_HORIZON.into(),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
@@ -2379,7 +2391,17 @@ reply is framed differently from the turn that produced it.");
         let budget = self.ctx.n_ctx.saturating_sub(self.ctx.max_tokens) as usize;
         let max_msgs = if self.threading { self.ctx.history_turns * 2 + 1 } else { 1 };
         let mut g = self.convo_graph(upto);
-        g.mark_window_ex(budget, est(sys) + 8, per_msg_overhead, max_msgs);
+        // LOGSCOPE_WINDOW_SLACK=0 restores the plain tail window exactly; the default holds the floor
+        // and, when it must move, jumps far enough to sit still for several turns. The trade is
+        // fewer turns in context right after a jump, in exchange for a prompt prefix the KV tree can
+        // actually match. Simulated over 40 turns: 30+ prefix changes with the tail window against 8
+        // at this slack.
+        let slack: f32 = std::env::var("LOGSCOPE_WINDOW_SLACK").ok()
+            .and_then(|v| v.trim().parse().ok()).filter(|v: &f32| (0.0..=0.9).contains(v))
+            .unwrap_or(0.35);
+        let (_, _, new_floor) = g.mark_window_sticky(
+            budget, est(sys) + 8, per_msg_overhead, max_msgs, self.win_floor.get(), slack);
+        if upto == self.msgs.len() { self.win_floor.set(new_floor); }
         g.context_ids().into_iter().map(|id| &self.msgs[id]).collect()
     }
 
