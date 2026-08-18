@@ -73,10 +73,19 @@ impl eframe::App for App {
                 ambience::ambience_ui(ui, &self.ambience, &self.sparkles, t,
                                       ui.max_rect(), &self.colors);
             }
-            ui.horizontal(|ui| {
-                // Two tabs because two pages are ported. A bar listing pages
-                // that do not exist would be the same overstatement the audit
-                // caught in the first place.
+            // WRAPPED, and no longer two tabs. The comment below said two
+            // because two were ported; there are seven now and the note did
+            // not grow with the list. Seven fixed labels in a plain
+            // ui.horizontal run off a phone, and this app is an ambient layer
+            // for a phone.
+            //
+            // Wrapping rather than the scrolling page_bar bo-suite uses,
+            // because that widget lives in bo-suite's shell_bits and not in
+            // the kit — copying it here would be a fourth implementation of a
+            // tab row, which is the thing hoisting segmented_tabs was meant to
+            // stop. If a third app needs the scrolling variant, that is when
+            // it earns a move into uikit-egui.
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.page, Page::Live, "Live");
                 ui.selectable_value(&mut self.page, Page::History, "History");
                 ui.selectable_value(&mut self.page, Page::Places, "Places");
