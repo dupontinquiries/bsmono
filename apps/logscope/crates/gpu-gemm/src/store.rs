@@ -310,6 +310,77 @@ pub fn resident_bytes_for(d: u64, h: u64, n: u64, n_heads: u64, n_kv: u64, vocab
     int8 + scales + embed_f32 + output
 }
 
+/// What the loader will actually hold resident for a file, split by how each tensor is held.
+///
+/// The old estimator below has two holes this one closes, both of the "a guard that cannot find
+/// its input is not a guard" class:
+/// - it reads `llama.*` metadata keys, so every other arch prefix (qwen2, gemma3,
+///   diffusion_gemma, …) returns None and the preflight silently skips itself;
+/// - it prices EVERYTHING as int8-resident, which is fiction in both directions for an IQ1_S
+///   file — the native path (lib.rs, `LOGSCOPE_NO_IQ1_NATIVE` to disable) keeps type-19 tensors
+///   in the file's own 1.5625-bpw bytes, so a 30 GiB checkpoint neither needs 87 GiB (the q4
+///   inflation) nor the ~60 GiB an int8 plan would claim. A wrong figure here is a wrong
+///   REFUSAL, and a refusal is invisible.
+///
+/// Computed from the TENSOR TABLE, not from shape metadata, so it needs no arch knowledge and
+/// cannot disagree with what is actually in the file (MoE stacks, untied outputs, oddballs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentEstimate {
+    /// Tensors the loader keeps in the file's own bytes (IQ1_S with block-aligned rows).
+    pub native_view_bytes: u64,
+    /// The embedding (and an untied output projection), kept f32 for the host-side lookup.
+    pub f32_bytes: u64,
+    /// Everything else, priced at int8 residency (memplan's 1.125 B/param, scales included) …
+    pub int8_rest_bytes: u64,
+    /// … or at q4 residency (0.625 B/param) — the downgrade ladder's floor.
+    pub q4_rest_bytes: u64,
+}
+
+impl ResidentEstimate {
+    /// Total resident bytes when the non-native rest is held int8 / q4.
+    pub fn plan_int8(&self) -> u64 { self.native_view_bytes + self.f32_bytes + self.int8_rest_bytes }
+    pub fn plan_q4(&self) -> u64 { self.native_view_bytes + self.f32_bytes + self.q4_rest_bytes }
+}
+
+/// One tensor's view for the estimator: is it the embedding/output (stays f32), how many
+/// parameters, its ggml type, and its row length (dims[0] — the block-alignment gate for IQ1_S).
+pub type TensorPlanRow = (bool, u64, u32, u64);
+
+/// The pure core, over rows rather than a Gguf, so tests need no file.
+pub fn estimate_resident_from_tensors(rows: impl Iterator<Item = TensorPlanRow>,
+                                      iq1_native: bool) -> ResidentEstimate {
+    let (int8_bpp, q4_bpp) = (crate::memplan::Residency::Int8.bytes_per_param(),
+                              crate::memplan::Residency::Q4.bytes_per_param());
+    let mut e = ResidentEstimate::default();
+    for (is_f32_kept, params, ggml_type, row_len) in rows {
+        if is_f32_kept {
+            e.f32_bytes += params * 4;
+        } else if iq1_native && ggml_type == 19 && row_len % 256 == 0 {
+            // the same predicate the loader's native path applies (lib.rs): IQ1_S, block-aligned
+            e.native_view_bytes += crate::gguf::type_nbytes(19, params as usize)
+                .map(|b| b as u64)
+                // a type_nbytes miss for a type we just matched would be a table bug; price the
+                // exact 50-bytes-per-256 rather than silently pricing zero
+                .unwrap_or(params / 256 * 50);
+        } else {
+            e.int8_rest_bytes += (params as f64 * int8_bpp) as u64;
+            e.q4_rest_bytes += (params as f64 * q4_bpp) as u64;
+        }
+    }
+    e
+}
+
+/// Walk a parsed GGUF's tensor table. Arch-independent (no metadata keys), IQ1_S-aware
+/// (honours `LOGSCOPE_NO_IQ1_NATIVE`, the same lever the loader's native path reads).
+pub fn estimate_resident_for_load(g: &crate::gguf::Gguf) -> ResidentEstimate {
+    let iq1_native = std::env::var("LOGSCOPE_NO_IQ1_NATIVE").is_err();
+    estimate_resident_from_tensors(g.tensors.iter().map(|t| {
+        let params: u64 = t.dims.iter().product();
+        let is_f32_kept = t.name == "token_embd.weight" || t.name == "output.weight";
+        (is_f32_kept, params, t.ggml_type, t.dims.first().copied().unwrap_or(0))
+    }), iq1_native)
+}
+
 /// Estimate a llama GGUF's int8-resident footprint from its metadata. None if the metadata is missing.
 pub fn estimate_int8_resident(g: &crate::gguf::Gguf) -> Option<u64> {
     let d = g.get_u32("llama.embedding_length")? as u64;
@@ -673,6 +744,53 @@ pub fn bandwidth_get(adapter: &str) -> Option<f32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod resident_estimate_tests {
+    use super::*;
+
+    #[test]
+    fn iq1s_tensors_are_priced_at_their_file_bytes_not_as_int8_fiction() {
+        // One 256×256 IQ1_S weight: 256 blocks of 50 bytes = 12,800 bytes native. Priced int8 it
+        // would claim 73,728 — 5.76x, which is the wrong-refusal factor on a 30 GiB checkpoint.
+        let rows = [(false, 256u64 * 256, 19u32, 256u64)];
+        let e = estimate_resident_from_tensors(rows.into_iter(), true);
+        assert_eq!(e.native_view_bytes, 256 * 50);
+        assert_eq!(e.int8_rest_bytes, 0, "nothing double-counted");
+        assert_eq!(e.plan_int8(), e.plan_q4(), "native bytes are residency-independent");
+    }
+
+    #[test]
+    fn the_native_gate_is_the_loaders_gate_alignment_and_the_env_lever() {
+        // Row length 704 (a DiffusionGemma expert down-proj) is NOT 256-aligned: ggml could not
+        // have produced such an IQ1_S tensor, and the loader's native path would refuse the
+        // slice — so the estimator must not price it native either.
+        let misaligned = [(false, 704u64 * 8, 19u32, 704u64)];
+        let e = estimate_resident_from_tensors(misaligned.into_iter(), true);
+        assert_eq!(e.native_view_bytes, 0);
+        assert!(e.int8_rest_bytes > 0, "falls to the requant pricing");
+        // LOGSCOPE_NO_IQ1_NATIVE=1 (iq1_native=false) prices even aligned IQ1_S as requantized —
+        // matching what the loader will then actually do.
+        let aligned = [(false, 512u64 * 256, 19u32, 256u64)];
+        let off = estimate_resident_from_tensors(aligned.into_iter(), false);
+        assert_eq!(off.native_view_bytes, 0);
+    }
+
+    #[test]
+    fn the_embedding_stays_f32_and_the_rest_tracks_memplan_bytes_per_param() {
+        // Constants come FROM memplan::Residency, not a copy — this test exists so a future
+        // bytes-per-param correction there cannot leave this estimator quoting the old figure
+        // (the exact drift the 1.0-vs-1.125 fix was about).
+        let rows = [(true, 1000u64, 0u32, 1000u64), (false, 3200u64, 12u32, 320u64)];
+        let e = estimate_resident_from_tensors(rows.into_iter(), true);
+        assert_eq!(e.f32_bytes, 4000);
+        assert_eq!(e.int8_rest_bytes,
+                   (3200.0 * crate::memplan::Residency::Int8.bytes_per_param()) as u64);
+        assert_eq!(e.q4_rest_bytes,
+                   (3200.0 * crate::memplan::Residency::Q4.bytes_per_param()) as u64);
+        assert!(e.plan_q4() < e.plan_int8());
+    }
 }
 
 #[cfg(test)]

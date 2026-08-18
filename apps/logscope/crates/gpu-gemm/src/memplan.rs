@@ -1572,12 +1572,16 @@ mod iq1s_view_tests {
 
 /// What will actually happen to an IQ1_S checkpoint, said at load time.
 ///
-/// **The native path is not wired.** `LinKind::Iq1`, `MATVEC_IQ1_S` and `MOE_MATVEC_IQ1_S` exist;
-/// the loader still routes every tensor through `dequantize` to f32 and then requantizes, so an
-/// IQ1_S file becomes q4 and inflates 2.88x.
-///
-/// A 30.3 GiB checkpoint becomes 87 GiB. Saying so BEFORE the load beats discovering it after — the
-/// load is minutes, and the failure would otherwise arrive as a budget refusal that names no cause.
+/// The native path IS wired (lib.rs: block-aligned IQ1_S tensors go from mmap to `LinKind::Iq1`
+/// in the file's own bytes; `LOGSCOPE_NO_IQ1_NATIVE=1` disables it), so the caller passes which
+/// state applies — wired for the default, unwired when the lever is set or a row fails the
+/// 256-alignment gate. This doc previously asserted the path's ABSENCE outright, which the iq1
+/// commits made false — the "asserts absence" class, in a doc comment this time. The consequence
+/// either way is the same arithmetic: unwired, every tensor round-trips through f32 to q4 and a
+/// 30.3 GiB file inflates 2.88x to 87 GiB. Saying which one BEFORE the load beats discovering it
+/// after — the load is minutes, and the failure would otherwise arrive as a budget refusal that
+/// names no cause. `store::estimate_resident_for_load` computes the per-tensor split this
+/// sentence summarizes.
 pub fn iq1s_load_plan(file_gib: f32, ceiling_gib: f32, native_path_wired: bool) -> String {
     if native_path_wired {
         return format!("IQ1_S held natively: {file_gib:.1} GiB resident against a {ceiling_gib:.1} GiB ceiling. Experts stay at 1.5625 bpw, so more of them pin — which is what makes whole layers routable and removes the per-layer readback.");

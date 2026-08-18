@@ -273,14 +273,35 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
             // otherwise let the loader pick. LOGSCOPE_FORCE_LOAD=1 bypasses; LOGSCOPE_MAX_RESIDENT_GB sets
             // the budget; LOGSCOPE_Q4_RESIDENT=1 forces q4 up front.
             if std::env::var("LOGSCOPE_FORCE_LOAD").is_err() {
-                if let (Some(est), Some(budget)) = (gpu_kernels::store::estimate_int8_resident(&g), gpu_kernels::store::resident_budget_bytes()) {
-                    let q4_est = est / 2; // q4-resident is ≈half of int8
-                    if q4_est > budget {
-                        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                // FILE-AWARE, ARCH-INDEPENDENT. The previous check read `llama.*` metadata keys —
+                // so a qwen2/gemma3/diffusion_gemma header returned None and the guard silently
+                // skipped itself (the "a guard that cannot find its input" class, already fixed
+                // once below for vocab width) — and it priced EVERYTHING as int8, which refuses
+                // an IQ1_S checkpoint the native path holds at 1.5625 bpw. The estimator walks
+                // the tensor table instead: no arch knowledge, and type-19 tensors are priced at
+                // the file's own bytes exactly when the loader will keep them that way.
+                let est = gpu_kernels::store::estimate_resident_for_load(&g);
+                if let Some(budget) = gpu_kernels::store::resident_budget_bytes() {
+                    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                    if est.native_view_bytes > 0 {
+                        // `load` is a constructor — no self yet, so the model is named by its file.
+                        let fname = std::path::Path::new(path).file_name()
+                            .map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+                        crate::diag!("wgpu-engine: [{}] {}", fname,
+                            gpu_kernels::memplan::iq1s_load_plan(
+                                gib(est.native_view_bytes) as f32, gib(budget) as f32,
+                                std::env::var("LOGSCOPE_NO_IQ1_NATIVE").is_err()));
+                    }
+                    if est.plan_q4() > budget {
                         return Err(format!(
-                            "won't fit: ~{:.1} GiB needed even at q4-resident, ~{:.1} GiB available. Try a \
+                            "won't fit: ~{:.1} GiB needed even at q4-resident{}, ~{:.1} GiB available. Try a \
                              smaller model, free memory, or LOGSCOPE_FORCE_LOAD=1 to try anyway (likely OOM).",
-                            gib(q4_est), gib(budget)));
+                            gib(est.plan_q4()),
+                            if est.native_view_bytes > 0 {
+                                format!(" (of which {:.1} GiB is IQ1_S held in the file's own bytes)",
+                                        gib(est.native_view_bytes))
+                            } else { String::new() },
+                            gib(budget)));
                     }
                 }
             }

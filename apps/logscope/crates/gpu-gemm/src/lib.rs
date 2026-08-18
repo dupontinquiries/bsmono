@@ -2643,8 +2643,7 @@ fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
         // This is what MOE_MATVEC_IQ1_S has been waiting for: the kernel exists and has never been
         // dispatched, because nothing could hand it a per-expert slice.
         LinKind::Iq1(q) => {
-            if q.k % 256 != 0 { return None }
-            let row_bytes = (q.k / 256 * 50) as u64;
+            let row_bytes = Iq1Weight::row_bytes(q.k)? as u64;
             let (off, len) = (row0 as u64 * row_bytes, rows as u64 * row_bytes);
             // The blocks tensor is uploaded as opaque words, so its cols are byte_len/4.
             Some(Lin::iq1(Iq1Weight {
@@ -3125,6 +3124,14 @@ impl Iq1Weight {
     /// Bytes per 256-weight block: 50 for IQ1_S.
     pub const BLOCK_BYTES: usize = 50;
     pub fn bytes(&self) -> usize { (self.n * self.k / 256) * Self::BLOCK_BYTES }
+    /// Bytes of ONE row of a k-wide IQ1_S matrix, or None when k is not block-aligned — the
+    /// per-expert slice offset the MoE arm stands on. Extracted after this arithmetic shipped
+    /// broken three separate ways (dims shifted by a field, the missing codebook, the alignment
+    /// cut); one source, tested against `dot_iq1_s` on concatenated rows in cpumatvec.
+    pub fn row_bytes(k: usize) -> Option<usize> {
+        if k == 0 || k % 256 != 0 { return None; }
+        Some(k / 256 * Self::BLOCK_BYTES)
+    }
 }
 
 enum LinKind { F32(Tensor), Q8(QWeight), Q4(Q4Weight), Iq1(Iq1Weight) }

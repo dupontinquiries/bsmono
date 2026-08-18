@@ -695,4 +695,31 @@ mod iq1s_dot_tests {
         assert!(dot_iq1_s(&[0u8; 49], &vec![0f32; 256]).is_none());
         assert!(dot_iq1_s(&[0u8; 50], &vec![0f32; 256]).is_some());
     }
+
+    #[test]
+    fn iq1s_row_slices_of_a_stack_recover_the_independent_rows() {
+        // The MoE arm hands MOE_MATVEC_IQ1_S per-expert byte ranges computed by
+        // Iq1Weight::row_bytes — the arithmetic that shipped broken three separate ways. This
+        // pins it against ground truth the offsets cannot fake: rows are generated
+        // INDEPENDENTLY, dotted via the reference, then concatenated into the stacked layout the
+        // loader uploads; slicing the stack at row r must reproduce row r's own dot exactly.
+        let k = 512usize; // two blocks per row — exercises the per-row block stride too
+        let rb = crate::Iq1Weight::row_bytes(k).unwrap();
+        assert_eq!(rb, 2 * 50);
+        // deterministic pseudo-random block bytes (SplitMix-ish), valid by construction: every
+        // byte pattern decodes — the grid is total over its 11-bit index space.
+        let mut s = 0x9e3779b97f4a7c15u64;
+        let mut byte = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s >> 33) as u8 };
+        let rows: Vec<Vec<u8>> = (0..3).map(|_| (0..rb).map(|_| byte()).collect()).collect();
+        let act: Vec<f32> = (0..k).map(|i| (i as f32 * 0.37).sin()).collect();
+        let expect: Vec<f32> = rows.iter().map(|r| dot_iq1_s(r, &act).unwrap()).collect();
+        let stack: Vec<u8> = rows.concat();
+        for (r, want) in expect.iter().enumerate() {
+            let got = dot_iq1_s(&stack[r * rb..(r + 1) * rb], &act).unwrap();
+            assert_eq!(got.to_bits(), want.to_bits(), "row {r}: slice must be BIT-identical");
+        }
+        // and the alignment gate refuses the row width ggml itself cannot quantize (the
+        // DiffusionGemma expert down-proj width) instead of cutting mid-block
+        assert!(crate::Iq1Weight::row_bytes(704).is_none());
+    }
 }
