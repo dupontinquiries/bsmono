@@ -32,6 +32,12 @@ python3 convert.py /path/to/diffusiongemma-26B-A4B-it \
 
 # end-to-end selfcheck: tiny synthetic 2-layer model, no shards needed
 python3 convert.py --selfcheck --gguf-py /path/to/llama.cpp/gguf-py
+
+# tokenizer-only GGUF from a real drop, with probe strings encoded by the HF
+# `tokenizers` reference at emit time; verify the engine reproduces the ids:
+python3 convert.py /path/to/diffusiongemma-26B-A4B-it --emit-tokenizer \
+    --out tok.gguf --gguf-py /path/to/llama.cpp/gguf-py
+kernel-validate --gate-tokenizer tok.gguf
 ```
 
 Needs `numpy` + `safetensors`; `gguf` either via `--gguf-py <llama.cpp>/gguf-py`

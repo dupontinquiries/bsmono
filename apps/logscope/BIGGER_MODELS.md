@@ -84,3 +84,36 @@ or layer streaming. SmolLM2's 0.5 GiB matches the real M2 log (calibration ancho
 `--gate-memplan`: assert the planner's verdicts for a table of known shapes against measured resident
 footprints on the M2 (extend the SmolLM2 anchor to 1B/8B), so the estimate stays honest as the loader
 evolves.
+
+---
+
+## Addendum 2026-08-18 — MoE + diffusion move two of the three axes
+
+Written after the DiffusionGemma (26B-A4B) recognition work; the original text above is left as
+it stood because its reasoning still holds — these are the deltas.
+
+**Architecture axis.** The registry now carries a MoE block-diffusion arch,
+`diffusion_gemma`, as *recognized-not-supported*: the loader refuses with the eight-gap report
+instead of "unknown architecture", every novel op has a CPU oracle, and a whole-model CPU
+reference + block-AR loop exists (`gemmadiffcpu.rs`) for the eventual kernels to be gated
+bit-exact against. Two of the gaps are STRUCTURAL in the sense this file's Gemma2/Phi-3 notes
+never were: per-layer head_dim/KV width (the KV cache and dims plumbing assume one width per
+model) and V-sourced-from-K on the v_proj-less layers. Full dossier:
+`crates/gpu-gemm/DIFFUSION_GEMMA.md`.
+
+**Memory axis.** Two changes since the table above was computed:
+- The app's preflight no longer reads `llama.*` keys (which made it silently skip every
+  non-llama header) and no longer prices everything as int8 (which refused IQ1_S natives 5.76×
+  too big). `store::estimate_resident_for_load` walks the tensor table arch-independently and
+  prices 256-aligned type-19 tensors at the file's own bytes.
+- MoE changes the shape of the table: the 26B-A4B is ~25.2B total / ~3.8B active, and its
+  expert `down` rows (704 wide) can never be IQ1_S, so real 1.58-bit files are per-tensor
+  mixes. Shape arithmetic puts it at ~30.5 GB int8 / ~18.3 GB q4 / ~12.5 GB mixed —
+  **M2-class even at int8, not FP5-class even at the mix** (KV alone is 440 KiB/token f32,
+  ragged per layer). The planner-table format above still applies; the per-tensor file walk is
+  what prices a mixed file correctly where a whole-file bpw assumption cannot.
+
+**Quant axis** stays as stated (not the blocker), with one addition: IQ1_S is loadable natively
+(file's own bytes) with `LOGSCOPE_NO_IQ1_NATIVE` as the kill-switch, and the fixture carries a
+packed IQ1_S probe tensor so the pricing + row-slice pathway is pinned against real file bytes
+in-sandbox rather than waiting for the M2.
