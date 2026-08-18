@@ -527,6 +527,111 @@ pub fn auto_window(need: usize, n_ctx: u32, trained_max: usize, kv_per_token: u6
 (the prompt plus reply headroom needs {need} tokens)")))
 }
 
+/// What to do about a reply budget the window can no longer hold.
+///
+/// The failure this exists for is silent and slow: `n_new = ceiling.min(window - prompt)` never
+/// errors, it just hands back a smaller number every turn. A real session shows the reply budget
+/// going 2470 -> 2050 -> 1832 -> 1187 -> 874 -> 814 over seventeen turns while the operator was
+/// told nothing, and a turn that asked for a long answer got exactly 814 tokens and stopped
+/// mid-thought. Autotuning the budget downward is a legitimate policy — it never blocks — but it
+/// is the WRONG DEFAULT for long-horizon work, where the right move is to stop, compact what has
+/// accumulated, and continue with room to answer.
+///
+/// Two policies, chosen by the operator, decided here so both paths are one function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReliefPolicy {
+    /// Shrink the reply budget to whatever is left. Never blocks; degrades quietly.
+    Autotune,
+    /// When the squeeze would take the budget below what an answer needs, stop and ask for a
+    /// summary of the older turns first, then continue with the freed room.
+    SummarizeAndContinue,
+}
+
+/// The decision for one turn.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Relief {
+    /// Room to spare: generate with this budget (the ceiling, unsqueezed).
+    Proceed { n_new: usize },
+    /// Squeezed but still workable: generate with this budget. `note` is non-None only when the
+    /// squeeze crossed into territory worth telling the operator about, so an ordinary turn is
+    /// not narrated.
+    Squeeze { n_new: usize, note: Option<String> },
+    /// Compact first. `summarize_upto` is how many of the OLDEST prompt tokens should be folded
+    /// into a summary, chosen to free enough room for a full-ceiling reply plus headroom;
+    /// `keep_recent` is what must survive verbatim — the recent turns are the ones the next reply
+    /// actually continues, and summarizing those is how a compaction loses the thread.
+    Summarize { summarize_upto: usize, keep_recent: usize, reason: String },
+}
+
+/// Below this many tokens a reply is not an answer, it is a fragment: the model stops mid-sentence
+/// and the operator's next move is "continue", which costs another full prefill. Chosen as the
+/// point where the observed session's replies began hitting their cap exactly (one turn produced
+/// 1357 of 1357) rather than finishing.
+pub const REPLY_FLOOR: usize = 512;
+
+/// Fraction of the window kept verbatim when summarizing. The recent turns are what the next
+/// reply continues; folding them into prose is how a compaction produces an answer that has lost
+/// the thread it was supposed to pick up.
+const KEEP_RECENT_FRAC: f32 = 0.35;
+
+/// How much a fold is expected to compress: `summarize_upto / SUMMARY_COMPRESSION` tokens of
+/// summary. Conservative on purpose — over-estimating compression is what makes a compaction
+/// recommend itself, cost a round trip, and land back in the squeeze.
+const SUMMARY_COMPRESSION: usize = 6;
+/// And no summary is allowed to be huge, whatever the fold's size implies.
+const SUMMARY_CAP: usize = 512;
+
+/// Decide what to do with `ceiling` tokens of requested reply inside `window`, given a prompt of
+/// `prompt` tokens.
+///
+/// `Summarize` is returned only when it would actually help: if the prompt is mostly recent turns
+/// (nothing old enough to fold), compaction frees nothing and the honest answer is the squeeze,
+/// with the reason said out loud rather than a second policy that also fails silently.
+pub fn relief(policy: ReliefPolicy, prompt: usize, window: usize, ceiling: usize) -> Relief {
+    let room = window.saturating_sub(prompt);
+    if room >= ceiling { return Relief::Proceed { n_new: ceiling }; }
+    let squeezed = room.max(1);
+    let note = |n: usize| Some(format!(
+        "reply budget squeezed {ceiling} \u{2192} {n} — the prompt ({prompt}) leaves {room} of a \
+{window} window. Long-horizon mode can summarize the older turns instead of shrinking every \
+reply; this turn will be cut off at {n} tokens."));
+    match policy {
+        ReliefPolicy::Autotune => {
+            // Narrate only once it matters. A ceiling trimmed from 2470 to 2050 is not news; a
+            // budget under the floor is the turn that ends mid-sentence.
+            let n = squeezed;
+            Relief::Squeeze { n_new: n, note: if n < REPLY_FLOOR { note(n) } else { None } }
+        }
+        ReliefPolicy::SummarizeAndContinue => {
+            if squeezed >= REPLY_FLOOR {
+                // still a workable answer — compaction would cost a round trip for nothing
+                return Relief::Squeeze { n_new: squeezed, note: None };
+            }
+            let keep_recent = ((window as f32 * KEEP_RECENT_FRAC) as usize).min(prompt);
+            // Fold everything older than the kept tail — but the SUMMARY ITSELF occupies the
+            // window, and a rule that forgets that recommends a compaction which frees less than
+            // it promised, gets squeezed anyway, and has spent a round trip to arrive at the same
+            // place. Price it at the compression this codebase actually asks for, floored so a
+            // tiny fold is not modelled as free.
+            let summarize_upto = prompt.saturating_sub(keep_recent);
+            let summary_cost = (summarize_upto / SUMMARY_COMPRESSION).clamp(
+                if summarize_upto == 0 { 0 } else { 32 }, SUMMARY_CAP);
+            let freed_room = window.saturating_sub(keep_recent + summary_cost);
+            if summarize_upto == 0 || freed_room < REPLY_FLOOR {
+                return Relief::Squeeze { n_new: squeezed, note: note(squeezed) };
+            }
+            Relief::Summarize {
+                summarize_upto,
+                keep_recent,
+                reason: format!("the prompt ({prompt} tokens) leaves {room} of a {window} window \
+\u{2014} under the {REPLY_FLOOR}-token floor for a complete reply. Folding the oldest \
+{summarize_upto} tokens into a summary and keeping the most recent {keep_recent} verbatim \
+restores room for a full answer (the summary itself is priced at ~{summary_cost} tokens)."),
+            }
+        }
+    }
+}
+
 /// Why the window is what it is, for the log line. Naming the BINDING constraint is the point: the
 /// operator's next question after "it resized" is always "why not further".
 pub fn ctx_reason(chosen: usize, need: usize, trained_max: usize, by_memory: usize) -> &'static str {
@@ -656,4 +761,91 @@ mod sizing {
         assert!(why.unwrap().contains("KV memory budget"));
     }
 
+}
+
+#[cfg(test)]
+mod relief_tests {
+    use super::*;
+
+    /// The observed session, turn by turn: prompt grows, the budget silently collapses. Under
+    /// Autotune every one of these generates — which is the policy working as designed and also
+    /// exactly why nobody noticed the replies getting shorter.
+    #[test]
+    fn autotune_never_blocks_and_that_is_the_problem() {
+        let window = 4096;
+        let ceiling = 2470;
+        for prompt in [1626usize, 2046, 2264, 2909, 3222, 3282] {
+            match relief(ReliefPolicy::Autotune, prompt, window, ceiling) {
+                Relief::Proceed { n_new } => assert!(n_new == ceiling && prompt + ceiling <= window),
+                Relief::Squeeze { n_new, .. } => {
+                    assert!(n_new >= 1 && n_new < ceiling);
+                    assert_eq!(n_new, window - prompt, "budget is exactly the room left");
+                }
+                Relief::Summarize { .. } => panic!("Autotune must never block"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_squeeze_is_narrated_only_once_it_costs_an_answer() {
+        // 2264-token prompt: budget 1832, plenty — a line here would be noise
+        let Relief::Squeeze { note, .. } = relief(ReliefPolicy::Autotune, 2264, 4096, 2470)
+            else { panic!("squeezed") };
+        assert!(note.is_none(), "an 1832-token budget is not news");
+        // 3700-token prompt: 396 left, under the floor — the turn will end mid-sentence
+        let Relief::Squeeze { n_new, note } = relief(ReliefPolicy::Autotune, 3700, 4096, 2470)
+            else { panic!("squeezed") };
+        assert_eq!(n_new, 396);
+        assert!(note.expect("narrated").contains("396"), "the line names the number");
+    }
+
+    #[test]
+    fn summarize_fires_exactly_where_autotune_would_have_degraded() {
+        let (window, ceiling) = (4096usize, 2470usize);
+        // comfortable: identical under both policies
+        assert_eq!(relief(ReliefPolicy::Autotune, 1626, window, ceiling),
+                   relief(ReliefPolicy::SummarizeAndContinue, 1626, window, ceiling));
+        // squeezed but workable: still identical — compaction costs a round trip for nothing
+        assert!(matches!(relief(ReliefPolicy::SummarizeAndContinue, 3222, window, ceiling),
+                         Relief::Squeeze { n_new: 874, note: None }));
+        // under the floor: this is where the policies diverge
+        match relief(ReliefPolicy::SummarizeAndContinue, 3700, window, ceiling) {
+            Relief::Summarize { summarize_upto, keep_recent, .. } => {
+                assert!(keep_recent > 0 && summarize_upto > 0);
+                assert_eq!(summarize_upto + keep_recent, 3700, "every prompt token is accounted for");
+                assert!(window - keep_recent >= REPLY_FLOOR, "and the fold actually frees room");
+            }
+            other => panic!("expected a summarize decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recent_turns_are_never_folded_away() {
+        // The compaction failure mode: summarizing what the next reply is supposed to continue.
+        let Relief::Summarize { keep_recent, .. } =
+            relief(ReliefPolicy::SummarizeAndContinue, 4000, 4096, 2470) else { panic!("summarize") };
+        assert!(keep_recent >= 1024, "a third of the window stays verbatim, got {keep_recent}");
+    }
+
+    #[test]
+    fn a_fold_that_cannot_free_room_says_so_instead_of_looping() {
+        // Window so small that the kept tail PLUS the summary still leaves nothing: a policy that
+        // returned Summarize here would summarize, re-prefill, and get squeezed anyway — a round
+        // trip spent to arrive at the same budget. My first draft did exactly that, because it
+        // priced the summary at zero; this case is why the summary's own cost is in the rule.
+        match relief(ReliefPolicy::SummarizeAndContinue, 690, 700, 2470) {
+            Relief::Squeeze { note, .. } => assert!(note.is_some(), "and it explains why"),
+            other => panic!("compaction cannot free room here: {other:?}"),
+        }
+        // But a fold that DOES help must still fire: same shape, a window with room to work in.
+        assert!(matches!(relief(ReliefPolicy::SummarizeAndContinue, 900, 1024, 2470),
+                         Relief::Summarize { .. }), "124 tokens of room becomes ~570 — worth it");
+    }
+
+    #[test]
+    fn a_prompt_that_fits_is_untouched_by_either_policy() {
+        for p in [ReliefPolicy::Autotune, ReliefPolicy::SummarizeAndContinue] {
+            assert_eq!(relief(p, 1000, 8192, 2048), Relief::Proceed { n_new: 2048 });
+        }
+    }
 }

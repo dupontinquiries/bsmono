@@ -46,13 +46,20 @@ pub struct GenParams {
     /// coherence levers consumed by the wgpu engine's sampler.
     pub repeat_penalty: f32,
     pub min_p: f32,
+    /// Long-horizon relief policy. False (default) autotunes the reply budget down to whatever
+    /// the window has left — it never blocks, and it never says anything, so replies get quietly
+    /// shorter turn after turn. True asks the engine to REQUEST a compaction once the squeeze
+    /// would take a reply below the usable floor, so the caller can summarize the older turns and
+    /// continue with room to answer. A bool rather than the engine's own enum: this crate does
+    /// not depend on the engine, and the mapping is one line at the call site.
+    pub summarize_instead_of_squeeze: bool,
     pub n_threads: i32,
     /// -1 = offload all layers to the GPU.
     pub n_gpu_layers: i32,
 }
 impl Default for GenParams {
     fn default() -> Self {
-        Self { max_tokens: 512, reply_ceiling: 512, n_ctx: 4096, n_batch: 4096, temperature: 0.7, repeat_penalty: 1.15, min_p: 0.05, n_threads: 4, n_gpu_layers: -1 }
+        Self { max_tokens: 512, reply_ceiling: 512, n_ctx: 4096, n_batch: 4096, temperature: 0.7, repeat_penalty: 1.15, min_p: 0.05, summarize_instead_of_squeeze: false, n_threads: 4, n_gpu_layers: -1 }
     }
 }
 
