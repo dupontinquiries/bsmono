@@ -79,6 +79,13 @@ pub enum LibraryTab { Tracks, AllTracks, Albums, Artists, Tags, Playlists }
 /// second literal list in the view is how a reorder starts naming the wrong
 /// page — the same failure `the_named_page_bar_and_the_swipe_nav_stay_in_step`
 /// guards for the page bar, and the same one the snapclone tab labels hit.
+/// The mixer page's sections, in the order they read in.
+///
+/// The stagger is per-index, so this order IS the entrance order — the dial
+/// first because it is the hero control, the keys last because they are the
+/// least important thing on the page.
+pub const MIXER_CARDS: [&str; 4] = ["Output", "Channels", "Crossover", "Steps"];
+
 pub const LIBRARY_TABS: [&str; 6] =
     ["Tracks", "All tracks", "Albums", "Artists", "Tags", "Playlists"];
 
@@ -328,6 +335,12 @@ pub struct Controller {
     /// plain row does not scroll: the last ones simply leave the screen.
     library_bar: crate::shell_bits::PageBar,
     /// The mixer page's cards, staggered so the page assembles.
+    ///
+    /// Labelled from MIXER_CARDS, which is what they actually wrap. They were
+    /// built from VIEWS — the PAGE names — so drawing them would have put
+    /// "Devices" and "Spaces" over the mixer's dial and channel columns. The
+    /// list was a convenient source of five strings, and nothing caught it
+    /// because card_frame was never called.
     pub cards: Vec<crate::shell_bits::ControlCard>,
     pub speaker_col: crate::channel::ChannelColumn,
     pub instrumental_col: crate::channel::ChannelColumn,
@@ -403,7 +416,7 @@ impl Controller {
             library_bar: crate::shell_bits::PageBar::new(&LIBRARY_TABS),
             // The delay is per-card because only the page knows the order the
             // cards read in.
-            cards: VIEWS.iter().enumerate()
+            cards: MIXER_CARDS.iter().enumerate()
                 .map(|(i, v)| crate::shell_bits::ControlCard::new(v, i as f32 * 60.0))
                 .collect(),
             // Frequencies and role hints come from the mixer's own band plan;
@@ -1020,7 +1033,20 @@ impl Controller {
         self.watermark.tick(ui.input(|i| i.stable_dt).min(0.1) * 1000.0);
         watermark_paint(ui, &self.watermark, ui.cursor().min + egui::vec2(70.0, 70.0), 100.0, c);
         ui.ctx().request_repaint(); // the stroke lives — it advances every frame
-        if let Some(v) = crate::dial::dial_ui(ui, &mut self.dial, 140.0, c) {
+        // THE CARD FRAME, at last drawn. ControlCard has carried a rise, a
+        // fade and an active glow since the port, the controller built one per
+        // section with a staggered entrance delay, and a test asserts the
+        // stagger produces different opacities — for frames nothing painted.
+        //
+        // The dial goes in the first card because the stagger is per-index and
+        // this is the hero control: it should be the thing that arrives first.
+        // The frame is drawn, then the dial inside the rect it returns, which
+        // is the contract card_frame states.
+        let card_rect = crate::shell_bits::card_frame(
+            ui, &mut self.cards[0], 170.0, c);
+        let mut inner = ui.new_child(
+            egui::UiBuilder::new().max_rect(card_rect.shrink2(egui::vec2(10.0, 22.0))));
+        if let Some(v) = crate::dial::dial_ui(&mut inner, &mut self.dial, 140.0, c) {
             self.pending_volume = Some(v);
         }
         if let Some(v) = self.pending_volume {
@@ -1031,15 +1057,25 @@ impl Controller {
         }
         // The two channel strips, side by side, over their response curves —
         // the independence of the chains is the thing this page exists to show.
-        ui.horizontal(|ui| {
+        let chan_rect = crate::shell_bits::card_frame(ui, &mut self.cards[1], 210.0, c);
+        let mut chan = ui.new_child(
+            egui::UiBuilder::new().max_rect(chan_rect.shrink2(egui::vec2(10.0, 22.0))));
+        chan.horizontal(|ui| {
             crate::channel::column_ui(ui, &mut self.speaker_col, c);
             ui.separator();
             crate::channel::column_ui(ui, &mut self.instrumental_col, c);
         });
-        crate::channel::curve_ui(ui, &self.speaker_col, &self.instrumental_col, 120.0, c);
+        let curve_rect = crate::shell_bits::card_frame(ui, &mut self.cards[2], 150.0, c);
+        let mut curve = ui.new_child(
+            egui::UiBuilder::new().max_rect(curve_rect.shrink2(egui::vec2(10.0, 22.0))));
+        crate::channel::curve_ui(&mut curve, &self.speaker_col, &self.instrumental_col, 120.0, c);
 
-        // The step keys, in the app's own press language.
-        ui.horizontal(|ui| {
+        // The step keys, in the app's own press language. Last card, so last
+        // to read in — they are the least important thing on the page.
+        let keys_rect = crate::shell_bits::card_frame(ui, &mut self.cards[3], 78.0, c);
+        let mut keys = ui.new_child(
+            egui::UiBuilder::new().max_rect(keys_rect.shrink2(egui::vec2(10.0, 22.0))));
+        keys.horizontal(|ui| {
             if crate::fileproc::step_key_ui(ui, &mut self.key_down, 40.0, c) {
                 self.dial.set_external((self.dial.value - 5.0).max(0.0));
             }

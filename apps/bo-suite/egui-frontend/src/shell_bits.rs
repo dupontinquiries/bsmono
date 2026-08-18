@@ -263,6 +263,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_mixer_sections_are_framed_and_labelled_for_what_they_wrap() {
+        // card_frame was never called: ControlCard carried a rise, a fade and
+        // an active glow, the controller built one per section with a
+        // staggered delay, and a test asserted the stagger produced different
+        // opacities — for frames nothing painted.
+        //
+        // Worse, the cards were built from VIEWS, the PAGE names. Drawing them
+        // would have put "Devices" and "Spaces" over the mixer's dial and
+        // channel columns.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("shell_bits::card_frame("), "no card is framed");
+        assert!(lib.contains("ControlCard::new(v, i as f32 * 60.0)"));
+        assert!(lib.contains("MIXER_CARDS.iter()"),
+                "the cards are not labelled from the mixer's own sections");
+        assert!(!lib.contains("cards: VIEWS.iter()"),
+                "page names are back as card labels");
+    }
+
+    #[test]
+    fn there_is_one_card_per_section_and_the_indices_are_in_range() {
+        // The draw sites index self.cards[0..=3] directly, so a shorter list
+        // panics at runtime rather than failing to compile.
+        assert_eq!(crate::MIXER_CARDS.len(), 4);
+        let lib = include_str!("lib.rs");
+        for i in 0..crate::MIXER_CARDS.len() {
+            assert!(lib.contains(&format!("&mut self.cards[{i}]")),
+                    "card {i} is built and never drawn");
+        }
+    }
+
+    #[test]
+    fn a_later_card_is_still_arriving_when_an_earlier_one_has_landed() {
+        // The stagger is the point: the page assembles rather than appearing.
+        let mut first = ControlCard::new("Output", 0.0);
+        let mut last = ControlCard::new("Steps", 180.0);
+        for _ in 0..4 {
+            first.tick(50.0);
+            last.tick(50.0);
+        }
+        assert!(first.opacity() > last.opacity(),
+                "no stagger: {} vs {}", first.opacity(), last.opacity());
+    }
+
+    #[test]
     fn the_library_bar_is_drawn_and_its_names_come_from_one_list() {
         // page_bar_ui had never been drawn: the controller built a PageBar
         // from VIEWS, kept it in step with the swipe nav, and tested that it
