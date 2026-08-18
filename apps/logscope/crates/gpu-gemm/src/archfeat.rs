@@ -98,6 +98,30 @@ pub enum Feature {
     /// The attention scale is a hyperparameter rather than 1/sqrt(head_dim). Equal to the default on
     /// most Gemma 3, but NOT on the 27B, which uses 1/sqrt(n_embd/n_head).
     AttentionScaleHparam,
+    /// V is taken FROM THE K PROJECTION on layers that ship no `attn_v` (Gemma 4 full-attention
+    /// layers), with a WEIGHTLESS rms on V. Not "V equals cached K": K then gets its learned norm
+    /// and rope, V does not — same projection, different post-processing (gemma4.cpp).
+    AltAttnValueFromKey,
+    /// Dense (shared) FFN and the routed MoE run as PARALLEL branches off attn_out — each with its
+    /// own pre/post norms — summed, post-normed once, then added to the residual (Gemma 4 MoE).
+    /// Sequential wiring runs and produces plausible text, which is the failure mode worth a flag.
+    TwinFfnParallelResidual,
+    /// Router logits are computed on a WEIGHTLESS rms of attn_out, scaled by 1/sqrt(d) and a
+    /// learned per-dimension vector (`ffn_gate_inp.scale`) — not on the MoE branch's normed input
+    /// (Gemma 4's "custom MoE logits calculation").
+    RouterInputNormScale,
+    /// Expert outputs are multiplied by a LEARNED per-expert scale vector
+    /// (`ffn_down_exps.scale`, one value per expert). Distinct from `ExpertWeightsScale`, which is
+    /// a metadata CONSTANT — conflating a trained vector with a constant is the Llama-4-norms
+    /// class of mistake.
+    PerExpertOutputScale,
+    /// A self-conditioning FFN at the decoder top (DiffusionGemma `self_cond.*`) feeding the
+    /// previous denoising step's state back into the current one.
+    SelfConditioning,
+    /// A SECOND set of per-layer output scalars for the causal ENCODE pass
+    /// (`layer_output_scale_enc`) beside the denoise-pass set — one stack, two modes
+    /// (DiffusionGemma). Depends on `LayerOutputScale` being read at all.
+    EncDecLayerScale,
 }
 
 impl Feature {
@@ -127,6 +151,12 @@ impl Feature {
             Feature::ExpertWeightsScale => "routed-expert weights scaled by a metadata constant",
             Feature::ExpertWeightsNorm => "routed-expert weights renormalized to sum to 1",
             Feature::SparseAttentionIndexer => "sparse attention: an indexer selects top-k keys",
+            Feature::AltAttnValueFromKey => "V sourced from the K projection (attn_v absent; weightless V norm)",
+            Feature::TwinFfnParallelResidual => "dense + MoE FFN as parallel branches with one joining post-norm",
+            Feature::RouterInputNormScale => "router input: weightless rms of attn_out times a learned scale vector",
+            Feature::PerExpertOutputScale => "learned per-expert output scale vector",
+            Feature::SelfConditioning => "self-conditioning FFN at the decoder top",
+            Feature::EncDecLayerScale => "separate encoder-pass per-layer output scalars",
         }
     }
 
@@ -234,7 +264,16 @@ impl Feature {
             // glm.c: the DSA indexer is a no-op for seq <= index_topk, where top-k IS every key, so
             // dense causal attention is the same computation rather than an approximation of it.
             // GLM-5.2's index_topk is 2048. See `indexer_needed_at`.
-            Feature::SparseAttentionIndexer => false
+            Feature::SparseAttentionIndexer => false,
+            // Gemma 4 MoE / DiffusionGemma (gemmadiff.rs is the CPU reference each will be gated
+            // against; none has a GPU caller yet — the reference existing is NOT the feature
+            // existing, which is exactly the distinction this table exists to hold).
+            Feature::AltAttnValueFromKey => false,     // the loader requires attn_v today
+            Feature::TwinFfnParallelResidual => false, // block forward runs ONE ffn branch
+            Feature::RouterInputNormScale => false,    // router reads the branch's normed input
+            Feature::PerExpertOutputScale => false,    // ffn_down_exps.scale is not read
+            Feature::SelfConditioning => false,        // self_cond.* tensors are not read
+            Feature::EncDecLayerScale => false,        // no pass-dependent scalar plumbing
         }
     }
 
@@ -264,6 +303,18 @@ it is unaffordable. The real loader blocker is IndexShare: index_topk_freq 4 mea
 in 4 carries indexer tensors, which is what breaks stock llama.cpp on converted GGUFs"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
+            Feature::AltAttnValueFromKey => Some("STRUCTURAL for the affected layers: without it the \
+loader refuses on the missing attn_v; faking V=K without the weightless norm runs and is wrong"),
+            Feature::TwinFfnParallelResidual => Some("sequential wiring produces plausible text — the \
+CPU reference in gemmadiff pins the parallel join order the gate must match"),
+            Feature::RouterInputNormScale => Some("routing on the branch input instead of attn_out \
+mis-routes every token quietly; gemmadiff::router_logits_reference is the oracle"),
+            Feature::PerExpertOutputScale => Some("ignoring the vector is the GLM-5.2 \
+expert_weights_scale bug again, per expert this time — quietly worse, never wrong-looking"),
+            Feature::SelfConditioning => Some("diffusion-only; skipping it changes denoise trajectories, \
+not shapes — the kind of gap only an end-to-end oracle catches"),
+            Feature::EncDecLayerScale => Some("gemmadiff::layer_out_scale REFUSES an encode pass without \
+the enc scalar rather than borrowing the denoise one"),
             _ => None,
         }
     }
@@ -299,6 +350,19 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
                          Feature::GeGluActivation, Feature::GemmaRmsNorm,
                          Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
                          Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
+        // DiffusionGemma = the Gemma 4 26B-A4B MoE base plus the diffusion pieces. Transcribed
+        // from gemma4.cpp (base) + the HF drop's configs and weight census (diffusion). The MoE
+        // routing/gather machinery itself is exercised daily (qwen3moe, llada2) so it is not a
+        // feature here; what IS listed is every way this stack differs from what block_decode runs.
+        "diffusion_gemma" | "diffusiongemma" => vec![
+            Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
+            Feature::GeGluActivation, Feature::GemmaRmsNorm, Feature::FinalLogitSoftcap,
+            Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
+            Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam,
+            Feature::SharedExpert,
+            Feature::AltAttnValueFromKey, Feature::TwinFfnParallelResidual,
+            Feature::RouterInputNormScale, Feature::PerExpertOutputScale,
+            Feature::SelfConditioning, Feature::EncDecLayerScale],
         // deepseek2/3 covers GLM-4.7-Flash, which ships the split 3-D projections. Listed so the
         // refusal names the real blocker rather than blaming the MLA forward, which is implemented.
         "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert,
@@ -331,6 +395,36 @@ pub fn gap_report(arch: &str, variant: u32) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diffusion_gemma_gaps_are_the_eight_structural_ones_not_the_gemma3_base() {
+        // The Gemma 3 base (SWA, post-norms, QK-norm, GeGLU, (1+w) norm, embedding scale,
+        // per-layer rope base, softcap) is implemented and must NOT appear as a gap — a stale
+        // FALSE there would refuse work the engine can do (the PerLayerRopeFreqs lesson). What
+        // remains is the per-layer geometry pair, the output scalars (both sets), and the four
+        // Gemma-4-MoE/diffusion mechanisms.
+        let g = gaps("diffusion_gemma", 128);
+        let expect = [Feature::PerLayerHeadDim, Feature::LayerOutputScale,
+                      Feature::AltAttnValueFromKey, Feature::TwinFfnParallelResidual,
+                      Feature::RouterInputNormScale, Feature::PerExpertOutputScale,
+                      Feature::SelfConditioning, Feature::EncDecLayerScale];
+        for f in expect { assert!(g.contains(&f), "{f:?} must be a named gap: {g:?}"); }
+        assert_eq!(g.len(), expect.len(), "and nothing implemented leaks into the gap list: {g:?}");
+        // the report names the arch and every gap, so the loader's refusal is actionable
+        let report = gap_report("diffusion_gemma", 128);
+        assert_eq!(report.len(), expect.len());
+        assert!(report.iter().all(|l| l.contains("diffusion_gemma")));
+    }
+
+    #[test]
+    fn per_expert_scale_is_not_the_metadata_constant() {
+        // ExpertWeightsScale (a constant, implemented) and PerExpertOutputScale (a trained
+        // vector, not) collapsing into one entry is how the registry would end up claiming the
+        // vector is handled because the constant is — the exact class of the Llama-4 norm bug.
+        assert_ne!(Feature::ExpertWeightsScale, Feature::PerExpertOutputScale);
+        assert!(Feature::ExpertWeightsScale.implemented());
+        assert!(!Feature::PerExpertOutputScale.implemented());
+    }
 
     #[test]
     fn scout_needs_the_post_rope_norm_and_maverick_does_not() {

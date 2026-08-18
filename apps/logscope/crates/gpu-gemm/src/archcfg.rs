@@ -11,7 +11,7 @@
 //! Gemma2 (geglu + dual soft-cap + a norm tweak), then Phi-3 (fused QKV / partial-rotary).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Gemma3, Phi3, Glm4Moe, DeepseekV3, Unknown }
+pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Gemma3, DiffusionGemma, Phi3, Glm4Moe, DeepseekV3, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Norm { /// x/rms(x) · w
@@ -212,9 +212,38 @@ expert with its own gate, and Q4_K/MXFP4 both slice since c4-784 and c4-805",
         // gate, not before.
         "gemma4" | "gemma4e" => ArchConfig {
             arch: Arch::Gemma3, prefix: "gemma4", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::RmsGemma, act: Act::GeGlu,
-            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: false, dense_supported: false,
-            note: "gemma4/E-series: assumed Gemma 3 shape (1+w rms, geglu, qk-norm, NEOX). UNVERIFIED against a real checkpoint — recognised so the failure names the gap rather than the family",
+            note: "gemma4/E-series: STILL unverified against a real checkpoint, but no longer a guess — \
+the vendored llama.cpp reference (src/models/gemma4.cpp) settles the shape this entry previously \
+ASSUMED was Gemma 3's. The 26B-A4B is a MoE: dense FFN as a shared expert beside 128 routed \
+(top-8, softmax gating, GELU), a TWIN parallel FFN residual with its own norm set \
+(pre_ffw_norm_2 / post_ffw_norm_1 / post_ffw_norm_2), V taken FROM THE K PROJECTION on \
+full-attention layers (attn_v optional; weightless rms on V), per-layer head_dim \
+(key_length_swa vs key_length), per-layer learned output scale, proportional rope via per-layer \
+rope_freqs tensors on full layers, and the FINAL-logit soft cap back at 30.0. E2B/E4B add \
+per-layer token embeddings on top. archfeat::required(\"gemma4\") names what of this the engine \
+lacks; the entry exists so the refusal names the gaps rather than the family",
+        },
+        // DiffusionGemma (google/diffusiongemma-26B-A4B, general.architecture = "diffusion_gemma"):
+        // BLOCK-DIFFUSION text generation on the Gemma 4 26B-A4B MoE stack above. One weight stack,
+        // two passes: a causal ENCODE pass that appends finished canvases to the KV cache, and a
+        // bidirectional DENOISE pass over the current canvas — each with its OWN learned per-layer
+        // output scalar — plus a self-conditioning FFN at the decoder top and the BlockRefinement
+        // scheduler (entropy-bound commits, full renoise, 0.8→0.4 anneal, confident-AND-stable
+        // early stop). The plan and the scheduler live in `gemmadiff` (pure, tested); the mask
+        // token is `<mask>` (tokenizer.ggml.mask_token_id), and diffusion.shift_logits is FALSE —
+        // canvas denoising predicts in place, LLaDA-lineage.
+        "diffusion_gemma" | "diffusiongemma" => ArchConfig {
+            arch: Arch::DiffusionGemma, prefix: "diffusion_gemma", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::RmsGemma, act: Act::GeGlu,
+            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: Some(30.0), attn_softcap: None, tied_embed_default: true,
+            supported: false, dense_supported: false,
+            note: "DiffusionGemma 26B-A4B: the Gemma 4 MoE base (twin parallel FFN, V-from-K on full \
+layers, per-layer head_dim/kv/rope, per-layer output scale, softcap 30) plus diffusion — an \
+encoder-mode scalar set (blk.N.layer_output_scale_enc), a self_cond.* FFN, and block-refinement \
+decoding. gemmadiff::read_shape validates the header; archfeat::required(\"diffusion_gemma\") \
+names the kernels this engine lacks. Flips to supported on a real checkpoint through a gate, \
+never on the fixture",
         },
         "phi3" => ArchConfig {
             arch: Arch::Phi3, prefix: "phi3", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
@@ -437,6 +466,36 @@ mod tests {
         // context, MLA layout fixed — and unrunnable. LOGSCOPE_TRY_UNSUPPORTED_ARCH is the escape, and
         // it claims nothing: it lets someone find out.
         assert!(!is_supported("glm-dsa", 0), "still unverified, correctly");
+    }
+
+    #[test]
+    fn diffusion_gemma_is_recognised_gapped_and_gemma_shaped() {
+        let c = for_arch("diffusion_gemma");
+        assert_eq!(c.arch, Arch::DiffusionGemma);
+        assert_eq!(c.prefix, "diffusion_gemma", "metadata reads under its own namespace");
+        assert!(c.moe && c.moe_shared_expert, "26B-A4B: 128 routed + the dense FFN as shared expert");
+        assert!(c.attn_qk_norm && c.norm == Norm::RmsGemma && c.act == Act::GeGlu,
+                "Gemma lineage: learned QK-norm, (1+w) rms, GeGLU");
+        assert_eq!(c.logit_softcap, Some(30.0), "the final-logit cap is back in this generation");
+        assert!(!c.supported && !c.dense_supported,
+                "recognised-but-refused until a real checkpoint passes a gate");
+        assert!(!is_supported("diffusion_gemma", 128), "gaps veto regardless of the flag");
+        assert_eq!(for_arch("diffusiongemma").arch, Arch::DiffusionGemma, "converter spelling variant");
+        // and recognition means the refusal can NAME things: at least one gap must exist to name
+        assert!(!crate::archfeat::gaps("diffusion_gemma", 128).is_empty());
+    }
+
+    #[test]
+    fn gemma4_now_carries_what_the_reference_settled() {
+        // The entry previously said "assumed Gemma 3 shape" — the vendored gemma4.cpp shows the
+        // 26B-A4B is a shared-expert MoE. The flags must match the reference, and the note must
+        // no longer present the assumption as the whole story.
+        let c = for_arch("gemma4");
+        assert!(c.moe && c.moe_shared_expert, "26B-A4B is a MoE with the dense FFN as shared expert");
+        assert!(c.logit_softcap.is_none(),
+                "the DEFAULT stays metadata-driven — only diffusion_gemma's shipped config pins 30.0");
+        assert!(!c.note.contains("assumed Gemma 3 shape"), "the guess is retired: {}", c.note);
+        assert!(c.note.contains("gemma4.cpp"), "and the note says where the shape now comes from");
         assert!(!declared_supported("glm-dsa"), "and the declaration is what gates it, not the gaps");
         // The gap list is now down to one, which is what makes the attempt worth offering.
         assert_eq!(crate::archfeat::gaps("glm-dsa", 0).len(), 1,

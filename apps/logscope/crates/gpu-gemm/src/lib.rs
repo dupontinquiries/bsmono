@@ -122,6 +122,7 @@ pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod moe;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
 #[allow(dead_code)] pub mod mla;     // Multi-head Latent Attention (DeepSeek/GLM) compressed-KV — CPU reference
 #[allow(dead_code)] pub mod dsa;     // DeepSeek Sparse Attention lightning indexer — CPU reference
+pub mod gemmadiff; // DiffusionGemma: Gemma-4-MoE layer plan + BlockRefinement scheduler — CPU reference
 #[allow(dead_code)] pub mod ngram;   // prompt-lookup (n-gram) speculative draft source — lossless speedup
 #[allow(dead_code)] pub mod expert_predict; // context-conditioned MoE expert predictor for SSD-streaming prefetch
 #[allow(dead_code)] pub mod expert_cache; // MoE expert-streaming policy: pin store + per-layer LRU slots + prefetch
@@ -11814,7 +11815,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         if embed_scale != 1.0 {
             eprintln!("loader: embedding scaled by sqrt(d) = {embed_scale:.2} (Gemma)");
         }
-        let diffusion = matches!(acfg.prefix, "llada2" | "rnd1" | "dream" | "llada");
+        let diffusion = matches!(acfg.prefix, "llada2" | "rnd1" | "dream" | "llada" | "diffusion_gemma");
         let mask_token_id = crate::gguf_mask_token_id(&g);
         // llama.cpp's ABSENT=>true rule only works because MAINLINE's converter always writes the
         // kv for llada (conversion/llada.py: add_diffusion_shift_logits(False), both classes). The
@@ -11825,7 +11826,10 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         let shift_logits = match g.get_str("diffusion.shift_logits") {
             Some(v) => v == "true",
             None => {
-                let llada_lineage = matches!(acfg.prefix, "llada2" | "llada");
+                // diffusion_gemma joins the in-place lineage: block-refinement denoises the
+                // canvas position it reads (the converter writes the kv explicitly, so this
+                // default only matters for a GGUF from elsewhere).
+                let llada_lineage = matches!(acfg.prefix, "llada2" | "llada" | "diffusion_gemma");
                 if diffusion && llada_lineage {
                     eprintln!("loader: diffusion.shift_logits ABSENT — resolved FALSE from the LLaDA \
 lineage (mainline's converter writes false for this family; the absent-defaults-true rule assumes a \
