@@ -427,6 +427,69 @@ impl Ingest {
     }
 }
 
+/// Tidy: whitespace and asset names. Nothing that changes words.
+///
+/// Collapses runs of blank lines to one and rewrites base64-named image links
+/// to something readable. The image FILES are not renamed — this returns
+/// markdown and the caller owns the assets folder, and a link rewritten to a
+/// file that was not moved is worse than an ugly filename.
+pub fn tidy(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut blanks = 0;
+    for line in md.lines() {
+        if line.trim().is_empty() {
+            blanks += 1;
+            // One blank separates paragraphs; more is layout whitespace the
+            // extractor carried across.
+            if blanks <= 1 {
+                out.push('\n');
+            }
+            continue;
+        }
+        blanks = 0;
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Structural: tidy, plus dropping dead refs and un-splitting table cells.
+///
+/// A dead ref `[][1]` is REMOVED rather than repaired. There is nothing to
+/// repair with: the text was gone before the file was written, and inventing a
+/// label would be Assisted's job done without saying so. Removing it leaves
+/// the sentence visibly broken, which is honest — "The **completely
+/// dominates** the ." still reads wrong, and it should, because it is.
+pub fn structural(md: &str) -> String {
+    let tidied = tidy(md);
+    let mut out = String::with_capacity(tidied.len());
+    for line in tidied.lines() {
+        let mut s = line.to_string();
+        // Drop `[][n]` and `[]( )` outright.
+        while let Some(i) = find_empty_ref(&s) {
+            let end = match s[i + 2..].chars().next() {
+                Some('[') => s[i..].find(']').and_then(|_| s[i + 2..].find(']')).map(|j| i + 2 + j + 1),
+                Some('(') => s[i + 2..].find(')').map(|j| i + 2 + j + 1),
+                _ => None,
+            };
+            match end {
+                Some(e) if e <= s.len() => { s.replace_range(i..e, ""); }
+                _ => break,
+            }
+        }
+        out.push_str(s.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn find_empty_ref(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    (0..b.len().saturating_sub(2)).find(|&i| {
+        b[i] == b'[' && b[i + 1] == b']' && (b[i + 2] == b'[' || b[i + 2] == b'(')
+    })
+}
+
 /// Split a document for a model with a bounded context.
 ///
 /// Chunks break on BLANK LINES, never mid-paragraph: a chunk boundary inside a
@@ -597,6 +660,50 @@ mod tests {
         // Separators are dropped between chunks, so the sum is slightly under.
         assert!(total >= CAPTURE.len() - chunks.len() * 2,
                 "content lost: {} vs {}", total, CAPTURE.len());
+    }
+
+    #[test]
+    fn the_levels_actually_improve_the_real_capture() {
+        // The verdict machinery is worthless if the repairs do not move the
+        // score on a real document. Both run against the 1,535-line capture.
+        let mut i = Ingest::default();
+        i.load(CAPTURE, 34);
+        let v = i.run(Level::Tidy, |s| tidy(s));
+        assert_eq!(v, Verdict::Improved, "tidy did not help the real capture");
+        i.revert();
+
+        let v = i.run(Level::Structural, |s| structural(s));
+        assert_eq!(v, Verdict::Improved);
+        match &i.phase {
+            Phase::Confirming(r) => {
+                assert_eq!(r.after.empty_refs, 0, "structural left dead refs behind");
+                assert!(r.after.total_lines < r.before.total_lines,
+                        "blank runs were not collapsed");
+            }
+            p => panic!("expected Confirming, got {p:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dead_ref_is_removed_rather_than_invented() {
+        // There is nothing to repair WITH: the text was gone before the file
+        // was written, and inventing a label is Assisted's job done without
+        // saying so. The sentence stays visibly broken, which is honest.
+        let out = structural("The **completely dominates** the .[][1]\n");
+        assert!(!out.contains("[]["), "the dead ref survived: {out:?}");
+        assert!(out.contains("completely dominates"), "prose was damaged: {out:?}");
+        assert!(!out.contains("Fairphone"), "a label was invented: {out:?}");
+    }
+
+    #[test]
+    fn tidy_does_not_touch_words() {
+        // The level's whole promise. If it can change prose it is not the safe
+        // option the recommendation treats it as.
+        let src = "# T\n\n\n\nA line.   \n\n\n\nAnother [][2] line.\n";
+        let out = tidy(src);
+        assert!(out.contains("A line."));
+        assert!(out.contains("Another [][2] line."), "tidy removed a ref: {out:?}");
+        assert!(!out.contains("\n\n\n"), "blank runs survived");
     }
 
     #[test]
