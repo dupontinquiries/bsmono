@@ -152,6 +152,43 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [ ] Report skew watch: 9-4 clan A on the tilted map (was 7-6). Thirteen deterministic
   samples is inside coin-flip variance (P(≥9) ≈ 13%) — before tuning, extend the report
   harness to run each pick under several terrain rolls for real sample size
+## Asset compression (the parts-web pipeline, from blackstar-rs)
+- [x] Measured first, per `blackstar-rs/docs/COMPRESSION.md` doctrine. 17 IQMs = 19.0 MB;
+  `iqm.rs` reads positions + indices only (10.7 MB) and throws away texcoords/normals on
+  every load — 44% of the drop is shipped to be discarded.
+- [x] Two of the described techniques do NOT pay here, and the negative results are worth
+  keeping: cross-model topology dedup finds **0 of 17** (no two models share an index
+  array) and float-exact vertex welding finds **0 of 413,307** (already welded). Lattice
+  welding only starts paying at 12 bits (0.2%). Same shape as blackstar's own finding that
+  dedup found nothing on fold strips.
+- [x] What pays, cumulative, one zstd -19 pass: 14-bit quantisation per model box (8.2 MB,
+  worst error 0.0031% of span) + Morton reorder (worth 17%: 3.86 -> 3.20 MB) + planar
+  delta streams + varints -> **2.81 MB, 6.8x**. Planar positions beat BSWEB's existing
+  fixed-width layout by 21% (3.63 -> 2.85 MB at equal quantisation).
+- [x] `games/shared/bsweb` gains its missing encoder half (`pack.rs`, 15 tests) plus two
+  additive reader changes: `pmode` (0 = the original fixed AoS, the default when absent,
+  so every previously built web still reads) and generalised bit widths
+  (`maxq = (1<<bits)-1`, identical for the 8 and 16 that existed). blackstar benefits too.
+- [x] `assetpack.rs` + `examples/pack_animals.rs` + `examples/pack_verify.rs`; `Model::load`
+  reads the pack with IQM fallback; real-asset integration test in `tests/`.
+- [x] Load-time trap found and fixed by measurement: unzstd costs ~37 ms while decoding one
+  model costs ~1.3 ms, so a per-call decompress would have made seventeen loads ~700 ms —
+  *slower* than the IQMs it replaced. Decompress once into a `OnceLock`, decode per model.
+- [x] Which artifact to ship, measured rather than assumed: the .zst saves 0.93 MB but an
+  outer archive recompresses the raw web to within 79 bytes of it (2,811,201 vs
+  2,811,122), so the container only earns its keep when files ship loose. Loader prefers
+  the raw web; both are gitignored (committing a derived pack beside its source is exactly
+  the trap FLEET_COMPRESSION.md records: a 904 MB bundle).
+- [ ] **Your call, not mine:** dropping the loose IQMs. Shipping only the pack takes
+  assets from 19.0 MB to 2.8 MB, but reclaiming it needs a history rewrite
+  (`git filter-repo --invert-paths`), and the pack is lossy-by-design at 14 bits — the
+  IQMs are the only way back to a finer ladder. Decide before rewriting, not after.
+- [ ] Decode speed: 1.3 ms/model (21.9 ms for all 17) against 5.6 ms for parsing the loose
+  IQMs — 4x slower, invisible for statues, worth revisiting if a mode ever streams these
+- [ ] The triangle stream could be ~8% smaller with per-triangle (b-a, c-a) deltas instead
+  of one running cursor, but bsweb's decoder is a single cursor and changing it is a
+  format break, not an additive one. Left as measured, not done.
+
 - [ ] Landform-carved heightfield (walls/crags as real terrain relief rather than placed
   slabs) would need a per-mode heightfield overlay in world — a bigger seam, deferred
 - [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes

@@ -1,0 +1,10 @@
+# Build outputs of `cargo run --example pack_animals` — derived from
+# assets/animals/*.iqm, which stay the source of truth. Deliberately not
+# committed: the pack is 3.7 MB (or 2.8 MB zstd'd) and committing it beside the
+# 19 MB of IQM it derives from would put BOTH in the history forever, which is
+# the trap blackstar-rs/docs/FLEET_COMPRESSION.md records hitting — quantising
+# shrank its working tree and GREW its bundle to 904 MB, because git still held
+# the originals. Shipping the pack instead of the IQMs is a decision to make
+# once, with a history rewrite, not a side effect of a build step.
+assets/animals.web
+assets/animals.web.zst

@@ -103,9 +103,19 @@ impl Model {
         Ok(Model { positions, tris })
     }
 
-    /// Load from assets/animals by short name ("white_tiger"). Path is anchored to the
+    /// Load from assets by short name ("white_tiger"). Paths are anchored to the
     /// crate dir so `cargo run`/`cargo test` agree on where assets live.
+    ///
+    /// **The packed web wins when it exists.** `assets/animals.web.zst` carries
+    /// all seventeen models in 2.8 MB against 19.0 MB of IQM (see
+    /// `assetpack.rs`), so a shipped build reads the pack and the loose IQMs do
+    /// not need to travel. They stay the source of truth for the build step, and
+    /// remain the fallback here: a checkout that has not run
+    /// `cargo run --example pack_animals` still loads, just from the big files.
     pub fn load(name: &str) -> Result<Model, String> {
+        if let Some(web) = crate::assetpack::shipped_web() {
+            return crate::assetpack::load_web(web, name);
+        }
         let path = format!("{}/assets/animals/{name}.iqm", env!("CARGO_MANIFEST_DIR"));
         let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
         Model::parse(&bytes)
@@ -250,6 +260,40 @@ mod tests {
             let m = Model::load(name).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(m.tris.len() > 1000, "{name} should be a real model");
             assert!(*h > 1.0 && *h < 5.0);
+        }
+    }
+
+    #[test]
+    fn the_pack_and_the_iqm_agree_on_what_a_model_is() {
+        // Model::load now prefers the packed web (assetpack.rs); this holds it
+        // to the file it replaced. Not byte equality — quantisation is the whole
+        // point — but the geometry a renderer would see: same triangle budget,
+        // same extents, same footprint after normalize().
+        for name in ["cat", "white_tiger", "puma"] {
+            let packed = Model::load(name).expect(name);
+            let path = format!("{}/assets/animals/{name}.iqm", env!("CARGO_MANIFEST_DIR"));
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let src = Model::parse(&bytes).expect("iqm parses");
+            // triangles: the pack drops exact duplicates and weld slivers only
+            let ratio = packed.tris.len() as f32 / src.tris.len() as f32;
+            assert!(ratio > 0.84 && ratio <= 1.0, "{name}: tri ratio {ratio}");
+            let (plo, phi) = packed.bbox();
+            let (slo, shi) = src.bbox();
+            let span = (0..3).map(|d| shi[d] - slo[d]).fold(0.0f32, f32::max);
+            for d in 0..3 {
+                assert!((plo[d] - slo[d]).abs() < span * 1e-3, "{name}: low corner moved");
+                assert!((phi[d] - shi[d]).abs() < span * 1e-3, "{name}: high corner moved");
+            }
+            // and after the normalize every call site uses, they land together
+            let (mut a, mut b) = (packed, src);
+            a.normalize(3.0);
+            b.normalize(3.0);
+            let (alo, ahi) = a.bbox();
+            let (blo, bhi) = b.bbox();
+            for d in 0..3 {
+                assert!((alo[d] - blo[d]).abs() < 0.01, "{name}: normalized low {d}");
+                assert!((ahi[d] - bhi[d]).abs() < 0.01, "{name}: normalized high {d}");
+            }
         }
     }
 

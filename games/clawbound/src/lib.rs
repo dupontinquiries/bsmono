@@ -25,6 +25,7 @@ pub mod capture;
 pub mod ecology;
 pub mod hunter;
 pub mod iqm;
+pub mod assetpack;
 pub mod junglemap;
 pub mod mapeval;
 pub mod menu;

@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 math-kit = { path = "../../shared/math-kit" }
 netcode = { path = "../shared/netcode" }
+# The parts-web reader/packer, shared with blackstar. `zstd` pulls ruzstd —
+# pure Rust, no build script, no cc: this crate cross-compiles to ARM handsets.
+bsweb = { path = "../shared/bsweb", features = ["zstd"] }
 wgpu = "22"
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
