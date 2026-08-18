@@ -189,6 +189,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_locator_is_actually_drawn() {
+        // shows_locator() is true in both modes and this module was ported
+        // with the escape chord, the reclaimed-rows maths and its tests — and
+        // nothing ever called locator_ui, so voice mode had no indication of
+        // which tab you were in. Exactly the disorientation the module says it
+        // exists to prevent.
+        let bin = include_str!("bin/voiceterm_egui.rs");
+        assert!(bin.contains("chrome_mode::locator_ui("), "the locator is not drawn");
+        assert!(bin.contains("self.chrome.escaped()"),
+                "the chrome-restored notice cannot appear");
+    }
+
+    #[test]
+    fn the_locator_survives_the_mode_that_hides_everything_else() {
+        // Voice mode removes the tab strip and the buttons. If the locator
+        // went with them the user would have no place-marker at all, which is
+        // the whole argument for it costing fourteen points.
+        let mut c = Chrome::default();
+        c.toggle();
+        assert!(!c.mode().shows_tab_strip());
+        assert!(!c.mode().shows_buttons());
+        assert!(c.mode().shows_locator(), "voice mode with no locator is a room with no map");
+        assert!(!c.locator(0, 3, "build", 1).is_empty());
+    }
+
+    #[test]
     fn touch_is_the_default_because_a_new_user_has_not_set_voice_up() {
         assert_eq!(ChromeMode::default(), ChromeMode::Touch);
         assert!(ChromeMode::default().shows_tab_strip());

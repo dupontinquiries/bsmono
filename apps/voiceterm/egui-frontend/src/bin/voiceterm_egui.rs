@@ -1298,6 +1298,28 @@ impl eframe::App for VoicetermApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // THE LOCATOR. shows_locator() returns true in BOTH modes and its
+            // comment says why: it "is what stops voice mode from being
+            // disorienting; removing it would save fourteen points and cost
+            // the user their place". In voice mode the sidebar and tab strip
+            // are gone, so without this there is nothing on screen saying
+            // which tab you are in.
+            //
+            // It was ported with the escape chord, the reclaimed-rows maths
+            // and its own tests, and never drawn.
+            {
+                let title = self.workspace.tabs.get(self.workspace.active)
+                    .map(|t| t.title.clone()).unwrap_or_default();
+                let text = self.chrome.locator(
+                    self.workspace.active,
+                    self.workspace.tabs.len(),
+                    &title,
+                    self.workspace.active_pane_ids().len(),
+                );
+                voiceterm_egui::chrome_mode::locator_ui(
+                    ui, &text, self.chrome.escaped(), &self.colors);
+            }
+
             // SWIPE BETWEEN TABS. The surface is the whole central area, and
             // at_limit is false because the workspace wraps — there is no edge
             // to bounce off, so the barrier never needs painting here.
