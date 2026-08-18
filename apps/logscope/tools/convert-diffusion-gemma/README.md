@@ -64,7 +64,12 @@ tensors are skipped — text pathway only.
    `down` rows are 704 wide — not a multiple of the 256-weight IQ1_S block — so
    a real "IQ1_S" file is necessarily a per-tensor mix; the engine's loader and
    preflight already price mixed files per tensor.
-4. **Recognition tier.** The engine loads the header, validates the shape, and
-   names its forward gaps (`--gate-gemmadiff <file>` prints them). Nothing runs
-   a DiffusionGemma forward yet; `archcfg` keeps `supported: false` until a
-   real checkpoint passes a gate on hardware.
+4. **Engine forward.** A CPU reference forward now exists (`gemmadiffcpu.rs`):
+   `--gate-gemmadiff <file>` loads an f32/f16 GGUF through it, checks causality
+   on the file's own weights and denoises a block end to end (encode → denoise
+   → commit → encode). The ENGINE forward — kernels, per-layer-head-dim KV
+   layout, the app path — is still the eight-gap report, and `archcfg` keeps
+   `supported: false` until a real checkpoint passes a gate on hardware. The
+   `--selfcheck` fixture also carries `__fixture.iq1s_probe`, a pre-packed
+   IQ1_S tensor the gate uses to pin the native-pricing and row-slice pathway
+   against real file bytes; real conversions never emit it.

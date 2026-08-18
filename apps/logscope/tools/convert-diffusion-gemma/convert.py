@@ -159,6 +159,11 @@ def write_metadata(w, cfg: dict, mask_id: int):
     u32(f"{p}.attention.sliding_window", t["sliding_window"])
     u32(f"{p}.attention.sliding_window_pattern", period)
     f32(f"{p}.attention.layer_norm_rms_epsilon", t["rms_norm_eps"])
+    # gemma4.cpp: hparams.f_attention_scale = 1.0 — attention scores are UNSCALED (QK-norm makes
+    # the 1/sqrt(head_dim) factor redundant). Written explicitly because the engine's generic
+    # loader applies the kernels' 1/sqrt(head_dim) default when this key is absent, and a wrongly
+    # scaled softmax is a quietly-worse model, never a visibly broken one.
+    f32(f"{p}.attention.scale", 1.0)
     rp = t["rope_parameters"]
     f32(f"{p}.rope.freq_base", rp["full_attention"]["rope_theta"])
     f32(f"{p}.rope.freq_base_swa", rp["sliding_attention"]["rope_theta"])
@@ -236,7 +241,8 @@ def copy_tokenizer(w, donor: Path, gguf):
 # ── conversion core (dict in → gguf out, so --selfcheck needs no shards) ────────────────────────
 
 def convert(tensors: dict, cfg: dict, mask_id: int, out: Path, gguf, dtype: str,
-            tokenizer_donor=None):
+            tokenizer_donor=None,
+            extra_raw: list | None = None):
     t = cfg["text_config"]
     d, ff_exp = t["hidden_size"], t["moe_intermediate_size"]
     w = gguf.GGUFWriter(str(out), "diffusion_gemma")
@@ -261,6 +267,15 @@ def convert(tensors: dict, cfg: dict, mask_id: int, out: Path, gguf, dtype: str,
         w.add_tensor(name, np.ascontiguousarray(a))
         emitted.add(name)
 
+    # fixture-only raw tensors (--selfcheck): pre-packed quantized bytes the engine-side gate
+    # probes — never emitted for a real conversion, and named __fixture.* so nothing mistakes
+    # them for model weights
+    for (rname, rbytes, rshape, rdtype) in (extra_raw or []):
+        # gguf-py derives a quantized tensor's LOGICAL shape from the data's BYTE shape
+        # (rows, bytes_per_row) — hand it exactly that and let it compute k itself
+        w.add_tensor(rname, np.frombuffer(rbytes, dtype=np.uint8).reshape(rshape[0], -1),
+                     raw_dtype=rdtype)
+
     # the census invariants the engine's gate re-checks — fail HERE, near the cause
     layers = t["num_hidden_layers"]
     lt = t["layer_types"]
@@ -277,7 +292,7 @@ def convert(tensors: dict, cfg: dict, mask_id: int, out: Path, gguf, dtype: str,
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    print(f"wrote {out} ({len(emitted)} tensors, {dtype} projections)")
+    print(f"wrote {out} ({len(emitted) + len(extra_raw or [])} tensors, {dtype} projections)")
 
 
 def load_hf(hf_dir: Path):
@@ -354,7 +369,24 @@ def selfcheck(gguf, out: Path):
     # a vision tensor that must be SKIPPED, not refused
     ten["model.encoder.vision_tower.std_bias"] = rng.standard_normal(3)
 
-    convert(ten, cfg, mask_id=4, out=out, gguf=gguf, dtype="f32")
+    # IQ1_S probe: 4 rows of k=512 (two 50-byte blocks per row). Any byte pattern decodes — the
+    # grid is total over its 11-bit index space — but the block's leading f16 scale is set SANE
+    # (0.5) so the gate's finite-dot check means "decoded", not "got lucky with random exponents".
+    def iq1s_probe(n=4, k=512):
+        blocks_per_row = k // 256
+        state = 0x9e3779b97f4a7c15
+        def nxt():
+            nonlocal state
+            state = (state * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+            return (state >> 33) & 0xFF
+        out_b = bytearray()
+        for _ in range(n * blocks_per_row):
+            out_b += np.float16(0.5).tobytes()          # sane scale
+            out_b += bytes(nxt() for _ in range(48))    # qs + qh, deterministic
+        return bytes(out_b)
+    probe = iq1s_probe()
+    convert(ten, cfg, mask_id=4, out=out, gguf=gguf, dtype="f32",
+            extra_raw=[("__fixture.iq1s_probe", probe, (4, 512), gguf.GGMLQuantizationType.IQ1_S)])
 
     r = gguf.GGUFReader(str(out))
     kv = {f.name: f.contents() for f in r.fields.values()}
@@ -365,6 +397,7 @@ def selfcheck(gguf, out: Path):
     assert kv["diffusion_gemma.rope.dimension_count"] == 2, "0.25 × global_head_dim"
     assert kv["diffusion.shift_logits"] == "false" and kv["tokenizer.ggml.mask_token_id"] == 4
     assert "blk.0.attn_v.weight" in names and "blk.1.attn_v.weight" not in names, "V-from-K census"
+    assert "__fixture.iq1s_probe" in names, "the IQ1_S probe must survive the round-trip"
     assert {"self_cond.pre_norm.weight", "blk.1.layer_output_scale_enc.weight",
             "blk.0.ffn_gate_inp.scale", "blk.0.ffn_down_exps.scale"} <= names
     gu = next(t for t in r.tensors if t.name == "blk.0.ffn_gate_up_exps.weight")

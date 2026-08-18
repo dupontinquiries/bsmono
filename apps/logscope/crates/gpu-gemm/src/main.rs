@@ -2779,10 +2779,89 @@ fn main() {
         ck("mask token id present (tokenizer.ggml.mask_token_id)", gpu_kernels::gguf_mask_token_id(&g).is_some());
         ck("diffusion.shift_logits = false (in-place lineage)", g.get_str("diffusion.shift_logits") == Some("false"));
         let gaps = gpu_kernels::archfeat::gap_report(&arch, g.get_u32("diffusion_gemma.expert_count").unwrap_or(0));
-        println!("  declared gaps ({} — a forward needs each):", gaps.len());
+        println!("  declared gaps ({} — the ENGINE forward needs each):", gaps.len());
         for l in &gaps { println!("    - {l}"); }
         ck("gaps are declared, not hidden", !gaps.is_empty());
-        println!("gate-gemmadiff: {}", if ok { "header checks \u{2713} (recognition + plan; NOT a forward)" } else { "FAIL \u{2717}" });
+        // ── CPU reference forward: the fixture actually RUNS, end to end ─────────────────────
+        // Weights::load reads f32/f16 files (fixture and unquantized real drops); a quantized
+        // file skips this section by design and the header verdict above still stands.
+        let all_plain = g.tensors.iter().all(|t| matches!(t.ggml_type, 0 | 1)
+            || t.name.starts_with("__fixture."));
+        if all_plain {
+            match gpu_kernels::gemmadiffcpu::Weights::load(&g, &bytes) {
+                Err(e) => ck(&format!("CPU weights load: {e}"), false),
+                Ok(w) => {
+                    ck("CPU weights load (every tensor, dims checked by name)", true);
+                    use gpu_kernels::gemmadiffcpu::{forward, KvCache};
+                    use gpu_kernels::gemmadiff::{blockrefine, Pass};
+                    // causality on FILE weights, both passes — the same pins the unit tests hold
+                    // on synthetic weights, now against what the converter wrote
+                    let run = |toks: &[u32], pass| {
+                        let mut c = KvCache::new(&w.shape);
+                        forward(&w, &mut c, toks, 0, pass)
+                    };
+                    let (a, b) = ([1u32, 2, 3], [1u32, 2, 7]);
+                    let causal = match (run(&a, Pass::Encode), run(&b, Pass::Encode)) {
+                        (Ok(ea), Ok(eb)) => ea[0] == eb[0] && ea[2] != eb[2],
+                        _ => false,
+                    };
+                    ck("encode is causal on the file's weights", causal);
+                    let bidir = match (run(&a, Pass::Denoise), run(&b, Pass::Denoise)) {
+                        (Ok(da), Ok(db)) => da[0] != db[0],
+                        _ => false,
+                    };
+                    ck("denoise is bidirectional on the file's weights", bidir);
+                    let sched = blockrefine::Schedule { max_steps: 8, ..blockrefine::Schedule::shipped() };
+                    match gpu_kernels::gemmadiffcpu::denoise_canvas(&w, &sched, &[1, 2, 3], w.shape.block_len as usize) {
+                        Err(e) => ck(&format!("block-AR denoise: {e}"), false),
+                        Ok(toks) => {
+                            ck("block-AR denoise: encode → denoise → commit → encode, one block",
+                               toks.len() == w.shape.block_len as usize
+                                   && toks.iter().all(|t| *t != w.mask_id && (*t as usize) < w.vocab));
+                            println!("    committed: {toks:?}");
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("  [–] CPU forward skipped: file carries quantized tensors (header verdict only)");
+        }
+        // ── IQ1_S pathway probe (fixture-only tensor written by convert.py --selfcheck) ──────
+        // The pathway the estimator and the MoE slicer stand on, exercised against FILE bytes:
+        // native pricing counts exactly the probe's bytes, the kill-switch flips it to zero, and
+        // per-row slices of the mmapped bytes dot bit-identically to the whole-tensor offsets.
+        if let Some(t) = g.tensor("__fixture.iq1s_probe") {
+            ck("probe is ggml type 19 (IQ1_S)", t.ggml_type == 19);
+            let (k, n) = (t.dims[0] as usize, t.dims[1] as usize);
+            let nbytes = gpu_kernels::gguf::type_nbytes(19, n * k).unwrap_or(0);
+            let est = gpu_kernels::store::estimate_resident_for_load(&g);
+            ck("preflight prices the probe natively, to the byte",
+               est.native_view_bytes == nbytes as u64);
+            std::env::set_var("LOGSCOPE_NO_IQ1_NATIVE", "1");
+            let est_off = gpu_kernels::store::estimate_resident_for_load(&g);
+            std::env::remove_var("LOGSCOPE_NO_IQ1_NATIVE");
+            ck("LOGSCOPE_NO_IQ1_NATIVE flips the same tensor out of native pricing",
+               est_off.native_view_bytes == 0 && est_off.plan_int8() > est.plan_int8());
+            let rb = gpu_kernels::Iq1Weight::row_bytes(k);
+            ck("row_bytes accepts the probe width", rb.is_some());
+            if let Some(rb) = rb {
+                // two INDEPENDENT size computations must agree on this tensor: gguf::type_nbytes
+                // over the element count vs row_bytes × rows — the disagreement class that made
+                // the resident path read shifted fields
+                ck("row_bytes × rows == type_nbytes (independent size paths agree)", n * rb == nbytes);
+                let off = (g.data_offset + t.offset) as usize;
+                let data = &bytes[off..off + nbytes];
+                let act: Vec<f32> = (0..k).map(|i| (i as f32 * 0.37).sin()).collect();
+                let rows_decode = (0..n).all(|r| {
+                    gpu_kernels::cpumatvec::dot_iq1_s(&data[r * rb..(r + 1) * rb], &act)
+                        .map(|f| f.is_finite()).unwrap_or(false)
+                });
+                ck("every per-row slice of the FILE bytes decodes finitely via dot_iq1_s", rows_decode);
+            }
+        }
+        println!("gate-gemmadiff: {}", if ok {
+            "\u{2713} header + CPU reference forward (the ENGINE forward is still the declared gaps)"
+        } else { "FAIL \u{2717}" });
         if !ok { std::process::exit(1); }
         return;
     }
