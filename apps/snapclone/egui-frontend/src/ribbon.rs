@@ -202,6 +202,38 @@ pub fn ribbon_ui(ui: &mut egui::Ui, r: &mut SmartRibbon,
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_ribbon_is_drawn_and_its_events_are_applied() {
+        // Everything but the draw was already here: refresh_ribbon recomputed
+        // which actions were pressable every frame, set_current kept the
+        // segment in step with the nav, and apply_ribbon carried out both
+        // actions — maintaining a bar nobody saw.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("ribbon::ribbon_ui("), "the ribbon is not drawn");
+        assert!(lib.contains("self.apply_ribbon(ev)"), "its events go nowhere");
+    }
+
+    #[test]
+    fn an_action_belongs_to_its_tab_and_does_not_survive_a_switch() {
+        // The failure the module says it prevents: "clear" from the Pending
+        // tab pressed while looking at All. Switching tabs must swap the whole
+        // set, not merge it.
+        let mut r = SmartRibbon::new(&["All", "Unread", "Sent"]);
+        r.set_tab_actions(1, vec![Action::new("read_all", "check", "Mark all read")]);
+        r.set_tab_actions(2, vec![Action::new("retry_failed", "refresh", "Retry failed")]);
+
+        r.set_current(1);
+        let on_unread: Vec<&str> = r.visible_actions().iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(on_unread, ["read_all"]);
+
+        r.set_current(2);
+        let on_sent: Vec<&str> = r.visible_actions().iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(on_sent, ["retry_failed"], "the previous tab's action survived");
+
+        r.set_current(0);
+        assert!(r.visible_actions().is_empty(), "All has no actions and must show none");
+    }
+
     fn ribbon() -> SmartRibbon {
         let mut r = SmartRibbon::new(&["All", "Unread", "Sent"]);
         r.set_tab_actions(1, vec![Action::new("read", "check", "Mark all read")]);

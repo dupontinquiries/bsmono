@@ -3203,8 +3203,31 @@ impl Snapclone {
             }
         }
         // The ribbon sits at the BOTTOM of the inbox, where a thumb reaches it.
+        //
+        // Everything but the draw was here: refresh_ribbon recomputes which
+        // actions are pressable each frame, set_current keeps the segment in
+        // step with the nav, apply_ribbon carries out both actions — and
+        // ribbon_ui was never called, so all of that maintained a bar nobody
+        // saw. Drawn at the END of the page, because bottom-docked is the
+        // whole argument for it existing beside SegmentedTabStrip: the actions
+        // you press most should be under your thumb.
         self.refresh_ribbon();
         self.ribbon.set_current(self.bar.sub[1]);
+
+        // Drawn BEFORE the branch below, not after: the Sent tab returns
+        // early, so a single draw at the end of the function would give the
+        // ribbon to two tabs out of three — and the tab it would skip is the
+        // one whose action ("Retry failed") is the reason the ribbon carries
+        // actions at all.
+        if let Some(ev) = crate::ribbon::ribbon_ui(ui, &mut self.ribbon, c) {
+            self.apply_ribbon(ev);
+            // The event may have changed the sub-tab, and the rest of this
+            // function reads it — so re-read rather than render one frame of
+            // the tab the user just left.
+            self.ribbon.set_current(self.bar.sub[1]);
+        }
+        ui.separator();
+
         // The nav has declared an Inbox "Sent" sub-tab since the shell was
         // ported, with nothing behind it. That is the outbox.
         if self.bar.sub[1] == 2 {
