@@ -21,6 +21,12 @@ pub mod prefetch;
 pub mod mladims;
 pub mod rolequant;
 pub mod ragged;
+pub mod steer;
+pub mod probe;
+pub mod tourney;
+pub mod reap;
+pub mod round;
+pub mod recover;
 pub mod specverify;
 pub mod batchplan;
 pub mod q2demote;
@@ -12877,6 +12883,103 @@ pub struct SessionQ8 {
     pub done: bool,
 }
 
+/// Which layers and positions a capture pass should read the residual out at.
+///
+/// Positions are restricted because capturing every token multiplies the readback cost by the
+/// generation length for no gain: a probe wants ONE row per branch at a comparable point, and
+/// mixing positions makes the fitted direction partly a position detector.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureSpec {
+    layers: Vec<usize>,
+    /// Absolute positions to capture at. Empty means every position, which is almost never wanted.
+    positions: Vec<usize>,
+}
+
+impl CaptureSpec {
+    /// Capture at `layers`, only at `pos`. The single-row-per-branch case, which is the one
+    /// `probe::LayerSweep` is built for.
+    pub fn at(layers: impl IntoIterator<Item = usize>, pos: usize) -> Self {
+        let mut layers: Vec<usize> = layers.into_iter().collect();
+        layers.sort_unstable(); layers.dedup();
+        CaptureSpec { layers, positions: vec![pos] }
+    }
+    pub fn layers(&self) -> &[usize] { &self.layers }
+    pub fn is_empty(&self) -> bool { self.layers.is_empty() }
+    /// Readbacks one full generation of `tokens` tokens costs at this spec.
+    pub fn downloads(&self, tokens: usize) -> usize {
+        let p = if self.positions.is_empty() { tokens } else { self.positions.len().min(tokens) };
+        self.layers.len() * p
+    }
+    fn wants(&self, layer: usize) -> bool { self.layers.binary_search(&layer).is_ok() }
+    fn wants_pos(&self, pos: usize) -> bool {
+        self.positions.is_empty() || self.positions.contains(&pos)
+    }
+}
+
+/// Residual rows read out during a capture pass.
+#[derive(Clone, Debug, Default)]
+pub struct Captured {
+    rows: Vec<(usize, usize, Vec<f32>)>,
+}
+
+impl Captured {
+    pub fn new() -> Self { Captured::default() }
+    pub fn len(&self) -> usize { self.rows.len() }
+    pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+    fn push(&mut self, layer: usize, pos: usize, h: Vec<f32>) { self.rows.push((layer, pos, h)); }
+    /// Every row captured at `layer`, in capture order.
+    pub fn at_layer(&self, layer: usize) -> impl Iterator<Item = (usize, &[f32])> {
+        self.rows.iter().filter(move |(l, _, _)| *l == layer).map(|(_, p, h)| (*p, h.as_slice()))
+    }
+    /// Feed one branch's capture into a sweep, tagged with the fork it descended from and the
+    /// outcome it reached.
+    ///
+    /// `fork` is not optional and not cosmetic: `probe` cross-validates by fork, because siblings of
+    /// one fork are not independent observations and a probe validated across them measures nothing
+    /// that transfers. Passing a distinct id per branch would defeat that silently, so pass the
+    /// FORK's id, not the branch's.
+    ///
+    /// Returns how many rows landed. Zero means the branch never reached the captured layer or
+    /// position, which is a scheduling bug worth noticing rather than a branch with no opinion.
+    pub fn feed(&self, sweep: &mut crate::probe::LayerSweep, fork: usize, ok: bool) -> usize {
+        let mut n = 0;
+        for (_, h) in self.at_layer(sweep.layer()) { if sweep.push(fork, h, ok) { n += 1; } }
+        n
+    }
+}
+
+/// Residual-stream steering biases, uploaded once for a whole round.
+///
+/// `steer::Plan` decides WHAT to add; this decides how often it reaches the GPU. Gain is a
+/// function of position, so a round has at most `ramp + 1` distinct non-zero levels per layer
+/// (exactly one when the ramp is off) — the bank enumerates the round's positions up front,
+/// dedupes by level, and uploads one tensor each. Doing it per token instead would put an
+/// `upload` on the decode hot path, which is the one thing this mechanism cannot afford to cost.
+pub struct SteerBank {
+    plan: crate::steer::Plan,
+    /// (layer, gain bit pattern, the vector already scaled by that gain).
+    biases: Vec<(usize, u32, Tensor)>,
+}
+
+impl SteerBank {
+    /// The unsteered bank. `decode_step` runs through the same code path with this, so the
+    /// unsteered path is not a separate implementation that could drift from the steered one —
+    /// it IS the steered one at zero gain, which is what makes the no-op gate meaningful.
+    pub fn none() -> Self {
+        SteerBank { plan: crate::steer::Plan::default(), biases: Vec::new() }
+    }
+    pub fn is_empty(&self) -> bool { self.biases.is_empty() }
+    pub fn uploads(&self) -> usize { self.biases.len() }
+
+    fn at(&self, layer: usize, pos: usize) -> Option<&Tensor> {
+        if self.biases.is_empty() { return None; }
+        let g = self.plan.gain_at(pos);
+        if g == 0.0 { return None; }
+        let bits = g.to_bits();
+        self.biases.iter().find(|(l, b, _)| *l == layer && *b == bits).map(|(_, _, t)| t)
+    }
+}
+
 /// One independent generation session: its own KV cache, stream position and RNG,
 /// sharing the `Model`'s resident weights. Many `Session`s run concurrently against
 /// a single resident `Model` — the per-session GPU cost is just the KV cache.
@@ -14632,6 +14735,52 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     pub fn decode_step(&self, m: &Model, c: &KvCache, token: u32, pos: usize) -> Vec<f32> {
+        self.decode_step_steered(m, c, token, pos, &SteerBank::none())
+    }
+
+    /// Upload every distinct (layer, gain) bias this plan needs over `positions`.
+    pub fn steer_bank(&self, plan: &crate::steer::Plan, positions: std::ops::Range<usize>) -> SteerBank {
+        let mut biases: Vec<(usize, u32, Tensor)> = Vec::new();
+        for layer in plan.layers() {
+            for pos in positions.clone() {
+                let g = plan.gain_at(pos);
+                if g == 0.0 { continue; }
+                let bits = g.to_bits();
+                if biases.iter().any(|(l, b, _)| *l == layer && *b == bits) { continue; }
+                if let Some(v) = plan.bias_at(layer, pos) {
+                    let t = self.upload(&v, 1, v.len());
+                    biases.push((layer, bits, t));
+                }
+            }
+        }
+        SteerBank { plan: plan.clone(), biases }
+    }
+
+    /// `decode_step` with a residual-stream bias added after each steered block.
+    ///
+    /// One `add_bias_t` per steered layer per token, and only where the schedule says so — an empty
+    /// bank adds a `Vec::is_empty()` check to the loop and nothing else.
+    pub fn decode_step_steered(&self, m: &Model, c: &KvCache, token: u32, pos: usize, bank: &SteerBank) -> Vec<f32> {
+        self.decode_step_full(m, c, token, pos, bank, None)
+    }
+
+    /// One decode step with optional steering AND optional residual capture.
+    ///
+    /// Capture is what feeds `probe::LayerSweep` — until this exists, every direction in `probe`,
+    /// `steer` and `tourney` is fitted to synthetic data. It is a `download` per requested layer, so
+    /// it belongs on a capture pass and not on ordinary decode: `PLATFORM_VALIDATION` records what
+    /// mid-decode readbacks did to frame batching before `download()` learned to reopen the frame
+    /// (~23 stray submits per layer on Scout), and even fixed it is a submit per layer per token.
+    /// That cost is the whole reason `tourney` exists — probe four layers, not thirty-two.
+    ///
+    /// **Capture happens BEFORE this layer's bias is added.** Reversing that is the one ordering
+    /// mistake here that manufactures results rather than losing them: round N+1's probe would be
+    /// fitting the direction round N injected, and the tournament would rediscover its own steering
+    /// vector with a beautiful held-out AUC. `capture_precedes_injection` pins it.
+    pub fn decode_step_full(
+        &self, m: &Model, c: &KvCache, token: u32, pos: usize,
+        bank: &SteerBank, mut cap: Option<(&CaptureSpec, &mut Captured)>,
+    ) -> Vec<f32> {
         self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
@@ -14652,6 +14801,15 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
                 _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
             };
+            // Capture first: this layer's UNSTEERED output is what a probe may legitimately learn
+            // from. See the ordering note on this function.
+            if let Some((spec, out)) = cap.as_mut() {
+                if spec.wants(li) && spec.wants_pos(pos) { out.push(li, pos, self.download(&x)); }
+            }
+            // The injection. AFTER the block, so the bias enters the residual stream the next block
+            // reads — and after this layer's K/V has already been written, so a steered position
+            // steers what follows rather than retroactively editing its own cache row.
+            if let Some(b) = bank.at(li, pos) { x = self.add_bias_t(&x, b); }
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
