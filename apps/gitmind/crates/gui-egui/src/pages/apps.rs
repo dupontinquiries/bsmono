@@ -48,6 +48,12 @@ pub struct State {
     /// not undoable — the bytes are content-addressed but the pin is the only
     /// record that this app ever had this version — so it asks first.
     pub confirm: Option<(String, String)>,
+    /// The kit dialog, built when a removal is asked for.
+    ///
+    /// Held rather than constructed per frame because it owns the countdown:
+    /// rebuilding it every frame would restart the timeout forever and the
+    /// dialog would never resolve on its own.
+    pub dialog: Option<uikit_egui::confirm_dialog::ConfirmDialog>,
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
@@ -149,17 +155,29 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
         });
 
-    // Confirmation. Asked because removing a pin is not undoable: the bytes are
-    // content-addressed, but the pin is the only record that this app ever had
-    // this version, and rebuilding it needs the commit it came from.
+    // Confirmation, through the KIT rather than an inline row. Asked because
+    // removing a pin is not undoable: the bytes are content-addressed, but the
+    // pin is the only record that this app ever had this version, and
+    // rebuilding it needs the commit it came from.
+    //
+    // The inline version was a label and two buttons in the page flow. The
+    // kit's is a modal with a dimmed backdrop, cancel on click-outside, and a
+    // timeout that resolves to the SAFE outcome — which for a destructive
+    // action is the difference between a mistap and a lost pin. Three ports
+    // used confirm_dialog and seven with destructive actions did not; this is
+    // one of the seven.
     if let Some((name, label)) = app.apps.confirm.clone() {
-        ui.add_space(6.0);
-        ui.separator();
         let what = if label.is_empty() { format!("{name} and every version") }
                    else { format!("{name}@{label}") };
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("Remove {what}?")).strong());
-            if ui.button("remove").clicked() {
+        let dialog = app.apps.dialog.get_or_insert_with(|| {
+            uikit_egui::confirm_dialog::ConfirmDialog::new(
+                "Remove pin",
+                format!("{what} — the pin is the only record of this version"),
+                "remove",
+            )
+        });
+        match dialog.show(ui.ctx()) {
+            uikit_egui::confirm_dialog::Outcome::Confirmed => {
                 let r = if label.is_empty() {
                     gitmind_core::binpin::remove_app(&name)
                 } else {
@@ -170,10 +188,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     Err(e) => format!("error: {e}"),
                 };
                 app.apps.confirm = None;
+                app.apps.dialog = None;
                 app.apps.loaded = false;
             }
-            if ui.button("cancel").clicked() { app.apps.confirm = None; }
-        });
+            uikit_egui::confirm_dialog::Outcome::Pending => {}
+            // Cancelled and Discarded both mean "not this": the dialog's third
+            // choice is about unsaved edits, and this page has none to discard.
+            _ => {
+                app.apps.confirm = None;
+                app.apps.dialog = None;
+            }
+        }
     }
 
     if let Some(r) = app.task.take_result() {
@@ -192,6 +217,33 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_goes_through_the_kit_dialog_not_an_inline_row() {
+        // Seven ports have destructive actions and three used confirm_dialog.
+        // The inline version here was a label and two buttons in the page
+        // flow: no dimmed backdrop, no cancel on click-outside, and no
+        // timeout resolving to the safe outcome — which for an undoable
+        // removal is the difference between a mistap and a lost pin.
+        let src = include_str!("apps.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(prod.contains("confirm_dialog::ConfirmDialog::new"),
+                "the kit dialog is not used");
+        assert!(!prod.contains(r#"ui.button("cancel").clicked() { app.apps.confirm = None"#),
+                "the inline confirmation row is back");
+    }
+
+    #[test]
+    fn the_dialog_is_held_rather_than_rebuilt_each_frame() {
+        // It owns the countdown. Constructing it per frame restarts the
+        // timeout forever and it would never resolve on its own — which is
+        // the one behaviour the kit version adds over the inline row.
+        let src = include_str!("apps.rs");
+        assert!(src.contains("app.apps.dialog.get_or_insert_with"),
+                "the dialog is rebuilt every frame");
+        assert!(src.contains("pub dialog: Option<uikit_egui::confirm_dialog::ConfirmDialog>"),
+                "the dialog is not held on the page state");
+    }
 
     #[test]
     fn a_missing_tile_is_the_normal_case_not_an_error() {
