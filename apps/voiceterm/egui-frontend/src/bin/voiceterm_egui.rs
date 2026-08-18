@@ -766,6 +766,11 @@ impl eframe::App for VoicetermApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(self.theme));
+        // ONCE PER FRAME, shared by every panel that needs it. detect reads
+        // the context and asks whether any touch input exists this frame;
+        // calling it per panel is the syscall-storm shape a comment elsewhere
+        // in this file already warns about.
+        let adaptive = uikit_egui::adaptive::Adaptive::detect(ctx);
 
         // CONTEXT-LEVEL WIDGETS, drawn above every panel because that is what
         // they are for: a modal that a panel can cover is not modal, and a
@@ -934,61 +939,74 @@ impl eframe::App for VoicetermApp {
             // and the other was not.
             ui.horizontal(|ui| {
                 ui.label("summaries:");
-                // AMBIENT LIGHT. Reported as a capability, not a dead
-                // control: the module mirrors hover_kit::capability so a
-                // settings page can EXPLAIN a missing sensor instead of
-                // showing a slider that does nothing.
-                {
-                    use voiceterm_egui::iio_light::{Sample, Unit};
-                    match self.light.as_ref() {
-                        Some(s) => {
-                            if let Sample::Value(v) = s.read() { self.light_value = Some(v); }
-                            let unit = match s.unit {
-                                // Counts are RELATIVE — labelling them lux
-                                // would invite comparing two phones' numbers.
-                                Unit::Illuminance => "lux",
-                                Unit::Counts => "counts (relative)",
-                            };
-                            ui.label(match self.light_value {
-                                Some(v) => format!("ambient light: {v:.0} {unit}  [{}]", s.channel),
-                                None => format!("ambient light: sensor found, no reading  [{}]", s.channel),
-                            });
+                // SENSORS, BEHIND A DISCLOSURE. This was fifty-five lines
+                // of capability reporting inline in the bar — two of them
+                // permanent labels saying what the device CANNOT do. A bar
+                // that is always on screen should carry what the operator
+                // acts on; "no sensor features available on this device" is
+                // a settings answer, and I put it here myself two commits
+                // ago while the bar was already too crowded.
+                //
+                // Collapsed by default: the common case is a device whose
+                // sensors do not change, and the answer is worth one tap
+                // when it is worth anything.
+                ui.collapsing("sensors", |ui| {
+                    // AMBIENT LIGHT. Reported as a capability, not a dead
+                    // control: the module mirrors hover_kit::capability so a
+                    // settings page can EXPLAIN a missing sensor instead of
+                    // showing a slider that does nothing.
+                    {
+                        use voiceterm_egui::iio_light::{Sample, Unit};
+                        match self.light.as_ref() {
+                            Some(s) => {
+                                if let Sample::Value(v) = s.read() { self.light_value = Some(v); }
+                                let unit = match s.unit {
+                                    // Counts are RELATIVE — labelling them lux
+                                    // would invite comparing two phones' numbers.
+                                    Unit::Illuminance => "lux",
+                                    Unit::Counts => "counts (relative)",
+                                };
+                                ui.label(match self.light_value {
+                                    Some(v) => format!("ambient light: {v:.0} {unit}  [{}]", s.channel),
+                                    None => format!("ambient light: sensor found, no reading  [{}]", s.channel),
+                                });
+                            }
+                            None => { ui.label("ambient light: no sensor on this device"); }
                         }
-                        None => { ui.label("ambient light: no sensor on this device"); }
-                    }
 
-                    // WHAT THE HARDWARE ALLOWS, from Sensors — which answers
-                    // all three questions and was called by nothing. The block
-                    // above hand-rolls the light half and never asks about
-                    // proximity at all, so half the capability report the
-                    // module exists to give was missing.
-                    //
-                    // can_auto_brightness needs LUX, not counts: light-kit's
-                    // curve is calibrated in lux and raw counts give a
-                    // differently-shaped response, which looks like bad tuning
-                    // rather than bad units. can_detect_cover only needs
-                    // consistency, so counts are fine. Saying which is
-                    // available is the difference between a missing feature
-                    // and a dead control.
-                    let caps = voiceterm_egui::iio_light::Sensors::detect();
-                    let mut have: Vec<&str> = Vec::new();
-                    if caps.can_auto_brightness() { have.push("auto brightness"); }
-                    if caps.can_detect_cover() { have.push("cover detection"); }
-                    if caps.has_proximity { have.push("proximity"); }
-                    ui.label(egui::RichText::new(if have.is_empty() {
-                        "no sensor features available on this device".to_string()
-                    } else {
-                        format!("available: {}", have.join(", "))
-                    }).weak().small());
-                    if caps.has_light && caps.light_is_relative {
-                        // Named rather than silent: the sensor IS there and
-                        // auto brightness still cannot run, which reads as a
-                        // bug unless the reason is given.
-                        ui.label(egui::RichText::new(
-                            "auto brightness needs lux; this sensor reports relative counts")
-                            .weak().small());
+                        // WHAT THE HARDWARE ALLOWS, from Sensors — which answers
+                        // all three questions and was called by nothing. The block
+                        // above hand-rolls the light half and never asks about
+                        // proximity at all, so half the capability report the
+                        // module exists to give was missing.
+                        //
+                        // can_auto_brightness needs LUX, not counts: light-kit's
+                        // curve is calibrated in lux and raw counts give a
+                        // differently-shaped response, which looks like bad tuning
+                        // rather than bad units. can_detect_cover only needs
+                        // consistency, so counts are fine. Saying which is
+                        // available is the difference between a missing feature
+                        // and a dead control.
+                        let caps = voiceterm_egui::iio_light::Sensors::detect();
+                        let mut have: Vec<&str> = Vec::new();
+                        if caps.can_auto_brightness() { have.push("auto brightness"); }
+                        if caps.can_detect_cover() { have.push("cover detection"); }
+                        if caps.has_proximity { have.push("proximity"); }
+                        ui.label(egui::RichText::new(if have.is_empty() {
+                            "no sensor features available on this device".to_string()
+                        } else {
+                            format!("available: {}", have.join(", "))
+                        }).weak().small());
+                        if caps.has_light && caps.light_is_relative {
+                            // Named rather than silent: the sensor IS there and
+                            // auto brightness still cannot run, which reads as a
+                            // bug unless the reason is given.
+                            ui.label(egui::RichText::new(
+                                "auto brightness needs lux; this sensor reports relative counts")
+                                .weak().small());
+                        }
                     }
-                }
+                });
                 for sc in voiceterm_egui::summary_scope::Scope::ALL {
                     if ui.selectable_label(self.summary_scope == sc, sc.label()).clicked() {
                         self.summary_scope = sc;
@@ -1165,8 +1183,17 @@ impl eframe::App for VoicetermApp {
             // where the output is, not in a status bar the user is not looking
             // at while watching a compile.
             voiceterm_egui::detect::progress_ui(ui, &self.progress, &self.colors);
-            if let Some(send) = keycap_bar_ui(ui, TERMINAL_KEYCAPS, &self.colors) {
-                self.app.terminal.feed(send);
+            // KEYCAPS ONLY WHERE THERE IS NO KEYBOARD. Esc, Tab and the arrows
+            // are what a phone cannot otherwise send to a terminal; on a
+            // desktop they duplicate keys already under the operator's hands
+            // and cost a row of the screen to do it.
+            //
+            // adaptive.touch, not width: a small window on a laptop still has
+            // a keyboard, and a large tablet still does not.
+            if adaptive.touch {
+                if let Some(send) = keycap_bar_ui(ui, TERMINAL_KEYCAPS, &self.colors) {
+                    self.app.terminal.feed(send);
+                }
             }
         });
 
@@ -1424,7 +1451,6 @@ impl eframe::App for VoicetermApp {
         // The open width scales with the surface rather than sitting at 132:
         // on a narrow phone that is a third of the screen for a tab list, and
         // on a desktop it is needlessly cramped.
-        let adaptive = uikit_egui::adaptive::Adaptive::detect(ctx);
         let rail_w = if self.rail_open {
             (adaptive.size.0 * 0.28).clamp(120.0, 220.0)
         } else {

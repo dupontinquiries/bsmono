@@ -25,8 +25,12 @@ struct Cam {
 }
 
 impl eframe::App for Cam {
-    fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    // `ui`, not `update`. eframe 0.34 makes `ui` the required method and
+    // deprecates calling CentralPanel::show with a Context from inside a
+    // panel — the compiler asked for exactly this signature, and only this app
+    // still had the old shape, which is why it was the one that did not build.
+    fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui.ctx(), |ui| {
             ui.heading("snapshot-cam");
             ui.label(egui::RichText::new(
                 "photos stay on this device until you send them").weak().small());
