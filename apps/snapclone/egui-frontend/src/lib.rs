@@ -336,6 +336,9 @@ pub struct Snapclone {
     pub sessions: crate::peer_session::Sessions,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
+    /// The page strip. Equal segments, an underline and badges — the ported
+    /// SegmentedTabStrip, replacing a hand-rolled selectable_label row.
+    pub strip: crate::nav_chrome::TabStrip,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
     /// those tabs can actually offer.
     pub ribbon: crate::ribbon::SmartRibbon,
@@ -592,6 +595,7 @@ impl Snapclone {
                     action: "swap_camera".into(), label: "Swap camera".into() },
             ]),
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
+            strip: crate::nav_chrome::TabStrip::new(&PAGES),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
                 // sub-tab table cannot drift apart.
@@ -2213,13 +2217,22 @@ impl Snapclone {
 
         // page tabs on desktop; swipe hint on phone
         if !adaptive.is_compact() && !self.nav.can_go_back() {
-            ui.horizontal(|ui| {
-                for (i, name) in PAGES.iter().enumerate() {
-                    if ui.selectable_label(i == self.nav.page(), *name).clicked() {
-                        self.nav.go_page(i);
-                    }
-                }
-            });
+            // THE PORTED STRIP, not a hand-rolled row. strip_ui gives equal
+            // segments, an underline under the selected one rather than a box
+            // that fights the card borders, and BADGES — which is the part
+            // that mattered: sync_badges has computed an unread count into a
+            // TabBar that has no renderer at all, so the number reached no
+            // screen by any path.
+            //
+            // badge_text's own comment explains the shared cap: "two bars in
+            // one app disagreeing about what a large count looks like is
+            // visible on a single screen". Feeding this one from the same
+            // source is what keeps that true.
+            self.strip.select(self.nav.page());
+            self.strip.set_badge(1, self.inbox.unread_count() as u32);
+            if let Some(i) = crate::nav_chrome::strip_ui(ui, &self.strip, &colors) {
+                self.nav.go_page(i);
+            }
             ui.separator();
         }
 

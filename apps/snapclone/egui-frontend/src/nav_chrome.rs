@@ -258,6 +258,33 @@ pub fn peel_ui(ui: &mut egui::Ui, h: &mut PeelHint, rect: egui::Rect,
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_strip_is_drawn_and_carries_the_unread_badge() {
+        // The page tabs were a hand-rolled selectable_label row: no equal
+        // widths, no underline, and no badges. sync_badges had been computing
+        // an unread count into tab_bar::TabBar — a model with NO RENDERER —
+        // so the number reached no screen by any path.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("nav_chrome::strip_ui("), "the strip is not drawn");
+        assert!(lib.contains("self.strip.set_badge("), "the badge is not fed");
+        assert!(!lib.contains("for (i, name) in PAGES.iter().enumerate()"),
+                "the hand-rolled row is back alongside the strip");
+    }
+
+    #[test]
+    fn a_badge_over_the_cap_reads_the_same_as_everywhere_else() {
+        // badge_text's cap is shared on purpose: "two bars in one app
+        // disagreeing about what a large count looks like is visible on a
+        // single screen".
+        let mut s = TabStrip::new(&["Camera", "Chats", "Peers"]);
+        assert_eq!(s.badge_text(1), None, "zero is not a badge");
+        s.set_badge(1, 5);
+        assert_eq!(s.badge_text(1).as_deref(), Some("5"));
+        s.set_badge(1, 250);
+        assert_eq!(s.badge_text(1), uikit_egui::fmt::badge_count(250, 99),
+                   "the strip must not invent its own overflow text");
+    }
+
     fn strip() -> TabStrip { TabStrip::new(&["All", "Unread", "Sent"]) }
 
     #[test]
