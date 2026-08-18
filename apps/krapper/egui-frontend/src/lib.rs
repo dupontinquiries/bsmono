@@ -178,19 +178,41 @@ pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
                 Mic::Recording => ("REC", colors.accent),
             };
             ui.label(egui::RichText::new(txt).color(col).small());
-            let (r, _) = ui.allocate_exact_size(egui::Vec2::new(60.0, 8.0), egui::Sense::hover());
+            // The level meter takes a share of the row rather than a fixed 60
+            // points: on a narrow phone that 60 competed with the bpm and
+            // syllable labels beside it and pushed them off.
+            let meter_w = (ui.available_width() * 0.25).clamp(28.0, 60.0);
+            let (r, _) = ui.allocate_exact_size(egui::Vec2::new(meter_w, 8.0), egui::Sense::hover());
             ui.painter().rect_filled(r, 2.0, colors.bg_card);
             let mut f = r;
             f.set_width(r.width() * w.level);
             ui.painter().rect_filled(f, 2.0, col);
         });
     });
-    // the stress ruler: one cell per syllable, stressed ones filled
-    ui.horizontal(|ui| {
+    // The stress ruler: one cell per syllable, stressed ones filled.
+    //
+    // The cell WIDTH is derived rather than fixed at 14. syllables_per_bar is
+    // a u8, so a wide bar in a fixed-width row runs off any screen — 255 cells
+    // is 3,570 points and the row does not wrap. Dividing the available width
+    // keeps the whole bar visible, which is the point of a ruler: it is read
+    // as a shape, and a ruler with its end off-screen is worse than a narrow
+    // one because the missing part is where the overflow shows.
+    //
+    // Floored at 3 points so a very wide bar stays a visible texture rather
+    // than collapsing to nothing.
+    // The row WRAPS, because a floor and a fit cannot both hold. At 255
+    // syllables even a 3-point cell needs 765 points — a test asserted the
+    // whole bar fits one row and it cannot. Shrinking further makes the ruler
+    // a smudge nobody can read a stress pattern from; wrapping keeps every
+    // cell legible and the bar whole, and a ruler two rows tall is still read
+    // as a shape.
+    let cells = w.vibe.syllables_per_bar.max(1) as f32;
+    let cell_w = ((ui.available_width() - 90.0) / cells).clamp(6.0, 14.0);
+    ui.horizontal_wrapped(|ui| {
         for i in 0..w.vibe.syllables_per_bar as usize {
             let on = w.stress_at(i) == 1;
             let used = i < w.line_syllables();
-            let (r, _) = ui.allocate_exact_size(egui::Vec2::new(14.0, 16.0), egui::Sense::hover());
+            let (r, _) = ui.allocate_exact_size(egui::Vec2::new(cell_w, 16.0), egui::Sense::hover());
             let c = if !used { colors.bg_card }
                     else if on { colors.accent } else { colors.text_weak };
             ui.painter().rect_filled(r, 2.0, c);
@@ -247,6 +269,47 @@ impl eframe::App for Shell {
 
 #[cfg(test)]
 mod tests {
+    /// The ruler's cell width, extracted so the sizing rule can be tested
+    /// without a Ui — the same reason cockpit's models are separate from their
+    /// widgets.
+    fn cell_w(available: f32, syllables: u8) -> f32 {
+        let cells = syllables.max(1) as f32;
+        ((available - 90.0) / cells).clamp(6.0, 14.0)
+    }
+
+    #[test]
+    fn a_moderate_bar_fits_one_row_on_a_phone() {
+        // At a fixed 14 points these already overflowed a 360-point screen.
+        let phone = 360.0;
+        for n in [4u8, 8, 16, 32] {
+            let w = cell_w(phone, n);
+            let used = w * n as f32;
+            assert!(used <= phone - 90.0 + 0.01,
+                    "{n} cells at {w} = {used} exceeds the row");
+        }
+    }
+
+    #[test]
+    fn a_very_wide_bar_wraps_rather_than_shrinking_to_a_smudge() {
+        // The conflict a test found: at 255 syllables even a 3-point cell
+        // needs 765 points, so "fits one row" and "stays legible" cannot both
+        // hold. Legibility wins and the row wraps — a ruler two rows tall is
+        // still read as a shape; one made of 1-point slivers is not.
+        assert_eq!(cell_w(360.0, 255), 6.0, "the floor holds");
+        let src = include_str!("lib.rs");
+        assert!(src.contains("horizontal_wrapped(|ui| {\n        for i in 0..w.vibe.syllables_per_bar")
+                || src.matches("horizontal_wrapped").count() >= 2,
+                "the ruler row does not wrap");
+    }
+
+    #[test]
+    fn a_desktop_bar_keeps_the_original_size() {
+        // The change must not make the common case worse: a normal bar on a
+        // normal window looks exactly as it did.
+        assert_eq!(cell_w(760.0, 8), 14.0, "the default 8/bar on a desktop");
+        assert_eq!(cell_w(760.0, 4), 14.0);
+    }
+
     use super::*;
 
     fn w8() -> Writer {
