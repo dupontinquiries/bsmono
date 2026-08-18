@@ -180,6 +180,13 @@ pub(crate) mod engine {
         /// and would strip the pool one turn at a time. One slot is all a linear chat needs, and it
         /// touches none of the pool's invariants.
         spec_anchor: Option<(Vec<u32>, gpu_kernels::SpecRun)>,
+        /// Long-horizon watcher. ADVISORY ONLY — it observes the numbers this file already prints and
+        /// says what it would do, and changes nothing.
+        ///
+        /// Deliberately measure-before-mutate. The detector was built from one seventeen-turn log and
+        /// its job is to rewrite the operator's transcript; before it is allowed to do that it should
+        /// be seen firing, or not firing, on real traffic. A wrong compaction is expensive and silent.
+        horizon: std::cell::RefCell<gpu_kernels::horizon::Horizon>,
     }
     impl Engine {
         pub fn load(path: &str) -> Result<Self, String> {
@@ -665,7 +672,8 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 }
                 _ => None,
             };
-            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false, spec_anchor: None })
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false, spec_anchor: None,
+                horizon: std::cell::RefCell::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)) })
         }
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
@@ -697,6 +705,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 // A lane starts with no speculative anchor: the cache is not shareable across lanes
                 // (each holds its own KV) and a lane's first prompt is a different branch anyway.
                 spec_anchor: None,
+                horizon: std::cell::RefCell::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)),
                 eos: self.eos, stop_ids: self.stop_ids.clone(), template: self.template,
                 rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
                 anchors: Vec::new(), kv_cap: 1, pool: None, warm: self.warm,
@@ -1215,6 +1224,42 @@ was evicted)", prompt_ids.len())
                     format!("full prefill (first turn for this model)")
                 },
                 t0.elapsed().as_secs_f32());
+
+            // ── long-horizon watch (advisory) ────────────────────────────────────────────────────
+            // Feeds horizon the same numbers the line above just printed. It changes nothing; it says
+            // what it would change, so the diagnosis can be checked against real traffic before it is
+            // allowed to rewrite anyone's transcript.
+            //
+            // The window is read per turn rather than fixed at construction because the operator can
+            // move the n_ctx slider mid-session, and a watcher advising against a window that is no
+            // longer in force is worse than no watcher.
+            {
+                let mut hz = self.horizon.borrow_mut();
+                if hz.window() != window { *hz = gpu_kernels::horizon::Horizon::new(window, 512, l.max(1)); }
+                hz.observe(gpu_kernels::horizon::Turn {
+                    prompt_len: prompt_ids.len(),
+                    reused: if reuse { l } else { 0 },
+                    prefill_s: t0.elapsed().as_secs_f32(),
+                    emitted: 0, // filled by the next turn's prompt growth; not used by the policy
+                });
+                match hz.advise(prompt_ids.len()) {
+                    gpu_kernels::horizon::Move::Continue => {}
+                    // ctxwin::auto_window already sizes the window from the PROMPT and the device
+                    // budget. horizon adds the axis it cannot see: whether the history is worth
+                    // keeping. So this is phrased as a slider recommendation rather than as a
+                    // competing autotuner — two things sizing the same window from different
+                    // evidence is how they end up fighting.
+                    gpu_kernels::horizon::Move::Grow { to, why } => crate::diag!(
+                        "wgpu-engine: [{}] long-horizon ADVISORY (nothing changed) — this chat would \
+use an n_ctx of {to}; auto_window sizes to the prompt, it cannot see that the history is worth \
+keeping: {why}", self.name),
+                    gpu_kernels::horizon::Move::Compact { keep_prefix, also_grow, why } => crate::diag!(
+                        "wgpu-engine: [{}] long-horizon ADVISORY (nothing changed) — summarise and \
+continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
+                        match also_grow { Some(to) => format!(" and raise the window to {to}"), None => String::new() }),
+                }
+            }
+
             let td = Instant::now();
             // Batch 3: snapshot the engine's dispatch counters so we can report the CPU-bound (setup)
             // vs GPU-bound (sync) split for THIS generation — the data that answers "why is llama.cpp
