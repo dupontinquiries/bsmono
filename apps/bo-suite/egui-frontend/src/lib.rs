@@ -186,6 +186,8 @@ pub fn page(idx: usize, sign: i32, n: usize) -> usize {
 /// Controller state + the swipe gesture + a11y scene.
 pub struct Controller {
     pub view_idx: usize,
+    /// The kit's segmented strip, for the wide layout.
+    strip: uikit_egui::segmented_tabs::TabStrip,
     /// The ported surfaces, held across frames so they keep their state — a
     /// library that forgot its page, or a mixer that forgot its bands, is the
     /// same empty demo by another route.
@@ -318,7 +320,9 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
-        Controller { view_idx: 0, devices, scenes, active_scene: 0,
+        Controller { view_idx: 0,
+            strip: uikit_egui::segmented_tabs::TabStrip::new(&VIEWS),
+            devices, scenes, active_scene: 0,
             breath: uikit_egui::motion::Breath::new(2200.0, 0.35, 1.0),
             queue_open: false,
             transport: Default::default(),
@@ -457,13 +461,15 @@ impl Controller {
         self.a11y.begin_frame();
 
         if !adaptive.is_compact() {
-            ui.horizontal(|ui| {
-                for (i, name) in VIEWS.iter().enumerate() {
-                    if ui.selectable_label(i == self.view_idx, *name).clicked() {
-                        self.view_idx = i;
-                    }
-                }
-            });
+            // The kit's strip on wide, the kit's vertical_tabs on compact —
+            // both shared widgets now, where the wide branch was the last
+            // hand-rolled selectable_label row in this app. That leaves two
+            // navigation widgets rather than three, and the two that remain
+            // are the two the kit provides for the two shapes.
+            self.strip.select(self.view_idx);
+            if let Some(i) = uikit_egui::segmented_tabs::strip_ui(ui, &self.strip, &colors) {
+                self.view_idx = i;
+            }
             ui.separator();
             // The safety toast slides down from the TOP, above everything, and
             // is drawn before the header so it cannot be pushed off by a view
