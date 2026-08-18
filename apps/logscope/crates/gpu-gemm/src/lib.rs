@@ -12989,17 +12989,36 @@ impl SteerBank {
     }
 }
 
+/// What a speculative run leaves behind: the target KV cache it built and how far it filled.
+///
+/// A turn's cache is the next turn's anchor. Returning it is what lets the speculative path take
+/// part in prefix reuse instead of bypassing it.
+#[derive(Default)]
+pub struct SpecRun { pub cache: Option<KvCache>, pub pos: usize }
+
 /// How a speculative run gets the prompt into the target's KV cache.
 ///
 /// Not an internal detail: `PerPosition` costs one full decode step per prompt token, which on a
 /// measured 139 ms/token device is 227 s of time-to-first-token for a 1626-token prompt against
 /// 14.7 s chunked. It is what the correctness gates compare against and it is unusable in a chat.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpecPrefill {
+// No PartialEq/Debug: the Seeded variant holds a &KvCache, and a cache is neither comparable nor
+// printable. Nothing needs to compare prefill strategies, and deriving it would have forced those
+// traits onto every tensor in the cache to satisfy a convenience.
+#[derive(Clone, Copy)]
+pub enum SpecPrefill<'a> {
     /// One `decode_step` per prompt token. Bit-identical to `generate_kv`; O(prompt) decode steps.
     PerPosition,
     /// Batched prefill at this chunk size — the same call ordinary streaming makes.
     Chunked(usize),
+    /// Copy `len` rows of KV from `src`, then batch-prefill only the divergent suffix.
+    ///
+    /// The same two steps ordinary streaming takes on a prefix-tree hit, and the reason speculation
+    /// is currently a NET LOSS on any turn after the first. Measured on the operator's run: a
+    /// 1626-token prompt reused 97% of its prefill at 1.12 s, where a fresh chunked prefill costs
+    /// 14.7 s. Against 39 output tokens that is 8.2 tok/s with reuse and 2.1 without — and ordinary
+    /// non-speculative streaming, which reuses, gets 6.0. The drafter's 1.49x cannot pay for a
+    /// thrown-away prefix cache.
+    Seeded { src: &'a KvCache, len: usize },
 }
 
 /// One independent generation session: its own KV cache, stream position and RNG,
@@ -15587,7 +15606,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// bench can report acceptance rate and effective tokens-per-target-forward.
     /// Speculative decoding with a MODEL as the drafter. Unchanged entry point.
     pub fn speculative_generate_stats(&self, target: &Model, draft: &Model, prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
-        self.spec_core(target, Some(draft), None, prompt, n_new, k, SpecPrefill::PerPosition, st)
+        self.spec_core(target, Some(draft), None, prompt, n_new, k, SpecPrefill::PerPosition, st, None)
     }
 
     /// Speculative decoding with NO second checkpoint: any `Drafter` proposes, the same verifier
@@ -15598,7 +15617,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// of accept/reject to add a drafter would have put that proof out of date immediately.
     pub fn speculative_generate_drafter(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
         prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
-        self.spec_core(target, None, Some(drafter), prompt, n_new, k, SpecPrefill::PerPosition, st)
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, SpecPrefill::PerPosition, st, None)
     }
 
     /// As `speculative_generate_drafter`, choosing how the prompt is prefilled.
@@ -15610,13 +15629,21 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// hits. Nobody enabling speculation ever reaches the point of finding out whether the
     /// acceptance rate is any good.
     pub fn speculative_generate_drafter_with(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
-        prompt: &[u32], n_new: usize, k: usize, prefill: SpecPrefill, st: &mut SpecStats) -> Vec<u32> {
-        self.spec_core(target, None, Some(drafter), prompt, n_new, k, prefill, st)
+        prompt: &[u32], n_new: usize, k: usize, prefill: SpecPrefill<'_>, st: &mut SpecStats) -> Vec<u32> {
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, prefill, st, None)
+    }
+
+    /// As `speculative_generate_drafter_with`, also returning the cache the run built so the caller
+    /// can anchor the next turn from it.
+    pub fn speculative_generate_drafter_run(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
+        prompt: &[u32], n_new: usize, k: usize, prefill: SpecPrefill<'_>, st: &mut SpecStats,
+        run: &mut SpecRun) -> Vec<u32> {
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, prefill, st, Some(run))
     }
 
     fn spec_core(&self, target: &Model, draft: Option<&Model>,
         mut drafter: Option<&mut dyn crate::spec::Drafter>, prompt: &[u32], n_new: usize, k: usize,
-        prefill: SpecPrefill, st: &mut SpecStats) -> Vec<u32> {
+        prefill: SpecPrefill<'_>, st: &mut SpecStats, out: Option<&mut SpecRun>) -> Vec<u32> {
         let k = k.max(1);
         let max_seq = prompt.len() + n_new + 2 * k + 8;
         let tc = self.new_cache(target.n_layers, max_seq, target.kv_dim());
@@ -15641,6 +15668,27 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             // already owns that rule and the codebase's own note on it is that two copies of a
             // tuning rule is how they drift.
             SpecPrefill::Chunked(chunk) => { prev = self.prefill_chunked(target, &tc, prompt, chunk.max(1)); }
+            SpecPrefill::Seeded { src, len } => {
+                // Same two steps as the streaming reuse path: copy the shared rows, then run the
+                // divergent suffix through the BATCHED kernel rather than per-token decode. The
+                // suffix must be batched for the reason that path already documents — per-token and
+                // batched differ by about 1e-6, enough to tip a near-tied eos in a long context.
+                let len = len.min(prompt.len());
+                let kv = target.kv_dim();
+                for li in 0..target.n_layers {
+                    self.write_rows(&tc.k[li], &src.k[li], 0, len, kv);
+                    self.write_rows(&tc.v[li], &src.v[li], 0, len, kv);
+                }
+                if len < prompt.len() {
+                    let all = self.verify_forward(target, &tc, &prompt[len..], len);
+                    prev = all[all.len() - target.vocab..].to_vec();
+                } else {
+                    // The whole prompt was already in the seed; re-run the last token to obtain the
+                    // logits it implies, since the seed carries KV and not a distribution.
+                    let all = self.verify_forward(target, &tc, &prompt[prompt.len() - 1..], prompt.len() - 1);
+                    prev = all[all.len() - target.vocab..].to_vec();
+                }
+            }
         }
         let mut pos = prompt.len();
         // PERSISTENT draft session: prefilled once, then resynced incrementally each round.
@@ -15700,6 +15748,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             for t in emit { if gen.len() >= n_new { break; } gen.push(t); st.emitted += 1; }
         }
         gen.truncate(n_new);
+        // Hand the cache back. Without this the caller can CONSUME a prefix-tree entry to seed a run
+        // and has nothing to put back, so wiring reuse in would strip the pool one turn at a time —
+        // which is why the speculative path bypassed reuse entirely and paid a full prefill instead.
+        if let Some(o) = out { o.pos = pos; o.cache = Some(tc); }
         gen
     }
 

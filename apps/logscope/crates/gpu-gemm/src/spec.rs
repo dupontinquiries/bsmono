@@ -465,6 +465,32 @@ mod drafter_against_the_real_engine {
         }
     }
 
+    /// A seeded prefill must produce what a fresh one does.
+    ///
+    /// Reuse is worth more here than the drafter is — measured on the operator's run, a seeded turn
+    /// is 8.2 tok/s against 2.1 for a fresh chunked prefill, where the drafter itself is worth 1.49x
+    /// — so this is the path most of the win now flows through, and it copies KV rows between caches
+    /// by hand.
+    #[test]
+    fn a_seeded_prefill_matches_a_fresh_one() {
+        let Ok(bytes) = std::fs::read("/tmp/tiny-qwen3-q8.gguf") else { return };
+        let gpu = Gpu::new();
+        let Ok(m) = gpu.load_gguf_opt(&bytes, true) else { return };
+        let prompt: Vec<u32> = (1..40u32).map(|i| i % (m.vocab as u32).max(1)).collect();
+        let (mut a, mut b) = (SpecStats::default(), SpecStats::default());
+        // Build an anchor over a prefix, then seed a longer prompt from it.
+        let mut run = crate::SpecRun::default();
+        let _ = gpu.speculative_generate_drafter_run(&m, &mut PromptLookup { ngram: 2 }, &prompt[..24],
+            4, 4, crate::SpecPrefill::Chunked(16), &mut a, &mut run);
+        let cache = run.cache.expect("the run must hand its cache back or reuse cannot be wired");
+        let seeded = gpu.speculative_generate_drafter_with(&m, &mut PromptLookup { ngram: 2 }, &prompt,
+            10, 4, crate::SpecPrefill::Seeded { src: &cache, len: 24 }, &mut b);
+        let mut c = SpecStats::default();
+        let fresh = gpu.speculative_generate_drafter_with(&m, &mut PromptLookup { ngram: 2 }, &prompt,
+            10, 4, crate::SpecPrefill::Chunked(16), &mut c);
+        assert_eq!(seeded, fresh, "seeding from a previous turn's cache changed the output");
+    }
+
     /// A drafter proposing nothing must still generate — the case that hits on the first rounds,
     /// before any n-gram has repeated, and the one where a loop that assumes a non-empty draft
     /// would stall forever rather than fail loudly.

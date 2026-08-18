@@ -173,6 +173,13 @@ pub(crate) mod engine {
         /// draft proposes a block of tokens that the target verifies in ONE forward — bit-exact to
         /// greedy decode, but more tokens per expensive target pass. Must share the target's vocab.
         draft: Option<Model>,
+        /// Previous speculative turn's committed context and the cache it left behind.
+        ///
+        /// A single slot, deliberately separate from the shared prefix pool: `spec_core` owns its
+        /// cache, so a speculative turn that consumed a pool entry would have nothing to put back
+        /// and would strip the pool one turn at a time. One slot is all a linear chat needs, and it
+        /// touches none of the pool's invariants.
+        spec_anchor: Option<(Vec<u32>, gpu_kernels::SpecRun)>,
     }
     impl Engine {
         pub fn load(path: &str) -> Result<Self, String> {
@@ -658,7 +665,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 }
                 _ => None,
             };
-            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false })
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false, spec_anchor: None })
         }
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
@@ -687,6 +694,9 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
         pub fn lane(&self, n: usize) -> Engine {
             Engine {
                 gpu: self.gpu.clone(), model: self.model.clone(), tok: self.tok.clone(),
+                // A lane starts with no speculative anchor: the cache is not shareable across lanes
+                // (each holds its own KV) and a lane's first prompt is a different branch anyway.
+                spec_anchor: None,
                 eos: self.eos, stop_ids: self.stop_ids.clone(), template: self.template,
                 rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
                 anchors: Vec::new(), kv_cap: 1, pool: None, warm: self.warm,
@@ -970,8 +980,42 @@ names which)",
                 // ordinary streaming, from the one helper that owns it.
                 let chunk = prefill_chunk_for_streaming(self.model.d, self.model.h,
                     self.model.streams_experts(), self.model.moe_counts());
-                let ids = self.gpu.speculative_generate_drafter_with(&self.model, &mut d, &prompt_ids,
-                    n_new, k, gpu_kernels::SpecPrefill::Chunked(chunk), &mut st);
+                // SINGLE-SLOT ANCHOR, not the shared prefix pool. spec_core owns its cache, so
+                // consuming a pool entry would leave nothing to put back and would strip the pool a
+                // turn at a time; keeping the previous speculative turn's own cache here reuses the
+                // prefix without touching the pool's invariants at all. In a linear chat that is the
+                // same 97% hit ordinary streaming gets — and without it speculation is a NET LOSS on
+                // every turn after the first: 2.1 tok/s against plain streaming's 6.0, because a
+                // 14.7 s fresh prefill swamps a drafter worth 1.49x.
+                let seeded = self.spec_anchor.as_ref().and_then(|(toks, run)| {
+                    let n = toks.iter().zip(&prompt_ids).take_while(|(a, b)| a == b).count();
+                    // Leave the last shared token to the suffix pass so there is always a batched
+                    // forward to produce logits from; a zero-length suffix has no distribution.
+                    let n = n.min(prompt_ids.len().saturating_sub(1)).min(run.pos);
+                    run.cache.as_ref().filter(|_| n >= 16).map(|c| (c, n))
+                });
+                let prefill = match seeded {
+                    Some((c, n)) => {
+                        crate::diag!("wgpu-engine: [{}] speculative prefix reuse — {n} of {} prompt \
+tokens seeded from the previous speculative turn, {} to prefill",
+                            self.name, prompt_ids.len(), prompt_ids.len() - n);
+                        gpu_kernels::SpecPrefill::Seeded { src: c, len: n }
+                    }
+                    None => {
+                        crate::diag!("wgpu-engine: [{}] speculative prefill — {} prompt tokens, chunk \
+{chunk}, no anchor yet (first speculative turn, or the prompt diverged early)",
+                            self.name, prompt_ids.len());
+                        gpu_kernels::SpecPrefill::Chunked(chunk)
+                    }
+                };
+                let mut run = gpu_kernels::SpecRun::default();
+                let ids = self.gpu.speculative_generate_drafter_run(&self.model, &mut d, &prompt_ids,
+                    n_new, k, prefill, &mut st, &mut run);
+                // Keep this turn's cache as the next turn's anchor. The committed context is the
+                // prompt plus what was generated, which is exactly what the next prompt will extend.
+                let mut anchor_toks = prompt_ids.clone();
+                anchor_toks.extend_from_slice(&ids);
+                self.spec_anchor = Some((anchor_toks, run));
                 let secs = td.elapsed().as_secs_f32().max(1e-3);
                 let mut produced = 0usize;
                 let mut pending: Vec<u8> = Vec::new();
@@ -990,12 +1034,6 @@ names which)",
                 // Tokens per verification pass is the speedup, NOT the acceptance rate: a high rate
                 // on short drafts can be worth less than a mediocre one on long drafts (c4-829).
                 let per_pass = if st.rounds > 0 { st.emitted as f64 / st.rounds as f64 } else { 0.0 };
-                // The prefix tree is NOT reused on this path: spec_core builds a fresh cache from the
-                // raw prompt every turn, where ordinary streaming reused 1626 of 1684 tokens (1.12 s
-                // against 14.7 s) in the same session. That is the next thing to fix and it needs
-                // spec_core to accept a prefilled Session rather than a prompt.
-                crate::diag!("wgpu-engine: [{}] speculative prefill — {} prompt tokens, chunk {chunk}, \
-no prefix reuse on this path (ordinary streaming would have reused most of it)", self.name, prompt_ids.len());
                 crate::diag!("wgpu-engine: [{}] speculative (prompt-lookup, k={k}, ngram={ng}) — \
 {} tokens in {:.1}s = {:.2} tok/s | {} accepted of {} drafted over {} rounds = {:.2} tokens per \
 verification pass (1.00 means the drafter paid for nothing)",
