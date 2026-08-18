@@ -321,6 +321,9 @@ struct VoicetermApp {
     /// them; nothing showed you that it had — which is the whole gap the
     /// detect module names.
     progress: voiceterm_egui::detect::ProgressReadout,
+    /// The session walk player — the half of session_walk that the QML kept
+    /// in main.qml and the port left undrawn.
+    walk: voiceterm_egui::explore::Walk,
     /// Table view state: the op stack, the command line, the status. The
     /// ENGINE (table_ops + table_nlp) was already here and is not
     /// re-implemented — what was missing is the surface that owns a stack and
@@ -1309,7 +1312,7 @@ impl eframe::App for VoicetermApp {
             // and its own tests, and never drawn.
             {
                 let title = self.workspace.tabs.get(self.workspace.active)
-                    .map(|t| t.title.clone()).unwrap_or_default();
+                    .map(|t| t.name.clone()).unwrap_or_default();
                 let text = self.chrome.locator(
                     self.workspace.active,
                     self.workspace.tabs.len(),
@@ -1452,6 +1455,36 @@ impl eframe::App for VoicetermApp {
                         let groups = voiceterm_egui::explore::group_rows(&pages);
                         if let Some(path) = voiceterm_egui::explore::sitemap_ui(ui, &groups, &c) {
                             self.browser.load(&path);
+                        }
+
+                        // THE WALK PLAYER. explore's header says session_walk's
+                        // QML side "consumes a wire string built from these;
+                        // the camera animation + slider live in main.qml — so
+                        // the PLAYER is exactly what did not come across". It
+                        // came across as walk_ui and was never called.
+                        //
+                        // Fed from the same bookmarks the sitemap uses, for
+                        // the same reason stated there: built from the
+                        // browser's OWN pages rather than a fixture, because a
+                        // walk through invented paths would look like a
+                        // feature and be a decoration. last_session clusters
+                        // on time, and saved_at_ms is a real timestamp.
+                        let walk_pages: Vec<_> = self.browser.bookmarks.all().iter()
+                            .map(|b| voiceterm_egui::session_walk::WalkPage {
+                                id: b.url.clone(),
+                                title: b.title.clone(),
+                                domain: voiceterm_egui::explore::domain_of(&b.url),
+                                url: b.url.clone(),
+                                preview: String::new(),
+                                created_at: b.saved_at_ms / 1000,
+                            })
+                            .collect();
+                        let session = voiceterm_egui::session_walk::last_session(&walk_pages);
+                        self.walk.load(session);
+                        if let Some(i) = voiceterm_egui::explore::walk_ui(ui, &mut self.walk, &c) {
+                            if let Some(pg) = self.walk.pages().get(i) {
+                                self.browser.load(&pg.url.clone());
+                            }
                         }
                         if let Some(why) = self.browser.empty_reason() {
                             ui.colored_label(c.text_weak, why);
@@ -2739,6 +2772,7 @@ fn main() -> eframe::Result<()> {
                 // the layer was written against, so the detent lands where a
                 // thumb expects it on every app in the fleet.
                 tab_swipe: uikit_egui::GestureLayer::horizontal_page(320.0),
+                walk: Default::default(),
                 palette_open: false,
                 palette_query: String::new(),
                 palette_sel: 0,

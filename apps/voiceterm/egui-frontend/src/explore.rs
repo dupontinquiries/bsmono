@@ -240,6 +240,24 @@ pub fn group_rows(pages: &[SitePage]) -> Vec<(Group, Vec<SiteRow>)> {
     out
 }
 
+/// The host part of a URL, for `WalkPage::domain`.
+///
+/// `session_walk` takes the domain as given — it groups by it and never parses
+/// one — so the adapter that builds WalkPages has to supply it, and that
+/// adapter lives here beside the other engine adapters.
+///
+/// Deliberately naive: strip a scheme, cut at the first slash, drop any
+/// userinfo and port. A URL this cannot parse yields the whole string rather
+/// than an empty domain, because grouping under a visible oddity beats
+/// grouping everything unparseable together under "".
+pub fn domain_of(url: &str) -> String {
+    let s = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let s = s.split('/').next().unwrap_or(s);
+    let s = s.rsplit_once('@').map(|(_, r)| r).unwrap_or(s);
+    let s = s.split_once(':').map(|(l, _)| l).unwrap_or(s);
+    if s.is_empty() { url.to_string() } else { s.to_string() }
+}
+
 /// Draw the walk player. Returns a page index when the user picks one.
 pub fn walk_ui(ui: &mut egui::Ui, w: &mut Walk,
                c: &uikit_egui::PaletteColors) -> Option<usize> {
@@ -310,6 +328,36 @@ pub fn sitemap_ui(ui: &mut egui::Ui, groups: &[(Group, Vec<SiteRow>)],
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_walk_player_is_drawn_and_fed_from_real_pages() {
+        // explore's header: session_walk's QML side "consumes a wire string
+        // built from these; the camera animation + slider live in main.qml —
+        // so the PLAYER is exactly what did not come across". It came across
+        // as walk_ui and was never called.
+        let bin = include_str!("bin/voiceterm_egui.rs");
+        assert!(bin.contains("explore::walk_ui("), "the player is not drawn");
+        assert!(bin.contains("session_walk::last_session("),
+                "the walk is not clustered from real visits");
+        assert!(bin.contains("b.saved_at_ms / 1000"),
+                "a fixture timestamp would make the clustering meaningless");
+    }
+
+    #[test]
+    fn a_domain_survives_the_shapes_a_url_actually_takes() {
+        // session_walk groups BY domain and never parses one, so this adapter
+        // is the only thing standing between a real URL and a wrong group.
+        assert_eq!(domain_of("https://example.com/a/b"), "example.com");
+        assert_eq!(domain_of("http://sub.example.com"), "sub.example.com");
+        assert_eq!(domain_of("example.com/x"), "example.com", "no scheme");
+        assert_eq!(domain_of("https://user:pw@example.com/x"), "example.com",
+                   "userinfo is not part of the host");
+        assert_eq!(domain_of("https://example.com:8443/x"), "example.com",
+                   "a port is not a different site");
+        // Unparseable yields the whole string rather than "", because grouping
+        // under a visible oddity beats collapsing every bad URL together.
+        assert_eq!(domain_of("://"), "://");
+    }
 
     fn page(id: &str) -> WalkPage {
         WalkPage { id: id.to_string(), title: id.to_string(), domain: "x".into(),
