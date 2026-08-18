@@ -34,6 +34,7 @@ pub mod runview;
 pub mod session;
 /// A/B slots: flash a kernel to the spare half and keep a way back.
 pub mod slots;
+pub mod sparse;
 /// Preflight: does this device reach a udev rule that grants access?
 pub mod udevcheck;
 pub mod flow;
