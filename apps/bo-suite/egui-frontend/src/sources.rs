@@ -485,4 +485,36 @@ mod tests {
         assert!(p.is_empty());
         assert!(EMPTY_TEXT.contains("Create one"));
     }
+
+    /// Both ported pages must stay reachable.
+    ///
+    /// sources_ui and playlists_ui were built, tested, and called from
+    /// nowhere: PlaylistsPage had state on the controller and a handler with
+    /// its own test, and no tab led to it. This fails if either route is
+    /// removed, because the symptom otherwise is a page that simply cannot be
+    /// opened — nothing breaks, it is just gone.
+    #[test]
+    fn both_pages_are_reachable_from_the_controller() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("sources::sources_ui("), "the sources grid is not drawn");
+        assert!(lib.contains("sources::playlists_ui("), "the playlists page is not drawn");
+        assert!(lib.contains("LibraryTab::Playlists"), "no tab reaches playlists");
+    }
+
+    #[test]
+    fn choosing_the_active_source_is_refused() {
+        // The page has always known this; it just never got to say so. A
+        // switch to where you already are is a no-op that still costs an audio
+        // path teardown on device.
+        let mut s = Sources::default();
+        // `active` belongs to the COLLECTION, not the row: a device has one
+        // input at a time, so storing a flag per source could represent two.
+        s.set(vec![
+            Source { name: "Bluetooth".into(), kind: "bluetooth".into() },
+            Source { name: "Line In".into(), kind: "analog".into() },
+        ], "Bluetooth");
+        assert_eq!(s.choose("Bluetooth"), None, "already active");
+        assert_eq!(s.choose("Line In"), Some("Line In".to_string()));
+        assert_eq!(s.choose("HDMI"), None, "not a source this device reported");
+    }
 }

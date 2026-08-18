@@ -71,7 +71,7 @@ pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundsca
 /// a six-page swipe with three more pages inside it is a maze — but the pages,
 /// their modes and their detail drill-downs are the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibraryTab { Tracks, AllTracks, Albums, Artists, Tags }
+pub enum LibraryTab { Tracks, AllTracks, Albums, Artists, Tags, Playlists }
 
 /// Move the view index by a swipe sign, clamped to the ends.
 /// Paint a product silhouette badge: thin strokes (the module pins 1.0–1.2px),
@@ -261,6 +261,13 @@ pub struct Controller {
     pub device_selector: crate::outputs::DeviceSelector,
     /// The route the user last committed; the host applies it.
     pub pending_route: Option<crate::settings_page::Route>,
+    /// The input source the user last picked; the host applies it.
+    ///
+    /// Same shape as `pending_route` and for the same reason: this view owns
+    /// no audio path. It records what was asked for and the host performs it,
+    /// so a pick that fails on device does not leave the UI claiming a source
+    /// it never got.
+    pub pending_source: Option<String>,
     /// The device the selector last switched to.
     pub active_device_url: String,
     /// What this device can play from, and what the user has collected.
@@ -339,6 +346,7 @@ impl Controller {
             open_tag: None,
             device_selector: Default::default(),
             pending_route: None,
+            pending_source: None,
             active_device_url: String::new(),
             sources_page: Default::default(),
             playlists_page: Default::default(),
@@ -546,6 +554,24 @@ impl Controller {
                 self.pending_route = self.sinks.route();
             }
         }
+        // INPUT SOURCES, beside the output routing they belong with. sources_ui
+        // was ported and never called, and choose() already refuses a source
+        // that is the active one — the page has always known not to offer a
+        // switch to where you already are.
+        //
+        // Drawn only when the device reported some: the renderer's own empty
+        // state says "No sources reported by this device", which is right on a
+        // Sources page and noise on a Devices page that has plenty else to
+        // show.
+        if !self.sources_page.is_empty() {
+            ui.separator();
+            ui.heading("Sources");
+            if let Some(name) = crate::sources::sources_ui(ui, &self.sources_page, c) {
+                if let Some(pick) = self.sources_page.choose(&name) {
+                    self.pending_source = Some(pick);
+                }
+            }
+        }
         ui.separator();
         ui.heading("Devices");
         // collect edits to avoid borrow issues while iterating
@@ -744,7 +770,8 @@ impl Controller {
                                  (LibraryTab::AllTracks, "All tracks"),
                                  (LibraryTab::Albums, "Albums"),
                                  (LibraryTab::Artists, "Artists"),
-                                 (LibraryTab::Tags, "Tags")] {
+                                 (LibraryTab::Tags, "Tags"),
+                                 (LibraryTab::Playlists, "Playlists")] {
                 if ui.selectable_label(self.library_tab == tab, label).clicked()
                     && self.library_tab != tab {
                     self.library_tab = tab;
@@ -764,6 +791,19 @@ impl Controller {
                 ui, &mut self.all_tracks, &mut self.tracks_kinetic, c,
             ) {
                 self.tracks_action(act);
+            }
+            return;
+        }
+        if self.library_tab == LibraryTab::Playlists {
+            // PlaylistsPage was ported with its create-in-place card, its
+            // state has sat on this controller as `playlists_page`, and
+            // apply_playlist has handled Create since it was written — with a
+            // test. The only missing piece was a tab to reach it, so a whole
+            // ported page had no route in.
+            if let Some(act) =
+                crate::sources::playlists_ui(ui, &mut self.playlists_page, self.now_secs, c)
+            {
+                self.apply_playlist(act);
             }
             return;
         }
