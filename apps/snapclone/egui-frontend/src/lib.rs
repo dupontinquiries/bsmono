@@ -710,13 +710,17 @@ impl Snapclone {
                      habits are readable from the data."),
             ]),
             ambient_samples: Default::default(),
-            tabs: crate::tab_bar::TabBar::new(vec![
-                crate::tab_bar::Tab::new("camera", "Camera"),
-                crate::tab_bar::Tab::new("chats", "Chats"),
-                crate::tab_bar::Tab::new("friends", "Friends"),
-                crate::tab_bar::Tab::new("map", "Map"),
-                crate::tab_bar::Tab::new("settings", "Settings"),
-            ]),
+            // Labels from PAGE_NAMES, not a second list. The bar said "Chats"
+            // and "Map" where the rest of the app says "Inbox" and
+            // "Wayfinder" — harmless while nothing drew it, and two names for
+            // one page the moment it appeared beside the strip on a resize.
+            // The icons stay hand-written because PAGE_NAMES has none.
+            tabs: crate::tab_bar::TabBar::new(
+                ["camera", "chats", "friends", "map", "settings"]
+                    .iter()
+                    .zip(PAGES.iter())
+                    .map(|(icon, name)| crate::tab_bar::Tab::new(icon, name))
+                    .collect()),
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
@@ -2247,6 +2251,28 @@ impl Snapclone {
         }
 
         // page tabs on desktop; swipe hint on phone
+        // NAVIGATION BY WIDTH. snapclone is mobile-first and a bottom bar is
+        // what a thumb reaches, so compact gets tab_bar; a desktop window gets
+        // the top strip, where a pointer already is and where vertical space
+        // is not the scarce thing. One model each, chosen here — which is the
+        // adaptability the kit exists to make cheap, rather than two apps.
+        //
+        // Compact previously got NEITHER: the strip was gated on
+        // !is_compact() and the bottom bar had no renderer, so on a phone the
+        // only way between pages was a swipe with nothing on screen saying so.
+        if adaptive.is_compact() && !self.nav.can_go_back() {
+            self.tabs.set_current(self.nav.page());
+            self.sync_badges();
+            let picked = egui::TopBottomPanel::bottom("tabbar")
+                .show_inside(ui, |ui| {
+                    crate::tab_bar::tab_bar_ui(ui, &mut self.tabs,
+                                               adaptive.min_touch_target, &colors)
+                })
+                .inner;
+            if let Some(i) = picked {
+                self.nav.go_page(i);
+            }
+        }
         if !adaptive.is_compact() && !self.nav.can_go_back() {
             // THE PORTED STRIP, not a hand-rolled row. strip_ui gives equal
             // segments, an underline under the selected one rather than a box
@@ -4695,10 +4721,16 @@ mod badge_tests {
         // CHATS_TAB is a constant precisely so a reorder cannot silently badge
         // the wrong tab — but a constant that drifts from the list is the same
         // bug with an extra step, so the two are checked against each other.
+        // The label is PAGES[CHATS_TAB] now, not the literal "Chats": the bar
+        // said "Chats" and "Map" where the rest of the app says "Inbox" and
+        // "Wayfinder", which was harmless while nothing drew it and two names
+        // for one page the moment it appeared. Checking against PAGES keeps
+        // the constant honest without pinning a name that is not the app's.
         let app = super::Snapclone::new(Vec::new());
         let tab = &app.tabs.tabs()[super::Snapclone::CHATS_TAB];
-        assert_eq!(tab.label, "Chats",
-                   "CHATS_TAB points at {:?}, not the chats tab", tab.label);
+        assert_eq!(tab.label, super::PAGES[super::Snapclone::CHATS_TAB],
+                   "CHATS_TAB points at {:?}, not the messages page", tab.label);
+        assert_eq!(tab.label, "Inbox", "the messages page is named Inbox");
     }
 
     #[test]

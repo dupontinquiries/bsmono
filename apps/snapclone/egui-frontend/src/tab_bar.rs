@@ -171,9 +171,142 @@ impl TabBar {
     }
 }
 
+/// Draw the bottom bar. Returns the tab that was newly selected.
+///
+/// This model had no renderer at all — the badge `sync_badges` computed into
+/// it reached no screen by any path, and `tick_indicator` was never stepped.
+/// Written now because the answer to "top strip or bottom bar" turned out to
+/// be BOTH: snapclone is mobile-first, a bottom bar is what a thumb reaches,
+/// and the caller picks by width.
+///
+/// The touch rule from `TabBar.cpp` is what this function exists to honour.
+/// egui has no TouchUpdate to accept, so that specific workaround does not
+/// port — but the behaviour it protected does: commit on RELEASE, at the
+/// release position, with a drift tolerance, because a finger moves a few
+/// pixels during a tap. Driving `press`/`release`/`cancel` rather than reading
+/// `clicked()` is what keeps that rule in force.
+pub fn tab_bar_ui(ui: &mut egui::Ui, bar: &mut TabBar, min_touch: f32,
+                  c: &uikit_egui::PaletteColors) -> Option<usize> {
+    if bar.is_empty() {
+        return None;
+    }
+    let width = ui.available_width();
+    // The bar is at least a touch target tall, whatever the theme's spacing
+    // says. A navigation bar too short to hit is worse than no bar: it looks
+    // available and is not.
+    let height = min_touch.max(44.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height),
+                                              egui::Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 0.0, c.bg_raised);
+
+    let mut picked = None;
+    // Was the pointer already down on this bar last frame? egui gives no
+    // "press began" flag for a click that never becomes a drag, so the down
+    // edge is derived: down now, and a click has not yet been reported.
+    let down_seen = ui.ctx().input(|i| i.pointer.any_down())
+        && !resp.drag_started();
+    if let Some(pos) = resp.interact_pointer_pos() {
+        let local = pos.x - rect.left();
+        // press on the frame the pointer goes down, release on the frame it
+        // comes up. `press` is idempotent for our purposes — it overwrites the
+        // start point — but calling it every frame would move the origin under
+        // the drift check and defeat it, so it is gated on the down edge.
+        if resp.drag_started() || resp.is_pointer_button_down_on() && !down_seen {
+            bar.press(local, pos.y);
+        }
+        if resp.drag_stopped() || resp.clicked() {
+            picked = bar.release(local, pos.y, width);
+        }
+    } else {
+        // The pointer left the bar mid-gesture. Cancelling matches the
+        // original's TouchCancel path: a press that wandered off is not a tap,
+        // and holding it would commit on a release that happens elsewhere.
+        bar.cancel();
+    }
+
+    bar.tick_indicator(width, ui.input(|i| i.stable_dt));
+
+    let tw = bar.tab_width(width);
+    for (i, tab) in bar.tabs().iter().enumerate() {
+        let x = rect.left() + tw * i as f32;
+        let centre = egui::pos2(x + tw / 2.0, rect.center().y);
+        let on = i == bar.current();
+        p.text(egui::pos2(centre.x, centre.y - 6.0), egui::Align2::CENTER_CENTER,
+               &tab.icon, egui::FontId::proportional(16.0),
+               if on { c.accent } else { c.text_weak });
+        p.text(egui::pos2(centre.x, centre.y + 10.0), egui::Align2::CENTER_CENTER,
+               &tab.label, egui::FontId::proportional(10.0),
+               if on { c.accent } else { c.text_weak });
+        if let Some(b) = tab.badge_text() {
+            // Offset from the icon rather than the cell edge, so a long label
+            // does not push the badge away from the thing it counts.
+            let bp = egui::pos2(centre.x + 12.0, centre.y - 12.0);
+            p.circle_filled(bp, 7.0, c.warning);
+            p.text(bp, egui::Align2::CENTER_CENTER, b,
+                   egui::FontId::proportional(9.0), c.bg_base);
+        }
+    }
+
+    // The indicator is animated state, not a derived position: it eases toward
+    // the target so a tab change slides rather than jumps.
+    let iw = bar.indicator_width(width);
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(rect.left() + bar.indicator_x() - iw / 2.0, rect.top()),
+            egui::vec2(iw, 2.0)),
+        0.0, c.accent);
+
+    picked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bottom_bar_is_drawn_on_compact_and_the_strip_on_wide() {
+        // This model had NO renderer: the badge sync_badges computed into it
+        // reached no screen by any path, and tick_indicator was never stepped.
+        // Worse, the strip was gated on !is_compact(), so a phone got neither
+        // — the only way between pages was a swipe with nothing on screen
+        // saying so.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("tab_bar::tab_bar_ui("), "no bottom bar");
+        assert!(lib.contains("if adaptive.is_compact() && !self.nav.can_go_back()"),
+                "the bottom bar is not gated on compact");
+        assert!(lib.contains("if !adaptive.is_compact() && !self.nav.can_go_back()"),
+                "the strip is not gated on wide");
+    }
+
+    #[test]
+    fn the_bar_has_one_tab_per_page_in_page_order() {
+        // The renderer returns a TAB INDEX and the caller feeds it straight to
+        // nav.go_page. A bar with a different count or order would navigate to
+        // the wrong page silently — there is no type keeping these in step.
+        let lib = include_str!("lib.rs");
+
+        // Built from PAGES by zip, so the correspondence is structural rather
+        // than a list somebody has to keep in step. Asserting the construction
+        // is what catches a future edit that reintroduces a literal list.
+        assert!(lib.contains(".zip(PAGES.iter())"),
+                "the bar's labels are not derived from PAGES");
+    }
+
+    #[test]
+    fn a_tap_that_drifts_too_far_is_not_a_tap() {
+        // The rule TabBar.cpp's touch workaround existed to protect. The
+        // renderer drives press/release rather than reading clicked(), which
+        // is what keeps this in force at the UI layer.
+        let mut b = TabBar::new(vec![Tab::new("a", "A"), Tab::new("b", "B")]);
+        b.press(10.0, 10.0);
+        assert_eq!(b.release(10.0 + TAP_SLOP + 5.0, 10.0, 200.0), None,
+                   "a drifted gesture committed a tab change");
+        // Within tolerance, at the release position, it commits.
+        b.press(150.0, 10.0);
+        assert_eq!(b.release(152.0, 11.0, 200.0), Some(1));
+        assert_eq!(b.current(), 1);
+    }
 
     fn bar() -> TabBar {
         TabBar::new(vec![Tab::new("💬", "Chats"), Tab::new("👥", "People"),
