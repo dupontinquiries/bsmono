@@ -55,10 +55,21 @@ tensors are skipped — text pathway only.
    engine names `PerLayerRopeFreqs`-adjacent behaviour in its gap report. When
    the reference lands (transformers 5.8 release or llama.cpp support), wire it
    here first.
-2. **Tokenizer.** Full ggml tokenizer emission from HF `tokenizer.json` is
-   deliberately out of scope; copy from a same-vocab donor GGUF with
-   `--tokenizer-gguf`, or omit and use the engine's `LOGSCOPE_TOKENIZER_GGUF`
-   borrow at load (vocab width is cross-checked against `token_embd` there).
+2. **Tokenizer: SOLVED natively.** Gemma's SentencePiece model is BPE-type —
+   merges carry the segmentation, no unigram scores exist to lose — so the
+   converter now emits the full ggml tokenizer straight from `tokenizer.json`
+   (262144 pieces, ~515k merges): `tokenizer.ggml.model = "llama"` + tokens +
+   merges + token types, which the engine routes to its SP-BPE mode (`▁`
+   spaces, `<0xNN>` byte fallback). Verify any emission against the reference
+   implementation: `convert.py <hf_dir> --emit-tokenizer --out tok.gguf`
+   embeds probe strings encoded by the HF `tokenizers` pipeline at emit time,
+   and `kernel-validate --gate-tokenizer tok.gguf` re-encodes them with the
+   engine and demands id equality. The `--tokenizer-gguf` donor path remains
+   for weights-only redistributions — with a hazard now on record: a Gemma-3
+   donor passes the 262144-width check while shipping DIFFERENT special
+   strings at the same ids (105/106 are `<start_of_turn>`/`<end_of_turn>`
+   there, `<|turn>`/`<turn|>` here). Width cannot see that; native emission
+   makes it moot.
 3. **IQ1_S production.** This tool emits f32/f16 GGUFs only. 1.5625-bpw files
    come from `llama-quantize` once the arch exists upstream. Note the expert
    `down` rows are 704 wide — not a multiple of the 256-weight IQ1_S block — so

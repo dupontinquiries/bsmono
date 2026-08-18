@@ -1024,6 +1024,56 @@ fn route_analyze(path: &str) {
     }
 }
 
+/// The tokenizer contract checks shared by --gate-gemmadiff (optional section) and
+/// --gate-tokenizer (required): engine SP-BPE loads, widths and the mask agree, and every
+/// cross-implementation probe the converter embedded — strings encoded by the HF `tokenizers`
+/// reference at convert time — re-encodes to the SAME ids here and decodes back to the same text.
+/// A near-miss tokenizer prints fluent nonsense, never an error; id equality is the only verdict.
+fn tokenizer_checks(g: &gpu_kernels::gguf::Gguf, ck: &mut dyn FnMut(&str, bool)) {
+            match gpu_kernels::tokenizer::Tokenizer::from_gguf(&g) {
+                Err(e) => ck(&format!("tokenizer from_gguf: {e}"), false),
+                Ok(tk) => {
+                    if let Some(t) = g.tensor("token_embd.weight") {
+                        ck("tokenizer width == token_embd width",
+                           t.dims.get(1).copied() == Some(tk.vocab_size() as u64));
+                    }
+                    let mask_ok = gpu_kernels::gguf_mask_token_id(&g)
+                        .map(|id| tk.decode(&[id]).contains("<mask>") && tk.encode("<mask>") == vec![id])
+                        .unwrap_or(false);
+                    ck("mask id ↔ \"<mask>\" both directions", mask_ok);
+                    let mut i = 0u32;
+                    let mut n_probe = 0u32;
+                    let mut all_ok = true;
+                    loop {
+                        let (tkey, ikey) = (format!("__fixture.tok_probe.{i}.text"),
+                                            format!("__fixture.tok_probe.{i}.ids"));
+                        let Some(gpu_kernels::gguf::Value::Str(text)) = g.metadata.get(&tkey) else { break };
+                        let want: Vec<u32> = match g.metadata.get(&ikey) {
+                            Some(gpu_kernels::gguf::Value::Arr(a)) => a.iter().filter_map(|v| match v {
+                                gpu_kernels::gguf::Value::U32(x) => Some(*x),
+                                gpu_kernels::gguf::Value::I32(x) => Some(*x as u32),
+                                _ => None,
+                            }).collect(),
+                            _ => { all_ok = false; break }
+                        };
+                        let got = tk.encode(text);
+                        if got != want {
+                            all_ok = false;
+                            println!("    probe {i} {text:?}: engine {got:?} != reference {want:?}");
+                        }
+                        if tk.decode(&want) != *text {
+                            all_ok = false;
+                            println!("    probe {i} {text:?}: decode diverged: {:?}", tk.decode(&want));
+                        }
+                        i += 1; n_probe += 1;
+                    }
+                    if n_probe > 0 {
+                        ck(&format!("{n_probe} cross-implementation probes: engine ids == HF reference ids, decode round-trips"), all_ok);
+                    }
+                }
+            }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--route-analyze") {
@@ -2859,9 +2909,34 @@ fn main() {
                 ck("every per-row slice of the FILE bytes decodes finitely via dot_iq1_s", rows_decode);
             }
         }
+        // ── tokenizer: the engine's SP-BPE against the reference implementation's own ids ────
+        // Optional here (a weights-only conversion has none); --gate-tokenizer is the standalone,
+        // REQUIRED version of the same checks for tokenizer-carrying files.
+        if g.metadata.contains_key("tokenizer.ggml.tokens") {
+            tokenizer_checks(&g, &mut ck);
+        }
         println!("gate-gemmadiff: {}", if ok {
             "\u{2713} header + CPU reference forward (the ENGINE forward is still the declared gaps)"
         } else { "FAIL \u{2717}" });
+        if !ok { std::process::exit(1); }
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-tokenizer") {
+        // Standalone tokenizer contract gate — any GGUF that claims to carry a tokenizer. The
+        // gemmadiff gate runs the same checks as an optional section; here they are REQUIRED, so
+        // "no tokenizer" is a failure, not a shrug. Built for the tokenizer-only GGUFs
+        // convert.py --emit-tokenizer produces from a real drop (262k pieces, half a million
+        // merges, probes encoded by the HF reference at emit time).
+        let path = args.iter().position(|a| a == "--gate-tokenizer")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| { eprintln!("usage: --gate-tokenizer <file.gguf>"); std::process::exit(2) });
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| { eprintln!("read {path}: {e}"); std::process::exit(2) });
+        let g = gpu_kernels::gguf::parse(&bytes).unwrap_or_else(|e| { eprintln!("parse: {e}"); std::process::exit(2) });
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let has = g.metadata.contains_key("tokenizer.ggml.tokens");
+        ck("tokenizer.ggml.tokens present", has);
+        if has { tokenizer_checks(&g, &mut ck); }
+        println!("gate-tokenizer: {}", if ok { "\u{2713}" } else { "FAIL \u{2717}" });
         if !ok { std::process::exit(1); }
         return;
     }
@@ -5420,7 +5495,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }

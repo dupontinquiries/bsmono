@@ -130,7 +130,7 @@ def orient_experts(name: str, a: np.ndarray, d: int, ff_exp: int) -> np.ndarray:
 
 # ── metadata ─────────────────────────────────────────────────────────────────────────────────────
 
-def write_metadata(w, cfg: dict, mask_id: int):
+def write_metadata(w, cfg: dict, mask_id: int, tokenizer: dict | None = None):
     t = cfg["text_config"]
     p = "diffusion_gemma"
     layers = t["num_hidden_layers"]
@@ -200,6 +200,18 @@ def write_metadata(w, cfg: dict, mask_id: int):
     if (ct := sched.get("threshold")) is not None:
         f32("diffusion.commit_threshold", ct)   # BlockRefinementScheduler's 0.95 fast-commit
     u32("tokenizer.ggml.mask_token_id", mask_id)
+    if tokenizer is not None:
+        # model string "llama" = the SentencePiece FAMILY marker; the engine routes
+        # llama-with-merges to its SP-BPE mode. add_bos is FALSE from the file's own
+        # post_processor, which adds nothing — BOS placement is the chat template's job here.
+        w.add_tokenizer_model("llama")
+        w.add_token_list(tokenizer["tokens"])
+        w.add_token_merges(tokenizer["merges"])
+        w.add_token_types(tokenizer["types"])
+        for name, tid in tokenizer["ids"].items():
+            if tid is not None:
+                getattr(w, f"add_{name}_token_id")(tid)
+        w.add_add_bos_token(False)
 
 
 def mask_id_from_tokenizer(hf_dir: Path) -> int:
@@ -240,13 +252,71 @@ def copy_tokenizer(w, donor: Path, gguf):
 
 # ── conversion core (dict in → gguf out, so --selfcheck needs no shards) ────────────────────────
 
+
+# ── tokenizer: native emission from the drop's own tokenizer.json ────────────────────────────────
+
+def tokenizer_kvs_from_json(hf_dir: Path):
+    """GGUF tokenizer kvs from HF tokenizer.json, or None when the drop ships none.
+
+    Gemma's SentencePiece model is BPE-TYPE — the merges carry the segmentation, no unigram
+    scores exist to lose — so the HF json is a COMPLETE source and no donor GGUF is needed.
+    The donor path stays for weights-only redistributions, but note the hazard it carries:
+    a Gemma-3 donor passes the 262144-width check while shipping DIFFERENT special strings at
+    the same ids (105/106 are <start_of_turn>/<end_of_turn> there, <|turn>/<turn|> here) —
+    the width check cannot see that, native emission makes it moot.
+    """
+    tj = hf_dir / "tokenizer.json"
+    if not tj.exists():
+        return None
+    t = json.loads(tj.read_text())
+    m = t["model"]
+    if m.get("type") != "BPE":
+        raise SystemExit(f"tokenizer.json model type {m.get('type')!r} — this emitter understands "
+                         f"the BPE-type SentencePiece encoding only; a unigram model needs scores "
+                         f"this file does not carry")
+    vocab = m["vocab"]
+    n = len(vocab)
+    tokens = [None] * n
+    for piece, i in vocab.items():
+        if not (0 <= i < n) or tokens[i] is not None:
+            raise SystemExit(f"tokenizer vocab is not a dense 0..{n-1} id space at {piece!r}/{i}")
+        tokens[i] = piece
+    for a in t.get("added_tokens", []):
+        i, c = a["id"], a["content"]
+        if i >= n or (tokens[i] is not None and tokens[i] != c):
+            raise SystemExit(f"added token {c!r} at id {i} disagrees with the vocab table")
+        tokens[i] = c
+    if any(tok is None for tok in tokens):
+        raise SystemExit("tokenizer vocab has holes — refusing to invent pieces")
+    # the GGUF merge format is one space-joined string per pair; a piece CONTAINING a space
+    # would corrupt it on the way back in. The \u2581 convention means none exist — enforced,
+    # because the day one does is the day this assert pays for itself.
+    for tok in tokens:
+        if " " in tok:
+            raise SystemExit(f"piece {tok!r} contains a literal space — the merge encoding cannot carry it")
+    merges = [f"{a} {b}" for a, b in m["merges"]]
+    special_ids = {a["id"] for a in t.get("added_tokens", []) if a.get("special")}
+    added_ids = {a["id"] for a in t.get("added_tokens", [])}
+    def ttype(i, piece):
+        if i in special_ids: return 3                       # control
+        if i in added_ids: return 4                         # user-defined
+        if piece == m.get("unk_token"): return 2            # unknown
+        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"): return 6  # byte
+        return 1
+    types = [ttype(i, tok) for i, tok in enumerate(tokens)]
+    ids = {name: vocab.get(piece) for name, piece in
+           (("bos", "<bos>"), ("eos", "<eos>"), ("unk", "<unk>"), ("pad", "<pad>"))}
+    return {"tokens": tokens, "merges": merges, "types": types, "ids": ids}
+
+
 def convert(tensors: dict, cfg: dict, mask_id: int, out: Path, gguf, dtype: str,
             tokenizer_donor=None,
-            extra_raw: list | None = None):
+            extra_raw: list | None = None, tokenizer: dict | None = None,
+            tok_probes: list | None = None):
     t = cfg["text_config"]
     d, ff_exp = t["hidden_size"], t["moe_intermediate_size"]
     w = gguf.GGUFWriter(str(out), "diffusion_gemma")
-    write_metadata(w, cfg, mask_id)
+    write_metadata(w, cfg, mask_id, tokenizer)
     if tokenizer_donor:
         copy_tokenizer(w, tokenizer_donor, gguf)
 
@@ -270,6 +340,12 @@ def convert(tensors: dict, cfg: dict, mask_id: int, out: Path, gguf, dtype: str,
     # fixture-only raw tensors (--selfcheck): pre-packed quantized bytes the engine-side gate
     # probes — never emitted for a real conversion, and named __fixture.* so nothing mistakes
     # them for model weights
+    # fixture-only cross-implementation probes: strings the HF `tokenizers` reference encoded,
+    # with its ids — the engine-side gate re-encodes and demands equality
+    for i, (ptext, pids) in enumerate(tok_probes or []):
+        w.add_string(f"__fixture.tok_probe.{i}.text", ptext)
+        w.add_array(f"__fixture.tok_probe.{i}.ids", [int(x) for x in pids])
+
     for (rname, rbytes, rshape, rdtype) in (extra_raw or []):
         # gguf-py derives a quantized tensor's LOGICAL shape from the data's BYTE shape
         # (rows, bytes_per_row) — hand it exactly that and let it compute k itself
@@ -385,8 +461,48 @@ def selfcheck(gguf, out: Path):
             out_b += bytes(nxt() for _ in range(48))    # qs + qh, deterministic
         return bytes(out_b)
     probe = iq1s_probe()
-    convert(ten, cfg, mask_id=4, out=out, gguf=gguf, dtype="f32",
-            extra_raw=[("__fixture.iq1s_probe", probe, (4, 512), gguf.GGMLQuantizationType.IQ1_S)])
+    # ── a miniature SP-BPE tokenizer, 32 pieces to match the model's vocab width, pushed
+    # through tokenizer_kvs_from_json (the SAME code the real drop takes) and cross-encoded by
+    # the HF `tokenizers` reference so the engine gate can demand id equality. <mask> sits at 4
+    # to agree with tokenizer.ggml.mask_token_id.
+    pieces = ["<pad>", "<eos>", "<bos>", "<unk>", "<mask>", "\u2581", "a", "b", "c", "d",
+              "ab", "\u2581b", "\u2581ab", "abc", "<0xC3>", "<0xA9>", "<0xE2>", "<0x98>",
+              "<0x95>", "\n"] + [f"<unused{i}>" for i in range(12)]
+    assert len(pieces) == 32
+    tok_json = {
+        "version": "1.0",
+        "added_tokens": [{"id": i, "content": pieces[i], "special": True, "normalized": False,
+                          "single_word": False, "lstrip": False, "rstrip": False}
+                         for i in range(5)],
+        "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u2581"},
+        "pre_tokenizer": {"type": "Split", "pattern": {"String": " "},
+                          "behavior": "MergedWithPrevious", "invert": False},
+        "post_processor": None,
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "},
+            {"type": "ByteFallback"}, {"type": "Fuse"}]},
+        "model": {"type": "BPE", "dropout": None, "unk_token": "<unk>",
+                  "continuing_subword_prefix": None, "end_of_word_suffix": None,
+                  "fuse_unk": True, "byte_fallback": True, "ignore_merges": False,
+                  "vocab": {pc: i for i, pc in enumerate(pieces)},
+                  "merges": [["a", "b"], ["\u2581", "b"], ["ab", "c"], ["\u2581", "ab"]]},
+    }
+    tokdir = Path("/tmp/gemmadiff-selfcheck-tok")
+    tokdir.mkdir(exist_ok=True)
+    (tokdir / "tokenizer.json").write_text(json.dumps(tok_json))
+    tok = tokenizer_kvs_from_json(tokdir)
+    probes = ["ab", "a b", "abc", "b ab c", "\u00e9", "\u2615", "a<mask>b", "a\nb"]
+    try:
+        from tokenizers import Tokenizer as HfTok
+    except ImportError:
+        raise SystemExit("--selfcheck needs the `tokenizers` package to cross-encode the probe "
+                         "strings (pip install tokenizers) — the whole point of the probes is that "
+                         "the ids come from the REFERENCE implementation, not from this file")
+    hf = HfTok.from_str(json.dumps(tok_json))
+    probe_ids = [hf.encode(t, add_special_tokens=False).ids for t in probes]
+    convert(ten, cfg, mask_id=4, out=out, gguf=gguf, dtype="f32", tokenizer=tok,
+            extra_raw=[("__fixture.iq1s_probe", probe, (4, 512), gguf.GGMLQuantizationType.IQ1_S)],
+            tok_probes=list(zip(probes, probe_ids)))
 
     r = gguf.GGUFReader(str(out))
     kv = {f.name: f.contents() for f in r.fields.values()}
@@ -408,6 +524,46 @@ def selfcheck(gguf, out: Path):
     print(f"selfcheck \u2713 — {len(names)} tensors, name map + metadata round-trip")
 
 
+
+def emit_tokenizer_gguf(hf: Path, out: Path, gguf):
+    """Tokenizer-only GGUF: the native emission plus cross-implementation probes at REAL scale
+    (262144 pieces, ~515k merges for the 26B drop). The probes are representative strings encoded
+    here by the HF `tokenizers` pipeline; `kernel-validate --gate-tokenizer <out>` re-encodes them
+    with the engine and demands id equality — the check that catches a rank table gone subtly
+    wrong, which no amount of eyeballing a vocab dump will."""
+    tok = tokenizer_kvs_from_json(hf)
+    if tok is None:
+        raise SystemExit(f"{hf}/tokenizer.json not found")
+    try:
+        from tokenizers import Tokenizer as HfTok
+    except ImportError:
+        raise SystemExit("--emit-tokenizer needs the `tokenizers` package (pip install tokenizers) "
+                         "— the probes must come from the reference implementation")
+    hftk = HfTok.from_file(str(hf / "tokenizer.json"))
+    probes = ["Hello, world!", "two  spaces", "caf\u00e9 \u2615 na\u00efve",
+              "a\nb\tc", "<mask>", "The quick brown fox jumps over the lazy dog.",
+              "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8",
+              "\U0001f980 rust", "x = f(x); // comment", "<|turn>user<turn|>",
+              "\U00013000"]  # egyptian hieroglyph: byte-fallback territory even at 262k
+    probe_ids = [hftk.encode(t, add_special_tokens=False).ids for t in probes]
+    w = gguf.GGUFWriter(str(out), "diffusion_gemma")
+    w.add_tokenizer_model("llama")
+    w.add_token_list(tok["tokens"])
+    w.add_token_merges(tok["merges"])
+    w.add_token_types(tok["types"])
+    for name, tid in tok["ids"].items():
+        if tid is not None:
+            getattr(w, f"add_{name}_token_id")(tid)
+    w.add_add_bos_token(False)
+    w.add_uint32("tokenizer.ggml.mask_token_id", mask_id_from_tokenizer(hf))
+    for i, (text, ids) in enumerate(zip(probes, probe_ids)):
+        w.add_string(f"__fixture.tok_probe.{i}.text", text)
+        w.add_array(f"__fixture.tok_probe.{i}.ids", [int(x) for x in ids])
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    print(f"wrote {out}: {len(tok['tokens'])} pieces, {len(tok['merges'])} merges, "
+          f"{len(probes)} reference-encoded probes")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("hf_dir", nargs="?", help="HF model dir (config.json + safetensors shards)")
@@ -416,12 +572,21 @@ def main():
     ap.add_argument("--gguf-py", type=Path, help="path to llama.cpp's gguf-py (else: pip gguf)")
     ap.add_argument("--tokenizer-gguf", type=Path, help="donor GGUF to copy tokenizer.* kvs from")
     ap.add_argument("--selfcheck", action="store_true", help="synthetic end-to-end check, no shards")
+    ap.add_argument("--emit-tokenizer", action="store_true",
+                    help="tokenizer-only GGUF from hf_dir's tokenizer.json, with probe strings "
+                         "encoded by the HF reference at emit time — verify with "
+                         "kernel-validate --gate-tokenizer <out>")
     args = ap.parse_args()
 
     if args.gguf_py:
         sys.path.insert(0, str(args.gguf_py))
     import gguf  # noqa: E402
 
+    if args.emit_tokenizer:
+        if not args.hf_dir or not args.out:
+            ap.error("--emit-tokenizer needs hf_dir and --out")
+        emit_tokenizer_gguf(Path(args.hf_dir), args.out, gguf)
+        return
     if args.selfcheck:
         out = args.out or Path("/tmp/gemmadiff-selfcheck.gguf")
         selfcheck(gguf, out)
@@ -439,8 +604,12 @@ def main():
     gen = hf / "generation_config.json"
     if gen.exists():
         cfg["_generation"] = json.loads(gen.read_text())
+    tok = tokenizer_kvs_from_json(hf)
+    if tok is not None:
+        print(f"tokenizer: emitting natively from tokenizer.json "
+              f"({len(tok['tokens'])} pieces, {len(tok['merges'])} merges) — no donor needed")
     convert(load_hf(hf), cfg, mask_id_from_tokenizer(hf), args.out, gguf, args.dtype,
-            tokenizer_donor=args.tokenizer_gguf)
+            tokenizer_donor=args.tokenizer_gguf, tokenizer=tok)
 
 
 if __name__ == "__main__":
