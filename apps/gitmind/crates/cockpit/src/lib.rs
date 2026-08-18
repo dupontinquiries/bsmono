@@ -40,6 +40,7 @@ pub mod udevcheck;
 pub mod flow;
 pub mod identity;
 pub mod importer;
+pub mod incoming;
 pub mod installer;
 pub mod merge;
 pub mod netshare;

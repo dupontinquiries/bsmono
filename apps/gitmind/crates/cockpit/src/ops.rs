@@ -591,3 +591,67 @@ mod root_tests {
         assert!(err.contains("no Cargo.toml"), "clear error: {err}");
     }
 }
+
+/// Does this repo have that commit?
+///
+/// The question `incoming::plan` needs answered and cannot answer itself. A
+/// bare `cat-file -t` rather than `rev-parse`: rev-parse succeeds on an
+/// abbreviated sha that matches nothing yet, and a prerequisite check that
+/// says yes for a commit git cannot read is the failure this whole flow exists
+/// to catch early.
+pub fn has_commit(sha: &str) -> bool {
+    if sha.trim().is_empty() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["cat-file", "-t", sha])
+        .env("PATH", tool_path_env())
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "commit")
+        .unwrap_or(false)
+}
+
+/// What a bundle carries and what it needs: `(refs, prerequisites)`.
+///
+/// Parsed from `git bundle verify`, which prints both even when it then
+/// refuses the bundle — that refusal is exactly the case worth reporting, so
+/// the exit status is deliberately ignored and only the output is read.
+pub fn bundle_refs(path: &str) -> (Vec<String>, Vec<String>) {
+    let out = std::process::Command::new("git")
+        .args(["bundle", "verify", path])
+        .env("PATH", tool_path_env())
+        .output();
+    let Ok(o) = out else { return (Vec::new(), Vec::new()) };
+    // verify writes its listing to stderr on some versions and stdout on
+    // others; reading both avoids a silent empty result.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut refs = Vec::new();
+    let mut requires = Vec::new();
+    let mut in_requires = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("The bundle requires") {
+            in_requires = true;
+            continue;
+        }
+        if l.starts_with("The bundle contains") {
+            in_requires = false;
+            continue;
+        }
+        let mut parts = l.split_whitespace();
+        let (Some(sha), rest) = (parts.next(), parts.next()) else { continue };
+        if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        if in_requires {
+            requires.push(sha.to_string());
+        } else if let Some(name) = rest {
+            refs.push(name.to_string());
+        }
+    }
+    (refs, requires)
+}
