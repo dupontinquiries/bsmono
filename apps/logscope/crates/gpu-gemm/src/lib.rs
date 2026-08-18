@@ -15881,7 +15881,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             g.observe_clean(k);
             let after = g.learned_cap();
             if after > before {
-                eprintln!("wgpu-engine: governor — window autotuned up {before}→{after} (device has headroom; clean run at k={k})");
+                eprintln!("wgpu-engine: governor — window autotuned up {before}→{after} \
+(a window of {k} completed cleanly; the cap may now probe one step past what ran). If this line \
+stops appearing while the window stays small, the live budget is the binding constraint, not the \
+governor — the clamp line above names which.");
             }
         }
         produced
