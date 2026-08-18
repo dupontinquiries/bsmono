@@ -36,6 +36,7 @@ pub mod workspaces_view;
 pub mod pty_input;
 pub mod table_view;
 pub mod row_render;
+pub mod docingest;
 pub mod detect;
 pub mod explore;
 pub mod manpage_view;
