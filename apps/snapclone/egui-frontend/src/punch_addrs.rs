@@ -192,6 +192,33 @@ pub fn gossip_ui(ui: &mut egui::Ui, g: &Gossip, punch: &PunchAddrs, now_ms: u64,
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_network_view_is_drawn_and_its_caches_are_fed() {
+        // Both halves were missing. gossip_ui was never called, and
+        // note_peer_addr was reached only from a test — so `heard` and `punch`
+        // were always empty and the view could not have shown anything however
+        // it was drawn.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("punch_addrs::gossip_ui("), "the view is not drawn");
+        assert!(lib.contains("self.note_peer_addr(&id,"),
+                "arriving gossip does not reach the reach caches");
+    }
+
+    #[test]
+    fn only_an_address_gets_cached_as_one() {
+        // PeerAddr is four bytes. A hostname or an IPv6 literal has no honest
+        // conversion, and a zero address in this cache would read as a
+        // reachable peer — "a guess wearing a fact's clothes", which is the
+        // failure the module's own header names.
+        let d = crate::parse_dotted_quad("192.168.1.9");
+        assert_eq!(d, Some([192, 168, 1, 9]));
+        assert_eq!(crate::parse_dotted_quad("peer.local"), None, "a hostname is not an address");
+        assert_eq!(crate::parse_dotted_quad("::1"), None, "IPv6 has no [u8; 4] form");
+        assert_eq!(crate::parse_dotted_quad("1.2.3"), None, "too few octets");
+        assert_eq!(crate::parse_dotted_quad("1.2.3.4.5"), None, "too many");
+        assert_eq!(crate::parse_dotted_quad("1.2.3.999"), None, "an octet must fit a byte");
+    }
+
     fn addr(n: u8) -> PeerAddr { PeerAddr::new([10, 0, 0, n], 4000 + n as u16) }
 
     #[test]

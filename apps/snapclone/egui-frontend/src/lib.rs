@@ -509,6 +509,24 @@ pub struct Snapclone {
     palette: String,
 }
 
+
+/// Parse `a.b.c.d` into four octets, or `None`.
+///
+/// Deliberately narrow: `PeerAddr` is four bytes, and a hostname or an IPv6
+/// literal cannot become one. Returning None keeps them out of the punch cache
+/// rather than storing a zero address that would read as a reachable peer.
+fn parse_dotted_quad(host: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = host.trim().split('.');
+    for slot in out.iter_mut() {
+        *slot = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;   // five or more segments is not an address
+    }
+    Some(out)
+}
+
 impl Snapclone {
     pub fn new(peers: Vec<Peer>) -> Snapclone {
         Self::new_with_login(peers, true)
@@ -749,6 +767,19 @@ impl Snapclone {
         // already have one. Discovery ADDS reachability information; it does
         // not get to rename or replace a contact the user chose to keep.
         let id = rec.id.clone();
+        // FEED THE REACH CACHES. note_peer_addr was reached only from a test,
+        // so `heard` and `punch` were always empty and the network view could
+        // not have shown anything however it was drawn. Records arrive here
+        // and nowhere else.
+        //
+        // Only a dotted-quad host is taken. PeerAddr is [u8; 4] and a
+        // hostname or an IPv6 literal has no honest conversion — recording a
+        // zero address would put a fact-shaped guess in the cache the module's
+        // own comment warns about, and the peer row above still gets added
+        // either way, so nothing is lost by declining.
+        if let Some(ip) = parse_dotted_quad(&rec.host) {
+            self.note_peer_addr(&id, ip, rec.port, rec.last_seen_ms);
+        }
         self.view.observe(rec);
         if !self.peers.iter().any(|p| p.name == id) {
             self.peers.push(Peer { name: id, online: true });
@@ -2795,15 +2826,18 @@ impl Snapclone {
         // NETWORK REACH. Where peers were last seen, with the expiry that
         // keeps a stale address from reading as a live one.
         ui.collapsing(format!("network ({} heard)", self.heard.len()), |ui| {
-            if self.heard.is_empty() {
-                ui.colored_label(c.text_weak, "nobody heard from yet");
-            }
-            for p in self.heard.recent().iter().take(8) {
-                ui.colored_label(c.text_weak, egui::RichText::new(format!(
-                    "{} · {}.{}.{}.{}:{}", p.sc_id,
-                    p.addr.ip[0], p.addr.ip[1], p.addr.ip[2], p.addr.ip[3], p.addr.port))
-                    .size(11.0));
-            }
+            // THE PORTED VIEW, not a partial reimplementation of it. The
+            // inline version printed sc_id and a dotted quad and ignored
+            // `punch` entirely — so it showed an address without saying
+            // whether it was still usable, which is the one thing the module
+            // exists to convey: "an address nobody has confirmed in minutes is
+            // a guess wearing a fact's clothes".
+            //
+            // gossip_ui adds the age and a "direct" marker when a punchable
+            // address is cached, which is the actionable fact — a direct
+            // connection can be attempted rather than a relay.
+            let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+            crate::punch_addrs::gossip_ui(ui, &self.heard, &self.punch, now_ms, c);
         });
         ui.collapsing("diagnostics", |ui| {
             use crate::trace_channels::Channel;
