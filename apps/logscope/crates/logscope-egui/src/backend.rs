@@ -2584,3 +2584,74 @@ mod ctxfit_packing {
         assert_eq!(f.window, 1_048_576);
     }
 }
+
+// ── the zero-caller guard ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod published_signals {
+    //! Three times in one session a SIGNAL was published with nothing reading it:
+    //! `memplan::iq1s_load_plan` (tests, no callers, and a doc asserting a gap that had closed),
+    //! `COMPACT_REQUEST` (the long-horizon policy publishing a request no UI consumed), and
+    //! `context_fit()` (the engine measuring prompt/window/elision for nobody). Each looked
+    //! implemented and did nothing, and none of them could fail a test, because the code was
+    //! correct — it simply was not reached.
+    //!
+    //! This is the guard for that class, scoped to where it keeps happening: the atomics
+    //! `backend.rs` publishes for the UI. A signal nothing loads is dead; an accessor the chat
+    //! never calls is a measurement taken and thrown away. Source-scanning rather than
+    //! type-checking because the defect is precisely the thing a compiler is happy about — the
+    //! same reason `perfverdict` reads `main.rs` with `include_str!` to check the gate list.
+
+    const BACKEND: &str = include_str!("backend.rs");
+    const CHAT: &str = include_str!("tabs/chat.rs");
+
+    /// Names of the atomics `backend.rs` publishes for consumption (`pub`/`pub(crate)` statics).
+    fn published() -> Vec<String> {
+        BACKEND.lines().filter_map(|l| {
+            let t = l.trim_start();
+            let rest = t.strip_prefix("pub(crate) static ").or_else(|| t.strip_prefix("pub static "))?;
+            let (name, ty) = rest.split_once(':')?;
+            ty.contains("Atomic").then(|| name.trim().to_string())
+        }).collect()
+    }
+
+    #[test]
+    fn every_published_signal_is_both_stored_and_loaded() {
+        let names = published();
+        assert!(names.len() >= 3, "the scan found {} — it stopped matching the declarations", names.len());
+        for n in &names {
+            assert!(BACKEND.contains(&format!("{n}.store(")),
+                    "{n} is published but never written — nothing can be signalled through it");
+            let loaded = BACKEND.contains(&format!("{n}.load(")) || CHAT.contains(&format!("{n}\n"))
+                || CHAT.contains(&format!("{n}."));
+            assert!(loaded, "{n} is written and never read — a signal with no consumer, which is \
+what COMPACT_REQUEST was until the compaction banner landed");
+        }
+    }
+
+    #[test]
+    fn every_accessor_over_a_published_signal_has_a_caller_in_the_chat() {
+        // `pub fn foo(&self)` in backend.rs whose body loads one of the published atomics is an
+        // accessor built FOR the UI; if its name never appears in chat.rs, the measurement is
+        // taken and discarded. This is exactly how context_fit() sat unused.
+        let names = published();
+        let mut checked = 0;
+        for (i, line) in BACKEND.lines().enumerate() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("pub fn ") else { continue };
+            let Some(fname) = rest.split(['(', '<']).next() else { continue };
+            // body = until the next line at the same indent starting with '}'
+            let body: String = BACKEND.lines().skip(i + 1).take(12).collect::<Vec<_>>().join("\n");
+            if !names.iter().any(|n| body.contains(&format!("{n}.load("))) { continue; }
+            checked += 1;
+            // `fname(` — a CALL, not a mention. The first draft accepted `CHAT.contains(fname)`
+            // and a deliberate mutation (deleting the only call to `context_fit`) did NOT trip it,
+            // because a comment three lines away still named the function. A guard against dead
+            // code that a comment can satisfy is itself dead.
+            assert!(CHAT.contains(&format!("{fname}(")),
+                    "backend::{fname} reads a published signal and nothing in the chat calls it — \
+either wire it up or delete it, but a measurement nobody reads is not a feature");
+        }
+        assert!(checked >= 1, "the accessor scan matched nothing — it has stopped working");
+    }
+}
