@@ -21,6 +21,15 @@ pub mod prefetch;
 pub mod mladims;
 pub mod rolequant;
 pub mod ragged;
+pub mod steer;
+pub mod probe;
+pub mod tourney;
+pub mod reap;
+pub mod round;
+pub mod corpus;
+pub mod horizon;
+pub mod scope;
+pub mod recover;
 pub mod specverify;
 pub mod batchplan;
 pub mod q2demote;
@@ -1186,8 +1195,10 @@ fn pass_fuse_enabled() -> bool {
 fn bind_group_cache_enabled() -> bool {
     fast_decode_enabled() || std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
-/// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
-/// scratch). Bit-identical to the unfused path; enabled by the magical A/B (or LOGSCOPE_FUSE_GLU=1).
+// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
+// scratch). Bit-identical to the unfused path; enabled by the magical A/B (or LOGSCOPE_FUSE_GLU=1).
+// Plain comment, not doc: rustdoc does not attach documentation to a macro invocation, so `///`
+// here is silently discarded and warns.
 thread_local! {
     /// Force the MoE fusions on inside a scope, independent of the decode verdict.
     static FUSE_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1274,6 +1285,11 @@ type Pending = (wgpu::ComputePipeline, std::sync::Arc<wgpu::BindGroup>, (u32, u3
 /// allocation-free (amortized Vec growth aside). Measured-by-construction: 2 heap allocations per
 /// dispatch -> 0. The latency delta is deliberately UNCLAIMED — llvmpipe timings in this sandbox
 /// say nothing about the operator's M2, where encode was profiled at 84% of decode wall time.
+/// dead_code fires on both fields and rustc suggests replacing them with `()`. Taking that
+/// suggestion would drop the Arc at push time and free a bind group the GPU is still reading —
+/// the "Buffer 'dims' is invalid" failure `pending_keep` exists to prevent. The field is read by
+/// Drop, which the lint cannot see.
+#[allow(dead_code)]
 enum Keep { Bg(std::sync::Arc<wgpu::BindGroup>), Buf(std::sync::Arc<wgpu::Buffer>) }
 
 struct Frame { enc: wgpu::CommandEncoder, pending: Vec<Pending>, keep: Vec<Keep>, passes: u32,
@@ -11866,7 +11882,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
     /// in a packed-int8 word shows up rather than comparing equal.
     pub fn int8_cache_diff(&self, a: &Model, b: &Model) -> String {
         let bits = |t: &Tensor| -> Vec<u32> { self.download(t).iter().map(|f| f.to_bits()).collect() };
-        let mut cmp = |name: String, x: &Tensor, y: &Tensor| -> Option<String> {
+        let cmp = |name: String, x: &Tensor, y: &Tensor| -> Option<String> {
             let (xa, ya) = (bits(x), bits(y));
             if xa.len() != ya.len() { return Some(format!("{name}: LENGTH {} vs {}", xa.len(), ya.len())); }
             xa.iter().zip(&ya).position(|(p, q)| p != q)
@@ -11884,9 +11900,9 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
                 _ => {}
             }
             match (&la.kind, &lb.kind) {
-                (LinKind::F32(x), LinKind::F32(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.f32"), x, y) }
-                (LinKind::Q8(x), LinKind::Q8(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
-                (LinKind::Q4(x), LinKind::Q4(y)) => { let mut c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
+                (LinKind::F32(x), LinKind::F32(y)) => { let c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.f32"), x, y) }
+                (LinKind::Q8(x), LinKind::Q8(y)) => { let c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
+                (LinKind::Q4(x), LinKind::Q4(y)) => { let c = |n: String, x: &Tensor, y: &Tensor| { let (xa, ya): (Vec<u32>, Vec<u32>) = (g.download(x).iter().map(|f| f.to_bits()).collect(), g.download(y).iter().map(|f| f.to_bits()).collect()); if xa.len() != ya.len() { return Some(format!("{n}: LENGTH")); } xa.iter().zip(&ya).position(|(p, q)| p != q).map(|i| format!("{n}[{i}]: {:#010x} vs {:#010x}", xa[i], ya[i])) }; c(format!("{name}.qw"), &x.qw, &y.qw).or_else(|| c(format!("{name}.qs"), &x.qs, &y.qs)) }
                 _ => Some(format!("{name}: KIND differs")),
             }
         };
@@ -12887,6 +12903,135 @@ pub struct SessionQ8 {
     pub generated: Vec<u32>,
     pub rng: u64,
     pub done: bool,
+}
+
+/// Which layers and positions a capture pass should read the residual out at.
+///
+/// Positions are restricted because capturing every token multiplies the readback cost by the
+/// generation length for no gain: a probe wants ONE row per branch at a comparable point, and
+/// mixing positions makes the fitted direction partly a position detector.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureSpec {
+    layers: Vec<usize>,
+    /// Absolute positions to capture at. Empty means every position, which is almost never wanted.
+    positions: Vec<usize>,
+}
+
+impl CaptureSpec {
+    /// Capture at `layers`, only at `pos`. The single-row-per-branch case, which is the one
+    /// `probe::LayerSweep` is built for.
+    pub fn at(layers: impl IntoIterator<Item = usize>, pos: usize) -> Self {
+        let mut layers: Vec<usize> = layers.into_iter().collect();
+        layers.sort_unstable(); layers.dedup();
+        CaptureSpec { layers, positions: vec![pos] }
+    }
+    pub fn layers(&self) -> &[usize] { &self.layers }
+    pub fn is_empty(&self) -> bool { self.layers.is_empty() }
+    /// Readbacks one full generation of `tokens` tokens costs at this spec.
+    pub fn downloads(&self, tokens: usize) -> usize {
+        let p = if self.positions.is_empty() { tokens } else { self.positions.len().min(tokens) };
+        self.layers.len() * p
+    }
+    fn wants(&self, layer: usize) -> bool { self.layers.binary_search(&layer).is_ok() }
+    fn wants_pos(&self, pos: usize) -> bool {
+        self.positions.is_empty() || self.positions.contains(&pos)
+    }
+}
+
+/// Residual rows read out during a capture pass.
+#[derive(Clone, Debug, Default)]
+pub struct Captured {
+    rows: Vec<(usize, usize, Vec<f32>)>,
+}
+
+impl Captured {
+    pub fn new() -> Self { Captured::default() }
+    pub fn len(&self) -> usize { self.rows.len() }
+    pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+    fn push(&mut self, layer: usize, pos: usize, h: Vec<f32>) { self.rows.push((layer, pos, h)); }
+    /// Every row captured at `layer`, in capture order.
+    pub fn at_layer(&self, layer: usize) -> impl Iterator<Item = (usize, &[f32])> {
+        self.rows.iter().filter(move |(l, _, _)| *l == layer).map(|(_, p, h)| (*p, h.as_slice()))
+    }
+    /// Feed one branch's capture into a sweep, tagged with the fork it descended from and the
+    /// outcome it reached.
+    ///
+    /// `fork` is not optional and not cosmetic: `probe` cross-validates by fork, because siblings of
+    /// one fork are not independent observations and a probe validated across them measures nothing
+    /// that transfers. Passing a distinct id per branch would defeat that silently, so pass the
+    /// FORK's id, not the branch's.
+    ///
+    /// Returns how many rows landed. Zero means the branch never reached the captured layer or
+    /// position, which is a scheduling bug worth noticing rather than a branch with no opinion.
+    pub fn feed(&self, sweep: &mut crate::probe::LayerSweep, fork: usize, ok: bool) -> usize {
+        let mut n = 0;
+        for (_, h) in self.at_layer(sweep.layer()) { if sweep.push(fork, h, ok) { n += 1; } }
+        n
+    }
+}
+
+/// Residual-stream steering biases, uploaded once for a whole round.
+///
+/// `steer::Plan` decides WHAT to add; this decides how often it reaches the GPU. Gain is a
+/// function of position, so a round has at most `ramp + 1` distinct non-zero levels per layer
+/// (exactly one when the ramp is off) — the bank enumerates the round's positions up front,
+/// dedupes by level, and uploads one tensor each. Doing it per token instead would put an
+/// `upload` on the decode hot path, which is the one thing this mechanism cannot afford to cost.
+pub struct SteerBank {
+    plan: crate::steer::Plan,
+    /// (layer, gain bit pattern, the vector already scaled by that gain).
+    biases: Vec<(usize, u32, Tensor)>,
+}
+
+impl SteerBank {
+    /// The unsteered bank. `decode_step` runs through the same code path with this, so the
+    /// unsteered path is not a separate implementation that could drift from the steered one —
+    /// it IS the steered one at zero gain, which is what makes the no-op gate meaningful.
+    pub fn none() -> Self {
+        SteerBank { plan: crate::steer::Plan::default(), biases: Vec::new() }
+    }
+    pub fn is_empty(&self) -> bool { self.biases.is_empty() }
+    pub fn uploads(&self) -> usize { self.biases.len() }
+
+    fn at(&self, layer: usize, pos: usize) -> Option<&Tensor> {
+        if self.biases.is_empty() { return None; }
+        let g = self.plan.gain_at(pos);
+        if g == 0.0 { return None; }
+        let bits = g.to_bits();
+        self.biases.iter().find(|(l, b, _)| *l == layer && *b == bits).map(|(_, _, t)| t)
+    }
+}
+
+/// What a speculative run leaves behind: the target KV cache it built and how far it filled.
+///
+/// A turn's cache is the next turn's anchor. Returning it is what lets the speculative path take
+/// part in prefix reuse instead of bypassing it.
+#[derive(Default)]
+pub struct SpecRun { pub cache: Option<KvCache>, pub pos: usize }
+
+/// How a speculative run gets the prompt into the target's KV cache.
+///
+/// Not an internal detail: `PerPosition` costs one full decode step per prompt token, which on a
+/// measured 139 ms/token device is 227 s of time-to-first-token for a 1626-token prompt against
+/// 14.7 s chunked. It is what the correctness gates compare against and it is unusable in a chat.
+// No PartialEq/Debug: the Seeded variant holds a &KvCache, and a cache is neither comparable nor
+// printable. Nothing needs to compare prefill strategies, and deriving it would have forced those
+// traits onto every tensor in the cache to satisfy a convenience.
+#[derive(Clone, Copy)]
+pub enum SpecPrefill<'a> {
+    /// One `decode_step` per prompt token. Bit-identical to `generate_kv`; O(prompt) decode steps.
+    PerPosition,
+    /// Batched prefill at this chunk size — the same call ordinary streaming makes.
+    Chunked(usize),
+    /// Copy `len` rows of KV from `src`, then batch-prefill only the divergent suffix.
+    ///
+    /// The same two steps ordinary streaming takes on a prefix-tree hit, and the reason speculation
+    /// is currently a NET LOSS on any turn after the first. Measured on the operator's run: a
+    /// 1626-token prompt reused 97% of its prefill at 1.12 s, where a fresh chunked prefill costs
+    /// 14.7 s. Against 39 output tokens that is 8.2 tok/s with reuse and 2.1 without — and ordinary
+    /// non-speculative streaming, which reuses, gets 6.0. The drafter's 1.49x cannot pay for a
+    /// thrown-away prefix cache.
+    Seeded { src: &'a KvCache, len: usize },
 }
 
 /// One independent generation session: its own KV cache, stream position and RNG,
@@ -14644,6 +14789,52 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     pub fn decode_step(&self, m: &Model, c: &KvCache, token: u32, pos: usize) -> Vec<f32> {
+        self.decode_step_steered(m, c, token, pos, &SteerBank::none())
+    }
+
+    /// Upload every distinct (layer, gain) bias this plan needs over `positions`.
+    pub fn steer_bank(&self, plan: &crate::steer::Plan, positions: std::ops::Range<usize>) -> SteerBank {
+        let mut biases: Vec<(usize, u32, Tensor)> = Vec::new();
+        for layer in plan.layers() {
+            for pos in positions.clone() {
+                let g = plan.gain_at(pos);
+                if g == 0.0 { continue; }
+                let bits = g.to_bits();
+                if biases.iter().any(|(l, b, _)| *l == layer && *b == bits) { continue; }
+                if let Some(v) = plan.bias_at(layer, pos) {
+                    let t = self.upload(&v, 1, v.len());
+                    biases.push((layer, bits, t));
+                }
+            }
+        }
+        SteerBank { plan: plan.clone(), biases }
+    }
+
+    /// `decode_step` with a residual-stream bias added after each steered block.
+    ///
+    /// One `add_bias_t` per steered layer per token, and only where the schedule says so — an empty
+    /// bank adds a `Vec::is_empty()` check to the loop and nothing else.
+    pub fn decode_step_steered(&self, m: &Model, c: &KvCache, token: u32, pos: usize, bank: &SteerBank) -> Vec<f32> {
+        self.decode_step_full(m, c, token, pos, bank, None)
+    }
+
+    /// One decode step with optional steering AND optional residual capture.
+    ///
+    /// Capture is what feeds `probe::LayerSweep` — until this exists, every direction in `probe`,
+    /// `steer` and `tourney` is fitted to synthetic data. It is a `download` per requested layer, so
+    /// it belongs on a capture pass and not on ordinary decode: `PLATFORM_VALIDATION` records what
+    /// mid-decode readbacks did to frame batching before `download()` learned to reopen the frame
+    /// (~23 stray submits per layer on Scout), and even fixed it is a submit per layer per token.
+    /// That cost is the whole reason `tourney` exists — probe four layers, not thirty-two.
+    ///
+    /// **Capture happens BEFORE this layer's bias is added.** Reversing that is the one ordering
+    /// mistake here that manufactures results rather than losing them: round N+1's probe would be
+    /// fitting the direction round N injected, and the tournament would rediscover its own steering
+    /// vector with a beautiful held-out AUC. `capture_precedes_injection` pins it.
+    pub fn decode_step_full(
+        &self, m: &Model, c: &KvCache, token: u32, pos: usize,
+        bank: &SteerBank, mut cap: Option<(&CaptureSpec, &mut Captured)>,
+    ) -> Vec<f32> {
         self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
@@ -14664,6 +14855,15 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
                 _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
             };
+            // Capture first: this layer's UNSTEERED output is what a probe may legitimately learn
+            // from. See the ordering note on this function.
+            if let Some((spec, out)) = cap.as_mut() {
+                if spec.wants(li) && spec.wants_pos(pos) { out.push(li, pos, self.download(&x)); }
+            }
+            // The injection. AFTER the block, so the bias enters the residual stream the next block
+            // reads — and after this layer's K/V has already been written, so a steered position
+            // steers what follows rather than retroactively editing its own cache row.
+            if let Some(b) = bank.at(li, pos) { x = self.add_bias_t(&x, b); }
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
@@ -15419,7 +15619,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// bench can report acceptance rate and effective tokens-per-target-forward.
     /// Speculative decoding with a MODEL as the drafter. Unchanged entry point.
     pub fn speculative_generate_stats(&self, target: &Model, draft: &Model, prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
-        self.spec_core(target, Some(draft), None, prompt, n_new, k, st)
+        self.spec_core(target, Some(draft), None, prompt, n_new, k, SpecPrefill::PerPosition, st, None)
     }
 
     /// Speculative decoding with NO second checkpoint: any `Drafter` proposes, the same verifier
@@ -15430,18 +15630,79 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// of accept/reject to add a drafter would have put that proof out of date immediately.
     pub fn speculative_generate_drafter(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
         prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
-        self.spec_core(target, None, Some(drafter), prompt, n_new, k, st)
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, SpecPrefill::PerPosition, st, None)
+    }
+
+    /// As `speculative_generate_drafter`, choosing how the prompt is prefilled.
+    ///
+    /// The per-position prefill is not a performance detail, it is the difference between the
+    /// feature being usable and not. It runs one full decode step per prompt token: on a measured
+    /// 139 ms/token device a 1626-token prompt costs 227 SECONDS before the first output token,
+    /// against 14.7 s for the same prompt through `prefill_chunked` and 1.12 s when the prefix tree
+    /// hits. Nobody enabling speculation ever reaches the point of finding out whether the
+    /// acceptance rate is any good.
+    pub fn speculative_generate_drafter_with(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
+        prompt: &[u32], n_new: usize, k: usize, prefill: SpecPrefill<'_>, st: &mut SpecStats) -> Vec<u32> {
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, prefill, st, None)
+    }
+
+    /// As `speculative_generate_drafter_with`, also returning the cache the run built so the caller
+    /// can anchor the next turn from it.
+    pub fn speculative_generate_drafter_run(&self, target: &Model, drafter: &mut dyn crate::spec::Drafter,
+        prompt: &[u32], n_new: usize, k: usize, prefill: SpecPrefill<'_>, st: &mut SpecStats,
+        run: &mut SpecRun) -> Vec<u32> {
+        self.spec_core(target, None, Some(drafter), prompt, n_new, k, prefill, st, Some(run))
     }
 
     fn spec_core(&self, target: &Model, draft: Option<&Model>,
         mut drafter: Option<&mut dyn crate::spec::Drafter>, prompt: &[u32], n_new: usize, k: usize,
-        st: &mut SpecStats) -> Vec<u32> {
+        prefill: SpecPrefill<'_>, st: &mut SpecStats, out: Option<&mut SpecRun>) -> Vec<u32> {
         let k = k.max(1);
         let max_seq = prompt.len() + n_new + 2 * k + 8;
         let tc = self.new_cache(target.n_layers, max_seq, target.kv_dim());
-        // prefill the target like generate_kv (per-position) so the running logits match bit-for-bit.
+        // How the prompt gets into the target's KV.
+        //
+        // PerPosition matches `generate_kv` bit-for-bit, which is what the correctness gates compare
+        // against, and costs one full decode step per prompt token — 227 s for a 1626-token prompt on
+        // a 139 ms/token device. Chunked is the path ordinary streaming already uses and is what the
+        // "identical output, only faster" claim is measured against in practice; it is the only one
+        // that makes speculation reachable on a real prompt.
+        //
+        // Whether the two agree bit-for-bit is a question about the prefill GEMM against the matvec,
+        // not about speculation, and it is unmeasured here — `spec_prefill_paths_agree` in the gate
+        // set answers it on hardware. If they diverge, the divergence is already present in ordinary
+        // streaming and speculation only makes it visible.
         let mut prev = Vec::new();
-        for pos in 0..prompt.len() { prev = self.decode_step(target, &tc, prompt[pos], pos); }
+        match prefill {
+            SpecPrefill::PerPosition => {
+                for pos in 0..prompt.len() { prev = self.decode_step(target, &tc, prompt[pos], pos); }
+            }
+            // The chunk size is the CALLER's, not recomputed here: `prefill_chunk_for_streaming`
+            // already owns that rule and the codebase's own note on it is that two copies of a
+            // tuning rule is how they drift.
+            SpecPrefill::Chunked(chunk) => { prev = self.prefill_chunked(target, &tc, prompt, chunk.max(1)); }
+            SpecPrefill::Seeded { src, len } => {
+                // Same two steps as the streaming reuse path: copy the shared rows, then run the
+                // divergent suffix through the BATCHED kernel rather than per-token decode. The
+                // suffix must be batched for the reason that path already documents — per-token and
+                // batched differ by about 1e-6, enough to tip a near-tied eos in a long context.
+                let len = len.min(prompt.len());
+                let kv = target.kv_dim();
+                for li in 0..target.n_layers {
+                    self.write_rows(&tc.k[li], &src.k[li], 0, len, kv);
+                    self.write_rows(&tc.v[li], &src.v[li], 0, len, kv);
+                }
+                if len < prompt.len() {
+                    let all = self.verify_forward(target, &tc, &prompt[len..], len);
+                    prev = all[all.len() - target.vocab..].to_vec();
+                } else {
+                    // The whole prompt was already in the seed; re-run the last token to obtain the
+                    // logits it implies, since the seed carries KV and not a distribution.
+                    let all = self.verify_forward(target, &tc, &prompt[prompt.len() - 1..], prompt.len() - 1);
+                    prev = all[all.len() - target.vocab..].to_vec();
+                }
+            }
+        }
         let mut pos = prompt.len();
         // PERSISTENT draft session: prefilled once, then resynced incrementally each round.
         // Only the model drafter carries a session. A Drafter is stateless from the loop's side:
@@ -15500,6 +15761,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             for t in emit { if gen.len() >= n_new { break; } gen.push(t); st.emitted += 1; }
         }
         gen.truncate(n_new);
+        // Hand the cache back. Without this the caller can CONSUME a prefix-tree entry to seed a run
+        // and has nothing to put back, so wiring reuse in would strip the pool one turn at a time —
+        // which is why the speculative path bypassed reuse entirely and paid a full prefill instead.
+        if let Some(o) = out { o.pos = pos; o.cache = Some(tc); }
         gen
     }
 

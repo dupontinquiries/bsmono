@@ -173,6 +173,20 @@ pub(crate) mod engine {
         /// draft proposes a block of tokens that the target verifies in ONE forward — bit-exact to
         /// greedy decode, but more tokens per expensive target pass. Must share the target's vocab.
         draft: Option<Model>,
+        /// Previous speculative turn's committed context and the cache it left behind.
+        ///
+        /// A single slot, deliberately separate from the shared prefix pool: `spec_core` owns its
+        /// cache, so a speculative turn that consumed a pool entry would have nothing to put back
+        /// and would strip the pool one turn at a time. One slot is all a linear chat needs, and it
+        /// touches none of the pool's invariants.
+        spec_anchor: Option<(Vec<u32>, gpu_kernels::SpecRun)>,
+        /// Long-horizon watcher. ADVISORY ONLY — it observes the numbers this file already prints and
+        /// says what it would do, and changes nothing.
+        ///
+        /// Deliberately measure-before-mutate. The detector was built from one seventeen-turn log and
+        /// its job is to rewrite the operator's transcript; before it is allowed to do that it should
+        /// be seen firing, or not firing, on real traffic. A wrong compaction is expensive and silent.
+        horizon: std::cell::RefCell<gpu_kernels::horizon::Horizon>,
     }
     impl Engine {
         pub fn load(path: &str) -> Result<Self, String> {
@@ -679,7 +693,8 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 }
                 _ => None,
             };
-            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false })
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false, spec_anchor: None,
+                horizon: std::cell::RefCell::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)) })
         }
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
@@ -708,6 +723,10 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
         pub fn lane(&self, n: usize) -> Engine {
             Engine {
                 gpu: self.gpu.clone(), model: self.model.clone(), tok: self.tok.clone(),
+                // A lane starts with no speculative anchor: the cache is not shareable across lanes
+                // (each holds its own KV) and a lane's first prompt is a different branch anyway.
+                spec_anchor: None,
+                horizon: std::cell::RefCell::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)),
                 eos: self.eos, stop_ids: self.stop_ids.clone(), template: self.template,
                 rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
                 anchors: Vec::new(), kv_cap: 1, pool: None, warm: self.warm,
@@ -1009,8 +1028,50 @@ names which)",
                 let mut d = gpu_kernels::spec::PromptLookup { ngram: ng };
                 let mut st = gpu_kernels::SpecStats::default();
                 let td = Instant::now();
-                let ids = self.gpu.speculative_generate_drafter(&self.model, &mut d, &prompt_ids,
-                                                                n_new, k, &mut st);
+                // CHUNKED, not per-position. `speculative_generate_drafter` prefills one decode step
+                // per prompt token: on the measured 139 ms/token Asahi run that is 227 s of
+                // time-to-first-token for a 1626-token prompt, against 14.7 s here — so the operator
+                // who follows the engine's own advice to set LOGSCOPE_SPEC_DRAFT=lookup waits four
+                // minutes for a first token and concludes the feature is broken. Same chunk rule as
+                // ordinary streaming, from the one helper that owns it.
+                let chunk = prefill_chunk_for_streaming(self.model.d, self.model.h,
+                    self.model.streams_experts(), self.model.moe_counts());
+                // SINGLE-SLOT ANCHOR, not the shared prefix pool. spec_core owns its cache, so
+                // consuming a pool entry would leave nothing to put back and would strip the pool a
+                // turn at a time; keeping the previous speculative turn's own cache here reuses the
+                // prefix without touching the pool's invariants at all. In a linear chat that is the
+                // same 97% hit ordinary streaming gets — and without it speculation is a NET LOSS on
+                // every turn after the first: 2.1 tok/s against plain streaming's 6.0, because a
+                // 14.7 s fresh prefill swamps a drafter worth 1.49x.
+                let seeded = self.spec_anchor.as_ref().and_then(|(toks, run)| {
+                    let n = toks.iter().zip(&prompt_ids).take_while(|(a, b)| a == b).count();
+                    // Leave the last shared token to the suffix pass so there is always a batched
+                    // forward to produce logits from; a zero-length suffix has no distribution.
+                    let n = n.min(prompt_ids.len().saturating_sub(1)).min(run.pos);
+                    run.cache.as_ref().filter(|_| n >= 16).map(|c| (c, n))
+                });
+                let prefill = match seeded {
+                    Some((c, n)) => {
+                        crate::diag!("wgpu-engine: [{}] speculative prefix reuse — {n} of {} prompt \
+tokens seeded from the previous speculative turn, {} to prefill",
+                            self.name, prompt_ids.len(), prompt_ids.len() - n);
+                        gpu_kernels::SpecPrefill::Seeded { src: c, len: n }
+                    }
+                    None => {
+                        crate::diag!("wgpu-engine: [{}] speculative prefill — {} prompt tokens, chunk \
+{chunk}, no anchor yet (first speculative turn, or the prompt diverged early)",
+                            self.name, prompt_ids.len());
+                        gpu_kernels::SpecPrefill::Chunked(chunk)
+                    }
+                };
+                let mut run = gpu_kernels::SpecRun::default();
+                let ids = self.gpu.speculative_generate_drafter_run(&self.model, &mut d, &prompt_ids,
+                    n_new, k, prefill, &mut st, &mut run);
+                // Keep this turn's cache as the next turn's anchor. The committed context is the
+                // prompt plus what was generated, which is exactly what the next prompt will extend.
+                let mut anchor_toks = prompt_ids.clone();
+                anchor_toks.extend_from_slice(&ids);
+                self.spec_anchor = Some((anchor_toks, run));
                 let secs = td.elapsed().as_secs_f32().max(1e-3);
                 let mut produced = 0usize;
                 let mut pending: Vec<u8> = Vec::new();
@@ -1210,6 +1271,42 @@ was evicted)", prompt_ids.len())
                     format!("full prefill (first turn for this model)")
                 },
                 t0.elapsed().as_secs_f32());
+
+            // ── long-horizon watch (advisory) ────────────────────────────────────────────────────
+            // Feeds horizon the same numbers the line above just printed. It changes nothing; it says
+            // what it would change, so the diagnosis can be checked against real traffic before it is
+            // allowed to rewrite anyone's transcript.
+            //
+            // The window is read per turn rather than fixed at construction because the operator can
+            // move the n_ctx slider mid-session, and a watcher advising against a window that is no
+            // longer in force is worse than no watcher.
+            {
+                let mut hz = self.horizon.borrow_mut();
+                if hz.window() != window { *hz = gpu_kernels::horizon::Horizon::new(window, 512, l.max(1)); }
+                hz.observe(gpu_kernels::horizon::Turn {
+                    prompt_len: prompt_ids.len(),
+                    reused: if reuse { l } else { 0 },
+                    prefill_s: t0.elapsed().as_secs_f32(),
+                    emitted: 0, // filled by the next turn's prompt growth; not used by the policy
+                });
+                match hz.advise(prompt_ids.len()) {
+                    gpu_kernels::horizon::Move::Continue => {}
+                    // ctxwin::auto_window already sizes the window from the PROMPT and the device
+                    // budget. horizon adds the axis it cannot see: whether the history is worth
+                    // keeping. So this is phrased as a slider recommendation rather than as a
+                    // competing autotuner — two things sizing the same window from different
+                    // evidence is how they end up fighting.
+                    gpu_kernels::horizon::Move::Grow { to, why } => crate::diag!(
+                        "wgpu-engine: [{}] long-horizon ADVISORY (nothing changed) — this chat would \
+use an n_ctx of {to}; auto_window sizes to the prompt, it cannot see that the history is worth \
+keeping: {why}", self.name),
+                    gpu_kernels::horizon::Move::Compact { keep_prefix, also_grow, why } => crate::diag!(
+                        "wgpu-engine: [{}] long-horizon ADVISORY (nothing changed) — summarise and \
+continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
+                        match also_grow { Some(to) => format!(" and raise the window to {to}"), None => String::new() }),
+                }
+            }
+
             let td = Instant::now();
             // Batch 3: snapshot the engine's dispatch counters so we can report the CPU-bound (setup)
             // vs GPU-bound (sync) split for THIS generation — the data that answers "why is llama.cpp
@@ -1386,10 +1483,44 @@ was evicted)", prompt_ids.len())
             // prefix `l`. Under-reporting to `l` capped continuation reuse: a child resuming from this tip got
             // clamped to the seed and blew past the 256 suffix window into a full prefill (the 3/24 ceiling).
             let mut prefill_len = prompt_ids.len();
-            // Self-heal: anchor reuse that stops at 0 tokens (with no cancel) may have hit residual
-            // reuse drift tipping a near-tied eos — retry once with a clean full prefill. If that
-            // also yields nothing, the model genuinely stopped (nothing more to be done here).
-            if reuse && produced == 0 && !cancel() {
+            // Was the empty reply the model cleanly stopping, or something going wrong?
+            //
+            // `stream_session` breaks on eos BEFORE calling `on_token`, so an eos-first reply leaves
+            // `produced == 0` and `stop_tok == None` — indistinguishable from a cap, a guard trip or
+            // a cancel. `s.logits` is left at the distribution eos was drawn from, so the answer is
+            // right there: top-1 and its margin over the runner-up.
+            //
+            // The retry below justifies itself as recovering a NEAR-TIED eos tipped by reuse drift.
+            // That is a good hypothesis and it was never checked — the retry fired on the token count
+            // alone. When the model wants to stop by a wide margin a clean prefill reproduces it
+            // exactly, and the retry is a full redundant prefill for nothing: three of them in one
+            // observed session at 17.2s, 17.3s and 17.7s, which the operator experiences as the app
+            // hanging and the model "being fussy".
+            let stop_margin = |lg: &[f32]| -> Option<(u32, f32)> {
+                if lg.is_empty() { return None; }
+                let (mut i1, mut v1, mut v2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for (i, v) in lg.iter().enumerate() {
+                    if *v > v1 { v2 = v1; v1 = *v; i1 = i; } else if *v > v2 { v2 = *v; }
+                }
+                Some((i1 as u32, v1 - v2))
+            };
+            // Below this the two candidates really could swap under a different prefill path, which
+            // is the only case the retry was ever meant to cover.
+            const NEAR_TIE_LOGITS: f32 = 0.5;
+            let stopped_decisively = match stop_margin(&s.logits) {
+                Some((top, margin)) => stop.contains(&top) && margin >= NEAR_TIE_LOGITS,
+                None => false,
+            };
+            if reuse && produced == 0 && stopped_decisively && !cancel() {
+                if let Some((top, margin)) = stop_margin(&s.logits) {
+                    crate::diag!("wgpu-engine: reuse produced 0 tokens, but the model chose stop token {top} \
+                                  by {margin:.2} logits over the runner-up — that is the model stopping, not \
+                                  reuse drift, and a clean prefill would reproduce it. Retry SKIPPED (it costs \
+                                  a full prefill); LOGSCOPE_ALWAYS_REPREFILL=1 forces it anyway.");
+                }
+            }
+            let force_retry = std::env::var("LOGSCOPE_ALWAYS_REPREFILL").as_deref() == Ok("1");
+            if reuse && produced == 0 && (!stopped_decisively || force_retry) && !cancel() {
                 crate::diag!("wgpu-engine: reuse produced 0 tokens — retrying with a clean full prefill…");
                 let mut s2 = self.gpu.session_new(&self.model, cap, self.rng);
                 s2.logits = self.gpu.prefill_chunked(&self.model, &s2.cache, &prompt_ids, prefill_chunk_for_streaming(self.model.d, self.model.h, self.model.streams_experts(), self.model.moe_counts()));
@@ -1711,12 +1842,24 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name, bgh as f64 / per);
             // argmax of the final logits is what the model wanted next (its stop token, if it stopped).
             if produced < 24 {
                 let tail: Vec<u32> = s.generated.iter().rev().take(16).rev().copied().collect();
+                let next_argmax = s.logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i);
                 let why = match stop_tok.get() {
                     Some(t) if Some(t) == self.eos => format!("model emitted EOS {t}"),
                     Some(t) => format!("model emitted stop token {t}"),
-                    None => "token cap / runaway guard / cancel (no stop token seen)".to_string(),
+                    // `stream_session` breaks on eos before `on_token` runs, so an eos-first reply
+                    // arrives here with stop_tok unset. Reporting it as a cap or a guard trip sends
+                    // the reader looking for a limit that was never hit — the observed log said
+                    // "no stop token seen" on the same line as "argmax=Some(128009)", which IS a
+                    // stop token. `s.logits` is the distribution eos was drawn from, so read it.
+                    None => match next_argmax.map(|i| i as u32) {
+                        Some(t) if Some(t) == self.eos =>
+                            format!("model emitted EOS {t} as its FIRST token (uncounted: stream_session \
+                                     breaks on eos before the stop callback)"),
+                        Some(t) if self.stop_ids.contains(&t) =>
+                            format!("model chose stop token {t} first (uncounted, same path as EOS)"),
+                        _ => "token cap / runaway guard / cancel (no stop token seen)".to_string(),
+                    },
                 };
-                let next_argmax = s.logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i);
                 let decoded = String::from_utf8_lossy(&self.tok.decode_bytes(&s.generated)).replace('\n', "\\n");
                 crate::diag!("wgpu-engine: [{}] SHORT REPLY ({produced} tok) — stop: {why}; stop_set={:?}; next-token argmax={:?}",
                     self.name, self.stop_ids, next_argmax);

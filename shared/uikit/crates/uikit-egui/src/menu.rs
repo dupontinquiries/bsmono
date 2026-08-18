@@ -33,7 +33,6 @@
 //! never performed it. A context menu without Copy is most of a context menu
 //! missing.
 
-use std::time::Duration;
 
 /// `kHoldMs` — how long a press must rest before it is a hold.
 ///
@@ -275,7 +274,7 @@ pub fn menu_ui(ui: &mut egui::Ui, m: &mut ContextMenu, colors: &crate::PaletteCo
                                  else { colors.text };
                     let text = egui::RichText::new(&item.label).color(colour);
                     let r = ui.add_enabled(item.enabled,
-                        egui::SelectableLabel::new(cursor == Some(i), text));
+                        egui::Button::selectable(cursor == Some(i), text));
                     if r.clicked() { chosen = Some(item.id.clone()); }
                 }
             });

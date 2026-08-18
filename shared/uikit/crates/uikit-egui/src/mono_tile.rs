@@ -98,7 +98,7 @@ pub fn mono_tile(ui: &mut Ui, name: &str, size: f32) -> Response {
     painter.rect_filled(rect, CornerRadius::same((size * 0.24).clamp(2.0, 20.0) as u8), ground);
 
     // draw one rotated, centered copy of the initials
-    let mut layer = |center: Pos2, angle: f32, color: Color32| {
+    let layer = |center: Pos2, angle: f32, color: Color32| {
         let galley = painter.layout_no_wrap(m.clone(), FontId::proportional(fs), color);
         let half = galley.size() * 0.5;
         // position so that rotating the galley about its top-left keeps the glyph centred on `center`

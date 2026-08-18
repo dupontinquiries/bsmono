@@ -122,15 +122,11 @@ impl SetupWizard {
     }
 }
 
-// tiny helper so `ui.weak(text)` reads clearly across egui label helpers
-trait Weak {
-    fn weak(&mut self, text: &str);
-}
-impl Weak for egui::Ui {
-    fn weak(&mut self, text: &str) {
-        self.label(egui::RichText::new(text).weak());
-    }
-}
+// The `Weak` shim that used to live here was dead and had always been dead: egui::Ui has an
+// inherent `weak()`, and inherent methods win over trait methods, so the `ui.weak(..)` call above
+// has always resolved to egui's. dead_code caught it only because the trait lost that race. The
+// sibling in model_picker.rs avoids the collision by naming its helper `weak_label_compat`, which
+// is why that one is actually reachable.
 
 #[cfg(test)]
 mod tests {

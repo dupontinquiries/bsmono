@@ -104,7 +104,6 @@ impl ToggleGrid {
 
         let appear = motion::animate_eased(ui.ctx(), self.id.with("appear"), self.open, 0.14, motion::ease::out_back);
         let states = self.states.clone();
-        let item = self.item_size;
         let gid = self.id;
         egui::Area::new(self.id).order(Order::Foreground).fixed_pos(self.origin).show(ui.ctx(), |ui| {
             let vis = ui.visuals().clone();
