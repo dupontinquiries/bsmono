@@ -840,6 +840,38 @@ impl eframe::App for VoicetermApp {
                         }
                         None => { ui.label("ambient light: no sensor on this device"); }
                     }
+
+                    // WHAT THE HARDWARE ALLOWS, from Sensors — which answers
+                    // all three questions and was called by nothing. The block
+                    // above hand-rolls the light half and never asks about
+                    // proximity at all, so half the capability report the
+                    // module exists to give was missing.
+                    //
+                    // can_auto_brightness needs LUX, not counts: light-kit's
+                    // curve is calibrated in lux and raw counts give a
+                    // differently-shaped response, which looks like bad tuning
+                    // rather than bad units. can_detect_cover only needs
+                    // consistency, so counts are fine. Saying which is
+                    // available is the difference between a missing feature
+                    // and a dead control.
+                    let caps = voiceterm_egui::iio_light::Sensors::detect();
+                    let mut have: Vec<&str> = Vec::new();
+                    if caps.can_auto_brightness() { have.push("auto brightness"); }
+                    if caps.can_detect_cover() { have.push("cover detection"); }
+                    if caps.has_proximity { have.push("proximity"); }
+                    ui.label(egui::RichText::new(if have.is_empty() {
+                        "no sensor features available on this device".to_string()
+                    } else {
+                        format!("available: {}", have.join(", "))
+                    }).weak().small());
+                    if caps.has_light && caps.light_is_relative {
+                        // Named rather than silent: the sensor IS there and
+                        // auto brightness still cannot run, which reads as a
+                        // bug unless the reason is given.
+                        ui.label(egui::RichText::new(
+                            "auto brightness needs lux; this sensor reports relative counts")
+                            .weak().small());
+                    }
                 }
                 for sc in voiceterm_egui::summary_scope::Scope::ALL {
                     if ui.selectable_label(self.summary_scope == sc, sc.label()).clicked() {

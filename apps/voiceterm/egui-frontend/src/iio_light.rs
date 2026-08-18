@@ -200,6 +200,13 @@ pub struct Sensors {
 }
 
 impl Sensors {
+    /// Ask the real sysfs tree.
+    ///
+    /// `detect_in` takes a root so the tests can point at a fixture; every
+    /// caller outside them wants IIO_DEVICES, and making each one name it
+    /// would put the path in the UI.
+    pub fn detect() -> Sensors { Sensors::detect_in(Path::new(IIO_DEVICES)) }
+
     pub fn detect_in(root: &Path) -> Sensors {
         let p = IioSensor::discover_in(root, PROXIMITY_CHANNELS);
         let l = IioSensor::discover_in(root, LIGHT_CHANNELS);
@@ -226,6 +233,37 @@ impl Sensors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_capability_report_reaches_the_settings_page() {
+        // Sensors answers three questions and was called by nothing: the
+        // settings page hand-rolled the light half and never asked about
+        // proximity, so half the report this module exists to give was
+        // missing.
+        let bin = include_str!("bin/voiceterm_egui.rs");
+        assert!(bin.contains("iio_light::Sensors::detect()"),
+                "capability is never asked of the hardware");
+        assert!(bin.contains("caps.can_auto_brightness()"));
+        assert!(bin.contains("caps.has_proximity"),
+                "proximity is still unreported");
+    }
+
+    #[test]
+    fn a_relative_sensor_offers_cover_detection_but_not_brightness() {
+        // The distinction the module argues for: light-kit's curve is
+        // calibrated in LUX, and counts give a differently-shaped response —
+        // wrong in a way that looks like bad tuning rather than bad units.
+        // Differentials only need consistency, so cover detection is fine.
+        let relative = Sensors { has_proximity: false, has_light: true, light_is_relative: true };
+        assert!(!relative.can_auto_brightness(), "counts fed to a lux curve");
+        assert!(relative.can_detect_cover());
+
+        let absolute = Sensors { has_proximity: false, has_light: true, light_is_relative: false };
+        assert!(absolute.can_auto_brightness());
+
+        let none = Sensors { has_proximity: false, has_light: false, light_is_relative: false };
+        assert!(!none.can_auto_brightness() && !none.can_detect_cover());
+    }
     use std::fs;
 
     fn fake(name: &str, files: &[(&str, &str)]) -> PathBuf {
