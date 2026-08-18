@@ -2372,16 +2372,45 @@ impl eframe::App for VoicetermApp {
                         a.render_at(ui, &colors, r.min);
                     }
                     _ => {
-                        // The pane says what it is. Until each view's renderer
-                        // is called from here, naming it is honest and a blank
-                        // box is not — an unlabelled pane reads as broken.
-                        ui.painter().text(
-                            r.center(),
-                            egui::Align2::CENTER_CENTER,
-                            p.view.label(),
-                            egui::FontId::proportional(12.0),
-                            colors.text_weak,
+                        // THE VIEW'S OWN RENDERER, where one exists. mail_view,
+                        // table_view and graph_view are already built, already
+                        // tested, and already called for the full-screen views
+                        // — a pane was labelling itself while the code to draw
+                        // it sat one module away.
+                        //
+                        // Drawn inside a child UI clipped to the pane rect, so
+                        // a list longer than the pane scrolls within it rather
+                        // than painting over its neighbours.
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new().max_rect(r.shrink(6.0)),
                         );
+                        child.set_clip_rect(r.shrink(2.0));
+                        match p.view {
+                            voiceterm_egui::shell::PaneView::Mail => {
+                                voiceterm_egui::mail_view::list_ui(
+                                    &mut child, &mut self.mail, &colors);
+                            }
+                            // Table is NOT wired, deliberately. table_view_ui
+                            // needs headers and rows, and the full-screen call
+                            // gets them from the block the user opened — a
+                            // pane has no such source, and inventing one would
+                            // put fabricated data on screen. The pane needs a
+                            // way to be pointed at a block first; that is a
+                            // model change, not a render call.
+                            _ => {
+                                // Views with no renderer yet still NAME
+                                // themselves. A blank box reads as broken,
+                                // and an unlabelled pane cannot be told from
+                                // one that failed to draw.
+                                child.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    p.view.label(),
+                                    egui::FontId::proportional(12.0),
+                                    colors.text_weak,
+                                );
+                            }
+                        }
                     }
                 }
                 if resp.clicked() {
