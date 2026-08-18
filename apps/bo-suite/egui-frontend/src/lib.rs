@@ -73,6 +73,31 @@ pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundsca
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryTab { Tracks, AllTracks, Albums, Artists, Tags, Playlists }
 
+/// The Library tab names, in tab order.
+///
+/// One list, because the bar renders from it and the enum maps to it: a
+/// second literal list in the view is how a reorder starts naming the wrong
+/// page — the same failure `the_named_page_bar_and_the_swipe_nav_stay_in_step`
+/// guards for the page bar, and the same one the snapclone tab labels hit.
+pub const LIBRARY_TABS: [&str; 6] =
+    ["Tracks", "All tracks", "Albums", "Artists", "Tags", "Playlists"];
+
+impl LibraryTab {
+    pub fn label(self) -> &'static str { LIBRARY_TABS[self as usize] }
+
+    pub fn from_index(i: usize) -> Option<LibraryTab> {
+        Some(match i {
+            0 => LibraryTab::Tracks,
+            1 => LibraryTab::AllTracks,
+            2 => LibraryTab::Albums,
+            3 => LibraryTab::Artists,
+            4 => LibraryTab::Tags,
+            5 => LibraryTab::Playlists,
+            _ => return None,
+        })
+    }
+}
+
 /// Move the view index by a swipe sign, clamped to the ends.
 /// Paint a product silhouette badge: thin strokes (the module pins 1.0–1.2px),
 /// an opacity reveal, and the accent halo blooming behind a change.
@@ -298,6 +323,10 @@ pub struct Controller {
     /// The named page menu at the top of the canvas. PageDots stays the swipe
     /// hint at the bottom; this is the jump-to menu.
     pub page_bar: crate::shell_bits::PageBar,
+    /// The Library's own tab bar. Six tabs — Tracks, All tracks, Albums,
+    /// Artists, Tags, Playlists — do not fit a phone in a plain row, and a
+    /// plain row does not scroll: the last ones simply leave the screen.
+    library_bar: crate::shell_bits::PageBar,
     /// The mixer page's cards, staggered so the page assembles.
     pub cards: Vec<crate::shell_bits::ControlCard>,
     pub speaker_col: crate::channel::ChannelColumn,
@@ -371,6 +400,7 @@ impl Controller {
             key_mute: crate::fileproc::StepKey::new("MUTE", true),
             pending_proc: None,
             page_bar: crate::shell_bits::PageBar::new(&VIEWS),
+            library_bar: crate::shell_bits::PageBar::new(&LIBRARY_TABS),
             // The delay is per-card because only the page knows the order the
             // cards read in.
             cards: VIEWS.iter().enumerate()
@@ -785,27 +815,25 @@ impl Controller {
         // Tracks / Albums / Artists. The tab row stays visible on a detail page
         // so there is always a way out that is not the back chevron — a drill-down
         // you can only leave by one control is where a touch user gets stuck.
-        ui.horizontal(|ui| {
-            for (tab, label) in [(LibraryTab::Tracks, "Tracks"),
-                                 (LibraryTab::AllTracks, "All tracks"),
-                                 (LibraryTab::Albums, "Albums"),
-                                 (LibraryTab::Artists, "Artists"),
-                                 (LibraryTab::Tags, "Tags"),
-                                 (LibraryTab::Playlists, "Playlists")] {
-                if ui.selectable_label(self.library_tab == tab, label).clicked()
-                    && self.library_tab != tab {
-                    self.library_tab = tab;
-                    // Switching tabs closes any open detail page: coming back to
-                    // Albums and finding an artist's tracks under an album header
-                    // is worse than losing the drill-down.
-                    self.browse.back();
-                    self.browse.tab = match tab {
-                        LibraryTab::Artists => crate::browse::Tab::Artists,
-                        _ => crate::browse::Tab::Albums,
-                    };
-                }
+        // THROUGH page_bar_ui, which scrolls and keeps the active tab in view.
+        // Six tabs in a plain ui.horizontal do not fit a phone, and a plain row
+        // does not scroll — the last ones simply leave the screen. That is the
+        // job this widget was written for and it had never been drawn: the
+        // controller built a PageBar from VIEWS, kept it in step, and tested
+        // that it could not misname a page, all for something with no display.
+        //
+        // The strip is not the right widget here. It divides the width into
+        // equal segments, which is correct for five short page names and wrong
+        // for six tabs including "All tracks" — at phone width each segment
+        // would be too narrow to read or hit.
+        self.library_bar.select(LIBRARY_TABS.iter()
+            .position(|n| *n == self.library_tab.label())
+            .unwrap_or(0));
+        if let Some(i) = crate::shell_bits::page_bar_ui(ui, &mut self.library_bar, 92.0, c) {
+            if let Some(tab) = LibraryTab::from_index(i) {
+                self.library_tab = tab;
             }
-        });
+        }
         if self.library_tab == LibraryTab::AllTracks {
             if let Some(act) = crate::all_tracks::all_tracks_ui(
                 ui, &mut self.all_tracks, &mut self.tracks_kinetic, c,

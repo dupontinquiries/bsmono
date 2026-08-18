@@ -263,6 +263,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_library_bar_is_drawn_and_its_names_come_from_one_list() {
+        // page_bar_ui had never been drawn: the controller built a PageBar
+        // from VIEWS, kept it in step with the swipe nav, and tested that it
+        // could not misname a page — all for a widget with no display. The
+        // Library's six tabs are what it is for, since they do not fit a phone
+        // in a plain ui.horizontal and a plain row does not scroll.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("shell_bits::page_bar_ui("), "the bar is not drawn");
+        assert!(lib.contains("PageBar::new(&LIBRARY_TABS)"),
+                "the bar does not render from the shared name list");
+    }
+
+    #[test]
+    fn every_library_tab_round_trips_through_its_index() {
+        // `label` indexes LIBRARY_TABS by `self as usize` and `from_index`
+        // maps back by hand, so the two agree only if declaration order
+        // matches the list. A reorder that broke that would silently select
+        // the wrong tab — the exact failure the page-bar test guards for the
+        // page nav.
+        use crate::LibraryTab;
+        for (i, name) in crate::LIBRARY_TABS.iter().enumerate() {
+            let tab = LibraryTab::from_index(i).expect("every index is a tab");
+            assert_eq!(tab.label(), *name, "index {i} maps to the wrong name");
+            assert_eq!(tab as usize, i, "declaration order differs from the list");
+        }
+        assert!(LibraryTab::from_index(crate::LIBRARY_TABS.len()).is_none());
+    }
+
+    #[test]
     fn a_card_arrives_rather_than_brightening_in_place() {
         // Starting at zero opacity is what makes it an entrance.
         let mut card = ControlCard::new("Volume", 0.0);
