@@ -280,6 +280,53 @@ pub fn expected_speedup(bound: Bound, accept_rate: f64, k: usize, cost: DraftCos
     }
 }
 
+/// Speedup from drafting with the first `depth_frac` of the target's own layers, verifying with all.
+///
+/// The layer-based speedup that actually exists — self-speculative early exit — and worth separating
+/// from the layer-probe work in `probe`/`steer`, which measures whether a residual direction predicts
+/// eventual COMPILE SUCCESS and has nothing to do with tok/s.
+///
+/// Dispatches scale with depth, and on a submit-bound or latency-bound device wall time scales with
+/// dispatches, so a draft step at half depth really does cost about half a decode step. A round is
+/// `k * depth_frac + 1` decode-steps' worth of cost and emits `1 + accept * k` tokens.
+///
+/// The catch is not in this arithmetic. An untrained early exit feeds the LM head a residual the head
+/// was never calibrated for, so acceptance is poor — LayerSkip-style results need a trained exit
+/// head. `early_exit_break_even` prices what acceptance would have to be.
+pub fn early_exit_speedup(depth_frac: f64, k: usize, accept: f64) -> f64 {
+    let f = depth_frac.clamp(0.01, 1.0);
+    let cost = k as f64 * f + 1.0;
+    (1.0 + accept.clamp(0.0, 1.0) * k as f64) / cost
+}
+
+/// Acceptance an early-exit draft needs to beat an alternative already worth `target` times.
+///
+/// Returns `None` when no acceptance rate suffices — at k tokens of draft the ceiling is
+/// `(1 + k) / (k * depth_frac + 1)`, and a shallow-enough exit cannot reach some targets at all.
+///
+/// The number that matters for this engine: prompt-lookup measures 1.49 tokens per verification pass
+/// on real source, at ZERO draft cost. To merely MATCH that, an early-exit draft at k=4 needs
+///
+/// ```text
+///   half depth     0.87 acceptance
+///   quarter depth  0.50
+///   eighth depth   0.31
+/// ```
+///
+/// and those are match-not-beat figures. Half depth needing seven-eighths acceptance is the whole
+/// story: a draft that agrees with the full stack that often is barely a draft. Only a very shallow
+/// exit has room, and a very shallow exit is exactly where an uncalibrated LM head does worst.
+///
+/// (The half-depth figure was 0.70 when computed in the head rather than from the expression above,
+/// which is the same error this file already records against the 4.0x assertion two functions up.)
+pub fn early_exit_break_even(depth_frac: f64, k: usize, target: f64) -> Option<f64> {
+    let f = depth_frac.clamp(0.01, 1.0);
+    let cost = k as f64 * f + 1.0;
+    let need = (target * cost - 1.0) / k as f64;
+    if need <= 0.0 { return Some(0.0); }
+    if need > 1.0 { None } else { Some(need) }
+}
+
 /// What speculation is worth here.
 pub fn speculation_outlook(bound: Bound, accept_rate: f64, k: usize, cost: DraftCost) -> String {
     let x = expected_speedup(bound, accept_rate, k, cost);
@@ -355,6 +402,34 @@ mod outlook_tests {
         // 1 + 0.75*4 = 4.0. My first assertion said 3.0x, computed in my head rather than from the
         // formula in the function — the same error as the 97%-versus-98% one two commits ago.
         assert!(speculation_outlook(Bound::Bandwidth, 0.75, 4, DraftCost::Free).contains("4.0x"));
+    }
+
+    #[test]
+    fn early_exit_pays_only_at_an_acceptance_an_untrained_exit_will_not_reach() {
+        // Against prompt-lookup's MEASURED 1.49 tokens per verification pass at zero draft cost.
+        let half = early_exit_break_even(0.5, 4, 1.49).unwrap();
+        let quarter = early_exit_break_even(0.25, 4, 1.49).unwrap();
+        let eighth = early_exit_break_even(0.125, 4, 1.49).unwrap();
+        assert!((half - 0.8675).abs() < 0.01, "half-depth needs {half:.3}");
+        assert!((quarter - 0.495).abs() < 0.01, "quarter-depth needs {quarter:.3}");
+        assert!((eighth - 0.309).abs() < 0.01, "eighth-depth needs {eighth:.3}");
+        assert!(eighth < quarter && quarter < half, "shallower needs less, which is the trade");
+    }
+
+    #[test]
+    fn a_full_depth_draft_is_the_target_and_cannot_beat_anything() {
+        // depth_frac = 1.0 is just running the model twice. The ceiling at k=4 is 5/5 = 1.0.
+        assert!((early_exit_speedup(1.0, 4, 1.0) - 1.0).abs() < 1e-9);
+        assert_eq!(early_exit_break_even(1.0, 4, 1.49), None, "no acceptance rate can pay for that");
+    }
+
+    #[test]
+    fn early_exit_speedup_falls_out_of_the_same_shape_as_the_rest() {
+        // Perfect acceptance at quarter depth, k=7: 8 tokens for 2.75 steps.
+        let x = early_exit_speedup(0.25, 7, 1.0);
+        assert!((x - 8.0 / 2.75).abs() < 1e-6, "{x}");
+        // And a useless drafter never drops below the plain decode it replaces plus its own cost.
+        assert!(early_exit_speedup(0.5, 4, 0.0) < 1.0, "a rejected draft still paid for its steps");
     }
 
     #[test]
