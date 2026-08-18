@@ -960,9 +960,35 @@ names which)",
                     orig - tail_start, tail_start - head,
                     pl.head - head, tail_start - (orig - pl.tail));
             }
-            // Reply budget = ceiling, capped to the room left after the prompt (continuous decode fits
-            // the window instead of forcing prompt truncation).
-            let n_new = ceiling.min(window.saturating_sub(prompt_ids.len()).max(1));
+            // Reply budget. This USED to be a bare `ceiling.min(window - prompt)`, which never
+            // errors and never narrates — a real session walked 2470 -> 2050 -> 1832 -> 1187 ->
+            // 874 -> 814 over seventeen turns with nothing said, and the turn that wanted a long
+            // answer got exactly its cap and stopped mid-thought. ctxwin::relief makes the same
+            // arithmetic a DECISION: it says when the squeeze has crossed into costing an answer,
+            // and under the long-horizon policy it asks for a compaction instead of shrinking
+            // every reply forever.
+            let policy = if p.summarize_instead_of_squeeze {
+                gpu_kernels::ctxwin::ReliefPolicy::SummarizeAndContinue
+            } else { gpu_kernels::ctxwin::ReliefPolicy::Autotune };
+            let relief = gpu_kernels::ctxwin::relief(policy, prompt_ids.len(), window, ceiling);
+            let n_new = match &relief {
+                gpu_kernels::ctxwin::Relief::Proceed { n_new } => *n_new,
+                gpu_kernels::ctxwin::Relief::Squeeze { n_new, note } => {
+                    if let Some(n) = note { crate::diag!("wgpu-engine: [{}] {n}", self.name); }
+                    *n_new
+                }
+                gpu_kernels::ctxwin::Relief::Summarize { summarize_upto, keep_recent, reason } => {
+                    // The engine does not summarize: that is a turn, and turns belong to the
+                    // caller. Publish the request and fall back to the squeeze for THIS reply, so
+                    // a caller that ignores the signal degrades exactly as before rather than
+                    // hanging or producing nothing.
+                    crate::backend::COMPACT_REQUEST.store(
+                        crate::backend::compact_pack(*summarize_upto, *keep_recent),
+                        std::sync::atomic::Ordering::Relaxed);
+                    crate::diag!("wgpu-engine: [{}] COMPACTION REQUESTED — {reason}", self.name);
+                    window.saturating_sub(prompt_ids.len()).max(1)
+                }
+            };
             let cap = (prompt_ids.len() + n_new).max(1);
             // ── Speculative-decode path (opt-in: a draft model was loaded) ───────────────────────────
             // Draft proposes a block; target verifies the whole block in one forward (engine
@@ -1963,6 +1989,31 @@ pub struct Inference { tx: Sender<Cmd>, pub rx: Receiver<Evt>, cancel: Arc<Atomi
 /// would show one turn's prompt against another turn's window.
 pub(crate) static CTX_FIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The engine's standing request for a compaction, published the same way and for the same
+/// reason as CTX_FIT: the decision is made where the arithmetic is (`ctxwin::relief`), and the
+/// ACTION belongs to the caller, because summarizing is a turn and the engine does not own turns.
+/// Packed (summarize_upto:21 | keep_recent:21 | seq:22) — the sequence number rises on every
+/// request so the UI can tell "still the same unanswered request" from "asked again this turn".
+/// Zero means no request outstanding.
+pub(crate) static COMPACT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the engine wants folded, and what must survive verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactRequest { pub summarize_upto: usize, pub keep_recent: usize, pub seq: usize }
+
+pub(crate) fn compact_pack(summarize_upto: usize, keep_recent: usize) -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & ((1 << 22) - 1);
+    ((summarize_upto.min((1 << 21) - 1) as u64) << 43)
+        | ((keep_recent.min((1 << 21) - 1) as u64) << 22)
+        | seq
+}
+pub(crate) fn compact_unpack(v: u64) -> CompactRequest {
+    CompactRequest { summarize_upto: (v >> 43) as usize,
+                     keep_recent: ((v >> 22) & ((1 << 21) - 1)) as usize,
+                     seq: (v & ((1 << 22) - 1)) as usize }
+}
+
 /// Prompt tokens, window size, and how many tokens were dropped from the middle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CtxFit { pub prompt: usize, pub window: usize, pub elided: usize }
@@ -1988,6 +2039,15 @@ impl Inference {
         let v = CTX_FIT.load(Ordering::Relaxed);
         if v == 0 { None } else { Some(ctxfit_unpack(v)) }
     }
+
+    /// The engine's outstanding compaction request, if the long-horizon policy asked for one.
+    pub fn compact_request(&self) -> Option<CompactRequest> {
+        let v = COMPACT_REQUEST.load(Ordering::Relaxed);
+        if v == 0 { None } else { Some(compact_unpack(v)) }
+    }
+    /// Clear it once the caller has read it — an unanswered request left set would re-offer on
+    /// every frame, and the UI holds its own copy (with the seq) once it has one.
+    pub fn clear_compact_request(&self) { COMPACT_REQUEST.store(0, Ordering::Relaxed); }
 }
 impl Inference {
     pub fn spawn() -> Self {

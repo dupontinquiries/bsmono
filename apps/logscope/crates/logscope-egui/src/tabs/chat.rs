@@ -1037,6 +1037,12 @@ pub struct Chat {
     verify_job: Option<VerifyJob>, // running sandbox build-check of the generated files
     image_job: Option<ImageJob>,   // running :image generation (sd-cli, off-thread)
     replicator: Option<ReplicatorMode>, // :replicate — parallel worker columns over the workspace
+    /// The engine's outstanding compaction request, seq included so a request already declined is
+    /// not re-offered every frame. None = nothing pending.
+    compact_offer: Option<crate::backend::CompactRequest>,
+    /// Seq of the last request the operator dismissed — dismissing means "not this one", not
+    /// "never again", so a LATER request (higher seq) still asks.
+    compact_declined: usize,
     /// Long-horizon: when the reply budget would be squeezed below the usable floor, stop and ask
     /// for a summary of the older turns instead of shrinking this reply (and every one after it).
     summarize_on_squeeze: bool,
@@ -1240,6 +1246,8 @@ impl Default for Chat {
             image_job: None,
             replicator: None,
             summarize_on_squeeze: false,
+            compact_offer: None,
+            compact_declined: 0,
             fan_broadcast_once: false,
             fan_fullscreen: false,
             replica_jobs: Default::default(),
@@ -7346,6 +7354,18 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
             });
         }
 
+        // ── the engine's compaction request, picked up once per frame ──
+        // ctxwin::relief publishes this when the long-horizon policy decides the reply budget has
+        // been squeezed below a usable answer. The ACTION is `:compact`, which already exists —
+        // student/teacher self-compaction with a pinnable KV checkpoint — so this offers that
+        // rather than growing a second folding path beside it.
+        if let Some(req) = infer.compact_request() {
+            if req.seq != self.compact_declined && self.stream.is_none() {
+                self.compact_offer = Some(req);
+            }
+            infer.clear_compact_request();
+        }
+        let mut do_compact = false;
         let mut do_send = false;
         let mut do_continue = false;
         let mut do_checkpoint = false;
@@ -7934,6 +7954,34 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
             } // aggressive: spatial graph replaces the linear log
             egui::ScrollArea::vertical().id_salt("chat_log").auto_shrink([false, false]).stick_to_bottom(true)
                 .show(ui, |ui| {
+                    // CONTEXT IS FULL. The alternative is the default: shrink this reply, and the
+                    // next, and the one after that, without saying so. One session's budget walked
+                    // 2470 → 814 tokens over seventeen turns that way.
+                    if let Some(req) = self.compact_offer {
+                        egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
+                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::AMBER()), ..Default::default() }
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("🗜").color(theme::AMBER()).strong());
+                                ui.label(RichText::new(format!(
+                                    "The context is full: replies from here would be cut short. Fold the older \
+turns into a briefing (~{} tokens of history) and keep the most recent {} verbatim?",
+                                    req.summarize_upto, req.keep_recent)).color(theme::INK()));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if theme::action_button(ui, "Summarize & continue", theme::AMBER(), true)
+                                    .on_hover_text("Stages the :compact teacher turn — fold the older turns into a \
+dense briefing that replaces them as the working context, then carry on with room to answer").clicked() {
+                                    do_compact = true;
+                                }
+                                if ui.button("Keep squeezing").on_hover_text(
+                                    "Shrink this reply instead. The offer returns if it gets worse.").clicked() {
+                                    self.compact_declined = req.seq;
+                                    self.compact_offer = None;
+                                }
+                            });
+                        });
+                    }
                     if let Some(n) = self.recover {
                         egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
                             outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::CYAN()), ..Default::default() }
@@ -8291,6 +8339,38 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                 }
             }
             self.continue_generation(infer, doc);
+        }
+        // Accepting the offer runs the SAME `:compact` the operator could type, with the fold sized
+        // from the engine's request instead of the command's default ratio — one folding path, two
+        // ways in. A checkpoint first, because a compaction rewrites the working context and the
+        // operator's next thought may be that it dropped something.
+        if do_compact {
+            let req = self.compact_offer.take();
+            self.checkpoint("before compaction");
+            let mut chain = Vec::new();
+            let mut cur = self.active_leaf;
+            while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
+            chain.reverse();
+            let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
+                .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(),
+                          m.text().to_string()))
+                .collect();
+            if turns.len() < 2 {
+                self.note = "compaction: need at least two turns of history to fold".into();
+            } else {
+                let keep_tokens = req.map(|r| r.keep_recent).unwrap_or(1024);
+                let (keep, ratio) = crate::refresh::plan_for_request(
+                    &turns, keep_tokens, self.ctx.n_ctx as usize,
+                    crate::refresh::REPLY_FLOOR);
+                let plan = crate::refresh::plan(&turns, keep, ratio);
+                let folded: Vec<(String, String)> = turns[..plan.fold].to_vec();
+                self.input = crate::refresh::teacher_turn(&folded, plan.target_tokens);
+                self.note = format!(
+                    "🗜 compaction staged from the engine's request: fold {} turns → ~{} tok, keep {} \
+recent → context {}→{} tok (−{:.0}%). Send it; the briefing becomes the working context.",
+                    plan.fold, plan.target_tokens, plan.keep, plan.before_tokens, plan.after_tokens,
+                    plan.ratio_saved() * 100.0);
+            }
         }
         if do_checkpoint { self.checkpoint(format!("manual · {} msgs", self.msgs.len())); }
         if do_export {
