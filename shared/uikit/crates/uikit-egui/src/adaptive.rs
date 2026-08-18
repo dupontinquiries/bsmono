@@ -127,6 +127,36 @@ impl Adaptive {
 
     // ── overrides: an app takes the defaults, then changes only what it needs ──
 
+    /// Apply the platform's safe-area insets to a rect.
+    ///
+    /// `SafeArea` has existed on this struct since it was written, `detect`
+    /// fills it with a default, and NOTHING read it — not the kit, not one of
+    /// the ten ports. So every app draws under a notch and behind a gesture
+    /// bar on the phones this fleet targets.
+    ///
+    /// The helper lives here rather than in each app for the reason the whole
+    /// kit exists: four copies of an inset calculation is four chances to
+    /// forget the bottom one, which is the inset a gesture bar actually eats.
+    pub fn inset(&self, rect: egui::Rect) -> egui::Rect {
+        let s = self.safe_area;
+        let r = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + s.left, rect.min.y + s.top),
+            egui::pos2(rect.max.x - s.right, rect.max.y - s.bottom),
+        );
+        // A rect the insets have inverted is worse than an un-inset one: it
+        // paints nothing and reads as a blank screen rather than a layout bug.
+        if r.width() <= 0.0 || r.height() <= 0.0 { rect } else { r }
+    }
+
+    /// Does this surface report any inset at all?
+    ///
+    /// Worth asking before laying out: a desktop window has none, and code
+    /// that branches on it should say so rather than applying four zeros.
+    pub fn has_insets(&self) -> bool {
+        let s = self.safe_area;
+        s.top > 0.0 || s.bottom > 0.0 || s.left > 0.0 || s.right > 0.0
+    }
+
     pub fn force_class(mut self, class: DeviceClass) -> Self {
         self.class = class;
         self
@@ -203,6 +233,42 @@ fn has_touch_hint(i: &egui::InputState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn insets_were_settable_and_never_applied() {
+        // with_safe_area has existed since this struct was written and NOTHING
+        // read safe_area — not the kit, not one of the ten ports. The setter
+        // was there and the consumer was missing, so every app draws under a
+        // notch and behind a gesture bar.
+        let a = Adaptive { size: (400.0, 800.0), ..Adaptive::default() }
+            .with_safe_area(SafeArea { top: 48.0, bottom: 24.0, left: 0.0, right: 0.0 });
+        assert!(a.has_insets());
+        let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 800.0));
+        let safe = a.inset(full);
+        assert_eq!(safe.min.y, 48.0, "the notch is not avoided");
+        assert_eq!(safe.max.y, 776.0, "the gesture bar is not avoided");
+        assert_eq!(safe.width(), 400.0, "nothing was inset horizontally");
+    }
+
+    #[test]
+    fn a_desktop_surface_is_unchanged() {
+        // Zero insets must be a no-op rather than a rect rebuild, so an app can
+        // call inset unconditionally and get the right answer on both.
+        let a = Adaptive { size: (1600.0, 900.0), ..Adaptive::default() };
+        assert!(!a.has_insets());
+        let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0));
+        assert_eq!(a.inset(full), full);
+    }
+
+    #[test]
+    fn insets_larger_than_the_surface_are_refused() {
+        // An inverted rect paints nothing, which reads as a blank screen rather
+        // than a layout bug — so a bad inset gives back the original.
+        let a = Adaptive { size: (200.0, 100.0), ..Adaptive::default() }
+            .with_safe_area(SafeArea { top: 90.0, bottom: 90.0, left: 0.0, right: 0.0 });
+        let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0));
+        assert_eq!(a.inset(full), full, "an inverted rect was returned");
+    }
+
     use super::*;
 
     #[test]

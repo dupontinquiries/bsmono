@@ -1415,7 +1415,21 @@ impl eframe::App for VoicetermApp {
         // is a tiling workspace and its tabs are workspace tabs — not a list
         // of surfaces. Surfaces live in panes now, so this rail stays short
         // however many views exist.
-        let rail_w = if self.rail_open { 132.0 } else { 34.0 };
+        // ADAPTIVE, not two constants. The collapsed rail was 34 points wide —
+        // below any touch target on any device, so on a phone the toggle that
+        // reopens it could not reliably be hit, and the rail was one mistap
+        // from being stuck shut. min_touch_target is 44 on touch and 28 with a
+        // pointer, which is the number this should always have been.
+        //
+        // The open width scales with the surface rather than sitting at 132:
+        // on a narrow phone that is a third of the screen for a tab list, and
+        // on a desktop it is needlessly cramped.
+        let adaptive = uikit_egui::adaptive::Adaptive::detect(ctx);
+        let rail_w = if self.rail_open {
+            (adaptive.size.0 * 0.28).clamp(120.0, 220.0)
+        } else {
+            adaptive.min_touch_target
+        };
         egui::SidePanel::left("rail").exact_width(rail_w).show(ctx, |ui| {
             let c = self.colors;
             if ui.small_button(if self.rail_open { "‹" } else { "›" })
@@ -1449,6 +1463,19 @@ impl eframe::App for VoicetermApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // SAFE AREA. Nothing in the fleet applied these until now — the
+            // field existed, the setter existed, and no app read either, so
+            // every port drew under a notch and behind a gesture bar. It is a
+            // no-op on a desktop, where the insets are zero, so it can be
+            // called unconditionally.
+            let safe = adaptive.inset(ui.max_rect());
+            if safe != ui.max_rect() {
+                // Only build a child when the insets are real. On a desktop
+                // they are zero and an extra Ui layer would cost a layout pass
+                // per frame for nothing.
+                ui.set_clip_rect(safe);
+            }
+
             // THE LOCATOR. shows_locator() returns true in BOTH modes and its
             // comment says why: it "is what stops voice mode from being
             // disorienting; removing it would save fourteen points and cost
