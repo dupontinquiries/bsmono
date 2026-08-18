@@ -85,14 +85,19 @@ pub struct Scanner {
     cursor: usize,
     defined: HashSet<String>,
     unresolved: Vec<Unresolved>,
-    /// Names seen in call position that were not resolvable YET. Re-checked on each feed, because
-    /// Rust lets a function be called above its definition.
-    pending: Vec<String>,
+    /// Names seen in call position that were not resolvable YET, with the byte offset at which
+    /// each appeared. Re-checked on each feed, because Rust lets a function be called above its
+    /// definition — and the offset is what turns "unresolved" into "unresolved for long enough".
+    pending: Vec<(String, usize)>,
+    /// Comment/string lexer state at the cursor, so a chunk boundary inside a doc comment does not
+    /// turn the rest of that comment into code.
+    strip: StripState,
 }
 
 impl Scanner {
     pub fn new() -> Self {
-        Scanner { cursor: 0, defined: HashSet::new(), unresolved: Vec::new(), pending: Vec::new() }
+        Scanner { cursor: 0, defined: HashSet::new(), unresolved: Vec::new(), pending: Vec::new(),
+                  strip: StripState::Code }
     }
 
     pub fn defined(&self) -> usize { self.defined.len() }
@@ -113,9 +118,10 @@ impl Scanner {
     pub fn feed(&mut self, buf: &str, finished: bool) -> usize {
         let end = if finished { buf.len() } else { hold_back(buf) };
         if end > self.cursor {
-            let chunk = &buf[self.cursor..end];
-            for d in definitions(chunk) { self.defined.insert(d); }
-            for c in calls(chunk) { self.pending.push(c); }
+            let (chunk, next) = strip_from(&buf[self.cursor..end], self.strip);
+            self.strip = next;
+            for d in definitions(&chunk) { self.defined.insert(d); }
+            for (c, off) in calls_at(&chunk) { self.pending.push((c, self.cursor + off)); }
             self.cursor = end;
         }
         self.pending.len()
@@ -129,8 +135,24 @@ impl Scanner {
     /// be three lines away.
     pub fn suspects(&self, idx: &SymbolIndex) -> usize {
         self.pending.iter()
-            .filter(|n| !self.defined.contains(*n) && !idx.contains(n) && !is_builtin(n))
+            .filter(|(n, _)| !self.defined.contains(n) && !idx.contains(n) && !is_builtin(n))
             .count()
+    }
+
+    /// The first suspicion that has gone `patience` bytes without resolving, if any.
+    ///
+    /// This is the kill trigger, and `patience` is the only knob on it. Rust resolves forward
+    /// references, so a call to a not-yet-written helper is legitimate and common — waiting is what
+    /// keeps the detector from shredding good branches. But waiting is also exactly what pushes the
+    /// kill later into the budget, and `reap`'s yield is capped by `1/at_fraction`. So patience
+    /// trades false kills against the only quantity that makes reaping worth doing.
+    /// `examples/corpus_patience.rs` measures both sides of that trade.
+    pub fn stale(&self, idx: &SymbolIndex, patience: usize) -> Option<(&str, usize)> {
+        self.pending.iter()
+            .filter(|(n, off)| self.cursor.saturating_sub(*off) >= patience
+                && !self.defined.contains(n) && !idx.contains(n) && !is_builtin(n))
+            .map(|(n, off)| (n.as_str(), *off))
+            .next()
     }
 
     /// Resolve pending names against a corpus and condemn what neither side has. Call once, when
@@ -138,7 +160,7 @@ impl Scanner {
     pub fn settle(&mut self, idx: &SymbolIndex) -> bool {
         let before = self.unresolved.len();
         let (defined, pending) = (&self.defined, std::mem::take(&mut self.pending));
-        for name in pending {
+        for (name, _) in pending {
             if !defined.contains(&name) && !idx.contains(&name) && !is_builtin(&name) {
                 self.unresolved.push(Unresolved::Call(name));
             }
@@ -172,37 +194,67 @@ fn hold_back(buf: &str) -> usize {
 
 fn is_ident_byte(c: u8) -> bool { c.is_ascii_alphanumeric() || c == b'_' }
 
+/// Lexer state carried across a chunk boundary.
+///
+/// Stripping has to be resumable or it is wrong incrementally, and wrong in the worst direction: a
+/// chunk that begins inside a block comment or a string literal is lexed as code, so its prose
+/// becomes calls. Measured, that turned a 1-in-120 false-kill rate into 74-in-120 the moment the
+/// scanner was fed in 120-byte pieces instead of whole files.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StripState {
+    #[default]
+    Code,
+    LineComment,
+    /// Nesting depth, since Rust block comments nest.
+    BlockComment(u32),
+    Str,
+}
+
 /// Blank out comments and string literals, preserving byte offsets.
 ///
 /// Without this the detector reads prose. Measured on 120 real files it condemned `illuminated`,
 /// `isosceles`, `hallucinations`, `springing` and `backbone` — all ordinary English words that
 /// happened to be followed by an opening parenthesis inside a doc comment. Offsets are preserved
 /// rather than removed so `calls` can still look at the byte before an identifier.
-pub fn strip_noncode(src: &str) -> String {
+///
+/// Idempotent: blanked regions contain no `/` or `"`, so re-stripping stripped text is a no-op.
+pub fn strip_noncode(src: &str) -> String { strip_from(src, StripState::Code).0 }
+
+/// As `strip_noncode`, resuming from `state` and returning the state at the end of `src`.
+pub fn strip_from(src: &str, state: StripState) -> (String, StripState) {
     let b = src.as_bytes();
-    let mut out = vec![b' '; b.len()];
-    let (mut i, mut n) = (0usize, b.len());
+    let n = b.len();
+    let mut out = vec![b' '; n];
+    let mut st = state;
+    let mut i = 0usize;
     while i < n {
-        if b[i] == b'/' && i + 1 < n && b[i + 1] == b'/' {
-            while i < n && b[i] != b'\n' { i += 1; }
-        } else if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
-            let mut depth = 1; i += 2;
-            while i < n && depth > 0 {
-                if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' { depth += 1; i += 2; }
-                else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' { depth -= 1; i += 2; }
+        match st {
+            StripState::LineComment => {
+                if b[i] == b'\n' { out[i] = b'\n'; st = StripState::Code; }
+                i += 1;
+            }
+            StripState::BlockComment(d) => {
+                if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' { st = StripState::BlockComment(d + 1); i += 2; }
+                else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                    st = if d <= 1 { StripState::Code } else { StripState::BlockComment(d - 1) };
+                    i += 2;
+                } else { i += 1; }
+            }
+            StripState::Str => {
+                if b[i] == b'\\' { i += 2; }
+                else if b[i] == b'"' { st = StripState::Code; i += 1; }
                 else { i += 1; }
             }
-        } else if b[i] == b'"' {
-            i += 1;
-            while i < n { if b[i] == b'\\' { i += 2; } else if b[i] == b'"' { i += 1; break } else { i += 1 } }
-        } else if b[i] == b'\'' && i + 2 < n && b[i + 2] == b'\'' {
-            i += 3; // char literal; lifetimes have no closing quote and fall through
-        } else {
-            out[i] = b[i]; i += 1;
+            StripState::Code => {
+                if b[i] == b'/' && i + 1 < n && b[i + 1] == b'/' { st = StripState::LineComment; i += 2; }
+                else if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' { st = StripState::BlockComment(1); i += 2; }
+                else if b[i] == b'"' { st = StripState::Str; i += 1; }
+                else if b[i] == b'\'' && i + 2 < n && b[i + 2] == b'\'' { i += 3; }
+                else { out[i] = b[i]; i += 1; }
+            }
         }
-        let _ = &mut n;
     }
-    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+    (String::from_utf8(out).unwrap_or_else(|_| " ".repeat(n)), st)
 }
 
 /// Every identifier in `src`, in order, with duplicates.
@@ -284,6 +336,11 @@ pub fn definitions(src: &str) -> Vec<String> {
 /// What survives is free-function and path calls, which is where a hallucinated API most often
 /// shows up anyway.
 pub fn calls(src: &str) -> Vec<String> {
+    calls_at(src).into_iter().map(|(n, _)| n).collect()
+}
+
+/// As `calls`, with each name's byte offset within `src`.
+pub fn calls_at(src: &str) -> Vec<(String, usize)> {
     const CLAUSE: &[&str] = &["if", "while", "for", "match", "return", "fn"];
     // A DEFINITION puts its own name in lexical call position: `fn f()`, `struct Pair(u8, u8)`.
     // Counting those as calls made every function look like a call to itself, which is both a
@@ -292,7 +349,7 @@ pub fn calls(src: &str) -> Vec<String> {
     const DEFINES_NEXT: &[&str] = &["fn", "struct", "enum", "union", "macro_rules"];
     let src = &strip_noncode(src);
     let b = src.as_bytes();
-    let (mut out, mut i) = (Vec::new(), 0usize);
+    let (mut out, mut i): (Vec<(String, usize)>, usize) = (Vec::new(), 0usize);
     let mut prev = String::new();
     while i < b.len() {
         if b[i].is_ascii_alphabetic() || b[i] == b'_' {
@@ -318,7 +375,7 @@ pub fn calls(src: &str) -> Vec<String> {
                 continue;
             }
             if j < b.len() && b[j] == b'(' && !CLAUSE.contains(&name) {
-                out.push(name.to_string());
+                out.push((name.to_string(), s));
             }
         } else {
             // Only whitespace may sit between an introducer and the name it introduces.
@@ -409,6 +466,78 @@ mod tests {
         assert_eq!(s.feed("fn f() { mystery(); ", false), 1);
         assert!(s.unresolved().is_empty());
         assert_eq!(s.suspects(&SymbolIndex::new()), 1, "suspected, not condemned");
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_a_comment_does_not_turn_prose_into_code() {
+        // The incremental bug. Whole-file stripping got this right and chunked feeding did not,
+        // which took the false-kill rate from 1-in-120 to 74-in-120 on the same corpus.
+        let src = "fn f() {}\n/* a long note about isosceles(triangles) and\n   helix(shapes) */\n";
+        let mut whole = Scanner::new();
+        whole.feed(src, true);
+        let mut chunked = Scanner::new();
+        let mut i = 8usize;
+        while i < src.len() { while !src.is_char_boundary(i) { i += 1; } chunked.feed(&src[..i], false); i += 8; }
+        chunked.feed(src, true);
+        let idx = SymbolIndex::new();
+        assert_eq!(whole.suspects(&idx), 0);
+        assert_eq!(chunked.suspects(&idx), 0, "chunked feeding read the comment as code");
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_a_string_is_handled_too() {
+        let src = "fn f() { let s = \"call ghost(1) please\"; }";
+        let mut sc = Scanner::new();
+        let mut i = 6usize;
+        while i < src.len() { while !src.is_char_boundary(i) { i += 1; } sc.feed(&src[..i], false); i += 6; }
+        sc.feed(src, true);
+        assert_eq!(sc.suspects(&SymbolIndex::new()), 0);
+    }
+
+    #[test]
+    fn stripping_is_idempotent_so_the_scanner_may_strip_twice() {
+        let src = "let a = 1; // note (here)\nfoo(2);";
+        let once = strip_noncode(src);
+        assert_eq!(strip_noncode(&once), once);
+    }
+
+    #[test]
+    fn nested_block_comments_close_correctly() {
+        let out = strip_noncode("a(); /* outer /* inner */ still */ b();");
+        assert!(out.contains("a()"));
+        assert!(out.contains("b()"));
+        assert!(!out.contains("inner"));
+    }
+
+    #[test]
+    fn patience_holds_fire_until_a_suspicion_has_aged() {
+        let mut s = Scanner::new();
+        s.feed("fn f() { helper(); ", false);
+        let idx = SymbolIndex::new();
+        assert!(s.stale(&idx, 100).is_none(), "too young to condemn");
+        assert!(s.stale(&idx, 0).is_some(), "zero patience fires immediately");
+    }
+
+    #[test]
+    fn a_definition_arriving_within_the_patience_window_prevents_the_kill() {
+        // The whole reason patience exists: forward references are legal and common.
+        let mut s = Scanner::new();
+        s.feed("fn f() { helper(); }\n", false);
+        let idx = SymbolIndex::new();
+        assert!(s.stale(&idx, 5).is_some(), "unresolved and aged");
+        s.feed("fn f() { helper(); }\nfn helper() {}\n", true);
+        assert!(s.stale(&idx, 0).is_none(), "definition arrived, suspicion cleared");
+    }
+
+    #[test]
+    fn stale_reports_where_the_call_was_written_not_where_it_was_noticed() {
+        // at_fraction is measured from this offset, so it has to be the call site.
+        let mut s = Scanner::new();
+        let buf = "fn f() {\n    ghost();\n}\n";
+        s.feed(buf, true);
+        let (name, off) = s.stale(&SymbolIndex::new(), 0).unwrap();
+        assert_eq!(name, "ghost");
+        assert_eq!(off, buf.find("ghost").unwrap());
     }
 
     #[test]
