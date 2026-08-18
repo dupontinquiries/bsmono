@@ -5516,7 +5516,16 @@ them to", patches.len());
     /// mode cannot fill. The seam is `Vec<Host>` precisely so that adding peers later is a change
     /// to this function and nothing else.
     fn replicator_hosts(&self) -> Vec<logscope::replicator::Host> {
+        // `resident_budget_bytes` lives in the engine crate, which the default build does not link
+        // (wgpu-engine is opt-in) — this call un-gated is what broke `cargo check` with no features.
+        // Without the engine, `instance_bytes` never leaves 0 (it is set from the lane pool's Ready
+        // event), and `replicator::slots` reads per-instance 0 as "no memory bound" — so the budget
+        // is never consulted and 0 is inert rather than a lie. Duplicating the meminfo parse here to
+        // fake a figure would just be a second copy of the rule waiting to drift.
+        #[cfg(feature = "wgpu-engine")]
         let budget = gpu_kernels::store::resident_budget_bytes().unwrap_or(0);
+        #[cfg(not(feature = "wgpu-engine"))]
+        let budget = 0u64;
         vec![logscope::replicator::Host { id: "local".into(), budget_bytes: budget }]
     }
 
