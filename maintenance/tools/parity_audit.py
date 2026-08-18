@@ -418,7 +418,13 @@ def mentions(name, text):
     # A Qt class ending in View/Widget/Page/Dialog/Panel/Window also matches
     # its stem: in Rust the suffix is Qt's noise rather than part of the name,
     # and `microterm.rs` is the complete port of `MicrotermView`.
-    for suffix in ('View', 'Widget', 'Page', 'Dialog', 'Panel', 'Window'):
+    # `Tab` belongs here and its absence cost a duplicated port. logscope's
+    # GTK CargoTab is fully ported as tabs/cargo.rs — same primary-span rule,
+    # same rendered fallback, a worker thread and its own unit test — and the
+    # audit called it missing because the literal string "CargoTab" appears
+    # nowhere in a tree that organises tabs as tabs/<name>.rs. I believed the
+    # tool and wrote the port again.
+    for suffix in ('View', 'Widget', 'Page', 'Dialog', 'Panel', 'Window', 'Tab'):
         if name.endswith(suffix) and len(name) > len(suffix):
             stem = name[:-len(suffix)]
             if stem in text or snake(stem) in text:
