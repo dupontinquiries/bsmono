@@ -2874,6 +2874,54 @@ impl Snapclone {
         // name, which is worse than an empty page because nothing looks
         // missing. Those controls live on the voice bar, which is where the Qt
         // app puts them.
+        // LANDMARKS. begin_landmark, commit_landmark and add_landmark_ui were
+        // all written and none had a caller: the wayfinder places people, and
+        // the other half — naming a point you can be RESOLVED to, so a contact
+        // matches a place without either of you sharing a live position — was
+        // unreachable.
+        ui.horizontal(|ui| {
+            if self.add_landmark.is_none() && ui.button("＋ landmark").clicked() {
+                // Accuracy is passed in because the wayfinder does not track
+                // it, and the record has to carry which claim it is: saved at
+                // 500 m is a different statement from saved at 5 m.
+                // Accuracy comes from contact_freshness under our own id when
+                // the host has supplied it. There is no other source:
+                // wayfinder::Fix carries lat/lon only, and folding accuracy
+                // into it is noted as the cleaner follow-up on that field.
+                //
+                // The fallback is 0.0 rather than a plausible-looking metre
+                // count, because begin_landmark's doc is explicit that "saved
+                // at 500 m accuracy is a different claim from one saved at 5
+                // m" — inventing a number would make the record assert a
+                // precision nobody measured.
+                let acc = self.contact_freshness.get(&self.local_id)
+                    .map(|(_, a)| *a as f64)
+                    .unwrap_or(0.0);
+                self.begin_landmark(acc);
+            }
+            if !self.landmarks.is_empty() {
+                ui.colored_label(c.text_weak,
+                    format!("{} saved", self.landmarks.len()));
+            }
+        });
+        if self.add_landmark.is_some() {
+            let creator = self.local_id.clone();
+            let id = format!("lm-{}", self.now_secs);
+            let now_ms = self.now_secs * 1000;
+            // The form closes only on success — the renderer returns None both
+            // while editing and on a refused save, and discarding what was
+            // typed along with the reason it failed is the case its doc calls
+            // out.
+            let saved = self.add_landmark.as_mut().and_then(|f| {
+                crate::landmark::add_landmark_ui(ui, f, &creator, &id, now_ms, c)
+            });
+            if let Some(l) = saved {
+                self.landmarks.push(l);
+                self.add_landmark = None;
+            }
+            ui.separator();
+        }
+
         let nodes = crate::wayfinder::build_nodes(self.self_fix, &self.wayfinder_contacts);
         let photos = crate::wayfinder::place_photos(&nodes, &self.wayfinder_snaps);
         if let Some(id) = crate::wayfinder::wayfinder_ui(ui, &nodes, &photos, c) {

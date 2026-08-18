@@ -209,6 +209,37 @@ pub fn add_landmark_ui(ui: &mut egui::Ui, d: &mut AddLandmark, creator_id: &str,
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_dialog_can_be_opened_and_its_result_is_kept() {
+        // begin_landmark, commit_landmark and add_landmark_ui were all written
+        // and none had a caller. The wayfinder places people; naming a point
+        // you can be RESOLVED to was unreachable.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("self.begin_landmark("), "nothing opens the form");
+        assert!(lib.contains("landmark::add_landmark_ui("), "the form is not drawn");
+        assert!(lib.contains("self.landmarks.push(l)"), "a saved landmark is dropped");
+    }
+
+    #[test]
+    fn a_form_with_no_fix_refuses_and_says_why() {
+        // The form closes only on success. An error means the name was blank
+        // or there is no fix, and closing would discard what the user typed
+        // along with the reason it failed.
+        let mut d = AddLandmark::new(None);
+        d.name = "the studio".into();
+        assert!(!d.have_fix());
+        assert_eq!(d.save_hint(), Some(NO_FIX_HINT), "refusing silently teaches nothing");
+        assert!(d.save("me", "lm-1", 1_000).is_none(), "saved without a position");
+
+        // With a fix it goes through, and the accuracy travels with it.
+        let mut d = AddLandmark::new(Some(Fix { lat: 45.5, lon: -73.6, accuracy_m: 8.0 }));
+        d.name = "the studio".into();
+        let l = d.save("me", "lm-1", 1_000).expect("named, located, saveable");
+        assert_eq!(l.creator_id, "me");
+        assert!((l.accuracy_m - 8.0).abs() < 1e-9,
+                "the accuracy claim must survive the save");
+    }
+
     fn fix() -> Fix { Fix { lat: 51.5074, lon: -0.1278, accuracy_m: 12.0 } }
 
     #[test]
