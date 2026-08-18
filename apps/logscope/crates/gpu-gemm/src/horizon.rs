@@ -70,7 +70,10 @@ pub enum Move {
     /// `keep_prefix` is the span that is already stable — typically the system block, which is what
     /// the tree keeps falling back to anyway. Summarising below it would throw away the one prefix
     /// that IS being reused.
-    Compact { keep_prefix: usize, why: String },
+    ///
+    /// `also_grow` is set when `plan` reports that even the compacted context will not fit. The two
+    /// moves are not exclusive and treating them as exclusive costs a second failed turn to find out.
+    Compact { keep_prefix: usize, also_grow: Option<usize>, why: String },
     /// Raise the context window. Buys output headroom, costs KV and a longer prefill, and does
     /// nothing for a prefix that keeps moving.
     Grow { to: usize, why: String },
@@ -153,6 +156,26 @@ impl Horizon {
         (now - per_tok * next_turn_tokens as f32).max(0.0)
     }
 
+    /// As `advise`, but with the turn sizes, so a `Compact` can say whether it will be enough.
+    ///
+    /// `advise` alone cannot: it sees prompt lengths, not the per-turn breakdown a compaction plan
+    /// needs. Callers that have the graph should use this one.
+    pub fn advise_with(&self, next_prompt_len: usize, turns: &[Span]) -> Move {
+        match self.advise(next_prompt_len) {
+            Move::Compact { keep_prefix, why, .. } => {
+                let also_grow = match plan(self.stable_prefix, turns, self.window) {
+                    Some(c) if !c.fits => Some(self.window * 2),
+                    Some(_) => None,
+                    // Nothing worth summarising and still out of room: growth is the only move left.
+                    None if self.headroom(next_prompt_len) < self.min_headroom => Some(self.window * 2),
+                    None => None,
+                };
+                Move::Compact { keep_prefix, also_grow, why }
+            }
+            other => other,
+        }
+    }
+
     /// What to do before the next turn, given the prompt it would use.
     pub fn advise(&self, next_prompt_len: usize) -> Move {
         let head = self.headroom(next_prompt_len);
@@ -162,6 +185,7 @@ impl Horizon {
             let rate = self.hist[self.hist.len() - 1].reuse_rate();
             return Move::Compact {
                 keep_prefix: self.stable_prefix,
+                also_grow: None,
                 why: format!(
                     "the prefix tree has matched the same ~{} tokens for {PATIENCE} turns while the \
 prompt moved by {} — it is finding the stable prefix, not the previous turn, because trimming keeps \
@@ -185,7 +209,7 @@ re-prefilled. Saving is about {:.1}s of prefill per turn",
             // Out of room to answer in. Compaction and growth both fix it; compaction also fixes
             // reuse, so it wins unless reuse is already healthy.
             return if low || self.trimming() {
-                Move::Compact { keep_prefix: self.stable_prefix, why: format!(
+                Move::Compact { keep_prefix: self.stable_prefix, also_grow: None, why: format!(
                     "only {head} output tokens fit under a {} window and reuse is already poor — \
 compacting recovers headroom AND stops the re-prefill", self.window) }
             } else {
@@ -197,11 +221,92 @@ history is worth keeping intact. Growing costs KV bytes and a longer first prefi
         }
 
         if low {
-            return Move::Compact { keep_prefix: self.stable_prefix, why: format!(
+            return Move::Compact { keep_prefix: self.stable_prefix, also_grow: None, why: format!(
                 "reuse has been under {:.0}% for {PATIENCE} turns", REUSE_FLOOR * 100.0) };
         }
         Move::Continue
     }
+}
+
+/// One turn's identity and size, as the caller's conversation graph already knows them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Span { pub id: usize, pub tokens: usize }
+
+/// A concrete compaction: which turns collapse into a summary and which stay verbatim.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Compaction {
+    /// Turns to replace, oldest first. Contiguous, and never inside the stable prefix.
+    pub summarize: Vec<usize>,
+    /// Turns after them, kept word for word.
+    pub keep_tail: Vec<usize>,
+    /// Tokens the summary may use.
+    pub summary_budget: usize,
+    pub before_tokens: usize,
+    pub after_tokens: usize,
+    /// Does the compacted context actually fit the window?
+    ///
+    /// False means compaction alone is not enough and the window has to grow too. Saying so here is
+    /// the difference between one fix and a second failed turn: an earlier draft of this function
+    /// took `budget` and ignored it, under a comment claiming the caller would be told.
+    pub fits: bool,
+}
+
+impl Compaction {
+    pub fn saved(&self) -> usize { self.before_tokens.saturating_sub(self.after_tokens) }
+}
+
+/// Turns of recent history kept verbatim. Summarising the turn currently being worked on is what
+/// makes compaction feel like amnesia, and it saves the least, because recent turns are the ones the
+/// model is actually using.
+pub const KEEP_TAIL: usize = 4;
+/// Summary length as a fraction of what it replaces.
+pub const SUMMARY_RATIO: f32 = 0.15;
+/// Below this saving a compaction is not worth its cost: it moves the prefix, which forfeits the
+/// prefix tree for one turn, to reclaim tokens that were not the problem.
+pub const MIN_SAVING: usize = 400;
+
+/// Plan a compaction, or `None` when one is not worth doing.
+///
+/// `stable` is the current stable prefix — the system block plus any summaries already committed.
+/// It is never summarised: it is the one span the prefix tree IS matching, and rewriting it is how
+/// a compaction makes things worse than the trimming it replaces.
+pub fn plan(stable_tokens: usize, turns: &[Span], budget: usize) -> Option<Compaction> {
+    if turns.len() <= KEEP_TAIL { return None; }
+    let cut = turns.len() - KEEP_TAIL;
+    let (head, tail) = turns.split_at(cut);
+    let head_tokens: usize = head.iter().map(|t| t.tokens).sum();
+    let tail_tokens: usize = tail.iter().map(|t| t.tokens).sum();
+    let summary_budget = ((head_tokens as f32) * SUMMARY_RATIO).ceil() as usize;
+    let before = stable_tokens + head_tokens + tail_tokens;
+    let after = stable_tokens + summary_budget + tail_tokens;
+    if before.saturating_sub(after) < MIN_SAVING { return None; }
+    Some(Compaction {
+        summarize: head.iter().map(|t| t.id).collect(),
+        keep_tail: tail.iter().map(|t| t.id).collect(),
+        summary_budget, before_tokens: before, after_tokens: after,
+        fits: after <= budget,
+    })
+}
+
+/// Does the new stable prefix EXTEND the old one?
+///
+/// The invariant the whole design rests on. Compaction is append-only: each pass adds a summary and
+/// leaves earlier ones word for word, so the prefix only ever grows and every later turn extends it.
+/// Re-rolling several summaries into one tighter summary is the obvious optimisation and it is a
+/// trap — it rewrites the prefix, so the KV tree loses everything past the system block, which is
+/// precisely the failure compaction was introduced to fix. Re-rolling is affordable rarely and
+/// deliberately, never as a routine tidy-up.
+pub fn is_append_only(prev_prefix: &[usize], next_prefix: &[usize]) -> bool {
+    next_prefix.len() >= prev_prefix.len() && next_prefix[..prev_prefix.len()] == *prev_prefix
+}
+
+/// The instruction the summariser is given.
+///
+/// A default, not a considered product decision: it asks for decisions and open threads rather than
+/// a narrative, because what the next turns need from dropped history is what was AGREED and what is
+/// still outstanding, not a retelling. Worth revisiting against real transcripts.
+pub fn summary_instruction(budget_tokens: usize) -> String {
+    format!("Summarise the conversation so far in at most {budget_tokens} tokens. Record decisions that were made, constraints that were agreed, names of files and functions that were introduced, and questions still open. Omit pleasantries, restatements and anything already visible in the messages that follow. Write it as notes, not prose.")
 }
 
 #[cfg(test)]
@@ -264,7 +369,7 @@ mod tests {
         let mut h = Horizon::new(4096, 512, 1626);
         for x in &measured()[..8] { h.observe(*x); }
         match h.advise(3300) {
-            Move::Compact { keep_prefix, why } => {
+            Move::Compact { keep_prefix, why, .. } => {
                 assert_eq!(keep_prefix, 1626, "keep the span that IS being reused");
                 assert!(why.contains("not the previous turn"), "{why}");
                 assert!(why.contains("bigger window"), "{why}");
@@ -303,6 +408,28 @@ mod tests {
     }
 
     #[test]
+    fn a_compact_that_will_not_be_enough_asks_to_grow_as_well() {
+        // The operator's own shape: reuse collapsed AND the output ceiling fell to 874. Compaction
+        // fixes the first; if the recent turns alone still overflow, only growth fixes the second,
+        // and finding that out on the next failed turn is a wasted turn.
+        let mut h = Horizon::new(4096, 512, 1626);
+        for x in &measured()[..8] { h.observe(*x); }
+        let big = vec![Span { id: 0, tokens: 900 }, Span { id: 1, tokens: 900 },
+                       Span { id: 2, tokens: 900 }, Span { id: 3, tokens: 900 },
+                       Span { id: 4, tokens: 900 }, Span { id: 5, tokens: 900 }];
+        match h.advise_with(3300, &big) {
+            Move::Compact { also_grow: Some(to), .. } => assert_eq!(to, 8192),
+            other => panic!("expected Compact wanting growth, got {other:?}"),
+        }
+        // Small turns compact down comfortably and need no growth.
+        let small = spans(20, 100);
+        match h.advise_with(3300, &small) {
+            Move::Compact { also_grow: None, .. } => {}
+            other => panic!("expected Compact alone, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn compacting_clears_the_history_and_moves_the_stable_prefix() {
         let mut h = Horizon::new(4096, 512, 1626);
         for x in &measured()[..8] { h.observe(*x); }
@@ -320,6 +447,71 @@ mod tests {
         // turn's own tokens, so the saving should be most of that.
         let s = h.compaction_saving_s(256);
         assert!(s > 10.0 && s < 20.0, "saving {s}s");
+    }
+
+    fn spans(n: usize, tokens: usize) -> Vec<Span> {
+        (0..n).map(|i| Span { id: i, tokens }).collect()
+    }
+
+    #[test]
+    fn compaction_keeps_the_recent_turns_word_for_word() {
+        let c = plan(1626, &spans(20, 200), 4096).unwrap();
+        assert_eq!(c.keep_tail.len(), KEEP_TAIL);
+        assert_eq!(c.keep_tail, vec![16, 17, 18, 19], "the newest turns, not the oldest");
+        assert_eq!(c.summarize.len(), 16);
+    }
+
+    #[test]
+    fn the_stable_prefix_is_never_summarised() {
+        // It is the one span the tree IS matching. Rewriting it makes compaction worse than the
+        // trimming it replaces.
+        let c = plan(1626, &spans(20, 200), 4096).unwrap();
+        assert!(!c.summarize.is_empty());
+        assert_eq!(c.before_tokens - c.after_tokens, c.saved());
+        assert!(c.after_tokens >= 1626, "the stable prefix survives whole");
+    }
+
+    #[test]
+    fn a_compaction_that_still_does_not_fit_says_so() {
+        // Four recent turns of 900 tokens each cannot be summarised away, so a small window is still
+        // exceeded afterwards and the caller has to grow as well.
+        let mut t = spans(12, 900);
+        for (i, s) in t.iter_mut().enumerate() { s.id = i; }
+        let c = plan(1600, &t, 4096).unwrap();
+        assert!(!c.fits, "after {} against a 4096 window", c.after_tokens);
+        assert!(plan(1600, &t, 32768).unwrap().fits);
+    }
+
+    #[test]
+    fn a_short_conversation_is_not_worth_compacting() {
+        assert!(plan(1626, &spans(4, 200), 4096).is_none(), "nothing outside the tail");
+        assert!(plan(1626, &spans(6, 50), 4096).is_none(), "saving under the floor");
+    }
+
+    #[test]
+    fn the_saving_is_what_the_summary_does_not_spend() {
+        let c = plan(1000, &spans(14, 300), 4096).unwrap();
+        let head: usize = 10 * 300;
+        assert_eq!(c.summary_budget, (head as f32 * SUMMARY_RATIO).ceil() as usize);
+        assert_eq!(c.saved(), head - c.summary_budget);
+    }
+
+    #[test]
+    fn appending_a_summary_extends_the_prefix_and_re_rolling_does_not() {
+        // The trap, stated as a test. Two summaries rewritten into one is tidier and forfeits the
+        // prefix tree for a turn, which is the cost compaction exists to avoid paying every turn.
+        let before = vec![0usize, 1];          // system, summary #1
+        assert!(is_append_only(&before, &[0, 1, 2]), "appending summary #2 extends");
+        assert!(!is_append_only(&before, &[0, 9]), "re-rolling 1 and 2 into 9 rewrites");
+        assert!(is_append_only(&before, &before), "no change is trivially append-only");
+        assert!(!is_append_only(&before, &[0]), "a prefix cannot shrink");
+    }
+
+    #[test]
+    fn the_summary_instruction_carries_its_own_budget() {
+        let s = summary_instruction(240);
+        assert!(s.contains("240 tokens"));
+        assert!(s.contains("still open"), "outstanding threads are what the next turns need");
     }
 
     #[test]
