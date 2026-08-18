@@ -271,3 +271,53 @@ from someone who knows what the bar is for.
 `bars::BarState` should probably go at the same time. Two view modules over one
 engine model, both unreached, is a duplicate to resolve rather than two things
 to wire.
+
+---
+
+# clawbound-changes.bundle cannot be applied here (2026-08-18)
+
+Ten commits, and none of them can be read. Recording why precisely, because
+the fix is a one-line re-export and guessing at it wastes a round trip.
+
+The bundle is INCREMENTAL against `e2bdd70c` — the commit that archived the
+pre-rewrite history. That commit no longer exists: the v3-pack blob rewrite
+(`c4-882`, removing the superseded `BSPK` v3 packs by content) rewrote every
+commit from that point forward, and its replacement is `1a8a8a5a` with the same
+message and a DIFFERENT tree, because the tree it had contained the v3 packs.
+
+So the base cannot be reconstructed even in principle — the content it
+references was deliberately deleted.
+
+What was tried, in order:
+
+1. `git fetch` — refused, prerequisite missing.
+2. `git clone` the bundle standalone — same.
+3. Stripping the bundle header and `git index-pack` on the packfile — "80
+   unresolved deltas".
+4. `git unpack-objects` — the same deltas, but the COMMIT objects landed. All
+   ten messages are readable, which is how the contents are known.
+5. `git checkout 6a772be5 -- games/clawbound` — the root tree is itself one of
+   the unresolved deltas, so nothing under it resolves.
+
+The commits are worth having. Top of the chain:
+
+```
+6a772be5  clawbound: ship the pack, drop the source IQMs
+0151ca9b  clawbound: the map was not fair, and the harness could not have told us
+ede7a418  clawbound+bsweb: the animal models as a parts web — 19.0 MB to 2.81 MB
+6106e7f0  clawbound: the tilted country — the duo lane climbs, the river keeps the floor
+```
+
+`ede7a418` is the parts-web port suggested earlier in this session, and
+`6a772be5` drops the source IQMs it supersedes — 19.0 MB to 2.81 MB, which also
+settles the clawbound entry in REPO_SIZE.md.
+
+**To send it again**, either works:
+
+```sh
+git bundle create clawbound.bundle --all          # self-contained, larger
+git format-patch <base>..HEAD -o patches/         # applies over a rewrite
+```
+
+Patches are the safer default now: this line has been rewritten three times and
+any incremental bundle cut against a pre-rewrite base will fail the same way.
