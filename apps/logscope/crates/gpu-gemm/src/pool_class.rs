@@ -381,6 +381,36 @@ mod pending_drain_tests {
     /// catch.
     ///
     /// `begin_frame` was the path that did not drain. Four others did.
+    /// ANY write to the frame's encoder must drain first, not just a submit.
+    ///
+    /// The submit case was the obvious one and it was not the whole rule.
+    /// Queued dispatches are encoded at DRAIN time, so anything recorded into
+    /// `frame.enc` in the meantime lands AHEAD of work that was issued before
+    /// it — the encoder sees the copy or the clear first and the dispatches
+    /// afterwards, which is the reverse of the program order.
+    ///
+    /// Two sites had this and neither was a submit: `zero_tensor`, whose own
+    /// doc says "the clear cannot be reordered against real work", and
+    /// `copy_buf`, which writes the KV cache. Under fusion the clear zeroed a
+    /// buffer a queued dispatch had been told to fill, and the copy read a
+    /// cache entry before it was written. Both are fluent wrong output, not a
+    /// crash.
+    #[test]
+    fn every_write_to_the_frame_encoder_drains_pending_first() {
+        let src = include_str!("lib.rs");
+        for (i, _) in src.match_indices("frame.enc.").chain(src.match_indices("f.enc.")) {
+            let call = &src[i..(i + 40).min(src.len())];
+            // Opening a pass IS the drain's own work; skip it.
+            if call.contains("begin_compute_pass") { continue; }
+            // Look back for the drain that must precede it.
+            let back = &src[i.saturating_sub(600)..i];
+            assert!(back.contains("drain_pending"),
+                    "an encoder write with no preceding drain — queued dispatches would be \
+encoded AFTER it, reversing program order:\n...{}",
+                    &src[i.saturating_sub(200)..(i + 60).min(src.len())]);
+        }
+    }
+
     #[test]
     fn every_frame_submit_drains_pending_first() {
         let src = include_str!("lib.rs");

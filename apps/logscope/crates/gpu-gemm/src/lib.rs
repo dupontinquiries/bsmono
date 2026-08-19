@@ -3969,6 +3969,15 @@ impl Gpu {
         if bytes == 0 { return; }
         let mut fr = self.frame.lock().unwrap();
         if let Some(f) = fr.as_mut() {
+            // DRAIN FIRST. This function's own doc says "the clear cannot be
+            // reordered against real work" — and with pass fusion that is
+            // exactly what happened. Queued dispatches are encoded at drain
+            // time, so a clear issued between dispatch A and dispatch B was
+            // recorded into the encoder IMMEDIATELY, ahead of both, and zeroed
+            // a buffer A had already been told to fill.
+            //
+            // Silent under fusion-off, because nothing is ever queued.
+            Self::drain_pending(f);
             f.enc.clear_buffer(&t.buf, 0, Some(bytes));
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zero") });
@@ -13746,6 +13755,11 @@ impl Gpu {
     /// writes batch with the token's compute), else submits on its own.
     fn copy_buf(&self, src: &Tensor, src_off: u64, dst: &Tensor, dst_off: u64, bytes: u64) {
         if let Some(frame) = self.frame.lock().unwrap().as_mut() {
+            // DRAIN FIRST, same hazard as zero_tensor. A KV cache write copied
+            // out of a tensor that a queued dispatch has not yet filled reads
+            // whatever was there before — a stale or uninitialised cache entry,
+            // which is fluent wrong output rather than a crash.
+            Self::drain_pending(frame);
             frame.enc.copy_buffer_to_buffer(&src.buf, src_off, &dst.buf, dst_off, bytes);
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
