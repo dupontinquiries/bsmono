@@ -71,3 +71,6 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 # CARGO_PROFILE_DEV_DEBUG=2 when a debugger session needs full types.
 [profile.dev]
 debug = "line-tables-only"
+
+[dev-dependencies]
+naga = "29"

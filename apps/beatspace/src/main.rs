@@ -17,6 +17,7 @@ mod model;
 mod player;
 mod train;
 mod trainpage;
+mod wgpu_train;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
