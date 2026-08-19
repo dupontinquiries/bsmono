@@ -601,14 +601,29 @@ impl App {
                 self.cfg.data_dir = dir.clone().into();
             }
             if ui.add_enabled(!running, egui::Button::new("📁")).clicked() {
-                // Blocking pick. The frame stalls while the portal is open,
-                // which is correct: the operator is in a modal dialog and an
-                // animating window behind it is not worth a thread.
-                if let Some(d) = rfd::FileDialog::new()
-                    .set_directory(&self.cfg.data_dir)
-                    .pick_folder()
-                {
-                    self.cfg.data_dir = d;
+                // The KIT picker, in-window. rfd was here and it PANICKED on
+                // this hardware:
+                //
+                //   pick_folder -> ashpd -> zbus -> tokio::spawn_blocking
+                //   "there is no reactor running, must be called from the
+                //    context of a Tokio 1.x runtime"
+                //
+                // rfd was built with features = ["xdg-portal", "tokio"], which
+                // makes zbus use tokio's reactor — and pollster::block_on
+                // inside an egui frame is not a tokio context. The blocking
+                // comment above it described a stall that never happened
+                // because the call could not complete at all.
+                //
+                // Worse, zbus features are ADDITIVE across the graph: turning
+                // tokio on for rfd turned it on for accesskit too, and eframe's
+                // Linux accessibility thread panicked at startup with the same
+                // message, before anything was clicked. One dependency's
+                // feature flag broke a subsystem that never asked for it.
+                self.picker_open = !self.picker_open;
+                if self.picker_open {
+                    let start = self.cfg.data_dir.to_string_lossy().to_string();
+                    let start = if start.is_empty() { "~".to_string() } else { start };
+                    self.picker.reset_to(&start, uikit_egui::path_picker::list_local);
                 }
             }
         });

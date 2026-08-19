@@ -16,7 +16,15 @@ path = "src/main.rs"
 # Placed at the TOP of this section deliberately: appended at the bottom it
 # landed inside [profile], which is a legal table, so cargo parsed the file
 # without complaint and simply did not have the dependency.
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# rfd REMOVED. Its xdg-portal backend goes through ashpd -> zbus, and the
+# "tokio" feature made zbus demand a tokio reactor that an egui frame does not
+# have — pick_folder panicked outright. zbus features are additive, so that
+# flag also broke eframe's accesskit thread, which panicked at startup with the
+# same message and had nothing to do with file dialogs.
+#
+# uikit_egui::path_picker replaces it: in-window, no portal, no bus, and it
+# works on a phone where a desktop file dialog is somebody else's full-screen
+# UI with its own touch targets.
 
 # --- neural net (pure-Rust, CPU by default; see README for GPU) ---
 candle-core = "0.11"
