@@ -3596,7 +3596,16 @@ fn trim_hallucination_loop(s: &str) -> String {
         // Scan for runs of identical shingles starting from the
         // beginning. Practically, hallucinations loop early in the
         // output so we don't bother scanning later positions.
-        for start in 0..(words.len() - window * 3) {
+        //
+        // Inclusive upper bound (`..=`): a loop whose shingle repeats
+        // exactly 3x and fills the ENTIRE word list (no trailing
+        // words) has its only valid `start` at `words.len() -
+        // window*3` itself — an exclusive `0..` range skipped that
+        // one position and missed exactly this case. Ported from the
+        // same fix already made at shared/voice-kit/src/hallucination.rs
+        // (see that module's `trims_repeated_shingle_loops` test,
+        // labeled "the off-by-one case").
+        for start in 0..=(words.len() - window * 3) {
             let first_shingle = &words[start..start + window];
             let mut runs = 1;
             let mut pos = start + window;

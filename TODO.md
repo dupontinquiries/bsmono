@@ -25,7 +25,13 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 - [x] rusty-board voice/hallucination.rs → voice-kit shim.
 - [x] Verified: standalone harness crates cargo-check green vs the kits.
 - [ ] User builds + runs all apps via GUI to confirm full builds (Qt/GTK, not sandbox-buildable).
-- [ ] voiceterm voice.rs hallucination fns → voice-kit (embedded; + fix loop-trimmer off-by-one at source).
+- [ ] voiceterm voice.rs hallucination fns → voice-kit (embedded; fix
+      loop-trimmer off-by-one at source — DONE, see below). Repoint onto
+      the voice-kit shim itself still open: `voice.rs` is huge (4400+
+      lines) and almost entirely `#[cfg(feature = "voice")]`/qmetaobject
+      (Qt), neither buildable in this sandbox, so a mechanical repoint here
+      would be unverifiable until a real build — left for a session with a
+      real Qt toolchain rather than done blind.
 - [ ] unendlich worldgen RNG → core_kit::rng (opt-in — changes sequence).
 - [ ] scattered now_ms / hex app copies → core-kit (follow-up sweep).
 - [ ] reconcile only-in-monorepo dead files in synced apps (see maintenance/SISTER_STATUS.md).
@@ -171,6 +177,25 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   worker pattern as the completion Engine), **egui_kittest** snapshots for the
   view layer (state layer is already headless-tested), **minimap** on the
   scrollbar rail.
+
+## voiceterm — loop-trimmer off-by-one (fixed at source, 2026-08-19)
+
+`apps/voiceterm/src/voice.rs`'s `trim_hallucination_loop` predates the
+`voice-kit` extraction and still carried the bug the kit's copy already
+fixed: `for start in 0..(words.len() - window * 3)` is an EXCLUSIVE range,
+so a hallucination loop whose shingle repeats exactly 3× and fills the
+*entire* word list (no trailing words after it — e.g. "go left go left go
+left") has its only valid `start` position sit exactly at the excluded
+upper bound and goes undetected. `shared/voice-kit/src/hallucination.rs`
+already uses the inclusive `0..=(...)` and has a test naming this exact
+case ("the off-by-one case"). Ported the same one-character fix
+(`0..` → `0..=`) to voiceterm's copy, with a comment pointing at the kit's
+test. Verified the ported logic in isolation (a standalone `rustc`
+compile of just the function against voice-kit's own test cases, since
+`voice.rs` itself is behind the `voice` feature + qmetaobject/Qt, neither
+buildable in this sandbox) — not a substitute for a real `cargo test` in
+a Qt-capable environment, but confirms the fix is a correct, minimal,
+byte-for-byte port of already-tested code rather than a guess.
 
 ## scene-kit (shared/scene-kit) — logscope migration
 
