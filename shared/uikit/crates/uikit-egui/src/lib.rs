@@ -31,6 +31,7 @@ pub mod touch;
 pub mod skin;
 pub mod livebg;
 pub mod nav;
+pub mod path_picker;
 pub mod segmented_tabs;
 pub mod scroll;
 pub mod fuzzy;

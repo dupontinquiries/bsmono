@@ -23,8 +23,14 @@ candle-core = "0.11"
 candle-nn   = "0.11"
 
 # --- GUI ---
-eframe = { version = "0.35", default-features = true }
-egui   = "0.35"
+eframe = { version = "0.34", default-features = true }
+# 0.34, matching the other thirteen egui apps and uikit-egui. beatspace was the
+# only crate on 0.35, which meant the kit's Ui and this app's Ui were different
+# types and no shared widget could cross — another manifest in this tree already
+# carries the comment "must match uikit-egui, or Color32 and Sense are different
+# types", learned the same way.
+egui   = "0.34"
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
 
 # --- realtime audio out ---
 cpal = "0.18"

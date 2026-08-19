@@ -263,6 +263,11 @@ struct App {
     /// Lines arriving from a running trainer.
     train_rx: Option<std::sync::mpsc::Receiver<String>>,
     train_epochs: String,
+    /// The shared kit picker, rather than rfd. A native dialog is somebody
+    /// else's full-screen UI with its own touch targets, and on postmarketOS
+    /// it may simply not be there.
+    picker: uikit_egui::path_picker::PathPicker,
+    picker_open: bool,
     train_batch: String,
     latent: usize,
     shared: Arc<Mutex<Shared>>,
@@ -296,6 +301,8 @@ impl App {
             gpu: Default::default(),
             train_rx: None,
             train_epochs: "20000".into(),
+            picker: Default::default(),
+            picker_open: false,
             train_batch,
             cfg,
             latent,
@@ -614,6 +621,51 @@ impl App {
             }
         }
         ui.separator();
+
+        // THE LIBRARY PATH: typed or walked. Both, because a path pasted from
+        // a terminal is faster when you have one and unusable when you do not,
+        // and this app's own data dir is 124 folders deep in a music library.
+        ui.label(egui::RichText::new("library").small());
+        ui.horizontal(|ui| {
+            let mut path = self.cfg.data_dir.to_string_lossy().to_string();
+            if ui.text_edit_singleline(&mut path).changed() {
+                self.cfg.data_dir = path.into();
+            }
+            if ui.button(if self.picker_open { "hide" } else { "browse" }).clicked() {
+                self.picker_open = !self.picker_open;
+                if self.picker_open {
+                    let start = self.cfg.data_dir.to_string_lossy().to_string();
+                    let start = if start.is_empty() { "~".to_string() } else { start };
+                    self.picker.reset_to(&start, uikit_egui::path_picker::list_local);
+                }
+            }
+        });
+        if self.picker_open {
+            use uikit_egui::path_picker::{list_local, picker_ui, Action};
+            let colors = uikit_egui::palette_colors("midnight");
+            // The picker returns an ACTION and does no I/O of its own, so the
+            // read_dir happens here where it is obviously synchronous. Local
+            // listing is sub-millisecond; if this ever browses a network path
+            // it has to move off the frame, and the seam is already in place.
+            if let Some(a) = picker_ui(ui, &self.picker, &colors, 8) {
+                match a {
+                    Action::Enter(p) => self.picker.open(&p, list_local),
+                    Action::Up => self.picker.up(list_local),
+                    Action::Choose(p) => {
+                        self.cfg.data_dir = p.into();
+                        self.picker_open = false;
+                        self.status = "library set".into();
+                    }
+                    Action::ToggleHidden => {
+                        self.picker.show_hidden = !self.picker.show_hidden;
+                        if let Some(cur) = self.picker.current().map(str::to_string) {
+                            self.picker.open(&cur, list_local);
+                        }
+                    }
+                }
+            }
+            ui.separator();
+        }
 
         ui.horizontal(|ui| {
             ui.label("epochs");
