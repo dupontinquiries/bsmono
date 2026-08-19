@@ -156,3 +156,124 @@ convolution's output positions into one GEMM rather than looping.
 copying when the training path starts producing timings: seeded rows tagged
 `source:"hardware"`, tracked at p50/p99/max with a run count, so a regression
 is visible against a recorded baseline instead of a remembered one.
+
+---
+
+## Why speculative decoding is worth MORE here than on a datacentre card
+
+Prompted by a vLLM fork (`oceanplexian`, Aug 2026) reporting **218 tok/s** on
+Qwen3.8-27B across two RTX 3090s. The headline is speculative decoding, and the
+numbers are worth reading precisely:
+
+| | their run | what it means |
+|---|---|---|
+| draft tokens | 7 | proposed per target forward |
+| acceptance | 47.8% | of individual draft tokens |
+| **acceptance length** | **3.35** | **tokens committed per target forward** |
+| speedup | ~4.6x | over non-speculative |
+
+**Acceptance length is the metric, not acceptance rate.** 47.8% sounds like a
+coin flip; 3.35 tokens per forward is the number that becomes the speedup.
+logscope already reports it as `per_pass` in the spec-decode path — worth
+keeping, because "48% acceptance" invites tuning toward a percentage that is not
+the thing being bought.
+
+**The argument for this hardware is stronger than theirs, and it is the
+inversion worth noticing.** On a 3090 the target forward is compute-bound, so
+verifying 8 tokens costs meaningfully more than verifying 1 and the speedup is
+sublinear in acceptance length. Here it is not: the measured profile is 92% GPU
+sync across ~35 submits per forward, and a verify pass over k+1 tokens costs
+the SAME submits as one token — the batch dimension is nearly free when the
+bottleneck is dispatch, not arithmetic. So acceptance length converts to
+speedup more directly on Honeykrisp than on the card the technique was tuned
+for.
+
+**Their drafter costs 13.5 GB of VRAM. Ours must not.** DFlash2 is a second
+model resident alongside the target, which is available on a 24 GB card and
+impossible on a 4-8 GB phone — the fleet this targets. `spec::PromptLookup` is
+the answer already in the tree: model-free, it finds the current suffix earlier
+in the context and proposes what followed, so there is no second checkpoint to
+download, load or keep resident. It should do well on repository reading, where
+identifiers and paths repeat, and mostly whiff on prose — where a miss costs one
+verification slot and nothing else.
+
+Defaults today: `LOGSCOPE_SPEC_DRAFT=lookup`, `LOGSCOPE_SPEC_K=4`,
+`LOGSCOPE_SPEC_NGRAM=2` (measured: ng=2 beats 3 and 4 on every corpus). Their
+run used k=7. **Worth re-sweeping k on this hardware for exactly the reason
+above** — a larger k costs almost nothing per forward when submits dominate, so
+the optimum here should sit higher than on a compute-bound card. That is a
+prediction, not a measurement.
+
+**The same lever, in the other family.** Block diffusion's threshold commit
+(`LOGSCOPE_DIFFUSION_TAU`) is the identical arithmetic: tokens committed per
+forward. Speculative decoding does it for AR by guessing ahead and verifying;
+diffusion does it by committing every position the model is already confident
+about. One number, two families, and on this hardware it is the number that
+matters in both — because the forward is the unit that costs.
+
+---
+
+# What a 218 tok/s vLLM number does and does not transfer (2026-08-19)
+
+A vLLM fork reports **218 tok/s single request, Qwen3.8-27B on 2×3090**, with
+**~4.6× effective speedup over non-speculative**. Worth separating three
+claims that arrive as one number.
+
+## The hardware is not comparable and the technique is
+
+Two 3090s are ~1.7 TB/s of aggregate bandwidth with mature CUDA kernels; the
+Asahi M2 Ultra path here measures **3–9 GB/s of an 800 GB/s spec**, i.e. under
+1% of its own ceiling. The gap in that number is not the algorithm.
+
+The 4.6× **is** the algorithm: `--speculative-config` with
+`num_speculative_tokens: 7` and a DFlash2 drafter. Draft several tokens
+cheaply, verify them in one batched pass of the target model, keep the prefix
+that matches. It converts a latency-bound decode into a throughput-bound one —
+which is exactly the regime logscope is in, where the roofline says the
+hardware is idle and the limit is dispatch and sync overhead.
+
+## logscope already has it, and nothing calls it
+
+Every piece is built and tested:
+
+| piece | where | state |
+|---|---|---|
+| the control loop | `specloop.rs` — `propose()` / `settle()` | 6 tests, **no caller** |
+| the accept rule | `specverify.rs` | present |
+| a drafter needing no second model | `lookupdraft.rs` (n-gram from context) | present |
+| the batched verify pass | `Gpu::decode_batched` | present |
+| draft rollback | `Session::rewind(rows)` | present |
+
+`specloop`'s own header explains the sequencing it was designed for:
+
+```text
+let d = spec.propose(&context);        // tokens to draft, possibly empty
+// run the target over context + d, one batched pass -> d.len()+1 argmaxes
+let out = spec.settle(&d, &argmaxes);  // tokens to emit
+```
+
+`lookupdraft` matters more here than DFlash2 does: vLLM's speedup needs a
+second checkpoint sharing a tokenizer, and the n-gram drafter needs nothing —
+which for a fleet that loads one GGUF at a time is the difference between a
+feature and a deployment problem.
+
+**This was NOT wired in that session, deliberately.** `specloop`'s header calls
+the generation loop "the hardest code in the engine to change safely", the
+rejection path has to `rewind` the KV cache by exactly the count that failed,
+and there is no hardware here to check the output against. Wiring it blind is
+what `LOGSCOPE_PASS_FUSE` did — it changed generated tokens on 3 of 6
+configurations and is now retracted. The right shape is an env flag, off by
+default, reporting `accept_rate()` — the same way every other risky lever in
+this engine ships.
+
+## It does not apply to the diffusion path at all
+
+Speculation drafts a token and checks it against the model's next-token
+distribution. Block diffusion has no next-token step to draft — it denoises a
+whole block. The analogue is **tokens committed per forward**, which is the
+confidence threshold `LOGSCOPE_DIFFUSION_TAU`, and as of c4-917 the measured
+rate is reported at the end of a run.
+
+So for DiffuCoder the lever is tau, and for an AR model on this engine it is
+the speculative loop that already exists. Two different answers, and the vLLM
+number is evidence for the second one only.
