@@ -18,6 +18,8 @@ mod player;
 mod train;
 mod trainpage;
 mod wgpu_train;
+#[cfg(feature = "gpu")]
+mod wgpu_run;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
