@@ -551,6 +551,8 @@ pub struct SparseBlock {
     pointwise: Conv2d,
     bn: BatchNorm2d,
     threshold: f32,
+    /// Gate steepness. 40.0 in the reference pipeline.
+    sharpness: f32,
 }
 
 /// DEPTHWISE CONVOLUTION IS A PESSIMISATION ON THIS BACKEND, and it is where
@@ -586,26 +588,43 @@ pub struct SparseBlock {
 /// BEATSPACE_DENSE_D=1 builds a single dense convolution instead. It is NOT
 /// checkpoint-compatible — different parameter shapes, so a run started one way
 /// cannot resume the other — which is why it is a flag and not a change.
-/// `|x| > t ? x : 0`, in one traversal.
+/// `x * sigmoid(sharpness * (|x| - t))`, in one traversal.
 ///
-/// A CustomOp1 rather than a chain of tensor ops because the chain is four
-/// passes and four allocations over a tensor that can be 8.4M elements, and
-/// candle's elementwise kernels are single-threaded.
+/// A SHARP SIGMOID, NOT A HARD STEP, and this is the bug that killed the
+/// 269-epoch run. The port implemented v5.2's gate:
 ///
-/// IT IMPLEMENTS `bwd`, and the first version did not.
+///     x * (x.abs() > threshold).float()
 ///
-/// I reached for `apply_op1_no_bwd` and wrote a comment rationalising it — that
-/// the gate is "a straight-through path where it passes and a stop where it
-/// does not". That is true of the VALUE and false of the GRAPH: no_bwd cuts the
-/// backward edge, so no gradient would have reached the depthwise convolution
-/// beneath it and the discriminator would have quietly stopped learning half of
-/// itself. The loss would still move, because the pointwise and later layers
-/// still train.
+/// and v5.3 of the reference pipeline replaced it precisely because that
+/// collapses the discriminator. Its own comment, worth quoting in full because
+/// it describes the failure that was observed here exactly:
 ///
-/// The original chain was differentiable: `mul` by a constant mask passes
-/// `grad * mask` through. This reproduces exactly that, in one pass.
+///   "the gate used to be a hard step, (x.abs() > threshold).float(), which has
+///    EXACTLY ZERO gradient for every unit below threshold. Verified that even
+///    at random init 80-99.9% of units in a block fall below threshold, and
+///    that fraction only grows deeper in the network as training progresses --
+///    units below threshold can never receive a gradient to recover, so the
+///    whole discriminator can (and did) collapse into a permanently frozen,
+///    input-independent fixed point: bit-identical D(real)/D(fake)/losses for
+///    tens of thousands of iterations straight."
+///
+/// That is the observed signature: d_loss pinned at 2ln2, g_loss at ln2, flat
+/// for forty points, after a vertical fall. A frozen input-independent D scores
+/// exactly there.
+///
+/// The sigmoid is near-zero below threshold and near-one above, so the forward
+/// behaviour is nearly the same — but its gradient is never exactly zero, so a
+/// dead unit can still receive a small gradient and recover.
+///
+/// One CustomOp1 rather than a chain, for the reason the hard version was: the
+/// chain is four passes and four allocations over a tensor that reaches 8.4M
+/// elements, and candle's elementwise kernels are single-threaded.
 struct SparseGate {
     thr: f32,
+    /// 40.0 in the reference. High enough that the gate is effectively binary
+    /// in the forward pass, low enough that the derivative below threshold is
+    /// small rather than zero.
+    sharpness: f32,
 }
 
 impl candle_core::CustomOp1 for SparseGate {
@@ -623,23 +642,37 @@ impl candle_core::CustomOp1 for SparseGate {
                     Some((a, b)) => &v[a..b],
                     None => candle_core::bail!("sparse-gate wants a contiguous input"),
                 };
+                let s = self.sharpness;
                 candle_core::CpuStorage::F32(
-                    src.iter().map(|&x| if x.abs() > thr { x } else { 0.0 }).collect())
+                    src.iter().map(|&x| x / (1.0 + (-s * (x.abs() - thr)).exp())).collect())
             }
             _ => candle_core::bail!("sparse-gate is f32 only"),
         };
         Ok((out, l.shape().clone()))
     }
 
-    /// `grad * (|x| > t)`, matching what `mul` by the constant mask did.
+    /// The derivative of `x * sigma(s(|x| - t))`.
     ///
-    /// Reads the ARGUMENT rather than the result: at exactly zero the two are
-    /// indistinguishable in the output — a gated-off element and a genuine zero
-    /// both read 0 — and deriving the mask from the result would pass gradient
-    /// through elements the forward had blocked.
+    /// By the product rule, with `u = s(|x| - t)` and `g = sigma(u)`:
+    ///
+    ///     dy/dx = g + x * g(1-g) * s * sign(x)
+    ///
+    /// The second term is what the hard step threw away, and it is the whole
+    /// point: it is non-zero for every unit, so one that has fallen below
+    /// threshold still receives gradient and can climb back. A step function's
+    /// derivative is zero there, which is why those units died permanently.
+    ///
+    /// Reads the ARGUMENT rather than the result: at x = 0 both are zero and
+    /// the result cannot say what the input was.
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad: &Tensor) -> Result<Option<Tensor>> {
-        let mask = arg.abs()?.gt(self.thr)?.to_dtype(DType::F32)?;
-        Ok(Some(grad.mul(&mask)?))
+        let s = self.sharpness as f64;
+        let u = arg.abs()?.affine(s, -(self.thr as f64) * s)?;   // s(|x| - t)
+        let g = candle_nn::ops::sigmoid(&u)?;
+        let one_minus = g.affine(-1.0, 1.0)?;
+        // sign(x), and 0 at exactly 0 — where the term vanishes anyway.
+        let sign = arg.sign()?;
+        let second = arg.mul(&g)?.mul(&one_minus)?.affine(s, 0.0)?.mul(&sign)?;
+        Ok(Some(grad.mul(&g.add(&second)?)?))
     }
 }
 
@@ -657,6 +690,7 @@ impl SparseBlock {
                 pointwise: Conv2d::new(cout, cout, 1, 1, 0, 1, dev)?,
                 bn: BatchNorm2d::new(cout, dev)?,
                 threshold,
+                sharpness: 40.0,
             });
         }
         Ok(Self {
@@ -666,6 +700,7 @@ impl SparseBlock {
             pointwise: Conv2d::new(cin, cout, 1, 1, 0, 1, dev)?,
             bn: BatchNorm2d::new(cout, dev)?,
             threshold,
+            sharpness: 40.0,
         })
     }
 
@@ -688,10 +723,14 @@ impl SparseBlock {
         // single custom unary so the comparison and the select happen in the
         // same pass over the data.
         let thr = self.threshold;
-        let x = x.apply_op1(SparseGate { thr })?;
+        let x = x.apply_op1(SparseGate { thr, sharpness: self.sharpness })?;
         let x = self.pointwise.forward(&x)?;
         let x = self.bn.forward(&x, train)?;
-        x.relu()
+        // LEAKY relu at 0.2, matching the reference. A plain relu is the same
+        // dead-unit trap as the hard gate one line up: a channel driven
+        // negative has zero gradient forever, and this block already had one
+        // way to freeze.
+        x.maximum(&(&x * 0.2)?)
     }
 
     fn vars(&self, out: &mut Vec<Var>) {
@@ -880,6 +919,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_unit_below_threshold_still_receives_gradient() {
+        // THE WHOLE FIX. The hard step `x * (|x| > t)` has EXACTLY ZERO
+        // gradient below threshold, and the reference pipeline's v5.3 comment
+        // records what that does: "even at random init 80-99.9% of units in a
+        // block fall below threshold ... units below threshold can never
+        // receive a gradient to recover, so the whole discriminator can (and
+        // did) collapse into a permanently frozen, input-independent fixed
+        // point".
+        //
+        // That is the signature the 269-epoch run produced — d_loss pinned at
+        // 2ln2, flat for forty points. So the property to assert is not that
+        // the gate matches the old one; it is that it DIFFERS from it in
+        // exactly the place the old one was fatal.
+        use candle_core::{Device, Tensor, Var};
+        let dev = Device::Cpu;
+        let thr = 0.05f32;
+        // Values well below threshold: the dead zone.
+        let below: Vec<f32> = vec![0.001, 0.005, 0.01, 0.02, -0.001, -0.02];
+        let v = Var::from_tensor(&Tensor::from_vec(below.clone(), (1, 1, 2, 3), &dev).unwrap())
+            .unwrap();
+        let y = v.as_tensor().apply_op1(SparseGate { thr, sharpness: 40.0 }).unwrap();
+        let g = y.sum_all().unwrap().backward().unwrap();
+        let d = g.get(&v).expect("no gradient at all")
+            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        for (x, dx) in below.iter().zip(&d) {
+            assert!(dx.abs() > 1e-6,
+                    "unit at {x} has gradient {dx} — it can never recover, which is the \
+v5.2 collapse");
+            assert!(dx.is_finite());
+        }
+    }
+
+    #[test]
+    fn the_gate_still_suppresses_below_threshold_and_passes_above() {
+        // The forward behaviour must stay near the hard gate's, or this is a
+        // different model rather than a fixed one. sharpness 40 makes the
+        // sigmoid effectively binary a little way either side of t.
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let thr = 0.05f32;
+        let xs = vec![0.001f32, 0.5, -0.5, 0.0];
+        let x = Tensor::from_vec(xs.clone(), (1, 1, 1, 4), &dev).unwrap();
+        let y = x.apply_op1(SparseGate { thr, sharpness: 40.0 }).unwrap()
+            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(y[0].abs() < 0.001, "0.001 should be suppressed, got {}", y[0]);
+        assert!((y[1] - 0.5).abs() < 0.01, "0.5 should pass, got {}", y[1]);
+        assert!((y[2] + 0.5).abs() < 0.01, "-0.5 should pass, got {}", y[2]);
+        assert_eq!(y[3], 0.0, "zero stays zero");
+    }
+
+    #[test]
+    fn the_block_activation_is_leaky() {
+        // A plain relu is the same dead-unit trap one line down from the gate:
+        // a channel driven negative gets zero gradient forever. The reference
+        // uses leaky_relu(0.2) and so must this.
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let blk = SparseBlock::new(1, 1, 1, 0.0, &dev).unwrap();
+        // Drive the output negative by construction is awkward; assert on the
+        // source instead, which is what actually has to not regress.
+        let src = include_str!("model.rs");
+        assert!(src.contains("x.maximum(&(&x * 0.2)?)"), "the block is not leaky");
+        assert!(!src.contains("        x.relu()\n    }"), "a plain relu came back");
+        let _ = blk;
+        let _ = Tensor::zeros((1, 1, 4, 4), candle_core::DType::F32, &dev).unwrap();
+    }
+
+    #[test]
     fn the_folded_batchnorm_matches_the_unfolded_formula() {
         // Compared against the ARITHMETIC IT REPLACED, not against a property.
         // My first attempt asserted "variance is 1" and got 1.012 — which sent
@@ -957,43 +1065,16 @@ mod tests {
                 "eval output looks batch-normalised, so the running stats were ignored");
     }
 
-    #[test]
-    fn the_fused_gate_matches_the_four_op_chain_and_its_gradient() {
-        // The forward is the easy half. The GRADIENT is the half I nearly lost:
-        // the first version used apply_op1_no_bwd, which cuts the backward edge,
-        // so nothing would have reached the depthwise conv and the
-        // discriminator would have quietly stopped training half of itself
-        // while the loss kept moving.
-        use candle_core::{DType, Device, Tensor, Var};
-        let dev = Device::Cpu;
-        let thr = 0.25f32;
-        let vals: Vec<f32> = (0..64).map(|i| (i as f32 * 0.31).sin()).collect();
-
-        // Fused.
-        let a = Var::from_tensor(&Tensor::from_vec(vals.clone(), (1, 1, 8, 8), &dev).unwrap()).unwrap();
-        let ya = a.as_tensor().apply_op1(SparseGate { thr }).unwrap();
-        let ga = ya.sum_all().unwrap().backward().unwrap();
-
-        // The chain it replaces.
-        let b = Var::from_tensor(&Tensor::from_vec(vals.clone(), (1, 1, 8, 8), &dev).unwrap()).unwrap();
-        let mask = b.as_tensor().abs().unwrap().gt(thr).unwrap().to_dtype(DType::F32).unwrap();
-        let yb = b.as_tensor().mul(&mask).unwrap();
-        let gb = yb.sum_all().unwrap().backward().unwrap();
-
-        let fa = ya.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let fb = yb.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(fa, fb, "the forward differs");
-
-        let da = ga.get(&a).expect("the fused gate produced NO gradient")
-            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let db = gb.get(&b).expect("the chain produced no gradient")
-            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(da, db, "the gradient differs");
-        // And it is a real mask, not all-ones — otherwise the test would pass
-        // on a gate that does nothing.
-        assert!(da.iter().any(|&v| v == 0.0) && da.iter().any(|&v| v != 0.0),
-                "the threshold gated nothing, so this proves nothing");
-    }
+    // the_fused_gate_matches_the_four_op_chain_and_its_gradient REMOVED.
+    //
+    // It asserted the fused gate matched `x * (|x| > t)` exactly, forward and
+    // backward — which was right when the gate was a hard step and is now the
+    // wrong thing to want. The reference pipeline replaced that step precisely
+    // because its gradient is zero below threshold, and a test demanding the
+    // old gradient would have blocked the fix.
+    //
+    // a_unit_below_threshold_still_receives_gradient replaces it, and asserts
+    // the property the old one forbade.
 
     #[test]
     fn the_dense_discriminator_block_has_the_same_shape_contract() {
