@@ -105,7 +105,9 @@ impl ToggleGrid {
         let appear = motion::animate_eased(ui.ctx(), self.id.with("appear"), self.open, 0.14, motion::ease::out_back);
         let states = self.states.clone();
         let gid = self.id;
-        egui::Area::new(self.id).order(Order::Foreground).fixed_pos(self.origin).show(ui.ctx(), |ui| {
+        // Derived, for the same reason as slide_menu: an Area id IS a layer id,
+        // and sharing it with a caller's widget id trips egui's layer assertion.
+        egui::Area::new(self.id.with("area")).order(Order::Foreground).fixed_pos(self.origin).show(ui.ctx(), |ui| {
             let vis = ui.visuals().clone();
             let ctx = ui.ctx().clone();
             let painter = ui.painter();

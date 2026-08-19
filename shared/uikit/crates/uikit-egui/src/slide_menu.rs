@@ -475,7 +475,29 @@ impl SlideMenu {
         // Border blooms 2 → 4 px in the edge-freeze zone (QML animated 120 ms; smoothed the same way).
         let bloom = crate::motion::animate_eased(ui.ctx(), id.with("bloom"), frozen, 0.12, crate::motion::ease::out_quad);
 
-        egui::Area::new(id).order(Order::Foreground).fixed_pos(panel.min).show(ui.ctx(), |ui| {
+        // AREA ID IS DERIVED, not the caller's raw id.
+        //
+        // `Area::new(x)` creates a LAYER whose id is x, and egui registers the
+        // area as a widget under it. The caller's id comes from
+        // `ui.id().with(...)`, which lives in the BACKGROUND layer's namespace —
+        // so the one id names both a background widget and a foreground layer,
+        // and egui's debug build asserts:
+        //
+        //   DEBUG ASSERT: Widget C79D changed layer_id during the frame from
+        //   LayerId { Background 5A3E } to LayerId { Foreground C79D }
+        //
+        // The foreground layer id equalling the widget id is the tell: they are
+        // the same Id. `.with("area")` separates the namespaces.
+        //
+        // State lookups are untouched — `d.get_temp::<SlideState>(id)` still
+        // keys on the caller's id, which is what makes the state survive.
+        //
+        // UNVERIFIED against the crash: it was reported from a debug run of
+        // rusty-board's `feel` example and this container has no display. The
+        // reasoning stands on its own — a derived layer id cannot collide with
+        // a caller's widget id — but the assertion firing is what would prove
+        // it was this one.
+        egui::Area::new(id.with("area")).order(Order::Foreground).fixed_pos(panel.min).show(ui.ctx(), |ui| {
             let vis = ui.visuals().clone();
             let ctx = ui.ctx().clone();
             let painter = ui.painter();
@@ -685,7 +707,7 @@ impl SlideMenu {
         let appear = crate::motion::animate_eased(ui.ctx(), id.with("appear"), st.open, 0.14, crate::motion::ease::out_back);
         let item = self.item_size;
 
-        egui::Area::new(id).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ui.ctx(), |ui| {
+        egui::Area::new(id.with("area")).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ui.ctx(), |ui| {
             let vis = ui.visuals().clone();
             let ctx = ui.ctx().clone();
             let painter = ui.painter();

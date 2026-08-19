@@ -381,3 +381,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod layer_id_hygiene {
+    /// No kit widget may open an `Area` under an id a caller handed it.
+    ///
+    /// `Area::new(x)` creates a LAYER whose id is x, and egui registers the
+    /// area as a widget under it. A caller's id comes from `ui.id().with(...)`
+    /// and lives in the background layer's namespace, so passing it straight
+    /// through makes one Id name both a background widget and a foreground
+    /// layer. egui's debug build asserts on exactly that:
+    ///
+    ///   DEBUG ASSERT: Widget C79D changed layer_id during the frame from
+    ///   LayerId { Background 5A3E } to LayerId { Foreground C79D }
+    ///
+    /// The layer id equalling the widget id is the signature. A literal
+    /// `Id::new("...")` is fine — it is the kit's own namespace, not a
+    /// caller's — and so is a derived `.with(...)`.
+    ///
+    /// A source check because reproducing it needs a display and a debug
+    /// build, which is precisely why it reached a user rather than a test.
+    #[test]
+    fn an_area_never_takes_a_callers_id_unchanged() {
+        for (name, src) in [
+            ("slide_menu", include_str!("slide_menu.rs")),
+            ("toggle_grid", include_str!("toggle_grid.rs")),
+            ("confirm_dialog", include_str!("confirm_dialog.rs")),
+            ("toast", include_str!("toast.rs")),
+            ("repl_voice_glow", include_str!("repl_voice_glow.rs")),
+        ] {
+            for (i, _) in src.match_indices("Area::new(") {
+                // Skip comment lines — the explanation of this very rule
+                // quotes `Area::new(x)`, and matching prose would make the
+                // guard fail on its own documentation.
+                let line_start = src[..i].rfind('\n').map(|n| n + 1).unwrap_or(0);
+                if src[line_start..i].trim_start().starts_with("//") { continue; }
+                let arg: String = src[i + 10..].chars().take_while(|c| *c != ')').collect();
+                let ok = arg.contains("Id::new(")     // the kit's own namespace
+                    || arg.contains(".with(")          // derived from a caller's
+                    || arg.trim().is_empty();
+                assert!(ok,
+                    "{name}: Area::new({arg}) uses an id verbatim — if a caller passed it, \
+that Id now names both a background widget and this foreground layer");
+            }
+        }
+    }
+}
