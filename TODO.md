@@ -22,7 +22,11 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 
 - [x] bo-suite audio_features.rs (both copies) → audio-kit shim (+ engine_timbre_score local).
 - [x] bo-controller podcast_diar rms + voiceterm separation rms → audio_kit::level::rms.
-- [x] rusty-board voice/hallucination.rs → voice-kit shim.
+- [x] rusty-board voice/hallucination.rs → voice-kit shim. (This checkbox was
+      stale as of 2026-08-19 — the file was still a full standalone
+      implementation, not a shim. Actually done now; see the "rusty-board
+      (newly ingested)" section's voice-kit consumers item below for the
+      real commits.)
 - [x] Verified: standalone harness crates cargo-check green vs the kits.
 - [ ] User builds + runs all apps via GUI to confirm full builds (Qt/GTK, not sandbox-buildable).
 - [x] voiceterm voice.rs hallucination fns → voice-kit (embedded; fix
@@ -106,10 +110,23 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       `patches/rusty-board-swipe-regression.NOTES.md` (good core ≈ commits
       876a0fa..7d3efea; rusty-board-git.zip has the history). FUTURE: bisect/diff
       to recover the core → a reusable **swipe/touch-kit** (path→keys→words). Not active.
-- [ ] **voice-kit consumers**: repoint rusty-board `src/voice/` + voiceterm
-      `src/voice.rs` onto voice-kit (hallucination + model). Wire voice/recorder
-      level metering onto audio-kit `level`; a VAD gate (voice-kit over audio-kit)
-      is the next voice-kit growth.
+- [x] **voice-kit consumers, hallucination half**: rusty-board `src/voice/
+      hallucination.rs` and voiceterm `src/voice.rs`'s `is_sane_transcription`
+      + `trim_hallucination_loop` are now real shims over voice-kit (both
+      repointed this session, in small verified-by-comparison commits — a
+      previous session's [x] for the rusty-board half was stale, it had
+      never actually happened). Neither app compiles in this sandbox (GTK4/
+      libadwaita and Qt/qmetaobject respectively aren't installed/available
+      here), so both repoints are unverified by compilation — verified
+      instead by direct line-by-line comparison against voice-kit's actual
+      source before each substitution, and by voice-kit's own 43/43 tests
+      covering the functions being delegated to.
+- [ ] **voice-kit consumers, model half**: whisper model discovery/resolution
+      in both apps still has its own local copy; voice-kit's `model.rs`
+      exists and is tested (part of the same 43) but neither app has been
+      repointed onto it yet. Wire voice/recorder level metering onto
+      audio-kit `level`; a VAD gate (voice-kit over audio-kit) is the next
+      voice-kit growth.
 
 ## Source-of-truth hygiene
 
