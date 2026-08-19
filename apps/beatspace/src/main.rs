@@ -43,6 +43,10 @@ enum Cmd {
     /// Validate + benchmark the GPU generator (batched) against the CPU.
     #[cfg(feature = "gpu")]
     Gpu(GpuArgs),
+    /// Run the TRAINING kernels on this device and compare with the CPU
+    /// reference. The acceptance test for the wgpu training path.
+    #[cfg(feature = "gpu")]
+    GpuSelftest,
 }
 
 #[cfg(feature = "gpu")]
@@ -143,6 +147,16 @@ fn main() -> Result<()> {
         Cmd::Gpu(a) => {
             run_gpu(a)?;
         }
+        #[cfg(feature = "gpu")]
+        Cmd::GpuSelftest => match wgpu_run::selftest() {
+            Ok(report) => print!("{report}"),
+            Err(report) => {
+                // Printed, then a non-zero exit: a self-test that reports a
+                // failure and exits 0 is one a script will not notice.
+                print!("{report}");
+                std::process::exit(1);
+            }
+        },
     }
     Ok(())
 }

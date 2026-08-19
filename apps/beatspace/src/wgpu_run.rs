@@ -233,3 +233,170 @@ mod tests {
         assert!(col > raw * 3, "the expansion is not being reported: {col} vs {raw}");
     }
 }
+
+// ── self-test ───────────────────────────────────────────────────────────────
+
+/// Run the training kernels on the real device and compare against the CPU
+/// reference in `wgpu_train`.
+///
+/// This is why the reference was written first. A GPU kernel that produces
+/// plausible numbers is the hardest kind of wrong to notice — the loss still
+/// falls, just to somewhere worse — so the acceptance test is an exact
+/// comparison against arithmetic that has already been checked with finite
+/// differences, not an eyeball on a curve.
+///
+/// Reports every mismatch rather than the first: a GEMM that is wrong only on
+/// the ragged edge and a GEMM that is wrong everywhere need different fixes,
+/// and "first mismatch at index 0" cannot tell them apart.
+pub fn selftest() -> Result<String, String> {
+    use crate::wgpu_train::{gemm_ref, gemm_wgsl, TILE};
+
+    let mut out = String::new();
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .map_err(|e| format!("no wgpu adapter: {e}"))?;
+    let info = adapter.get_info();
+    out.push_str(&format!("adapter: {} ({:?})\n", info.name, info.backend));
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("beatspace-train"),
+        required_features: wgpu::Features::empty(),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .map_err(|e| format!("no device: {e}"))?;
+
+    // A size that is deliberately NOT a multiple of the tile, so the ragged
+    // edge is exercised. A square power of two would pass with a kernel whose
+    // bounds handling is broken.
+    let (m, k, n) = (37usize, 53usize, 41usize);
+    let a: Vec<f32> = (0..m * k).map(|i| ((i * 37 % 91) as f32 - 45.0) / 45.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| ((i * 53 % 83) as f32 - 41.0) / 41.0).collect();
+    let want = gemm_ref(&a, &b, m, k, n, false, false);
+
+    let src = gemm_wgsl();
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("gemm"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+
+    use wgpu::util::DeviceExt;
+    let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("a"),
+        contents: bytemuck::cast_slice(&a),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("b"),
+        contents: bytemuck::cast_slice(&b),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let c_bytes = (m * n * 4) as u64;
+    let c_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("c"),
+        size: c_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    // Dims: m, k, n, a_t, b_t, accum, pad, pad — matching the struct in the
+    // shader. Written as u32 in that order because a mismatch here is a
+    // silently transposed matrix, not an error.
+    let dims: [u32; 8] = [m as u32, k as u32, n as u32, 0, 0, 0, 0, 0];
+    let d_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("dims"),
+        contents: bytemuck::cast_slice(&dims),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("read"),
+        size: c_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("gemm"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: c_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: d_buf.as_entire_binding() },
+        ],
+    });
+
+    let grid = Grid::for_tiles(m, n, TILE);
+    out.push_str(&format!("gemm {m}x{k}x{n} on a {}x{} tile grid\n", grid.x, grid.y));
+
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(grid.x, grid.y, grid.z);
+    }
+    enc.copy_buffer_to_buffer(&c_buf, 0, &read_buf, 0, c_bytes);
+    queue.submit([enc.finish()]);
+
+    let slice = read_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv()
+        .map_err(|e| format!("map channel: {e}"))?
+        .map_err(|e| format!("map failed: {e}"))?;
+    let got: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+    read_buf.unmap();
+
+    // f32 accumulation over 53 terms in a different order than the reference,
+    // so an exact match is not the bar — but the tolerance is tight enough
+    // that a genuinely wrong kernel cannot slip through.
+    let tol = 1e-4f32;
+    let mut bad = 0usize;
+    let mut worst = 0f32;
+    let mut worst_at = (0usize, 0usize);
+    for i in 0..m {
+        for j in 0..n {
+            let d = (got[i * n + j] - want[i * n + j]).abs();
+            if d > worst {
+                worst = d;
+                worst_at = (i, j);
+            }
+            if d > tol {
+                bad += 1;
+            }
+        }
+    }
+    out.push_str(&format!(
+        "worst |gpu-cpu| = {worst:.3e} at ({}, {})\n", worst_at.0, worst_at.1));
+
+    if bad == 0 {
+        out.push_str(&format!("PASS — all {} elements within {tol:.0e}\n", m * n));
+        Ok(out)
+    } else {
+        // Where the mismatches are IS the diagnosis. Confined to the last
+        // partial tile means the bounds handling; spread everywhere means the
+        // barrier or the indexing.
+        let edge = worst_at.0 >= (m / TILE) * TILE || worst_at.1 >= (n / TILE) * TILE;
+        out.push_str(&format!(
+            "FAIL — {bad} of {} elements past {tol:.0e}. Worst is {} the ragged edge, which \
+             points at {}.\n",
+            m * n,
+            if edge { "ON" } else { "NOT on" },
+            if edge { "the bounds handling in a_at/b_at" }
+            else { "the tile barriers or the index maths" },
+        ));
+        Err(out)
+    }
+}
