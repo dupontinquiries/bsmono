@@ -32,6 +32,31 @@ pub const ALL: [Ancestor; 13] = [
     Ancestor::Lynx, Ancestor::Jaguar, Ancestor::Suanni,
 ];
 
+/// A signature crest colour for the battle render (`build_battle` in
+/// `main.rs`) — independent of `team_col`, which only says which of the two
+/// clans a warrior belongs to. Team colour answers "which side"; this
+/// answers "who": two ancestors on the same team still read apart by their
+/// tall crest. Picked from each legend's own fantasy (the lion-clan's gold,
+/// the sun-priest's ember, the storm-dragon's seated violet) rather than
+/// derived from the kit's stats — a second, independent visual identity.
+pub fn crest_color(a: Ancestor) -> u32 {
+    match a {
+        Ancestor::Lion => 0xe8c85a,     // Goldenmane — pride gold
+        Ancestor::Tiger => 0xe8792a,    // Duskstripe — burnt orange
+        Ancestor::Leopard => 0xd4b06a,  // Rainspots — dappled tan
+        Ancestor::Panther => 0x2a2a38,  // Nightpelt — near-black moonless
+        Ancestor::Caracal => 0xc98a52,  // Windclaw — dry-plains sand
+        Ancestor::Puma => 0xa08262,     // Stonewhisper — grey crag stone
+        Ancestor::Serval => 0xd8c040,   // Faryowl — singing-grassland gold
+        Ancestor::Lynx => 0xcfe6f2,     // Snowhush — deep-snow white-blue
+        Ancestor::Jaguar => 0x3a6e4a,   // Riptail — drowned-forest green
+        Ancestor::CaveLion => 0xb08048, // Oldroar — Ice Age hide ochre
+        Ancestor::Smilodon => 0x8a8a92, // Twofang — elder-dawn grey
+        Ancestor::SunCat => 0xf2a83c,   // Suneye — desert ember
+        Ancestor::Suanni => 0x5a3a8a,   // Stillsmoke — storm-dragon violet
+    }
+}
+
 /// What an ability *does* when the sim fires it. One mechanic per kind keeps the
 /// sim generic over kits: a kit is numbers, the sim is verbs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -429,5 +454,15 @@ mod tests {
             assert!(k.abilities[0].cd <= 10.0 && k.abilities[1].cd <= 10.0,
                 "{}: a controller's tools must cycle quickly", k.name);
         }
+    }
+
+    #[test]
+    fn every_ancestor_has_a_distinct_crest_color() {
+        // team colour already says which side; the crest is the OTHER axis
+        // (who) — two ancestors sharing a crest colour would defeat that.
+        let mut colors: Vec<u32> = ALL.iter().map(|&a| crest_color(a)).collect();
+        colors.sort_unstable();
+        colors.dedup();
+        assert_eq!(colors.len(), ALL.len(), "every ancestor needs its own crest colour");
     }
 }

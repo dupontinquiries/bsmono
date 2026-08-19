@@ -241,7 +241,10 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   match needs, and isn't done yet.
 - [ ] Map fairness: the mid trail crosses the wide river basin (a genuine "river lane" —
   Rainspots country) — extend mapeval to grade lane water-fractions per clan side
-- [ ] Ancestor crest colours per-kit in the battle render (hook left in build_battle)
+- [x] Ancestor crest colours per-kit in the battle render — `ancestor::crest_color`
+  (13 distinct hex colours, one per legend, tested for uniqueness), wired into
+  `build_battle`'s ancestor-crest branch in place of the team-colour fallback
+  that was there before.
 
 ## Roadmap (multi-turn)
 -29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an
