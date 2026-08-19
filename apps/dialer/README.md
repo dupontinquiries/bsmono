@@ -162,24 +162,35 @@ backend on the same Link, emitting the same `MessageIn`/`MessageSent`.
   up to ~5 s (single-thread sync loop with a 5 s server timeout — split into
   a feeder thread if that ever matters).
 
-## Verification status (authoring pass)
+## Verification status
 
-`dialer-core`: **35 unit tests green on rustc 1.75**, both default-features and
-`--features matrix`. New coverage includes the payload SMS round-trip and the
-"plain text is never a command" property, the guard (running-off default,
-trusted+prefixed bypass, shell-metacharacter inertness, newline rejection,
-view-root confinement), the conversation store, and Matrix inbound
-message/handoff parsing. (`--features matrix` needs ureq pinned to 2.9.7 + url
-2.5.0/zeroize 1.7.0 downgrades ONLY because the sandbox cargo predates
-`edition2024`; a modern toolchain resolves `ureq = "2"` freely.)
+`dialer-core`: **42 unit tests green**, both default-features and `--features
+matrix` (`matrix.rs`'s pure JSON layer is unconditional; only its
+`ureq`-based HTTP send path is behind the feature, so both runs exercise the
+same 42). Coverage includes the payload SMS round-trip and the "plain text is
+never a command" property, the guard (running-off default, trusted+prefixed
+bypass, shell-metacharacter inertness, newline rejection, view-root
+confinement), the conversation store, and Matrix inbound message/handoff
+parsing.
 
-The egui surface, the mm.rs SMS additions (zbus), and the Matrix send path are
-**not run here** (sandbox toolchain predates egui 0.34's MSRV). They pass
-rustcheck Tier 0, and every egui-0.34 API the shell uses was checked by name
-and signature against the egui 0.34 source (`corner_radius`, `copy_text`,
-`open_url`/`OpenUrl::new_tab`, `stick_to_bottom(bool)`, `Frame::new`,
-`long_touched`). A hardware `cargo build` is still required before calling any
-of it working. Everything touching zbus (`mm.rs`) and the
-whole egui surface is static-checked only (suspenders) — the sandbox
-toolchain predates egui 0.34's MSRV — and needs a real `cargo build` plus an
-on-device pass (FP5/PinePhone with ModemManager) before being called working.
+`dialer-egui`: **actually built and tested this session** (`cargo check -p
+dialer-egui`, `cargo check -p dialer-egui --bin dialer-egui`, `cargo test -p
+dialer-egui --lib`) — a real toolchain finally cleared egui 0.34's MSRV, which
+earlier sessions here couldn't do. Zero compile errors on the shell, the
+zbus-backed `mm.rs` additions, or the Matrix send path; 5/5 lib tests green.
+Only warnings are three pre-existing `egui::TopBottomPanel`/`Panel::show`
+deprecations (API renames, not bugs — `Panel::top`/`bottom` +
+`show_inside()` are the 0.34 spelling) and two unused imports in `mm.rs`,
+none touched this pass. **What's still NOT verified**: this is a headless
+sandbox with no display and no ModemManager — the binary has never actually
+run, and the zbus/D-Bus and ModemManager integration paths are compile-clean
+but behaviorally unconfirmed. A real on-device pass (FP5/PinePhone with
+ModemManager) is still required before calling the modem integration working,
+same as before — only the "can this even compile" question has moved from
+speculative (checked API names by hand against source) to answered (a real
+compiler said yes).
+
+`ureq` no longer needs the 2.9.7/url-2.5.0/zeroize-1.7.0 pin this doc used to
+require — that was a workaround for a sandbox cargo that predated
+`edition2024`; this session's toolchain resolves `ureq = "2"` freely (see
+`Cargo.lock`, regenerated fresh this session with no manual pins).
