@@ -562,6 +562,63 @@ pub struct SparseBlock {
 /// BEATSPACE_DENSE_D=1 builds a single dense convolution instead. It is NOT
 /// checkpoint-compatible — different parameter shapes, so a run started one way
 /// cannot resume the other — which is why it is a flag and not a change.
+/// `|x| > t ? x : 0`, in one traversal.
+///
+/// A CustomOp1 rather than a chain of tensor ops because the chain is four
+/// passes and four allocations over a tensor that can be 8.4M elements, and
+/// candle's elementwise kernels are single-threaded.
+///
+/// IT IMPLEMENTS `bwd`, and the first version did not.
+///
+/// I reached for `apply_op1_no_bwd` and wrote a comment rationalising it — that
+/// the gate is "a straight-through path where it passes and a stop where it
+/// does not". That is true of the VALUE and false of the GRAPH: no_bwd cuts the
+/// backward edge, so no gradient would have reached the depthwise convolution
+/// beneath it and the discriminator would have quietly stopped learning half of
+/// itself. The loss would still move, because the pointwise and later layers
+/// still train.
+///
+/// The original chain was differentiable: `mul` by a constant mask passes
+/// `grad * mask` through. This reproduces exactly that, in one pass.
+struct SparseGate {
+    thr: f32,
+}
+
+impl candle_core::CustomOp1 for SparseGate {
+    fn name(&self) -> &'static str { "sparse-gate" }
+
+    fn cpu_fwd(&self, s: &candle_core::CpuStorage, l: &candle_core::Layout)
+        -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let thr = self.thr;
+        let out = match s {
+            candle_core::CpuStorage::F32(v) => {
+                // start_offset honoured, because a narrowed or transposed
+                // tensor arrives here as a view and reading from index 0 would
+                // gate the wrong elements.
+                let src = match l.contiguous_offsets() {
+                    Some((a, b)) => &v[a..b],
+                    None => candle_core::bail!("sparse-gate wants a contiguous input"),
+                };
+                candle_core::CpuStorage::F32(
+                    src.iter().map(|&x| if x.abs() > thr { x } else { 0.0 }).collect())
+            }
+            _ => candle_core::bail!("sparse-gate is f32 only"),
+        };
+        Ok((out, l.shape().clone()))
+    }
+
+    /// `grad * (|x| > t)`, matching what `mul` by the constant mask did.
+    ///
+    /// Reads the ARGUMENT rather than the result: at exactly zero the two are
+    /// indistinguishable in the output — a gated-off element and a genuine zero
+    /// both read 0 — and deriving the mask from the result would pass gradient
+    /// through elements the forward had blocked.
+    fn bwd(&self, arg: &Tensor, _res: &Tensor, grad: &Tensor) -> Result<Option<Tensor>> {
+        let mask = arg.abs()?.gt(self.thr)?.to_dtype(DType::F32)?;
+        Ok(Some(grad.mul(&mask)?))
+    }
+}
+
 impl SparseBlock {
     fn new(cin: usize, cout: usize, stride: usize, threshold: f32, dev: &Device) -> Result<Self> {
         // One dense conv rather than depthwise + pointwise. More parameters and
@@ -590,10 +647,24 @@ impl SparseBlock {
 
     fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
         let x = self.depthwise.forward(x)?;
-        // sparsity mask: zero out activations with |x| <= threshold
-        let absx = x.abs()?;
-        let mask = absx.gt(self.threshold)?.to_dtype(DType::F32)?;
-        let x = x.mul(&mask)?;
+        // THE SPARSITY MASK, in one pass instead of four.
+        //
+        // It was abs() -> gt() -> to_dtype() -> mul(): four full-tensor
+        // traversals, each allocating a whole new tensor, and candle's
+        // elementwise ops are SINGLE-THREADED — cpu_backend/utils.rs uses a
+        // plain `.iter()`, with no rayon anywhere in unary_map or binary_map.
+        //
+        // On the discriminator's first block that tensor is
+        // (16, 64, 64, 128) = 8.4M elements, so the four-pass version moved
+        // 134 MB through one core per block per forward, three forwards a
+        // step. The threshold test is the same arithmetic either way; what is
+        // saved is three traversals and three allocations.
+        //
+        // Numerically identical: |x| > t keeps x, else 0. Written with a
+        // single custom unary so the comparison and the select happen in the
+        // same pass over the data.
+        let thr = self.threshold;
+        let x = x.apply_op1(SparseGate { thr })?;
         let x = self.pointwise.forward(&x)?;
         let x = self.bn.forward(&x, train)?;
         x.relu()
@@ -783,6 +854,44 @@ pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fused_gate_matches_the_four_op_chain_and_its_gradient() {
+        // The forward is the easy half. The GRADIENT is the half I nearly lost:
+        // the first version used apply_op1_no_bwd, which cuts the backward edge,
+        // so nothing would have reached the depthwise conv and the
+        // discriminator would have quietly stopped training half of itself
+        // while the loss kept moving.
+        use candle_core::{DType, Device, Tensor, Var};
+        let dev = Device::Cpu;
+        let thr = 0.25f32;
+        let vals: Vec<f32> = (0..64).map(|i| (i as f32 * 0.31).sin()).collect();
+
+        // Fused.
+        let a = Var::from_tensor(&Tensor::from_vec(vals.clone(), (1, 1, 8, 8), &dev).unwrap()).unwrap();
+        let ya = a.as_tensor().apply_op1(SparseGate { thr }).unwrap();
+        let ga = ya.sum_all().unwrap().backward().unwrap();
+
+        // The chain it replaces.
+        let b = Var::from_tensor(&Tensor::from_vec(vals.clone(), (1, 1, 8, 8), &dev).unwrap()).unwrap();
+        let mask = b.as_tensor().abs().unwrap().gt(thr).unwrap().to_dtype(DType::F32).unwrap();
+        let yb = b.as_tensor().mul(&mask).unwrap();
+        let gb = yb.sum_all().unwrap().backward().unwrap();
+
+        let fa = ya.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let fb = yb.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(fa, fb, "the forward differs");
+
+        let da = ga.get(&a).expect("the fused gate produced NO gradient")
+            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let db = gb.get(&b).expect("the chain produced no gradient")
+            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(da, db, "the gradient differs");
+        // And it is a real mask, not all-ones — otherwise the test would pass
+        // on a gate that does nothing.
+        assert!(da.iter().any(|&v| v == 0.0) && da.iter().any(|&v| v != 0.0),
+                "the threshold gated nothing, so this proves nothing");
+    }
 
     #[test]
     fn the_dense_discriminator_block_has_the_same_shape_contract() {
