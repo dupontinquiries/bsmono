@@ -6,10 +6,14 @@ edition = "2021"
 # The egui build's own library. Separate from main.rs, which is
 # 7,048 lines of GTK and does not compile without gtk4/adw/glib — building with
 # --features egui produced 240 errors, all of them unguarded gtk:: paths there.
+# NOTE: `required-features` is IGNORED on [lib]. Cargo honours it for bins,
+# examples, tests and benches only — silently, with no warning — so this target
+# built unconditionally and its 121 "cannot find crate `egui`" errors were the
+# feature being off, not the code being wrong. The gate lives at the top of
+# src/egui_lib.rs instead, where it works.
 [lib]
 name = "ambient_learner_egui"
 path = "src/egui_lib.rs"
-required-features = ["egui"]
 
 [features]
 default = ["gtk"]

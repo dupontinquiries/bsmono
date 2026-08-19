@@ -1,3 +1,12 @@
+//! GATED AT THE FILE, because Cargo ignores `required-features` on `[lib]`.
+//!
+//! Without this the target compiles on every `cargo check --all-targets` with
+//! the egui dependency absent, producing 121 "cannot find crate" errors that
+//! look like broken code and are a manifest that cannot express what it means.
+//! With it the module is empty unless the feature is on, which is what the
+//! manifest line was trying to say.
+#![cfg(feature = "egui")]
+
 //! The egui build's library root: the Live view plus the state a running app
 //! needs around it.
 //!
