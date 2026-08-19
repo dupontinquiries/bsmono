@@ -24,9 +24,23 @@ pub const LOG_LINES: usize = 2000;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
     pub epoch: u64,
-    pub loss: f32,
+    /// The DISCRIMINATOR loss. Named `loss` originally, which was wrong for a
+    /// GAN: there are two, they move against each other, and a dashboard that
+    /// plots one and calls it "the loss" hides the only thing worth watching.
+    pub d_loss: f32,
+    pub g_loss: f32,
     /// Seconds since the run started.
     pub at_secs: f64,
+}
+
+impl Point {
+    /// The number the trend and the stall check read.
+    ///
+    /// The GENERATOR's, because that is the model being kept. A discriminator
+    /// loss falling to zero is the failure mode — it means the discriminator
+    /// won and the generator has no gradient left — so a single "is it going
+    /// down" summary over d_loss would report a collapsed run as excellent.
+    pub fn tracked(&self) -> f32 { self.g_loss }
 }
 
 /// What the run is doing.
@@ -150,8 +164,8 @@ impl TrainPage {
         }
         let tail = &self.curve[self.curve.len() - n..];
         let half = tail.len() / 2;
-        let older: f32 = tail[..half].iter().map(|p| p.loss).sum::<f32>() / half as f32;
-        let newer: f32 = tail[half..].iter().map(|p| p.loss).sum::<f32>()
+        let older: f32 = tail[..half].iter().map(|p| p.tracked()).sum::<f32>() / half as f32;
+        let newer: f32 = tail[half..].iter().map(|p| p.tracked()).sum::<f32>()
             / (tail.len() - half) as f32;
         if older.abs() < f32::EPSILON {
             return None;
@@ -194,11 +208,12 @@ impl TrainPage {
             Phase::Preparing { .. } => "preparing clips…".into(),
             Phase::Training => match (self.latest(), self.eta_secs()) {
                 (Some(p), Some(eta)) => format!(
-                    "epoch {}/{} · loss {:.4} · {}",
-                    p.epoch, self.epochs_target, p.loss, human_secs(eta)
+                    "epoch {}/{} · g {:.4} d {:.4} · {}",
+                    p.epoch, self.epochs_target, p.g_loss, p.d_loss, human_secs(eta)
                 ),
                 (Some(p), None) => {
-                    format!("epoch {}/{} · loss {:.4}", p.epoch, self.epochs_target, p.loss)
+                    format!("epoch {}/{} · g {:.4} d {:.4}",
+                            p.epoch, self.epochs_target, p.g_loss, p.d_loss)
                 }
                 _ => "training…".into(),
             },
@@ -221,10 +236,18 @@ impl TrainPage {
         s.push_str(&format!("  batch:   {}\n", self.batch_size));
         s.push_str(&format!("  status:  {}\n", self.status_line()));
         if let Some(p) = self.latest() {
-            s.push_str(&format!("  loss:    {:.5} at epoch {}\n", p.loss, p.epoch));
+            s.push_str(&format!("  loss:    g {:.5}  d {:.5}  at epoch {}\n",
+                                p.g_loss, p.d_loss, p.epoch));
+            // Said explicitly: a discriminator at zero means it won outright
+            // and the generator has no gradient to learn from. The g_loss can
+            // look calm while that happens.
+            if p.d_loss < 0.01 {
+                s.push_str("  WARNING: d_loss near zero — the discriminator has won and \
+the generator is no longer learning\n");
+            }
         }
         if let Some(first) = self.curve.first() {
-            s.push_str(&format!("  started: loss {:.5} at epoch {}\n", first.loss, first.epoch));
+            s.push_str(&format!("  started: g {:.5} at epoch {}\n", first.g_loss, first.epoch));
         }
         match self.trend(40) {
             Some(t) if t.abs() < 0.001 => s.push_str(
@@ -257,13 +280,21 @@ pub fn parse_epoch(line: &str) -> Option<Point> {
         .find(|s| !s.is_empty())?
         .parse()
         .ok()?;
-    let loss_at = line.find("loss ")? + 5;
-    let loss: f32 = line[loss_at..]
-        .split_whitespace()
-        .next()?
-        .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
-        .parse()
-        .ok()?;
+    // BOTH losses. The trainer prints "d_loss 1.3820  g_loss 0.7214", and the
+    // first version searched for "loss " — which matches inside "d_loss" and
+    // silently plotted the discriminator while claiming to plot the loss.
+    let num_after = |key: &str| -> Option<f32> {
+        let i = line.find(key)? + key.len();
+        line[i..].split_whitespace().next()?
+            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
+            .parse().ok()
+    };
+    let (d_loss, g_loss) = match (num_after("d_loss "), num_after("g_loss ")) {
+        (Some(d), Some(g)) => (d, g),
+        // A single-loss line still plots, with both fields equal — an older
+        // format, or a non-GAN trainer, should not silently stop appearing.
+        _ => { let v = num_after("loss ")?; (v, v) }
+    };
     // The timestamp is optional — an older line has none and the point is
     // still worth plotting; only the rate and ETA need it.
     let at_secs = line
@@ -271,7 +302,7 @@ pub fn parse_epoch(line: &str) -> Option<Point> {
         .and_then(|i| line[i + 1..].split(|c| c == 's' || c == ')').next())
         .and_then(|s| s.trim().parse::<f64>().ok())
         .unwrap_or(0.0);
-    Some(Point { epoch, loss, at_secs })
+    Some(Point { epoch, d_loss, g_loss, at_secs })
 }
 
 /// `1h 04m`, `12m 30s`, `45s` — whichever two units matter.
@@ -314,18 +345,53 @@ mod tests {
         let mut p = TrainPage::default();
         p.start(20000, 32, "Cpu", "/music");
         for (i, l) in losses.iter().enumerate() {
-            p.curve.push(Point { epoch: i as u64, loss: *l, at_secs: i as f64 });
+            p.curve.push(Point { epoch: i as u64, d_loss: 1.0, g_loss: *l, at_secs: i as f64 });
         }
         p.phase = Phase::Training;
         p
     }
 
     #[test]
-    fn a_real_trainer_line_becomes_a_point() {
-        let p = parse_epoch("[train] epoch 120/20000 loss 0.0412 (12.5s)").unwrap();
-        assert_eq!(p.epoch, 120);
-        assert!((p.loss - 0.0412).abs() < 1e-6);
-        assert!((p.at_secs - 12.5).abs() < 1e-6);
+    fn the_real_trainer_line_gives_both_losses() {
+        // VERBATIM from a run. The first parser searched for "loss " — which
+        // matches inside "d_loss" — so it plotted the discriminator and called
+        // it the loss, and nothing said otherwise.
+        let p = parse_epoch("[train] epoch     1/20000  d_loss 1.3820  g_loss 0.7214  (4.2s)")
+            .unwrap();
+        assert_eq!(p.epoch, 1);
+        assert!((p.d_loss - 1.3820).abs() < 1e-6, "d {}", p.d_loss);
+        assert!((p.g_loss - 0.7214).abs() < 1e-6, "g {}", p.g_loss);
+        assert!((p.at_secs - 4.2).abs() < 1e-6);
+        // The tracked series is the GENERATOR's: a discriminator loss falling
+        // to zero is the failure, so summarising over it would report a
+        // collapsed run as excellent.
+        assert_eq!(p.tracked(), p.g_loss);
+    }
+
+    #[test]
+    fn a_collapsed_discriminator_is_called_out() {
+        // d_loss at zero means it won outright and the generator has no
+        // gradient left. g_loss can look calm while that happens, which is why
+        // it needs saying rather than plotting.
+        let mut p = TrainPage::default();
+        p.start(100, 16, "Cpu", "/m");
+        p.curve.push(Point { epoch: 1, d_loss: 0.0001, g_loss: 4.0, at_secs: 1.0 });
+        assert!(p.summary().contains("WARNING"), "{}", p.summary());
+        assert!(p.summary().contains("discriminator has won"));
+    }
+
+    #[test]
+    fn an_eta_appears_once_there_are_two_timed_epochs() {
+        // The question this whole line exists to answer: when should I come
+        // back. Two points and a clock are enough.
+        let mut p = TrainPage::default();
+        p.start(20000, 16, "Cpu", "/m");
+        p.feed("[train] epoch     1/20000  d_loss 1.4  g_loss 0.7  (4.0s)");
+        p.feed("[train] epoch     3/20000  d_loss 1.3  g_loss 0.7  (8.0s)");
+        // 2 epochs in 4 s = 0.5/s, 19,997 left ≈ 40,000 s ≈ 11 hours.
+        let eta = p.eta_secs().expect("two timed points is enough");
+        assert!(eta > 39_000.0 && eta < 41_000.0, "eta {eta}");
+        assert!(p.status_line().contains("h "), "no hours in {}", p.status_line());
     }
 
     #[test]
@@ -409,8 +475,8 @@ mod tests {
     fn the_eta_comes_from_the_runs_own_pace() {
         let mut p = TrainPage::default();
         p.start(1000, 32, "Cpu", "/m");
-        p.curve.push(Point { epoch: 0, loss: 1.0, at_secs: 0.0 });
-        p.curve.push(Point { epoch: 100, loss: 0.5, at_secs: 50.0 });
+        p.curve.push(Point { epoch: 0, d_loss: 1.0, g_loss: 1.0, at_secs: 0.0 });
+        p.curve.push(Point { epoch: 100, d_loss: 1.0, g_loss: 0.5, at_secs: 50.0 });
         assert!((p.rate().unwrap() - 2.0).abs() < 1e-9, "100 epochs in 50s");
         let eta = p.eta_secs().unwrap();
         assert!((eta - 450.0).abs() < 1e-6, "900 epochs left at 2/sec");

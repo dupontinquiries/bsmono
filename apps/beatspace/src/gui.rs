@@ -847,6 +847,52 @@ impl App {
         ui.heading("training");
         ui.label(self.train.status_line());
 
+        // THE GAUGES, above the curve. "When do I come back" is the question a
+        // long run has to answer on sight, so the finish TIME is shown beside
+        // the duration — "11h 20m left" still needs arithmetic at 2am.
+        ui.horizontal(|ui| {
+            let g = |ui: &mut egui::Ui, label: &str, value: String| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(value).strong().size(18.0));
+                    ui.label(egui::RichText::new(label).weak().small());
+                });
+            };
+            match self.train.latest() {
+                Some(p) => {
+                    g(ui, "epoch", format!("{}/{}", p.epoch, self.train.epochs_target));
+                    g(ui, "g_loss", format!("{:.4}", p.g_loss));
+                    // Marked when it collapses rather than merely shown: a
+                    // discriminator at zero has won and the generator has
+                    // stopped learning, and the number alone does not say so.
+                    let d = format!("{:.4}", p.d_loss);
+                    ui.vertical(|ui| {
+                        let txt = egui::RichText::new(d).strong().size(18.0);
+                        ui.label(if p.d_loss < 0.01 { txt.color(egui::Color32::from_rgb(220, 120, 60)) } else { txt });
+                        ui.label(egui::RichText::new(if p.d_loss < 0.01 { "d_loss ⚠" } else { "d_loss" })
+                            .weak().small());
+                    });
+                }
+                None => { g(ui, "epoch", "—".into()); }
+            }
+            match self.train.rate() {
+                Some(r) if r > 0.0 => {
+                    g(ui, "epochs/s", format!("{r:.2}"));
+                    // Seconds per epoch too: below 1/s the rate reads as 0.03
+                    // and tells nobody anything, while "34 s/epoch" is legible.
+                    g(ui, "s/epoch", format!("{:.1}", 1.0 / r));
+                }
+                _ => { g(ui, "epochs/s", "—".into()); }
+            }
+            match self.train.eta_secs() {
+                Some(e) => {
+                    g(ui, "remaining", crate::trainpage::human_secs(e).replace(" left", ""));
+                    g(ui, "finishes", finish_clock(e));
+                }
+                None => { g(ui, "remaining", "—".into()); }
+            }
+        });
+        ui.separator();
+
         if let Phase::Preparing { done, total } = self.train.phase {
             if total > 0 {
                 ui.add(egui::ProgressBar::new(done as f32 / total as f32)
@@ -860,7 +906,10 @@ impl App {
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), h), egui::Sense::hover());
             let p = ui.painter_at(rect);
-            let losses: Vec<f32> = self.train.curve.iter().map(|c| c.loss).collect();
+            // The GENERATOR's curve — the model being kept. Plotting the
+            // discriminator's would show a run collapsing as a line going
+            // pleasingly down.
+            let losses: Vec<f32> = self.train.curve.iter().map(|c| c.g_loss).collect();
             let (lo, hi) = losses.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
             // A flat curve has zero span and would divide by nothing; drawing
             // it down the middle is the honest picture of "not moving".
@@ -932,4 +981,26 @@ impl App {
             s.stopped = stopped;
         }
     }
+}
+
+
+/// A wall-clock finish time, `HH:MM`, with the day if it is not today.
+///
+/// "11h 20m left" is a duration and the question is a TIME — at 2am the
+/// subtraction is exactly the thing nobody wants to do. Computed from the
+/// system clock with no date library: seconds since the epoch, shifted, and
+/// reduced to hours and minutes.
+fn finish_clock(eta_secs: f64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let then = now + eta_secs.max(0.0) as u64;
+    // Local time needs the offset, which std does not give. Rather than guess
+    // UTC and print a wrong clock time, the day count is relative and the
+    // hours are UTC-labelled — an honest "+1d 14:20 UTC" beats a confident
+    // wrong "02:20".
+    let days = (then / 86400) as i64 - (now / 86400) as i64;
+    let (h, m) = ((then % 86400) / 3600, (then % 3600) / 60);
+    if days > 0 { format!("+{days}d {h:02}:{m:02}Z") } else { format!("{h:02}:{m:02}Z") }
 }

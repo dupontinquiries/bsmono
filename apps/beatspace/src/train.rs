@@ -29,6 +29,8 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
     // was passed implied it should have been something else. Saying which
     // backend was looked for, and that the flag is inference-only, is the
     // difference between a limitation and a fault.
+    let t_start = std::time::Instant::now();
+    let _awake = StayAwake::new("beatspace is training");
     let dev = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     match &dev {
         Device::Cpu => {
@@ -125,12 +127,18 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
         }
 
         let n = cfg.steps_per_epoch as f32;
+        // The ELAPSED SECONDS are on the line because everything downstream
+        // needs them and nothing else has them: a rate, an ETA, and the answer
+        // to "when should I come back". Without a clock in the output the
+        // dashboard can plot a curve and cannot say how long it will take, and
+        // a 20,000-epoch run with no ETA is one nobody can plan around.
         println!(
-            "[train] epoch {:>5}/{}  d_loss {:.4}  g_loss {:.4}",
+            "[train] epoch {:>5}/{}  d_loss {:.4}  g_loss {:.4}  ({:.1}s)",
             epoch + 1,
             cfg.epochs,
             d_running / n,
-            g_running / n
+            g_running / n,
+            t_start.elapsed().as_secs_f64(),
         );
 
         let last = epoch + 1 == cfg.epochs;
@@ -207,4 +215,67 @@ fn started_at() -> std::time::SystemTime {
     use std::sync::OnceLock;
     static T: OnceLock<std::time::SystemTime> = OnceLock::new();
     *T.get_or_init(std::time::SystemTime::now)
+}
+
+/// Keeps the machine awake for as long as it is held.
+///
+/// A 20,000-epoch CPU run is hours, and the default on every desktop this
+/// targets is to suspend on idle — training is not idle by any measure the
+/// user cares about and is exactly idle by the one the session manager uses,
+/// because nobody is touching the keyboard.
+///
+/// SPAWNS `systemd-inhibit` RATHER THAN TALKING TO D-BUS. logind owns the
+/// inhibitor locks and KDE's powerdevil honours them, so this reaches
+/// powerdevil without a bus library. That matters here specifically: the last
+/// D-Bus crate added to this app pulled zbus with the tokio feature, which
+/// panicked the file dialog AND took eframe's accessibility thread down with
+/// it. A child process cannot do that.
+///
+/// The lock lives exactly as long as the child, and the child is killed on
+/// drop — including on a panic, which is when leaving a machine permanently
+/// awake would be least noticed.
+pub struct StayAwake(Option<std::process::Child>);
+
+impl StayAwake {
+    /// Take the lock, or report why not and carry on.
+    ///
+    /// Never fatal. A machine with no logind — a container, a BSD, a phone
+    /// running something else — should still train; it just may sleep. Failing
+    /// the run over a power hint would be a worse trade than the hint.
+    pub fn new(why: &str) -> StayAwake {
+        let child = std::process::Command::new("systemd-inhibit")
+            .arg("--what=idle:sleep")
+            .arg("--who=beatspace")
+            .arg(format!("--why={why}"))
+            .arg("--mode=block")
+            // A command that blocks forever and costs nothing: the inhibitor is
+            // held for the lifetime of whatever systemd-inhibit runs, so the
+            // command's only job is to not exit.
+            .arg("sleep")
+            .arg("infinity")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(c) => {
+                println!("[train] holding an idle/sleep inhibitor — the machine will stay awake");
+                StayAwake(Some(c))
+            }
+            Err(e) => {
+                println!("[train] no sleep inhibitor ({e}) — the machine may suspend mid-run");
+                StayAwake(None)
+            }
+        }
+    }
+}
+
+impl Drop for StayAwake {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.as_mut() {
+            let _ = c.kill();
+            // Reaped, or it becomes a zombie holding the lock for the lifetime
+            // of the parent — which for the GUI is the whole session.
+            let _ = c.wait();
+        }
+    }
 }
