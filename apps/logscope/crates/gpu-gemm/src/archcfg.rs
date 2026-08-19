@@ -315,6 +315,29 @@ tools/tiny-variants/gen_glmdsa.py reproduces it in 3 layers, and note_claims::ml
 fails the moment that stops being true, which is the only thing that will make anyone update this \
 line. It stays unverified end to end for the same reason: nothing has run an MLA checkpoint here",
         },
+        // Dream / DiffuCoder: a Qwen2.5 backbone trained for masked diffusion rather than AR
+        // continuation — same QKV-bias attention, RMSNorm and SwiGLU as "qwen2", only the
+        // metadata prefix and the generation loop differ. Confirmed on a real checkpoint
+        // (DiffuCoder-7B-Instruct q4_k_m): n_embd=3584, 28 layers, 28/4 heads, n_ff=18944.
+        //
+        // The mask id comes from tokenizer.ggml.mask_token_id and is NOT a constant — it is
+        // 151666 on that checkpoint. gguf_mask_token_id() already reads it; this entry only
+        // lets the loader resolve the hparam keys, which it could not do while "dream" fell
+        // through to the unknown arm and got an empty prefix.
+        "dream" => ArchConfig {
+            arch: Arch::Qwen2, prefix: "dream", attn_qkv_bias: true, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            supported: true, dense_supported: true,
+            note: "Same tensor shapes and kernels as qwen2; only the metadata prefix differs. Runs the diffusion denoise loop, not AR continuation. Verified by a forward pass on DiffuCoder-7B-Instruct — which is the bar this file sets for `supported`.",
+        },
+        // LLaDA: a Llama backbone trained for masked diffusion. No QKV bias, ADJACENT-pair
+        // rope, identical shape to "llama". Mask id from the GGUF, as above.
+        "llada" => ArchConfig {
+            arch: Arch::Llama, prefix: "llada", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            supported: true, dense_supported: true,
+            note: "Same tensor shapes and kernels as llama; only the metadata prefix differs. NOT llada-moe — that prefix carries expert_* keys nobody has inspected, and assuming this entry covers it is how a MoE model loads with its routing silently ignored.",
+        },
         _ => ArchConfig {
             arch: Arch::Unknown, prefix: "", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,

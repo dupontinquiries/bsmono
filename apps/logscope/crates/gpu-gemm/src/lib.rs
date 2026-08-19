@@ -18737,6 +18737,49 @@ impl<P: DenoisePolicy> DenoisePolicy for TraceRecorder<P> {
 /// prefix is fixed for a block's whole life (c4-767), so `reused` is work a prefix K/V cache would
 /// remove outright — the number that decides whether that cache is worth its plumbing, measured
 /// instead of guessed.
+/// Tokens actually committed per forward, and what that means for the clock.
+///
+/// THE FORWARD IS THE EXPENSIVE UNIT on this path — the profile puts 92% of wall
+/// time in GPU sync, spread over ~35 submits per forward, so wall time tracks
+/// the forward count almost exactly. Tokens per forward is therefore the
+/// throughput multiplier, and until now nothing measured it.
+///
+/// What was printed instead was `block / steps`, the schedule's FLOOR, computed
+/// before the run and sitting in the same stream as real numbers. It read as an
+/// observation. With a confidence threshold active the true rate is different
+/// and nobody could see which way — so the one lever that trades quality for
+/// speed had no feedback attached to it.
+fn report_commit_rate(forwards: usize, committed: usize, tau: Option<f32>) {
+    if forwards == 0 { return; }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+    let rate = committed as f64 / forwards as f64;
+    let tau_s = match tau {
+        Some(t) => format!("threshold {t:.2}"),
+        None => "no threshold (schedule only)".to_string(),
+    };
+    eprintln!(
+        "wgpu-engine: block diffusion rate — {committed} token(s) over {forwards} forward(s) = \
+{rate:.2} per forward, at {tau_s}. The forward is what costs: wall time tracks this number, so \
+doubling it roughly halves the run. {}",
+        if rate < 1.5 {
+            match tau {
+                Some(t) if t > 0.6 => format!(
+                    "At {rate:.2} the threshold is almost never clearing — LOGSCOPE_DIFFUSION_TAU \
+below {:.2} commits more per forward. Lower it until the output degrades, then step back; that \
+boundary is the whole trade and it is model-specific.", (t - 0.15).max(0.5)),
+                Some(_) => "The threshold is already low and still not clearing — the model is \
+genuinely uncertain here, and fewer STEPS is the remaining lever.".to_string(),
+                None => "No threshold is set, so every step commits exactly the schedule — \
+LOGSCOPE_DIFFUSION_TAU=0.9 lets confident positions commit early.".to_string(),
+            }
+        } else {
+            "The threshold is doing real work; the remaining cost is per-forward overhead rather \
+than the schedule.".to_string()
+        }
+    );
+}
+
 fn report_recompute(forwards: usize, rows: usize, reused: usize) {
     if forwards == 0 || rows == 0 { return; }
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -18834,6 +18877,9 @@ impl Gpu {
         // under block-causal that prefix is provably UNCHANGED for the block's whole life — so those
         // rows are recomputed, not computed.
         let (mut rows_forwarded, mut rows_reused, mut forwards) = (0usize, 0usize, 0usize);
+        // Tokens actually written to the canvas. With a threshold this is not
+        // `forwards * schedule` — that is exactly why it is counted rather than derived.
+        let mut committed = 0usize;
         let mut oom_steps = 0u32;
         let block_causal = std::env::var("LOGSCOPE_DIFFUSION_BLOCK_CAUSAL").as_deref() != Ok("0");
         // PREFIX K/V CACHE. Sound only under block-causal (c4-767: the prefix is then provably
@@ -18887,7 +18933,8 @@ would otherwise re-forward the whole canvas. LOGSCOPE_DIFFUSION_STEPS pins it ei
                 // quality, which is the lever an operator actually wants and the line never named.
                 let (c_now, c16, c8) = (n_ctx + n_fill * (blk + 1), n_ctx + n_fill * 17, n_ctx + n_fill * 9);
                 eprintln!("wgpu-engine: block diffusion — {n_blocks} block(s) of {blk}, {steps_per_block} step(s) each \
-({per_commit:.1} token(s) committed per forward; the reference commits 1). Total forwards \
+(schedule FLOOR {per_commit:.1} token(s) per forward — the measured rate is reported at the \
+end and with a threshold it is usually higher; the reference commits 1). Total forwards \
 {}. Cost is ~{c_now} rows against ~{c16} at block 16 and ~{c8} at block 8 — all still one token per \
 commit, because the BLOCK SIZE sets the price and the steps set the quality. LOGSCOPE_DIFFUSION_BLOCK \
 trades planning horizon for speed; LOGSCOPE_DIFFUSION_STEPS trades quality for speed. Block-based is \
@@ -19163,6 +19210,7 @@ cannot sample from a readout that does not exist.", lg.len(), hi - w0));
                     if t == mask { continue; }
                     tokens[i] = t;
                     masked[i] = false;
+                    committed += 1;
                 }
             }
 
@@ -19211,11 +19259,13 @@ cannot sample from a readout that does not exist.", lg.len(), hi - w0));
                 // real hardware run printed no line at all. A number that only appears when
                 // generation runs to its ceiling describes the rare case.
                 report_recompute(forwards, rows_forwarded, rows_reused);
+                report_commit_rate(forwards, committed, tau);
                 return Ok(tokens.split_off(n_ctx));
             }
             if !keep_going || cancel() {
                 tokens.truncate(hi);
                 report_recompute(forwards, rows_forwarded, rows_reused);
+                report_commit_rate(forwards, committed, tau);
                 return Ok(tokens.split_off(n_ctx));
             }
         }
