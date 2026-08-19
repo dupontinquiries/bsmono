@@ -5,6 +5,13 @@ Asahi-Linux/Mesa/Vulkan operational knowledge; applied to the logscope AI backen
 compute, and the shared engine. Same ledger discipline as PERF_SHOCOVOX.md: every claim is marked
 shipped-and-verified, shipped-pending-hardware, deferred, or not-applicable.*
 
+**Companion page: `ASAHI_GPU.md`.** This one is operational — detection, the
+Mesa/Vulkan stack, reaching the GPU from a container. That one is about writing
+a compute kernel once it is open: the AGX SIMD width, the threadgroup-memory
+occupancy cliff, the 65535 dispatch limit, subgroup ops hanging Honeykrisp, and
+which of those are measured rather than believed. Two projects target this GPU
+and were about to learn the same things twice.
+
 ## What ramalama actually encodes about Asahi
 
 1. **Detection**: Asahi (Linux on Apple Silicon) is detected by reading

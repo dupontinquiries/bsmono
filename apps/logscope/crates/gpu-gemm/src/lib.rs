@@ -1,4 +1,20 @@
 //! Transformer GPU kernels on wgpu (Vulkan on Asahi/Linux). Each kernel is a
+//!
+//! ## The hardware findings live in maintenance/ASAHI_GPU.md
+//!
+//! Two projects now run compute on this GPU — this one for inference, beatspace
+//! for training — and both were about to learn the same things twice. That page
+//! collects them, marks each MEASURED or ASSUMED, and cites where the code is.
+//! The findings this file established (the 65535 dispatch limit, subgroup ops
+//! hanging Honeykrisp, the 31 GiB concurrent-buffer constant and its caveat,
+//! pass boundaries forcing 96% of submits) are recorded there with their
+//! provenance, so the next person to reach for LOGSCOPE_PASS_FUSE finds the
+//! retraction before the flag.
+//!
+//! Confirmed there as of 2026-08-19: beatspace's tiled GEMM, built to the rules
+//! this file records, passes on an M2 Ultra at 1.7e-6 worst deviation from a
+//! CPU reference — which is the first evidence that these constraints transfer
+//! to a workload other than the one they were derived from.
 //! WGSL compute shader dispatched through one shared helper; correctness is
 //! checked against CPU references in the validator binary. These are the ops a
 //! wgpu/Burn inference backend composes: linear (nn.Linear with transposed

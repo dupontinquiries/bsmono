@@ -42,6 +42,23 @@
 //!   dimension exceeds 65535, which is a limit this project has already hit
 //!   once and fixed by spilling into `y`.
 //!
+//! ## Verified on hardware, 2026-08-19
+//!
+//! ```text
+//! adapter: Apple M2 Ultra (G14D B1) (Vulkan)
+//! gemm 37x53x41 on a 3x3 tile grid
+//! worst |gpu-cpu| = 1.669e-6 at (7, 24)
+//! PASS — all 1517 elements within 1e-4
+//! ```
+//!
+//! 1.669e-6 is the right answer rather than a near miss: f32 carries about
+//! seven digits, the kernel accumulates 53 terms in tile order and the
+//! reference in index order, and a deviation at that scale IS the reordering.
+//! Exact equality would have been the suspicious result.
+//!
+//! `maintenance/ASAHI_GPU.md` records this and the rest of what is known about
+//! this GPU, each item marked measured or assumed.
+//!
 //! ## What this module is, honestly
 //!
 //! Index arithmetic and shader source, with the backward math verified against
