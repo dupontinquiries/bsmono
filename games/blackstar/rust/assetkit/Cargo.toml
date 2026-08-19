@@ -18,8 +18,12 @@ description = "Cybertron asset library manager: browse/score the model library, 
 # fail to typecheck. Bumping to 0.34 is the likely fix but spans five minor
 # versions of egui API churn, so it needs a real compile to land -- which this
 # sandbox cannot do (egui 0.29 already needs rustc >= 1.76; available: 1.75).
-egui = "0.29"
-eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+# Bumped from 0.29 to match shared/uikit/crates/uikit-egui's 0.34 pin — the
+# TODO(hardware) note above (kept for history) predicted this needed a real
+# compile to land safely; this session has rustc 1.96, which clears egui
+# 0.34's MSRV, so it did. See RUNNING.md for what changed at each call site.
+egui = "0.34"
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 
