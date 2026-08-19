@@ -59,12 +59,56 @@ pub fn isolate(mount: &Mount, scratch_root: &Path) -> io::Result<Workspace> {
     let dir = scratch_root.join(&id);
     if dir.exists() { let _ = std::fs::remove_dir_all(&dir); }
     std::fs::create_dir_all(&dir)?;
-    copy_tree(&mount.root, &dir)?; // skips target/ and .git — we re-init clean
-    git(&dir, &["init", "-q"])?;
+    // CLONE THE HISTORY WHEN THERE IS ONE, rather than squashing the tree into
+    // a single synthetic commit.
+    //
+    // The old path copied the files without .git and init'd a fresh repo, so
+    // the scratch had exactly one commit called "logscope baseline" and no past
+    // at all. That costs three things an agent working in here actually needs:
+    // `git log` and `git blame` on the code it is editing, a real base to diff
+    // against, and the ability to hand the work back as a patch series instead
+    // of one squashed change.
+    //
+    // A local clone is cheap — git hardlinks the object store — so this is
+    // faster than the copy it replaces on any repo with history.
+    let cloned = mount.root.join(".git").exists()
+        && git(&dir, &["clone", "--quiet", "--local", "--no-hardlinks",
+                       &mount.root.to_string_lossy(), "."]).is_ok();
+
+    if cloned {
+        // SCRUB THE REMOTES. A clone inherits `origin`, and this is a scratch
+        // directory an autonomous agent runs commands in. A stray `git push`
+        // from here reaches the real remote, and the whole point of the
+        // isolation is that nothing in this directory can escape it.
+        if let Ok(out) = std::process::Command::new("git").current_dir(&dir).arg("remote").output() {
+            for r in String::from_utf8_lossy(&out.stdout).lines() {
+                let r = r.trim();
+                if !r.is_empty() { let _ = git(&dir, &["remote", "remove", r]); }
+            }
+        }
+        // The upstream branch is gone with the remote, so detach the tracking
+        // config too — otherwise `git status` reports a phantom "gone" branch
+        // on every command the agent runs.
+        let _ = git(&dir, &["config", "--unset-all", "branch.main.remote"]);
+        let _ = git(&dir, &["config", "--unset-all", "branch.main.merge"]);
+        // Bring across anything the clone could not see: uncommitted working
+        // changes are the state the operator is actually looking at, and an
+        // agent handed the last commit instead would be editing the wrong code.
+        copy_tree(&mount.root, &dir)?;
+    } else {
+        copy_tree(&mount.root, &dir)?; // no history to inherit — init clean
+        git(&dir, &["init", "-q"])?;
+    }
+
     git(&dir, &["config", "user.email", "logscope@local"])?;
     git(&dir, &["config", "user.name", "logscope"])?;
+    // A guard rather than a convention: even with no remotes configured, an
+    // explicit URL push would work. This makes the command itself refuse.
+    git(&dir, &["config", "remote.pushDefault", "logscope-scratch-no-push"])?;
     git(&dir, &["checkout", "-q", "-b", "logscope-work"])?;
     git(&dir, &["add", "-A"])?;
+    // --allow-empty because with a clone the tree usually matches HEAD, and a
+    // baseline commit that refuses to exist would leave logscope-base dangling.
     git(&dir, &["commit", "-q", "--allow-empty", "-m", "logscope baseline (mounted state)"])?;
     git(&dir, &["tag", "logscope-base"])?;
     Ok(Workspace { id, dir, base: "logscope-base".into(), branch: "logscope-work".into() })
@@ -234,5 +278,92 @@ mod tests {
         assert_eq!(m.kind, MountKind::SingleFile);
         assert_eq!(m.file.as_deref(), Some(f.canonicalize().unwrap().as_path()));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod isolate_tests {
+    use super::*;
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let _ = Command::new("git").current_dir(dir).args(args).output();
+    }
+
+    /// A project with history and a remote, the shape isolate actually meets.
+    fn fixture(name: &str) -> Option<std::path::PathBuf> {
+        let root = std::env::temp_dir().join(format!("iso-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).ok()?;
+        sh(&root, &["init", "-q", "-b", "main", "."]);
+        sh(&root, &["config", "user.email", "t@t"]);
+        sh(&root, &["config", "user.name", "t"]);
+        for i in 0..3 {
+            std::fs::write(root.join("f.txt"), format!("v{i}\n")).ok()?;
+            sh(&root, &["add", "-A"]);
+            sh(&root, &["commit", "-q", "-m", &format!("commit {i}")]);
+        }
+        sh(&root, &["remote", "add", "origin", "https://example.invalid/repo.git"]);
+        // An uncommitted edit: the state the operator is looking at.
+        std::fs::write(root.join("f.txt"), "uncommitted\n").ok()?;
+        root.join(".git").exists().then_some(root)
+    }
+
+    #[test]
+    fn the_scratch_carries_the_real_history() {
+        // It used to be one synthetic commit. An agent editing in there had no
+        // `git log`, no `git blame`, and no base to produce a patch series
+        // against — the handoff could only ever be one squashed change.
+        let Some(root) = fixture("hist") else { return };
+        let m = Mount { root: root.clone(), ..detect(&root).unwrap() };
+        let scratch = std::env::temp_dir().join(format!("iso-s-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let ws = isolate(&m, &scratch).unwrap();
+
+        let out = Command::new("git").current_dir(&ws.dir)
+            .args(["log", "--oneline"]).output().unwrap();
+        let log = String::from_utf8_lossy(&out.stdout);
+        assert!(log.lines().count() >= 4,
+                "expected the project's history plus a baseline, got:\n{log}");
+        assert!(log.contains("commit 0"), "the oldest commit did not come across:\n{log}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn no_remote_survives_into_the_scratch() {
+        // This is a directory an autonomous agent runs git commands in. An
+        // inherited `origin` means a stray push reaches the real remote, and
+        // the isolation is the whole point.
+        let Some(root) = fixture("rem") else { return };
+        let m = Mount { root: root.clone(), ..detect(&root).unwrap() };
+        let scratch = std::env::temp_dir().join(format!("iso-r-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let ws = isolate(&m, &scratch).unwrap();
+
+        let out = Command::new("git").current_dir(&ws.dir).arg("remote").output().unwrap();
+        let remotes = String::from_utf8_lossy(&out.stdout);
+        assert!(remotes.trim().is_empty(), "a remote survived: {remotes:?}");
+        // And even an explicit push has no default to fall back on.
+        let out = Command::new("git").current_dir(&ws.dir)
+            .args(["config", "--get", "remote.pushDefault"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("no-push"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn uncommitted_work_is_what_the_agent_sees() {
+        // A clone gives HEAD, and the operator is looking at their working
+        // tree. Handing the agent the last commit would have it editing code
+        // that is not on screen.
+        let Some(root) = fixture("dirty") else { return };
+        let m = Mount { root: root.clone(), ..detect(&root).unwrap() };
+        let scratch = std::env::temp_dir().join(format!("iso-d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let ws = isolate(&m, &scratch).unwrap();
+        let got = std::fs::read_to_string(ws.dir.join("f.txt")).unwrap();
+        assert_eq!(got.trim(), "uncommitted", "the scratch has HEAD, not the working tree");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

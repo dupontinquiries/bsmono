@@ -116,6 +116,20 @@ vm_id — and the flags are WRITEBACK and VM_PRIVATE. There is no userptr and no
 the UAPI at all, so VK_EXT_external_memory_host cannot be implemented by Mesa; it would need a kernel \
 ABI change and a matched kernel/Mesa pair thereafter. PARKED: do not spend more effort here. On Metal \
 the arena's map-at-creation path already achieves the same end without the extension" },
+    // THE RETRACTED ONE. Absent from this table until a run set it and got
+    // corrupted output while the log reported only "non-default levers set —
+    // LOGSCOPE_ARENA=1". A flag that changes generated tokens must never be
+    // invisible, and this table is what makes a run reproducible from its log.
+    Lever { var: "LOGSCOPE_PASS_FUSE", default: Default_::Off, platform: Platform::Any,
+        validated_by: Some("tools/gate-passfuse-diffusion.sh (RED: 3 of 6 configs change tokens)"),
+        why: "RETRACTED. Broke AR decode 6/6 (c4-736) and changes generated tokens on 3 of 6 diffusion configurations (tools/gate-passfuse-diffusion.sh). c4-933 fixed one real mechanism — begin_frame submitted a frame without draining its queued dispatches, silently dropping them — and a run on that build STILL produced garbage at 596 dispatches per pass, so at least one more cause remains. Do not enable it to go faster; enable it only to debug why it corrupts." },
+    // The diffusion SCHEDULE levers are deliberately NOT here. This table is a
+    // correctness register — every entry names the gate that proves it does not
+    // change results — and steps/block/tau change results by design. I added
+    // them and the table's own tests refused: "nothing should be unvalidated".
+    // They are already visible anyway, in the block-diffusion line ("78 block(s)
+    // of 32, 6 step(s) each") and in the commit-rate line ("at threshold 0.95").
+
 ];
 
 /// Levers that are on by default without anything validating them. Must be empty.

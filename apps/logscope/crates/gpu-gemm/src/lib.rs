@@ -4061,10 +4061,20 @@ impl Gpu {
         // its work missing.
         //
         // Invisible with fusion off, because nothing is ever queued and pending
-        // is always empty. With LOGSCOPE_PASS_FUSE on it is the reported
-        // failure exactly: no crash, no error, fluent output that differs —
-        // "broke AR decode 6/6 and changes generated tokens on 3 of 6 diffusion
-        // configurations". Four other take-sites drain; this one did not.
+        // is always empty.
+        //
+        // I called this the LIKELY cause of the PASS_FUSE retraction. A run on
+        // the build carrying this fix, with fusion on, produced garbage output
+        // at 596 dispatches per pass — so this was a real dropped-work bug and
+        // NOT the (only) reason fusion corrupts. Corrected here rather than
+        // left as a plausible story, because the next person to read it would
+        // otherwise turn the flag on expecting it to be fixed.
+        //
+        // Ruled out since, on this same evidence: the dims ring fences every
+        // 2048 dispatches and a submit holds about 300, so no slot is rewritten
+        // under a queued dispatch; and the pool defers frees while a frame is
+        // open, so intra-frame recycling is not it either. What remains is
+        // unknown and needs a bisect on hardware.
         //
         // The cause tag stays ADJACENT to the submit below: every_submit_caller_
         // tags_a_cause scans a window, and this comment sitting between them is
