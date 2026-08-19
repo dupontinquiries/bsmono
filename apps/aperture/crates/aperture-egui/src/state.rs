@@ -256,6 +256,23 @@ pub struct AppState {
     describe: Option<Engine>,
     pub rev_note: String,
     note_generation: u64,
+    /// "Go to via route"'s AI tier: a THIRD independent engine (own
+    /// generation counter, own `Option<Engine>`) alongside `engine` (ghost
+    /// completion) and `describe` (revision notes) — same reasoning as
+    /// `describe`'s doc comment: a route-search prompt and a FIM prompt are
+    /// different jobs, and sharing one Engine's generation counter across
+    /// two independently-incrementing call sites would break "coalesce to
+    /// the newest" (a route request racing a describe request on the same
+    /// counter isn't actually newer just because its own local counter says
+    /// so). `aperture_complete::route_ai`'s pending/fulfill cache is the
+    /// seam this drains — this field IS the worker `route_ai`'s own doc
+    /// says the crate can't supply itself.
+    route_engine: Option<Engine>,
+    route_generation: u64,
+    /// The key `route_ai::request_route_summary` returned for the request
+    /// currently in flight on `route_engine`, if any — what `poll_route_ai`
+    /// calls `route_ai::fulfill` against when the outcome lands.
+    route_pending_key: Option<u64>,
     fim_ctx: String,
     fim_ctx_version: u64,
     pub popup: Option<Popup>,
@@ -313,6 +330,16 @@ impl AppState {
             }),
             rev_note: String::new(),
             note_generation: 0,
+            // Same APERTURE_CMD provider as `describe` — both are "ask the
+            // assistant a one-off text question" jobs; what makes them
+            // independent is the generation counter and the Engine
+            // INSTANCE, not the provider construction.
+            route_engine: std::env::var("APERTURE_CMD").ok().map(|cmd| {
+                let argv = cmd.split_whitespace().map(str::to_string).collect();
+                Engine::new(Box::new(CommandProvider::new(argv)))
+            }),
+            route_generation: 0,
+            route_pending_key: None,
             fim_ctx: String::new(),
             fim_ctx_version: u64::MAX,
             popup: None,
@@ -503,6 +530,56 @@ impl AppState {
                     // line is. Keep the two in sync if that budget changes.
                     const MARGIN_NOTE_CHARS: usize = 60;
                     self.rev_note = text.trim().lines().next().unwrap_or("").chars().take(MARGIN_NOTE_CHARS).collect();
+                }
+            }
+        }
+    }
+
+    /// The AI tier of "go to via route": ask whatever `route_engine` is
+    /// configured to pick and describe the best of `cands` (tier one's
+    /// deterministic output). Idempotent per `aperture_complete::route_ai`'s
+    /// own content-hash dedup — calling this again with the same query and
+    /// candidate set while a request is already queued/in-flight is a
+    /// no-op, so the palette can call it on every render without spamming
+    /// the provider on every frame. No-op entirely if no `route_engine` is
+    /// configured (no `APERTURE_CMD`) — tier one still works standalone.
+    pub fn request_route_ai(&mut self, query: &str, cands: &[aperture_core::route::RouteCandidate]) {
+        let Some(engine) = &self.route_engine else { return };
+        if query.trim().is_empty() || cands.is_empty() {
+            return;
+        }
+        let briefs: Vec<aperture_complete::route_ai::CandidateBrief> = cands
+            .iter()
+            .map(|c| aperture_complete::route_ai::CandidateBrief {
+                label: c.label.clone(),
+                rel: c.rel.clone(),
+                line: c.line,
+                snippet: c.snippet.clone(),
+            })
+            .collect();
+        let key = aperture_complete::route_ai::request_route_summary(query, &briefs);
+        if self.route_pending_key == Some(key) {
+            return; // already the in-flight/landed request for this exact ask
+        }
+        let Some((taken_key, prompt)) = aperture_complete::route_ai::take_pending() else {
+            // Nothing new was queued (a duplicate request, or the answer
+            // already landed in a prior frame) — still track the key so a
+            // landed answer's route_summary(key) gets picked up below.
+            self.route_pending_key = Some(key);
+            return;
+        };
+        self.route_generation += 1;
+        self.route_pending_key = Some(taken_key);
+        engine.request(CompletionRequest { generation: self.route_generation, prefix: prompt, suffix: String::new(), lang: "text".into() });
+    }
+
+    /// Drain the route-AI engine; call once per frame, same as `poll_note`.
+    pub fn poll_route_ai(&mut self) {
+        let Some(engine) = &self.route_engine else { return };
+        while let Some(out) = engine.poll() {
+            if out.generation == self.route_generation {
+                if let (Ok(text), Some(key)) = (out.result, self.route_pending_key) {
+                    aperture_complete::route_ai::fulfill(key, text);
                 }
             }
         }
@@ -1885,6 +1962,54 @@ mod tests {
         assert!(s.rev_ix.is_none());
         assert!(s.rev_note.is_empty(), "note clears on returning home");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_ai_fires_and_lands_through_a_real_engine() {
+        let mut s = AppState::new(None, false);
+        assert!(s.route_engine.is_none(), "no APERTURE_CMD in the test process: zero cost");
+        // Same injection pattern as describe_engine_fires_on_landing_and_clears_on_home:
+        // a real CommandProvider, avoiding global process-env mutation.
+        s.route_engine = Some(aperture_complete::engine::Engine::new(Box::new(
+            aperture_complete::providers::CommandProvider::new(vec!["echo".into(), "-n".into(), "1. wizard.rs — the account setup flow".into()]),
+        )));
+
+        let cands = vec![aperture_core::route::RouteCandidate {
+            path: PathBuf::from("wizard.rs"),
+            rel: "wizard.rs".to_string(),
+            line: 4,
+            kind: aperture_core::route::RouteKind::Symbol,
+            label: "account_setup_wizard".to_string(),
+            snippet: "fn account_setup_wizard() {}".to_string(),
+            score: 5,
+        }];
+        s.request_route_ai("find the account setup wizard", &cands);
+        assert!(s.route_pending_key.is_some(), "a request should be in flight");
+
+        let briefs: Vec<aperture_complete::route_ai::CandidateBrief> = cands
+            .iter()
+            .map(|c| aperture_complete::route_ai::CandidateBrief { label: c.label.clone(), rel: c.rel.clone(), line: c.line, snippet: c.snippet.clone() })
+            .collect();
+        let key = aperture_complete::route_ai::route_key("find the account setup wizard", &briefs);
+        assert!(aperture_complete::route_ai::in_flight(key), "cache should show the request in flight");
+
+        let mut got = false;
+        for _ in 0..200 {
+            s.poll_route_ai();
+            if aperture_complete::route_ai::route_summary(key).is_some() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got, "the AI tier's answer should land within 1s");
+        assert_eq!(aperture_complete::route_ai::route_summary(key).as_deref(), Some("1. wizard.rs — the account setup flow"));
+
+        // A second call with the SAME query+candidates is idempotent — no
+        // new request queued (would panic-free either way, but this checks
+        // the dedup path doesn't error or double-queue).
+        s.request_route_ai("find the account setup wizard", &cands);
+        assert!(aperture_complete::route_ai::take_pending().is_none(), "no duplicate request queued for the same key");
     }
 
     #[test]

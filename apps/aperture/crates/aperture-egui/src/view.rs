@@ -37,6 +37,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     }
     state.poll_completions(now_ms);
     state.poll_note();
+    state.poll_route_ai();
     state.tick_completion(now_ms);
     if state.debounce.armed() || state.ghost.is_pending() {
         // A request may become due (or land) without any input event —
@@ -654,6 +655,21 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
 
+    // Go-to-route's AI tier: trigger from a tight, self-contained borrow
+    // scope (owned String + Vec) so it doesn't overlap the palette borrow
+    // the render closure below takes — request_route_ai needs `&mut
+    // AppState` as a whole (it touches route_engine/route_generation/
+    // route_pending_key), which can't coexist with a live `&mut
+    // PaletteState` reborrowed from `state.palette`. Idempotent per exact
+    // query+candidate set, so recomputing every frame is cheap and safe —
+    // same posture as every other mode's search already being recomputed
+    // every render.
+    if let Some((query, cands)) = state.palette.as_ref().and_then(|p| {
+        (p.mode == Mode::GoToRoute).then(|| (p.input.clone(), aperture_core::route::candidates(&p.root, &p.files, &p.symbols, &p.input, 8)))
+    }) {
+        state.request_route_ai(&query, &cands);
+    }
+
     egui::Area::new(Id::new("aperture_palette"))
         .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
         .order(egui::Order::Foreground)
@@ -908,6 +924,27 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 if enter {
                                     let i = p.selected.min(cands.len() - 1);
                                     open_hit = Some((cands[i].path.clone(), cands[i].line));
+                                }
+                                // AI tier: whatever landed for this exact query+candidate
+                                // set — request_route_ai (triggered above, outside this
+                                // borrow scope) is what queues it; this just reads the
+                                // cache. Absent if no APERTURE_CMD is configured, or
+                                // still queued/in-flight.
+                                let briefs: Vec<aperture_complete::route_ai::CandidateBrief> = cands
+                                    .iter()
+                                    .map(|c| aperture_complete::route_ai::CandidateBrief {
+                                        label: c.label.clone(), rel: c.rel.clone(), line: c.line, snippet: c.snippet.clone(),
+                                    })
+                                    .collect();
+                                let key = aperture_complete::route_ai::route_key(&p.input, &briefs);
+                                if let Some(answer) = aperture_complete::route_ai::route_summary(key) {
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("AI picks:").color(colors.text_weak).small().strong());
+                                    ui.label(egui::RichText::new(answer.trim()).color(colors.text).small());
+                                } else if aperture_complete::route_ai::in_flight(key) {
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("asking the assistant…").color(colors.text_weak).small().italics());
                                 }
                             } else if !p.input.trim().is_empty() {
                                 ui.label(egui::RichText::new("no keyword matches — try different words").color(colors.text_weak).italics());
