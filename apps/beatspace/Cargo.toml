@@ -9,6 +9,15 @@ name = "beatspace"
 path = "src/main.rs"
 
 [dependencies]
+# Native folder picker for the training page. xdg-portal so it works under a
+# Wayland compositor on mobile Linux without dragging in GTK — this fleet
+# targets postmarketOS as well as desktops.
+#
+# Placed at the TOP of this section deliberately: appended at the bottom it
+# landed inside [profile], which is a legal table, so cargo parsed the file
+# without complaint and simply did not have the dependency.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
 # --- neural net (pure-Rust, CPU by default; see README for GPU) ---
 candle-core = "0.11"
 candle-nn   = "0.11"
@@ -57,6 +66,7 @@ lto = "thin"
 # Enable one of these to train/generate on a GPU instead of CPU, e.g.
 #   cargo run --release --features cuda  -- train ...
 #   cargo run --release --features metal -- gui   ...
+
 [features]
 default = []
 cuda  = ["candle-core/cuda",  "candle-nn/cuda"]
@@ -71,6 +81,7 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 # CARGO_PROFILE_DEV_DEBUG=2 when a debugger session needs full types.
 [profile.dev]
 debug = "line-tables-only"
+
 
 [dev-dependencies]
 naga = "29"

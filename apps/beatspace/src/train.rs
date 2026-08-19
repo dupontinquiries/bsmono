@@ -134,8 +134,25 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
         );
 
         let last = epoch + 1 == cfg.epochs;
-        if (epoch + 1) % cfg.ckpt_every == 0 || last {
+        // STOP REQUESTED? Checked at the epoch boundary, where a checkpoint can
+        // be written, so stopping costs at most one epoch rather than
+        // everything since the last save.
+        //
+        // Through a FILE because the GUI runs this as a subprocess: it sets a
+        // flag in its own memory and the trainer is a different address space,
+        // so the button was inert. A signal would kill mid-epoch and lose the
+        // work; a file the loop polls between epochs is what lets it exit
+        // having saved. The check costs one stat per epoch.
+        let asked_to_stop = stop_requested(cfg);
+        if (epoch + 1) % cfg.ckpt_every == 0 || last || asked_to_stop {
             checkpoint(&g, &d, cfg, epoch + 1)?;
+        }
+        if asked_to_stop {
+            // Removed on the way out, or the next run stops at epoch one and
+            // looks broken.
+            let _ = fs::remove_file(stop_path(cfg));
+            println!("[train] stopped by request after epoch {} — checkpoint written", epoch + 1);
+            return Ok(());
         }
     }
 
@@ -154,4 +171,40 @@ fn checkpoint(g: &Generator, d: &Discriminator, cfg: &Config, epoch: usize) -> R
     save_discriminator(d, &dir.join("disc_latest.safetensors"))?;
     println!("[train] checkpoint @ epoch {epoch} -> {gp:?}");
     Ok(())
+}
+
+
+/// Where the GUI writes its stop request.
+///
+/// In the checkpoint directory rather than /tmp: it belongs to this run, two
+/// trainers on one machine must not stop each other, and a stale file in a
+/// checkpoint directory is discoverable by the person wondering why their run
+/// keeps ending early.
+pub fn stop_path(cfg: &Config) -> std::path::PathBuf {
+    cfg.ckpt_dir.join("STOP")
+}
+
+/// Has a stop been asked for?
+///
+/// Only true for a file written AFTER this process started. A leftover STOP
+/// from a previous run would otherwise end the next one at its first epoch,
+/// and the operator would see a trainer that refuses to train.
+pub fn stop_requested(cfg: &Config) -> bool {
+    let p = stop_path(cfg);
+    let Ok(md) = fs::metadata(&p) else { return false };
+    let Ok(written) = md.modified() else { return true };
+    match started_at().duration_since(std::time::UNIX_EPOCH) {
+        Ok(start) => written
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|w| w >= start)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// When this process began, captured once.
+fn started_at() -> std::time::SystemTime {
+    use std::sync::OnceLock;
+    static T: OnceLock<std::time::SystemTime> = OnceLock::new();
+    *T.get_or_init(std::time::SystemTime::now)
 }

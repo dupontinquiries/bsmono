@@ -25,6 +25,16 @@ pub struct Player {
     /// last few output samples, for the GUI waveform strip
     scope: Vec<f32>,
     scope_cap: usize,
+    /// Output gain, 0.0 to 1.0. Muting happens HERE rather than in the UI so
+    /// nothing can push past it: the generator thread keeps producing beats and
+    /// the callback keeps consuming them, but nothing reaches the device.
+    gain: f32,
+    /// Playback stopped: the callback outputs silence and the position does not
+    /// advance. Distinct from gain 0 — a muted stream is still running and
+    /// resumes where it was, a stopped one restarts the current beat. Both
+    /// exist because "I want quiet" and "I want it to stop" are different
+    /// requests and conflating them loses your place.
+    stopped: bool,
 }
 
 impl Player {
@@ -39,6 +49,8 @@ impl Player {
             out_sr,
             scope: vec![0.0; 512],
             scope_cap: 512,
+            gain: 1.0,
+            stopped: false,
         }
     }
 
@@ -65,8 +77,37 @@ impl Player {
     }
 
     /// Produce one output sample.
+    /// Set the output gain. Clamped, because a gain above 1 clips on a signal
+    /// that is already normalised and the distortion sounds like a broken model.
+    pub fn set_gain(&mut self, g: f32) {
+        self.gain = g.clamp(0.0, 1.0);
+    }
+
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Stop or resume. Stopping rewinds to the start of the current beat, so
+    /// resuming begins on a beat boundary rather than mid-phrase.
+    pub fn set_stopped(&mut self, s: bool) {
+        if s && !self.stopped {
+            self.pos = 0;
+            self.fade_pos = 0;
+        }
+        self.stopped = s;
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
     pub fn next_sample(&mut self) -> f32 {
-        if self.cur.is_empty() {
+        if self.stopped || self.cur.is_empty() {
+            // The scope is fed zeros too, so the waveform strip shows silence
+            // rather than freezing on the last frame — a frozen scope reads as
+            // a hung app.
+            if self.scope.len() >= self.scope_cap { self.scope.remove(0); }
+            self.scope.push(0.0);
             return 0.0;
         }
         let clen = self.cur.len();
@@ -97,10 +138,17 @@ impl Player {
             s
         };
 
+        // Gain applied LAST, after the crossfade, so a fade in progress is not
+        // distorted by a volume change landing mid-blend.
+        let out = out * self.gain;
+
         // feed the scope ring (cheap; just overwrite oldest)
         if self.scope.len() >= self.scope_cap {
             self.scope.remove(0);
         }
+        // The scope shows what LEFT the player, gain included — a waveform at
+        // full height while the output is muted is a display that disagrees
+        // with the speakers.
         self.scope.push(out);
         out
     }

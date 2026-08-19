@@ -57,6 +57,10 @@ pub struct TrainPage {
     log: VecDeque<String>,
     /// Set when the operator asks to stop; the trainer observes it.
     pub stop_requested: bool,
+    /// The mel cache, re-read periodically rather than remembered.
+    pub cache: CacheView,
+    /// GPU numbers, when a run reports them.
+    pub gpu: GpuView,
 }
 
 impl Default for TrainPage {
@@ -70,6 +74,8 @@ impl Default for TrainPage {
             curve: Vec::new(),
             log: VecDeque::new(),
             stop_requested: false,
+            cache: Default::default(),
+            gpu: Default::default(),
         }
     }
 }
@@ -431,5 +437,336 @@ mod tests {
         p.feed("[train] device: Cpu");
         assert_eq!(p.device, "Cpu");
         assert!(p.summary().contains("device:  Cpu"));
+    }
+}
+
+// ── what the page shows besides the loss ────────────────────────────────────
+
+/// The mel cache on disk, as the page needs to draw it.
+///
+/// Read rather than inferred: the trainer's cache is a directory of `.bspc`
+/// files that a previous run may have half-filled, another run may be evicting,
+/// and a user may have deleted by hand. A page that displayed a remembered
+/// count would be wrong the first time any of those happened.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CacheView {
+    pub files: usize,
+    pub bytes: u64,
+    /// `cache_batches * batch_size`, or None when unbounded.
+    pub budget: Option<usize>,
+    /// Sources found by the recursive scan, when a run has reported it.
+    pub sources: usize,
+}
+
+impl CacheView {
+    /// How full the cache is against its budget, 0..1.
+    ///
+    /// None when unbounded, because a progress bar with no maximum is a bar
+    /// that means nothing — better to show the count and no bar.
+    pub fn fullness(&self) -> Option<f32> {
+        let b = self.budget?;
+        if b == 0 {
+            return None;
+        }
+        Some((self.files as f32 / b as f32).min(1.0))
+    }
+
+    /// One line for the page.
+    pub fn summary(&self) -> String {
+        let mib = self.bytes as f64 / (1024.0 * 1024.0);
+        match self.budget {
+            Some(b) => format!(
+                "{} of {} clips cached · {:.0} MiB{}",
+                self.files, b, mib,
+                if self.files >= b { " · at budget, evicting oldest" } else { "" }
+            ),
+            None => format!("{} clips cached · {:.0} MiB · unbounded", self.files, mib),
+        }
+    }
+
+    /// Is the cache the reason a run has not started producing epochs?
+    ///
+    /// Answered here because it is the question an operator actually has while
+    /// watching a bar not move, and the honest answer needs both numbers: a
+    /// cold cache with many sources is a wait, and a warm cache is not.
+    pub fn explains_a_slow_start(&self, phase: &Phase) -> bool {
+        matches!(phase, Phase::Preparing { .. }) && self.sources > self.files
+    }
+
+    /// Will this library re-decode as it goes?
+    ///
+    /// True when the source count exceeds the budget: the cache then holds a
+    /// moving window, and a random sampler reaching outside it decodes again.
+    /// Worth saying BEFORE a run rather than leaving the operator to infer it
+    /// from a slow epoch — the fix is a larger `cache_batches`, and it is free
+    /// on a machine with disk to spare.
+    ///
+    /// An unbounded cache never thrashes, and neither does a library that fits.
+    pub fn will_thrash(&self) -> bool {
+        match self.budget {
+            Some(b) => self.sources > b,
+            None => false,
+        }
+    }
+
+    /// One line for a panel. An alias for `summary` so the page and any other
+    /// caller cannot drift into two phrasings of the same fact.
+    pub fn line(&self) -> String {
+        self.summary()
+    }
+}
+
+/// Read the cache directory.
+pub fn read_cache(dir: &std::path::Path, budget: Option<usize>) -> CacheView {
+    let mut v = CacheView { budget, ..Default::default() };
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) == Some("bspc") {
+                v.files += 1;
+                v.bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    v
+}
+
+/// GPU numbers, when the run reports them.
+///
+/// All optional. This is the field where a dashboard invents a plausible figure
+/// because a blank looks unfinished — and a made-up utilisation is worse than
+/// no utilisation, because someone will tune against it. Nothing here is
+/// derived; every value arrives from a log line or stays None.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpuView {
+    pub adapter: Option<String>,
+    pub backend: Option<String>,
+    /// Bytes of GPU buffers the run has reserved.
+    pub buffer_bytes: Option<u64>,
+    /// The concurrent-buffer ceiling this build assumes.
+    pub buffer_ceiling: Option<u64>,
+    /// Dispatches in the last step.
+    pub dispatches: Option<u64>,
+    /// Milliseconds the CPU spent blocked on the GPU in the last step.
+    pub sync_ms: Option<f64>,
+    /// Milliseconds of the last step in total.
+    pub step_ms: Option<f64>,
+}
+
+impl GpuView {
+    /// The share of a step spent waiting on the GPU.
+    /// Take a line of trainer output and keep anything about the GPU.
+    ///
+    /// Parsed from the log rather than passed through a channel for the reason
+    /// the whole page works this way: the CLI and the GUI then show the same
+    /// run. A second path would let the panel disagree with the terminal, and
+    /// the terminal is what gets pasted into a bug report.
+    ///
+    /// Fields stay `None` until a line supplies them, so a CPU run shows no GPU
+    /// panel at all — an empty panel reads as "no GPU" and a panel of zeros
+    /// reads as a broken one.
+    pub fn feed_gpu(&mut self, line: &str) {
+        if let Some(rest) = line.split("adapter: ").nth(1) {
+            // "adapter: Apple M2 Ultra (G14D B1) (Vulkan)" — the backend is the
+            // last parenthesised group, and the name itself contains
+            // parentheses, so it is taken from the right.
+            let rest = rest.trim();
+            if let Some(open) = rest.rfind('(') {
+                self.adapter = Some(rest[..open].trim().to_string());
+                self.backend = Some(rest[open + 1..].trim_end_matches(')').to_string());
+            } else {
+                self.adapter = Some(rest.to_string());
+            }
+        }
+        if let Some(rest) = line.split("dispatches ").nth(1) {
+            if let Some(n) = rest.split_whitespace().next().and_then(|s| s.parse().ok()) {
+                self.dispatches = Some(n);
+            }
+        }
+        if let Some(rest) = line.split("sync ").nth(1) {
+            // "sync 60519ms" — trimmed of the unit rather than parsed with it,
+            // because the engine writes both "60519ms" and "60519 ms".
+            let tok = rest.split_whitespace().next().unwrap_or("");
+            if let Ok(ms) = tok.trim_end_matches("ms").trim().parse::<f64>() {
+                self.sync_ms = Some(ms);
+            }
+        }
+        if let Some(rest) = line.split("buffer budget ").nth(1) {
+            let mut it = rest.split_whitespace();
+            if let (Some(a), Some(b)) = (it.next(), it.nth(1)) {
+                if let (Ok(u), Ok(c)) = (a.parse::<f64>(), b.parse::<f64>()) {
+                    // Reported in MiB by the engine; stored in bytes so the
+                    // fullness maths does not carry a unit.
+                    self.buffer_bytes = Some((u * 1024.0 * 1024.0) as u64);
+                    self.buffer_ceiling = Some((c * 1024.0 * 1024.0) as u64);
+                }
+            }
+        }
+    }
+
+    pub fn sync_share(&self) -> Option<f32> {
+        let (s, t) = (self.sync_ms?, self.step_ms?);
+        (t > 0.0).then(|| (s / t) as f32)
+    }
+
+    /// What the numbers say, in the terms the engine's own diagnostics use.
+    ///
+    /// The wording is deliberate: a high sync share is NOT automatically
+    /// overhead. logscope's engine records the same signature and reads it
+    /// correctly — at few submits carrying real work, the wait IS the compute.
+    /// A dashboard that shouted "stalled" at 90% sync would send the operator
+    /// optimising a queue that was already full.
+    pub fn verdict(&self) -> Option<String> {
+        let share = self.sync_share()?;
+        let d = self.dispatches.unwrap_or(0);
+        Some(if share > 0.8 && d > 200 {
+            format!("{:.0}% waiting on the GPU across {d} dispatches — many small dispatches, \
+                     so the wait is probably per-dispatch overhead", share * 100.0)
+        } else if share > 0.8 {
+            format!("{:.0}% waiting on the GPU across {d} dispatches — few dispatches carrying \
+                     real work, so the wait is the compute", share * 100.0)
+        } else {
+            format!("{:.0}% waiting on the GPU", share * 100.0)
+        })
+    }
+
+    /// Buffer use against the ceiling, 0..1.
+    pub fn buffer_fullness(&self) -> Option<f32> {
+        let (used, cap) = (self.buffer_bytes?, self.buffer_ceiling?);
+        (cap > 0).then(|| (used as f64 / cap as f64) as f32)
+    }
+}
+
+impl TrainPage {
+    /// Parse the GPU lines the engine and the trainer print.
+    ///
+    /// Tolerant, and it fills nothing it did not read. A parser that defaulted a
+    /// missing field to zero would show 0% utilisation on a working run.
+    pub fn feed_gpu(&mut self, line: &str) {
+        if let Some(rest) = line.strip_prefix("adapter: ") {
+            // "Apple M2 Ultra (G14D B1) (Vulkan)" — the backend is the last
+            // parenthesised group, and the name itself contains parentheses,
+            // which is why this splits from the right.
+            if let Some(open) = rest.rfind('(') {
+                self.gpu.adapter = Some(rest[..open].trim().to_string());
+                self.gpu.backend =
+                    Some(rest[open + 1..].trim_end_matches(')').trim().to_string());
+            } else {
+                self.gpu.adapter = Some(rest.trim().to_string());
+            }
+        }
+        if let Some(v) = after_key(line, "dispatches ") {
+            self.gpu.dispatches = v.parse().ok();
+        }
+        if let Some(v) = after_key(line, "sync ") {
+            self.gpu.sync_ms = v.trim_end_matches("ms").parse().ok();
+        }
+        if let Some(v) = after_key(line, "step ") {
+            self.gpu.step_ms = v.trim_end_matches("ms").parse().ok();
+        }
+    }
+}
+
+fn after_key(line: &str, key: &str) -> Option<String> {
+    let i = line.find(key)? + key.len();
+    Some(line[i..].split_whitespace().next()?.to_string())
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn an_unbounded_cache_shows_no_bar() {
+        // A progress bar with no maximum means nothing. Better to show the
+        // count and omit the bar than to draw one against an invented ceiling.
+        let v = CacheView { files: 40, bytes: 1 << 20, budget: None, sources: 0 };
+        assert!(v.fullness().is_none());
+        assert!(v.summary().contains("unbounded"));
+    }
+
+    #[test]
+    fn a_full_cache_says_it_is_evicting() {
+        // The operator seeing files stop growing needs to know that is the
+        // policy working rather than the run stalling.
+        let v = CacheView { files: 128, bytes: 0, budget: Some(128), sources: 0 };
+        assert_eq!(v.fullness(), Some(1.0));
+        assert!(v.summary().contains("evicting"));
+        // And it cannot exceed 1: a cache the user over-filled by hand should
+        // not draw a bar past its own end.
+        let over = CacheView { files: 500, budget: Some(128), ..Default::default() };
+        assert_eq!(over.fullness(), Some(1.0));
+    }
+
+    #[test]
+    fn a_cold_cache_explains_a_slow_start_and_a_warm_one_does_not() {
+        // The question an operator has while watching a bar not move.
+        let cold = CacheView { files: 10, sources: 5630, budget: Some(128), bytes: 0 };
+        assert!(cold.explains_a_slow_start(&Phase::Preparing { done: 10, total: 5630 }));
+        let warm = CacheView { files: 5630, sources: 5630, budget: None, bytes: 0 };
+        assert!(!warm.explains_a_slow_start(&Phase::Preparing { done: 0, total: 0 }));
+        // And it never explains a slow TRAINING phase — that is a different
+        // problem and pointing at the cache would misdirect.
+        assert!(!cold.explains_a_slow_start(&Phase::Training));
+    }
+
+    #[test]
+    fn an_adapter_name_with_parentheses_still_parses() {
+        // "Apple M2 Ultra (G14D B1) (Vulkan)" — the name itself is
+        // parenthesised, so splitting on the FIRST bracket gives the backend as
+        // "G14D B1) (Vulkan" and the name as "Apple M2 Ultra".
+        let mut p = TrainPage::default();
+        p.feed_gpu("adapter: Apple M2 Ultra (G14D B1) (Vulkan)");
+        assert_eq!(p.gpu.adapter.as_deref(), Some("Apple M2 Ultra (G14D B1)"));
+        assert_eq!(p.gpu.backend.as_deref(), Some("Vulkan"));
+    }
+
+    #[test]
+    fn nothing_unread_is_invented() {
+        // The field where a dashboard shows a plausible zero because a blank
+        // looks unfinished. A made-up utilisation is worse than none, because
+        // someone tunes against it.
+        let p = TrainPage::default();
+        assert!(p.gpu.sync_share().is_none());
+        assert!(p.gpu.verdict().is_none());
+        assert!(p.gpu.buffer_fullness().is_none());
+        assert!(p.gpu.dispatches.is_none());
+    }
+
+    #[test]
+    fn a_high_sync_share_is_not_called_a_stall_without_the_dispatch_count() {
+        // logscope's engine reads this signature correctly: at few submits
+        // carrying real work, the wait IS the compute. Shouting "stalled" at
+        // 90% sync sends the operator optimising a queue that is already full.
+        let busy = GpuView {
+            sync_ms: Some(900.0), step_ms: Some(1000.0), dispatches: Some(12),
+            ..Default::default()
+        };
+        let v = busy.verdict().unwrap();
+        assert!(v.contains("the wait is the compute"), "{v}");
+
+        let chatty = GpuView {
+            sync_ms: Some(900.0), step_ms: Some(1000.0), dispatches: Some(30000),
+            ..Default::default()
+        };
+        let v = chatty.verdict().unwrap();
+        assert!(v.contains("per-dispatch overhead"), "{v}");
+    }
+
+    #[test]
+    fn the_cache_is_read_from_disk_rather_than_remembered() {
+        // A previous run may have half-filled it, another may be evicting, and
+        // a user may have deleted it by hand. A remembered count is wrong the
+        // first time any of those happens.
+        let dir = std::env::temp_dir().join(format!("cv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("c{i}.bspc")), vec![0u8; 100]).unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
+        let v = read_cache(&dir, Some(8));
+        assert_eq!(v.files, 3, "non-cache files were counted");
+        assert_eq!(v.bytes, 300);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

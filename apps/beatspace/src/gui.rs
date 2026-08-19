@@ -36,6 +36,16 @@ struct Shared {
     weights_request: Option<PathBuf>,
     loaded_label: String,
     device_label: String,
+    /// Output gain the generator thread applies to its player, 0..1.
+    ///
+    /// Routed through Shared rather than by handing the GUI an Arc<Player>: the
+    /// player is created inside the audio thread and its lock is taken by the
+    /// cpal callback on every sample. A GUI holding that lock for a frame is an
+    /// audio dropout, so the GUI writes a number here and the generator thread
+    /// applies it between beats, where the lock is already being taken.
+    gain: f32,
+    /// Playback stopped. Distinct from gain 0 — see Player::set_stopped.
+    stopped: bool,
 }
 
 pub fn run(cfg: Config) -> Result<()> {
@@ -49,6 +59,8 @@ pub fn run(cfg: Config) -> Result<()> {
         weights_request: None,
         loaded_label: "(none)".into(),
         device_label: "?".into(),
+        gain: 1.0,
+        stopped: false,
     }));
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -174,7 +186,20 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
         let wav = mel.mel_to_wav_warm(&flat, t, cfg.griffin_iters_rt, &mut gl);
         let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
-        audio.lock().unwrap().push(&wav);
+        // Apply the GUI's transport in the same lock as the push, between
+        // beats. The cpal callback takes this lock per sample, so a GUI thread
+        // holding it for a frame is an audible dropout — this is the one place
+        // the lock is already being taken for a long-lived reason.
+        {
+            let (gain, stopped) = {
+                let s = shared.lock().unwrap();
+                (s.gain, s.stopped)
+            };
+            let mut p = audio.lock().unwrap();
+            p.set_gain(gain);
+            p.set_stopped(stopped);
+            p.push(&wav);
+        }
 
         if let Some(path) = save_req {
             // render a clean, high-quality version from the same latent (fresh
@@ -222,9 +247,19 @@ struct App {
     /// Held for the training page: it needs the data and checkpoint dirs to
     /// launch a run, and Shared carries neither.
     cfg: Config,
+    /// The level to restore when unmuting. Dragging a slider to zero to
+    /// silence something otherwise loses the level you had chosen.
+    last_gain: f32,
     page: Page,
     /// The training dashboard's state. Fed from the trainer's own stdout.
     train: crate::trainpage::TrainPage,
+    /// The mel cache on disk. Rescanned on a timer rather than per frame —
+    /// a read_dir over thousands of entries every frame is a stall the page
+    /// does not need, and the cache changes on the scale of seconds.
+    cache: crate::trainpage::CacheView,
+    cache_checked: Option<std::time::Instant>,
+    /// GPU facts, parsed from the trainer's own output.
+    gpu: crate::trainpage::GpuView,
     /// Lines arriving from a running trainer.
     train_rx: Option<std::sync::mpsc::Receiver<String>>,
     train_epochs: String,
@@ -253,8 +288,12 @@ impl App {
             .to_string();
         let train_batch = cfg.batch_size.to_string();
         Self {
+            last_gain: 1.0,
             page: Page::Morph,
             train: Default::default(),
+            cache: Default::default(),
+            cache_checked: None,
+            gpu: Default::default(),
             train_rx: None,
             train_epochs: "20000".into(),
             train_batch,
@@ -321,6 +360,7 @@ impl eframe::App for App {
                 lines.push(l);
             }
             for l in lines {
+                self.gpu.feed_gpu(&l);
                 self.train.feed(&l);
             }
         }
@@ -333,11 +373,26 @@ impl eframe::App for App {
                 ui.heading("beatspace");
                 ui.label("latent-space beat morpher");
                 ui.horizontal(|ui| {
+                    let was = self.page;
                     ui.selectable_value(&mut self.page, Page::Morph, "morph");
                     ui.selectable_value(&mut self.page, Page::Train, "train");
+                    // ARRIVING AT THE TRAINING PAGE STOPS THE BEAT, once, on the
+                    // transition. Training is a long watch and a loop playing
+                    // under it is the thing you reach to silence — and the reach
+                    // is to the system volume, which silences everything else
+                    // too. Doing it on the EDGE rather than every frame is what
+                    // lets the operator press play again and be heard.
+                    if was != self.page && self.page == Page::Train {
+                        self.shared.lock().unwrap().stopped = true;
+                        self.status = "playback stopped for training".into();
+                    }
                 });
+                self.transport(ui);
                 ui.separator();
                 if self.page == Page::Train {
+                    // The transport is drawn above, before this branch, so both
+                    // pages get the same one rather than a second pair of buttons
+                    // that could disagree with it.
                     self.train_controls(ui);
                     return;
                 }
@@ -526,6 +581,40 @@ impl App {
         use crate::trainpage::Phase;
         let running = matches!(self.train.phase, Phase::Preparing { .. } | Phase::Training);
 
+        // THE INPUT DIRECTORY: a picker AND a text field, not one or the other.
+        // The picker is what a phone needs; the field is what a path pasted from
+        // a terminal needs, and it is also the only way to type a path that is
+        // not mounted yet. Both write the same value.
+        ui.label(egui::RichText::new("audio library").small());
+        ui.horizontal(|ui| {
+            let mut dir = self.cfg.data_dir.to_string_lossy().to_string();
+            if ui.add_enabled(!running,
+                egui::TextEdit::singleline(&mut dir).desired_width(150.0)).changed()
+            {
+                self.cfg.data_dir = dir.clone().into();
+            }
+            if ui.add_enabled(!running, egui::Button::new("📁")).clicked() {
+                // Blocking pick. The frame stalls while the portal is open,
+                // which is correct: the operator is in a modal dialog and an
+                // animating window behind it is not worth a thread.
+                if let Some(d) = rfd::FileDialog::new()
+                    .set_directory(&self.cfg.data_dir)
+                    .pick_folder()
+                {
+                    self.cfg.data_dir = d;
+                }
+            }
+        });
+        // Said plainly, because the scan is recursive now and the count is the
+        // difference between "this is the right folder" and a silent zero.
+        if !running {
+            let d = self.cfg.data_dir.clone();
+            if !d.is_dir() {
+                ui.label(egui::RichText::new("not a directory").small());
+            }
+        }
+        ui.separator();
+
         ui.horizontal(|ui| {
             ui.label("epochs");
             ui.add_enabled(!running,
@@ -546,8 +635,23 @@ impl App {
             // writes a checkpoint on the way out — tearing the thread down here
             // would lose the epochs since the last save, which on a slow CPU
             // run is the work of an hour.
+            // WRITTEN TO DISK, not just to this struct. The trainer is a
+            // separate process — setting a bool here could never reach it, and
+            // the button did nothing for two commits. It polls this file at
+            // each epoch boundary and exits having written a checkpoint.
             self.train.stop_requested = true;
-            self.status = "stop requested — finishing the epoch".into();
+            match std::fs::write(self.cfg.ckpt_dir.join("STOP"), b"stop\n") {
+                Ok(()) => {
+                    self.status = "stop requested — finishing the epoch, then saving".into();
+                }
+                Err(e) => {
+                    // Said out loud. A stop button that silently failed to
+                    // write is worse than no button: the operator walks away
+                    // believing the run is ending.
+                    self.train.stop_requested = false;
+                    self.status = format!("could not write the stop file: {e}");
+                }
+            }
         }
 
         ui.separator();
@@ -556,6 +660,52 @@ impl App {
             // Said, not acted on: a plateau is sometimes convergence and
             // sometimes a dead run, and the operator knows which.
             ui.label(egui::RichText::new("loss is flat — plateau or converged").small());
+        }
+
+        // THE CACHE, with the two numbers that decide whether to wait.
+        //
+        // Rescanned every two seconds, not every frame: a read_dir over
+        // thousands of entries is a real stall, and the cache moves on the
+        // scale of seconds.
+        let due = self.cache_checked
+            .map(|t| t.elapsed().as_secs_f32() > 2.0)
+            .unwrap_or(true);
+        if due {
+            let budget = if self.cfg.cache_batches == 0 { None }
+                         else { Some(self.cfg.cache_batches * self.cfg.batch_size.max(1)) };
+            self.cache = crate::trainpage::read_cache(&self.cfg.cache_dir, budget);
+            self.cache_checked = Some(std::time::Instant::now());
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("cache").small());
+        ui.label(egui::RichText::new(self.cache.line()).small());
+        if let Some(f) = self.cache.fullness() {
+            ui.add(egui::ProgressBar::new(f).desired_height(6.0).show_percentage());
+        }
+        if self.cache.will_thrash() {
+            // Said BEFORE the run. A library larger than the budget means every
+            // epoch re-decodes what the last one evicted, and the fix is a
+            // bigger cache_batches rather than patience.
+            ui.label(egui::RichText::new(
+                "library is larger than the cache budget — it will re-decode as it goes").small());
+        }
+
+        // GPU, when the trainer has said anything about one. Absent rather
+        // than zeroed when it has not: an empty panel reads as "no GPU", and
+        // a panel of zeros reads as a broken one.
+        if self.gpu.adapter.is_some() || self.gpu.sync_share().is_some() {
+            ui.separator();
+            ui.label(egui::RichText::new("gpu").small());
+            if let Some(a) = &self.gpu.adapter {
+                ui.label(egui::RichText::new(a).small());
+            }
+            if let Some(v) = self.gpu.verdict() {
+                ui.label(egui::RichText::new(v).small());
+            }
+            if let Some(f) = self.gpu.buffer_fullness() {
+                ui.add(egui::ProgressBar::new(f).desired_height(6.0)
+                    .text("buffer budget"));
+            }
         }
 
         ui.separator();
@@ -674,5 +824,45 @@ impl App {
                     ui.label(egui::RichText::new(line).monospace().small());
                 }
             });
+    }
+}
+
+
+impl App {
+    /// Mute, stop, and a level — on every page, because the thing you want to
+    /// silence is playing whichever page you are looking at.
+    fn transport(&mut self, ui: &mut egui::Ui) {
+        let (mut gain, mut stopped) = {
+            let s = self.shared.lock().unwrap();
+            (s.gain, s.stopped)
+        };
+        let before = (gain, stopped);
+
+        ui.horizontal(|ui| {
+            if ui.button(if stopped { "▶" } else { "■" })
+                .on_hover_text(if stopped { "resume playback" } else { "stop playback" })
+                .clicked()
+            {
+                stopped = !stopped;
+            }
+            // MUTE IS A SEPARATE CONTROL from the level, and it remembers.
+            // Dragging the slider to zero to silence something loses the level
+            // you liked; a mute toggle gives it back.
+            let muted = gain <= 0.0;
+            if ui.selectable_label(muted, "mute").clicked() {
+                gain = if muted { self.last_gain.max(0.1) } else { 0.0 };
+            }
+            if gain > 0.0 {
+                self.last_gain = gain;
+            }
+            ui.add(egui::Slider::new(&mut gain, 0.0..=1.0).show_value(false))
+                .on_hover_text("output level");
+        });
+
+        if (gain, stopped) != before {
+            let mut s = self.shared.lock().unwrap();
+            s.gain = gain;
+            s.stopped = stopped;
+        }
     }
 }
