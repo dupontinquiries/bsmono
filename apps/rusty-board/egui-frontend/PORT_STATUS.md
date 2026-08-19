@@ -39,14 +39,34 @@ moved.
   binary and `examples/feel` are both one call into it. (They used to be two hand-synced
   copies carrying a "kept in sync manually" comment; they had already drifted — the example
   had lost the real-layout tabs.)
+- **Settings panel** (`settings.rs`) — NOT a 2469-line reimplementation of the GTK panel (this
+  doc used to say that was still owed; it isn't the plan anymore, see the module's own doc
+  comment for why). Instead the port mounts `src/config/mod.rs` by `#[path]`, the same GTK-free
+  real `Config` type the engine uses, so there is one settings schema on disk instead of two
+  that can drift. `settings::ready(Section)` is honest about what the port's own UI currently
+  *presents* for each section — Appearance/Behavior/Gestures/Layout/Voice are reachable, Llm
+  round-trips through the shared type but has no port-side UI yet (see "Not done" below).
+- **Minimized tray** (`tray.rs`) — ported and wired into `demo_app`'s bottom panel: expand,
+  spacebar (tap = space + exits selection mode, double-tap = toggles selection mode, cardinal
+  swipe = arrow / Shift+arrow in selection mode), close. 11 tests.
+- **Microterm** (`microterm.rs`) — the status/voice-partial/steno-candidates/LLM-prompt strip,
+  modelled as a sum type (`Content`) rather than a struct of optionals on purpose — see the
+  module doc — and drawn above the keyboard in `demo_app` when visible.
+- **Voice input UI** (`voice.rs`, `dictation.rs`, `mic_source.rs`) — a real recording/
+  transcribing surface exists, not just the dependency wiring this doc used to describe: rusty-
+  board's own GTK-free voice stack (`src/voice/`) is mounted by `#[path]`, `DictationService`
+  drives partial-replaces-not-appends commit semantics (see `dictation.rs`'s module doc for the
+  double-transcription bug this designed out), and `demo_app` owns a live `DictationService` +
+  mic broker. Gated behind the `voice` feature (whisper-rs + cpal native build) — off by
+  default so a phone build that can't compile whisper-rs still ships a usable keyboard.
 
 ## Not done
 
-- **Settings panel** (`src/ui/settings_panel.rs`, 2469 lines). The frontend reads
-  `settings_kit::Prefs` already, so this is a UI build-out, not a plumbing problem.
-- **Minimized tray** (`src/ui/minimized_tray.rs`) and **microterm** (`src/ui/microterm.rs`).
-- **Voice input UI** — `voice-kit`/`mic-kit` are wired as dependencies and the a11y layer has
-  a voice key, but there is no recording/transcribing surface yet.
+- **The `Llm` settings section's own UI** — the field round-trips through the shared `Config`
+  (`settings::ready(Section::Llm)` is `false` on purpose, asserted in a test), but the port
+  doesn't host an assistant subsystem yet, so there's no port-side page for it. Not "the panel
+  isn't built" — the panel exists; this one section is deliberately withheld rather than
+  offering a control that does nothing.
 - **Platform placement** — layer-shell anchoring, exclusive zone, focus-follows behaviour.
   This is eframe/winit territory rather than a UI port, and belongs with the on-device work.
 
