@@ -1662,32 +1662,15 @@ fn battery_ok_for_background() -> bool {
 /// a pre-filter before fingerprint storage. Previously private.
 #[cfg(feature = "voice")]
 pub fn is_sane_transcription(text: &str) -> bool {
-    let t = text.trim();
-    let len = t.chars().count();
-    if len < 2 || len > 120 { return false; }
-    // Repetition check: if the same word appears >50% of the time, it's
-    // probably a hallucination loop.
-    let words: Vec<&str> = t.split_whitespace().collect();
-    if words.len() >= 4 {
-        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for w in &words { *counts.entry(*w).or_insert(0) += 1; }
-        let max_count = counts.values().max().copied().unwrap_or(0);
-        if max_count * 2 > words.len() { return false; }
-    }
-    // Known hallucination phrases. These are common enough across
-    // whisper outputs that filtering them isn't going to lose much.
-    let lower = t.to_lowercase();
-    let bad_phrases = [
-        "thank you for watching", "thanks for watching",
-        "subscribe to", "like and subscribe",
-        "see you next time", "see you in the next video",
-        "don't forget to subscribe",
-        "[music]", "[silence]", "[blank_audio]",
-    ];
-    for p in &bad_phrases {
-        if lower.contains(p) { return false; }
-    }
-    true
+    // Repointed onto voice-kit (TODO.md item): this body used to duplicate
+    // exactly this length check + repetition check + BAD_PHRASES list —
+    // voice-kit's own module doc says `looks_like_speech` was "Lifted from
+    // voiceterm's `is_sane_transcription`", so this is restoring a single
+    // source of truth, not changing behavior. Confirmed line-for-line
+    // identical against voice-kit's copy before repointing (same 2..120
+    // bound, same `max_count * 2 > words.len()` threshold, same phrase
+    // list) — see shared/voice-kit/src/hallucination.rs.
+    voice_kit::hallucination::looks_like_speech(text)
 }
 
 // v0.1.209: stub for builds without the voice feature. Same shape,
