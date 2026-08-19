@@ -1895,6 +1895,9 @@ mod tests {
             mac: "AA:BB:CC:DD:EE:FF".into(),
             name: "X".into(),
             playing_pid: pid_slot,
+            // Added to the struct after this test; the test is about
+            // is_playing(), which reads playing_pid only.
+            active_sink: Arc::new(Mutex::new(None)),
         });
         assert!(bt.is_playing());
     }

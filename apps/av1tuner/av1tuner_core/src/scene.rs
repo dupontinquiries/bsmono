@@ -86,6 +86,11 @@ mod tests {
             duration_s: frames as f64 / fps,
             pixel_format: "yuv420p".into(),
             codec: "h264".into(),
+            // Added to VideoInfo after this helper was written. Empty rather
+            // than a fabricated stream: these tests are about scene detection,
+            // and inventing audio would make a future audio-aware test pass
+            // against data no probe produced.
+            audio_streams: Vec::new(),
         }
     }
 

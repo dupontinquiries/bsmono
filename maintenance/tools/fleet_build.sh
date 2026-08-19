@@ -42,6 +42,51 @@ FILTER="${1:-}"
 LOGDIR="${FLEET_LOGDIR:-/tmp/fleet-logs}"
 FAILED=()
 OK=0
+TESTED=()          # "label PASS 128" / "label FAIL 3"
+TEST_PIDS=()       # tests running in the background while the next crate builds
+
+# TESTS RUN IN THE BACKGROUND, one per crate that compiled.
+#
+# The build of the NEXT crate is the idle time: cargo is single-crate-serial
+# here because the apps are separate workspaces, so a test run costs nothing
+# but the cores it borrows. Bounded by FLEET_TEST_JOBS because a fleet-wide
+# `cargo test` at full width will thrash a laptop and swap a phone.
+#
+# `check` cannot become `test` in one step: a crate that FAILS to compile has
+# no tests to run, and reporting "0 tests" for it would hide the build error
+# behind a green number.
+TEST_JOBS="${FLEET_TEST_JOBS:-2}"
+RUN_TESTS="${FLEET_TEST:-1}"
+
+reap_tests() {
+    # Collect finished test runs. `wait -n` blocks for ANY of them, which is
+    # what keeps the build moving rather than waiting on the slowest.
+    while [ "${#TEST_PIDS[@]}" -ge "$1" ]; do
+        wait -n 2>/dev/null || true
+        local live=()
+        for pid in "${TEST_PIDS[@]}"; do
+            kill -0 "$pid" 2>/dev/null && live+=("$pid")
+        done
+        TEST_PIDS=("${live[@]}")
+        # No progress possible — everything already exited.
+        [ "${#live[@]}" -ge "$1" ] || break
+    done
+}
+
+start_tests() {
+    local dir="$1" label="$2"
+    [ "$RUN_TESTS" = "1" ] || return
+    reap_tests "$TEST_JOBS"
+    (
+        cd "$dir" || exit 0
+        # --no-fail-fast: one failing crate in a workspace should not hide the
+        # rest, which is the same reason this script exists at all.
+        CARGO_PROFILE_DEV_DEBUG=0 timeout 900 cargo test -q --no-fail-fast \
+            > "$LOGDIR/$(echo "$label" | tr '/' '-').test.log" 2>&1
+        echo "$?" > "$LOGDIR/$(echo "$label" | tr '/' '-').test.rc"
+    ) &
+    TEST_PIDS+=($!)
+}
 
 check() {
     local dir="$1" label="$2" mode="$3"
@@ -54,6 +99,10 @@ check() {
         echo "  SKIP $label — needs a system toolchain ($dep)"
         rm -f /tmp/fleet.$$
         return
+    fi
+    if ! grep -qE '^error' /tmp/fleet.$$; then
+        # Compiled — hand it to a background test run and carry on building.
+        start_tests "$dir" "$label"
     fi
     if grep -qE '^error' /tmp/fleet.$$; then
         local n; n=$(grep -cE '^error' /tmp/fleet.$$)
@@ -115,11 +164,82 @@ for manifest in "$ROOT"/apps/*/Cargo.toml "$ROOT"/apps/*/egui-frontend/Cargo.tom
     check "$dir" "$label" "--all-targets"
 done
 
-echo
-if [ ${#FAILED[@]} -eq 0 ]; then
-    echo "all $OK targets compile"
-    exit 0
+# Wait for the last test runs. They were started as their crate finished
+# building, so by here most have already landed.
+if [ "$RUN_TESTS" = "1" ] && [ "${#TEST_PIDS[@]}" -gt 0 ]; then
+    echo
+    echo "==> waiting on ${#TEST_PIDS[@]} test run(s)"
+    wait
 fi
-echo "${#FAILED[@]} broken, $OK ok:"
-printf '  %s\n' "${FAILED[@]}"
+
+SUMMARY="$LOGDIR/summary.txt"
+{
+    echo "fleet build — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "commit: $(git -C "$(dirname "$0")/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "host:   $(uname -srm)"
+    echo "rustc:  $(rustc --version 2>/dev/null || echo absent)"
+    echo
+} > "$SUMMARY"
+
+TEST_FAIL=()
+if [ "$RUN_TESTS" = "1" ]; then
+    for rc in "$LOGDIR"/*.test.rc; do
+        [ -e "$rc" ] || continue
+        label="$(basename "$rc" .test.rc)"
+        log="${rc%.rc}.log"
+        # The COUNT comes from cargo's own summary line, not from the exit
+        # code: a crate with several test binaries prints several, and summing
+        # them is the number a person wants.
+        passed=$(grep -hoE '^test result: ok\. [0-9]+' "$log" 2>/dev/null \
+                 | grep -oE '[0-9]+' | paste -sd+ - | bc 2>/dev/null || echo 0)
+        if [ "$(cat "$rc")" = "0" ]; then
+            TESTED+=("$label PASS ${passed:-0}")
+        else
+            # A timeout and a real failure are different problems and the exit
+            # code distinguishes them: 124 is timeout(1)'s.
+            if [ "$(cat "$rc")" = "124" ]; then
+                TEST_FAIL+=("$label TIMEOUT after 900s")
+            else
+                n=$(grep -cE '^(test .* FAILED|error)' "$log" 2>/dev/null || echo "?")
+                TEST_FAIL+=("$label FAIL ($n)")
+            fi
+        fi
+    done
+fi
+
+{
+    if [ ${#FAILED[@]} -eq 0 ]; then
+        echo "BUILD: all $OK targets compile"
+    else
+        echo "BUILD: ${#FAILED[@]} broken, $OK ok"
+        printf '  %s\n' "${FAILED[@]}"
+    fi
+    echo
+    if [ "$RUN_TESTS" = "1" ]; then
+        total=$(printf '%s\n' "${TESTED[@]}" | awk '{s+=$3} END{print s+0}')
+        echo "TESTS: ${#TESTED[@]} crate(s) green, $total test(s) passed, ${#TEST_FAIL[@]} crate(s) failing"
+        [ ${#TEST_FAIL[@]} -gt 0 ] && printf '  %s\n' "${TEST_FAIL[@]}"
+    else
+        echo "TESTS: skipped (FLEET_TEST=0)"
+    fi
+} | tee -a "$SUMMARY"
+
+# ONE ZIP, so a failure can be handed over whole.
+#
+# The reason this script exists is that broken crates went unnoticed; the
+# reason logs get lost is that /tmp is per-machine and a report gets pasted
+# without them. Everything needed to read a failure travels together.
+ZIP="${FLEET_ZIP:-$LOGDIR/fleet-logs.zip}"
+if command -v zip >/dev/null 2>&1; then
+    ( cd "$LOGDIR" && zip -qr "$ZIP" . -x '*.zip' ) && echo && echo "logs + summary: $ZIP"
+else
+    # tar is on every machine this fleet targets; zip is not on a phone.
+    ZIP="${ZIP%.zip}.tar.gz"
+    ( cd "$LOGDIR" && tar czf "$ZIP" --exclude='*.tar.gz' . ) && echo && echo "logs + summary: $ZIP"
+fi
+
+# Non-zero for a build break OR a test break: a script that only fails on
+# compilation teaches people that green means working, which is the belief
+# this whole file exists to correct.
+[ ${#FAILED[@]} -eq 0 ] && [ ${#TEST_FAIL[@]} -eq 0 ] && exit 0
 exit 1
