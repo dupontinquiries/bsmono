@@ -102,25 +102,59 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
         let mut d_running = 0f32;
         let mut g_running = 0f32;
 
-        for _ in 0..cfg.steps_per_epoch {
+        // Per-phase timing, because "97 s/epoch" is not an answer to WHY.
+        // Nothing here was attributed, so the choice between a smaller batch, a
+        // smaller model and a different conv path was a guess. Accumulated over
+        // the epoch and printed with it — four Instant reads per step against a
+        // step that takes over a second.
+        let (mut t_sample, mut t_gfwd, mut t_dstep, mut t_gstep) = (0f64, 0f64, 0f64, 0f64);
+        // This epoch's own clock. The run total cannot give a percentage: by
+        // epoch 100 the accounted share of it would read as 1%.
+        let t_epoch = std::time::Instant::now();
+
+        for step in 0..cfg.steps_per_epoch {
+            // STOP, CHECKED PER STEP rather than per epoch.
+            //
+            // The mechanism was complete on both sides and still read as
+            // broken: the trainer polled only at epoch boundaries, so at 97
+            // s/epoch the button did nothing for up to a minute and a half. A
+            // stat every step costs nothing against a step that takes 1.5 s,
+            // and the checkpoint below still runs — stopping mid-epoch loses
+            // only the steps since the last one, not the epoch.
+            if step > 0 && stop_requested(cfg) {
+                println!("[train] stop requested mid-epoch at step {step}/{} — checkpointing",
+                         cfg.steps_per_epoch);
+                checkpoint(&g, &d, cfg, epoch)?;
+                let _ = fs::remove_file(stop_path(cfg));
+                return Ok(());
+            }
+
             // real batch
+            let t0 = std::time::Instant::now();
             let real = ds.sample_batch(b, &dev)?; // (B,1,128,256)
+            t_sample += t0.elapsed().as_secs_f64();
 
             // latent noise
             let z = Tensor::randn(0f32, 1f32, (b, latent), &dev)?;
+            let t1 = std::time::Instant::now();
             let fake = g.forward_train(&z)?; // (B,1,128,256)
+            t_gfwd += t1.elapsed().as_secs_f64();
 
             // ---- D step ----
             let real_logits = d.forward(&real, true)?;
             let fake_logits_d = d.forward(&fake.detach(), true)?;
             let d_loss = (bce_with_logits(&real_logits, &real_target)?
                 + bce_with_logits(&fake_logits_d, &fake_target)?)?;
+            let t2 = std::time::Instant::now();
             opt_d.backward_step(&d_loss)?;
+            t_dstep += t2.elapsed().as_secs_f64();
 
             // ---- G step ----
             let fake_logits_g = d.forward(&fake, true)?;
             let g_loss = bce_with_logits(&fake_logits_g, &gen_target)?;
+            let t3 = std::time::Instant::now();
             opt_g.backward_step(&g_loss)?;
+            t_gstep += t3.elapsed().as_secs_f64();
 
             d_running += d_loss.to_scalar::<f32>()?;
             g_running += g_loss.to_scalar::<f32>()?;
@@ -140,8 +174,27 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
             g_running / n,
             t_start.elapsed().as_secs_f64(),
         );
+        // WHERE THE EPOCH WENT. Printed once per epoch, so the operator can see
+        // which phase to attack rather than guessing between batch size, model
+        // size and the conv path. On this hardware candle has no BLAS backend —
+        // mkl is x86 and accelerate is macOS — so the conv/matmul phases are
+        // running on its portable path and are the expected suspects.
+        let epoch_secs = t_epoch.elapsed().as_secs_f64();
+        let acc = t_sample + t_gfwd + t_dstep + t_gstep;
+        println!(
+            "[train]   phases: sample {:.1}s · G fwd {:.1}s · D step {:.1}s · G step {:.1}s \
+({:.0}% of the epoch accounted)",
+            t_sample, t_gfwd, t_dstep, t_gstep,
+            if epoch_secs > 0.0 { 100.0 * acc / epoch_secs } else { 0.0 },
+        );
 
-        let last = epoch + 1 == cfg.epochs;
+        // The existing check, not a second one. stop_requested() only honours
+        // a STOP written AFTER this process started, which my first version
+        // handled by deleting the file eagerly — worse, because a save that
+        // panics then leaves no record that a stop was ever asked for.
+        let asked_to_stop = stop_requested(cfg);
+
+        let last = epoch + 1 == cfg.epochs || asked_to_stop;
         // STOP REQUESTED? Checked at the epoch boundary, where a checkpoint can
         // be written, so stopping costs at most one epoch rather than
         // everything since the last save.

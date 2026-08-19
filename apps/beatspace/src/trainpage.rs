@@ -261,7 +261,14 @@ the generator is no longer learning\n");
             None => s.push_str("  trend:   too few points to say\n"),
         }
         if let Some(r) = self.rate() {
-            s.push_str(&format!("  rate:    {r:.2} epochs/sec\n"));
+            // Both, and the ETA. A summary pasted into a message is read by
+            // someone deciding whether to wait, and "0.01 epochs/sec" does not
+            // answer that while "22 days" does.
+            s.push_str(&format!("  rate:    {:.2} epochs/min ({:.0} s/epoch)\n",
+                                r * 60.0, 1.0 / r));
+        }
+        if let Some(e) = self.eta_secs() {
+            s.push_str(&format!("  eta:     {}\n", human_secs(e).replace(" left", "")));
         }
         s
     }

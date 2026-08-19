@@ -876,12 +876,13 @@ impl App {
             }
             match self.train.rate() {
                 Some(r) if r > 0.0 => {
-                    g(ui, "epochs/s", format!("{r:.2}"));
-                    // Seconds per epoch too: below 1/s the rate reads as 0.03
-                    // and tells nobody anything, while "34 s/epoch" is legible.
-                    g(ui, "s/epoch", format!("{:.1}", 1.0 / r));
+                    // PER MINUTE, not per second. At 97 s/epoch the per-second
+                    // figure is 0.01 — a number that rounds to nothing and
+                    // conveys nothing. 0.6/min is a rate a person can hold.
+                    g(ui, "epochs/min", format!("{:.2}", r * 60.0));
+                    g(ui, "s/epoch", format!("{:.0}", 1.0 / r));
                 }
-                _ => { g(ui, "epochs/s", "—".into()); }
+                _ => { g(ui, "epochs/min", "—".into()); }
             }
             match self.train.eta_secs() {
                 Some(e) => {
