@@ -18600,7 +18600,26 @@ impl Gpu {
         assert_eq!(cache.filled, row0, "cache holds {} rows but the window starts at {row0}", cache.filled);
         assert!(row0 + n <= cache.cap, "window [{row0},{}) exceeds cache capacity {}", row0 + n, cache.cap);
         assert_eq!(tokens.len(), row0 + n, "tokens must cover the whole prefix plus the window");
-        self.begin_frame();
+        // A BATCH FRAME, not an interactive one.
+        //
+        // This is a denoise step: no compositor is waiting on it, and the Frame
+        // struct's own comment names exactly this case — "a framed step with no
+        // compositor to starve (denoise step, oracle stats). Pass-count flushing
+        // inside one is pure submit tax". The exemption was written for this
+        // path and this path did not take it.
+        //
+        // What it costs today: a 28-layer forward flushes every FLUSH_EVERY
+        // passes (32 by default) purely so a display that is not there can land
+        // a flip between chunks. A profile from a real diffusion run shows 94%
+        // of submits attributed to pass boundaries, at ~35 submits per forward
+        // and 92% of wall time in sync — so the submits are what the sync is
+        // waiting on.
+        //
+        // This does NOT touch the dispatch-per-pass ratio, which is the thing
+        // LOGSCOPE_PASS_FUSE tried to change and corrupted output doing. Passes
+        // are unchanged; only how many of them share a submit changes, and the
+        // retain cap and end_frame still bound it.
+        self.begin_batch_frame();
         let mut xh = Vec::with_capacity(n * m.d);
         for &id in &tokens[row0..row0 + n] {
             let st = id as usize * m.d;
