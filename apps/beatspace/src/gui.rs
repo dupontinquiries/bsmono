@@ -723,7 +723,13 @@ impl App {
 
         ui.separator();
         ui.label(egui::RichText::new(self.train.status_line()).small());
-        if self.train.stalled() {
+        if self.train.no_information() {
+            // Said before the "flat" line and in a colour, because at these
+            // values flat means dead and the two readings prescribe opposite
+            // actions — wait, or stop.
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 60),
+                "DEAD — d_loss at 2ln2, g_loss at ln2: the discriminator emits one logit for real and fake. No gradient means anything from here.");
+        } else if self.train.stalled() {
             // Said, not acted on: a plateau is sometimes convergence and
             // sometimes a dead run, and the operator knows which.
             ui.label(egui::RichText::new("loss is flat — plateau or converged").small());

@@ -173,6 +173,65 @@ impl TrainPage {
         Some((older - newer) / older.abs())
     }
 
+    /// `ln 2`, the BCE of a coin flip.
+    ///
+    /// A discriminator that outputs the same logit for real and fake scores
+    /// exactly this on each half, so `d_loss` lands at `2 ln 2` and `g_loss` at
+    /// `ln 2`. Those two numbers together are not a coincidence and not a
+    /// plateau — they are the arithmetic signature of a model that has stopped
+    /// distinguishing anything.
+    pub const LN2: f32 = std::f32::consts::LN_2;
+
+    /// Is the run sitting at the no-information equilibrium?
+    ///
+    /// THE FAILURE THAT LOOKS LIKE SUCCESS. A flat curve reads as convergence,
+    /// and at these values it is the opposite: the discriminator emits a
+    /// constant, so neither model receives a gradient that says anything, and
+    /// the remaining epochs cannot change that. A 20,000-epoch run reporting
+    /// "526h left" from here is 526 hours of nothing.
+    ///
+    /// Distinct from the d_loss -> 0 case already warned about, which is the
+    /// discriminator winning outright. This is the discriminator learning
+    /// NOTHING, and it needs saying separately because the remedy differs: a
+    /// won discriminator wants a weaker D or a stronger G, a collapsed one
+    /// wants to know why its activations died.
+    pub fn no_information(&self) -> bool {
+        let Some(p) = self.latest() else { return false };
+        // KEYED ON d_loss ALONE, and the reason is arithmetic.
+        //
+        // For a discriminator emitting logit z on both halves,
+        // d_loss = softplus(-z) + softplus(z), whose MINIMUM over z is 2ln2 at
+        // z = 0. So 2ln2 is a floor for an uninformative D, and any real
+        // separation pushes d_loss well below it — a working discriminator
+        // scores under 1.0.
+        //
+        // My first version also demanded g_loss within 5% of ln2 and missed the
+        // real run: g was 0.7985, which is 15% high. That is not noise. It
+        // inverts to a logit of -0.20 on fakes, so D was separating by two
+        // tenths of a logit — nothing, but not nothing enough to sit exactly at
+        // ln2. Requiring both to be pinned tested for a textbook point the
+        // failure does not have to land on.
+        //
+        // The observed d_loss of 1.3763 is itself slightly BELOW 2ln2, which is
+        // impossible for a constant logit and is the same sliver of signal seen
+        // from the other side. So the band is two-sided and generous: anything
+        // from 95% of 2ln2 upward is a discriminator that has stopped working.
+        p.d_loss > 2.0 * Self::LN2 * 0.95
+    }
+
+    /// The largest single-epoch fall in the tracked loss, and where.
+    ///
+    /// A cliff is not a plateau arriving. A curve that climbs for 250 epochs
+    /// and then drops vertically has had something break — saturated weights,
+    /// a dead activation, an optimiser step that overshot — and the flat part
+    /// afterwards is the wreckage, not the result.
+    pub fn worst_cliff(&self) -> Option<(u64, f32)> {
+        self.curve.windows(2)
+            .map(|w| (w[1].epoch, w[0].tracked() - w[1].tracked()))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .filter(|&(_, drop)| drop > 0.0)
+    }
+
     /// Has the loss stopped moving?
     ///
     /// Reported, never acted on: a plateau is sometimes convergence and
@@ -250,6 +309,14 @@ the generator is no longer learning\n");
             s.push_str(&format!("  started: g {:.5} at epoch {}\n", first.g_loss, first.epoch));
         }
         match self.trend(40) {
+            // The equilibrium check comes FIRST. "Flat" is true at the dead
+            // point too, and reporting it as a plateau is how a run keeps
+            // burning days.
+            Some(t) if t.abs() < 0.001 && self.no_information() => s.push_str(
+                "  trend:   DEAD — d_loss is at 2ln2 and g_loss at ln2, which is what a \
+discriminator scores when it emits the same logit for real and fake. It is not separating \
+anything, so neither model has a gradient that means anything and the remaining epochs \
+cannot change that. Stop the run.\n"),
             Some(t) if t.abs() < 0.001 => s.push_str(
                 "  trend:   flat over the last 40 points — plateau or converged\n"),
             Some(t) if t > 0.0 => s.push_str(&format!(
@@ -268,7 +335,24 @@ the generator is no longer learning\n");
                                 r * 60.0, 1.0 / r));
         }
         if let Some(e) = self.eta_secs() {
-            s.push_str(&format!("  eta:     {}\n", human_secs(e).replace(" left", "")));
+            // The ETA is suppressed at the dead point rather than printed.
+            // "526h left" beside "the run is dead" invites waiting, and the
+            // number is arithmetically correct and practically a lie.
+            if self.no_information() {
+                s.push_str("  eta:     (not shown — the run is at the no-information \
+equilibrium; time remaining is not the useful number)\n");
+            } else {
+                s.push_str(&format!("  eta:     {}\n", human_secs(e).replace(" left", "")));
+            }
+        }
+        if let Some((at, drop)) = self.worst_cliff() {
+            // Reported whenever it is large, dead or not: a cliff is where to
+            // look, and the epoch number is what makes the log searchable.
+            if drop > 1.0 {
+                s.push_str(&format!(
+                    "  cliff:   g_loss fell {drop:.2} in one epoch, at epoch {at} — a vertical \
+drop is something breaking, not converging\n"));
+            }
         }
         s
     }
@@ -373,6 +457,63 @@ mod tests {
         // to zero is the failure, so summarising over it would report a
         // collapsed run as excellent.
         assert_eq!(p.tracked(), p.g_loss);
+    }
+
+    #[test]
+    fn the_real_dead_run_is_recognised() {
+        // The numbers from a real 269-epoch run, verbatim. It reported
+        // "flat over the last 40 points — plateau or converged" and
+        // "526h 01m left", which together say "wait". The correct reading is
+        // "stop": d_loss 1.3763 is 2ln2 and g_loss 0.7985 is ln2, the exact
+        // scores a discriminator gets when it emits the same logit for real
+        // and fake.
+        let mut p = TrainPage::default();
+        p.start(20000, 16, "Cpu", "/music");
+        for i in 0..60u64 {
+            p.curve.push(Point { epoch: 210 + i, d_loss: 1.3763, g_loss: 0.7985,
+                                 at_secs: (210 + i) as f64 * 96.0 });
+        }
+        assert!(p.no_information(), "the dead equilibrium was not recognised");
+        assert!(p.stalled(), "and it is also flat, which is the misleading half");
+        let s = p.summary();
+        assert!(s.contains("DEAD"), "{s}");
+        assert!(!s.contains("plateau or converged"), "still reported as converged:\n{s}");
+        // And the ETA is withheld rather than printed beside it.
+        assert!(s.contains("not shown"), "the ETA still invites waiting:\n{s}");
+    }
+
+    #[test]
+    fn a_healthy_flat_run_is_still_called_a_plateau() {
+        // The check must not swallow every flat curve. A converged run at
+        // values that are NOT the equilibrium keeps the old reading, and its
+        // ETA is still worth having.
+        let mut p = TrainPage::default();
+        p.start(1000, 16, "Cpu", "/m");
+        for i in 0..60u64 {
+            p.curve.push(Point { epoch: i, d_loss: 0.45, g_loss: 2.1, at_secs: i as f64 });
+        }
+        assert!(!p.no_information());
+        let s = p.summary();
+        assert!(s.contains("plateau or converged"), "{s}");
+        assert!(!s.contains("DEAD"));
+    }
+
+    #[test]
+    fn the_cliff_is_found_and_dated() {
+        // The curve climbed to 8.0 over 250 epochs and fell vertically to 0.8.
+        // A drop like that is something breaking; the epoch number is what
+        // makes the log searchable.
+        let mut p = TrainPage::default();
+        p.start(1000, 16, "Cpu", "/m");
+        for i in 0..250u64 {
+            p.curve.push(Point { epoch: i, d_loss: 1.0,
+                                 g_loss: 0.7 + i as f32 * 0.029, at_secs: i as f64 });
+        }
+        p.curve.push(Point { epoch: 250, d_loss: 1.3763, g_loss: 0.7985, at_secs: 250.0 });
+        let (at, drop) = p.worst_cliff().expect("a 7-unit fall is a cliff");
+        assert_eq!(at, 250);
+        assert!(drop > 6.0, "drop {drop}");
+        assert!(p.summary().contains("cliff:"), "{}", p.summary());
     }
 
     #[test]
