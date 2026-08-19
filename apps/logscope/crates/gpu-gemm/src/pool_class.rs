@@ -368,3 +368,40 @@ mod reuse_order_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pending_drain_tests {
+    /// Every path that submits a frame must drain its queued dispatches first.
+    ///
+    /// A source check, because the failure has no runtime signature to assert
+    /// against: a dropped dispatch does not crash or error, it produces a layer
+    /// computed with some of its work missing. The reported symptom was exactly
+    /// that — "broke AR decode 6/6 and changes generated tokens on 3 of 6
+    /// diffusion configurations" — fluent, different output and nothing to
+    /// catch.
+    ///
+    /// `begin_frame` was the path that did not drain. Four others did.
+    #[test]
+    fn every_frame_submit_drains_pending_first() {
+        let src = include_str!("lib.rs");
+        // Each site that takes the frame, with the window in which a drain must
+        // appear before the encoder is handed to submit.
+        let takes: Vec<usize> = src.match_indices("fr.take()")
+            .chain(src.match_indices("self.frame.lock().unwrap().take()"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(takes.len() >= 5, "found {} take-sites; the audit is stale", takes.len());
+
+        for i in takes {
+            let window = &src[i..(i + 700).min(src.len())];
+            // A site that never reaches a submit is not a submit path.
+            let Some(sub) = window.find("self.submit(") else { continue };
+            let before = &window[..sub];
+            assert!(before.contains("drain_pending"),
+                    "a frame is submitted without draining its queued dispatches — \
+with LOGSCOPE_PASS_FUSE on, those dispatches are silently dropped and the model \
+computes a layer with part of its work missing:\n{}",
+                    &window[..before.len().min(240)]);
+        }
+    }
+}

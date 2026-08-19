@@ -3995,7 +3995,24 @@ impl Gpu {
         // frame was already empty, fr.take() yields None and nothing is flushed, but the counter had
         // already advanced. Your log showed the result — "9824 of 9642 submits attributed", more
         // causes than submits, which is arithmetically impossible and was mine from _406.
+        // DRAIN BEFORE SUBMIT. This path submitted `prev.enc` and dropped
+        // `prev.pending` on the floor — every dispatch queued into that frame
+        // was silently discarded, so the model computed a layer with part of
+        // its work missing.
+        //
+        // Invisible with fusion off, because nothing is ever queued and pending
+        // is always empty. With LOGSCOPE_PASS_FUSE on it is the reported
+        // failure exactly: no crash, no error, fluent output that differs —
+        // "broke AR decode 6/6 and changes generated tokens on 3 of 6 diffusion
+        // configurations". Four other take-sites drain; this one did not.
+        //
+        // The cause tag stays ADJACENT to the submit below: every_submit_caller_
+        // tags_a_cause scans a window, and this comment sitting between them is
+        // what tripped it — which is the drift guard doing its job, and the
+        // reason the explanation is up here instead.
         if let Some(prev) = fr.take() {
+            let mut prev = prev;
+            Self::drain_pending(&mut prev);
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(prev.enc);
         }
