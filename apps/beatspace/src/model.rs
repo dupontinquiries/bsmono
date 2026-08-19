@@ -603,3 +603,65 @@ pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &D
     let m = candle_core::safetensors::load(path, dev)?;
     d.load_state(&m)
 }
+
+// ── why training is slow on this hardware ───────────────────────────────────
+//
+// An educated diagnosis, from reading candle 0.11's CPU backend rather than
+// from profiling — the phase timing added alongside this will confirm or refute
+// it, and the numbers below are the prediction it should be judged against.
+//
+// THE DEVICE LINE IS CORRECT AND THE LOW CPU IS THE SYMPTOM. "device: Cpu" is
+// accurate; candle has no Vulkan backend and Asahi has no CUDA or Metal. But a
+// busy CPU-bound trainer should peg every core, and it does not — which means
+// the work is running on ONE core most of the time.
+//
+// WHERE. candle's two convolutions are implemented completely differently:
+//
+//   * conv2d  -> src/cpu_backend/conv2d.rs, an im2col + gemm lowering, tiled,
+//     `(0..p.b_size).into_par_iter()` — parallel over BATCH, and gemm itself
+//     takes Parallelism::Rayon(num_threads). This one uses the machine.
+//
+//   * conv_transpose2d -> src/cpu_backend/mod.rs:1243, a six-deep naive loop
+//     (b x i_h x i_w x c_in x k_h x k_w) whose only parallelism is
+//     `(0..p.c_out).into_par_iter()` — parallel over OUTPUT CHANNELS.
+//
+// The generator is four ConvTranspose2d plus a final one, and the final one
+// outputs ONE channel:
+//
+//   256 -> 128 -> 64 -> 32 -> 1
+//
+// So `par_iter` over c_out = 1 is a single thread, and it is the layer with the
+// LARGEST output tensor in the network — (B, 1, n_mels, time_frames), 16 x 128
+// x 256. Its inner work is b x i_h x i_w x c_in x k_h x k_w = 16 x 64 x 128 x
+// 32 x 4 x 4, which is ~67 million multiply-accumulates on one core, per step,
+// twice (forward, and again inside the backward). On a 24-core M2 Ultra that
+// reads as almost no CPU activity while being the bottleneck.
+//
+// The backward pass compounds it: the gradient of a transposed convolution
+// w.r.t. its input is a forward convolution — which is the fast path — but the
+// gradient w.r.t. the WEIGHTS goes back through the same naive kernel.
+//
+// WHAT WOULD FIX IT, in increasing order of work:
+//
+//   1. A wider final layer. If the last deconv produced, say, 16 channels and a
+//      1x1 conv2d reduced them to 1, the deconv parallelises 16 ways and the
+//      reduction runs on the gemm path. This CHANGES THE MODEL — more
+//      parameters, and a checkpoint from before it will not load — so it is a
+//      decision about the architecture rather than an optimisation, and it is
+//      not being made here.
+//
+//   2. Express the deconv as zero-insert upsample + conv2d. Mathematically the
+//      same operation, and it routes onto the im2col+gemm path that
+//      parallelises over batch. The insert wastes memory bandwidth on the
+//      zeros, so it is not obviously a win at every shape — but at c_out=1 it
+//      trades a 1-thread kernel for a 16-thread one, which is not close.
+//
+//   3. The wgpu path in wgpu_train.rs, which is why it exists. Its GEMM is
+//      verified on this hardware, and the whole point of lowering every
+//      convolution — forward and transposed — to one matmul is that there is no
+//      naive kernel left to fall onto.
+//
+// NOT the explanation, checked and ruled out: candle's thread count comes from
+// rayon's, which defaults to every core, so nothing is capping it; and matmul
+// does take Parallelism::Rayon. The fc layer and the discriminator (whose convs
+// are all conv2d) are on the fast paths already.
