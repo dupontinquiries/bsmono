@@ -269,3 +269,102 @@ mod tests {
         assert_eq!(s[1], s[2], "k and v match");
     }
 }
+
+#[cfg(test)]
+mod reuse_order_tests {
+    use std::collections::VecDeque;
+
+    /// The pool's ordering discipline, in isolation.
+    ///
+    /// The engine's own profile line names this: "the OUTPUT buffer moved — the
+    /// pool hands back a different slab for the same dispatch, so the fix is
+    /// pool reuse per call site". Reuse per call site was already there
+    /// (`#[track_caller]` keys the free list); what was not is the ORDER within
+    /// a site, and that is what decides whether a given dispatch sees a stable
+    /// buffer and therefore a bind-group cache hit.
+    ///
+    /// Modelled with integers rather than wgpu buffers so the property is
+    /// testable without a GPU — the question is purely about the container.
+    fn round(free: &mut VecDeque<u32>, next_id: &mut u32, n: usize, lifo: bool,
+             drop_reverse: bool) -> Vec<u32> {
+        let mut taken = Vec::new();
+        for _ in 0..n {
+            let b = if lifo { free.pop_back() } else { free.pop_front() };
+            taken.push(b.unwrap_or_else(|| { *next_id += 1; *next_id }));
+        }
+        let mut order = taken.clone();
+        if drop_reverse { order.reverse(); }
+        for b in order { free.push_back(b); }
+        taken
+    }
+
+    /// Deterministic handout: always the lowest id, whatever order they were
+    /// freed in.
+    fn round_sorted(free: &mut Vec<u32>, next_id: &mut u32, n: usize,
+                    drop_reverse: bool) -> Vec<u32> {
+        let mut taken = Vec::new();
+        for _ in 0..n {
+            let b = if free.is_empty() { *next_id += 1; *next_id } else { free.remove(0) };
+            taken.push(b);
+        }
+        let mut order = taken.clone();
+        if drop_reverse { order.reverse(); }
+        for b in order { free.push(b); free.sort_unstable(); }
+        taken
+    }
+
+    #[test]
+    fn neither_a_stack_nor_a_queue_is_stable_for_both_drop_orders() {
+        // The finding that killed my first fix. A queue is stable when frees
+        // arrive in allocation order (a chain, `x = f(x)`, allocates the new
+        // tensor before dropping the old) and rotates when they arrive
+        // backwards (a nest, where Rust drops in reverse declaration order). A
+        // stack is exactly the other way round.
+        //
+        // Both shapes exist in this engine, so picking a discipline trades one
+        // set of dispatches for another. Pinned as a test because the LIFO
+        // change LOOKED right and this is why it was not kept.
+        let (mut f1, mut i1) = (VecDeque::new(), 0u32);
+        let stack_chain_a = round(&mut f1, &mut i1, 3, true, false);
+        let stack_chain_b = round(&mut f1, &mut i1, 3, true, false);
+        assert_ne!(stack_chain_a, stack_chain_b, "a stack was stable on a chain");
+
+        let (mut f2, mut i2) = (VecDeque::new(), 0u32);
+        let queue_nest_a = round(&mut f2, &mut i2, 3, false, true);
+        let queue_nest_b = round(&mut f2, &mut i2, 3, false, true);
+        assert_ne!(queue_nest_a, queue_nest_b, "a queue was stable on a nest");
+    }
+
+    #[test]
+    fn a_sorted_free_list_is_stable_for_both() {
+        // The actual fix: hand out by a STABLE KEY rather than by arrival
+        // order. Each buffer carries a monotonic id and the lowest goes first,
+        // so a site sees the same buffer in the same position every round no
+        // matter which order the previous round's buffers were dropped in.
+        //
+        // The list is capped at 16 per (size, site), so keeping it sorted is a
+        // handful of comparisons against a dispatch that touches megabytes.
+        for drop_reverse in [true, false] {
+            let (mut free, mut id) = (Vec::new(), 0u32);
+            let a = round_sorted(&mut free, &mut id, 3, drop_reverse);
+            let b = round_sorted(&mut free, &mut id, 3, drop_reverse);
+            let c = round_sorted(&mut free, &mut id, 3, drop_reverse);
+            assert_eq!(a, b, "sorted handout rotated (drop_reverse={drop_reverse})");
+            assert_eq!(b, c);
+        }
+    }
+
+    #[test]
+    fn both_disciplines_are_stable_for_a_single_live_buffer() {
+        // The common shape — one live buffer per site — is stable under any
+        // discipline. Worth pinning: it bounds how much the change can
+        // possibly matter, and says the sorted handout cannot make the
+        // majority case worse.
+        for lifo in [true, false] {
+            let (mut free, mut id) = (VecDeque::new(), 0u32);
+            let a = round(&mut free, &mut id, 1, lifo, true);
+            let b = round(&mut free, &mut id, 1, lifo, true);
+            assert_eq!(a, b, "single-buffer site moved under lifo={lifo}");
+        }
+    }
+}

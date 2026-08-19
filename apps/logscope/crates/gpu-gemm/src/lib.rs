@@ -753,6 +753,8 @@ pub fn dims_retain_polls() -> u64 { DIMS_RETAIN_POLLS.load(std::sync::atomic::Or
 pub fn dims_cache_misses() -> u64 { DIMS_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
 /// Buffer-pool accounting: a MISS is a real `create_buffer` (allocation churn — the other half of
 /// "upload locking"); a HIT recycles a same-size buffer freed by a dropped Tensor. Hardware-independent.
+/// Buffer identities, handed out once at creation and never reused.
+pub static POOL_BID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn pool_hits() -> u64 { POOL_HITS.load(std::sync::atomic::Ordering::Relaxed) }
@@ -1877,7 +1879,7 @@ line: {head:?}. Compiler: {e}");
             *g = Some(self.alloc_words(need.max(1)));
         }
         let t = g.as_ref().unwrap();
-        Tensor { buf: t.buf.clone(), rows: 1, cols: t.cols, pool: None, site: (0, 0), view: None }
+        Tensor { buf: t.buf.clone(), rows: 1, cols: t.cols, pool: None, site: (0, 0), view: None, bid: 0 }
     }
 
     /// Record a Q4_K conversion to run later. Returns immediately with the (as yet unwritten) output
@@ -1949,7 +1951,7 @@ line: {head:?}. Compiler: {e}");
                             (p.qw_base_words + b0 * 32) as u32,
                             gx];
                 // the bind group holds the source buffer alive past this scope, so no manual keep-list
-                let out_t = Tensor { buf: p.out.clone(), rows: 1, cols: 1, pool: None, site: (0, 0), view: None };
+                let out_t = Tensor { buf: p.out.clone(), rows: 1, cols: 1, pool: None, site: (0, 0), view: None, bid: 0 };
                 self.dispatch(Q4K_TO_Q4, &[&src], &out_t, bytemuck::cast_slice(&dims), (gx, gy, 1));
                 b0 += cnt;
                 since_submit += 1;
@@ -2106,9 +2108,9 @@ line: {head:?}. Compiler: {e}");
         let dims = [nblk as u32, qs_off_words as u32, 0u32, gx]; // qw_base = 0
         self.dispatch(Q4K_TO_Q4, &[&src], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None, site: (0, 0),
-                          view: Some((0, (qw_words * 4) as u64)) };
+                          view: Some((0, (qw_words * 4) as u64)), bid: 0 };
         let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None, site: (0, 0),
-                          view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)) };
+                          view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)), bid: 0 };
         Q4Weight { qw, qs, n, k }
     }
 
@@ -2413,7 +2415,10 @@ waiting longer will not help because the work is gone");
 /// A queue hands them back in allocation order, so the same call site sees the same buffer token
 /// after token and the key repeats. Correctness is untouched — the frame-boundary rule that makes
 /// recycling safe at all is about WHEN a buffer returns to the pool, not which end it comes off.
-struct BufferPool { free: Mutex<HashMap<(u64, usize, u32), std::collections::VecDeque<wgpu::Buffer>>>,
+struct BufferPool {
+    /// Free buffers per (size, alloc site), each tagged with its monotonic id
+    /// so handout order is stable regardless of drop order — see `Gpu::alloc`.
+    free: Mutex<HashMap<(u64, usize, u32), std::collections::VecDeque<(u64, wgpu::Buffer)>>>,
     /// Returns DEFERRED while a frame is open. Intra-frame recycling is only safe under strict
     /// encoding order, and a mid-frame download breaks it: the download submits EVERYTHING encoded
     /// so far — including later work that already overwrote a recycled buffer being read. That one
@@ -2422,7 +2427,7 @@ struct BufferPool { free: Mutex<HashMap<(u64, usize, u32), std::collections::Vec
     /// size-keyed pool; the exactly-uniform canvas was a zeroed recycled buffer read as hidden
     /// state). Drops during an open frame land here; `Gpu::submit` flushes them into `free` after
     /// queue.submit, when encoding order can no longer be violated retroactively.
-    deferred: Mutex<Vec<((u64, usize, u32), wgpu::Buffer)>>,
+    deferred: Mutex<Vec<((u64, usize, u32), u64, wgpu::Buffer)>>,
     frames_open: std::sync::atomic::AtomicUsize }
 
 /// Slab bump-allocator for resident weights (opt-in: LOGSCOPE_ARENA). Packs many weight tensors into a
@@ -2489,7 +2494,10 @@ pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize, pool: O
     /// site's queue, so a call site gets the same buffer every token even when another site
     /// allocates the same size in between — which the FIFO change alone could not guarantee,
     /// because a size-keyed pool lets two sites trade places whenever their order interleaves.
-    site: (usize, u32) }
+    site: (usize, u32),
+    /// Monotonic identity, so the pool can hand buffers back in a stable order
+    /// rather than in the order they happened to be dropped. See `alloc`.
+    bid: u64 }
 impl Drop for Tensor {
     fn drop(&mut self) {
         if let Some(pool) = &self.pool {
@@ -2500,13 +2508,13 @@ impl Drop for Tensor {
                 if !defer_off && pool.frames_open.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                     // A frame is open: encoded-but-unsubmitted work may still reference this buffer,
                     // and a mid-frame download would submit any later overwrite of its recycled self.
-                    pool.deferred.lock().unwrap().push(((size, self.site.0, self.site.1), self.buf.clone()));
+                    pool.deferred.lock().unwrap().push(((size, self.site.0, self.site.1), self.bid, self.buf.clone()));
                 } else {
                     let mut free = pool.free.lock().unwrap();
                     let v = free.entry((size, self.site.0, self.site.1)).or_default();
                     // Cap per (size, site): the total is bounded by the number of alloc sites,
                     // which is a property of the code rather than of the workload.
-                    if v.len() < 16 { v.push_back(self.buf.clone()); }
+                    if v.len() < 16 { v.push_back((self.bid, self.buf.clone())); }
                 }
             }
         }
@@ -2690,7 +2698,7 @@ pub struct MoeStream {
 fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
     fn tview(t: &Tensor, byte_off: u64, byte_len: u64, rows: usize, cols: usize) -> Tensor {
         let base = t.view.map(|(o, _)| o).unwrap_or(0);
-        Tensor { buf: t.buf.clone(), rows, cols, pool: None, site: (0, 0), view: Some((base + byte_off, byte_len)) }
+        Tensor { buf: t.buf.clone(), rows, cols, pool: None, site: (0, 0), view: Some((base + byte_off, byte_len)), bid: 0 }
     }
     match &l.kind {
         // Not sliceable yet: IQ1_S packs 256 weights into 50 bytes, so a row slice lands on a
@@ -3116,7 +3124,7 @@ impl StreamSlots {
     /// The whole slot as a word-addressed Tensor, for a kernel that writes packed data into it.
     pub fn tensor_full(&self, idx: usize) -> Tensor {
         let buf = self.slots[idx.min(self.slots.len().saturating_sub(1))].clone();
-        Tensor { buf, rows: 1, cols: (self.slot_bytes / 4) as usize, pool: None, site: (0, 0), view: None }
+        Tensor { buf, rows: 1, cols: (self.slot_bytes / 4) as usize, pool: None, site: (0, 0), view: None, bid: 0 }
     }
 
     /// The raw slot buffer handle (cloned; wgpu buffers are Arc-backed) for binding as a weight.
@@ -3126,7 +3134,7 @@ impl StreamSlots {
     /// `cols` describe the expert weight matrix living in the slot.
     pub fn tensor(&self, idx: usize, rows: usize, cols: usize) -> Option<Tensor> {
         let buf = self.slots.get(idx)?.clone();
-        Some(Tensor { buf, rows, cols, pool: None, site: (0, 0), view: None })
+        Some(Tensor { buf, rows, cols, pool: None, site: (0, 0), view: None, bid: 0 })
     }
 
     /// Read `len` bytes back from slot `idx` — for verification/tests (fills must land intact).
@@ -3264,7 +3272,7 @@ impl Lin {
 impl Gpu {
     pub fn upload(&self, data: &[f32], rows: usize, cols: usize) -> Tensor {
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        Tensor { buf: self.upload_bytes(bytes, "tensor"), rows, cols, pool: None, site: (0, 0), view: None }
+        Tensor { buf: self.upload_bytes(bytes, "tensor"), rows, cols, pool: None, site: (0, 0), view: None, bid: 0 }
     }
 
     /// EXPERT-STREAM PROBE (the M2 go/no-go), corrected. The first cut asked "does the copy overlap
@@ -3389,25 +3397,57 @@ impl Gpu {
         let loc = std::panic::Location::caller();
         let site = (loc.file().as_ptr() as usize, loc.line());
         // Recycle a same-size buffer freed by a dropped Tensor, else allocate. Kills per-op alloc churn.
-        let recycled = if size > 0 { self.pool.free.lock().unwrap().get_mut(&(size, site.0, site.1)).and_then(|v| v.pop_front()) } else { None };
+        // HANDED OUT BY A STABLE KEY, not by arrival order.
+        //
+        // The profile's own line: "the OUTPUT buffer moved — the pool hands
+        // back a different slab for the same dispatch, so the fix is pool reuse
+        // per call site". Per-site keying was already here (`#[track_caller]`);
+        // the ORDER within a site was not, and that is what decides whether a
+        // dispatch sees a stable buffer and so a bind-group cache hit.
+        //
+        // It was a queue, and I first changed it to a stack. A test killed
+        // that: neither is stable for both shapes in this engine.
+        //
+        //   * A CHAIN (`x = f(x)`) allocates before dropping, so frees arrive
+        //     in allocation order — a queue is stable, a stack rotates.
+        //   * A NEST drops in reverse declaration order, Rust's rule — a stack
+        //     is stable, a queue rotates.
+        //
+        // So the discipline cannot fix it; the ORDERING KEY has to stop being
+        // arrival time. Each buffer carries a monotonic id and the lowest goes
+        // out first, which is stable under either drop order. The list is
+        // capped at 16 per (size, site), so keeping it ordered is a few
+        // comparisons against a dispatch that moves megabytes.
+        let recycled = if size > 0 {
+            self.pool.free.lock().unwrap()
+                .get_mut(&(size, site.0, site.1))
+                .and_then(|v| {
+                    // Lowest id first. min_by_key over <=16 entries beats
+                    // keeping the deque sorted on every push, because pushes
+                    // outnumber pops whenever a buffer outlives its round.
+                    let i = (0..v.len()).min_by_key(|&i| v[i].0)?;
+                    v.remove(i)
+                })
+        } else { None };
         // POISON VERIFIER (LOGSCOPE_POOL_POISON=1): NaN-fill every recycled buffer at handout so a
         // stale read screams at its source instead of surfacing as clean zeros three layers later.
         if let Some(b) = &recycled {
             static POISON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *POISON.get_or_init(|| std::env::var("LOGSCOPE_POOL_POISON").as_deref() == Ok("1")) {
                 let nan = vec![0x7fu8, 0xc0, 0x00, 0x00].repeat(size as usize / 4).iter().rev().cloned().collect::<Vec<u8>>();
-                self.queue.write_buffer(b, 0, &nan);
+                self.queue.write_buffer(&b.1, 0, &nan);
             }
         }
-        let buf = match recycled {
-            Some(b) => { POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); b }
+        let (buf, bid) = match recycled {
+            Some((id, b)) => { POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); (b, id) }
             None => {
                 POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tensor"), size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+                (self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tensor"), size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+                 POOL_BID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             }
         };
-        Tensor { buf, rows, cols, pool: Some(self.pool.clone()), view: None, site }
+        Tensor { buf, rows, cols, pool: Some(self.pool.clone()), view: None, site, bid }
     }
     /// `#[track_caller]` so the diagnostic attributes each readback to the code that ASKED for it.
     /// Without it the tally names this line 53 times and answers nothing.
@@ -3891,9 +3931,9 @@ impl Gpu {
             let mut d = self.pool.deferred.lock().unwrap();
             if !d.is_empty() {
                 let mut free = self.pool.free.lock().unwrap();
-                for (size, buf) in d.drain(..) {
+                for (size, bid, buf) in d.drain(..) {
                     let v = free.entry(size).or_default();
-                    if v.len() < 64 { v.push_back(buf); }
+                    if v.len() < 64 { v.push_back((bid, buf)); }
                 }
             }
         }
@@ -4286,7 +4326,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
 
     pub fn upload_u32(&self, data: &[u32]) -> Tensor {
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        Tensor { buf: self.upload_bytes(bytes, "qw"), rows: 1, cols: data.len(), pool: None, site: (0, 0), view: None }
+        Tensor { buf: self.upload_bytes(bytes, "qw"), rows: 1, cols: data.len(), pool: None, site: (0, 0), view: None, bid: 0 }
     }
     /// Resident-weight uploads: when an arena is active (LOGSCOPE_ARENA, set up by the loader) the bytes
     /// are packed into a shared slab and returned as an offset view; otherwise a dedicated buffer (the
@@ -4445,7 +4485,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                     label: Some("arena-slab-oom"), size: 4,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false });
-                return Tensor { buf: dummy, rows, cols, pool: None, site: (0, 0), view: None };
+                return Tensor { buf: dummy, rows, cols, pool: None, site: (0, 0), view: None, bid: 0 };
             }
             // Unmap the FILLED predecessor before admitting a new slab. The post-mortem that
             // motivated this measured the ceiling as CONCURRENTLY MAPPED bytes — "4.0 GiB of
@@ -4504,13 +4544,13 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                     label: Some("arena-slab-oom"), size: 4,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false });
-                return Tensor { buf: dummy, rows, cols, pool: None, site: (0, 0), view: None };
+                return Tensor { buf: dummy, rows, cols, pool: None, site: (0, 0), view: None, bid: 0 };
             }
         } else {
             self.write_chunked(&slab, off, bytes);   // arena slabs are up to 2 GiB
         }
         a.used = off + len;
-        Tensor { buf: slab, rows, cols, pool: None, site: (0, 0), view: Some((off, len)) }
+        Tensor { buf: slab, rows, cols, pool: None, site: (0, 0), view: Some((off, len)), bid: 0 }
     }
     /// Quantize a row-major [n,k] f32 weight into a resident int8 `QWeight`
     /// (symmetric per-32-block scales). `k` must be a multiple of 32.
@@ -5394,7 +5434,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                     self.write_chunked(&stage.buf, o2 as u64, dw);
                     let view = |off: usize, len: usize| Tensor {
                         buf: stage.buf.clone(), rows: 1, cols: len / 4, pool: None, site: (0, 0),
-                        view: Some((off as u64, al(len) as u64)) };
+                        view: Some((off as u64, al(len) as u64)), bid: 0 };
                     self.q4k_convert_from(&view(o0, g.len()), &gu_buf, ff, d, 0, gu_qs_off / 4);
                     self.q4k_convert_from(&view(o1, u.len()), &gu_buf, ff, d, half_qw_words, gu_qs_off / 4 + half_qs_vals);
                     self.q4k_convert_from(&view(o2, dw.len()), &dn_buf, d, ff, 0, dn_qs_off / 4);
@@ -5554,8 +5594,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let kb = k / 32;
         let qw_len = (n * k / 8 * 4) as u64;
         let qs_len = (n * kb * 4) as u64;
-        let qwt = Tensor { buf: qw.clone(), rows: n, cols: k, pool: None, site: (0, 0), view: Some((0, qw_len)) };
-        let qst = Tensor { buf: qs.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((0, qs_len)) };
+        let qwt = Tensor { buf: qw.clone(), rows: n, cols: k, pool: None, site: (0, 0), view: Some((0, qw_len)), bid: 0 };
+        let qst = Tensor { buf: qs.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((0, qs_len)), bid: 0 };
         Lin::q4(Q4Weight { qw: qwt, qs: qst, n, k })
     }
 
@@ -5620,10 +5660,10 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let qw_len = (n * k / 8 * 4) as u64;
         let qs_len = (n * kb * 4) as u64;
         // qw and qs share one slot buffer (qs at byte qs_off) unless a split buffer is given.
-        let qw = Tensor { buf: gu_slot.clone(), rows: n, cols: k, pool: None, site: (0, 0), view: Some((0, qw_len)) };
+        let qw = Tensor { buf: gu_slot.clone(), rows: n, cols: k, pool: None, site: (0, 0), view: Some((0, qw_len)), bid: 0 };
         let qs = match split_buf {
-            Some(b) => Tensor { buf: b.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((0, qs_len)) },
-            None => Tensor { buf: gu_slot.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((qs_off as u64, qs_len)) },
+            Some(b) => Tensor { buf: b.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((0, qs_len)), bid: 0 },
+            None => Tensor { buf: gu_slot.clone(), rows: n, cols: kb, pool: None, site: (0, 0), view: Some((qs_off as u64, qs_len)), bid: 0 },
         };
         Lin::q4(Q4Weight { qw, qs, n, k })
     }
@@ -10845,8 +10885,7 @@ LOGSCOPE_NO_Q4_0_TRANSCODE=1 restores the old path");
                             // on the GPU, which is why this path could be small in the first place.
                             let blocks = Tensor {
                                 buf: self.upload_bytes(raw, "iq1"),
-                                rows: 1, cols: raw.len() / 4, pool: None, site: (0, 0), view: None,
-                            };
+                                rows: 1, cols: raw.len() / 4, pool: None, site: (0, 0), view: None, bid: 0 };
                             return Ok(Lin::iq1(Iq1Weight { blocks, n, k }));
                         }
                     }
@@ -10867,9 +10906,9 @@ LOGSCOPE_NO_Q4_0_TRANSCODE=1 restores the old path");
                             let out = self.alloc_resident_words(qs_off_words + qs_words);
                             self.q4k_defer(&out, raw, n, k, 0, qs_off_words);
                             let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None, site: (0, 0),
-                                              view: Some((0, (qw_words * 4) as u64)) };
+                                              view: Some((0, (qw_words * 4) as u64)), bid: 0 };
                             let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None, site: (0, 0),
-                                              view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)) };
+                                              view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)), bid: 0 };
                             return Ok(Lin::q4(Q4Weight { qw, qs, n, k }));
                         }
                     }
@@ -13383,7 +13422,7 @@ mod download_honors_views {
         let mut all = head.clone(); all.extend_from_slice(&tail);
         let whole = gpu.upload(&all, 1, 128);
         let view = Tensor { buf: whole.buf.clone(), rows: 1, cols: 64,
-                            pool: None, site: (0, 0), view: Some((256, 256)) };
+                            pool: None, site: (0, 0), view: Some((256, 256)), bid: 0 };
         assert_eq!(gpu.download(&view), tail, "download must read the VIEW, not the head");
         let words: Vec<u32> = tail.iter().map(|f| f.to_bits()).collect();
         assert_eq!(gpu.download_u32(&view), words, "download_u32 must read the VIEW too");
@@ -13900,7 +13939,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let mut padded = raw[..nblk * 210].to_vec();
         padded.resize(src_bytes, 0);
         let srcbuf = self.upload_bytes(&padded, "q6k-src");
-        let src = Tensor { buf: srcbuf, rows: 1, cols: src_bytes / 4, pool: None, site: (0, 0), view: None };
+        let src = Tensor { buf: srcbuf, rows: 1, cols: src_bytes / 4, pool: None, site: (0, 0), view: None, bid: 0 };
         let out = self.alloc_resident_words(n_weights);
         let chunk = engine_config().convert_chunk_blocks.max(1);
         let mut b0 = 0usize;
@@ -13915,9 +13954,9 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             // Padding the BUFFER was not enough: the binding range is what the shader sees.
             let vlen = ((n * 210).div_ceil(4) * 4).min(src_bytes - byte_off);
             let view = Tensor { buf: src.buf.clone(), rows: 1, cols: vlen / 4,
-                                pool: None, site: (0, 0), view: Some((byte_off as u64, vlen as u64)) };
+                                pool: None, site: (0, 0), view: Some((byte_off as u64, vlen as u64)), bid: 0 };
             let dstv = Tensor { buf: out.buf.clone(), rows: 1, cols: n * 256,
-                                pool: None, site: (0, 0), view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)) };
+                                pool: None, site: (0, 0), view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)), bid: 0 };
             let dims = [n as u32, 0u32, 0u32, 0u32];
             // wg1 takes the ELEMENT count and divides by 64 itself. Passing an already-divided value
             // divides twice: 65 blocks asked for wg1(2) = ONE workgroup = 64 threads, so block 64 onward
@@ -13956,8 +13995,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             }
             Tensor {
                 buf: self.upload_bytes(bytemuck::cast_slice(&grid), "iq1s-grid"),
-                rows: 1, cols: grid.len(), pool: None, site: (0, 0), view: None,
-            }
+                rows: 1, cols: grid.len(), pool: None, site: (0, 0), view: None, bid: 0 }
         })
     }
 
@@ -14024,7 +14062,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let gx = (n as u32).min(32768);
         let gy = (n as u32).div_ceil(gx);
         let dims = [1u32, n as u32, k as u32, (k / 256) as u32, gx, 0, 0, 0];
-        let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, site: (0, 0), view: None };
+        let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, site: (0, 0), view: None, bid: 0 };
         // No .clone(): Tensor does not implement Clone, so cloning a &Tensor copies the reference
         // and does nothing. The cached grid is borrowed for the dispatch, which is all it needs —
         // and had Tensor implemented Clone, that call would have duplicated a GPU buffer handle per
@@ -14056,7 +14094,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let mut padded = raw.to_vec();
         padded.resize(raw.len().div_ceil(4) * 4, 0);
         let src = self.upload_bytes(&padded, "readback-probe");
-        let t = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, site: (0, 0), view: None };
+        let t = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, site: (0, 0), view: None, bid: 0 };
         // download() reads a buffer back as f32 words; reinterpreting them as bytes recovers exactly
         // what was uploaded, because nothing has interpreted them in between.
         let words = self.download(&t);
@@ -14071,7 +14109,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let mut padded = raw.to_vec();
         padded.resize(n.div_ceil(4) * 4, 0);
         let src = self.upload_bytes(&padded, "byte-probe-src");
-        let srct = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, site: (0, 0), view: None };
+        let srct = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, site: (0, 0), view: None, bid: 0 };
         let out = self.alloc_resident_words(n);
         let dims = [n as u32, 0u32, 0u32, 0u32];
         self.dispatch(shader, &[&srct], &out, bytemuck::cast_slice(&dims),
@@ -14093,7 +14131,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Test hook: a small view of a tensor, to force a sync without downloading all of it.
     pub fn view_pub(&self, t: &Tensor, off: usize, len: usize) -> Tensor {
         Tensor { buf: t.buf.clone(), rows: 1, cols: len, pool: None, site: (0, 0),
-                 view: Some(((off * 4) as u64, (len * 4) as u64)) }
+                 view: Some(((off * 4) as u64, (len * 4) as u64)), bid: 0 }
     }
 
     /// Test hook: copy rows between tensors, for exercising allocator reuse from a gate.
@@ -14103,7 +14141,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
 
     /// Test hook: a sub-range view of a tensor, for exercising windowed reads from a gate.
     pub fn tensor_view(&self, t: &Tensor, off: u64, size: u64, rows: usize, cols: usize) -> Tensor {
-        Tensor { buf: t.buf.clone(), rows, cols, pool: None, site: (0, 0), view: Some((off, size)) }
+        Tensor { buf: t.buf.clone(), rows, cols, pool: None, site: (0, 0), view: Some((off, size)), bid: 0 }
     }
 
     fn decode_attention_mh(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
@@ -14447,8 +14485,8 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let len = pos + 1 - start;
         let size = (len * row_bytes) as u64;
         Some((
-            Tensor { buf: kc.buf.clone(), rows: len, cols, pool: None, site: (0, 0), view: Some((off as u64, size)) },
-            Tensor { buf: vc.buf.clone(), rows: len, cols, pool: None, site: (0, 0), view: Some((off as u64, size)) },
+            Tensor { buf: kc.buf.clone(), rows: len, cols, pool: None, site: (0, 0), view: Some((off as u64, size)), bid: 0 },
+            Tensor { buf: vc.buf.clone(), rows: len, cols, pool: None, site: (0, 0), view: Some((off as u64, size)), bid: 0 },
             len,
         ))
     }
