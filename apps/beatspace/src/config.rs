@@ -56,6 +56,14 @@ pub struct Config {
     /// Zero means unbounded, which is the old behaviour and still right for a
     /// small set.
     pub cache_batches: usize,
+    /// Ceiling on the in-memory mel cache, in bytes.
+    ///
+    /// The actual budget is the smaller of this and half of MemAvailable, so
+    /// this is a cap rather than a target — it exists so a workstation with
+    /// 192 GiB does not decide to hold 90 of them for a job that does not need
+    /// it. Zero disables the in-memory tier entirely and every crop reads from
+    /// disk, which is the old behaviour.
+    pub mem_cache_bytes: u64,
     pub ckpt_dir: PathBuf,
     pub audio_exts: Vec<String>,
 }
@@ -96,6 +104,10 @@ impl Default for Config {
             // keeps hitting warm clips, small enough that the cache stays a
             // working set rather than a copy of the library.
             cache_batches: 32,
+            // 2 GiB: enough that a phone-sized working set is fully resident
+            // and a large library still fills it, without the cache alone
+            // being the reason a 4 GiB device starts swapping.
+            mem_cache_bytes: 2 * 1024 * 1024 * 1024,
             ckpt_dir: PathBuf::from("./checkpoints"),
             audio_exts: ["opus", "ogg", "wav", "flac", "mp3", "m4a", "aac"]
                 .iter()

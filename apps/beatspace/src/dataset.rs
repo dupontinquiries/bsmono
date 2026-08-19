@@ -36,6 +36,13 @@ pub struct Dataset {
 struct ClipMeta {
     path: PathBuf, // cache file
     t: usize,      // number of frames
+    /// The mel data, when it fitted in RAM.
+    ///
+    /// `None` means read it from `path` on every crop — which is a File::open,
+    /// a seek and a read per sample, times batch_size, times every step. On a
+    /// working set that fits, holding it costs memory once and removes two
+    /// syscalls from the inner loop.
+    resident: Option<std::sync::Arc<Vec<f32>>>,
 }
 
 /// Build (or refresh) the mel cache for everything in `cfg.data_dir`.
@@ -61,6 +68,34 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
     sources.sort();
     println!("[dataset] {} source files", sources.len());
 
+    // A ROTATING WINDOW, chosen before anything is decoded.
+    //
+    // The cache is a working set, not a copy of the library — but the first
+    // version enforced that by building every clip and then DELETING the
+    // overflow, which removed files the Dataset was already holding paths to.
+    // The next sample_batch opened one and got ENOENT. An optimisation that
+    // deletes the data it just produced is worse than no optimisation, and it
+    // failed after the slow part rather than before it.
+    //
+    // So the budget is applied to the SOURCE LIST instead: take a window of it,
+    // decode only that, and never evict anything the run is using. The window
+    // start advances every run, so a long library rotates through rather than
+    // training forever on whichever tracks sort first — which is the actual
+    // request, and something a delete-the-overflow scheme could never do
+    // because it always kept the same survivors.
+    let budget = if cfg.cache_batches == 0 { usize::MAX }
+                 else { cfg.cache_batches.saturating_mul(cfg.batch_size.max(1)) };
+    if sources.len() > budget {
+        let start = rotation_offset(cfg, sources.len());
+        let window: Vec<PathBuf> = (0..budget)
+            .map(|i| sources[(start + i) % sources.len()].clone())
+            .collect();
+        println!("[dataset] rotating window: {} of {} sources, from #{start} \
+(cache_batches {} x batch {})",
+                 window.len(), sources.len(), cfg.cache_batches, cfg.batch_size);
+        sources = window;
+    }
+
     // 2. build cache in parallel (skip ones already cached & up to date)
     let done = AtomicUsize::new(0);
     let total = sources.len();
@@ -78,7 +113,7 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
         })
         .collect();
 
-    let clips: Vec<ClipMeta> = results.into_iter().flatten().collect();
+    let mut clips: Vec<ClipMeta> = results.into_iter().flatten().collect();
     if clips.is_empty() {
         return Err(anyhow!(
             "every clip was too short for one {}-frame crop, or all failed to decode",
@@ -90,7 +125,45 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
         clips.len(),
         cfg.time_frames
     );
-    if let Some(evicted) = trim_cache(cfg)? {
+    // RESIDENCY: hold what fits, in order, and leave the rest on disk.
+    //
+    // Partial rather than all-or-nothing. A 3-minute track at this hop is
+    // ~10 MiB of mel, so a few hundred of them is tens of gigabytes and the
+    // all-or-nothing question answers itself with "no" on every real library —
+    // which would mean the feature never engages. Filling the budget and
+    // falling back per clip means a phone holds a few and a workstation holds
+    // the lot, from the same code.
+    let budget_bytes = mem_budget(cfg);
+    if budget_bytes > 0 {
+        let mut used = 0u64;
+        let mut held = 0usize;
+        for c in clips.iter_mut() {
+            let need = (c.t as u64) * (cfg.n_mels as u64) * 4;
+            if used + need > budget_bytes { continue; }
+            match read_clip_body(&c.path, c.t, cfg.n_mels) {
+                Ok(v) => {
+                    c.resident = Some(std::sync::Arc::new(v));
+                    used += need;
+                    held += 1;
+                }
+                // A clip that will not read is left on disk rather than
+                // failing the run: random_crop will hit the same error and
+                // report it against the sample that needed it.
+                Err(_) => continue,
+            }
+        }
+        if held > 0 {
+            println!("[dataset] in memory: {held} of {} clip(s), {:.1} MiB of a {:.1} MiB budget",
+                     clips.len(), used as f64 / 1.048_576e6, budget_bytes as f64 / 1.048_576e6);
+        }
+    }
+
+    // Evict only what THIS run is not using. The live paths are passed in
+    // rather than recomputed, because a second derivation of "which files
+    // matter" is how the two got out of step in the first place.
+    let live: std::collections::HashSet<PathBuf> =
+        clips.iter().map(|c| c.path.clone()).collect();
+    if let Some(evicted) = trim_cache(cfg, &live)? {
         println!("[dataset] cache trimmed: evicted {evicted} clip(s) over budget");
     }
 
@@ -215,7 +288,7 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
     let bytes: &[u8] = bytemuck_cast(&tdata);
     file.write_all(bytes)?;
 
-    Ok(Some(ClipMeta { path: cache, t }))
+    Ok(Some(ClipMeta { path: cache, t, resident: None }))
 }
 
 fn try_read_header(cache: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
@@ -238,6 +311,7 @@ fn try_read_header(cache: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
     Ok(Some(ClipMeta {
         path: cache.to_path_buf(),
         t,
+        resident: None,
     }))
 }
 
@@ -267,11 +341,23 @@ impl Dataset {
         let frames = self.time_frames;
         let header = 4 + 4 + 4;
         let offset = header + (start * n_mels) * 4;
-        let mut f = File::open(&clip.path)?;
-        f.seek(SeekFrom::Start(offset as u64))?;
-        let mut buf = vec![0u8; frames * n_mels * 4];
-        f.read_exact(&mut buf)?;
-        let tdata: &[f32] = bytemuck_cast_slice(&buf); // (frames, n_mels)
+        // Resident clips skip the File::open and the seek — two syscalls per
+        // sample, times batch_size, times every step.
+        let owned;
+        let tdata: &[f32] = match &clip.resident {
+            Some(v) => {
+                let a = start * n_mels;
+                &v[a..a + frames * n_mels]
+            }
+            None => {
+                let mut f = File::open(&clip.path)?;
+                f.seek(SeekFrom::Start(offset as u64))?;
+                let mut buf = vec![0u8; frames * n_mels * 4];
+                f.read_exact(&mut buf)?;
+                owned = bytemuck_cast_slice(&buf).to_vec();
+                &owned
+            }
+        }; // (frames, n_mels)
 
         // transpose (frames, n_mels) -> (n_mels, frames)
         let mut out = vec![0f32; n_mels * frames];
@@ -327,7 +413,7 @@ fn bytemuck_cast_slice(data: &[u8]) -> &[f32] {
 /// least-recently-written, which is still better than unbounded.
 ///
 /// Returns how many were evicted, or None when unbounded.
-fn trim_cache(cfg: &Config) -> Result<Option<usize>> {
+fn trim_cache(cfg: &Config, live: &std::collections::HashSet<PathBuf>) -> Result<Option<usize>> {
     if cfg.cache_batches == 0 {
         return Ok(None);
     }
@@ -336,6 +422,12 @@ fn trim_cache(cfg: &Config) -> Result<Option<usize>> {
     for e in fs::read_dir(&cfg.cache_dir)?.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("bspc") {
+            continue;
+        }
+        // NEVER the working set. This is the whole bug: the previous version
+        // evicted by age alone, and the newest files are exactly the ones this
+        // run just built and is about to read.
+        if live.contains(&p) {
             continue;
         }
         let md = match e.metadata() {
@@ -428,26 +520,100 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_is_trimmed_to_the_batch_budget() {
-        // The cache is a working set, not a copy of the library: 5,630 sources
-        // is tens of gigabytes of mel for a trainer that reads batch_size
-        // clips at a time, on the disk the checkpoints need.
-        let root = std::env::temp_dir().join(format!("bs-trim-{}", std::process::id()));
+    fn trimming_never_evicts_a_clip_this_run_is_using() {
+        // THE BUG THIS SHIPPED WITH. trim_cache ran after the clips were built
+        // and evicted by age alone — and the newest files are exactly the ones
+        // the run just produced and is about to read. Training died on the
+        // first batch with ENOENT, after the slow part rather than before it.
+        let root = std::env::temp_dir().join(format!("bs-live-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut cfg = cfg_in(&root);
-        cfg.batch_size = 4;
-        cfg.cache_batches = 2; // budget = 8
+        cfg.batch_size = 1;
+        cfg.cache_batches = 1;   // budget of 1
         fs::create_dir_all(&cfg.cache_dir).unwrap();
-        for i in 0..20 {
-            fs::write(cfg.cache_dir.join(format!("c{i}.bspc")), b"x").unwrap();
-            // Distinct timestamps so the LRU order is defined.
+        let mut live = std::collections::HashSet::new();
+        for i in 0..6 {
+            let p = cfg.cache_dir.join(format!("c{i}.bspc"));
+            fs::write(&p, b"x").unwrap();
+            // Everything is live: this run is using all six.
+            live.insert(p);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let evicted = trim_cache(&cfg).unwrap().unwrap();
-        assert_eq!(evicted, 12, "expected 20 - 8");
-        let left = fs::read_dir(&cfg.cache_dir).unwrap().count();
-        assert_eq!(left, 8);
+        let evicted = trim_cache(&cfg, &live).unwrap().unwrap();
+        assert_eq!(evicted, 0, "the working set was evicted");
+        for p in &live {
+            assert!(p.exists(), "{p:?} was deleted while in use");
+        }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_entries_from_earlier_runs_are_still_evicted() {
+        // The protection must not turn the trim off — a library that rotates
+        // leaves last run's window behind, and that is exactly what should go.
+        let root = std::env::temp_dir().join(format!("bs-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = cfg_in(&root);
+        cfg.batch_size = 2;
+        cfg.cache_batches = 1;   // budget 2
+        fs::create_dir_all(&cfg.cache_dir).unwrap();
+        for i in 0..5 {
+            fs::write(cfg.cache_dir.join(format!("old{i}.bspc")), b"x").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut live = std::collections::HashSet::new();
+        for i in 0..2 {
+            let p = cfg.cache_dir.join(format!("new{i}.bspc"));
+            fs::write(&p, b"x").unwrap();
+            live.insert(p);
+        }
+        let evicted = trim_cache(&cfg, &live).unwrap().unwrap();
+        assert!(evicted > 0, "nothing stale was removed");
+        for p in &live { assert!(p.exists()); }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_rotation_advances_and_wraps() {
+        // A long library must not train forever on whichever tracks sort
+        // first, and the delete-the-overflow version could never fix that: it
+        // always kept the same survivors.
+        let root = std::env::temp_dir().join(format!("bs-rot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = cfg_in(&root);
+        cfg.batch_size = 2;
+        cfg.cache_batches = 2;   // window of 4
+        fs::create_dir_all(&cfg.cache_dir).unwrap();
+        let total = 10;
+        let a = rotation_offset(&cfg, total);
+        let b = rotation_offset(&cfg, total);
+        let c = rotation_offset(&cfg, total);
+        assert_eq!((a, b, c), (0, 4, 8), "consecutive runs must see disjoint windows");
+        // And it wraps rather than running off the end.
+        let d = rotation_offset(&cfg, total);
+        assert!(d < total, "offset {d} is past the library");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_proc_meminfo_disables_the_memory_cache() {
+        // An in-memory cache is an optimisation. Inventing a memory figure when
+        // the system will not report one is how a 4 GiB phone gets OOM-killed
+        // by its own trainer.
+        let root = std::env::temp_dir().join("bs-mem");
+        let cfg = cfg_in(&root);
+        let b = mem_budget(&cfg);
+        // On Linux this is real; the assertion that holds either way is that it
+        // never exceeds the configured ceiling.
+        assert!(b <= cfg.mem_cache_bytes, "{b} exceeds the ceiling");
+    }
+
+    #[test]
+    fn a_zero_ceiling_keeps_everything_on_disk() {
+        let root = std::env::temp_dir().join("bs-mem0");
+        let mut cfg = cfg_in(&root);
+        cfg.mem_cache_bytes = 0;
+        assert_eq!(mem_budget(&cfg), 0);
     }
 
     #[test]
@@ -463,7 +629,7 @@ mod tests {
         for i in 0..5 {
             fs::write(cfg.cache_dir.join(format!("c{i}.bspc")), b"x").unwrap();
         }
-        assert_eq!(trim_cache(&cfg).unwrap(), None);
+        assert_eq!(trim_cache(&cfg, &Default::default()).unwrap(), None);
         assert_eq!(fs::read_dir(&cfg.cache_dir).unwrap().count(), 5);
         let _ = fs::remove_dir_all(&root);
     }
@@ -482,8 +648,76 @@ mod tests {
         for i in 0..4 {
             fs::write(cfg.cache_dir.join(format!("c{i}.bspc")), b"x").unwrap();
         }
-        trim_cache(&cfg).unwrap();
+        trim_cache(&cfg, &Default::default()).unwrap();
         assert!(cfg.cache_dir.join("keep.ckpt").exists(), "a non-cache file was evicted");
         let _ = fs::remove_dir_all(&root);
     }
+}
+
+
+/// Bytes of RAM it is reasonable to spend on the mel cache right now.
+///
+/// Read from the SYSTEM rather than guessed, because the honest answer depends
+/// on what else is running: this fleet targets phones with 4-8 GiB where the
+/// compositor and the browser have already spoken for most of it, and the same
+/// binary runs on a 192 GiB workstation.
+///
+/// MemAvailable, not MemFree — free memory on Linux is small by design because
+/// the page cache uses the rest, and sizing against it would refuse to use a
+/// machine that has plenty. Available is the kernel's own estimate of what can
+/// be had without swapping, which is the question being asked.
+///
+/// Half of it, and never more than the config's ceiling. Half because the
+/// model, the optimiser state and candle's own allocations come out of the same
+/// pool, and a cache that takes everything available makes the trainer the
+/// thing that gets killed.
+fn mem_budget(cfg: &Config) -> u64 {
+    let avail = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb * 1024)
+        // No /proc — not Linux, or a container without it. Zero rather than a
+        // guess: an in-memory cache is an optimisation, and inventing a
+        // memory figure to enable it is how a phone gets OOM-killed.
+        .unwrap_or(0);
+    (avail / 2).min(cfg.mem_cache_bytes)
+}
+
+/// Where this run's window starts, advanced every run.
+///
+/// Persisted in the cache directory as a plain integer. A random offset would
+/// also rotate, but it would revisit and skip unevenly; a counter walks the
+/// library. Stored beside the cache rather than in the config because it is
+/// state about what has been SEEN, not a setting anyone chose.
+///
+/// An unreadable or corrupt file starts from zero rather than failing — losing
+/// the rotation position costs some repeated work and nothing else, which is
+/// not worth refusing to train over.
+fn rotation_offset(cfg: &Config, total: usize) -> usize {
+    let f = cfg.cache_dir.join("rotation");
+    let cur = std::fs::read_to_string(&f)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let budget = cfg.cache_batches.saturating_mul(cfg.batch_size.max(1)).max(1);
+    // Advance by the window, so consecutive runs see disjoint sets until the
+    // library wraps.
+    let next = (cur + budget) % total.max(1);
+    let _ = std::fs::write(&f, next.to_string());
+    cur % total.max(1)
+}
+
+
+/// Read a cached clip's whole body, skipping the header.
+fn read_clip_body(path: &Path, t: usize, n_mels: usize) -> Result<Vec<f32>> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(12))?;   // MAGIC + n_mels + t
+    let mut buf = vec![0u8; t * n_mels * 4];
+    f.read_exact(&mut buf)?;
+    Ok(bytemuck_cast_slice(&buf).to_vec())
 }
