@@ -267,7 +267,7 @@ impl BatchNorm2d {
     fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
         let c = self.c;
         // reduce over batch(0), height(2), width(3) -> per-channel (C,)
-        let (mean, var) = if train {
+        let (mean, var, centered) = if train {
             let mean = x.mean((0usize, 2, 3))?; // (C,)
             let mean_b = mean.reshape((1, c, 1, 1))?;
             let centered = x.broadcast_sub(&mean_b)?;
@@ -279,21 +279,45 @@ impl BatchNorm2d {
             let new_var = ((self.run_var.as_tensor() * (1.0 - m))? + (&var * m)?)?;
             self.run_mean.set(&new_mean.detach())?;
             self.run_var.set(&new_var.detach())?;
-            (mean, var)
+            // CENTERED IS REUSED, not recomputed. It was built here for the
+            // variance, dropped, and then `x.broadcast_sub(&mean)` ran again
+            // below — a second full-tensor pass over up to 8.4M elements, on a
+            // backend whose elementwise kernels are single-threaded
+            // (cpu_backend/utils.rs walks a plain .iter(), no rayon).
+            (mean, var, Some(centered))
         } else {
             (
                 self.run_mean.as_tensor().clone(),
                 self.run_var.as_tensor().clone(),
+                None,
             )
         };
-        let mean = mean.reshape((1, c, 1, 1))?;
         let var = var.reshape((1, c, 1, 1))?;
         let g = self.gamma.as_tensor().reshape((1, c, 1, 1))?;
         let b = self.beta.as_tensor().reshape((1, c, 1, 1))?;
-        let xn = x
-            .broadcast_sub(&mean)?
-            .broadcast_div(&var.affine(1.0, self.eps)?.sqrt()?)?;
-        xn.broadcast_mul(&g)?.broadcast_add(&b)
+
+        // SCALE AND SHIFT FOLDED. The tail was div -> mul -> add: three passes
+        // where the arithmetic is one affine transform per channel. Since
+        //
+        //     y = (x - mu)/sqrt(v + eps) * gamma + beta
+        //       = (x - mu) * (gamma / sqrt(v + eps)) + beta
+        //
+        // the divide and the gamma multiply collapse into ONE per-channel
+        // factor, computed on a (1,C,1,1) tensor rather than on the full one.
+        // Two full-tensor passes instead of three, and the saved one is a
+        // divide.
+        let scale = g.broadcast_div(&var.affine(1.0, self.eps)?.sqrt()?)?;
+        // Named `cen` rather than `c`: `c` is the CHANNEL COUNT in this
+        // scope, and shadowing it inside the match arm would have made the
+        // reshape below read the tensor instead. It compiled either way.
+        let centered = match centered {
+            Some(cen) => cen,
+            None => {
+                let mean = mean.reshape((1, c, 1, 1))?;
+                x.broadcast_sub(&mean)?
+            }
+        };
+        centered.broadcast_mul(&scale)?.broadcast_add(&b)
     }
 
     fn vars(&self, out: &mut Vec<Var>) {
@@ -854,6 +878,84 @@ pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_folded_batchnorm_matches_the_unfolded_formula() {
+        // Compared against the ARITHMETIC IT REPLACED, not against a property.
+        // My first attempt asserted "variance is 1" and got 1.012 — which sent
+        // me looking for a bug in the refactor when the assertion was simply
+        // the wrong claim: y is normalised by the BIASED batch variance and
+        // then scaled by gamma, so E[y^2] is only 1 when gamma is exactly 1 and
+        // eps is exactly 0. Testing the replacement against the original is the
+        // check that actually says "I did not change the maths".
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let bn = BatchNorm2d::new(3, &dev).unwrap();
+        let xs: Vec<f32> = (0..2 * 3 * 4 * 5)
+            .map(|i| (i as f32 * 0.41).sin() * 3.0 + 1.0).collect();
+        let x = Tensor::from_vec(xs, (2, 3, 4, 5), &dev).unwrap();
+
+        let got = bn.forward(&x, true).unwrap();
+
+        // The original, written out: mean, centered, biased var, then
+        // sub -> div -> mul -> add as four separate broadcasts.
+        let mean = x.mean((0usize, 2, 3)).unwrap();
+        let mean_b = mean.reshape((1, 3, 1, 1)).unwrap();
+        let centered = x.broadcast_sub(&mean_b).unwrap();
+        let var = centered.sqr().unwrap().mean((0usize, 2, 3)).unwrap()
+            .reshape((1, 3, 1, 1)).unwrap();
+        let g = bn.gamma.as_tensor().reshape((1, 3, 1, 1)).unwrap();
+        let b = bn.beta.as_tensor().reshape((1, 3, 1, 1)).unwrap();
+        let want = x.broadcast_sub(&mean_b).unwrap()
+            .broadcast_div(&var.affine(1.0, bn.eps).unwrap().sqrt().unwrap()).unwrap()
+            .broadcast_mul(&g).unwrap()
+            .broadcast_add(&b).unwrap();
+
+        let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let e = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let worst = a.iter().zip(&e).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-5, "the fold changed the arithmetic: worst {worst}");
+        // And it must not be trivially equal because everything is zero.
+        assert!(a.iter().any(|v| v.abs() > 0.1), "the test data was degenerate");
+    }
+
+    #[test]
+    fn eval_mode_uses_the_running_stats_and_not_the_batch() {
+        // The eval arm has no `centered` to reuse, so it takes the fallback
+        // path — which must subtract the RUNNING mean rather than recomputing
+        // the batch's. Getting that wrong makes inference depend on batch
+        // composition and nothing fails loudly.
+        //
+        // My first version asserted eval was the identity at init. It is not:
+        // gamma is randn(0, 0.02) + 1.0, the DCGAN convention, so a channel
+        // scaled by 0.9785 is a perfectly ordinary draw. The code was right and
+        // the assertion was wrong — checked before changing anything.
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let bn = BatchNorm2d::new(2, &dev).unwrap();
+        let xs: Vec<f32> = (0..2 * 2 * 3 * 3).map(|i| i as f32 * 0.7 - 3.0).collect();
+        let x = Tensor::from_vec(xs, (2, 2, 3, 3), &dev).unwrap();
+
+        let got = bn.forward(&x, false).unwrap();
+        let mean = bn.run_mean.as_tensor().reshape((1, 2, 1, 1)).unwrap();
+        let var = bn.run_var.as_tensor().reshape((1, 2, 1, 1)).unwrap();
+        let g = bn.gamma.as_tensor().reshape((1, 2, 1, 1)).unwrap();
+        let b = bn.beta.as_tensor().reshape((1, 2, 1, 1)).unwrap();
+        let want = x.broadcast_sub(&mean).unwrap()
+            .broadcast_div(&var.affine(1.0, bn.eps).unwrap().sqrt().unwrap()).unwrap()
+            .broadcast_mul(&g).unwrap()
+            .broadcast_add(&b).unwrap();
+
+        let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let e = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let worst = a.iter().zip(&e).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-5, "eval does not follow the running stats: worst {worst}");
+
+        // And the batch's own statistics must NOT have leaked in: this input
+        // has a large mean, so a train-mode result would be centred near zero.
+        assert!(a.iter().map(|v| v.abs()).fold(0f32, f32::max) > 1.0,
+                "eval output looks batch-normalised, so the running stats were ignored");
+    }
 
     #[test]
     fn the_fused_gate_matches_the_four_op_chain_and_its_gradient() {
