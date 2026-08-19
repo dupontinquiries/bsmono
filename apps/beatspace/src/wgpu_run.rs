@@ -382,7 +382,17 @@ pub fn selftest() -> Result<String, String> {
         "worst |gpu-cpu| = {worst:.3e} at ({}, {})\n", worst_at.0, worst_at.1));
 
     if bad == 0 {
-        out.push_str(&format!("PASS — all {} elements within {tol:.0e}\n", m * n));
+        out.push_str(&format!("gemm PASS — all {} elements within {tol:.0e}\n", m * n));
+        // The other kernels, on the same device, in the same run. Reported
+        // together because a partial pass is the useful signal: GEMM good and
+        // Adam bad points somewhere entirely different from both failing.
+        match adam_check(&device, &queue) {
+            Ok(line) => out.push_str(&line),
+            Err(line) => {
+                out.push_str(&line);
+                return Err(out);
+            }
+        }
         Ok(out)
     } else {
         // Where the mismatches are IS the diagnosis. Confined to the last
@@ -398,5 +408,140 @@ pub fn selftest() -> Result<String, String> {
             else { "the tile barriers or the index maths" },
         ));
         Err(out)
+    }
+}
+
+
+/// Run one Adam step on the device and compare with the CPU reference.
+///
+/// Small — 4096 parameters — because this is a correctness check, not a
+/// benchmark, and a small buffer keeps the failure readable. The values are
+/// chosen to exercise the parts that hide: a zero gradient, a tiny one where
+/// the eps placement decides the step, and a large one.
+fn adam_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<String, String> {
+    use crate::wgpu_train::{adam_bias_correction, adam_step_ref, adam_wgsl};
+    use wgpu::util::DeviceExt;
+
+    let n = 4096usize;
+    let param: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).sin()).collect();
+    let grad: Vec<f32> = (0..n)
+        .map(|i| match i % 4 {
+            0 => 0.0,          // a dead parameter
+            1 => 1e-7,         // where sqrt(v)+eps vs sqrt(v+eps) diverges
+            2 => 1.0,
+            _ => -3.5,
+        })
+        .collect();
+    let m = vec![0f32; n];
+    let v = vec![0f32; n];
+    let (lr, b1, b2, eps) = (2e-4f32, 0.5f32, 0.999f32, 1e-8f32);
+    let (bc1, bc2) = adam_bias_correction(b1 as f64, b2 as f64, 1);
+
+    let mut want = param.clone();
+    let (mut wm, mut wv) = (m.clone(), v.clone());
+    adam_step_ref(&mut want, &grad, &mut wm, &mut wv, lr, b1, b2, eps, bc1, bc2);
+
+    let mk = |data: &[f32], usage| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(data),
+            usage,
+        })
+    };
+    let st = wgpu::BufferUsages::STORAGE;
+    let p_buf = mk(&param, st | wgpu::BufferUsages::COPY_SRC);
+    let g_buf = mk(&grad, st);
+    let m_buf = mk(&m, st);
+    let v_buf = mk(&v, st);
+    let u: [f32; 8] = [f32::from_bits(n as u32), lr, b1, b2, eps, bc1, bc2, 0.0];
+    // n is a u32 in the shader; writing it through from_bits keeps the byte
+    // layout right without a second buffer for one integer.
+    let mut raw = [0u8; 32];
+    raw[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+    for (i, f) in u.iter().enumerate().skip(1) {
+        raw[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: &raw,
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let read = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (n * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let src = adam_wgsl();
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("adam"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("adam"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: p_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: g_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: m_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: v_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: a_buf.as_entire_binding() },
+        ],
+    });
+
+    let grid = Grid::for_items(n);
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(grid.x, grid.y, grid.z);
+    }
+    enc.copy_buffer_to_buffer(&p_buf, 0, &read, 0, (n * 4) as u64);
+    queue.submit([enc.finish()]);
+
+    let slice = read.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv().map_err(|e| format!("adam map: {e}"))?
+        .map_err(|e| format!("adam map: {e}"))?;
+    let got: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+    read.unmap();
+
+    let mut worst = 0f32;
+    let mut worst_i = 0usize;
+    for i in 0..n {
+        let d = (got[i] - want[i]).abs();
+        if d > worst {
+            worst = d;
+            worst_i = i;
+        }
+    }
+    // Tighter than the GEMM's: Adam is elementwise, so there is no reordering
+    // to excuse a deviation. Anything above rounding is a real difference.
+    let tol = 1e-7f32;
+    if worst <= tol {
+        Ok(format!("adam PASS — {n} params, worst {worst:.3e}\n"))
+    } else {
+        // Which SHAPE of gradient failed is the diagnosis: index mod 4 says
+        // whether it was the dead parameter, the tiny one, or a normal one.
+        let kind = match worst_i % 4 {
+            0 => "a ZERO gradient — suspect the eps placement or a NaN from 0/0",
+            1 => "a TINY gradient — suspect sqrt(v+eps) instead of sqrt(v)+eps",
+            2 => "a unit gradient — suspect the bias correction",
+            _ => "a large negative gradient — suspect a sign or the moment update",
+        };
+        Err(format!(
+            "adam FAIL — worst {worst:.3e} at index {worst_i}, which is {kind}\n"))
     }
 }
