@@ -208,7 +208,27 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
 // GUI
 // ----------------------------------------------------------------------------
 
+/// Which page is showing.
+///
+/// Two, because two exist. A tab bar listing pages that are not built is the
+/// overstatement the port audits kept finding elsewhere in this tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Morph,
+    Train,
+}
+
 struct App {
+    /// Held for the training page: it needs the data and checkpoint dirs to
+    /// launch a run, and Shared carries neither.
+    cfg: Config,
+    page: Page,
+    /// The training dashboard's state. Fed from the trainer's own stdout.
+    train: crate::trainpage::TrainPage,
+    /// Lines arriving from a running trainer.
+    train_rx: Option<std::sync::mpsc::Receiver<String>>,
+    train_epochs: String,
+    train_batch: String,
     latent: usize,
     shared: Arc<Mutex<Shared>>,
     z_a: Vec<f32>,
@@ -225,18 +245,27 @@ const RANGE: f32 = 3.0; // pad maps to [-RANGE, RANGE]
 impl App {
     fn new(cfg: Config, shared: Arc<Mutex<Shared>>) -> Self {
         let latent = cfg.latent;
+        // Computed before the struct literal moves cfg into it.
+        let ckpt_text = cfg
+            .ckpt_dir
+            .join("gen_latest.safetensors")
+            .display()
+            .to_string();
+        let train_batch = cfg.batch_size.to_string();
         Self {
+            page: Page::Morph,
+            train: Default::default(),
+            train_rx: None,
+            train_epochs: "20000".into(),
+            train_batch,
+            cfg,
             latent,
             shared,
             z_a: vec![0.0; latent],
             z_b: vec![0.0; latent],
             walk_t: None,
             walk_speed: 0.01,
-            ckpt_text: cfg
-                .ckpt_dir
-                .join("gen_latest.safetensors")
-                .display()
-                .to_string(),
+            ckpt_text,
             save_text: "beat.wav".into(),
             status: "drag on the pad to morph".into(),
         }
@@ -281,6 +310,21 @@ impl eframe::App for App {
             self.walk_t = if nt >= 1.0 { None } else { Some(nt) };
         }
 
+        // Drain whatever the trainer has printed since the last frame.
+        //
+        // try_recv in a loop rather than a blocking read: this runs inside the
+        // frame, and a trainer that has gone quiet must not freeze the UI —
+        // which is the whole reason the run is on a thread.
+        if let Some(rx) = &self.train_rx {
+            let mut lines = Vec::new();
+            while let Ok(l) = rx.try_recv() {
+                lines.push(l);
+            }
+            for l in lines {
+                self.train.feed(&l);
+            }
+        }
+
         egui::Panel::left("controls")
             .resizable(false)
             .exact_size(250.0)
@@ -288,7 +332,15 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 ui.heading("beatspace");
                 ui.label("latent-space beat morpher");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.page, Page::Morph, "morph");
+                    ui.selectable_value(&mut self.page, Page::Train, "train");
+                });
                 ui.separator();
+                if self.page == Page::Train {
+                    self.train_controls(ui);
+                    return;
+                }
 
                 if ui.button("🎲  Randomize all dims").clicked() {
                     self.randomize();
@@ -375,6 +427,13 @@ impl eframe::App for App {
                 }
             });
 
+        if self.page == Page::Train {
+            egui::CentralPanel::default().show(ui, |ui| {
+                self.train_body(ui);
+            });
+            return;
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
             ui.label("latent pad — X→z₀  Y→z₁  scroll→z₂");
@@ -458,5 +517,162 @@ impl eframe::App for App {
             }
             painter.circle_filled(cur, 4.0, egui::Color32::from_rgb(140, 255, 190));
         });
+    }
+}
+
+impl App {
+    /// The training page's left-panel controls.
+    fn train_controls(&mut self, ui: &mut egui::Ui) {
+        use crate::trainpage::Phase;
+        let running = matches!(self.train.phase, Phase::Preparing { .. } | Phase::Training);
+
+        ui.horizontal(|ui| {
+            ui.label("epochs");
+            ui.add_enabled(!running,
+                egui::TextEdit::singleline(&mut self.train_epochs).desired_width(70.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("batch");
+            ui.add_enabled(!running,
+                egui::TextEdit::singleline(&mut self.train_batch).desired_width(70.0));
+        });
+
+        if !running {
+            if ui.button("▶  start training").clicked() {
+                self.start_training();
+            }
+        } else if ui.button("■  stop").clicked() {
+            // A REQUEST, not a kill. The trainer checks this between epochs and
+            // writes a checkpoint on the way out — tearing the thread down here
+            // would lose the epochs since the last save, which on a slow CPU
+            // run is the work of an hour.
+            self.train.stop_requested = true;
+            self.status = "stop requested — finishing the epoch".into();
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new(self.train.status_line()).small());
+        if self.train.stalled() {
+            // Said, not acted on: a plateau is sometimes convergence and
+            // sometimes a dead run, and the operator knows which.
+            ui.label(egui::RichText::new("loss is flat — plateau or converged").small());
+        }
+
+        ui.separator();
+        if ui.button("copy summary").clicked() {
+            ui.ctx().copy_text(self.train.summary());
+            self.status = "summary copied".into();
+        }
+    }
+
+    /// Spawn a trainer and pipe its output into the page.
+    ///
+    /// Runs the same binary as the CLI rather than calling `train::run` in a
+    /// thread. That keeps ONE training path: a GUI that reimplemented the loop
+    /// would drift from the command line, and the log the dashboard parses is
+    /// the log the terminal shows.
+    fn start_training(&mut self) {
+        let epochs: u64 = self.train_epochs.trim().parse().unwrap_or(1000);
+        let batch: usize = self.train_batch.trim().parse().unwrap_or(16);
+        let cfg = self.cfg.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        self.train_rx = Some(rx);
+        self.train.start(epochs, batch, "…", &cfg.data_dir.to_string_lossy());
+
+        let exe = std::env::current_exe().unwrap_or_else(|_| "beatspace".into());
+        let data = cfg.data_dir.clone();
+        let ckpt = cfg.ckpt_dir.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let child = std::process::Command::new(exe)
+                .arg("train")
+                .arg("--data-dir").arg(&data)
+                .arg("--ckpt-dir").arg(&ckpt)
+                .arg("--epochs").arg(epochs.to_string())
+                .arg("--batch-size").arg(batch.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(format!("[train] could not start: {e}"));
+                    return;
+                }
+            };
+            // stderr on its own thread: the trainer writes failures there, and
+            // reading the two in sequence loses the error when stdout blocks.
+            if let Some(err) = child.stderr.take() {
+                let etx = tx.clone();
+                std::thread::spawn(move || {
+                    for l in BufReader::new(err).lines().map_while(Result::ok) {
+                        let _ = etx.send(l);
+                    }
+                });
+            }
+            if let Some(out) = child.stdout.take() {
+                for l in BufReader::new(out).lines().map_while(Result::ok) {
+                    if tx.send(l).is_err() {
+                        // The page is gone; stop reading rather than filling a
+                        // channel nobody drains.
+                        break;
+                    }
+                }
+            }
+            let _ = child.wait();
+            let _ = tx.send("[train] process exited".into());
+        });
+    }
+
+    /// The dashboard: the curve, then the log.
+    fn train_body(&mut self, ui: &mut egui::Ui) {
+        use crate::trainpage::Phase;
+        ui.heading("training");
+        ui.label(self.train.status_line());
+
+        if let Phase::Preparing { done, total } = self.train.phase {
+            if total > 0 {
+                ui.add(egui::ProgressBar::new(done as f32 / total as f32)
+                    .text(format!("decoding {done}/{total}")));
+            }
+        }
+
+        // THE LOSS CURVE, drawn from the page's own history.
+        if self.train.curve.len() >= 2 {
+            let h = 140.0;
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), h), egui::Sense::hover());
+            let p = ui.painter_at(rect);
+            let losses: Vec<f32> = self.train.curve.iter().map(|c| c.loss).collect();
+            let (lo, hi) = losses.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+            // A flat curve has zero span and would divide by nothing; drawing
+            // it down the middle is the honest picture of "not moving".
+            let span = if (hi - lo).abs() < f32::EPSILON { 1.0 } else { hi - lo };
+            let n = losses.len();
+            let pts: Vec<egui::Pos2> = losses.iter().enumerate().map(|(i, v)| {
+                let x = rect.left() + rect.width() * (i as f32 / (n - 1) as f32);
+                let y = rect.bottom() - rect.height() * ((v - lo) / span);
+                egui::pos2(x, y)
+            }).collect();
+            p.rect_filled(rect, 2.0, egui::Color32::from_black_alpha(40));
+            for w in pts.windows(2) {
+                p.line_segment([w[0], w[1]], egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE));
+            }
+            ui.label(egui::RichText::new(format!("loss {lo:.5} … {hi:.5}")).small());
+        }
+
+        ui.separator();
+        // THE LOG, newest at the bottom and stuck there.
+        //
+        // stick_to_bottom, because a log that does not follow makes the reader
+        // scroll on every frame during the part they are watching for.
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for line in self.train.log_lines() {
+                    ui.label(egui::RichText::new(line).monospace().small());
+                }
+            });
     }
 }

@@ -16,6 +16,7 @@ mod gui;
 mod model;
 mod player;
 mod train;
+mod trainpage;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
