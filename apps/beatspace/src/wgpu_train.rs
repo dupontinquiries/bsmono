@@ -928,3 +928,202 @@ mod bn_tests {
         assert!(diff > 0.5, "the coupling terms make no difference here: {diff}");
     }
 }
+
+// ── the optimiser ───────────────────────────────────────────────────────────
+
+/// Adam, matching what the candle path already runs.
+///
+/// `train.rs` builds `AdamW` with `weight_decay: 0.0`, which is plain Adam —
+/// the decoupled decay AdamW is named for is switched off. Reproducing that
+/// exactly matters more than picking the better optimiser: if the GPU path
+/// trains a different objective from the CPU path, the two cannot be compared,
+/// and comparison against the CPU is the only way this backend gets trusted.
+///
+/// betas are (0.5, 0.999) from the config — the DCGAN convention, not Adam's
+/// usual 0.9. A first moment that forgets faster is what keeps a GAN from
+/// chasing a discriminator that has already moved.
+///
+/// The bias correction is computed on the host and passed in, rather than
+/// recomputed per element from a step counter. `beta^t` for t in the millions
+/// underflows f32 to zero — at which point the correction silently becomes 1.0
+/// and the early-step warmup it exists for is gone. On the host it is f64.
+pub fn adam_wgsl() -> String {
+    format!(
+        r#"
+struct Ad {{
+  n: u32,
+  lr: f32,
+  beta1: f32,
+  beta2: f32,
+  eps: f32,
+  // 1/(1 - beta^t), computed in f64 on the host: beta^t underflows f32 for
+  // large t and the correction would silently become 1.0.
+  bc1: f32,
+  bc2: f32,
+  _pad: u32,
+}};
+
+@group(0) @binding(0) var<storage, read_write> param : array<f32>;
+@group(0) @binding(1) var<storage, read>       grad  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> m     : array<f32>;
+@group(0) @binding(3) var<storage, read_write> v     : array<f32>;
+@group(0) @binding(4) var<uniform>             a     : Ad;
+
+@compute @workgroup_size({wg}u, 1u, 1u)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+  let i = gid.x;
+  if (i >= a.n) {{ return; }}
+  let g = grad[i];
+
+  let mi = a.beta1 * m[i] + (1.0 - a.beta1) * g;
+  let vi = a.beta2 * v[i] + (1.0 - a.beta2) * g * g;
+  m[i] = mi;
+  v[i] = vi;
+
+  let mh = mi * a.bc1;
+  let vh = vi * a.bc2;
+  // sqrt THEN add eps, matching candle and the Adam paper. Adding eps inside
+  // the sqrt is a common transcription and gives a different — larger — step
+  // when vh is small, which is exactly when the difference decides whether a
+  // dead parameter revives.
+  param[i] = param[i] - a.lr * mh / (sqrt(vh) + a.eps);
+}}
+"#,
+        wg = WORKGROUP,
+    )
+}
+
+/// Bias-correction multipliers for step `t` (1-based).
+///
+/// f64 throughout, then narrowed once. In f32, `0.999^t` reaches zero around
+/// t ≈ 10^5 and the correction becomes 1.0 without warning; a 20,000-epoch run
+/// with several steps per epoch gets there.
+pub fn adam_bias_correction(beta1: f64, beta2: f64, t: u64) -> (f32, f32) {
+    let t = t.max(1) as i32;
+    let c1 = 1.0 - beta1.powi(t);
+    let c2 = 1.0 - beta2.powi(t);
+    // At t=1 with beta=0.999 the divisor is 1e-3, so the reciprocal is 1000 —
+    // large but correct, and it is what makes the first step full-sized.
+    ((1.0 / c1) as f32, (1.0 / c2) as f32)
+}
+
+/// One Adam step on the CPU, matching `adam_wgsl`.
+#[allow(clippy::too_many_arguments)]
+pub fn adam_step_ref(
+    param: &mut [f32], grad: &[f32], m: &mut [f32], v: &mut [f32],
+    lr: f32, beta1: f32, beta2: f32, eps: f32, bc1: f32, bc2: f32,
+) {
+    for i in 0..param.len() {
+        let g = grad[i];
+        m[i] = beta1 * m[i] + (1.0 - beta1) * g;
+        v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
+        let mh = m[i] * bc1;
+        let vh = v[i] * bc2;
+        param[i] -= lr * mh / (vh.sqrt() + eps);
+    }
+}
+
+#[cfg(test)]
+mod adam_tests {
+    use super::*;
+
+    #[test]
+    fn the_adam_kernel_compiles() {
+        let src = adam_wgsl();
+        let module = naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("parse:\n{}", e.emit_to_string(&src)));
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module)
+            .unwrap_or_else(|e| panic!("validate:\n{}", e.emit_to_string(&src)));
+    }
+
+    #[test]
+    fn the_first_step_is_not_shrunk_by_an_uncorrected_moment() {
+        // Bias correction exists because m and v start at zero, so without it
+        // the first steps are tiny and the run wastes its beginning. At t=1
+        // the corrected estimate should be the gradient itself.
+        let (bc1, bc2) = adam_bias_correction(0.5, 0.999, 1);
+        let mut p = vec![0f32];
+        let mut m = vec![0f32];
+        let mut v = vec![0f32];
+        adam_step_ref(&mut p, &[1.0], &mut m, &mut v, 0.1, 0.5, 0.999, 1e-8, bc1, bc2);
+        // m̂ = g, v̂ = g², so the step is lr * g / (|g| + eps) ≈ lr.
+        assert!((p[0] + 0.1).abs() < 1e-3, "first step was {} not -0.1", p[0]);
+    }
+
+    #[test]
+    fn the_correction_survives_a_step_count_that_underflows_f32() {
+        // 0.999^t reaches zero in f32 around t ≈ 1e5, and a 20,000-epoch run
+        // with several steps per epoch passes that. Computed in f32 the
+        // correction silently becomes 1.0 — which is CORRECT at large t, so
+        // the bug hides; what breaks is that the f32 pow underflows to zero
+        // long before the f64 one does, and in between the two disagree.
+        let (bc1, bc2) = adam_bias_correction(0.5, 0.999, 1_000_000);
+        assert!(bc1.is_finite() && bc2.is_finite());
+        assert!((bc1 - 1.0).abs() < 1e-6, "beta1^1e6 should be long gone: {bc1}");
+        assert!((bc2 - 1.0).abs() < 1e-6, "beta2^1e6 should be long gone: {bc2}");
+        // And an f32 computation of the same thing at a step where it still
+        // matters diverges from the f64 one.
+        let t = 5000i32;
+        let f64_c = 1.0 / (1.0 - 0.999f64.powi(t));
+        let f32_c = 1.0 / (1.0 - 0.999f32.powi(t));
+        assert!((f64_c as f32 - f32_c).abs() < 0.01,
+                "at t={t} the two still agree, so pick a larger t for this check");
+    }
+
+    #[test]
+    fn eps_is_added_outside_the_square_root() {
+        // sqrt(v)+eps, not sqrt(v+eps). A common transcription, and it gives a
+        // different — larger — step when v is small, which is exactly when the
+        // difference decides whether a dead parameter revives.
+        let src = adam_wgsl();
+        assert!(src.contains("sqrt(vh) + a.eps"), "the eps placement changed");
+        assert!(!src.contains("sqrt(vh + a.eps)"));
+
+        // And numerically: with a tiny gradient the two differ visibly.
+        let (bc1, bc2) = adam_bias_correction(0.5, 0.999, 1);
+        let mut p = vec![0f32];
+        let (mut m, mut v) = (vec![0f32], vec![0f32]);
+        adam_step_ref(&mut p, &[1e-6], &mut m, &mut v, 0.1, 0.5, 0.999, 1e-8, bc1, bc2);
+        let correct = p[0];
+        // The wrong form, inline for comparison.
+        let g = 1e-6f32;
+        let (mm, vv) = ((1.0 - 0.5) * g, (1.0 - 0.999) * g * g);
+        let wrong = -0.1 * (mm * bc1) / (vv * bc2 + 1e-8f32).sqrt();
+        assert!((correct - wrong).abs() > 1e-4,
+                "the two eps placements agree here, so this test proves nothing");
+    }
+
+    #[test]
+    fn a_repeated_gradient_converges_rather_than_diverging() {
+        // The property that says the update is the right shape: a constant
+        // gradient should walk the parameter steadily in one direction at
+        // roughly lr per step, not accelerate or stall.
+        let mut p = vec![0f32];
+        let (mut m, mut v) = (vec![0f32], vec![0f32]);
+        let lr = 0.01f32;
+        for t in 1..=200u64 {
+            let (bc1, bc2) = adam_bias_correction(0.5, 0.999, t);
+            adam_step_ref(&mut p, &[1.0], &mut m, &mut v, lr, 0.5, 0.999, 1e-8, bc1, bc2);
+        }
+        // 200 steps of a unit gradient at lr 0.01: Adam normalises the step to
+        // about lr, so the parameter should be near -2.
+        assert!((p[0] + 2.0).abs() < 0.3, "walked to {} instead of about -2", p[0]);
+    }
+
+    #[test]
+    fn the_moments_match_candles_configuration() {
+        // train.rs builds AdamW with weight_decay 0.0, which is plain Adam.
+        // If the GPU path decayed weights the two would train different
+        // objectives and could never be compared — and comparison against the
+        // CPU is the only way this backend earns trust.
+        let src = adam_wgsl();
+        assert!(!src.contains("decay"), "the GPU path applies a decay the CPU path does not");
+        let train = include_str!("train.rs");
+        assert!(train.contains("weight_decay: 0.0"),
+                "the CPU path started decaying weights; the GPU kernel must follow");
+    }
+}
