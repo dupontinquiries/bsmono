@@ -145,6 +145,24 @@ impl ConvT2d {
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // BEATSPACE_DECONV=upsample routes through zero-insert + conv2d, which
+        // is the same operation on a different candle kernel.
+        //
+        // conv_transpose2d is a naive six-deep loop parallel only over c_out;
+        // conv2d is im2col + gemm parallel over BATCH. At the final layer
+        // c_out is 1, so the transposed path runs on one thread while the
+        // conv2d path would run on all of them.
+        //
+        // OFF BY DEFAULT and measured rather than assumed. The first phase
+        // report showed G forward at 2.2s of 145 — so the forward deconv is
+        // NOT the bottleneck and switching it blind would be a change with no
+        // evidence. The flag exists so the same run can be timed both ways;
+        // where it should pay is the BACKWARD, since the gradient of a
+        // convolution is a transposed convolution and the G backward is 12x
+        // its forward.
+        if std::env::var("BEATSPACE_DECONV").as_deref() == Ok("upsample") {
+            return self.forward_via_conv2d(x);
+        }
         x.conv_transpose2d(
             self.w.as_tensor(),
             self.padding,
@@ -152,6 +170,55 @@ impl ConvT2d {
             self.stride,
             1,
         )
+    }
+
+    /// A transposed convolution as zero-insert upsample + ordinary convolution.
+    ///
+    /// Identical arithmetic: inserting `stride-1` zeros between input samples
+    /// and convolving with the kernel flipped, at padding `k - 1 - p`, is the
+    /// textbook equivalence. The cost is the zeros — the intermediate is
+    /// `stride^2` times larger and most of it is zero, so this trades memory
+    /// bandwidth for parallelism and is not obviously a win at every shape.
+    ///
+    /// It should win exactly where c_out is small, which is the last layer of
+    /// this generator and the first layer's gradient in the discriminator.
+    fn forward_via_conv2d(&self, x: &Tensor) -> Result<Tensor> {
+        let w = self.w.as_tensor();          // (c_in, c_out, kh, kw)
+        let (_, _, kh, kw) = w.dims4()?;
+        let s = self.stride;
+
+        // Zero-insert. upsample_nearest2d would REPEAT samples, which is a
+        // different operation and a silently wrong one — the zeros are what
+        // make this equal to a transposed convolution.
+        let x = if s > 1 {
+            let (b, c, h, wd) = x.dims4()?;
+            let z = Tensor::zeros((b, c, h, wd, s * s - 1), x.dtype(), x.device())?;
+            let spread = Tensor::cat(&[x.reshape((b, c, h, wd, 1))?, z], 4)?
+                .reshape((b, c, h, wd * s, s))?
+                .transpose(3, 4)?
+                .reshape((b, c, h * s, wd * s))?;
+            // The trailing row/column of zeros is not part of the output.
+            spread.narrow(2, 0, h * s - (s - 1))?.narrow(3, 0, wd * s - (s - 1))?
+        } else {
+            x.clone()
+        };
+
+        // The kernel: swap in/out channels and flip both spatial axes.
+        // Contiguous before index_select, which candle requires — a transpose
+        // leaves a strided view and the flip below reads through it.
+        let mut k = w.transpose(0, 1)?.contiguous()?;
+        for axis in [2usize, 3] {
+            let n = if axis == 2 { kh } else { kw };
+            let idx = Tensor::from_iter((0..n).rev().map(|i| i as u32), w.device())?;
+            k = k.index_select(&idx, axis)?.contiguous()?;
+        }
+        let pad = (kh - 1).saturating_sub(self.padding);
+        let y = x.conv2d(&k.contiguous()?, pad, 1, 1, 1)?;
+        if self.out_padding > 0 {
+            let (_, _, h, wd) = y.dims4()?;
+            return y.narrow(2, 0, h + self.out_padding)?.narrow(3, 0, wd + self.out_padding);
+        }
+        Ok(y)
     }
     fn vars(&self, out: &mut Vec<Var>) {
         out.push(self.w.clone());
@@ -665,3 +732,47 @@ pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &D
 // rayon's, which defaults to every core, so nothing is capping it; and matmul
 // does take Parallelism::Rayon. The fc layer and the discriminator (whose convs
 // are all conv2d) are on the fast paths already.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two deconv paths must agree to floating-point noise.
+    ///
+    /// "Mathematically identical" is a claim, and an unchecked one here would
+    /// be the worst kind: the upsample path would train, produce plausible
+    /// output, and be subtly wrong. A flipped kernel axis or an off-by-one in
+    /// the padding does not crash — it shifts the image by a pixel.
+    #[test]
+    fn upsample_conv2d_matches_conv_transpose2d() {
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        for (c_in, c_out, stride, pad, h, w) in
+            [(3usize, 2usize, 2usize, 1usize, 5usize, 6usize),
+             (4, 1, 2, 1, 4, 4),      // c_out = 1, the case that motivates this
+             (2, 3, 1, 0, 5, 5),      // stride 1, the no-insert path
+             (2, 2, 2, 0, 3, 4)] {
+            let kh = 4;
+            let xs: Vec<f32> = (0..c_in * h * w).map(|i| (i as f32 * 0.37).sin()).collect();
+            let x = Tensor::from_vec(xs, (1, c_in, h, w), &dev).unwrap();
+            let ws: Vec<f32> = (0..c_in * c_out * kh * kh)
+                .map(|i| (i as f32 * 0.11).cos()).collect();
+            let wt = Tensor::from_vec(ws, (c_in, c_out, kh, kh), &dev).unwrap();
+
+            let layer = ConvT2d {
+                w: Var::from_tensor(&wt).unwrap(),
+                stride, padding: pad, out_padding: 0,
+            };
+            let want = x.conv_transpose2d(layer.w.as_tensor(), pad, 0, stride, 1).unwrap();
+            let got = layer.forward_via_conv2d(&x).unwrap();
+            assert_eq!(want.dims(), got.dims(),
+                       "shape differs at c_in{c_in} c_out{c_out} s{stride} p{pad}");
+            let a = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-4,
+                    "c_in{c_in} c_out{c_out} s{stride} p{pad}: worst {worst}");
+        }
+    }
+}

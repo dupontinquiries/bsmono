@@ -108,6 +108,7 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
         // the epoch and printed with it — four Instant reads per step against a
         // step that takes over a second.
         let (mut t_sample, mut t_gfwd, mut t_dstep, mut t_gstep) = (0f64, 0f64, 0f64, 0f64);
+        let mut t_dfwd = 0f64;
         // This epoch's own clock. The run total cannot give a percentage: by
         // epoch 100 the accounted share of it would read as 1%.
         let t_epoch = std::time::Instant::now();
@@ -141,17 +142,30 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
             t_gfwd += t1.elapsed().as_secs_f64();
 
             // ---- D step ----
+            // TIMED, because these three D forwards were the missing 27%. The
+            // first phase report accounted for 73% of the epoch and the gap was
+            // exactly here: two forwards in the D step and one more in the G
+            // step, none of them measured.
+            let tdf = std::time::Instant::now();
             let real_logits = d.forward(&real, true)?;
             let fake_logits_d = d.forward(&fake.detach(), true)?;
             let d_loss = (bce_with_logits(&real_logits, &real_target)?
                 + bce_with_logits(&fake_logits_d, &fake_target)?)?;
+            t_dfwd += tdf.elapsed().as_secs_f64();
             let t2 = std::time::Instant::now();
             opt_d.backward_step(&d_loss)?;
             t_dstep += t2.elapsed().as_secs_f64();
 
             // ---- G step ----
+            // The THIRD D forward. Not removable: opt_d has just updated the
+            // discriminator's weights, so the generator must be scored against
+            // the new D — reusing fake_logits_d would train G against a
+            // discriminator that no longer exists. Standard DCGAN ordering, and
+            // it costs a full D forward per step.
+            let tdf2 = std::time::Instant::now();
             let fake_logits_g = d.forward(&fake, true)?;
             let g_loss = bce_with_logits(&fake_logits_g, &gen_target)?;
+            t_dfwd += tdf2.elapsed().as_secs_f64();
             let t3 = std::time::Instant::now();
             opt_g.backward_step(&g_loss)?;
             t_gstep += t3.elapsed().as_secs_f64();
@@ -180,11 +194,12 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
         // mkl is x86 and accelerate is macOS — so the conv/matmul phases are
         // running on its portable path and are the expected suspects.
         let epoch_secs = t_epoch.elapsed().as_secs_f64();
-        let acc = t_sample + t_gfwd + t_dstep + t_gstep;
+        let acc = t_sample + t_gfwd + t_dfwd + t_dstep + t_gstep;
         println!(
-            "[train]   phases: sample {:.1}s · G fwd {:.1}s · D step {:.1}s · G step {:.1}s \
-({:.0}% of the epoch accounted)",
-            t_sample, t_gfwd, t_dstep, t_gstep,
+            "[train]   phases: sample {:.1}s · G fwd {:.1}s · D fwd x3 {:.1}s · D bwd {:.1}s · \
+G bwd {:.1}s ({:.0}% accounted). G bwd runs through the WHOLE discriminator before it \
+reaches G, which is why it is many times the G forward.",
+            t_sample, t_gfwd, t_dfwd, t_dstep, t_gstep,
             if epoch_secs > 0.0 { 100.0 * acc / epoch_secs } else { 0.0 },
         );
 
