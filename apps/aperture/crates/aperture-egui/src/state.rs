@@ -54,6 +54,7 @@ pub enum K {
     B,
     M,
     H,
+    T,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -1203,7 +1204,9 @@ impl AppState {
             (S, true) => self.save(now_ms),
             (O, true) => self.open_palette_in_open_mode(),
             (P, true) => self.open_palette(),
+            (F, true) if shift => self.open_project_search(),
             (F, true) => self.open_find(),
+            (T, true) => self.open_workspace_symbol(),
             (H, true) => self.open_find_with_replace(),
             (E, true) => self.toggle_follow(now_ms),
             (Comma, true) => self.rev_step(1, now_ms),
@@ -1402,6 +1405,33 @@ impl AppState {
         self.palette = Some(crate::palette_ui::PaletteState::open_file(root, files));
         self.ghost.dismiss();
         self.debounce.cancel();
+    }
+
+    fn open_project_search(&mut self) {
+        let root = self.workspace_root();
+        let files = crate::file_finder::walk_files(&root, 4000);
+        self.palette = Some(crate::palette_ui::PaletteState::project_search(root, files));
+        self.ghost.dismiss();
+        self.debounce.cancel();
+    }
+
+    fn open_workspace_symbol(&mut self) {
+        let root = self.workspace_root();
+        let files = crate::file_finder::walk_files(&root, 4000);
+        self.palette = Some(crate::palette_ui::PaletteState::workspace_symbol(root, files));
+        self.ghost.dismiss();
+        self.debounce.cancel();
+    }
+
+    /// Open `path` (same as `open_file`) and land the caret at `line` (a
+    /// 0-based line index — project search's own convention, matching
+    /// `Pos::line`/`goto_line`), then aim the camera at it. Used by project
+    /// search's jump-to-hit; `open_file` alone would land at char 0, losing
+    /// exactly the thing a search result promised.
+    pub fn open_file_at_line(&mut self, path: PathBuf, line: usize, now_ms: u64) {
+        self.open_file(path, now_ms);
+        self.editor.goto_line(line);
+        self.follow_caret = true;
     }
 
     /// Caret char index for a click at content-space (x px, y px).

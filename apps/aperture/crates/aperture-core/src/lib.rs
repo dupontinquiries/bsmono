@@ -18,6 +18,13 @@
 //! * [`syntax`] — the [`syntax::LineLexer`] seam + an incremental per-line
 //!   state cache. Ships a small hand-rolled Rust lexer; the cache interface is
 //!   the socket tree-sitter plugs into later (see DESIGN.md §syntax).
+//! * [`project_search`] — "find in project": grep an already-walked file
+//!   list for a substring, capped per-file and in total, returning
+//!   line/column hits a shell can render as a jump list.
+//! * [`workspace_symbols`] (feature `tree-sitter`) — "go to symbol in
+//!   workspace": the same per-file outline the symbol popup uses, run over
+//!   every walked file so a name search jumps across the tree, not just the
+//!   open file. A name index, not semantic go-to-definition.
 //!
 //! No egui, no sockets, no threads. `cargo test -p aperture-core` runs the
 //! whole editing model headless in well under a second — that is the point.
@@ -35,10 +42,13 @@ pub mod editor;
 pub mod gitspace;
 pub mod history;
 pub mod op;
+pub mod project_search;
 pub mod syntax;
 pub mod width;
 #[cfg(feature = "tree-sitter")]
 pub mod ts;
+#[cfg(feature = "tree-sitter")]
+pub mod workspace_symbols;
 
 pub use buffer::{Buffer, Pos};
 pub use editor::{Editor, Selection};

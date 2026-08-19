@@ -652,6 +652,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let close = esc;
     let mut apply: Option<palette_ui::Cmd> = None;
     let mut open_path: Option<String> = None;
+    let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
 
     egui::Area::new(Id::new("aperture_palette"))
         .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
@@ -668,6 +669,8 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                     let hint = match p.mode {
                         Mode::Commands => "command, theme, or :line…",
                         Mode::OpenFile => "path to open…",
+                        Mode::ProjectSearch => "text to find in project…",
+                        Mode::WorkspaceSymbol => "symbol name…",
                     };
                     let edit = egui::TextEdit::singleline(&mut p.input)
                         .hint_text(hint)
@@ -768,6 +771,94 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 }
                             }
                         }
+                        Mode::ProjectSearch => {
+                            let hits = aperture_core::project_search::search_files(&p.root, &p.files, &p.input, 50, 20);
+                            if !hits.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("↑↓ navigate · Enter jump · Esc cancel")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(hits.len() - 1);
+                                }
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for (i, hit) in hits.iter().enumerate() {
+                                        let selected = i == p.selected;
+                                        let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                        let text_color = if selected { colors.text } else { colors.text_weak };
+                                        let row = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0);
+                                        let resp = row
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.vertical(|ui| {
+                                                    ui.label(egui::RichText::new(format!("{}:{}", hit.rel, hit.line + 1)).color(text_color).strong());
+                                                    ui.label(egui::RichText::new(hit.text.trim()).color(colors.text_weak).small());
+                                                });
+                                            })
+                                            .response
+                                            .interact(Sense::click());
+                                        if resp.clicked() {
+                                            open_hit = Some((hit.path.clone(), hit.line));
+                                        }
+                                    }
+                                });
+                                if enter {
+                                    let i = p.selected.min(hits.len() - 1);
+                                    open_hit = Some((hits[i].path.clone(), hits[i].line));
+                                }
+                            } else if !p.input.is_empty() {
+                                ui.label(egui::RichText::new("no match").color(colors.text_weak).italics());
+                            }
+                        }
+                        Mode::WorkspaceSymbol => {
+                            let ranked = palette_ui::rank_symbols(&p.symbols, &p.input, 30);
+                            if !ranked.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("↑↓ navigate · Enter jump · Esc cancel")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(ranked.len() - 1);
+                                }
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for (i, sym) in ranked.iter().enumerate() {
+                                        let selected = i == p.selected;
+                                        let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                        let text_color = if selected { colors.text } else { colors.text_weak };
+                                        let row = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0);
+                                        let resp = row
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new(&sym.item.name).color(text_color).strong());
+                                                    ui.label(egui::RichText::new(format!("{}:{}", sym.rel, sym.item.line + 1)).color(colors.text_weak).small());
+                                                });
+                                            })
+                                            .response
+                                            .interact(Sense::click());
+                                        if resp.clicked() {
+                                            open_hit = Some((sym.path.clone(), sym.item.line));
+                                        }
+                                    }
+                                });
+                                if enter {
+                                    let i = p.selected.min(ranked.len() - 1);
+                                    open_hit = Some((ranked[i].path.clone(), ranked[i].item.line));
+                                }
+                            } else if p.symbols.is_empty() {
+                                ui.label(egui::RichText::new("no Rust symbols indexed in this workspace").color(colors.text_weak).italics());
+                            } else if !p.input.is_empty() {
+                                ui.label(egui::RichText::new("no match").color(colors.text_weak).italics());
+                            }
+                        }
                     }
                 });
         });
@@ -778,6 +869,11 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     }
     if let Some(path) = open_path {
         state.open_file(std::path::PathBuf::from(path), now_ms);
+        state.palette = None;
+        return;
+    }
+    if let Some((path, line)) = open_hit {
+        state.open_file_at_line(path, line, now_ms);
         state.palette = None;
         return;
     }
@@ -814,6 +910,7 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::B => K::B,
         EK::M => K::M,
         EK::H => K::H,
+        EK::T => K::T,
         EK::F => K::F,
         EK::F3 => K::F3,
         EK::Space => K::Space,
