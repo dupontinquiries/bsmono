@@ -136,6 +136,16 @@ Session scope was: rope core + invertible-Op history, line-lexer syntax,
 ghost-text completion loop (ollama FIM / subprocess / demo), smooth-camera
 egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
 
+- **Instruct-edit shell wiring**: `aperture-complete::edit::make_edit_request`
+  (headless, tested) packs an instruction + selection into the existing
+  `CompletionRequest` envelope for `CommandProvider` — the request-building
+  half of "ask AI to rewrite this selection" exists. NOT wired into the
+  shell: needs a way to route an outcome back as "this is an edit result,
+  render a diff/accept/reject view" rather than feeding it into ghost text
+  the way every other `Engine::poll()` outcome is — the generation-gate
+  design assumes one semantic per outcome today. Adding a tag (or a second
+  `Engine`) is the shape of the fix; not attempted this pass.
+
 - **tree-sitter** behind the existing `LineLexer` seam (`aperture-core/syntax.rs`).
   The seam is `(line, entry_state) -> (spans, exit_state)` so an incremental
   parser slots in without touching the renderer. Deferred because grammar
@@ -149,8 +159,10 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   Two call sites now exist — next co-change, lift `shared/infer-kit`.
 - **Cloud provider** behind a `ureq` feature (TLS). Until then
   `APERTURE_CMD` subprocess is the escape hatch (curl in a script).
-- **File-fuzzy palette**: Ctrl+O currently takes a typed path; walk the
-  workspace root and reuse `uikit_egui::fuzzy` for ranking.
+- **File-fuzzy palette**: DONE (`file_finder.rs`, Ctrl+O). ~~Find in
+  project~~ DONE (`project_search.rs`, Ctrl+Shift+F). ~~Go to symbol in
+  workspace~~ DONE (`workspace_symbols.rs`, Ctrl+T, name index over every
+  file's existing tree-sitter outline — not semantic go-to-def).
 - **Multi-cursor**: `Selection` is already value-based; becomes
   `Vec<Selection>` + edit fan-out with offset fixup.
 - **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs

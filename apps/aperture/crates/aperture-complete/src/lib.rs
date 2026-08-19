@@ -16,6 +16,7 @@
 //! nothing secret: the shell's "loop pane" renders exactly what came through
 //! this API. Steerable beats magic.
 
+pub mod edit;
 pub mod engine;
 pub mod providers;
 
