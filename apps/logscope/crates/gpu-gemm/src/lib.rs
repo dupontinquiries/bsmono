@@ -1403,6 +1403,37 @@ impl SubmitTuner {
     pub fn results(&self) -> &[(u32, f64, f64)] { &self.results }
 }
 
+/// Host→device bytes and the wall time spent moving them, process-wide.
+    ///
+/// UPLOADS WERE NOT TIMED. The heatmap says so in its own footnote —
+/// "compute includes host→device upload, which the engine does not time" —
+/// which means the 8.2% attributed to compute is compute PLUS an unknown
+/// upload share, and no one could say whether a faster upload path was
+/// worth building. That is the wrong state to start optimising from: the
+/// staging-ring work already in this file was justified by a measurement,
+/// and anything after it should be too.
+    ///
+/// Atomics rather than a field on Sample because uploads happen from
+/// loaders, probes and the decode loop alike, and threading a timer
+/// through all of them to answer one question would be a worse trade than
+/// two relaxed adds on a path that is already touching megabytes.
+/// Records on drop, so an early return inside upload_bytes still counts. A
+/// timer that only fires on the success path measures the cheap case.
+pub(crate) struct UploadTimer { pub t0: std::time::Instant, pub n: u64 }
+impl Drop for UploadTimer {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        UPLOAD_NS.fetch_add(self.t0.elapsed().as_nanos() as u64, Relaxed);
+        UPLOAD_BYTES.fetch_add(self.n, Relaxed);
+    }
+}
+
+pub(crate) static UPLOAD_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static UPLOAD_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+
 impl Gpu {
     pub fn new() -> Self {
         let instance = wgpu::Instance::default();
@@ -3320,6 +3351,9 @@ impl Gpu {
     /// records a CATCHABLE OutOfMemory instead of the fatal get_mapped_range abort a failed map-on-create
     /// gives. The UMA map path is safe because weight loads memplan-preflight the fit before any upload.
     fn upload_bytes(&self, bytes: &[u8], label: &'static str) -> wgpu::Buffer {
+        let _up_t0 = std::time::Instant::now();
+        let _up_n = bytes.len() as u64;
+        let _up_guard = UploadTimer { t0: _up_t0, n: _up_n };
         // ROUND UP TO A WHOLE WORD. Shaders view these buffers as `array<u32>`, so the last partial word
         // is unreadable if the buffer ends mid-word: a WGSL index past the array length yields zero, not
         // an error.
@@ -18749,6 +18783,39 @@ impl<P: DenoisePolicy> DenoisePolicy for TraceRecorder<P> {
 /// observation. With a confidence threshold active the true rate is different
 /// and nobody could see which way — so the one lever that trades quality for
 /// speed had no feedback attached to it.
+/// What the uploads actually cost, now that they are timed.
+///
+/// Answers a question that could not be asked before: is a faster host→device
+/// path worth building? The staging ring in this file (STAGE_RING = 8, one
+/// persistent buffer with per-fill regions) was justified by a measurement —
+/// write_buffer at 64 MiB hits ~32 GiB/s while recreating a mapped buffer per
+/// swap manages 4–14, because the CREATION cost dominates the copy. Any next
+/// step on uploads deserves the same standard, and this is the number it needs.
+pub fn report_upload_cost(wall_ms: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ns = UPLOAD_NS.load(Relaxed);
+    let by = UPLOAD_BYTES.load(Relaxed);
+    if ns == 0 || by == 0 { return; }
+    let ms = ns as f64 / 1e6;
+    let gibs = (by as f64 / 1.073_741_824e9) / (ns as f64 / 1e9);
+    // A zero denominator means the caller had no clock. Say so rather than
+    // print "0.0% of wall", which reads as "uploads are free" and is the exact
+    // wrong conclusion to hand someone.
+    let share = if wall_ms > 0.0 { 100.0 * ms / wall_ms } else { f64::NAN };
+    eprintln!(
+        "wgpu-engine: upload — {:.1} MiB in {ms:.0} ms = {gibs:.1} GiB/s{}. {}",
+        by as f64 / 1.048_576e6,
+        if share.is_nan() { String::new() } else { format!(", {share:.1}% of wall") },
+        if share < 2.0 {
+            "Uploads are NOT where the time goes; a faster upload path buys almost nothing here, whatever it does to the bandwidth figure."
+        } else if gibs < 8.0 {
+            "Slow enough to be worth attention — check whether these are 64 MiB write_buffer fills, which measured ~32 GiB/s on this hardware, or per-swap mapped buffers, which measured 4-14 because buffer CREATION dominates the copy."
+        } else {
+            "Uploads are a real share of wall time and already running at the fast rate; the lever is fewer bytes, not a faster path."
+        }
+    );
+}
+
 fn report_commit_rate(forwards: usize, committed: usize, tau: Option<f32>) {
     if forwards == 0 { return; }
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -19260,12 +19327,22 @@ cannot sample from a readout that does not exist.", lg.len(), hi - w0));
                 // generation runs to its ceiling describes the rare case.
                 report_recompute(forwards, rows_forwarded, rows_reused);
                 report_commit_rate(forwards, committed, tau);
+                // No wall clock is in scope here, and inventing one would make the
+                // share a guess. Passing 0.0 suppresses the percentage and still
+                // prints the bytes and the rate, which are the parts that do not
+                // depend on knowing the denominator.
+                report_upload_cost(0.0);
                 return Ok(tokens.split_off(n_ctx));
             }
             if !keep_going || cancel() {
                 tokens.truncate(hi);
                 report_recompute(forwards, rows_forwarded, rows_reused);
                 report_commit_rate(forwards, committed, tau);
+                // No wall clock is in scope here, and inventing one would make the
+                // share a guess. Passing 0.0 suppresses the percentage and still
+                // prints the bytes and the rate, which are the parts that do not
+                // depend on knowing the denominator.
+                report_upload_cost(0.0);
                 return Ok(tokens.split_off(n_ctx));
             }
         }
