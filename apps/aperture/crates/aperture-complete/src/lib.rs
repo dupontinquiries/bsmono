@@ -19,6 +19,7 @@
 pub mod edit;
 pub mod engine;
 pub mod providers;
+pub mod route_ai;
 
 /// What the provider sees. `prefix`/`suffix` are already budget-trimmed
 /// (see [`make_request`]); `lang` is a lowercase tag like "rust".

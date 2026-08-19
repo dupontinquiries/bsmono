@@ -25,6 +25,12 @@
 //!   workspace": the same per-file outline the symbol popup uses, run over
 //!   every walked file so a name search jumps across the tree, not just the
 //!   open file. A name index, not semantic go-to-definition.
+//! * [`route`] (feature `tree-sitter`) — "go to via route": the instant,
+//!   deterministic tier of a natural-language "go to" search — score
+//!   [`workspace_symbols`] + file content against a query's keywords,
+//!   return a short ranked list with a one-line description each. Modeled
+//!   on logscope's `filesummary.rs` two-tier design; the AI-assisted
+//!   second tier is `aperture_complete::route_ai`.
 //!
 //! No egui, no sockets, no threads. `cargo test -p aperture-core` runs the
 //! whole editing model headless in well under a second — that is the point.
@@ -49,6 +55,8 @@ pub mod width;
 pub mod ts;
 #[cfg(feature = "tree-sitter")]
 pub mod workspace_symbols;
+#[cfg(feature = "tree-sitter")]
+pub mod route;
 
 pub use buffer::{Buffer, Pos};
 pub use editor::{Editor, Selection};

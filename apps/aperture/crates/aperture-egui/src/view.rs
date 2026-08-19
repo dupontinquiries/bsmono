@@ -671,6 +671,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                         Mode::OpenFile => "path to open…",
                         Mode::ProjectSearch => "text to find in project…",
                         Mode::WorkspaceSymbol => "symbol name…",
+                        Mode::GoToRoute => "describe what you're looking for…",
                     };
                     let edit = egui::TextEdit::singleline(&mut p.input)
                         .hint_text(hint)
@@ -859,6 +860,59 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 ui.label(egui::RichText::new("no match").color(colors.text_weak).italics());
                             }
                         }
+                        Mode::GoToRoute => {
+                            let cands = aperture_core::route::candidates(&p.root, &p.files, &p.symbols, &p.input, 8);
+                            if !cands.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("↑↓ navigate · Enter jump · Esc cancel — describe what you're looking for, not a name")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(cands.len() - 1);
+                                }
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for (i, c) in cands.iter().enumerate() {
+                                        let selected = i == p.selected;
+                                        let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                        let text_color = if selected { colors.text } else { colors.text_weak };
+                                        let row = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0);
+                                        let kind_glyph = match c.kind {
+                                            aperture_core::route::RouteKind::Symbol => "\u{0192}", // ƒ — a symbol hit
+                                            aperture_core::route::RouteKind::Text => "\u{201C}",    // “ — a text hit
+                                        };
+                                        let resp = row
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(egui::RichText::new(kind_glyph).color(colors.accent).small());
+                                                        ui.label(egui::RichText::new(&c.label).color(text_color).strong().monospace());
+                                                        ui.label(egui::RichText::new(format!("{}:{}", c.rel, c.line + 1)).color(colors.text_weak).small());
+                                                    });
+                                                    if !c.snippet.is_empty() {
+                                                        ui.label(egui::RichText::new(&c.snippet).color(colors.text_weak).small());
+                                                    }
+                                                });
+                                            })
+                                            .response
+                                            .interact(Sense::click());
+                                        if resp.clicked() {
+                                            open_hit = Some((c.path.clone(), c.line));
+                                        }
+                                    }
+                                });
+                                if enter {
+                                    let i = p.selected.min(cands.len() - 1);
+                                    open_hit = Some((cands[i].path.clone(), cands[i].line));
+                                }
+                            } else if !p.input.trim().is_empty() {
+                                ui.label(egui::RichText::new("no keyword matches — try different words").color(colors.text_weak).italics());
+                            }
+                        }
                     }
                 });
         });
@@ -911,6 +965,7 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::M => K::M,
         EK::H => K::H,
         EK::T => K::T,
+        EK::G => K::G,
         EK::F => K::F,
         EK::F3 => K::F3,
         EK::Space => K::Space,

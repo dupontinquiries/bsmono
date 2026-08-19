@@ -55,6 +55,7 @@ pub enum K {
     M,
     H,
     T,
+    G,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -1207,6 +1208,7 @@ impl AppState {
             (F, true) if shift => self.open_project_search(),
             (F, true) => self.open_find(),
             (T, true) => self.open_workspace_symbol(),
+            (G, true) => self.open_go_to_route(),
             (H, true) => self.open_find_with_replace(),
             (E, true) => self.toggle_follow(now_ms),
             (Comma, true) => self.rev_step(1, now_ms),
@@ -1419,6 +1421,14 @@ impl AppState {
         let root = self.workspace_root();
         let files = crate::file_finder::walk_files(&root, 4000);
         self.palette = Some(crate::palette_ui::PaletteState::workspace_symbol(root, files));
+        self.ghost.dismiss();
+        self.debounce.cancel();
+    }
+
+    fn open_go_to_route(&mut self) {
+        let root = self.workspace_root();
+        let files = crate::file_finder::walk_files(&root, 4000);
+        self.palette = Some(crate::palette_ui::PaletteState::go_to_route(root, files));
         self.ghost.dismiss();
         self.debounce.cancel();
     }

@@ -168,6 +168,27 @@ Session scope was: rope core + invertible-Op history, line-lexer syntax,
 ghost-text completion loop (ollama FIM / subprocess / demo), smooth-camera
 egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
 
+- **"Go to via route" (Ctrl+G)** — DONE, deterministic tier: `aperture_core::
+  route::candidates(root, files, symbols, query, limit)` scores the workspace
+  symbol index + file content against a natural-language query's keywords
+  ("finding the button on the wizard page for account setup" → keyword set
+  {button, wizard, page, account, setup}, symbol-name hits weighted over
+  text hits), returns a ranked, capped list with a one-line description
+  each. Modeled directly on logscope's `filesummary.rs` two-tier design
+  (structural digest = instant/deterministic; model summary = background/
+  cached). Wired into the palette (`Mode::GoToRoute`) with real jump-to-line.
+  7 tests, `cargo test -p aperture-core --features tree-sitter`: 73/73.
+  **AI tier built but not wired to a live model**: `aperture_complete::
+  route_ai` is the request-builder + pending/fulfill cache half (prompt
+  construction, content-hash-keyed dedup, `take_pending`/`fulfill` — the
+  same servicing-seam shape as `filesummary.rs`'s worker-drains-a-queue
+  pattern), 4 tests, `cargo test -p aperture-complete`: 23/23. No worker
+  thread lives in aperture-complete (same reason `edit.rs` only builds a
+  request, not a full engine wire-up: verifying a live model call needs a
+  running provider this crate can't stand up or test itself). Wiring a
+  real worker against `Engine`/`Provider` (the same pair ghost completion
+  already uses) into the egui shell is the next step, not attempted here.
+
 - **Instruct-edit shell wiring**: `aperture-complete::edit::make_edit_request`
   (headless, tested) packs an instruction + selection into the existing
   `CompletionRequest` envelope for `CommandProvider` — the request-building
