@@ -48,6 +48,14 @@ pub struct Config {
     // --- paths ---
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
+    /// How many decoded clips the cache may hold, as a multiple of the batch.
+    ///
+    /// The cache exists so a batch does not re-decode; it does not need the
+    /// whole library on disk. At 5,630 sources a full cache is tens of
+    /// gigabytes of mel for a trainer that reads `batch_size` clips at a time.
+    /// Zero means unbounded, which is the old behaviour and still right for a
+    /// small set.
+    pub cache_batches: usize,
     pub ckpt_dir: PathBuf,
     pub audio_exts: Vec<String>,
 }
@@ -84,6 +92,10 @@ impl Default for Config {
 
             data_dir: PathBuf::from("./data"),
             cache_dir: PathBuf::from("./cache"),
+            // 32 batches of headroom: enough that a sampler drawing randomly
+            // keeps hitting warm clips, small enough that the cache stays a
+            // working set rather than a copy of the library.
+            cache_batches: 32,
             ckpt_dir: PathBuf::from("./checkpoints"),
             audio_exts: ["opus", "ogg", "wav", "flac", "mp3", "m4a", "aac"]
                 .iter()

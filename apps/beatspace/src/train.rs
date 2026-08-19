@@ -18,8 +18,32 @@ use crate::model::{
 };
 
 pub fn run(cfg: &Config, resume: bool) -> Result<()> {
+    // DEVICE, AND WHY.
+    //
+    // `--features gpu` does not affect training and never did: that feature
+    // builds `src/gpu.rs`, a wgpu path for GENERATOR INFERENCE. Training runs
+    // on candle, whose backends are CUDA and Metal — neither of which exists
+    // on Asahi, where the Apple GPU is reached through Vulkan.
+    //
+    // So "device: Cpu" was accurate and read as a bug, because the flag that
+    // was passed implied it should have been something else. Saying which
+    // backend was looked for, and that the flag is inference-only, is the
+    // difference between a limitation and a fault.
     let dev = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
-    println!("[train] device: {:?}", dev);
+    match &dev {
+        Device::Cpu => {
+            println!("[train] device: Cpu");
+            #[cfg(feature = "gpu")]
+            println!(
+                "[train] note: --features gpu builds the wgpu GENERATOR path, not training. \
+                 candle trains on CUDA or Metal; on Asahi the Apple GPU is Vulkan-only, so \
+                 there is no candle backend for it and CPU is the whole menu."
+            );
+            #[cfg(not(feature = "gpu"))]
+            println!("[train] note: no CUDA device found; candle has no Vulkan backend");
+        }
+        other => println!("[train] device: {other:?}"),
+    }
 
     fs::create_dir_all(&cfg.ckpt_dir)?;
     cfg.save_json(&cfg.ckpt_dir.join("config.json"))
