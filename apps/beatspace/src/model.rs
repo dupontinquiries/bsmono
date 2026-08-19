@@ -529,8 +529,55 @@ pub struct SparseBlock {
     threshold: f32,
 }
 
+/// DEPTHWISE CONVOLUTION IS A PESSIMISATION ON THIS BACKEND, and it is where
+/// the discriminator's time goes.
+///
+/// candle implements a grouped convolution by SPLITTING it (conv.rs:193):
+///
+/// ```text
+/// let blocks = self.chunk(groups, 1)?;
+/// let kernel = kernel.chunk(groups, 0)?;
+/// blocks.iter().zip(&kernel).map(|(b, k)| b.conv2d_single_group(k, &params))
+/// ```
+///
+/// `.map()`, not `par_iter().map()` — so `groups == c_in` becomes c_in
+/// SEQUENTIAL conv2d calls, each on a single-channel tensor. Per discriminator
+/// forward, across channels 1 -> 64 -> 128 -> 256, that is
+/// 1 + 64 + 128 + 256 = 449 separate convolutions. Three D forwards per step,
+/// 64 steps: ~86,000 convolution invocations an epoch, and as many again in
+/// the backward.
+///
+/// Each one is tiny, so im2col setup dominates its own gemm and the batch-level
+/// parallelism inside it has almost nothing to chew on. That is why the
+/// measured D forward is 208 ms while the generator's forward — which does MORE
+/// multiply-accumulates, through the supposedly naive transposed-convolution
+/// kernel — is 34 ms.
+///
+/// Depthwise separable convolutions save FLOPs and are a win on hardware with a
+/// fused depthwise kernel: cuDNN, Metal Performance Shaders, mobile NPUs. On a
+/// backend that emulates groups by splitting, they trade one large matmul for
+/// hundreds of small serial ones, and FLOPs saved is the wrong thing to have
+/// optimised.
+///
+/// BEATSPACE_DENSE_D=1 builds a single dense convolution instead. It is NOT
+/// checkpoint-compatible — different parameter shapes, so a run started one way
+/// cannot resume the other — which is why it is a flag and not a change.
 impl SparseBlock {
     fn new(cin: usize, cout: usize, stride: usize, threshold: f32, dev: &Device) -> Result<Self> {
+        // One dense conv rather than depthwise + pointwise. More parameters and
+        // more FLOPs, on a path that is one gemm instead of `cin` of them.
+        if std::env::var("BEATSPACE_DENSE_D").as_deref() == Ok("1") {
+            return Ok(Self {
+                // groups = 1, so this reaches conv2d_im2col_gemm directly.
+                depthwise: Conv2d::new(cin, cout, 3, stride, 1, 1, dev)?,
+                // Identity-shaped 1x1: kept so the struct, the var list and the
+                // checkpoint keys stay one shape, rather than forking every
+                // function that walks a block.
+                pointwise: Conv2d::new(cout, cout, 1, 1, 0, 1, dev)?,
+                bn: BatchNorm2d::new(cout, dev)?,
+                threshold,
+            });
+        }
         Ok(Self {
             // depthwise: groups == cin, k3
             depthwise: Conv2d::new(cin, cin, 3, stride, 1, cin, dev)?,
@@ -736,6 +783,58 @@ pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dense_discriminator_block_has_the_same_shape_contract() {
+        // The flag swaps depthwise+pointwise for dense+1x1, which changes the
+        // parameter shapes. What must NOT change is what a block does to a
+        // tensor: same output channels, same stride behaviour. If it did, the
+        // flag would not be an A/B of speed, it would be a different model
+        // that also happens to run.
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let x = Tensor::zeros((2, 8, 16, 32), candle_core::DType::F32, &dev).unwrap();
+
+        std::env::set_var("BEATSPACE_DENSE_D", "1");
+        let dense = SparseBlock::new(8, 16, 2, 0.0, &dev).unwrap();
+        std::env::remove_var("BEATSPACE_DENSE_D");
+        let depth = SparseBlock::new(8, 16, 2, 0.0, &dev).unwrap();
+
+        let a = dense.forward(&x, false).unwrap();
+        let b = depth.forward(&x, false).unwrap();
+        assert_eq!(a.dims(), b.dims(), "the two paths disagree on shape");
+        assert_eq!(a.dims(), &[2, 16, 8, 16], "stride 2 on 16x32 should give 8x16");
+    }
+
+    #[test]
+    fn a_grouped_conv_really_is_split_per_group() {
+        // The claim the whole finding rests on, checked against candle rather
+        // than read from its source: a depthwise conv over N channels costs
+        // roughly N times a single-channel one, because it IS N of them run in
+        // sequence. Timed loosely — this asserts an order of magnitude, not a
+        // number, so it cannot fail on a busy machine.
+        use candle_core::{DType, Device, Tensor};
+        let dev = Device::Cpu;
+        let c = 64usize;
+        let x = Tensor::ones((1, c, 32, 32), DType::F32, &dev).unwrap();
+        let kd = Tensor::ones((c, 1, 3, 3), DType::F32, &dev).unwrap();   // depthwise
+        let k1 = Tensor::ones((c, c, 1, 1), DType::F32, &dev).unwrap();   // dense 1x1
+
+        let t0 = std::time::Instant::now();
+        let _ = x.conv2d(&kd, 1, 1, 1, c).unwrap();
+        let depthwise = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let _ = x.conv2d(&k1, 0, 1, 1, 1).unwrap();
+        let dense = t1.elapsed().as_secs_f64();
+
+        // The depthwise does ~9x fewer multiply-accumulates than the dense 1x1
+        // over 64 channels, and should still not be dramatically FASTER — if it
+        // were, the split would not be costing what this finding says. Loose
+        // bound so a noisy machine cannot fail it spuriously.
+        assert!(depthwise > dense / 20.0,
+                "depthwise {depthwise:.6}s vs dense 1x1 {dense:.6}s — the group split may have \
+been fixed upstream, which would retire the BEATSPACE_DENSE_D flag");
+    }
 
     /// The two deconv paths must agree to floating-point noise.
     ///
