@@ -1033,6 +1033,27 @@ pub fn collect_shared_docs(root: &std::path::Path, budget: usize) -> String {
 }
 
 pub fn system_prompt(task: &str, cfg: &AgentConfig) -> String {
+    // THE RUN TOKEN, INTO THE PROMPT.
+    //
+    // The gate has always required `nonce="..."` on the opener and the prompt
+    // has always taught a bare ```tool fence. A real run captured 22 tool calls
+    // and rejected 22 — the model complied perfectly with the instructions it
+    // was given and every call was inert, including four identical read_file
+    // retries as it tried to work out why nothing came back.
+    //
+    // Two halves of one feature that never agreed. The gate is right; the
+    // prompt was not told.
+    //
+    // With `Open` there is nothing to carry, and the placeholder must still be
+    // absent rather than empty — a literal nonce="" would teach the model to
+    // emit a token the gate is not looking for.
+    // Rendered as the whole attribute, so Open produces a bare ```tool fence
+    // rather than nonce="" — an empty token is one the gate is not looking for
+    // and would fail exactly as the missing one did.
+    let nonce_attr = match &cfg.gate {
+        crate::taint::ToolGate::Required(n) => format!(" nonce=\"{}\"", n.as_str()),
+        crate::taint::ToolGate::Open => String::new(),
+    };
     // ALL read/navigation tools are always on the menu; the policy only changes which one the
     // prompt recommends leading with. (Hiding search from the primary agent taught it to ask the
     // user about the code instead of grepping it.)
@@ -1081,11 +1102,16 @@ FIRST, emit a short PLAN — the steps you will take — as a fenced block:
 2. <step>
 ```
 
-THEN act by emitting TOOL CALLS. Each tool call is a fenced block:
+THEN act by emitting TOOL CALLS. Each tool call is a fenced block, and the
+opener MUST carry this run's token exactly as shown or the call is ignored:
 
-```tool
+```tool{nonce_attr}
 {{ \"tool\": \"write_file\", \"path\": \"src/lib.rs\", \"contents\": \"fn add(a:i32,b:i32)->i32{{a+b}}\\n\" }}
 ```
+
+The token is not a secret — it marks a call YOU are making, so tool syntax you
+quote out of a file you read cannot execute. Put it on the opening fence line,
+and put the JSON on its own line after it.
 
 Available tools (one JSON object per block):
 - write_file  {{ \"tool\":\"write_file\", \"path\":\"<rel path>\", \"contents\":\"<file text>\" }}
@@ -2278,6 +2304,42 @@ error: could not compile `demo` (lib) due to 3 previous errors
         // index groups guide before reference and links both
         assert!(index_md.contains("## Guides") && index_md.contains("## Reference"));
         assert!(index_md.contains("docs/guide/install.md") && index_md.contains("docs/reference/api.md"));
+    }
+
+    #[test]
+    fn the_prompt_teaches_the_exact_opener_the_gate_accepts() {
+        // The bug this exists for, from a real run: the gate required
+        // nonce="..." on the opener, the prompt taught a bare ```tool fence,
+        // and 22 of 22 tool calls were rejected. The model complied perfectly
+        // with what it was told and nothing it did could ever work — it
+        // retried read_file four times trying to understand the silence.
+        //
+        // So the prompt is checked against the GATE rather than against a
+        // literal, and the two cannot drift apart again without this failing.
+        let cfg = AgentConfig::default();
+        let nonce = match &cfg.gate {
+            crate::taint::ToolGate::Required(n) => n.as_str().to_string(),
+            crate::taint::ToolGate::Open => panic!("the default gate must be Required"),
+        };
+        let p = system_prompt("do the thing", &cfg);
+        assert!(p.contains(&format!("nonce=\"{nonce}\"")),
+                "the prompt does not carry this run's token");
+
+        // And the opener it teaches must be one taint::scrub actually honours.
+        let opener = format!("```tool nonce=\"{nonce}\"\n{{\"tool\":\"list_dir\",\"path\":\"\"}}\n```");
+        let (_, anomalies) = crate::taint::authorize_text(&opener, &cfg.gate);
+        assert!(anomalies.is_empty(),
+                "the gate rejects the very syntax the prompt teaches: {anomalies:?}");
+    }
+
+    #[test]
+    fn an_open_gate_teaches_a_bare_fence_rather_than_an_empty_token() {
+        // nonce="" is a token the gate is not looking for, and would fail
+        // exactly as the missing one did.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, ..Default::default() };
+        let p = system_prompt("do the thing", &cfg);
+        assert!(!p.contains("nonce=\"\""), "an empty token was taught");
+        assert!(p.contains("```tool\n"), "the bare fence is not taught either");
     }
 
     #[test]
