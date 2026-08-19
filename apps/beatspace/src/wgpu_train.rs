@@ -677,3 +677,254 @@ mod tests {
         assert!((lhs - rhs).abs() < 1e-2, "strided lowering not adjoint: {lhs} vs {rhs}");
     }
 }
+
+// ── batch normalisation ─────────────────────────────────────────────────────
+
+/// BatchNorm2d's backward pass, per channel.
+///
+/// The layer between every deconv in the generator, and the one place where
+/// the gradient is not a matrix multiply. It is also the easiest backward pass
+/// to get subtly wrong: the mean and variance are FUNCTIONS OF THE BATCH, so
+/// changing one sample changes every other sample's normalised value, and a
+/// derivation that treats them as constants produces a gradient that is
+/// directionally right and quantitatively wrong. Training with it converges —
+/// slowly, to somewhere worse — which is the failure mode that costs a week.
+///
+/// For `y = γ·x̂ + β` with `x̂ = (x - μ)/√(σ² + ε)` over N elements per channel:
+///
+/// ```text
+/// dγ = Σ dy·x̂
+/// dβ = Σ dy
+/// dx = γ/√(σ²+ε) · [ dy − (Σdy)/N − x̂·(Σ dy·x̂)/N ]
+/// ```
+///
+/// The two subtracted terms are exactly the coupling through μ and σ². Dropping
+/// them is the mistake above.
+pub fn batchnorm_bwd_wgsl() -> String {
+    format!(
+        r#"
+// One WORKGROUP per channel. The reduction is over the channel's whole plane
+// across the batch, which is far more than one workgroup can hold, so each
+// thread strides through it and a small shared buffer combines the partials.
+//
+// The buffer is {wg} f32 = {kb} KB. Kept small deliberately: an AGX core has
+// ~32 KB of threadgroup memory and reserving most of it pins occupancy to one
+// workgroup per core, which on a memory-bound pass like this is the dominant
+// cost. No subgroupAdd — Honeykrisp can hang on it (see ASAHI_GPU.md).
+
+struct Bn {{
+  channels: u32,
+  // Elements per channel across the whole batch: batch * height * width.
+  per_ch: u32,
+  eps: f32,
+  _pad: u32,
+}};
+
+@group(0) @binding(0) var<storage, read>       xhat  : array<f32>;  // normalised forward value
+@group(0) @binding(1) var<storage, read>       dy    : array<f32>;
+@group(0) @binding(2) var<storage, read>       gamma : array<f32>;
+@group(0) @binding(3) var<storage, read>       istd  : array<f32>;  // 1/sqrt(var+eps), per channel
+@group(0) @binding(4) var<storage, read_write> dx    : array<f32>;
+@group(0) @binding(5) var<storage, read_write> dgamma: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dbeta : array<f32>;
+@group(0) @binding(7) var<uniform>             p     : Bn;
+
+var<workgroup> red_a : array<f32, {wg}u>;
+var<workgroup> red_b : array<f32, {wg}u>;
+
+@compute @workgroup_size({wg}u, 1u, 1u)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+  let ch = wid.x;
+  if (ch >= p.channels) {{ return; }}
+  let base = ch * p.per_ch;
+  let tid = lid.x;
+
+  // Pass one: the two sums this channel needs.
+  var s_dy: f32 = 0.0;
+  var s_dyx: f32 = 0.0;
+  for (var i: u32 = tid; i < p.per_ch; i = i + {wg}u) {{
+    let g = dy[base + i];
+    s_dy = s_dy + g;
+    s_dyx = s_dyx + g * xhat[base + i];
+  }}
+  red_a[tid] = s_dy;
+  red_b[tid] = s_dyx;
+  workgroupBarrier();
+
+  // Tree reduction. Both barriers are required: the second stops a fast thread
+  // from writing the next round while a slow one still reads this one.
+  var stride: u32 = {wg}u / 2u;
+  loop {{
+    if (stride == 0u) {{ break; }}
+    if (tid < stride) {{
+      red_a[tid] = red_a[tid] + red_a[tid + stride];
+      red_b[tid] = red_b[tid] + red_b[tid + stride];
+    }}
+    workgroupBarrier();
+    stride = stride / 2u;
+  }}
+  let sum_dy  = red_a[0];
+  let sum_dyx = red_b[0];
+
+  // The parameter gradients are the sums themselves.
+  if (tid == 0u) {{
+    dgamma[ch] = sum_dyx;
+    dbeta[ch]  = sum_dy;
+  }}
+
+  // Pass two: the input gradient, with the coupling through mean and variance.
+  // Dropping the two subtracted terms gives a gradient that trains — slowly,
+  // to somewhere worse.
+  let n = f32(p.per_ch);
+  let scale = gamma[ch] * istd[ch];
+  for (var i: u32 = tid; i < p.per_ch; i = i + {wg}u) {{
+    let xh = xhat[base + i];
+    dx[base + i] = scale * (dy[base + i] - sum_dy / n - xh * sum_dyx / n);
+  }}
+}}
+"#,
+        wg = WORKGROUP,
+        kb = (WORKGROUP * 4 * 2) / 1024,
+    )
+}
+
+/// CPU reference for `batchnorm_bwd_wgsl`. Returns `(dx, dgamma, dbeta)`.
+pub fn batchnorm_bwd_ref(
+    xhat: &[f32], dy: &[f32], gamma: &[f32], istd: &[f32],
+    channels: usize, per_ch: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut dx = vec![0f32; channels * per_ch];
+    let mut dgamma = vec![0f32; channels];
+    let mut dbeta = vec![0f32; channels];
+    for c in 0..channels {
+        let base = c * per_ch;
+        let (mut s_dy, mut s_dyx) = (0f32, 0f32);
+        for i in 0..per_ch {
+            s_dy += dy[base + i];
+            s_dyx += dy[base + i] * xhat[base + i];
+        }
+        dgamma[c] = s_dyx;
+        dbeta[c] = s_dy;
+        let n = per_ch as f32;
+        let scale = gamma[c] * istd[c];
+        for i in 0..per_ch {
+            dx[base + i] =
+                scale * (dy[base + i] - s_dy / n - xhat[base + i] * s_dyx / n);
+        }
+    }
+    (dx, dgamma, dbeta)
+}
+
+#[cfg(test)]
+mod bn_tests {
+    use super::*;
+
+    #[test]
+    fn the_batchnorm_kernel_compiles() {
+        let src = batchnorm_bwd_wgsl();
+        let module = naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("parse:\n{}", e.emit_to_string(&src)));
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module)
+            .unwrap_or_else(|e| panic!("validate:\n{}", e.emit_to_string(&src)));
+    }
+
+    #[test]
+    fn the_reduction_buffer_stays_off_the_occupancy_cliff() {
+        // Two f32 buffers of WORKGROUP entries. An AGX core has ~32 KB and
+        // reserving most of it pins occupancy to one workgroup per core, which
+        // on a memory-bound pass is the dominant cost.
+        let bytes = WORKGROUP * 4 * 2;
+        assert!(bytes <= 4096, "{bytes} bytes of threadgroup memory");
+        // The tree reduction halves from WORKGROUP, so it must be a power of
+        // two or the last stride drops elements.
+        assert!(WORKGROUP.is_power_of_two(), "{WORKGROUP} breaks the tree reduction");
+    }
+
+    #[test]
+    fn the_batchnorm_gradient_matches_finite_differences() {
+        // The check that matters. A derivation treating mean and variance as
+        // constants is directionally right and quantitatively wrong, and it
+        // TRAINS — slowly, to somewhere worse. Only a numerical derivative of
+        // the real loss catches that.
+        let (channels, per_ch) = (2usize, 12usize);
+        let eps = 1e-5f32;
+        let mut x: Vec<f32> = (0..channels * per_ch)
+            .map(|i| (i as f32 * 0.37).sin() * 2.0)
+            .collect();
+        let gamma: Vec<f32> = vec![1.3, 0.7];
+        let beta: Vec<f32> = vec![0.1, -0.2];
+
+        // Forward, and the loss: a weighted sum, so dy is not all ones and a
+        // sign error cannot cancel.
+        let w: Vec<f32> = (0..channels * per_ch).map(|i| (i as f32 * 0.29).cos()).collect();
+        let forward = |x: &[f32]| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut xhat = vec![0f32; channels * per_ch];
+            let mut istd = vec![0f32; channels];
+            let mut y = vec![0f32; channels * per_ch];
+            for c in 0..channels {
+                let b = c * per_ch;
+                let mean: f32 = x[b..b + per_ch].iter().sum::<f32>() / per_ch as f32;
+                let var: f32 = x[b..b + per_ch].iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                    / per_ch as f32;
+                let is = 1.0 / (var + eps).sqrt();
+                istd[c] = is;
+                for i in 0..per_ch {
+                    xhat[b + i] = (x[b + i] - mean) * is;
+                    y[b + i] = gamma[c] * xhat[b + i] + beta[c];
+                }
+            }
+            (y, xhat, istd)
+        };
+        let loss = |x: &[f32]| -> f32 {
+            let (y, _, _) = forward(x);
+            y.iter().zip(&w).map(|(a, b)| a * b).sum()
+        };
+
+        let (_, xhat, istd) = forward(&x);
+        let dy = w.clone();
+        let (dx, dgamma, dbeta) = batchnorm_bwd_ref(&xhat, &dy, &gamma, &istd, channels, per_ch);
+
+        let h = 1e-3f32;
+        for idx in [0usize, 3, 7, per_ch, per_ch + 5, channels * per_ch - 1] {
+            let orig = x[idx];
+            x[idx] = orig + h;
+            let up = loss(&x);
+            x[idx] = orig - h;
+            let dn = loss(&x);
+            x[idx] = orig;
+            let numeric = (up - dn) / (2.0 * h);
+            assert!((dx[idx] - numeric).abs() < 5e-2,
+                    "dx[{idx}]: analytic {} vs numeric {numeric}", dx[idx]);
+        }
+
+        // And the parameter gradients, which are the plain sums.
+        for c in 0..channels {
+            let b = c * per_ch;
+            let want_g: f32 = (0..per_ch).map(|i| dy[b + i] * xhat[b + i]).sum();
+            let want_b: f32 = (0..per_ch).map(|i| dy[b + i]).sum();
+            assert!((dgamma[c] - want_g).abs() < 1e-4);
+            assert!((dbeta[c] - want_b).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn ignoring_the_batch_coupling_gives_a_visibly_different_gradient() {
+        // Guarding the guard: if the naive gradient happened to match, the
+        // test above would prove nothing. It does not match, by a lot.
+        let (channels, per_ch) = (1usize, 8usize);
+        let xhat: Vec<f32> = (0..per_ch).map(|i| (i as f32 - 3.5) / 2.0).collect();
+        let dy: Vec<f32> = (0..per_ch).map(|i| (i as f32 * 0.7).sin()).collect();
+        let gamma = vec![1.0f32];
+        let istd = vec![1.0f32];
+        let (dx, _, _) = batchnorm_bwd_ref(&xhat, &dy, &gamma, &istd, channels, per_ch);
+        // The naive version: dx = gamma * istd * dy, no coupling terms.
+        let naive: Vec<f32> = dy.clone();
+        let diff: f32 = dx.iter().zip(&naive).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 0.5, "the coupling terms make no difference here: {diff}");
+    }
+}
