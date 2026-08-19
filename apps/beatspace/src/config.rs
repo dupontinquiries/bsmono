@@ -104,10 +104,15 @@ impl Default for Config {
             // keeps hitting warm clips, small enough that the cache stays a
             // working set rather than a copy of the library.
             cache_batches: 32,
-            // 2 GiB: enough that a phone-sized working set is fully resident
-            // and a large library still fills it, without the cache alone
-            // being the reason a 4 GiB device starts swapping.
-            mem_cache_bytes: 2 * 1024 * 1024 * 1024,
+            // 16 GiB as the CEILING, not the target — the real budget is half
+            // of MemAvailable, so a 4 GiB phone still lands around 1.5 GiB and
+            // a workstation can hold a whole rotation window.
+            //
+            // The earlier 2 GiB was too low for the thing this is for. A
+            // 512-clip window at ~10 MiB of mel is ~5 GiB, so a 2 GiB ceiling
+            // meant most of the window still went to disk and the SSD writes
+            // this exists to avoid happened anyway.
+            mem_cache_bytes: 16 * 1024 * 1024 * 1024,
             ckpt_dir: PathBuf::from("./checkpoints"),
             audio_exts: ["opus", "ogg", "wav", "flac", "mp3", "m4a", "aac"]
                 .iter()

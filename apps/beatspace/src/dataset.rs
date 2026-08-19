@@ -83,8 +83,28 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
     // training forever on whichever tracks sort first — which is the actual
     // request, and something a delete-the-overflow scheme could never do
     // because it always kept the same survivors.
-    let budget = if cfg.cache_batches == 0 { usize::MAX }
-                 else { cfg.cache_batches.saturating_mul(cfg.batch_size.max(1)) };
+    // The window is bounded by RAM as well as by the batch multiple, because
+    // the point of the window is to be the thing that FITS. Sizing it past
+    // memory means the tail spills to disk and writes exactly what this is
+    // meant to avoid — the batch multiple sets the ambition and memory sets
+    // the ceiling.
+    let mut budget = if cfg.cache_batches == 0 { usize::MAX }
+                     else { cfg.cache_batches.saturating_mul(cfg.batch_size.max(1)) };
+    let mem = mem_budget(cfg);
+    if mem > 0 && budget != usize::MAX {
+        // A conservative per-clip estimate: the real size is not known until
+        // the clip is decoded, so this uses the observed order of magnitude
+        // (~10 MiB of mel for a 3-minute track at this hop) and lets the
+        // per-clip claim do the exact accounting. Wrong in either direction
+        // only changes how many spill to disk, never correctness.
+        let est_per_clip = 12u64 * 1024 * 1024;
+        let fits = (mem / est_per_clip).max(1) as usize;
+        if fits < budget {
+            println!("[dataset] window capped by memory: {fits} clip(s), not {budget} \
+({:.1} GiB budget at ~{} MiB each)", mem as f64 / 1.073_741_824e9, est_per_clip / 1_048_576);
+            budget = fits;
+        }
+    }
     if sources.len() > budget {
         let start = rotation_offset(cfg, sources.len());
         let window: Vec<PathBuf> = (0..budget)
@@ -97,6 +117,11 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
     }
 
     // 2. build cache in parallel (skip ones already cached & up to date)
+    // The budget, set before the workers start. Everything that fits is held
+    // and never written; the rest falls back to .bspc files.
+    MEM_LEFT.store(mem_budget(cfg), std::sync::atomic::Ordering::Relaxed);
+    let mem_start = mem_budget(cfg);
+
     let done = AtomicUsize::new(0);
     let total = sources.len();
     let results: Vec<Option<ClipMeta>> = sources
@@ -125,37 +150,15 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
         clips.len(),
         cfg.time_frames
     );
-    // RESIDENCY: hold what fits, in order, and leave the rest on disk.
-    //
-    // Partial rather than all-or-nothing. A 3-minute track at this hop is
-    // ~10 MiB of mel, so a few hundred of them is tens of gigabytes and the
-    // all-or-nothing question answers itself with "no" on every real library —
-    // which would mean the feature never engages. Filling the budget and
-    // falling back per clip means a phone holds a few and a workstation holds
-    // the lot, from the same code.
-    let budget_bytes = mem_budget(cfg);
-    if budget_bytes > 0 {
-        let mut used = 0u64;
-        let mut held = 0usize;
-        for c in clips.iter_mut() {
-            let need = (c.t as u64) * (cfg.n_mels as u64) * 4;
-            if used + need > budget_bytes { continue; }
-            match read_clip_body(&c.path, c.t, cfg.n_mels) {
-                Ok(v) => {
-                    c.resident = Some(std::sync::Arc::new(v));
-                    used += need;
-                    held += 1;
-                }
-                // A clip that will not read is left on disk rather than
-                // failing the run: random_crop will hit the same error and
-                // report it against the sample that needed it.
-                Err(_) => continue,
-            }
-        }
-        if held > 0 {
-            println!("[dataset] in memory: {held} of {} clip(s), {:.1} MiB of a {:.1} MiB budget",
-                     clips.len(), used as f64 / 1.048_576e6, budget_bytes as f64 / 1.048_576e6);
-        }
+    // Residency happened during the build, not after it: build_one claims from
+    // the shared budget and keeps the mel it just computed rather than writing
+    // it out and reading it back. A post-hoc pass would have written every file
+    // first, which is the cost being avoided.
+    let held = clips.iter().filter(|c| c.resident.is_some()).count();
+    if held > 0 {
+        let used = mem_start.saturating_sub(MEM_LEFT.load(std::sync::atomic::Ordering::Relaxed));
+        println!("[dataset] in memory: {held} of {} clip(s), {:.1} MiB — {} disk write(s) avoided",
+                 clips.len(), used as f64 / 1.048_576e6, held);
     }
 
     // Evict only what THIS run is not using. The live paths are passed in
@@ -241,6 +244,28 @@ fn path_hash(p: &Path) -> u64 {
 
 /// Decode + mel + write cache for one source. Returns Ok(Some(meta)) if usable,
 /// Ok(None) if the clip is too short to crop.
+/// Bytes still available to hold clips in RAM this run.
+///
+/// Shared across the rayon workers, so the decision "RAM or disk" is made once
+/// per clip against a live total rather than each thread assuming it has the
+/// whole budget.
+static MEM_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Claim `n` bytes, or fail. Compare-and-swap rather than fetch_sub, because
+/// fetch_sub on a u64 that is about to go negative wraps to an enormous number
+/// and every subsequent clip would think it had room.
+fn claim_mem(n: u64) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let mut cur = MEM_LEFT.load(Relaxed);
+    loop {
+        if cur < n { return false; }
+        match MEM_LEFT.compare_exchange_weak(cur, cur - n, Acquire, Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
     let cache = cache_path(src, cfg);
 
@@ -265,6 +290,12 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
         // A header with the real frame count IS the record: try_read_header
         // reads it back, sees t < time_frames, and returns Ok(None) without
         // touching the audio.
+        //
+        // THIS ONE IS WORTH THE WRITE and the others are not. It is 12 bytes,
+        // it is written once per rejected clip ever rather than once per
+        // rotation, and what it buys is not re-decoding a whole file to learn
+        // again that it is too short. The full-mel writes below are megabytes
+        // for data that is already in hand; this is a tombstone.
         let mut file = File::create(&cache)?;
         file.write_all(MAGIC)?;
         file.write_all(&(cfg.n_mels as u32).to_le_bytes())?;
@@ -279,6 +310,22 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
         for f in 0..t {
             tdata[f * n_mels + m] = data[m * t + f];
         }
+    }
+
+    // RAM FIRST, AND THEN NO WRITE AT ALL.
+    //
+    // The point is not saving a syscall per sample — it is not spending SSD
+    // WRITE ENDURANCE to cache audio that fits in memory. And the rotation
+    // added a commit ago makes that worse rather than better: each run caches a
+    // DIFFERENT window, so a 664-clip library at ~10 MiB of mel per clip writes
+    // gigabytes per full cycle, forever, for data that is derived and
+    // reproducible from the source files.
+    //
+    // So a clip that fits in the budget is held and never written. The .bspc
+    // file is the FALLBACK for what does not fit, not the primary store.
+    let need = (t as u64) * (n_mels as u64) * 4;
+    if claim_mem(need) {
+        return Ok(Some(ClipMeta { path: cache, t, resident: Some(std::sync::Arc::new(tdata)) }));
     }
 
     let mut file = File::create(&cache)?;
@@ -606,6 +653,35 @@ mod tests {
         // On Linux this is real; the assertion that holds either way is that it
         // never exceeds the configured ceiling.
         assert!(b <= cfg.mem_cache_bytes, "{b} exceeds the ceiling");
+    }
+
+    #[test]
+    fn a_clip_that_fits_in_memory_writes_no_file() {
+        // The actual point. Not saving a syscall per sample — not spending SSD
+        // WRITE ENDURANCE on a mel cache that is derived data, reproducible
+        // from the source audio, and fits in RAM.
+        //
+        // The rotation makes this sharper rather than softer: each run caches a
+        // different window, so a 664-clip library writes gigabytes per full
+        // cycle if the writes are not avoided.
+        MEM_LEFT.store(64 * 1024 * 1024, std::sync::atomic::Ordering::Relaxed);
+        assert!(claim_mem(1024 * 1024), "a small clip should fit");
+        assert!(claim_mem(60 * 1024 * 1024), "and so should a large one");
+        assert!(!claim_mem(64 * 1024 * 1024), "but not past the budget");
+    }
+
+    #[test]
+    fn an_exhausted_budget_does_not_wrap_into_an_enormous_one() {
+        // fetch_sub on a u64 about to go negative wraps to ~1.8e19 and every
+        // subsequent clip would believe it had room — holding the entire
+        // library in RAM and getting the process killed. The claim is a
+        // compare-and-swap for exactly this.
+        MEM_LEFT.store(100, std::sync::atomic::Ordering::Relaxed);
+        assert!(!claim_mem(101));
+        assert_eq!(MEM_LEFT.load(std::sync::atomic::Ordering::Relaxed), 100,
+                   "a refused claim must not move the counter");
+        assert!(claim_mem(100));
+        assert!(!claim_mem(1), "nothing left means nothing left");
     }
 
     #[test]
