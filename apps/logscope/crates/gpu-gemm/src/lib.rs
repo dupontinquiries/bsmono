@@ -753,6 +753,34 @@ pub fn dims_retain_polls() -> u64 { DIMS_RETAIN_POLLS.load(std::sync::atomic::Or
 pub fn dims_cache_misses() -> u64 { DIMS_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
 /// Buffer-pool accounting: a MISS is a real `create_buffer` (allocation churn — the other half of
 /// "upload locking"); a HIT recycles a same-size buffer freed by a dropped Tensor. Hardware-independent.
+/// Reusable MAP_READ staging buffers, keyed by exact size.
+///
+/// Every readback allocated a fresh one. In AR decode that is a buffer object
+/// per sampled token; in block diffusion it is one per FORWARD, and each is the
+/// full logits window — 81 rows x 152k vocab x 4 bytes is ~49 MiB on
+/// DiffuCoder, created and destroyed thousands of times a run.
+///
+/// The engine's own governor already counts buffer OBJECTS as the scarce
+/// resource on this driver ("baseline_objects at 6400"), and creation is not
+/// free: the expert-stream probe measured per-swap buffer creation dominating
+/// the memcpy at 4-14 GiB/s against write_buffer's 32.
+///
+/// Keyed by EXACT size rather than a size class: a readback maps the whole
+/// buffer, and handing back a larger one would map more than was copied and
+/// read stale bytes past the end. Two entries per size is enough for the
+/// double-buffered case and bounds the objects held.
+/// PER-GPU, NOT A PROCESS STATIC. A buffer belongs to the device that made it,
+/// and a global pool hands a dead one to the next device — which the test suite
+/// caught immediately, because it builds a Gpu per test:
+///
+///     Buffer[Id(1,1)] is no longer alive
+///
+/// In production there is one device, so this would have sat quiet until the
+/// first device loss or OOM recovery recreated it, and then failed inside an
+/// unrelated readback. It lives on `Gpu` now, so its lifetime is the device's
+/// by construction.
+type StagingPool = Mutex<std::collections::HashMap<u64, Vec<wgpu::Buffer>>>;
+
 /// Buffer identities, handed out once at creation and never reused.
 pub static POOL_BID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -941,6 +969,8 @@ pub struct Gpu {
     /// for the per-position dims that would otherwise create a new Metal buffer every dispatch. `(buffers,
     /// next_index, writes_since_fence)`. Lazily filled up to DIMS_RING_SIZE. Caps total dims buffer count.
     dims_ring: Mutex<(Vec<std::sync::Arc<wgpu::Buffer>>, usize, usize)>,
+    /// Reusable MAP_READ staging buffers, keyed by exact size. See StagingPool.
+    staging: StagingPool,
     /// Backend-agnostic resource governor: knows this device's budget shape (Metal buffer-objects /
     /// Vulkan allocation-count / …) and self-tunes the safe windowed-decode k from live pressure, so the
     /// window never marches into the device's ceiling. Replaces the hardcoded LOGSCOPE_WINDOW_MAX guess.
@@ -1540,7 +1570,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -3452,14 +3482,41 @@ impl Gpu {
     /// `#[track_caller]` so the diagnostic attributes each readback to the code that ASKED for it.
     /// Without it the tally names this line 53 times and answers nothing.
     #[track_caller]
+    /// Take a staging buffer of exactly `bytes`, reusing a free one.
+    ///
+    /// Exact size, not a size class: a readback maps the WHOLE buffer, so a
+    /// larger one would map past what was copied and return stale bytes — a
+    /// wrong number rather than an error.
+    fn staging_take(&self, bytes: u64, label: &'static str) -> wgpu::Buffer {
+        if let Ok(mut g) = self.staging.lock() {
+            if let Some(v) = g.get_mut(&bytes) {
+                if let Some(b) = v.pop() { return b; }
+            }
+        }
+        self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false })
+    }
+
+    /// Give one back. AFTER `unmap`, never before — a still-mapped buffer
+    /// handed to the next readback fails its own map_async.
+    fn staging_give(&self, bytes: u64, buf: wgpu::Buffer) {
+        if let Ok(mut g) = self.staging.lock() {
+            let v = g.entry(bytes).or_default();
+            if v.len() < 2 { v.push(buf); }
+        }
+    }
+
     pub fn download(&self, t: &Tensor) -> Vec<f32> {
         crate::framediag::note_download();
         // Post-OOM safety (see download_u32): mapping a buffer that failed to allocate is a fatal wgpu
         // error, so bail early with an empty result once the device has signalled OOM this step.
         if self.oom_backoff() { return Vec::new(); }
         let bytes = (t.len() * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl"), size: bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // Pooled. On the diffusion path this is one ~49 MiB buffer per FORWARD
+        // — created and destroyed thousands of times a run — and on AR decode
+        // one per sampled token.
+        let staging = self.staging_take(bytes, "dl");
         // If a frame is open, append the readback copy to it and flush the whole frame in one
         // submit. frame.keep (dims uniforms + bind groups) is RETAINED past the submit — it's async,
         // and dropping it before the poll below recycles buffers the GPU is still reading → "Buffer
@@ -3494,6 +3551,9 @@ impl Gpu {
         let data = slice.get_mapped_range();
         let v = bytemuck::cast_slice(&data).to_vec();
         drop(data); staging.unmap();
+        // AFTER unmap, never before: a still-mapped buffer handed to the next
+        // readback fails its own map_async.
+        self.staging_give(bytes, staging);
         check_stall(t_dl_poll, 0);   // a readback that waited seconds is a hang, not a slow kernel
         self.clear_retained(); // poll waited for completion → retained dims/bind-groups are safe to free
         // REOPEN THE FRAME. Taking it above is necessary — the readback has to be submitted to be read —
@@ -4250,7 +4310,27 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
             }
             frame.keep.push(Keep::Bg(bg.clone())); // Arc<BindGroup> kept until flush (cached or fresh)
             if let Some(d) = dbuf { frame.keep.push(Keep::Buf(d.clone())); } // AND its dims uniform Arc
-            frame.passes += 1;
+            // COUNTS DISPATCHES, and the name is the only thing wrong with it.
+            //
+            // I read this as an accounting bug — fused, every dispatch becomes
+            // one pass at drain, so counting dispatches means flush_every fires
+            // after 32 of them and the frame submits as often as unfused — and
+            // changed it to advance once per drain. That was wrong, and worth
+            // recording rather than quietly reverting.
+            //
+            // flush_every does not bound PASS OBJECTS, it bounds SUBMIT
+            // DURATION, so that a compositor sharing this GPU can land a flip
+            // between chunks. Its own constant says so: "Frame batching
+            // collapsed a token to a single ~129ms submit, which on a shared
+            // GPU starves the compositor and shows as screen artifacts."
+            // Dispatches are the proxy for duration; passes are not. Counting
+            // drains would have let a fused interactive frame grow to one
+            // enormous submit and brought the artifacts back.
+            //
+            // The workloads that genuinely want one submit per step are already
+            // exempt by another route: `!frame.batch`. Denoise steps and oracle
+            // stats set batch, so they never hit this at all, which is where
+            // the diffusion path's submits should fall.
             let over_flush = !frame.batch && frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
             let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
             if over_flush || over_retain {

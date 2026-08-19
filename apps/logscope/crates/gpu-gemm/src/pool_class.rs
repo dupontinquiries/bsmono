@@ -405,3 +405,65 @@ computes a layer with part of its work missing:\n{}",
         }
     }
 }
+
+#[cfg(test)]
+mod staging_pool_tests {
+    /// The staging pool's contract, without a GPU.
+    ///
+    /// Modelled on integers because the property is about the CONTAINER: exact
+    /// size keying, a bound on retained objects, and reuse in preference to
+    /// creation. Whether wgpu is happy to remap a buffer is a different
+    /// question and one only hardware answers.
+    fn take(pool: &mut std::collections::HashMap<u64, Vec<u32>>, bytes: u64,
+            next: &mut u32) -> u32 {
+        if let Some(v) = pool.get_mut(&bytes) {
+            if let Some(b) = v.pop() { return b; }
+        }
+        *next += 1;
+        *next
+    }
+    fn give(pool: &mut std::collections::HashMap<u64, Vec<u32>>, bytes: u64, b: u32) {
+        let v = pool.entry(bytes).or_default();
+        if v.len() < 2 { v.push(b); }
+    }
+
+    #[test]
+    fn a_repeated_readback_of_one_size_creates_a_single_buffer() {
+        // The diffusion case: one ~49 MiB logits readback per forward, the same
+        // size every time. Without a pool that is a buffer object created and
+        // destroyed per forward, and this driver's governor already treats
+        // buffer objects as the scarce resource.
+        let (mut pool, mut next) = (Default::default(), 0u32);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let b = take(&mut pool, 49_000_000, &mut next);
+            seen.insert(b);
+            give(&mut pool, 49_000_000, b);
+        }
+        assert_eq!(seen.len(), 1, "a same-size readback loop created {} buffers", seen.len());
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn sizes_never_share_a_buffer() {
+        // Exact-size keying, not a size class. A readback maps the WHOLE
+        // buffer, so a larger one handed to a smaller request would map past
+        // what was copied and return stale bytes — a wrong number, not an
+        // error.
+        let (mut pool, mut next) = (Default::default(), 0u32);
+        let big = take(&mut pool, 1024, &mut next);
+        give(&mut pool, 1024, big);
+        let small = take(&mut pool, 512, &mut next);
+        assert_ne!(big, small, "a 1024-byte buffer was reused for a 512-byte read");
+    }
+
+    #[test]
+    fn the_pool_is_bounded_per_size() {
+        // A run whose readback sizes vary — a growing context — must not
+        // accumulate objects without limit; that is the exhaustion the ring
+        // elsewhere in this engine exists to prevent.
+        let mut pool: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        for i in 0..50 { give(&mut pool, 4096, i); }
+        assert_eq!(pool[&4096].len(), 2, "the per-size cap did not hold");
+    }
+}
