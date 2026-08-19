@@ -9,6 +9,7 @@ pub mod appcatalog;
 pub mod browse;
 pub mod bttransfer;
 pub mod buildflags;
+pub mod build_report;
 pub mod buildsystem;
 pub mod daemons;
 pub mod deploy;

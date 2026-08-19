@@ -402,31 +402,50 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     // Reported missing from "all apps" and never added. Both walk
     // `store_groups()`, which is the same list the catalog above renders — so
     // "all" cannot drift from what the page shows.
+    //
+    // Layout: on a narrow screen a row of six buttons (build all / test all /
+    // copy log / copy errors / copy times / export) doesn't fit — so narrow
+    // unifies all six into ONE press-hold matrix (`fleet_actions::full_menu`,
+    // the same `uikit_egui::slide_menu` widget voiceterm-egui's block-row
+    // "⋯" menu uses). Wide keeps the two dedicated buttons (muscle memory,
+    // one tap instead of hold-then-pick) and adds a small "⋯" matrix next to
+    // them for just the four copy/export actions, which never had ANY UI
+    // before this — `fleet_actions::utility_menu`.
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
+    let compact = uikit_egui::adaptive::Adaptive::detect(ui.ctx()).is_compact();
     ui.horizontal(|ui| {
         let idle = !app.task.is_running();
-        if ui.add_enabled(idle, egui::Button::new("build all")).clicked() {
-            app.task.run_logged(move |sink| {
-                let mut on_line = |l: &str| sink.push(l);
-                let (ok, failed) = cockpit::flow::build_all_logged(&mut on_line);
-                // Report BOTH counts. "built 23 apps" with three silent
-                // failures is the line that makes a broken fleet look healthy.
-                if failed.is_empty() { format!("✓ built {ok} apps") }
-                else { format!("built {ok}, FAILED {}: {}", failed.len(), failed.join(", ")) }
-            });
+        if compact {
+            let host = ui.add_enabled(idle, egui::Button::new("\u{22EF} actions"));
+            let id = egui::Id::new("gitmind-fleet-actions-compact");
+            if let uikit_egui::slide_menu::SlideOutcome::Selected(chosen, _) =
+                uikit_egui::slide_menu::SlideMenu::new(id).columns(3).show_stored(ui, id, &host, &crate::fleet_actions::full_menu())
+            {
+                if let Some(a) = crate::fleet_actions::FleetAction::from_id(&chosen) {
+                    run_fleet_action(a, app, ui);
+                }
+            }
+        } else {
+            if ui.add_enabled(idle, egui::Button::new("build all")).clicked() {
+                run_fleet_action(crate::fleet_actions::FleetAction::BuildAll, app, ui);
+            }
+            if ui.add_enabled(idle, egui::Button::new("test all")).clicked() {
+                run_fleet_action(crate::fleet_actions::FleetAction::TestAll, app, ui);
+            }
+            let host = ui.button("\u{22EF}").on_hover_text("Copy or export the last run's log");
+            let id = egui::Id::new("gitmind-fleet-actions-utility");
+            if let uikit_egui::slide_menu::SlideOutcome::Selected(chosen, _) =
+                uikit_egui::slide_menu::SlideMenu::new(id).columns(2).show_stored(ui, id, &host, &crate::fleet_actions::utility_menu())
+            {
+                if let Some(a) = crate::fleet_actions::FleetAction::from_id(&chosen) {
+                    run_fleet_action(a, app, ui);
+                }
+            }
+            ui.label(egui::RichText::new("runs every app in the catalog, one at a time")
+                .weak().small());
         }
-        if ui.add_enabled(idle, egui::Button::new("test all")).clicked() {
-            app.task.run_logged(move |sink| {
-                let mut on_line = |l: &str| sink.push(l);
-                let (ok, failed) = cockpit::flow::test_all_logged(&mut on_line);
-                if failed.is_empty() { format!("✓ {ok} app suites green") }
-                else { format!("{ok} green, FAILED {}: {}", failed.len(), failed.join(", ")) }
-            });
-        }
-        ui.label(egui::RichText::new("runs every app in the catalog, one at a time")
-            .weak().small());
     });
 
     if let Some(r) = app.task.take_result() {
@@ -459,4 +478,79 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     // The batch layer, under the single-app controls above.
     reroll_ui(app, ui);
+}
+
+/// Run one [`crate::fleet_actions::FleetAction`]. `BuildAll`/`TestAll` start a
+/// new `Task` run exactly as the old dedicated buttons did (same closures,
+/// moved here so both layouts — the wide row and the compact matrix — share
+/// one implementation instead of two copies that could drift). The four
+/// copy/export actions read whatever the `Task` last captured — a build-all,
+/// a test-all, or a per-app build/test alike — so they work regardless of
+/// which button produced the log being inspected.
+fn run_fleet_action(action: crate::fleet_actions::FleetAction, app: &mut App, ui: &mut egui::Ui) {
+    use crate::fleet_actions::FleetAction;
+    match action {
+        FleetAction::BuildAll => {
+            app.task.run_logged(move |sink| {
+                let mut on_line = |l: &str| sink.push(l);
+                let (ok, failed) = cockpit::flow::build_all_logged(&mut on_line);
+                // Report BOTH counts. "built 23 apps" with three silent
+                // failures is the line that makes a broken fleet look healthy.
+                if failed.is_empty() { format!("✓ built {ok} apps") }
+                else { format!("built {ok}, FAILED {}: {}", failed.len(), failed.join(", ")) }
+            });
+        }
+        FleetAction::TestAll => {
+            app.task.run_logged(move |sink| {
+                let mut on_line = |l: &str| sink.push(l);
+                let (ok, failed) = cockpit::flow::test_all_logged(&mut on_line);
+                if failed.is_empty() { format!("✓ {ok} app suites green") }
+                else { format!("{ok} green, FAILED {}: {}", failed.len(), failed.join(", ")) }
+            });
+        }
+        FleetAction::CopyLog => {
+            let log = app.task.log().join("\n");
+            if log.is_empty() {
+                app.fleet.note = "nothing to copy — run build/test first".to_string();
+            } else {
+                ui.ctx().copy_text(log);
+                app.fleet.note = "log copied".to_string();
+            }
+        }
+        FleetAction::CopyErrors => {
+            let errs = cockpit::build_report::errors_only(&app.task.timed_log());
+            if errs.is_empty() {
+                app.fleet.note = "no error lines in the last run".to_string();
+            } else {
+                ui.ctx().copy_text(errs);
+                app.fleet.note = "errors copied".to_string();
+            }
+        }
+        FleetAction::CopyTimes => {
+            let times = cockpit::build_report::times_by_crate(&app.task.timed_log());
+            if times.is_empty() {
+                app.fleet.note = "no per-crate timing found in the last run".to_string();
+            } else {
+                let text: String = times.iter().map(|(n, ms)| format!("{n}: {:.1}s\n", *ms as f64 / 1000.0)).collect();
+                ui.ctx().copy_text(text);
+                app.fleet.note = format!("build times copied ({} entries)", times.len());
+            }
+        }
+        FleetAction::Export => {
+            let lines = app.task.timed_log();
+            if lines.is_empty() {
+                app.fleet.note = "nothing to export — run build/test first".to_string();
+            } else {
+                let meta = cockpit::build_report::ReportMeta { title: "fleet run".to_string(), ok: 0, failed: Vec::new() };
+                match cockpit::build_report::export(&cockpit::build_report::default_export_dir(), &meta, &lines) {
+                    Ok(path) => {
+                        let shown = path.display().to_string();
+                        ui.ctx().copy_text(shown.clone());
+                        app.fleet.note = format!("exported to {shown} (path copied)");
+                    }
+                    Err(e) => app.fleet.note = format!("export failed: {e}"),
+                }
+            }
+        }
+    }
 }

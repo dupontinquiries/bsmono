@@ -9,3 +9,4 @@ pub mod device_picker;
 pub mod peek_viewer;
 pub mod status_rows;
 pub mod task;
+pub mod fleet_actions;
