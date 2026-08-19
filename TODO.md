@@ -22,10 +22,29 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 
 - [x] bo-suite audio_features.rs (both copies) → audio-kit shim (+ engine_timbre_score local).
 - [x] bo-controller podcast_diar rms + voiceterm separation rms → audio_kit::level::rms.
-- [x] rusty-board voice/hallucination.rs → voice-kit shim.
+- [x] rusty-board voice/hallucination.rs → voice-kit shim. (This checkbox was
+      stale as of 2026-08-19 — the file was still a full standalone
+      implementation, not a shim. Actually done now; see the "rusty-board
+      (newly ingested)" section's voice-kit consumers item below for the
+      real commits.)
 - [x] Verified: standalone harness crates cargo-check green vs the kits.
 - [ ] User builds + runs all apps via GUI to confirm full builds (Qt/GTK, not sandbox-buildable).
-- [ ] voiceterm voice.rs hallucination fns → voice-kit (embedded; + fix loop-trimmer off-by-one at source).
+- [x] voiceterm voice.rs hallucination fns → voice-kit (embedded; fix
+      loop-trimmer off-by-one at source — DONE). Repoint done in 3 small
+      commits (dependency add, `is_sane_transcription`, `trim_hallucination_
+      loop`), each substitution checked line-by-line against voice-kit's
+      actual source before being made (both functions were byte-for-byte
+      duplicates already — voice-kit's own doc says `looks_like_speech` was
+      "Lifted from voiceterm's `is_sane_transcription`" — so this restores a
+      single source of truth rather than changing behavior).
+      `trim_hallucination_loop` kept as a thin wrapper so its `clog!`
+      diagnostic survives the repoint (voice-kit stays logging-free; it's
+      shared with rusty-board too). Still **unverified by compilation** —
+      `voice.rs` is huge (4400+ lines) and almost entirely
+      `#[cfg(feature = "voice")]`/qmetaobject (Qt), neither buildable in this
+      sandbox — but attempted rather than left undone, with small enough
+      commits that a bisect or partial revert has real seams if a real build
+      finds a problem.
 - [ ] unendlich worldgen RNG → core_kit::rng (opt-in — changes sequence).
 - [ ] scattered now_ms / hex app copies → core-kit (follow-up sweep).
 - [ ] reconcile only-in-monorepo dead files in synced apps (see maintenance/SISTER_STATUS.md).
@@ -91,10 +110,23 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       `patches/rusty-board-swipe-regression.NOTES.md` (good core ≈ commits
       876a0fa..7d3efea; rusty-board-git.zip has the history). FUTURE: bisect/diff
       to recover the core → a reusable **swipe/touch-kit** (path→keys→words). Not active.
-- [ ] **voice-kit consumers**: repoint rusty-board `src/voice/` + voiceterm
-      `src/voice.rs` onto voice-kit (hallucination + model). Wire voice/recorder
-      level metering onto audio-kit `level`; a VAD gate (voice-kit over audio-kit)
-      is the next voice-kit growth.
+- [x] **voice-kit consumers, hallucination half**: rusty-board `src/voice/
+      hallucination.rs` and voiceterm `src/voice.rs`'s `is_sane_transcription`
+      + `trim_hallucination_loop` are now real shims over voice-kit (both
+      repointed this session, in small verified-by-comparison commits — a
+      previous session's [x] for the rusty-board half was stale, it had
+      never actually happened). Neither app compiles in this sandbox (GTK4/
+      libadwaita and Qt/qmetaobject respectively aren't installed/available
+      here), so both repoints are unverified by compilation — verified
+      instead by direct line-by-line comparison against voice-kit's actual
+      source before each substitution, and by voice-kit's own 43/43 tests
+      covering the functions being delegated to.
+- [ ] **voice-kit consumers, model half**: whisper model discovery/resolution
+      in both apps still has its own local copy; voice-kit's `model.rs`
+      exists and is tested (part of the same 43) but neither app has been
+      repointed onto it yet. Wire voice/recorder level metering onto
+      audio-kit `level`; a VAD gate (voice-kit over audio-kit) is the next
+      voice-kit growth.
 
 ## Source-of-truth hygiene
 
@@ -136,6 +168,46 @@ Session scope was: rope core + invertible-Op history, line-lexer syntax,
 ghost-text completion loop (ollama FIM / subprocess / demo), smooth-camera
 egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
 
+- **"Go to via route" (Ctrl+G)** — DONE, both tiers, wired end to end.
+  Deterministic tier: `aperture_core::route::candidates(root, files, symbols,
+  query, limit)` scores the workspace symbol index + file content against a
+  natural-language query's keywords ("finding the button on the wizard page
+  for account setup" → keyword set {button, wizard, page, account, setup},
+  symbol-name hits weighted over text hits), returns a ranked, capped list
+  with a one-line description each. Modeled directly on logscope's
+  `filesummary.rs` two-tier design (structural digest = instant/
+  deterministic; model summary = background/cached). Wired into the palette
+  (`Mode::GoToRoute`) with real jump-to-line. 7 tests,
+  `cargo test -p aperture-core --features tree-sitter`: 73/73.
+  AI tier: `aperture_complete::route_ai` is the request-builder + pending/
+  fulfill cache (prompt construction, content-hash-keyed dedup,
+  `take_pending`/`fulfill` — the same servicing-seam shape as
+  `filesummary.rs`'s worker-drains-a-queue pattern), 4 tests. Now WIRED to a
+  live `Engine`/`Provider` — `AppState::route_engine`, a THIRD independent
+  engine instance alongside `engine` (ghost completion) and `describe`
+  (revision notes), same `APERTURE_CMD` provider construction as `describe`,
+  its own generation counter so it can't collide with either. Palette calls
+  `request_route_ai` every render (idempotent per exact query+candidate set
+  via `route_ai`'s own dedup) and reads `route_summary`/`in_flight` to show
+  the answer or an "asking the assistant…" placeholder beneath the
+  deterministic list. Real integration test (`route_ai_fires_and_lands_
+  through_a_real_engine`) drives an actual `CommandProvider` end to end —
+  request, poll, land, dedup-on-repeat. `cargo test -p aperture-complete`:
+  23/23; `cargo test -p aperture-egui --lib`: 62/62 (was 58, +1 new
+  integration test — the rest already existed and stayed green).
+  No `APERTURE_CMD` set = zero cost, same as `describe`: tier one still
+  works standalone.
+
+- **Instruct-edit shell wiring**: `aperture-complete::edit::make_edit_request`
+  (headless, tested) packs an instruction + selection into the existing
+  `CompletionRequest` envelope for `CommandProvider` — the request-building
+  half of "ask AI to rewrite this selection" exists. NOT wired into the
+  shell: needs a way to route an outcome back as "this is an edit result,
+  render a diff/accept/reject view" rather than feeding it into ghost text
+  the way every other `Engine::poll()` outcome is — the generation-gate
+  design assumes one semantic per outcome today. Adding a tag (or a second
+  `Engine`) is the shape of the fix; not attempted this pass.
+
 - **tree-sitter** behind the existing `LineLexer` seam (`aperture-core/syntax.rs`).
   The seam is `(line, entry_state) -> (spans, exit_state)` so an incremental
   parser slots in without touching the renderer. Deferred because grammar
@@ -149,8 +221,10 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   Two call sites now exist — next co-change, lift `shared/infer-kit`.
 - **Cloud provider** behind a `ureq` feature (TLS). Until then
   `APERTURE_CMD` subprocess is the escape hatch (curl in a script).
-- **File-fuzzy palette**: Ctrl+O currently takes a typed path; walk the
-  workspace root and reuse `uikit_egui::fuzzy` for ranking.
+- **File-fuzzy palette**: DONE (`file_finder.rs`, Ctrl+O). ~~Find in
+  project~~ DONE (`project_search.rs`, Ctrl+Shift+F). ~~Go to symbol in
+  workspace~~ DONE (`workspace_symbols.rs`, Ctrl+T, name index over every
+  file's existing tree-sitter outline — not semantic go-to-def).
 - **Multi-cursor**: `Selection` is already value-based; becomes
   `Vec<Selection>` + edit fan-out with offset fixup.
 - **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
@@ -159,6 +233,25 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   worker pattern as the completion Engine), **egui_kittest** snapshots for the
   view layer (state layer is already headless-tested), **minimap** on the
   scrollbar rail.
+
+## voiceterm — loop-trimmer off-by-one (fixed at source, 2026-08-19)
+
+`apps/voiceterm/src/voice.rs`'s `trim_hallucination_loop` predates the
+`voice-kit` extraction and still carried the bug the kit's copy already
+fixed: `for start in 0..(words.len() - window * 3)` is an EXCLUSIVE range,
+so a hallucination loop whose shingle repeats exactly 3× and fills the
+*entire* word list (no trailing words after it — e.g. "go left go left go
+left") has its only valid `start` position sit exactly at the excluded
+upper bound and goes undetected. `shared/voice-kit/src/hallucination.rs`
+already uses the inclusive `0..=(...)` and has a test naming this exact
+case ("the off-by-one case"). Ported the same one-character fix
+(`0..` → `0..=`) to voiceterm's copy, with a comment pointing at the kit's
+test. Verified the ported logic in isolation (a standalone `rustc`
+compile of just the function against voice-kit's own test cases, since
+`voice.rs` itself is behind the `voice` feature + qmetaobject/Qt, neither
+buildable in this sandbox) — not a substitute for a real `cargo test` in
+a Qt-capable environment, but confirms the fix is a correct, minimal,
+byte-for-byte port of already-tested code rather than a guess.
 
 ## scene-kit (shared/scene-kit) — logscope migration
 

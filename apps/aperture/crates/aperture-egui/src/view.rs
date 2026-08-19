@@ -37,6 +37,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     }
     state.poll_completions(now_ms);
     state.poll_note();
+    state.poll_route_ai();
     state.tick_completion(now_ms);
     if state.debounce.armed() || state.ghost.is_pending() {
         // A request may become due (or land) without any input event —
@@ -652,6 +653,22 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let close = esc;
     let mut apply: Option<palette_ui::Cmd> = None;
     let mut open_path: Option<String> = None;
+    let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
+
+    // Go-to-route's AI tier: trigger from a tight, self-contained borrow
+    // scope (owned String + Vec) so it doesn't overlap the palette borrow
+    // the render closure below takes — request_route_ai needs `&mut
+    // AppState` as a whole (it touches route_engine/route_generation/
+    // route_pending_key), which can't coexist with a live `&mut
+    // PaletteState` reborrowed from `state.palette`. Idempotent per exact
+    // query+candidate set, so recomputing every frame is cheap and safe —
+    // same posture as every other mode's search already being recomputed
+    // every render.
+    if let Some((query, cands)) = state.palette.as_ref().and_then(|p| {
+        (p.mode == Mode::GoToRoute).then(|| (p.input.clone(), aperture_core::route::candidates(&p.root, &p.files, &p.symbols, &p.input, 8)))
+    }) {
+        state.request_route_ai(&query, &cands);
+    }
 
     egui::Area::new(Id::new("aperture_palette"))
         .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
@@ -668,6 +685,9 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                     let hint = match p.mode {
                         Mode::Commands => "command, theme, or :line…",
                         Mode::OpenFile => "path to open…",
+                        Mode::ProjectSearch => "text to find in project…",
+                        Mode::WorkspaceSymbol => "symbol name…",
+                        Mode::GoToRoute => "describe what you're looking for…",
                     };
                     let edit = egui::TextEdit::singleline(&mut p.input)
                         .hint_text(hint)
@@ -768,6 +788,168 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 }
                             }
                         }
+                        Mode::ProjectSearch => {
+                            let hits = aperture_core::project_search::search_files(&p.root, &p.files, &p.input, 50, 20);
+                            if !hits.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("↑↓ navigate · Enter jump · Esc cancel")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(hits.len() - 1);
+                                }
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for (i, hit) in hits.iter().enumerate() {
+                                        let selected = i == p.selected;
+                                        let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                        let text_color = if selected { colors.text } else { colors.text_weak };
+                                        let row = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0);
+                                        let resp = row
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.vertical(|ui| {
+                                                    ui.label(egui::RichText::new(format!("{}:{}", hit.rel, hit.line + 1)).color(text_color).strong());
+                                                    ui.label(egui::RichText::new(hit.text.trim()).color(colors.text_weak).small());
+                                                });
+                                            })
+                                            .response
+                                            .interact(Sense::click());
+                                        if resp.clicked() {
+                                            open_hit = Some((hit.path.clone(), hit.line));
+                                        }
+                                    }
+                                });
+                                if enter {
+                                    let i = p.selected.min(hits.len() - 1);
+                                    open_hit = Some((hits[i].path.clone(), hits[i].line));
+                                }
+                            } else if !p.input.is_empty() {
+                                ui.label(egui::RichText::new("no match").color(colors.text_weak).italics());
+                            }
+                        }
+                        Mode::WorkspaceSymbol => {
+                            let ranked = palette_ui::rank_symbols(&p.symbols, &p.input, 30);
+                            if !ranked.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("↑↓ navigate · Enter jump · Esc cancel")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(ranked.len() - 1);
+                                }
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for (i, sym) in ranked.iter().enumerate() {
+                                        let selected = i == p.selected;
+                                        let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                        let text_color = if selected { colors.text } else { colors.text_weak };
+                                        let row = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0);
+                                        let resp = row
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new(&sym.item.name).color(text_color).strong());
+                                                    ui.label(egui::RichText::new(format!("{}:{}", sym.rel, sym.item.line + 1)).color(colors.text_weak).small());
+                                                });
+                                            })
+                                            .response
+                                            .interact(Sense::click());
+                                        if resp.clicked() {
+                                            open_hit = Some((sym.path.clone(), sym.item.line));
+                                        }
+                                    }
+                                });
+                                if enter {
+                                    let i = p.selected.min(ranked.len() - 1);
+                                    open_hit = Some((ranked[i].path.clone(), ranked[i].item.line));
+                                }
+                            } else if p.symbols.is_empty() {
+                                ui.label(egui::RichText::new("no Rust symbols indexed in this workspace").color(colors.text_weak).italics());
+                            } else if !p.input.is_empty() {
+                                ui.label(egui::RichText::new("no match").color(colors.text_weak).italics());
+                            }
+                        }
+                        Mode::GoToRoute => {
+                            let cands = aperture_core::route::candidates(&p.root, &p.files, &p.symbols, &p.input, 8);
+                            if !cands.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("↑↓ navigate · Enter jump · Esc cancel — describe what you're looking for, not a name")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(cands.len() - 1);
+                                }
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for (i, c) in cands.iter().enumerate() {
+                                        let selected = i == p.selected;
+                                        let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                        let text_color = if selected { colors.text } else { colors.text_weak };
+                                        let row = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0);
+                                        let kind_glyph = match c.kind {
+                                            aperture_core::route::RouteKind::Symbol => "\u{0192}", // ƒ — a symbol hit
+                                            aperture_core::route::RouteKind::Text => "\u{201C}",    // “ — a text hit
+                                        };
+                                        let resp = row
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(egui::RichText::new(kind_glyph).color(colors.accent).small());
+                                                        ui.label(egui::RichText::new(&c.label).color(text_color).strong().monospace());
+                                                        ui.label(egui::RichText::new(format!("{}:{}", c.rel, c.line + 1)).color(colors.text_weak).small());
+                                                    });
+                                                    if !c.snippet.is_empty() {
+                                                        ui.label(egui::RichText::new(&c.snippet).color(colors.text_weak).small());
+                                                    }
+                                                });
+                                            })
+                                            .response
+                                            .interact(Sense::click());
+                                        if resp.clicked() {
+                                            open_hit = Some((c.path.clone(), c.line));
+                                        }
+                                    }
+                                });
+                                if enter {
+                                    let i = p.selected.min(cands.len() - 1);
+                                    open_hit = Some((cands[i].path.clone(), cands[i].line));
+                                }
+                                // AI tier: whatever landed for this exact query+candidate
+                                // set — request_route_ai (triggered above, outside this
+                                // borrow scope) is what queues it; this just reads the
+                                // cache. Absent if no APERTURE_CMD is configured, or
+                                // still queued/in-flight.
+                                let briefs: Vec<aperture_complete::route_ai::CandidateBrief> = cands
+                                    .iter()
+                                    .map(|c| aperture_complete::route_ai::CandidateBrief {
+                                        label: c.label.clone(), rel: c.rel.clone(), line: c.line, snippet: c.snippet.clone(),
+                                    })
+                                    .collect();
+                                let key = aperture_complete::route_ai::route_key(&p.input, &briefs);
+                                if let Some(answer) = aperture_complete::route_ai::route_summary(key) {
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("AI picks:").color(colors.text_weak).small().strong());
+                                    ui.label(egui::RichText::new(answer.trim()).color(colors.text).small());
+                                } else if aperture_complete::route_ai::in_flight(key) {
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("asking the assistant…").color(colors.text_weak).small().italics());
+                                }
+                            } else if !p.input.trim().is_empty() {
+                                ui.label(egui::RichText::new("no keyword matches — try different words").color(colors.text_weak).italics());
+                            }
+                        }
                     }
                 });
         });
@@ -778,6 +960,11 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     }
     if let Some(path) = open_path {
         state.open_file(std::path::PathBuf::from(path), now_ms);
+        state.palette = None;
+        return;
+    }
+    if let Some((path, line)) = open_hit {
+        state.open_file_at_line(path, line, now_ms);
         state.palette = None;
         return;
     }
@@ -814,6 +1001,8 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::B => K::B,
         EK::M => K::M,
         EK::H => K::H,
+        EK::T => K::T,
+        EK::G => K::G,
         EK::F => K::F,
         EK::F3 => K::F3,
         EK::Space => K::Space,

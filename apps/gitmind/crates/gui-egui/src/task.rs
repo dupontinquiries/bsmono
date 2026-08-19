@@ -3,6 +3,7 @@
 //! GUI's shared Job (start / log_line / tail / finish + a cancel flag for `-f` streams).
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Default, Clone)]
 pub struct Task {
@@ -10,12 +11,23 @@ pub struct Task {
     cancel: Arc<AtomicBool>,
 }
 
-#[derive(Default)]
 struct TaskState {
     running: bool,
     done: bool,
     result: String,
-    log: Vec<String>,
+    /// (ms elapsed since the run started, line) — the timestamp is what lets
+    /// `cockpit::build_report` turn a raw log into "time by crate" without
+    /// re-running anything. Kept alongside the plain-`String` log rather than
+    /// replacing it: `log()` stays the cheap, existing shape every current
+    /// caller (`uikit_egui::scroll::log`) already uses.
+    log: Vec<(u64, String)>,
+    started: Option<Instant>,
+}
+
+impl Default for TaskState {
+    fn default() -> Self {
+        TaskState { running: false, done: false, result: String::new(), log: Vec::new(), started: None }
+    }
 }
 
 /// A handle a worker closure uses to push live log lines back to the UI.
@@ -27,7 +39,8 @@ pub struct LogSink {
 impl LogSink {
     pub fn push(&self, line: &str) {
         let mut s = self.inner.lock().unwrap();
-        s.log.push(line.to_string());
+        let ms = s.started.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+        s.log.push((ms, line.to_string()));
         let n = s.log.len();
         if n > 2000 {
             s.log.drain(0..n - 2000);
@@ -49,7 +62,14 @@ impl Task {
         }
     }
     pub fn log(&self) -> Vec<String> {
-        self.inner.lock().unwrap().log.clone()
+        self.inner.lock().unwrap().log.iter().map(|(_, l)| l.clone()).collect()
+    }
+    /// Same log, with each line's elapsed-ms since the run started — the input
+    /// `cockpit::build_report`'s error/timing/export functions read.
+    pub fn timed_log(&self) -> Vec<cockpit::build_report::TimedLine> {
+        self.inner.lock().unwrap().log.iter()
+            .map(|(ms, text)| cockpit::build_report::TimedLine { ms: *ms, text: text.clone() })
+            .collect()
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -66,7 +86,7 @@ impl Task {
         if s.running {
             return false;
         }
-        *s = TaskState { running: true, done: false, result: String::new(), log: Vec::new() };
+        *s = TaskState { running: true, done: false, result: String::new(), log: Vec::new(), started: Some(Instant::now()) };
         self.cancel.store(false, Ordering::Relaxed);
         true
     }
@@ -127,5 +147,24 @@ mod tests {
         let t = Task::default();
         assert!(t.run(|| { std::thread::sleep(std::time::Duration::from_millis(50)); "a".into() }));
         assert!(!t.run(|| "b".into()), "second run refused while first is in flight");
+    }
+    #[test]
+    fn timed_log_carries_nondecreasing_elapsed_ms() {
+        let t = Task::default();
+        assert!(t.run_logged(|sink| {
+            sink.push("first");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            sink.push("second");
+            "done".to_string()
+        }));
+        for _ in 0..200 {
+            if !t.is_running() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let tl = t.timed_log();
+        assert_eq!(tl.len(), 2);
+        assert_eq!(tl[0].text, "first");
+        assert_eq!(tl[1].text, "second");
+        assert!(tl[1].ms >= tl[0].ms, "elapsed time doesn't go backward");
     }
 }

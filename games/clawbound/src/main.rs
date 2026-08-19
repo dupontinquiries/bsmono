@@ -900,11 +900,12 @@ fn build_battle() -> (Mesh, Vec3) {
         cat::build(&mut m, v3(w.x, gy, w.z), w.heading, &cat::stand(), clawbound_rs::class::Class::Cat);
         let col = team_col(w.team);
         if w.role == Role::Ancestor {
-            m.segment(v3(w.x, gy + 2.0, w.z), v3(w.x, gy + 3.4, w.z), 0.22, 0.05, 5, col);
-            if let Some(a) = w.ancestor {
-                let _ = ancestor::kit(a);   // crest colour per ancestor could hang here
-            }
-            m.boxx(v3(w.x, gy + 3.5, w.z), v3(0.42, 0.42, 0.42), shade(col, 1.15));
+            // Team colour already says which side; the crest is per-ancestor
+            // so two ancestors on the same team still read apart (the TODO's
+            // "hook left in build_battle" — see ancestor::crest_color).
+            let crest = w.ancestor.map(|a| rgb(ancestor::crest_color(a))).unwrap_or(col);
+            m.segment(v3(w.x, gy + 2.0, w.z), v3(w.x, gy + 3.4, w.z), 0.22, 0.05, 5, crest);
+            m.boxx(v3(w.x, gy + 3.5, w.z), v3(0.42, 0.42, 0.42), shade(crest, 1.15));
         } else {
             m.boxx(v3(w.x, gy + 2.1, w.z), v3(0.4, 0.15, 0.4), col);
             if w.duty == Duty::Hunting { m.boxx(v3(w.x, gy + 2.35, w.z), v3(0.2, 0.2, 0.2), rgb(0xb0824f)); }

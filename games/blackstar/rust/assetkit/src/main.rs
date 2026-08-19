@@ -210,7 +210,18 @@ fn draw_mesh(ui: &mut egui::Ui, rect: Rect, m: &mesh::Mesh, yaw: f32, pitch: f32
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+    // eframe 0.34 renamed the required trait method from `update(&Context,
+    // &mut Frame)` to `ui(&mut Ui, &mut Frame)` (`update` still exists but
+    // is deprecated with a no-op default — implementing it silently stopped
+    // being called at all, which is why this was a real E0046, not a
+    // rename-and-done). Kept the whole existing ctx-based body (every
+    // `.show(ctx, ...)` call below still needs a `&Context`, and rewriting
+    // all of it to the Ui-first idiom is a separate, larger style change) —
+    // `ui.ctx()` hands back the same `Context` a `Ui` is built from, cloned
+    // once here rather than at every call site.
+    fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let pal = *self.pal.get_or_insert_with(|| {
             apply_palette(ctx, &snapclone_theme::palette::DARK)
         });
@@ -732,5 +743,5 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("assetkit — Cybertron asset library", opts,
-                       Box::new(|_cc| Box::<App>::default()))
+                       Box::new(|_cc| Ok(Box::<App>::default())))
 }

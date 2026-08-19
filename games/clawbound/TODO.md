@@ -185,8 +185,14 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   Kept because the archetype should have the job, and it is tested.
 - [ ] Remaining spread (Faryowl 61%, Goldenmane 39%) is inside +-6% standard error at
   n=42..82 games per kit — needs a longer run before anyone touches a number
-- [ ] `--play` wiring still blocked here: the `app` feature needs rustc >= 1.76 (emath
-  0.28), sandbox is pinned at 1.75, so none of that glue can be compiled or verified
+- [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
+  blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
+  with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean
+  (confirmed twice this session: once verifying `Screen::Draft`'s wiring, once verifying
+  the ancestor crest-colour change). Compiling is not the same as playtesting on a real
+  display (this sandbox is still headless), but the glue this note used to say "can't be
+  compiled or verified" now compiles — the remaining gap is a human at a screen, not a
+  toolchain.
 ## Asset compression (the parts-web pipeline, from blackstar-rs)
 - [x] Measured first, per `blackstar-rs/docs/COMPRESSION.md` doctrine. 17 IQMs = 19.0 MB;
   `iqm.rs` reads positions + indices only (10.7 MB) and throws away texcoords/normals on
@@ -232,10 +238,33 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   Undertow) before tuning numbers
 - [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
   camera follow; needs the `app` feature stack (winit/wgpu) compiled
-- [ ] Player-pick draft UI in menu.rs (menu logic is already unit-tested — extend the same way)
-- [ ] Map fairness: the mid trail crosses the wide river basin (a genuine "river lane" —
-  Rainspots country) — extend mapeval to grade lane water-fractions per clan side
-- [ ] Ancestor crest colours per-kit in the battle render (hook left in build_battle)
+- [x] Player-pick draft UI in menu.rs — `Screen::Draft`, 6 pick slots (3 per
+  clan) cycling through the 13-ancestor roster with no-duplicate cycling,
+  `MenuCmd::StartBattleground([Ancestor;3], [Ancestor;3])`. Reachable from
+  Title. `app.rs` wiring is intentionally the honest fallback (log the
+  confirmed draft, reopen the menu) rather than a fake live match — the
+  separate "--play wiring in app.rs" item below is what a real Battleground
+  match needs, and isn't done yet.
+- [x] Map fairness: the mid trail crosses the wide river basin (a genuine "river lane" —
+  Rainspots country) — extend mapeval to grade lane water-fractions per clan side.
+  `mapeval::lane_water_report(camp_a, camp_b, bends, samples)`: per lane, the water
+  fraction of each clan's own home-side half (camp → bend) and their `asymmetry`.
+  Generic over any 3-waypoint lane, no dependency on battleground's types (matches
+  the module's existing "adapted, not coupled" posture). Wired into
+  `examples/battleground_report.rs` as a one-time printout before the per-ancestor
+  match loop. Empirical result on the current default map/seed: **0% asymmetry on
+  all 3 lanes** (lane 2 has a small 3% water fraction, identical on both sides) —
+  `RIVER_U_EAST`'s own doc comment ("the U on the solo-lane side; the camp line
+  stays dry") already explains why: the river is placed to keep both camps' home
+  approaches dry by construction, not routed through the mid lane the way this
+  TODO's description assumed. The grading tool this item asked for now exists and
+  runs cleanly; if a future terrain change (different river course, different seed)
+  reintroduces a lopsided lane, this is what will catch it — nothing to fix on the
+  current map by this metric. 3 tests.
+- [x] Ancestor crest colours per-kit in the battle render — `ancestor::crest_color`
+  (13 distinct hex colours, one per legend, tested for uniqueness), wired into
+  `build_battle`'s ancestor-crest branch in place of the team-colour fallback
+  that was there before.
 
 ## Roadmap (multi-turn)
 -29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an

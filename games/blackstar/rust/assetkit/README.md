@@ -13,7 +13,8 @@ so it inherits the carved-material look and the palette bridge.
     # adjust the uikit paths in Cargo.toml to your monorepo checkout, then
     cargo run --release
 
-Needs **rustc >= 1.76** (egui 0.29's `ecolor`/`emath` require it).
+Needs **rustc >= 1.76** (egui 0.34's `ecolor`/`emath` require it — bumped from
+0.29 this session, see "What is verified" below).
 
 ## What is verified and what is not
 
@@ -26,10 +27,30 @@ algorithms were validated against known models**:
     grimlock          30.4         ---       52    shell
     jazz              29.2         ---       42    shell
 
-`src/main.rs` — the UI — is **not compiled**. It was written in an environment with
-rustc 1.75 and no route to upgrade, so every widget call is correct-by-inspection
-against `shared/uikit` rather than proven. Expect first-build fixes; the logic it
-drives is all in `mesh.rs` or in the existing python tools.
+`src/main.rs` — the UI — **now compiles clean**, as of a session with a real
+rustc 1.96 (see the Cargo.toml history: it used to pin egui 0.29 against
+`uikit-egui`'s 0.34, deliberately unfixed because no available sandbox could
+compile the fix). Bumping `egui`/`eframe` to 0.34 surfaced three real API
+changes, all fixed and reconfirmed with a clean `cargo check --bin assetkit`:
+
+  * `eframe::App`'s required method renamed `update(&Context, &mut Frame)` →
+    `ui(&mut Ui, &mut Frame)` (the old `update` still exists but is
+    deprecated with a no-op default, so the old impl silently stopped being
+    called — a real `E0046 missing ui`, not a cosmetic rename). Fixed by
+    pulling `ctx` out via `ui.ctx().clone()` at the top and keeping the rest
+    of the existing ctx-based panel code as-is, rather than rewriting every
+    call site to the newer Ui-first idiom in the same pass.
+  * `eframe::run_native`'s app-creation closure now returns
+    `Result<Box<dyn App>, _>`, not a bare `Box<dyn App>`.
+  * `eframe`'s `glow` feature alone no longer pulls in a window backend —
+    needed `wayland`/`x11` added explicitly (the same features
+    `apps/dialer`'s egui-egui port already needed for the same eframe
+    version).
+
+**Still not run**: this is a headless sandbox with no display. Compiling
+clean is confirmed; actually opening a window and clicking through Library/
+Viewer/Export/GAN is not, and needs the same on-device pass any of this
+monorepo's other egui ports still need.
 
 ## The score is a filter, not a verdict
 

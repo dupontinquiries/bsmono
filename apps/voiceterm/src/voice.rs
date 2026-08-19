@@ -1662,32 +1662,15 @@ fn battery_ok_for_background() -> bool {
 /// a pre-filter before fingerprint storage. Previously private.
 #[cfg(feature = "voice")]
 pub fn is_sane_transcription(text: &str) -> bool {
-    let t = text.trim();
-    let len = t.chars().count();
-    if len < 2 || len > 120 { return false; }
-    // Repetition check: if the same word appears >50% of the time, it's
-    // probably a hallucination loop.
-    let words: Vec<&str> = t.split_whitespace().collect();
-    if words.len() >= 4 {
-        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for w in &words { *counts.entry(*w).or_insert(0) += 1; }
-        let max_count = counts.values().max().copied().unwrap_or(0);
-        if max_count * 2 > words.len() { return false; }
-    }
-    // Known hallucination phrases. These are common enough across
-    // whisper outputs that filtering them isn't going to lose much.
-    let lower = t.to_lowercase();
-    let bad_phrases = [
-        "thank you for watching", "thanks for watching",
-        "subscribe to", "like and subscribe",
-        "see you next time", "see you in the next video",
-        "don't forget to subscribe",
-        "[music]", "[silence]", "[blank_audio]",
-    ];
-    for p in &bad_phrases {
-        if lower.contains(p) { return false; }
-    }
-    true
+    // Repointed onto voice-kit (TODO.md item): this body used to duplicate
+    // exactly this length check + repetition check + BAD_PHRASES list —
+    // voice-kit's own module doc says `looks_like_speech` was "Lifted from
+    // voiceterm's `is_sane_transcription`", so this is restoring a single
+    // source of truth, not changing behavior. Confirmed line-for-line
+    // identical against voice-kit's copy before repointing (same 2..120
+    // bound, same `max_count * 2 > words.len()` threshold, same phrase
+    // list) — see shared/voice-kit/src/hallucination.rs.
+    voice_kit::hallucination::looks_like_speech(text)
 }
 
 // v0.1.209: stub for builds without the voice feature. Same shape,
@@ -3583,41 +3566,21 @@ fn record_and_transcribe_inner() -> Result<(String, Vec<f32>), String> {
 /// Conservative: if we can't find a clear loop, return the input as-is.
 /// The loop must repeat at least 3 times to qualify (2 might be a
 /// natural rhetorical structure: "you can do this, do that").
+///
+/// Repointed onto voice-kit (TODO.md item) — the shingle-scan logic here
+/// was a byte-for-byte duplicate of `voice_kit::hallucination::
+/// trim_hallucination_loop` (both already carry the same off-by-one fix;
+/// see that function's own history). Kept as a thin wrapper rather than a
+/// bare re-export so the `clog!` diagnostic — useful on-device for seeing
+/// *that* a trim happened — survives the repoint; voice-kit itself stays
+/// logging-free since it's shared with rusty-board, which has its own
+/// diagnostics story.
 fn trim_hallucination_loop(s: &str) -> String {
-    let s = s.trim();
-    if s.is_empty() { return String::new(); }
-    let words: Vec<&str> = s.split_whitespace().collect();
-    if words.len() < 6 { return s.to_string(); }
-    // Try shingle sizes 1..=4. For each size, count how many
-    // consecutive identical shingles appear. If >= 3, truncate
-    // after the FIRST shingle (so "X X X" becomes "X").
-    for window in 1..=4 {
-        if window * 3 > words.len() { break; }
-        // Scan for runs of identical shingles starting from the
-        // beginning. Practically, hallucinations loop early in the
-        // output so we don't bother scanning later positions.
-        for start in 0..(words.len() - window * 3) {
-            let first_shingle = &words[start..start + window];
-            let mut runs = 1;
-            let mut pos = start + window;
-            while pos + window <= words.len()
-                && &words[pos..pos + window] == first_shingle {
-                runs += 1;
-                pos += window;
-            }
-            if runs >= 3 {
-                // Trim. Keep words[..start + window], discard rest.
-                let kept: Vec<&str> = words[..start + window].iter().copied().collect();
-                let trimmed = kept.join(" ");
-                crate::clog!("whisper", "trimmed hallucination loop ({}x repetition of '{}'): {:?} -> {:?}",
-                    runs, first_shingle.join(" "), s, trimmed);
-                // Also strip any trailing comma / punctuation we kept.
-                return trimmed.trim_end_matches(|c: char|
-                    c == ',' || c == '.' || c == ' ').to_string();
-            }
-        }
+    let trimmed = voice_kit::hallucination::trim_hallucination_loop(s);
+    if trimmed != s.trim() {
+        crate::clog!("whisper", "trimmed hallucination loop: {:?} -> {:?}", s, trimmed);
     }
-    s.to_string()
+    trimmed
 }
 
 /// Run transcription using whichever models are loaded (tiny, base, or both)

@@ -1,10 +1,20 @@
 //! palette_ui — Ctrl+P. Commands are data; ranking is uikit-egui's fuzzy
 //! scorer (the same one gitmind's pickers use), so palette feel is consistent
-//! across the suite. Two modes: command list, and Ctrl+O's file picker —
-//! `file_finder` walks the workspace root once per open and fuzzy-ranks
-//! against the typed query. Typed-path entry survives as the fallback when
-//! nothing fuzzy-matches (a path outside the walked root, or a huge repo
-//! past the walk cap): honest, and still works over ssh with zero UI.
+//! across the suite. Five modes: command list, Ctrl+O's file picker,
+//! Ctrl+Shift+F's project search, Ctrl+T's workspace symbol jump, and
+//! Ctrl+G's "go to via route" natural-language search — `file_finder`
+//! walks the workspace root once per open and fuzzy-ranks against the
+//! typed query; project search reuses the same walked pool but greps file
+//! *contents* instead of ranking *paths* (`aperture_core::project_search`);
+//! workspace symbol reuses it again to build a name index from every
+//! file's tree-sitter outline (`aperture_core::workspace_symbols`),
+//! fuzzy-ranked the same way file paths are; go-to-route scores that same
+//! symbol index plus file content against a multi-word natural-language
+//! query's keywords (`aperture_core::route`) — "finding the button on the
+//! wizard page for account setup" rather than a single name or substring.
+//! Typed-path entry survives as the file-picker fallback when nothing
+//! fuzzy-matches (a path outside the walked root, or a huge repo past the
+//! walk cap): honest, and still works over ssh with zero UI.
 
 use crate::state::AppState;
 use snapclone_theme::PaletteId;
@@ -13,6 +23,9 @@ use snapclone_theme::PaletteId;
 pub enum Mode {
     Commands,
     OpenFile,
+    ProjectSearch,
+    WorkspaceSymbol,
+    GoToRoute,
 }
 
 #[derive(Clone, Debug)]
@@ -20,28 +33,63 @@ pub struct PaletteState {
     pub mode: Mode,
     pub input: String,
     pub selected: usize,
-    /// Ctrl+O's candidate pool: walked ONCE on entering the mode (not
-    /// per-keystroke — a repo walk is cheap once, wasteful sixty times a
-    /// second while typing), then fuzzy-ranked fresh every render against
-    /// whatever's currently typed.
+    /// Ctrl+O's and Ctrl+Shift+F's shared candidate pool: walked ONCE on
+    /// entering the mode (not per-keystroke — a repo walk is cheap once,
+    /// wasteful sixty times a second while typing), then fuzzy-ranked or
+    /// grepped fresh every render against whatever's currently typed.
     pub root: std::path::PathBuf,
     pub files: Vec<std::path::PathBuf>,
+    /// Workspace-symbol mode's index: built ONCE on entering the mode (a
+    /// parse-per-file pass, unlike `files`' plain directory walk — doing it
+    /// every keystroke would make Ctrl+T laggy in anything but a tiny repo),
+    /// then fuzzy-ranked fresh every render against whatever's typed. Empty
+    /// and unused in every other mode.
+    pub symbols: Vec<aperture_core::workspace_symbols::Symbol>,
     pub focus_placed: bool,
 }
 
 impl PaletteState {
     pub fn commands() -> Self {
-        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new() }
+        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
     }
     pub fn open_file(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
-        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, focus_placed: false, root, files }
+        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, focus_placed: false, root, files, symbols: Vec::new() }
     }
+    pub fn project_search(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
+        PaletteState { mode: Mode::ProjectSearch, input: String::new(), selected: 0, focus_placed: false, root, files, symbols: Vec::new() }
+    }
+    pub fn workspace_symbol(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
+        // Capped at 1500 files, well past the walk cap's typical hit rate
+        // for a Rust-only index in a mixed-language monorepo, but still a
+        // real bound — see workspace_symbols::index_files's own doc.
+        let symbols = aperture_core::workspace_symbols::index_files(&root, &files, 1500);
+        PaletteState { mode: Mode::WorkspaceSymbol, input: String::new(), selected: 0, focus_placed: false, root, files, symbols }
+    }
+    pub fn go_to_route(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
+        // Same symbol index workspace_symbol builds — route::candidates
+        // scores against it too, so there's no reason to index twice.
+        let symbols = aperture_core::workspace_symbols::index_files(&root, &files, 1500);
+        PaletteState { mode: Mode::GoToRoute, input: String::new(), selected: 0, focus_placed: false, root, files, symbols }
+    }
+}
+
+/// Fuzzy-rank `symbols` by name against `query`, capped at `limit`. Same
+/// tie-break convention as `file_finder::rank` (shorter first, then
+/// lexical) so all the pickers feel alike.
+pub fn rank_symbols<'a>(symbols: &'a [aperture_core::workspace_symbols::Symbol], query: &str, limit: usize) -> Vec<&'a aperture_core::workspace_symbols::Symbol> {
+    let mut scored: Vec<(i32, &aperture_core::workspace_symbols::Symbol)> =
+        symbols.iter().filter_map(|s| uikit_egui::fuzzy::score(query, &s.item.name).map(|sc| (sc, s))).collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.item.name.len().cmp(&b.1.item.name.len())).then(a.1.item.name.cmp(&b.1.item.name)));
+    scored.into_iter().take(limit).map(|(_, s)| s).collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cmd {
     Save,
     OpenFileMode,
+    ProjectSearchMode,
+    WorkspaceSymbolMode,
+    GoToRouteMode,
     ToggleAi,
     CompleteNow,
     ToggleLoopPane,
@@ -59,6 +107,9 @@ pub fn command_list() -> Vec<(String, Cmd)> {
     let mut v = vec![
         ("File: Save".to_string(), Cmd::Save),
         ("File: Open…".to_string(), Cmd::OpenFileMode),
+        ("Find: In Project… (Ctrl+Shift+F)".to_string(), Cmd::ProjectSearchMode),
+        ("Go to Symbol in Workspace… (Ctrl+T)".to_string(), Cmd::WorkspaceSymbolMode),
+        ("Go to via Route… (Ctrl+G)".to_string(), Cmd::GoToRouteMode),
         ("AI: Toggle ghost completions".to_string(), Cmd::ToggleAi),
         ("AI: Complete now".to_string(), Cmd::CompleteNow),
         ("View: Toggle loop pane".to_string(), Cmd::ToggleLoopPane),
@@ -98,6 +149,24 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
             let root = s.workspace_root();
             let files = crate::file_finder::walk_files(&root, 4000);
             s.palette = Some(PaletteState::open_file(root, files));
+            return; // keep the palette open, in its new mode
+        }
+        Cmd::ProjectSearchMode => {
+            let root = s.workspace_root();
+            let files = crate::file_finder::walk_files(&root, 4000);
+            s.palette = Some(PaletteState::project_search(root, files));
+            return; // keep the palette open, in its new mode
+        }
+        Cmd::WorkspaceSymbolMode => {
+            let root = s.workspace_root();
+            let files = crate::file_finder::walk_files(&root, 4000);
+            s.palette = Some(PaletteState::workspace_symbol(root, files));
+            return; // keep the palette open, in its new mode
+        }
+        Cmd::GoToRouteMode => {
+            let root = s.workspace_root();
+            let files = crate::file_finder::walk_files(&root, 4000);
+            s.palette = Some(PaletteState::go_to_route(root, files));
             return; // keep the palette open, in its new mode
         }
         Cmd::ToggleAi => {
@@ -140,5 +209,21 @@ mod tests {
         let g = matches(":42");
         assert_eq!(g, vec![("Go to line 42".to_string(), Cmd::GotoLine(41))]);
         assert!(matches("zzzzqqq").is_empty());
+    }
+
+    #[test]
+    fn rank_symbols_fuzzy_matches_by_name() {
+        use aperture_core::syntax::{OutlineItem, OutlineKind};
+        use aperture_core::workspace_symbols::Symbol;
+        let mk = |name: &str, path: &str| Symbol {
+            item: OutlineItem { kind: OutlineKind::Fn, name: name.to_string(), sig: String::new(), line: 0, end_line: 0 },
+            path: std::path::PathBuf::from(path),
+            rel: path.to_string(),
+        };
+        let symbols = vec![mk("parse_line", "a.rs"), mk("parse_header", "b.rs"), mk("unrelated", "c.rs")];
+        let ranked = rank_symbols(&symbols, "parseline", 10);
+        let names: Vec<&str> = ranked.iter().map(|s| s.item.name.as_str()).collect();
+        assert!(names.contains(&"parse_line"), "{names:?}");
+        assert!(!names.contains(&"unrelated"), "{names:?}");
     }
 }

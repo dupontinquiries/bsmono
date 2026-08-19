@@ -3,12 +3,13 @@
 //! its `menu.rs` logic from the `egui_overlay` renderer. The app drives this with
 //! key/pointer input and an egui (or any) front-end reads it to draw.
 
+use crate::ancestor::{Ancestor, ALL as ANCESTORS};
 use crate::class::{Class, CLASSES};
 use crate::hunter::Kind;
 use crate::sim::Mode;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Screen { Title, Play, Settings, Keybinds }
+pub enum Screen { Title, Play, Draft, Settings, Keybinds }
 
 /// A bindable in-game action.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -84,7 +85,15 @@ impl GameMode {
 
 /// What the app should do when the player commits a menu choice.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum MenuCmd { None, StartSingle(Kind, Mode), StartMode(GameMode, Kind, Class), StartTutorial, Multiplayer, Quit, Close }
+pub enum MenuCmd {
+    None, StartSingle(Kind, Mode), StartMode(GameMode, Kind, Class), StartTutorial,
+    /// The clan-war draft is confirmed: three picks per side, straight into
+    /// `battleground::new_draft`. A distinct variant from `StartMode` rather
+    /// than shoehorning ancestor picks through `Class`/`Kind` — Battleground
+    /// isn't a 6v1 sim and has nothing to say about hunter kind or class.
+    StartBattleground([Ancestor; 3], [Ancestor; 3]),
+    Multiplayer, Quit, Close,
+}
 
 pub struct Menu {
     pub open: bool,
@@ -96,6 +105,11 @@ pub struct Menu {
     pub sel_game: GameMode,
     pub sel_class: Class,
     pub sel_clan: u8,
+    /// The draft's six pick slots: clan A's three, then clan B's three (rows
+    /// 0..3 and 3..6 of the Draft screen). Seeded to the roster's first six
+    /// distinct ancestors so a player who never touches left/right still
+    /// gets a legal, no-duplicate draft on Start.
+    pub draft: [Ancestor; 6],
     pub rebinding: Option<Action>,   // Some(action) while waiting for a key press
 }
 
@@ -104,13 +118,15 @@ impl Default for Menu { fn default() -> Self { Self::new() } }
 impl Menu {
     pub fn new() -> Self {
         Menu { open: true, screen: Screen::Title, cursor: 0, settings: Settings::default(),
-               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0, rebinding: None }
+               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0,
+               draft: [ANCESTORS[0], ANCESTORS[1], ANCESTORS[2], ANCESTORS[3], ANCESTORS[4], ANCESTORS[5]],
+               rebinding: None }
     }
 
     /// Menu item labels for the current screen (top-to-bottom).
     pub fn items(&self) -> Vec<String> {
         match self.screen {
-            Screen::Title => vec!["Single Player".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
+            Screen::Title => vec!["Single Player".into(), "Battleground of the Ancestors".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
             Screen::Play => vec![
                 format!("Game: {}", self.sel_game.name()),
                 format!("Hunter: {}", self.sel_hunter.params().name),
@@ -118,6 +134,15 @@ impl Menu {
                 format!("Clan: {} ({})", crate::clan::name(self.sel_clan), crate::clan::specialty(self.sel_clan)),
                 "Start".into(), "Back".into(),
             ],
+            Screen::Draft => {
+                let mut v: Vec<String> = (0..6).map(|i| {
+                    let clan = if i < 3 { 'A' } else { 'B' };
+                    format!("Clan {} — Pick {}: {}", clan, i % 3 + 1, self.draft[i].name())
+                }).collect();
+                v.push("Start".into());
+                v.push("Back".into());
+                v
+            }
             Screen::Settings => vec![
                 format!("Show vision cone: {}", if self.settings.show_cone { "On" } else { "Off" }),
                 format!("Master volume: {:.0}%", self.settings.master_volume * 100.0),
@@ -161,6 +186,28 @@ impl Menu {
         self.sel_class = CLASSES[(((cur as i32 + dir) % n + n) % n) as usize];
     }
 
+    /// Advance draft slot `i` to the next ancestor in roster order (wrapping),
+    /// skipping any ancestor already picked in one of the OTHER five slots —
+    /// a draft where the same legend is on both sides (or twice on one) isn't
+    /// a real pick, so duplicates are simply unreachable via adjust rather
+    /// than allowed-then-validated.
+    fn next_draft_pick(&mut self, i: usize, dir: i32) {
+        let n = ANCESTORS.len() as i32;
+        let cur = ANCESTORS.iter().position(|&a| a == self.draft[i]).unwrap_or(0) as i32;
+        let mut probe = cur;
+        for _ in 0..n {
+            probe = ((probe + dir) % n + n) % n;
+            let candidate = ANCESTORS[probe as usize];
+            let taken_elsewhere = self.draft.iter().enumerate().any(|(j, &a)| j != i && a == candidate);
+            if !taken_elsewhere {
+                self.draft[i] = candidate;
+                return;
+            }
+        }
+        // Every ancestor is taken elsewhere (impossible with 13 ancestors and
+        // 6 slots, but a stuck picker beats a panic if that ever changes).
+    }
+
     /// Left/right adjust the value on the current row (game, hunter, class, volume, etc.).
     pub fn adjust(&mut self, dir: i32) {
         match (self.screen, self.cursor) {
@@ -168,6 +215,7 @@ impl Menu {
             (Screen::Play, 1) => self.next_hunter(dir),
             (Screen::Play, 2) => self.next_class(dir),
             (Screen::Play, 3) => self.sel_clan = (self.sel_clan as i32 + dir).rem_euclid(crate::clan::CLAN_COUNT as i32) as u8,
+            (Screen::Draft, i) if i < 6 => self.next_draft_pick(i, dir),
             (Screen::Settings, 0) => self.settings.show_cone = !self.settings.show_cone,
             (Screen::Settings, 1) => self.settings.master_volume = (self.settings.master_volume + dir as f32 * 0.1).clamp(0.0, 1.0),
             (Screen::Settings, 2) => {
@@ -186,10 +234,11 @@ impl Menu {
         match self.screen {
             Screen::Title => match self.cursor {
                 0 => { self.screen = Screen::Play; self.cursor = 0; MenuCmd::None }
-                1 => MenuCmd::Multiplayer,
-                2 => { self.open = false; MenuCmd::StartTutorial }
-                3 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
-                4 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
+                1 => { self.screen = Screen::Draft; self.cursor = 0; MenuCmd::None }
+                2 => MenuCmd::Multiplayer,
+                3 => { self.open = false; MenuCmd::StartTutorial }
+                4 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
+                5 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::Quit,
             },
             Screen::Play => match self.cursor {
@@ -200,6 +249,16 @@ impl Menu {
                 }
                 5 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::None,   // rows 0..3 are adjusted with left/right
+            },
+            Screen::Draft => match self.cursor {
+                6 => {
+                    self.open = false;
+                    let a = [self.draft[0], self.draft[1], self.draft[2]];
+                    let b = [self.draft[3], self.draft[4], self.draft[5]];
+                    MenuCmd::StartBattleground(a, b)
+                }
+                7 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
+                _ => MenuCmd::None,   // rows 0..5 are adjusted with left/right
             },
             Screen::Settings => { if self.cursor == 6 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
             Screen::Keybinds => {
@@ -239,7 +298,7 @@ mod tests {
     #[test]
     fn tutorial_entry_launches_from_the_title_screen() {
         let mut m = Menu::new();
-        m.cursor = 2;   // Tutorial row
+        m.cursor = 3;   // Tutorial row (0=Single, 1=Battleground, 2=Multiplayer, 3=Tutorial)
         assert_eq!(m.activate(), MenuCmd::StartTutorial);
         assert!(!m.open, "starting the tutorial should close the menu");
     }
@@ -309,5 +368,67 @@ mod tests {
         assert_eq!(m.settings.keybinds.key_for(Action::Ability), "PageDown");
         // rebinding one action doesn't disturb another
         assert_eq!(m.settings.keybinds.key_for(Action::Leap), "PageUp");
+    }
+
+    #[test]
+    fn battleground_entry_opens_the_draft_screen() {
+        let mut m = Menu::new();
+        m.cursor = 1;   // Battleground row
+        assert_eq!(m.activate(), MenuCmd::None);
+        assert_eq!(m.screen, Screen::Draft);
+    }
+
+    #[test]
+    fn draft_defaults_are_six_distinct_ancestors() {
+        let m = Menu::new();
+        let mut seen = m.draft.to_vec();
+        seen.sort_by_key(|a| format!("{a:?}"));
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "the seeded draft must not start with a duplicate pick");
+    }
+
+    #[test]
+    fn adjusting_a_draft_slot_never_lands_on_an_ancestor_taken_elsewhere() {
+        let mut m = Menu::new();
+        m.screen = Screen::Draft;
+        let clashing = m.draft[1]; // slot 0 must never be adjusted onto this
+        m.cursor = 0;
+        for _ in 0..ANCESTORS.len() {
+            m.adjust(1);
+            assert_ne!(m.draft[0], clashing, "slot 0 must never equal slot 1's pick");
+            let mut rest = m.draft[1..].to_vec();
+            rest.sort_by_key(|a| format!("{a:?}"));
+            rest.dedup();
+            assert_eq!(rest.len(), 5, "the other five slots stay distinct throughout");
+        }
+    }
+
+    #[test]
+    fn starting_the_draft_sends_three_and_three_to_the_app() {
+        let mut m = Menu::new();
+        let expected = m.draft;
+        m.screen = Screen::Draft;
+        m.cursor = 6; // Start row
+        match m.activate() {
+            MenuCmd::StartBattleground(a, b) => {
+                assert_eq!(a, [expected[0], expected[1], expected[2]]);
+                assert_eq!(b, [expected[3], expected[4], expected[5]]);
+            }
+            c => panic!("expected StartBattleground, got {c:?}"),
+        }
+        assert!(!m.open, "starting a battleground should close the menu");
+    }
+
+    #[test]
+    fn back_from_draft_returns_to_title_without_losing_picks() {
+        let mut m = Menu::new();
+        m.screen = Screen::Draft;
+        m.cursor = 0;
+        m.adjust(1);
+        let picked = m.draft[0];
+        m.cursor = 7; // Back row
+        assert_eq!(m.activate(), MenuCmd::None);
+        assert_eq!(m.screen, Screen::Title);
+        assert_eq!(m.draft[0], picked, "leaving the draft screen doesn't reset picks");
     }
 }
