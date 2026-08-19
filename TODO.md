@@ -25,13 +25,22 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 - [x] rusty-board voice/hallucination.rs → voice-kit shim.
 - [x] Verified: standalone harness crates cargo-check green vs the kits.
 - [ ] User builds + runs all apps via GUI to confirm full builds (Qt/GTK, not sandbox-buildable).
-- [ ] voiceterm voice.rs hallucination fns → voice-kit (embedded; fix
-      loop-trimmer off-by-one at source — DONE, see below). Repoint onto
-      the voice-kit shim itself still open: `voice.rs` is huge (4400+
-      lines) and almost entirely `#[cfg(feature = "voice")]`/qmetaobject
-      (Qt), neither buildable in this sandbox, so a mechanical repoint here
-      would be unverifiable until a real build — left for a session with a
-      real Qt toolchain rather than done blind.
+- [x] voiceterm voice.rs hallucination fns → voice-kit (embedded; fix
+      loop-trimmer off-by-one at source — DONE). Repoint done in 3 small
+      commits (dependency add, `is_sane_transcription`, `trim_hallucination_
+      loop`), each substitution checked line-by-line against voice-kit's
+      actual source before being made (both functions were byte-for-byte
+      duplicates already — voice-kit's own doc says `looks_like_speech` was
+      "Lifted from voiceterm's `is_sane_transcription`" — so this restores a
+      single source of truth rather than changing behavior).
+      `trim_hallucination_loop` kept as a thin wrapper so its `clog!`
+      diagnostic survives the repoint (voice-kit stays logging-free; it's
+      shared with rusty-board too). Still **unverified by compilation** —
+      `voice.rs` is huge (4400+ lines) and almost entirely
+      `#[cfg(feature = "voice")]`/qmetaobject (Qt), neither buildable in this
+      sandbox — but attempted rather than left undone, with small enough
+      commits that a bisect or partial revert has real seams if a real build
+      finds a problem.
 - [ ] unendlich worldgen RNG → core_kit::rng (opt-in — changes sequence).
 - [ ] scattered now_ms / hex app copies → core-kit (follow-up sweep).
 - [ ] reconcile only-in-monorepo dead files in synced apps (see maintenance/SISTER_STATUS.md).
