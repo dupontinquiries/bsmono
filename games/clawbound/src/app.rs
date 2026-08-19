@@ -256,7 +256,7 @@ fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawb
         egui::Frame::popup(ui.style()).fill(Color32::from_rgba_unmultiplied(18, 14, 26, 235)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
             ui.set_min_width(320.0);
             ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(Color32::from_rgb(230, 210, 170)));
-            let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
+            let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Draft => "Battleground Draft", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
             if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(Color32::from_rgb(150, 130, 180))); }
             ui.add_space(10.0);
             for (i, it) in items.iter().enumerate() {
@@ -1349,7 +1349,7 @@ impl State {
                     egui::Frame::popup(ui.style()).fill(Color32::from_rgba_unmultiplied(18, 14, 26, 235)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
                         ui.set_min_width(320.0);
                         ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(Color32::from_rgb(230, 210, 170)));
-                        let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
+                        let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Draft => "Battleground Draft", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
                         if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(Color32::from_rgb(150, 130, 180))); }
                         ui.add_space(10.0);
                         for (i, it) in items.iter().enumerate() {
@@ -1544,6 +1544,18 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                                 p.set_tutorial_mode(true);
                                                 state.prowl = Some(p);
                                                 state.tutorial = Some(TutorialRun { step: 0, intro_t: 4.0, advance_flash: 0.0 });
+                                            }
+                                            MenuCmd::StartBattleground(a, b) => {
+                                                // Battleground has no live --play wiring yet (TODO.md:
+                                                // "--play wiring in app.rs: input -> set_input, ability
+                                                // keys, HUD ... camera follow; needs the app feature
+                                                // stack" is a separate, still-open item from this draft
+                                                // screen). Confirming a draft shouldn't pretend to start
+                                                // a match this loop can't render — log the picks and
+                                                // reopen the menu, the same honest fallback the not-yet-
+                                                // wired GameMode arms below already use.
+                                                eprintln!("[battleground] draft confirmed: A={:?} B={:?} (no live --play wiring yet — see TODO.md)", a, b);
+                                                state.menu.open = true;
                                             }
                                             MenuCmd::Quit => elwt.exit(),
                                             MenuCmd::Close => state.menu.open = false,

@@ -232,7 +232,13 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   Undertow) before tuning numbers
 - [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
   camera follow; needs the `app` feature stack (winit/wgpu) compiled
-- [ ] Player-pick draft UI in menu.rs (menu logic is already unit-tested — extend the same way)
+- [x] Player-pick draft UI in menu.rs — `Screen::Draft`, 6 pick slots (3 per
+  clan) cycling through the 13-ancestor roster with no-duplicate cycling,
+  `MenuCmd::StartBattleground([Ancestor;3], [Ancestor;3])`. Reachable from
+  Title. `app.rs` wiring is intentionally the honest fallback (log the
+  confirmed draft, reopen the menu) rather than a fake live match — the
+  separate "--play wiring in app.rs" item below is what a real Battleground
+  match needs, and isn't done yet.
 - [ ] Map fairness: the mid trail crosses the wide river basin (a genuine "river lane" —
   Rainspots country) — extend mapeval to grade lane water-fractions per clan side
 - [ ] Ancestor crest colours per-kit in the battle render (hook left in build_battle)
