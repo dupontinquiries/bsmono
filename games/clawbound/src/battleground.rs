@@ -43,9 +43,9 @@ pub const CLAN_B: u8 = 1;
 
 // ── the large map ───────────────────────────────────────────────────────────
 const ARENA: f32 = 150.0;                       // half-extent (capture plays in 90)
-const CAMP_ANCHOR: [(f32, f32); 2] = [(-118.0, -118.0), (118.0, 118.0)];
+pub const CAMP_ANCHOR: [(f32, f32); 2] = [(-118.0, -118.0), (118.0, 118.0)];
 /// Waypoint each trail bends through: west trail, the straight middle, east trail.
-const TRAIL_BEND: [(f32, f32); 3] = [(-85.0, 85.0), (0.0, 0.0), (85.0, -85.0)];
+pub const TRAIL_BEND: [(f32, f32); 3] = [(-85.0, 85.0), (0.0, 0.0), (85.0, -85.0)];
 pub const LANES: usize = 3;
 
 // structures

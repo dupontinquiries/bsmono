@@ -1,11 +1,36 @@
 //! Run headless Battleground matches and report how each one unfolded — the same
 //! visible-loop idea as sim_balance.rs. One match per player ancestor:
 //! who won, how long it took, what each clan ate, gathered, and lost.
+//!
+//! Also prints a one-time map-fairness readout (`mapeval::lane_water_report`)
+//! before the matches: per lane, what fraction of each clan's home-side half
+//! is water, and how far apart the two sides are — the TODO.md item about
+//! grading whether the river basin favors one camp's approach over the
+//! other's, same map every match so once is enough.
 
 use clawbound_rs::ancestor;
-use clawbound_rs::battleground::{Battleground, CLAN_A};
+use clawbound_rs::battleground::{Battleground, CLAN_A, TRAIL_BEND};
+use clawbound_rs::mapeval;
 
 fn main() {
+    // Map fairness once, up front: which lane (if any) hands one camp a
+    // wetter approach than the other. `bg.camps` is the actual land-adjusted
+    // camp position (see `land_near` in battleground.rs), not the raw
+    // CAMP_ANCHOR — the report should grade the map that's actually played,
+    // not the anchor the search started from.
+    {
+        let bg = Battleground::new(ancestor::ALL[0]);
+        let report = mapeval::lane_water_report(bg.camps[0], bg.camps[1], &TRAIL_BEND, 32);
+        eprintln!("MAP FAIRNESS (per lane, home-side half water fraction):");
+        for r in &report {
+            eprintln!(
+                "  lane {}   water A {:>4.0}%  water B {:>4.0}%   asymmetry {:>4.0}pp{}",
+                r.lane, r.water_a * 100.0, r.water_b * 100.0, r.asymmetry * 100.0,
+                if r.asymmetry > 0.15 { "  <- lopsided" } else { "" },
+            );
+        }
+    }
+
     for a in ancestor::ALL {
         let mut bg = Battleground::new(a);
         let mut steps = 0u32;
