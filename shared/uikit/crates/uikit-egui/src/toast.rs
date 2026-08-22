@@ -175,7 +175,7 @@ impl Toasts {
         if text.is_empty() {
             return None;
         }
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         egui::Area::new(Id::new("uikit-toast"))
             .order(Order::Foreground)
             .fixed_pos(egui::pos2(0.0, 0.0))

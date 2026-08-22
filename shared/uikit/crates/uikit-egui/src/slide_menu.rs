@@ -459,7 +459,7 @@ impl SlideMenu {
             press.x - (self.padding + grid_w / 2.0),
             press.y - (self.padding + self.title_h() + grid_h / 2.0),
         );
-        clamp_origin(target, panel.size(), ui.ctx().screen_rect())
+        clamp_origin(target, panel.size(), ui.ctx().content_rect())
     }
 
     /// Shared painter for the panel + title + cells (+ hover hint). `frozen` = the vertical-edge
