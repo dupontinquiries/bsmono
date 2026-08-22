@@ -1,15 +1,19 @@
 # TODO — monorepo unification
 
 Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log) and
-`maintenance/journal.txt` (session catalog).
+`maintenance/C9_TODO.md` (the c9 session's open threads, each marked with how
+it was established — verified, read, or assumed).
+
+`maintenance/journal.txt` was referenced here as the session catalog and does
+not exist in the tree; tracked as C9-7c rather than silently dropped.
 
 ## Shared kits — status
 
 | kit | what | state |
 |-----|------|-------|
 | registry-kit | small shared registry primitives | ✅ built |
-| snapcore | pure-Rust Kademlia DHT (node + store + cluster) | ✅ built, 25 tests |
-| crypto-kit | PQ-hybrid + sign + AEAD + group ratchet/seal | ✅ built, 36 tests |
+| snapcore | pure-Rust Kademlia DHT (node + store + cluster) | ✅ built, 71 tests |
+| crypto-kit | PQ-hybrid + sign + AEAD + group ratchet/seal | ✅ built, 28 tests + 1 ignored |
 | net-kit | transport plumbing: auth / wire / json / http (client+server) | ✅ built, 22 tests |
 | share-kit | the MAILBOX over snapcore + crypto-kit (DHT-as-host two-layer) | ✅ v0.1, 7 tests |
 | audio-kit | DSP primitives: level / goertzel+spectrogram / pitch / window / gen | ✅ v0.1, 25 tests |
