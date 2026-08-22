@@ -99,6 +99,16 @@ impl Safety {
     /// Is the toast up?
     pub fn toast_visible(&self) -> bool { self.pending.is_some() }
 
+    /// `(applied, requested)` while a request is held back.
+    ///
+    /// The renderer needs both numbers — "asked for 100, held at 95" is the
+    /// message, and either half alone does not explain the cap. `pending`
+    /// stores only the request; the applied value is the threshold, which is
+    /// what `request` returned in the Clamped outcome.
+    pub fn pending_pair(&self) -> Option<(u8, u8)> {
+        self.pending.map(|want| (self.unsafe_threshold, want))
+    }
+
     pub fn tick(&mut self, dt: f32) {
         if self.pending.is_none() { return; }
         self.toast_age += dt.max(0.0);
@@ -225,5 +235,89 @@ mod tests {
         let mut s = Safety::default();
         assert_eq!(s.request(85), Outcome::Applied(85));
         assert!(!s.toast_visible());
+    }
+}
+
+/// What the toast's buttons produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastAction {
+    /// Accept the cap.
+    Dismiss,
+    /// Accept the warning and unlock for this session. The caller applies the
+    /// volume `unlock()` hands back — this only reports the press, so the
+    /// "nothing pending" guard stays in one place.
+    Unlock,
+}
+
+/// The slide-down safety toast. Draws nothing when nothing is clamped.
+///
+/// Ported from `SafetyToast.qml`. The model was here and tested; there was no
+/// renderer and no caller, so a manual volume above the threshold went
+/// straight through — this module's whole reason for existing did not happen.
+pub fn safety_toast_ui(
+    ui: &mut egui::Ui,
+    s: &Safety,
+    c: &uikit_egui::PaletteColors,
+) -> Option<ToastAction> {
+    let (applied, requested) = match s.pending_pair() {
+        Some(p) => p,
+        None => return None,
+    };
+    let mut act = None;
+    egui::Frame::popup(ui.style()).fill(c.bg_raised).show(ui, |ui| {
+        ui.label(egui::RichText::new("volume limited").strong().color(c.warning));
+        ui.label(egui::RichText::new(format!(
+            "asked for {requested}, held at {applied} — sustained listening above this level \
+damages hearing")).small());
+        ui.horizontal(|ui| {
+            if ui.button("keep the limit").clicked() { act = Some(ToastAction::Dismiss); }
+            // NOT styled as the primary action. The QML calls this unlock
+            // "deliberately awkward", and a warning whose accept button is the
+            // prettiest thing on screen is a warning that gets accepted.
+            if ui.small_button("unlock for this session").clicked() {
+                act = Some(ToastAction::Unlock);
+            }
+        });
+    });
+    act
+}
+
+#[cfg(test)]
+mod toast_ui_tests {
+    use super::*;
+
+    #[test]
+    fn the_toast_is_absent_when_nothing_is_clamped() {
+        // Not an empty frame: a toast that renders its own chrome with no
+        // message is a permanent band across the UI.
+        let s = Safety::default();
+        assert!(s.pending_pair().is_none());
+    }
+
+    #[test]
+    fn the_unlock_is_not_the_primary_action() {
+        // The module's own doc calls the unlock "deliberately awkward". A
+        // warning whose accept button is the prettiest thing on screen is a
+        // warning that gets accepted.
+        let src = include_str!("safety.rs");
+        // The QUOTED label, not the phrase: two doc comments above the
+        // renderer contain the same words, and matching prose found the first
+        // of those and failed a correct button.
+        let quoted = format!("{}unlock for this session{}", '"', '"');
+        let at = src.find(quoted.as_str()).expect("the label moved");
+        let line_start = src[..at].rfind('\n').unwrap_or(0);
+        assert!(src[line_start..at].contains("small_button"),
+                "the unlock is rendered as a full-weight button");
+    }
+
+    #[test]
+    fn the_toast_reports_the_press_and_does_not_apply_the_volume() {
+        // unlock() guards against "nothing pending" so a stray Unlock cannot
+        // raise the volume on its own. A renderer that applied the value
+        // itself would need that guard a second time.
+        let src = include_str!("safety.rs");
+        let at = src.find("pub fn safety_toast_ui").unwrap();
+        let body = &src[at..src[at..].find("\n}\n").map(|i| at + i).unwrap_or(src.len())];
+        assert!(!body.contains(".unlock()"), "the renderer applies the unlock itself");
     }
 }

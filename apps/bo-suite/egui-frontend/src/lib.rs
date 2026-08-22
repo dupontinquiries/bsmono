@@ -1055,7 +1055,34 @@ impl Controller {
         let mut inner = ui.new_child(
             egui::UiBuilder::new().max_rect(card_rect.shrink2(egui::vec2(10.0, 22.0))));
         if let Some(v) = crate::dial::dial_ui(&mut inner, &mut self.dial, 140.0, c) {
-            self.pending_volume = Some(v);
+            // THROUGH THE SAFETY CLAMP. The dial wrote straight to
+            // pending_volume, so a manual change above the ~95 dB threshold
+            // went through unchallenged and the whole safety module — model,
+            // tests and all — never ran. Found by the tested-but-uncalled
+            // check: `request` was exercised only by its own tests.
+            match self.safety.request(v.round().clamp(0.0, 255.0) as u8) {
+                crate::safety::Outcome::Applied(a) => self.pending_volume = Some(a as f32),
+                crate::safety::Outcome::Clamped { applied, .. } => {
+                    // The capped value IS applied — the cap is a limit, not a
+                    // refusal, and leaving the dial at its old position would
+                    // make the control feel broken rather than protective.
+                    self.pending_volume = Some(applied as f32);
+                }
+            }
+        }
+        // The toast, when something is being held back.
+        if let Some(a) = crate::safety::safety_toast_ui(ui, &self.safety, c) {
+            match a {
+                crate::safety::ToastAction::Dismiss => self.safety.dismiss(),
+                crate::safety::ToastAction::Unlock => {
+                    // unlock() returns the volume to re-apply, or None if
+                    // nothing was pending — so a stray press cannot raise the
+                    // volume on its own.
+                    if let Some(v) = self.safety.unlock() {
+                        self.pending_volume = Some(v as f32);
+                    }
+                }
+            }
         }
         if let Some(v) = self.pending_volume {
             ui.colored_label(c.text_weak, format!("volume {v:.0}"));
