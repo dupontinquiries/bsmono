@@ -27,6 +27,20 @@ pub mod mail_selector;
 pub mod token_log;
 pub mod connections_graph;
 pub mod summary_queue;
+/// Satisfies `crate::data` for the `smart_cd` module included by `favorites`.
+///
+/// Empty lists rather than a copy of voiceterm's: a second list of project
+/// markers is a second thing to keep in step, and this frontend does not call
+/// the descent heuristics that read them. Empty is correct here and obviously
+/// wrong the moment anything does.
+#[allow(dead_code)]
+pub mod data {
+    pub fn project_markers() -> &'static [String] { &[] }
+    pub fn skip_dirs() -> &'static [String] { &[] }
+    pub fn source_exts() -> &'static [String] { &[] }
+    pub fn init() {}
+}
+pub mod favorites;     // KDE Places plus a Home anchor (favoritesPopup)
 pub mod missing_pkg;   // packages recent commands reported missing (missingPkgDrawer)
 pub mod cmd_sheet;     // touch-friendly command history, tap to place / drag up to star
 pub mod card_preview;  // the slide-up card sheet (previewPanel)

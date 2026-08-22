@@ -609,6 +609,9 @@ struct VoicetermApp {
     /// the detector, which owns dismissal so a package reappearing in a NEW
     /// block comes back.
     missing_pkg_open: bool,
+    /// The favorites panel. Open state only — the list is read fresh on every
+    /// draw, so someone editing Dolphin's favorites mid-session sees it.
+    favorites_open: bool,
     /// The acoustic peer handshake, when one is running. Held as the ENGINE's
     /// state rather than a mirror of it — the QML kept a hand-copied string
     /// and a hand-copied enum is one that drifts.
@@ -791,6 +794,32 @@ impl eframe::App for VoicetermApp {
         // they are for: a modal that a panel can cover is not modal, and a
         // voice halo that only shows on one tab is a status light behind a
         // door.
+        // FAVORITES. Read fresh each draw rather than on open: the QML
+        // refreshes on open for the same reason, and "each draw" is strictly
+        // fresher for the cost of parsing one small XML file.
+        if self.favorites_open {
+            let colors = self.colors;
+            egui::Window::new("favorites")
+                .collapsible(false).resizable(false)
+                .show(ctx, |ui| {
+                    use voiceterm_egui::favorites as fv;
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let rows = fv::entries(&home, fv::smart_cd::dolphin_favorites());
+                    if let Some(a) = fv::favorites_ui(ui, &rows, &colors) {
+                        match a {
+                            // Typed, not run — consistent with every other
+                            // surface in this app that produces a command.
+                            fv::Action::Cd(path) => {
+                                self.pty_out.extend_from_slice(
+                                    format!("cd {path:?}").as_bytes());
+                                self.favorites_open = false;
+                            }
+                            fv::Action::Close => self.favorites_open = false,
+                        }
+                    }
+                });
+        }
+
         // MISSING PACKAGES, right edge as in the QML. A side panel rather
         // than a modal: the list is something to read WHILE looking at the
         // command output that produced it.
@@ -1030,6 +1059,10 @@ impl eframe::App for VoicetermApp {
                     if let Some(ch) = pipe_char(&id) {
                         self.app.terminal.feed(ch);
                     }
+                }
+                // the 🏠 chip opens favorites (QML: home icon in the toolbar)
+                if ui.button("\u{1F3E0}").clicked() {
+                    self.favorites_open = !self.favorites_open;
                 }
                 // the 📦 chip opens the missing-package sidebar
                 if ui.button("\u{1F4E6}").clicked() {
@@ -3145,6 +3178,7 @@ fn main() -> eframe::Result<()> {
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
                 missing_pkg_open: false,
+                favorites_open: false,
                 peer: None,
                 deck: Default::default(),
                 captured: String::new(),
