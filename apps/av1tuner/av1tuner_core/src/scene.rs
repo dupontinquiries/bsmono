@@ -86,6 +86,7 @@ mod tests {
             duration_s: frames as f64 / fps,
             pixel_format: "yuv420p".into(),
             codec: "h264".into(),
+            audio_streams: Vec::new(),
         }
     }
 
