@@ -601,6 +601,10 @@ struct VoicetermApp {
     /// The find bar's FILES mode. `None` until a file search is started, so
     /// the panel costs no terminal rows in the common case.
     fs_search: voiceterm_egui::fs_results::Search,
+    /// The touch command history. Ranked from the block tracker on open, not
+    /// held live — the ranking is recency-weighted and a sheet built once at
+    /// startup would show the wrong "most recent" an hour later.
+    cmd_sheet: voiceterm_egui::cmd_sheet::CmdSheet,
     /// The acoustic peer handshake, when one is running. Held as the ENGINE's
     /// state rather than a mirror of it — the QML kept a hand-copied string
     /// and a hand-copied enum is one that drifts.
@@ -783,6 +787,34 @@ impl eframe::App for VoicetermApp {
         // they are for: a modal that a panel can cover is not modal, and a
         // voice halo that only shows on one tab is a status light behind a
         // door.
+        // THE TOUCH COMMAND HISTORY. A bottom panel rather than a modal: it
+        // is a picker, and the terminal behind it is the context for choosing.
+        if self.cmd_sheet.open {
+            let colors = self.colors;
+            egui::TopBottomPanel::bottom("cmd_sheet").show(ctx, |ui| {
+                if let Some(a) = voiceterm_egui::cmd_sheet::cmd_sheet_ui(
+                    ui, &mut self.cmd_sheet, &colors)
+                {
+                    use voiceterm_egui::cmd_sheet::SheetAction as A;
+                    match a {
+                        // Typed, not run — and here the rule matters most:
+                        // these are commands you already ran once, often the
+                        // one just before something went wrong.
+                        A::Drop(cmd) => {
+                            self.pty_out.extend_from_slice(cmd.as_bytes());
+                            self.cmd_sheet.close();
+                        }
+                        A::Save(cmd) => {
+                            // Marked in the sheet so a second drag on the same
+                            // card does not offer to star it again.
+                            self.cmd_sheet.mark_saved(&cmd);
+                        }
+                        A::Dismiss => self.cmd_sheet.close(),
+                    }
+                }
+            });
+        }
+
         // THE FIND BAR'S FILE RESULTS. Drawn before the modal below, because
         // it is not modal — it sits under the find bar and the terminal keeps
         // working around it.
@@ -968,6 +1000,37 @@ impl eframe::App for VoicetermApp {
                 if let SlideOutcome::Selected(id, _) = self.pipe_menu.show(ui, &pipe_host, &pipe_menu()) {
                     if let Some(ch) = pipe_char(&id) {
                         self.app.terminal.feed(ch);
+                    }
+                }
+                // the ⏱ chip opens the touch command history (QML cmdSheet)
+                if ui.button("\u{23F1}").clicked() {
+                    if self.cmd_sheet.open {
+                        self.cmd_sheet.close();
+                    } else {
+                        // RANKED AT OPEN, not held live: recall scores recency
+                        // against frequency, so a list built once at startup
+                        // shows the wrong "most recent" an hour later.
+                        use voiceterm_egui::cmd_sheet::recall;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0);
+                        let items: Vec<recall::RecallItem> = self.blocks.blocks.iter()
+                            .filter(|b| !b.command.trim().is_empty())
+                            .map(|b| recall::RecallItem {
+                                command: b.command.clone(),
+                                // Truncated by the caller, as recall's own doc
+                                // says: the snippet is for ranking context, and
+                                // a whole build log would dwarf every command.
+                                output_snippet: b.output.chars().take(200).collect(),
+                                cwd: b.cwd.clone(),
+                                started_at: b.started_at,
+                                exit_code: b.exit_code,
+                            })
+                            .collect();
+                        // Empty query: no filter, pure recency/frequency rank,
+                        // which is what a history sheet opens on.
+                        let hits = recall::recall("", &items, now, 40);
+                        self.cmd_sheet.open_with(hits);
                     }
                 }
                 // the 📜 chip toggles the blocks drawer (QML blocksDrawer.open())
@@ -3047,6 +3110,7 @@ fn main() -> eframe::Result<()> {
                 glow: Default::default(),
                 pending_confirm: None,
                 fs_search: Default::default(),
+                cmd_sheet: Default::default(),
                 peer: None,
                 deck: Default::default(),
                 captured: String::new(),

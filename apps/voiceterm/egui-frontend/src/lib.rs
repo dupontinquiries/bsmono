@@ -27,6 +27,7 @@ pub mod mail_selector;
 pub mod token_log;
 pub mod connections_graph;
 pub mod summary_queue;
+pub mod cmd_sheet;     // touch-friendly command history, tap to place / drag up to star
 pub mod card_preview;  // the slide-up card sheet (previewPanel)
 pub mod fs_results;   // the find bar's FILES mode — path:line hits, and the SSH refusal
 pub mod peer_panel;   // the acoustic handshake — the last QML surface with no egui counterpart
