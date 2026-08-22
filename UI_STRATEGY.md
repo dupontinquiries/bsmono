@@ -30,6 +30,7 @@ on every surface yet. Nothing here deletes a working front-end.
 | av1tuner(-m1)   | av1tuner_app                      | —                           | —                       |
 | settings-app    | SettingsEditor (`bsettings`)      | —                           | —                       |
 | dialer          | crates/dialer-egui (only UI)      | —                           | —                       |
+| launcher        | apps/launcher/egui-frontend       | apps/launcher/plasmoid (6 qml) | —                    |
 
 ## Why kits, not deletion
 
