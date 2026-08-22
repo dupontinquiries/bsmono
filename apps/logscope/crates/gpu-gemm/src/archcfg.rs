@@ -997,6 +997,43 @@ archcfg.rs — they tell the reader it is absent, and a note that is wrong about
 than no note at all.");
     }
 
+    /// Every dense-attention block fn refuses an MLA layer instead of computing over it.
+    ///
+    /// The companion to `mla_loading_is_still_absent`, and the reason it is here rather than beside
+    /// the blocks: that test says loading is absent, which is what makes THIS one cheap to satisfy
+    /// today. The moment loading lands, `BlockWeights.mla` becomes reachable, and `w.wq`/`w.wk`/
+    /// `w.wv` — not `Option`, so an MLA layer must carry something in them — become readable by
+    /// eight block fns of which only `block_decode_mla` is correct for that layer. The output would
+    /// be a correctly-shaped tensor of nonsense, not an error.
+    ///
+    /// Checked structurally, by the same reasoning as the loading test: a behavioural check needs a
+    /// GPU and an MLA checkpoint, and neither exists in the sandbox where this is most likely to be
+    /// broken. A grep over the source needs neither and fails on the ninth block fn someone adds
+    /// without the guard — which is the case that actually happens.
+    #[test]
+    fn every_dense_block_refuses_an_mla_layer() {
+        let src = include_str!("lib.rs");
+        let mut unguarded = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            // Signatures only: `fn block_decode…(&self,` at method indentation.
+            let Some(rest) = t.strip_prefix("fn ") else { continue };
+            if !rest.starts_with("block_decode") || !rest.contains("(&self,") { continue }
+            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if name == "block_decode_mla" { continue }
+            // The guard must be inside the body, not merely somewhere in the file. A signature can
+            // span several lines, so scan a window past it rather than only the next line.
+            let body: String = src.lines().skip(i).take(14).collect::<Vec<_>>().join("\n");
+            let want = format!("refuse_mla_on_dense_block(w, \"{name}\")");
+            if !body.contains(&want) { unguarded.push(name); }
+        }
+        assert!(unguarded.is_empty(),
+            "these dense-attention block fns would compute over an MLA layer's absent q/k/v weights \
+and return a plausible-looking tensor: {unguarded:?}. Add \
+`Self::refuse_mla_on_dense_block(w, \"<fn name>\");` as the first statement, or route the layer to \
+block_decode_mla.");
+    }
+
     /// The mirror: notes must not describe as PENDING anything the engine already honours. Group
     /// routing was reported pending for 50 bundles after it landed.
     #[test]

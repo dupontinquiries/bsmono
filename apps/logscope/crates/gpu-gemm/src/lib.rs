@@ -14474,6 +14474,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// One decode block using the int8 KV cache: compute q/k/v (f32), quantize this
     /// token's k/v row into the cache, attend the cache (dequant on the fly).
     fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode_q8");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -14497,6 +14498,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// matmul, q/k/v sliced from the packed output, then K and V quantized into the int8 cache exactly
     /// as before. Bit-exact to block_decode_q8 (the fusion never changes the values being quantized).
     fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode_q8_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -14623,6 +14625,43 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         }
     }
 
+    /// Refuse to run a Multi-head Latent Attention layer down a dense-attention block.
+    ///
+    /// ## Why this exists BEFORE MLA loading does
+    ///
+    /// `archcfg`'s deepseek2 note says MLA kernels are wired and loading is not, which reads as
+    /// "one thing left to build". It is two. `block_decode_mla` is dispatched from exactly two
+    /// places — `decode_step_full` and the staged decoder — and every other entry point
+    /// (`decode_step_q8`, `forward_kv_q8`, `forward_kv_q8_fused`, `decode_step_stream`,
+    /// `forward_kv`, `forward_kv_fused`, `decode_step_staged`) reaches a block fn that reads
+    /// `w.wq`/`w.wk`/`w.wv` unconditionally.
+    ///
+    /// Those fields are not `Option`, so whoever makes MLA checkpoints load has to put SOMETHING in
+    /// them, and an MLA layer has nothing to put. Whatever they choose, five entry points will then
+    /// compute attention over it and return a tensor. Not an error — a tensor, of the right shape,
+    /// full of nonsense, which the sampler will happily turn into fluent text.
+    ///
+    /// The int8-KV path is the one that makes this urgent rather than theoretical: `load_gguf_opt(_,
+    /// true)` is how real models load, and `decode_step_q8` is what runs them.
+    ///
+    /// So the guard lands first, on the BLOCK functions rather than the entry points — a new entry
+    /// point composed from these inherits it, whereas a list of entry points is a list to forget to
+    /// extend. Today nothing can trip it (no MLA checkpoint loads), which is exactly when a tripwire
+    /// is free to install.
+    ///
+    /// A panic is not the nice option; it is the only one that is not silent. These fns return
+    /// `Tensor`, not `Result`, and the alternative to stopping here is returning the nonsense.
+    #[inline]
+    fn refuse_mla_on_dense_block(w: &BlockWeights, block_fn: &str) {
+        if w.mla.is_some() {
+            panic!("{block_fn}: this layer carries MLA projections (attn_q_a / attn_kv_a_mqa) and \
+this is a dense-attention block, which would read w.wq/w.wk/w.wv — weights an MLA layer does not \
+have. Route MLA layers to block_decode_mla, as decode_step_full does. Returning here instead of \
+refusing produces a correctly-shaped tensor of nonsense, which samples into fluent text and looks \
+like a bad model rather than a wiring bug.");
+        }
+    }
+
     /// One decode step for a Multi-head Latent Attention layer.
     ///
     /// Structurally identical to `block_decode` — norm, attention, residual, FFN — but the attention half
@@ -14712,6 +14751,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -14758,6 +14798,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     fn block_decode_staged(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
             kc: &Tensor, vc: &Tensor, warm: Option<(&Tensor, &Tensor, &Tensor, &Tensor)>, warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode_staged");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -14789,6 +14830,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     fn block_decode_staged_multi(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
             kc: &Tensor, vc: &Tensor, warm_blocks: &[(&Tensor, &Tensor, &Tensor, &Tensor, usize)], warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode_staged_multi");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -14861,6 +14903,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// so it's bit-exact to roping them separately), v is copied straight into the V-cache row.
     /// Bit-exact to block_decode (--gate-qkv); saves 2 projection + 1 RoPE dispatch/layer.
     fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -14923,6 +14966,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// so a ring buffer can overwrite an evicted slot with no shifting. `block_decode` is
     /// the special case `slot == rope_pos`, `attend_len == rope_pos+1`.
     fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode_at");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -14943,6 +14987,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Fused-QKV counterpart of block_decode_at (streaming/ring f32 KV cache). Same as
     /// block_decode_fused but K/V are written at physical `slot` and attention spans `attend_len`.
     fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_on_dense_block(w, "block_decode_at_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
