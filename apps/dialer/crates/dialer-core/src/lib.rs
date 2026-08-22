@@ -24,6 +24,8 @@ pub mod command_guard;
 pub mod conversation;
 pub mod gesture;
 pub mod history;
+#[cfg(feature = "irc")]
+pub mod irc;
 pub mod link;
 pub mod matrix;
 pub mod message;

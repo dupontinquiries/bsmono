@@ -13,3 +13,7 @@ description = "logscope's egui-free orchestration core: the coordinator fan-out,
 crypto-kit = { path = "../../../../shared/crypto-kit" }
 # Ed25519 for the machine identity: the id an operator pastes IS a fingerprint of this key,
 # so without it the id is stable and not actually anyone's.
+# IRC channel logs as fan sources (the :irc command family). Zero-dependency
+# itself — std plus net-kit/core-kit, both std-only — so this does not violate
+# the crate's no-deps rule or slow the recompile loop.
+irc-kit = { path = "../../../../shared/irc-kit" }

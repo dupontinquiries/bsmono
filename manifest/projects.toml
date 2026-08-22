@@ -319,6 +319,16 @@ runtime = "none"
 targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
 notes = "transport: auth/wire/json/http; -> core-kit; no external deps"
 
+[shared.irc-kit]
+path = "shared/irc-kit"
+kind = "cargo"
+role = "shared-lib"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
+notes = "headless IRCv3: pure proto parse/format, pure session state machine (no clock), JSONL channel log with per-line provenance, pure search ranker, fail-closed source-consent gate; -> net-kit, core-kit; no external deps (TLS is the host's, Client is generic over one Read+Write); consumed by dialer (feature irc), voiceterm, logscope-fan"
+
 [shared.share-kit]
 path = "shared/share-kit"
 kind = "cargo"

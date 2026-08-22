@@ -27,8 +27,18 @@ zbus = { version = "4.4", optional = true }
 # matrix HTTP; blocking, fits the visible-loop style. The pure JSON layer of
 # matrix.rs compiles and tests without it.
 ureq = { version = "2", optional = true }
+# IRC as a fourth transport on the same Link. irc-kit is zero-dependency
+# (std + two std-only path kits), so the default feature set gains nothing;
+# TLS is a separate opt-in because rustls is the only heavy part.
+irc-kit = { path = "../../../../shared/irc-kit", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 [features]
 default = []
 mm = ["dep:zbus"]
 matrix = ["dep:ureq"]
+irc = ["dep:irc-kit"]
+# Plaintext IRC needs no crypto; TLS ports (6697) do. Split so a build that
+# only ever talks to a local bouncer does not pull rustls.
+irc-tls = ["irc", "dep:rustls", "dep:webpki-roots"]

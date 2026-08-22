@@ -79,6 +79,21 @@ pub enum Command {
     /// Parsed here so the mode is reachable from the same place every other mode is.
     Replicate(Option<usize>),
     SyncWorkspace,     // :sync — rescan the /tmp workspace's changed files (refresh after edits)
+    /// `:irc` — show which IRC channel logs exist and which are permitted as sources.
+    IrcStatus,
+    /// `:irc <network>/<channel>` — ASK about adding a channel log as a source. Deliberately
+    /// does not grant: it prints the consent text and arms a pending ask that `:ircy` confirms.
+    /// `:ws <path>` opens in one step because a workspace is your own files; a channel log is
+    /// other people's writing, so it costs two.
+    IrcAsk(String),
+    /// `:ircy <channel>` — confirm the pending ask by typing the channel name back. The phrase
+    /// is the channel name and not `y` so muscle memory cannot carry you through it.
+    IrcConfirm(String),
+    /// `:ircx <network>/<channel>` — withdraw a grant.
+    IrcRevoke(String),
+    /// `:ircf <query>` — search the granted channel logs. Ungranted logs are not searched:
+    /// the grant gates reading them into the model's reach, and search is that reach.
+    IrcFind(String),
     Stop,              // :stop / :st          — cancel a running fan + clear the queue
     Fill(String),      // :fill [path]         — decompose a todo!()-skeleton into KV-shared sub-tasks + fan them
     Assemble,          // :assemble / :asm     — splice the filled bodies back into the skeleton
@@ -486,6 +501,16 @@ pub fn parse_command(line: &str) -> Command {
             },
         },
         "sync" => Command::SyncWorkspace,
+        // Bare `:irc` is status, an argument is the ask — the same shape as
+        // `:ws`, so the muscle memory transfers.
+        "irc" => if arg.trim().is_empty() {
+            Command::IrcStatus
+        } else {
+            Command::IrcAsk(arg.trim().to_string())
+        },
+        "ircy" | "irc-confirm" => Command::IrcConfirm(arg.trim().to_string()),
+        "ircx" | "irc-revoke" => Command::IrcRevoke(arg.trim().to_string()),
+        "ircf" | "ircfind" => Command::IrcFind(arg.trim().to_string()),
         "stop" | "st" | "qa" => Command::Stop,  // :qa reads as vim "quit all" → cancel the run
         "quest" | "questions" => {
             let n = count.or_else(|| arg.split_whitespace().next().and_then(|w| w.parse().ok())).unwrap_or(5).clamp(1, 40);
@@ -848,6 +873,44 @@ mod tests {
                    "a bad count must not quietly become one worker");
         assert_eq!(parse_command(":workspace"), Command::WorkspaceStatus);
         assert_eq!(parse_command(":sync"), Command::SyncWorkspace);
+    }
+
+    #[test]
+    fn irc_bare_is_status_and_an_arg_is_the_ask() {
+        // Same split as :ws, on purpose.
+        assert_eq!(parse_command(":irc"), Command::IrcStatus);
+        assert_eq!(parse_command(":irc   "), Command::IrcStatus);
+        assert_eq!(parse_command(":irc oftc/#asahi-dev"), Command::IrcAsk("oftc/#asahi-dev".into()));
+    }
+
+    #[test]
+    fn asking_never_parses_as_granting() {
+        // The property that matters: no single command in the language grants
+        // a source. Whatever `:irc <target>` is given, it is an IrcAsk.
+        for arg in ["oftc/#asahi-dev", "oftc/#anything", "y", "--force", "yes really"] {
+            match parse_command(&format!(":irc {arg}")) {
+                Command::IrcAsk(_) => {}
+                other => panic!(":irc {arg} parsed as {other:?}, which is not an ask"),
+            }
+        }
+    }
+
+    #[test]
+    fn confirm_revoke_and_find_have_short_and_long_spellings() {
+        assert_eq!(parse_command(":ircy #asahi-dev"), Command::IrcConfirm("#asahi-dev".into()));
+        assert_eq!(parse_command(":irc-confirm #asahi-dev"), Command::IrcConfirm("#asahi-dev".into()));
+        assert_eq!(parse_command(":ircx oftc/#asahi-dev"), Command::IrcRevoke("oftc/#asahi-dev".into()));
+        assert_eq!(parse_command(":irc-revoke oftc/#asahi-dev"), Command::IrcRevoke("oftc/#asahi-dev".into()));
+        assert_eq!(parse_command(":ircf avd vulkan"), Command::IrcFind("avd vulkan".into()));
+        assert_eq!(parse_command(":ircfind avd vulkan"), Command::IrcFind("avd vulkan".into()));
+    }
+
+    #[test]
+    fn an_empty_confirm_is_still_a_confirm_so_the_handler_can_explain() {
+        // Not Unknown: ":ircy" alone should say what it wanted, which is a
+        // better error than "unknown command" — same reasoning as :image("").
+        assert_eq!(parse_command(":ircy"), Command::IrcConfirm(String::new()));
+        assert_eq!(parse_command(":ircf"), Command::IrcFind(String::new()));
         assert_eq!(parse_command(":map *.rs 'add tests to {file}'"),
                    Command::MapFiles { glob: "*.rs".into(), template: "add tests to {file}".into() });
         assert_eq!(parse_command(":map"), Command::MapFiles { glob: String::new(), template: String::new() });

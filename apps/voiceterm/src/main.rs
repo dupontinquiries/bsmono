@@ -343,6 +343,7 @@ mod syntax_hl;
 // v0.1.675: content (full-text) search across note/script bodies — the
 // piece the search bar was missing (searching "cloak" found nothing because
 // only filenames/history were searched, not file contents).
+mod irc_search;
 mod note_search;
 // v0.1.679: per-block markdown render for the WYSIWYG editor inactive lines.
 mod note_render;
