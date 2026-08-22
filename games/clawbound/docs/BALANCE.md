@@ -164,6 +164,40 @@ reason and can be turned on per run:
 cargo run --release --example battleground_balance -- 4 20 wombo kit 1 push
 ```
 
+## A push that leaves a holder, and a metric for the AI itself
+
+The all-in collapse above was diagnosed as an abandonment, so the switch now
+sends everyone *except* the lowest seat on each lane — a push with somebody
+holding. That diagnosis was right and the repair partial:
+
+| | no push | all-in | holder |
+|---|---|---|---|
+| dispersion | sd 2.9 | sd 4.2 | sd 3.5 |
+| kits outside 2se | 1 | 2 | 2 |
+| composition-decided | 54% | 52% | 54% |
+
+Composition-determinism came back to 54% and most of the dispersion damage
+undid itself, but pushing still does not beat not pushing. Default stays off.
+
+That prompted a third metric, because dispersion and composition-determinism
+both measure the *roster*, and nothing measured the AI: **does the clan that
+breaks the enemy's first border go on to win?** A team that takes the first
+objective and loses anyway is not converting an advantage.
+
+The answer was **43%** pooled over 320 games — breaking a border was not an
+advantage, it was slightly a liability. Reading the sim explained it: felling a
+tree costs time and blood deep in enemy ground and bought almost nothing,
+because the Great Tree's root guard was all-or-nothing. Two standing trees
+hardened it exactly as much as three. So the guard now scales — each felled
+border is a third of it gone, tested directly (`every_felled_border_softens_the_great_tree`).
+
+**And the conversion rate did not move: 48% and 39%, the same two seeds, before
+and after.** The mechanism is right and evidently was not the binding
+constraint. Left open rather than papered over; the likeliest remaining
+explanation is that the breaching clan simply overextends and pays for the
+border in bodies, which is a question for the retreat rules rather than the
+structures.
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three

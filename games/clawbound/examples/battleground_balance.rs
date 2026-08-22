@@ -25,16 +25,36 @@
 use clawbound_rs::ancestor::{self, Ancestor};
 use clawbound_rs::battleground::{Battleground, LanePolicy, CLAN_A};
 
-fn play(a: [Ancestor; 3], b: [Ancestor; 3], seed: u32, wombo: bool, policy: LanePolicy) -> Option<u8> {
+/// Returns the winner, and whether the clan that broke the enemy's first border
+/// went on to win. That second number is a measure of the AI itself rather than
+/// of the roster: a clan that takes the first objective and then loses anyway
+/// was not converting an advantage, and no amount of kit balance shows that.
+fn play(
+    a: [Ancestor; 3],
+    b: [Ancestor; 3],
+    seed: u32,
+    wombo: bool,
+    policy: LanePolicy,
+) -> (Option<u8>, Option<bool>) {
     let mut bg = Battleground::new_with(a, b, seed, policy);
     bg.wombo = wombo;
     bg.collapse_on_breach = std::env::args().any(|s| s == "push");
     let mut steps = 0u32;
+    let mut first_breaker: Option<u8> = None;
     while bg.outcome.is_none() && steps < 30 * 60 * 13 {
         bg.step(1.0 / 30.0);
         steps += 1;
+        if first_breaker.is_none() {
+            if let Some(t) = bg.heal_trees.iter().find(|t| !t.alive()) {
+                first_breaker = Some(1 - t.team);   // whoever felled it
+            }
+        }
     }
-    bg.outcome
+    let converted = match (first_breaker, bg.outcome) {
+        (Some(b), Some(w)) if w != 2 => Some(b == w),
+        _ => None,
+    };
+    (bg.outcome, converted)
 }
 
 fn main() {
@@ -70,6 +90,7 @@ fn main() {
     let mut total = 0u32;
     let mut fells = 0u32;
     let (mut pairs, mut pair_a_both, mut pair_b_both, mut pair_split) = (0u32, 0u32, 0u32, 0u32);
+    let (mut conversions, mut converted_wins) = (0u32, 0u32);
     let mut rng: u64 = draft_seed;
     let mut next = move || {
         rng ^= rng << 13;
@@ -94,7 +115,14 @@ fn main() {
             let mut pair_played = 0u32;
             for swap in [false, true] {
                 let (x, y) = if swap { (side_b, side_a) } else { (side_a, side_b) };
-                let Some(o) = play(x, y, seed, wombo, policy) else { continue };
+                let (outcome, converted) = play(x, y, seed, wombo, policy);
+                let Some(o) = outcome else { continue };
+                if let Some(c) = converted {
+                    conversions += 1;
+                    if c {
+                        converted_wins += 1;
+                    }
+                }
                 pair_played += 1;
                 if o == CLAN_A { pair_a_wins += 1; }
                 total += 1;
@@ -145,6 +173,10 @@ fn main() {
     eprintln!(
         "  {fells} decided by felling a Great Tree ({:.0}%)",
         fells as f64 / total as f64 * 100.0
+    );
+    eprintln!(
+        "  first border broken -> match won: {converted_wins}/{conversions} ({:.0}%) — an AI measure, not a roster one",
+        converted_wins as f64 / conversions.max(1) as f64 * 100.0
     );
     eprintln!(
         "  of {pairs} draft pairs played both ways: {pair_split} split 1-1, {pair_a_both} taken by clan A twice, {pair_b_both} by clan B twice"

@@ -1159,8 +1159,30 @@ impl Battleground {
                 {
                     if let Some(b) = self.breach_lane(team) {
                         if self.warriors[i].lane != b {
-                            self.warriors[i].lane = b;
-                            self.warriors[i].seg = 0;
+                            // …but somebody holds the lane you are leaving. The
+                            // first version of this sent *every* healthy warrior,
+                            // so a clan traded one broken border for two empty
+                            // ones and measured worse than not pushing at all.
+                            // The lowest seat stays — deterministic, and it means
+                            // the same cat holds rather than the lane flickering
+                            // between whoever thought of it first this tick.
+                            let my_seat = self.warriors[i].seat;
+                            let my_lane = self.warriors[i].lane;
+                            let holder = self
+                                .warriors
+                                .iter()
+                                .filter(|w| {
+                                    w.team == team
+                                        && w.role == Role::Ancestor
+                                        && w.alive()
+                                        && w.lane == my_lane
+                                })
+                                .map(|w| w.seat)
+                                .min();
+                            if holder != Some(my_seat) {
+                                self.warriors[i].lane = b;
+                                self.warriors[i].seg = 0;
+                            }
                         }
                     }
                 }
@@ -1217,8 +1239,22 @@ impl Battleground {
                 }
                 if dist(x, z, enemy_camp.0, enemy_camp.1) < REACH + 4.0 {
                     let e = Self::enemy(team) as usize;
-                    let roots = self.heal_trees.iter().any(|t| t.team != team && t.alive());
-                    let dmg = atk * self.siege_of(i) * dt * if roots { 1.0 - ROOT_GUARD } else { 1.0 };
+                    // The Great Tree's hardness scales with how many of its
+                    // clan's Heal Trees still stand, rather than being all-or-
+                    // nothing. Measured: the clan that broke the enemy's FIRST
+                    // border went on to win only 39-48% of the time — breaking a
+                    // border was not an advantage, it was a bill. Of course it
+                    // was: felling a tree cost time and blood deep in enemy
+                    // ground and bought nothing, because two standing roots
+                    // hardened the Great Tree exactly as much as three did.
+                    // Now each felled tree is a third of that guard gone.
+                    let standing = self
+                        .heal_trees
+                        .iter()
+                        .filter(|t| t.team != team && t.alive())
+                        .count();
+                    let guard = ROOT_GUARD * (standing as f32 / LANES as f32).min(1.0);
+                    let dmg = atk * self.siege_of(i) * dt * (1.0 - guard);
                     self.clans[e].great_tree_hp -= dmg;
                     return;
                 }
@@ -2945,8 +2981,32 @@ mod tests {
             }
         }
         bg.step(1.0 / 30.0);
-        for w in bg.warriors.iter().filter(|w| w.team == CLAN_A && w.role == Role::Ancestor) {
-            assert_eq!(w.lane, breach, "a healthy warrior heads for the hole in their border");
+        // the duo pair sends one and keeps one: a push is not an abandonment
+        let a_lanes: Vec<(u32, usize)> = bg
+            .warriors
+            .iter()
+            .filter(|w| w.team == CLAN_A && w.role == Role::Ancestor)
+            .map(|w| (w.seat, w.lane))
+            .collect();
+        assert!(
+            a_lanes.iter().any(|&(_, l)| l == breach),
+            "somebody heads for the hole in their border"
+        );
+        for lane in [DUO_LANE, SOLO_LANE] {
+            if lane == breach {
+                continue;
+            }
+            let started_there: Vec<u32> = a_lanes
+                .iter()
+                .filter(|&&(_, l)| l == lane)
+                .map(|&(s, _)| s)
+                .collect();
+            // whichever lanes still have somebody, that somebody is the lowest
+            // seat of the group — the holder, not a leftover
+            if let Some(&min) = started_there.iter().min() {
+                assert_eq!(started_there.len(), 1, "one holder, not a crowd");
+                let _ = min;
+            }
         }
         // a wounded one does not: it is going to a sanctuary, and a push is not
         // worth a life
@@ -2956,6 +3016,44 @@ mod tests {
         bg.warriors[hurt].mind = Mind::Trail;
         bg.step(1.0 / 30.0);
         assert_ne!(bg.warriors[hurt].lane, breach);
+    }
+
+    #[test]
+    fn every_felled_border_softens_the_great_tree() {
+        // Felling a Heal Tree has to buy something, or taking objectives is a
+        // bill rather than an advantage — which is exactly what the harness
+        // measured before this: the clan that broke the first border won under
+        // half its matches.
+        let gnaw_rate = |fell: usize| {
+            let mut bg = Battleground::new(Ancestor::CaveLion);
+            bg.patrol_t = [1e9; 2];
+            bg.warriors.retain(|w| w.team == CLAN_B);
+            for (n, t) in bg
+                .heal_trees
+                .iter_mut()
+                .filter(|t| t.team == CLAN_A)
+                .enumerate()
+            {
+                if n < fell {
+                    t.hp = 0.0;
+                }
+            }
+            let (cx, cz) = bg.camps[CLAN_A as usize];
+            let before = bg.clans[CLAN_A as usize].great_tree_hp;
+            for _ in 0..30 * 3 {
+                for i in 0..bg.warriors.len() {
+                    bg.warriors[i].x = cx + 2.0;
+                    bg.warriors[i].z = cz;
+                    bg.warriors[i].hp = bg.warriors[i].max_hp;
+                    bg.warriors[i].mind = Mind::Trail;
+                }
+                bg.step(1.0 / 30.0);
+            }
+            before - bg.clans[CLAN_A as usize].great_tree_hp
+        };
+        let (none, one, all) = (gnaw_rate(0), gnaw_rate(1), gnaw_rate(3));
+        assert!(one > none * 1.1, "the first border must buy something: {none} -> {one}");
+        assert!(all > one * 1.1, "and the next ones more: {one} -> {all}");
     }
 
     #[test]

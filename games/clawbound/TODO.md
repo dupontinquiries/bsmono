@@ -281,9 +281,19 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   dispersion 2.9 -> 4.2, kits outside 2se 1 -> 2, composition-determinism 54% -> 52%. Lives
   behind `collapse_on_breach`, default off. Suspected cause is in the rule: *every* healthy
   warrior goes, so the clan trades one broken border for two empty lanes.
-- [ ] The version worth testing next: collapse but leave one cat holding each remaining
-  lane. That is the difference between a push and an abandonment, and the switch exists to
-  answer it
+- [x] Holder-push tested: everyone collapses *except* the lowest seat on each lane. The
+  abandonment diagnosis was right — composition-determinism back to 54%, dispersion 4.2 ->
+  3.5 — but pushing still does not beat not pushing (sd 2.9). Default stays off.
+- [x] New metric, because both existing ones measure the roster and none measured the AI:
+  **does the clan that breaks the first border win?** Pooled answer **43% over 320 games** —
+  taking the first objective was slightly a *liability*.
+- [x] First explanation found and fixed: the Great Tree's root guard was all-or-nothing, so
+  two standing Heal Trees hardened it exactly as much as three and a felled border bought
+  nothing. It scales now, a third of the guard per border. Tested.
+- [ ] **But the conversion rate did not move** (48%/39% on the same two seeds, before and
+  after), so that was not the binding constraint. Next suspect: the breaching clan
+  overextends and pays for the border in bodies — a retreat-rule question, not a structure
+  one. Worth instrumenting deaths-per-clan in the minute after a border falls.
 - [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
   winning rather than only fleeing a lost one
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
@@ -384,9 +394,19 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   dispersion 2.9 -> 4.2, kits outside 2se 1 -> 2, composition-determinism 54% -> 52%. Lives
   behind `collapse_on_breach`, default off. Suspected cause is in the rule: *every* healthy
   warrior goes, so the clan trades one broken border for two empty lanes.
-- [ ] The version worth testing next: collapse but leave one cat holding each remaining
-  lane. That is the difference between a push and an abandonment, and the switch exists to
-  answer it
+- [x] Holder-push tested: everyone collapses *except* the lowest seat on each lane. The
+  abandonment diagnosis was right — composition-determinism back to 54%, dispersion 4.2 ->
+  3.5 — but pushing still does not beat not pushing (sd 2.9). Default stays off.
+- [x] New metric, because both existing ones measure the roster and none measured the AI:
+  **does the clan that breaks the first border win?** Pooled answer **43% over 320 games** —
+  taking the first objective was slightly a *liability*.
+- [x] First explanation found and fixed: the Great Tree's root guard was all-or-nothing, so
+  two standing Heal Trees hardened it exactly as much as three and a felled border bought
+  nothing. It scales now, a third of the guard per border. Tested.
+- [ ] **But the conversion rate did not move** (48%/39% on the same two seeds, before and
+  after), so that was not the binding constraint. Next suspect: the breaching clan
+  overextends and pays for the border in bodies — a retreat-rule question, not a structure
+  one. Worth instrumenting deaths-per-clan in the minute after a border falls.
 - [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
   winning rather than only fleeing a lost one
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
