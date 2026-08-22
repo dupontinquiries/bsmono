@@ -6,6 +6,57 @@ shapes — floating rings, balloon spheres, lollipop pillars, tilted ramps, box
 platforms and buried domes — with real car models, a real ball, boost pads, and
 RL-style flight physics tuned for keeping the ball on your nose.
 
+**Note (2026-08-19): this README and the `Cargo.toml` package name are stale.**
+This directory is a distinct, much larger project from `games/skydribble` — an
+engine extension toward a more ambitious, Destiny-style game (108 source files,
+~65,000 lines, vs. skydribble's 31 files, with dozens of exclusive systems:
+`campaign.rs`, `duel.rs`, `energon.rs`, `exoworlds.rs`, `finale.rs`,
+`corruption.rs`, vendored `snapcore`/`netcode` crates for networking, and more).
+The text above and the package name (`skydribble`) are copied from the sibling
+project and were never updated to describe what this one actually is. Not
+corrected here — a package rename has real blast radius (build scripts, any
+CI, other tooling referencing the crate name) this pass didn't attempt to
+audit.
+
+## Verification (2026-08-19)
+
+Had no build-status record anywhere. Ran it for real with rustc 1.96:
+`cargo check --tests` compiles clean. `cargo test`: **654/656 passing** after
+one real fix (below); 2 failures investigated but deliberately left alone
+(also below) rather than guess-fixed.
+
+**Fixed**: `chassis_traits::Traits::blend` used `a + (b - a) * w` for
+interpolation, which is not exact at `w == 1.0` in floating point (rounding
+in `b - a` means `a + (b - a)` can differ from `b` by an ULP or two) — broke
+`blending_is_clamped_at_both_ends`'s exact-equality check against `other`.
+Switched to `a * (1.0 - w) + b * w`, which is exact at both clamped
+endpoints. Verified: the two blend tests plus the other 10 in that module
+all pass, no regressions elsewhere.
+
+**Investigated, NOT fixed** — `render::sdf_capacity_tests::
+a_bigger_device_gets_a_bigger_roster` and `::capacity_is_a_whole_number_of_
+slabs`: `CSDF_MAXM` is `1344` in `render.rs`, but that constant's OWN doc
+comment (two stacked, seemingly duplicated blocks) does the math for a
+different value: "126 gives 123 real headroom without touching the 2048
+ceiling (16*126=2016)". The two failing tests hardcode literals consistent
+with the *126* reasoning (`sdf_capacity(4096) == 256`, i.e. `4096/16`, which
+only holds if the compile-time floor is well under 256). But `1344` is NOT
+simply a typo for `126`: `shader.wgsl`'s `CSDF_D = 1344.0` — the actual
+3D-texture depth the shader hardcodes — agrees exactly with `render.rs`'s
+own `csdf_extent()` formula when `CSDF_MAXM = 1344` (`SLAB * MAXM /
+TILES² = 16 * 1344 / 16 = 1344`). So the *code* (Rust and WGSL together) is
+now self-consistent at 1344; it's the older doc comments and these two
+tests that read like leftovers from before a tiling scheme
+(`CSDF_TILES` sharing each depth slab across 16 models) was introduced,
+never updated to match. Whether `sdf_capacity()`'s own scaling logic
+(`by_device.max(CSDF_MAXM)`) still means the right thing under that tiling
+scheme is exactly the kind of "three numbers must agree" cross-file
+question the file's own comments say has already burned this project once
+before ("the actual trade-off... two of the three were already wrong once
+before") — and it spans a Rust constant, a WGSL constant, and a GPU texture
+layout no headless sandbox can render to confirm. Left alone rather than
+guessed at.
+
 ## Build & run
 
 ```
