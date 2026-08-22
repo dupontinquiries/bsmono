@@ -557,3 +557,139 @@ mod tests {
         assert!(k.wide, "MUTE is a pill");
     }
 }
+
+/// The processing section at the bottom of the mixer page.
+///
+/// The model was complete and had no renderer, so `set_output`, `set_bitrate`,
+/// `clear_output` and `set_progress` were reachable only from tests — meaning
+/// the section this module exists for could not be operated at all. Found by
+/// the tested-but-uncalled check.
+///
+/// Returns the action the host should perform; nothing here touches a file.
+pub fn fileproc_ui(
+    ui: &mut egui::Ui,
+    p: &mut FileProcessor,
+    c: &uikit_egui::PaletteColors,
+) -> Option<ProcAction> {
+    let mut act = None;
+    ui.label(egui::RichText::new("process a file").strong());
+    ui.label(egui::RichText::new(
+        "runs a stereo WAV through the CURRENT mixer settings — if the file comes out right, \
+the live path is right")
+        .small().weak());
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("in").small().weak());
+        ui.text_edit_singleline(&mut p.input);
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("out").small().weak());
+        // THE SUGGESTION IS A PLACEHOLDER, not prefilled text. The model's own
+        // note: the suggestion is "a placeholder they can accept by doing
+        // nothing", and it stops following the input once the user types. A
+        // prefilled box would look edited before it was, and the model could
+        // not tell the difference.
+        let mut shown = p.output_field().to_string();
+        let hint = suggest_output(&p.input);
+        if ui.add(egui::TextEdit::singleline(&mut shown).hint_text(hint)).changed() {
+            p.set_output(&shown);
+        }
+        if !p.output_field().is_empty() && ui.small_button("reset").clicked() {
+            // Back to following the input, which is what clear_output means —
+            // not an empty path.
+            p.clear_output();
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("kbps").small().weak());
+        // The Opus range that matters, not a free number field: below 64 is
+        // audibly lossy on music and above 256 buys nothing at stereo.
+        for k in [96u32, 128, 192, 256] {
+            if ui.selectable_label(p.bitrate == k, k.to_string()).clicked() {
+                p.set_bitrate(k);
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        // can_run is the model's rule — an empty input, or a run already in
+        // flight. Disabled rather than absent here, because unlike the safety
+        // unlock this control DOES become available: typing a path enables it,
+        // and hiding it would leave nothing to explain what to do.
+        if ui.add_enabled(p.can_run(), egui::Button::new("run")).clicked() {
+            act = p.run();
+        }
+        for (label, which) in [("preview", "preview"), ("mix + play", "mixplay"),
+                               ("stream", "stream"), ("spectrum", "spectrum")] {
+            if ui.add_enabled(p.can_run(), egui::Button::new(label)).clicked() {
+                act = p.act(which);
+            }
+        }
+        ui.label(egui::RichText::new(p.state.chip()).small().color(c.accent));
+    });
+
+    if p.state.running() {
+        ui.add(egui::ProgressBar::new(p.progress).desired_height(4.0));
+        // The bar only moves if the host reports; repaint so it is not stuck
+        // between reports.
+        ui.ctx().request_repaint();
+    }
+    if let Some(t) = p.result_text() {
+        ui.label(egui::RichText::new(t).small());
+    }
+    act
+}
+
+#[cfg(test)]
+mod fileproc_ui_tests {
+    use super::*;
+
+    #[test]
+    fn the_suggestion_is_a_placeholder_not_prefilled_text() {
+        // The model's own note: the suggestion is "a placeholder they can
+        // accept by doing nothing", and it stops following the input once the
+        // user types. Prefilling would look edited before it was, and the
+        // model could not tell the difference.
+        let src = include_str!("fileproc.rs");
+        let at = src.find("hint_text(hint)").expect("the placeholder moved");
+        let back = &src[at.saturating_sub(300)..at];
+        assert!(back.contains("p.output_field()"),
+                "the box was seeded with the suggestion rather than hinting it");
+    }
+
+    #[test]
+    fn reset_returns_to_following_the_input_rather_than_emptying() {
+        // clear_output means "stop overriding", not "blank path" — the output
+        // resumes tracking the input.
+        let mut p = FileProcessor::default();
+        p.input = "/music/a.wav".into();
+        p.set_output("/tmp/mine.opus");
+        assert_eq!(p.output_field(), "/tmp/mine.opus");
+        p.clear_output();
+        assert!(p.output_field().is_empty());
+        assert!(p.output_path().contains("a"), "the path stopped following the input");
+    }
+
+    #[test]
+    fn run_is_disabled_rather_than_hidden() {
+        // Unlike the safety unlock, this control DOES become available —
+        // typing a path enables it. Hiding it would leave nothing on screen to
+        // explain what to do.
+        let src = include_str!("fileproc.rs");
+        let needle = format!("add_{}(p.can_run()", "enabled");
+        assert!(src.contains(needle.as_str()));
+    }
+
+    #[test]
+    fn nothing_runs_without_an_input() {
+        // can_run is the model's rule and the renderer defers to it rather
+        // than repeating the condition.
+        let mut p = FileProcessor::default();
+        assert!(!p.can_run());
+        assert!(p.run().is_none());
+        p.input = "/music/a.wav".into();
+        assert!(p.can_run());
+    }
+}

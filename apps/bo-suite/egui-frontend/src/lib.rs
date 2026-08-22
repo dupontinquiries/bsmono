@@ -1140,6 +1140,21 @@ impl Controller {
         });
         ui.separator();
 
+        // THE PROCESSING SECTION. The module's own words: it is "the
+        // correctness preview" — the same DSP path the realtime thread uses,
+        // checkable without a device in the room. It had a complete model, no
+        // renderer and no caller, so it could not be operated at all.
+        //
+        // At the BOTTOM of the mixer page, as the module says, because it runs
+        // the CURRENT settings: the controls above it are its input.
+        if let Some(a) = crate::fileproc::fileproc_ui(ui, &mut self.fileproc, c) {
+            // Through the existing stash. start_proc is the other door onto
+            // this and sets the same field; the host performs it and reports
+            // back with set_progress and finish.
+            self.pending_proc = Some(a);
+        }
+        ui.separator();
+
         let ordered: Vec<(usize, crate::device::Band)> = self.mixer.ordered();
         for (i, band) in ordered {
             ui.horizontal(|ui| {
