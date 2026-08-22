@@ -553,3 +553,125 @@ mod tests {
         assert_eq!(agg.tokens_saved, 8, "4 tokens saved per tenant");
     }
 }
+
+/// What this cache would actually BUY, on the two workloads logscope runs.
+///
+/// Everything in this module is pure and tested, and NOTHING CALLS IT. That is
+/// not an oversight: `logscope/src/` is a model tier — `batching`, `memplan`,
+/// `moe`, `arch` and this file all describe engine behaviour as pure,
+/// separately-testable logic and each names "the GPU seam" it stops at. The
+/// engine is `gpu-gemm`, whose real `KvCache` is a dense per-layer `Vec<Tensor>`
+/// with no paging and no prefix reuse at all.
+///
+/// So the gap is not a missing coordinator — the coordinator is here and
+/// complete. It is that the seam between the two crates has never been
+/// connected, and nobody had put a number on what connecting it is worth.
+///
+/// These are that number. They are measurements of the MODEL, not of the
+/// engine: they say what the bookkeeping would save if the engine used it,
+/// which is exactly the input a decision to wire it needs, and is not evidence
+/// that any GPU got faster.
+#[cfg(test)]
+mod what_prefix_reuse_is_worth {
+    use super::*;
+
+    /// Chained hashes for a prompt's full blocks, the way `admit_cached` wants
+    /// them: each block's hash folds in the previous, so a shared prefix
+    /// produces identical hashes and the first divergence breaks the run.
+    fn hashes(tokens: &[u32], bs: usize) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut prev = 0u64;
+        for chunk in tokens.chunks(bs) {
+            if chunk.len() < bs { break; } // only FULL blocks are cacheable
+            prev = block_hash(prev, chunk);
+            out.push(prev);
+        }
+        out
+    }
+
+    /// A multi-turn chat: every turn resends the whole transcript plus a new
+    /// question, which is the shape that makes prefix caching pay.
+    #[test]
+    fn a_ten_turn_conversation_reprefills_almost_nothing() {
+        let bs = 16;
+        let mut p = Paged::new(512, bs);
+
+        let mut transcript: Vec<u32> = (0..64).collect(); // system prompt
+        let (mut saved, mut total) = (0usize, 0usize);
+
+        for turn in 0..10u32 {
+            // the user's new question, then the model's reply — both distinct
+            let new: Vec<u32> = (0..48).map(|i| 10_000 + turn * 100 + i).collect();
+            transcript.extend_from_slice(&new);
+
+            let h = hashes(&transcript, bs);
+            let hit = p.admit_cached(turn as SeqId, &h, transcript.len()).expect("fits");
+            saved += hit;
+            total += transcript.len();
+            // the sequence stays resident for the next turn to share from
+        }
+
+        let frac = saved as f32 / total as f32;
+        assert!(
+            frac > 0.75,
+            "only {:.1}% of prefill tokens were reused across ten turns ({saved} of {total}) — the chained hashing or the retention policy has regressed",
+            frac * 100.0
+        );
+        // Recorded rather than merely asserted, because the SIZE is the reason
+        // to wire this: 2736 of 3280 prefill tokens, 83.4%. The engine
+        // currently re-prefills every one of those on every turn, because
+        // gpu-gemm's KvCache has no prefix reuse at all.
+        //
+        // The first draft of this line asserted `saved > 3000` and a comment
+        // claiming 84.6% / 3760 — figures never run. It failed immediately,
+        // which is the only reason they did not become two more confident
+        // numbers in a codebase this session spent its time correcting.
+        assert_eq!(saved, 2736, "measured reuse changed; re-derive the figure in this comment");
+        assert_eq!(total, 3280, "the workload itself changed; the 83.4% no longer describes it");
+    }
+
+    /// Repository reading: the same file re-sent under different questions.
+    /// `ASAHI_GPU.md` argues prompt-lookup drafting should do well here for the
+    /// same reason — identifiers and paths repeat.
+    #[test]
+    fn re_asking_about_one_file_prefills_it_once() {
+        let bs = 16;
+        let mut p = Paged::new(256, bs);
+        let file: Vec<u32> = (0..320).collect();
+
+        let mut first = 0usize;
+        let mut later = 0usize;
+        for q in 0..5u32 {
+            let mut prompt = file.clone();
+            prompt.extend((0..16).map(|i| 90_000 + q * 10 + i)); // a different question
+            let h = hashes(&prompt, bs);
+            let hit = p.admit_cached(q as SeqId, &h, prompt.len()).expect("fits");
+            if q == 0 { first = hit } else { later += hit }
+            p.free(q as SeqId); // each question is answered and released
+        }
+
+        assert_eq!(first, 0, "the first pass cannot hit a cache it is filling");
+        assert!(
+            later >= 4 * file.len() - 4 * bs,
+            "re-asking about the same file reused only {later} tokens across four repeats; the file is {} tokens and should be reused nearly whole each time",
+            file.len()
+        );
+    }
+
+    /// The honest counter-case: unrelated prompts pay a small cost and get
+    /// nothing, which is what stops this being free.
+    #[test]
+    fn unrelated_prompts_reuse_nothing_and_say_so() {
+        let bs = 16;
+        let mut p = Paged::new(256, bs);
+        for q in 0..6u32 {
+            let prompt: Vec<u32> = (0..96).map(|i| q * 1_000 + i).collect();
+            let h = hashes(&prompt, bs);
+            let hit = p.admit_cached(q as SeqId, &h, prompt.len()).expect("fits");
+            assert_eq!(hit, 0, "prompt {q} shares no prefix and must reuse nothing");
+        }
+        let st = p.stats();
+        assert!(st.hit_rate() < 0.01, "hit rate {} on disjoint prompts", st.hit_rate());
+        assert_eq!(st.tokens_saved, 0);
+    }
+}
