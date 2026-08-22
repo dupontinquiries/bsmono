@@ -605,6 +605,10 @@ struct VoicetermApp {
     /// held live — the ranking is recency-weighted and a sheet built once at
     /// startup would show the wrong "most recent" an hour later.
     cmd_sheet: voiceterm_egui::cmd_sheet::CmdSheet,
+    /// The missing-package sidebar. Open state only — the list itself lives in
+    /// the detector, which owns dismissal so a package reappearing in a NEW
+    /// block comes back.
+    missing_pkg_open: bool,
     /// The acoustic peer handshake, when one is running. Held as the ENGINE's
     /// state rather than a mirror of it — the QML kept a hand-copied string
     /// and a hand-copied enum is one that drifts.
@@ -787,6 +791,31 @@ impl eframe::App for VoicetermApp {
         // they are for: a modal that a panel can cover is not modal, and a
         // voice halo that only shows on one tab is a status light behind a
         // door.
+        // MISSING PACKAGES, right edge as in the QML. A side panel rather
+        // than a modal: the list is something to read WHILE looking at the
+        // command output that produced it.
+        if self.missing_pkg_open {
+            let colors = self.colors;
+            egui::SidePanel::right("missing_pkg").show(ctx, |ui| {
+                use voiceterm_egui::missing_pkg as mp;
+                // Asked fresh each frame. The detector scans blocks as output
+                // arrives, so a list cached on open goes stale while the
+                // drawer is still on screen.
+                let all = mp::missing_packages::list_active();
+                if let Some(a) = mp::missing_pkg_ui(ui, &all, &colors) {
+                    match a {
+                        // COPIED, never run. The detector calls its own hint a
+                        // best guess the user should verify.
+                        mp::Action::Copy(cmd) => ctx.copy_text(cmd),
+                        mp::Action::Dismiss { ecosystem, name } => {
+                            mp::missing_packages::dismiss(&ecosystem, &name);
+                        }
+                        mp::Action::Close => self.missing_pkg_open = false,
+                    }
+                }
+            });
+        }
+
         // THE TOUCH COMMAND HISTORY. A bottom panel rather than a modal: it
         // is a picker, and the terminal behind it is the context for choosing.
         if self.cmd_sheet.open {
@@ -1001,6 +1030,10 @@ impl eframe::App for VoicetermApp {
                     if let Some(ch) = pipe_char(&id) {
                         self.app.terminal.feed(ch);
                     }
+                }
+                // the 📦 chip opens the missing-package sidebar
+                if ui.button("\u{1F4E6}").clicked() {
+                    self.missing_pkg_open = !self.missing_pkg_open;
                 }
                 // the ⏱ chip opens the touch command history (QML cmdSheet)
                 if ui.button("\u{23F1}").clicked() {
@@ -3111,6 +3144,7 @@ fn main() -> eframe::Result<()> {
                 pending_confirm: None,
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
+                missing_pkg_open: false,
                 peer: None,
                 deck: Default::default(),
                 captured: String::new(),
