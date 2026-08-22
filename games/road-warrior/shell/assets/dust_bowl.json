@@ -1,0 +1,47 @@
+{
+  "name": "Dust Bowl",
+  "segments": [
+    {
+      "Flat": {
+        "length": 30.0,
+        "height": 0.0
+      }
+    },
+    {
+      "Ramp": {
+        "length": 8.0,
+        "from_height": 0.0,
+        "to_height": 5.0
+      }
+    },
+    {
+      "Gap": {
+        "length": 10.0
+      }
+    },
+    {
+      "Flat": {
+        "length": 40.0,
+        "height": 0.0
+      }
+    }
+  ],
+  "boss": {
+    "name": "The Behemoth's Rival",
+    "max_health": 1000.0,
+    "phase_2_threshold": 0.4,
+    "attacks": [
+      {
+        "kind": "GroundSlam",
+        "telegraph": 1.0,
+        "cooldown": 2.0
+      },
+      {
+        "kind": "Charge",
+        "telegraph": 0.5,
+        "cooldown": 1.5
+      }
+    ]
+  },
+  "unlock_reward": "SixWheeler"
+}

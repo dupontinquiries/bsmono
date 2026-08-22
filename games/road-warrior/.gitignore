@@ -1,0 +1,7 @@
+/target
+**/target
+Cargo.lock.bak
+*.pdb
+
+# Local save data if ever tested by running the binary from within the repo
+/shell/save.json

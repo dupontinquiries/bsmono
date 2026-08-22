@@ -1,0 +1,191 @@
+[
+  {
+    "name": "Dust Bowl",
+    "segments": [
+      {
+        "Flat": {
+          "length": 30.0,
+          "height": 0.0
+        }
+      },
+      {
+        "Ramp": {
+          "length": 8.0,
+          "from_height": 0.0,
+          "to_height": 5.0
+        }
+      },
+      {
+        "Gap": {
+          "length": 10.0
+        }
+      },
+      {
+        "Flat": {
+          "length": 40.0,
+          "height": 0.0
+        }
+      }
+    ],
+    "boss": {
+      "name": "The Behemoth's Rival",
+      "max_health": 1000.0,
+      "phase_2_threshold": 0.4,
+      "attacks": [
+        {
+          "kind": "GroundSlam",
+          "telegraph": 1.0,
+          "cooldown": 2.0
+        },
+        {
+          "kind": "Charge",
+          "telegraph": 0.5,
+          "cooldown": 1.5
+        }
+      ]
+    },
+    "unlock_reward": "SixWheeler"
+  },
+  {
+    "name": "Scrapyard Gauntlet",
+    "segments": [
+      {
+        "Flat": {
+          "length": 15.0,
+          "height": 0.0
+        }
+      },
+      {
+        "Ramp": {
+          "length": 6.0,
+          "from_height": 0.0,
+          "to_height": 3.0
+        }
+      },
+      {
+        "Gap": {
+          "length": 7.0
+        }
+      },
+      {
+        "Ramp": {
+          "length": 4.0,
+          "from_height": 3.0,
+          "to_height": 6.0
+        }
+      },
+      {
+        "Gap": {
+          "length": 9.0
+        }
+      },
+      {
+        "Flat": {
+          "length": 12.0,
+          "height": 0.0
+        }
+      },
+      {
+        "Ramp": {
+          "length": 10.0,
+          "from_height": 0.0,
+          "to_height": -4.0
+        }
+      },
+      {
+        "Flat": {
+          "length": 25.0,
+          "height": -4.0
+        }
+      }
+    ],
+    "boss": {
+      "name": "Junkyard Colossus",
+      "max_health": 1500.0,
+      "phase_2_threshold": 0.5,
+      "attacks": [
+        {
+          "kind": "Lobbed",
+          "telegraph": 0.8,
+          "cooldown": 1.8
+        },
+        {
+          "kind": "GroundSlam",
+          "telegraph": 0.6,
+          "cooldown": 1.5
+        },
+        {
+          "kind": "Charge",
+          "telegraph": 0.4,
+          "cooldown": 1.2
+        }
+      ]
+    },
+    "unlock_reward": "Behemoth"
+  },
+  {
+    "name": "Rust Canyon",
+    "segments": [
+      {
+        "Flat": {
+          "length": 20.0,
+          "height": 0.0
+        }
+      },
+      {
+        "Ramp": {
+          "length": 5.0,
+          "from_height": 0.0,
+          "to_height": 2.0
+        }
+      },
+      {
+        "Flat": {
+          "length": 8.0,
+          "height": 2.0
+        }
+      },
+      {
+        "Gap": {
+          "length": 12.0
+        }
+      },
+      {
+        "Ramp": {
+          "length": 6.0,
+          "from_height": 0.0,
+          "to_height": -3.0
+        }
+      },
+      {
+        "Flat": {
+          "length": 30.0,
+          "height": -3.0
+        }
+      }
+    ],
+    "boss": {
+      "name": "The Rustbound Warden",
+      "max_health": 1800.0,
+      "phase_2_threshold": 0.35,
+      "attacks": [
+        {
+          "kind": "Charge",
+          "telegraph": 0.9,
+          "cooldown": 2.0
+        },
+        {
+          "kind": "GroundSlam",
+          "telegraph": 0.5,
+          "cooldown": 1.3
+        },
+        {
+          "kind": "Lobbed",
+          "telegraph": 0.35,
+          "cooldown": 1.0
+        }
+      ]
+    },
+    "unlock_reward": "Pillager"
+  }
+]
