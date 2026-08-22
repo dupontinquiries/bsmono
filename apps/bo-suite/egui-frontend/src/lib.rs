@@ -527,18 +527,35 @@ impl Controller {
             // The safety toast slides down from the TOP, above everything, and
             // is drawn before the header so it cannot be pushed off by a view
             // that changes height.
-            self.safety.tick(ui.input(|i| i.stable_dt));
-            if self.safety.toast_visible() {
-                ui.horizontal(|ui| {
-                    ui.colored_label(colors.warning, "Volume capped for hearing safety");
-                    if ui.button("Dismiss").clicked() { self.safety.dismiss(); }
-                    if ui.button("Unlock").clicked() {
+            let dt = ui.input(|i| i.stable_dt);
+            self.safety.tick(dt);
+            // The playback position, interpolated between network reports. Its
+            // own doc: "advance the local clock between reports, so the bar
+            // moves smoothly rather than stuttering one packet at a time" —
+            // and nothing called it, so between packets the bar did not move
+            // at all.
+            self.transport.tick(dt as f64);
+            // ONE TOAST. An inline version lived here and I added a second in
+            // safety.rs last commit without seeing it — I searched for
+            // `safety::` and this calls through the FIELD, `self.safety.`.
+            //
+            // The inline one had two faults worth naming. It DISCARDED the
+            // unlocked volume: `let _ = v; // the host applies it` — no host
+            // does, so Unlock showed a confirmation and changed nothing. And
+            // beside it sat `self.transport.title = self.transport.title
+            // .clone()`, a self-assignment that does nothing at all.
+            //
+            // The renderer in safety.rs replaces it, and the volume is applied
+            // here where pending_volume lives.
+            if let Some(a) = crate::safety::safety_toast_ui(ui, &self.safety, &colors) {
+                match a {
+                    crate::safety::ToastAction::Dismiss => self.safety.dismiss(),
+                    crate::safety::ToastAction::Unlock => {
                         if let Some(v) = self.safety.unlock() {
-                            self.transport.title = self.transport.title.clone();
-                            let _ = v;   // the host applies it; the model decided it
+                            self.pending_volume = Some(v as f32);
                         }
                     }
-                });
+                }
                 ui.separator();
                 ui.ctx().request_repaint();
             }
@@ -610,6 +627,18 @@ impl Controller {
     fn devices_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
         // The product selector sits at the top, as in the Qt page.
         if let Some(url) = crate::outputs::device_selector_ui(ui, &mut self.device_selector, c) {
+            // A DIFFERENT SPEAKER IS A NEW SESSION. safety::new_session's own
+            // doc: "moving to another speaker should not carry an unlock
+            // granted for the first one" — so without this, unlocking high
+            // volume on a pair of headphones silently unlocks it on the living
+            // room speakers too.
+            //
+            // Guarded on the url actually changing: device_selector_ui returns
+            // the selection, and re-selecting the current device would
+            // otherwise revoke an unlock the operator just granted.
+            if url != self.active_device_url {
+                self.safety.new_session();
+            }
             self.active_device_url = url;
         }
         ui.separator();
@@ -1070,20 +1099,8 @@ impl Controller {
                 }
             }
         }
-        // The toast, when something is being held back.
-        if let Some(a) = crate::safety::safety_toast_ui(ui, &self.safety, c) {
-            match a {
-                crate::safety::ToastAction::Dismiss => self.safety.dismiss(),
-                crate::safety::ToastAction::Unlock => {
-                    // unlock() returns the volume to re-apply, or None if
-                    // nothing was pending — so a stray press cannot raise the
-                    // volume on its own.
-                    if let Some(v) = self.safety.unlock() {
-                        self.pending_volume = Some(v as f32);
-                    }
-                }
-            }
-        }
+        // The toast is drawn once, in the header strip above — not here.
+        // Two call sites would render it twice whenever this view is open.
         if let Some(v) = self.pending_volume {
             ui.colored_label(c.text_weak, format!("volume {v:.0}"));
         }
