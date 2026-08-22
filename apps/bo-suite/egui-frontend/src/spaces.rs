@@ -200,12 +200,59 @@ pub fn spaces_ui(ui: &mut egui::Ui, r: &mut Routing,
         });
         ui.separator();
     }
+    // THE LAYOUT PICKER. set_layout was reachable only from tests, so the
+    // routing matrix was permanently whatever layout it was constructed with —
+    // in an app whose own doc calls this "the large half".
+    //
+    // Its rule is worth surfacing here because it is why switching is safe:
+    // "going 5.1 -> 2.0 and back should not lose the whole room. Channels the
+    // new layout does not have are dropped; the rest keep their speakers."
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("layout").small().weak());
+        for l in [bo_mux::protocol::Layout::stereo(),
+                  bo_mux::protocol::Layout::quad(),
+                  bo_mux::protocol::Layout::surround_51()] {
+            let on = r.layout_name == l.name;
+            if ui.selectable_label(on, &l.name).clicked() && !on {
+                r.set_layout(&l);
+            }
+        }
+    });
+    ui.separator();
+
     let speakers = r.speakers.clone();
     for s in &speakers {
         ui.horizontal(|ui| {
             ui.label(&s.name);
             let cur = r.channel_of(&s.id).map(|c| c.to_string());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // SWAP, the fix the module names: "the common fix when the
+                // room is right but left and right are backwards". Reachable
+                // only from tests until now, so the only way to correct a
+                // reversed pair was to reassign both channels by hand — and
+                // doing that leaves the room briefly double-assigned.
+                //
+                // Offered only when there is another speaker to swap WITH, and
+                // only from assigned rows: swapping an unassigned speaker is
+                // just an assignment, which the combo beside it already does.
+                if cur.is_some() && speakers.len() > 1 {
+                    egui::ComboBox::from_id_salt(format!("swap-{}", s.id))
+                        .selected_text("⇄")
+                        .show_ui(ui, |ui| {
+                            for other in &speakers {
+                                if other.id == s.id { continue; }
+                                if ui.selectable_label(false, &other.name).clicked() {
+                                    // The mutation IS the effect. No second
+                                    // return channel: this function already
+                                    // reports an assignment through `made`,
+                                    // and lib.rs discards even that — adding
+                                    // another output nobody reads would be
+                                    // indirection rather than reporting.
+                                    r.swap(&s.id, &other.id);
+                                }
+                            }
+                        });
+                }
                 egui::ComboBox::from_id_salt(&s.id)
                     .selected_text(cur.clone().unwrap_or_else(|| "—".into()))
                     .show_ui(ui, |ui| {
@@ -228,6 +275,33 @@ pub fn spaces_ui(ui: &mut egui::Ui, r: &mut Routing,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swapping_exchanges_channels_without_a_gap() {
+        // The reason this needs to be one operation: correcting a reversed
+        // pair by reassigning both by hand leaves the room briefly
+        // double-assigned, and on a live router that is audible.
+        let mut r = Routing::new(&bo_mux::protocol::Layout::stereo(),
+            vec![spk("a"), spk("b")]);
+        r.assign("a", "L");
+        r.assign("b", "R");
+        r.swap("a", "b");
+        assert_eq!(r.channel_of("a"), Some("R"));
+        assert_eq!(r.channel_of("b"), Some("L"));
+    }
+
+    #[test]
+    fn swapping_with_an_unassigned_speaker_moves_the_channel() {
+        // Not an error, but worth pinning: the assigned side ends up empty
+        // rather than both sharing. The UI only offers swap FROM an assigned
+        // row, so this is the boundary rather than the common path.
+        let mut r = Routing::new(&bo_mux::protocol::Layout::stereo(),
+            vec![spk("a"), spk("b")]);
+        r.assign("a", "L");
+        r.swap("a", "b");
+        assert_eq!(r.channel_of("b"), Some("L"));
+        assert_eq!(r.channel_of("a"), None);
+    }
 
     fn spk(id: &str) -> Speaker {
         Speaker { id: id.into(), name: id.to_uppercase(), platform: Platform::Mozart }
