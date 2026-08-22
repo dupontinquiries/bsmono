@@ -528,34 +528,22 @@ impl TermWorkspace {
     /// removed pane id, if any.
     /// Close a WEB pane if the active tab has one, else the focused pane.
     ///
-    /// v0.1.881 in the QML, and the reason is in its comment: *"web panes are
-    /// never focused, so the old 'close pane' path could only ever close the
-    /// focused terminal pane"*. Without this, opening a web pane and pressing
-    /// close-pane shuts the terminal you were working in and leaves the web
-    /// pane sitting there — the opposite of what the key was pressed for.
+    /// A thin wrapper over `close_newest_web_pane`, which is the real v0.1.881
+    /// implementation and already existed — tested, documented, and called
+    /// from nowhere. I wrote a second one before finding it; this is the first
+    /// one with the duplicate removed.
     ///
-    /// Falls back to `close_pane`, which is focus-aware and closes the TAB on
-    /// its last pane. The fallback is the whole reason this is a wrapper
-    /// rather than a branch in the caller: two frontends would each have to
-    /// remember to fall through, and one of them would not.
+    /// The wrapper still earns its place: `close_newest_web_pane` returns None
+    /// when there is no web pane and its doc says "caller then falls back to
+    /// close_pane". Two frontends each remembering to fall back is one
+    /// frontend that forgets, and the forgetting is silent — close-pane simply
+    /// stops working when no web pane is open.
+    ///
+    /// NEWEST, not first-in-layout: that is what the existing implementation
+    /// does and what its tests pin. My version picked layout order on a
+    /// reasoning I found convincing and had no evidence for.
     pub fn close_web_or_focused_pane(&mut self) -> Option<u64> {
-        // First web pane in the active tab, in layout order. Layout order
-        // rather than most-recent, because with two open the operator is
-        // looking at a screen, not at a history — closing the one they can
-        // point to is the predictable answer.
-        let web = self.active().root.pane_ids().into_iter()
-            // pane_kind, the public accessor — find_kind is Node-private and
-            // widening it to reach this would expose the tree's internals for
-            // a query the workspace already answers.
-            .find(|id| matches!(self.pane_kind(*id), Some(PaneKind::Web { .. })));
-        match web {
-            Some(id) => {
-                // close_pane_id, not close_pane: web panes are never focused,
-                // so the focus-aware primitive would target the wrong pane.
-                if self.close_pane_id(id) { Some(id) } else { None }
-            }
-            None => self.close_pane(),
-        }
+        self.close_newest_web_pane().or_else(|| self.close_pane())
     }
 
     pub fn close_pane(&mut self) -> Option<u64> {
@@ -1341,13 +1329,14 @@ mod close_web_tests {
     fn split_with_web() -> TermWorkspace {
         let mut w = TermWorkspace::default();
         let term = w.active().focused_pane;
-        // split_web already exists and does both halves — I wrote
-        // split_right() + set_pane_kind() from memory and neither is the API.
+        // split_web restores focus to the prior pane itself — its own doc says
+        // so — which is why web panes are never focused and why close_pane
+        // cannot reach them. Asserted rather than forced, so the fixture
+        // notices if that ever changes.
         w.split_web(Dir::Right, "https://x");
-        // Focus stays on the terminal: the QML's premise is that web panes are
-        // never focused, and set here explicitly so the test asserts against
-        // that rather than against whatever split_web happened to leave.
-        w.active_mut().focused_pane = term;
+        assert_eq!(w.active().focused_pane, term,
+                   "split_web left focus on the web pane; the premise of this whole path is \
+that it does not");
         w
     }
 
