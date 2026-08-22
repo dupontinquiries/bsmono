@@ -94,6 +94,36 @@ struct TrainArgs {
     /// Resume from gen_latest/disc_latest in ckpt_dir if present.
     #[arg(long, default_value_t = false)]
     resume: bool,
+
+    // --- shape. Changing any of these invalidates an existing checkpoint, and
+    //     --resume will say so by name rather than failing inside a tensor
+    //     assignment. Must be multiples of 16: the generator's seed grid is
+    //     n_mels/16 by time_frames/16.
+    /// SAMPLER DURATION, in mel frames — the width of one training crop, which
+    /// is exactly the length of one generated beat. 64 frames at hop 256 and
+    /// 22050 Hz is ~0.74 s; `--time-frames 128` doubles it. Multiple of 16.
+    #[arg(long)]
+    time_frames: Option<usize>,
+    /// Mel bands (frequency resolution of the crop). Multiple of 16.
+    #[arg(long)]
+    n_mels: Option<usize>,
+    /// Latent width — the dimensionality of the space the GUI explores.
+    #[arg(long)]
+    latent: Option<usize>,
+    /// Generator width. The last deconvolution stage is this over 8.
+    #[arg(long)]
+    g_filters: Option<usize>,
+    /// Discriminator width.
+    #[arg(long)]
+    d_filters: Option<usize>,
+
+    // --- optimisation, safe to change between runs on the same checkpoint.
+    /// Adam learning rate.
+    #[arg(long)]
+    lr: Option<f64>,
+    /// Audio sample rate the trainer decodes to.
+    #[arg(long)]
+    sr: Option<u32>,
 }
 
 #[derive(Args)]
@@ -135,6 +165,66 @@ fn main() -> Result<()> {
             }
             if let Some(v) = a.ckpt_every {
                 cfg.ckpt_every = v;
+            }
+            if let Some(v) = a.time_frames {
+                cfg.time_frames = v;
+            }
+            if let Some(v) = a.n_mels {
+                cfg.n_mels = v;
+            }
+            if let Some(v) = a.latent {
+                cfg.latent = v;
+            }
+            if let Some(v) = a.g_filters {
+                cfg.g_filters = v;
+            }
+            if let Some(v) = a.d_filters {
+                cfg.d_filters = v;
+            }
+            if let Some(v) = a.lr {
+                cfg.lr = v;
+            }
+            if let Some(v) = a.sr {
+                cfg.sr = v;
+                // fmax follows the rate. There is no --fmax flag, and leaving
+                // a stale Nyquist above the new rate silently empties the top
+                // mel bands rather than erroring.
+                cfg.fmax = v as f32 / 2.0;
+            }
+
+            // VALIDATE BEFORE ANYTHING ALLOCATES. These constraints are
+            // structural — a seed grid that is not a multiple of 16 still runs
+            // and produces output that reads as a training failure rather than
+            // a configuration one.
+            if let Err(why) = cfg.validate() {
+                anyhow::bail!("this configuration cannot build a model:\n  - {why}");
+            }
+
+            // AND CHECK THE CHECKPOINT BEFORE LOADING IT. `load_state` writes
+            // into existing Vars, so a shape change surfaces deep inside a
+            // tensor assignment, far from the flag that caused it.
+            if a.resume {
+                // cfg.ckpt_dir, not a.ckpt_dir: the arg was moved into cfg above.
+                let saved = cfg.ckpt_dir.join("config.json");
+                if saved.exists() {
+                    match Config::load_json(&saved) {
+                        Ok(prev) => {
+                            if let Err(why) = cfg.shape_compatible_with(&prev) {
+                                anyhow::bail!(
+                                    "--resume cannot load {}: the model shape differs from the \
+checkpoint's.\n  - {why}\n\nTrain into a different --ckpt-dir, or drop the flag that changed \
+the shape. Non-shape settings (lr, epochs, batch size, paths) never block a resume.",
+                                    saved.display()
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[train] --resume: could not read {} ({e}); \
+proceeding, but a shape mismatch will now fail inside the loader",
+                            saved.display()
+                        ),
+                    }
+                }
             }
             train::run(&cfg, a.resume)?;
         }
