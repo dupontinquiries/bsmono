@@ -64,53 +64,72 @@ before both. The incoming work was effectively free.
 
 ---
 
-## 1. Incoming work not yet integrated
+## 1. Incoming work — all integrated
 
-Current unmerged refs (`verified`):
+**No unmerged refs remain.** Every branch and bundle handed over this session
+is either merged or harvested, and the pack went from 370.34 to 370.41 MiB
+absorbing all of it.
 
-```
-incoming/road-warrior           +1    fetched this session, untouched
-origin/incoming/launcher        +5    touches manifest/projects.toml
-origin/incoming/trap            +6    strict prefix of trap-autotune
-origin/incoming/trap-autotune  +23    apps/studio + shared/analog-kit
-origin/incoming/trap-session   +23    byte-identical to trap-autotune (c9c51289)
-```
+| line | how | result |
+|---|---|---|
+| `c8parallel` | merged | 23 commits, one disjoint overlap |
+| `c8-003` | merged | 31 commits, 888 KiB, one same-fix conflict |
+| `step-counter` | **extracted** | 6 files; forked pre-rewrite |
+| `c4-858` blackstar | **extracted** | 10 commits; forked pre-rewrite |
+| `road-warrior` | subtree-merged | 25 files, `core` + `shell` |
+| `trap-autotune` | merged | 23 commits + `shared/analog-kit` |
+| `launcher` | merged | 5 commits, merged clean after all |
 
-- **C9-1a — road-warrior into `games/`.** `queued` · `verified` it fetched and
-  is self-contained (1 commit, `316a0b25`). Root-level Rust already split
-  `core/` + `shell/`, which is the layering kit extraction wants, so the
-  eventual kit work has a seam to use. Not yet moved under `games/`.
+- **C9-1a — road-warrior.** `done`. Imported at `b20897c5` (subtree merge, so
+  blame reaches the original), registered at `bb957ffc`. 60 core tests pass
+  headless. Its `BUILDING.md` says 56 — drifted by four, deliberately left
+  alone inside the import.
 
-- **C9-1b — trap line: merge or drop.** `queued` · `verified` the fork point is
-  clean (`main` has not touched `apps/studio` or `shared/analog-kit` since),
-  `read` that it is 48 files / ~9.8K lines. Three refs are one line of work:
-  merge `trap-autotune` and the other two are covered. `REPO_SIZE.md` §4 names
-  this as a precondition for the history rewrite.
+- **C9-1b — trap line.** `done`, `07ee5a5e`. `incoming/trap` was a strict
+  prefix and `trap-session` byte-identical, so three refs were one merge.
+  Verified: analog-kit 3, studio-core 32, studio-live 59, studio-fx 133,
+  studio-collab 70, studio-media 9 (`--no-default-features`; the `opus`
+  feature builds libopus from C).
 
-- **C9-1c — launcher line.** `queued` · `verified` it touches
-  `manifest/projects.toml`, which `main` also edits, so expect a conflict.
-  Per `BRANCH_INDEX.md`, the manifest reconciliation is its own commit on top
-  of the import, not part of it.
+- **C9-1c — launcher.** `done`, `66cb0786`. Predicted to conflict on
+  `manifest/projects.toml`; did not — both sides added adjacent entries.
+  38 headless tests pass.
 
-- **C9-1d — c8-003 sibling monorepo.** `done` (merge) / `queued` (notes) ·
-  `verified`. Merged in `96e35966`: 31 commits, 888 KiB, one conflict in
-  `av1tuner_core/src/scene.rs` where both sides independently added the same
-  `audio_streams: Vec::new()` and ours also explained why — kept ours as the
-  superset. Lands the app repoints TODO.md had open under "the payoff"
-  (bo-suite/voiceterm/snapclone-audio/rusty-board rms and ct_eq onto
-  audio-kit/net-kit, rusty-board model_path onto voice-kit) plus twenty
-  projects compiled and tested for the first time.
-  **Still open:** their capture notes are parked at
-  `refs/notes/toolcalls-c8003`, not merged. 99 commits on their side carry
-  notes against 138 on ours, over disjoint commits, so the merge is mechanical
-  but not obviously lossless — and a capture log lost to a careless notes merge
-  is the one thing `SKILL_session_capture.md` says cannot be reconstructed.
+- **C9-1d — c8-003.** merged; **notes still parked** at
+  `refs/notes/toolcalls-c8003`. Unchanged from the last round.
 
-- **C9-1e — c4-858-delta: unblocked, not yet applied.** `queued` · `verified`.
-  Its prerequisite `a9a8cb0b` ("snapclone-egui: wire confirm, requests,
-  freshness, snap_export") IS inside the blackstar checkpoint bundle and IS an
-  ancestor of its head, so the delta is applyable. Expect the same
-  extract-not-merge route: the base it hangs off is pre-rewrite.
+- **C9-1e — c4-858-delta.** `queued`. Prerequisite located inside the
+  blackstar bundle. Applyable, almost certainly by extraction.
+
+### New, from integrating
+
+- **C9-1f — Two fullscreen app launchers, both `primary = true`.** `blocked`
+  on a decision · `verified`. `apps.hatch-egui` and `apps.launcher-egui`
+  overlap almost exactly, down to both doing their own freedesktop icon-theme
+  resolution, and both target desktop+phone. REPO_SIZE.md §3 anticipated this
+  ("the launcher port, the presentation work still to port into hatch"), so
+  the intended end state is one launcher and this session landed the second.
+  `launcher-egui/src/icontheme.rs` is the obvious first thing to share
+  whichever wins: 9 tested functions, no UI dependency.
+
+- **C9-1g — `kind = "kpackage"` is invisible to the orchestrator, not
+  handled by it.** `idea` · `verified`. The launcher plasmoid's entry argues
+  no orchestrator case is needed because build.sh has a safe unknown-kind
+  fallback. True — but with `targets = []` the effect is that
+  `build/build.sh --only launcher-plasmoid` prints the header and nothing
+  else. Fine for a manual `kpackagetool6` install; worth knowing before
+  anyone expects `--run` to deploy it.
+
+- **C9-1h — A third accelerometer reader.** `idea` · `verified`.
+  road-warrior's `shell/src/gyro.rs` reads `net.hadess.SensorProxy` over
+  D-Bus. `shared/sensor-kit` parses the same daemon's `monitor-sensor` output.
+  `apps/voiceterm/egui-frontend/src/iio_accel.rs` reads sysfs
+  `in_accel_*_raw × scale`. One daemon, three parsers, and sensor-kit's own
+  `gait.rs` header already names the voiceterm one as "to be promoted to a
+  shared crate". Well past this repo's bar for lifting a kit. Not attempted:
+  gyro.rs has never run against a live iio-sensor-proxy — only its failure
+  path — and unifying three readers on the strength of one verified one is
+  the wrong order.
 
 ---
 
