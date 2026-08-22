@@ -98,6 +98,11 @@ pub fn lane_for(seat: usize, picks: [Ancestor; 3], policy: LanePolicy) -> usize 
 
 // structures
 const HEAL_TREE_HP: f32 = 550.0;
+/// Freshkill spilled by a felled Heal Tree, when [`Battleground::spoils`] is on.
+/// Sized against the economy it enters: a rich kill from the contention ground
+/// is worth 3, so a border is worth about four of those — enough to notice in
+/// the growth curve, not enough to end a match by itself.
+const BORDER_SPOILS: f32 = 12.0;
 const GREAT_TREE_HP: f32 = 1400.0;
 const AURA_R: f32 = 14.0;
 const AURA_HEAL: f32 = 5.0;          // hp/s to allies, before herb scaling
@@ -372,6 +377,20 @@ pub struct Battleground {
     /// the rest collapse, rather than emptying all three — should get a
     /// different answer, and this is the switch that will test it.
     pub collapse_on_breach: bool,
+    /// Whether felling a Heal Tree pays the clan that felled it: the defenders'
+    /// cached prey spills from the roots ([`BORDER_SPOILS`] worth), straight
+    /// onto the attacker's pile.
+    ///
+    /// This is a **design switch, not a bug fix**, and it is off until someone
+    /// decides. The measurement that motivates it: the clan that breaks the
+    /// enemy's first border wins 39.8% of its matches over 793 games, 5.7
+    /// standard errors below even, because defending here is genuinely stronger
+    /// — the defender fights beside its medic den, inside its own auras,
+    /// respawns closer, and has the last-stand rule. Most games of this shape
+    /// pay the attacker for taking that risk. Whether *this* one should is a
+    /// question about what the mode is, so the switch exists and the default
+    /// declines to answer it.
+    pub spoils: bool,
     player_driven: bool,   // becomes true on the first set_input; until then the player's warrior is AI-driven
     input: Option<(f32, f32, bool, Option<usize>)>,   // move dir, claw, ability index
 }
@@ -612,7 +631,7 @@ impl Battleground {
             camps, medics, contention: (0.0, 0.0), contention_holder: None,
             skyrock: (-92.0, 92.0), skyrock_holder: None,
             time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], wave_n: [0; 2], tick: 0,
-            wombo: false, collapse_on_breach: false, player_driven: false, input: None,
+            wombo: false, collapse_on_breach: false, spoils: false, player_driven: false, input: None,
         }
     }
 
@@ -1234,7 +1253,12 @@ impl Battleground {
                     && (t.lane == lane || dist(t.x, t.z, x, z) < 6.0)
                     && dist(t.x, t.z, x, z) < REACH + 3.0);
                 if let Some(t) = etarget {
+                    let was_standing = self.heal_trees[t].alive();
                     self.heal_trees[t].hp -= atk * self.siege_of(i) * dt;
+                    if was_standing && !self.heal_trees[t].alive() && self.spoils {
+                        // the roots give up the prey cached under them
+                        self.clans[team as usize].pile += BORDER_SPOILS;
+                    }
                     return;
                 }
                 if dist(x, z, enemy_camp.0, enemy_camp.1) < REACH + 4.0 {
@@ -3091,6 +3115,51 @@ mod tests {
         }
         assert!(on_breach > 0, "the breach should pull patrols");
         assert!(elsewhere > 0, "but the other trails must not be abandoned");
+    }
+
+    #[test]
+    fn a_felled_border_can_be_made_to_pay_and_only_once() {
+        let mut bg = Battleground::new(Ancestor::CaveLion);
+        bg.patrol_t = [1e9; 2];
+        bg.spoils = true;
+        bg.warriors.retain(|w| w.team == CLAN_A);
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let (tx, tz, lane) = (bg.heal_trees[t].x, bg.heal_trees[t].z, bg.heal_trees[t].lane);
+        bg.heal_trees[t].hp = 1.0; // one gnaw from falling
+        let before = bg.clans[CLAN_A as usize].pile;
+        for _ in 0..30 * 3 {
+            bg.warriors[0].x = tx + 1.0;
+            bg.warriors[0].z = tz;
+            bg.warriors[0].lane = lane;
+            bg.warriors[0].mind = Mind::Trail;
+            bg.warriors[0].is_player = false;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(!bg.heal_trees[t].alive());
+        let gained = bg.clans[CLAN_A as usize].pile - before;
+        assert!(
+            (gained - BORDER_SPOILS).abs() < 1e-3,
+            "the roots pay once, not per gnaw: {gained}"
+        );
+        // and with the switch off the border pays nothing
+        let mut plain = Battleground::new(Ancestor::CaveLion);
+        plain.patrol_t = [1e9; 2];
+        plain.warriors.retain(|w| w.team == CLAN_A);
+        let t2 = plain.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let (px, pz, plane) =
+            (plain.heal_trees[t2].x, plain.heal_trees[t2].z, plain.heal_trees[t2].lane);
+        plain.heal_trees[t2].hp = 1.0;
+        let p0 = plain.clans[CLAN_A as usize].pile;
+        for _ in 0..30 * 3 {
+            plain.warriors[0].x = px + 1.0;
+            plain.warriors[0].z = pz;
+            plain.warriors[0].lane = plane;
+            plain.warriors[0].mind = Mind::Trail;
+            plain.warriors[0].is_player = false;
+            plain.step(1.0 / 30.0);
+        }
+        assert!(!plain.heal_trees[t2].alive());
+        assert_eq!(plain.clans[CLAN_A as usize].pile, p0);
     }
 
     #[test]

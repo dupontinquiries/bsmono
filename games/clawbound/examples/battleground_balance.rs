@@ -39,6 +39,7 @@ fn play(
     let mut bg = Battleground::new_with(a, b, seed, policy);
     bg.wombo = wombo;
     bg.collapse_on_breach = std::env::args().any(|s| s == "push");
+    bg.spoils = std::env::args().any(|s| s == "spoils");
     let mut steps = 0u32;
     let mut first_breaker: Option<u8> = None;
     while bg.outcome.is_none() && steps < 30 * 60 * 13 {

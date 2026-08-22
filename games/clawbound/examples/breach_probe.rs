@@ -32,11 +32,13 @@ fn main() {
         for slot in picks.iter_mut() {
             *slot = pool[bag.swap_remove((next() as usize) % bag.len())];
         }
+        let spoils = std::env::args().any(|s| s == "spoils");
         let mut bg = Battleground::new_on(
             [picks[0], picks[1], picks[2]],
             [picks[3], picks[4], picks[5]],
             m + 1,
         );
+        bg.spoils = spoils;
         let mut breacher: Option<u8> = None;
         let mut breach_at = 0.0f32;
         let mut alive: Vec<bool> = bg.warriors.iter().map(|w| w.alive()).collect();

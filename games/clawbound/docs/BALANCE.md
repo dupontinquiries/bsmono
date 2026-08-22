@@ -227,6 +227,35 @@ asymmetry in the mode's design rather than a bug, and worth deciding
 deliberately — a MOBA usually pays the attacker for the risk, and this one does
 not yet.
 
+## Paying the attacker: a switch, and a surprise
+
+`Battleground::spoils` makes a felled Heal Tree spill the defenders' cached prey
+(12 worth, about four rich kills) onto the attacker's pile — the classic answer
+to an attacker who is not paid for their risk. It is **off by default** because
+whether this mode should pay attackers is a design question, not a bug.
+
+Measured on the probe's 29 matches, and it did not do what it was for:
+
+| | off | spoils on |
+|---|---|---|
+| breacher wins | 41% | 34% |
+| breacher's freshkill lead at the break | +2.3 | +14.3 (ahead in 28/29) |
+| the same lead at match end | +2.7 | **+0.7** |
+| breacher deaths in the next minute | 21 | 18 |
+| defender deaths in the next minute | 25 | 28 |
+
+The reward arrives, and then it evaporates. A twelve-point lead at the break is
+seven-tenths of a point by the end — the defender out-farms it back — while the
+breacher wins *fewer* fights' worth of deaths and still loses more matches. So
+the attacker's problem is not that taking a border pays too little; something
+about holding a lead in this economy does not compound, and handing the
+attacker more of it changes nothing.
+
+That is a better-formed question than the one this switch was built to answer,
+and it is where the next investigation should start: what happens to a
+freshkill lead over the following two minutes, and why the growth curve does not
+turn it into map control.
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three

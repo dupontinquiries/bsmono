@@ -297,6 +297,13 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   standing (-0.28), because `breach_lane` funnelled *every* patrol wave into the hole while
   the defender kept covering three trails. Half the waves press the breach now; mechanism
   metric -0.28 -> -0.07, probe conversion 34% -> 41%.
+- [x] Tried paying the attacker (`spoils`, default off — a design switch, not a bug fix): a
+  felled border spills 12 freshkill. It **did not help**: breacher wins 41% -> 34%, and the
+  reward evaporates — a +14.3 pile lead at the break is +0.7 by match end while the
+  defender out-farms it back. The attacker's problem is not that borders pay too little.
+- [ ] The better question, now visible: **a freshkill lead does not compound.** Track a
+  clan's pile lead over the two minutes after it opens and find out why growth does not
+  turn into map control — that is where the attacker/defender asymmetry actually lives.
 - [ ] Conversion still isn't fixed: **39.8% pooled over 793 games (se 1.8)**, five standard
   errors below even. Two explanations eliminated, one repaired, and defending is still
   stronger than attacking. The remaining candidates are structural rather than buggy — the
