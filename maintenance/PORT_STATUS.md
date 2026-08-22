@@ -837,7 +837,10 @@ match — applied to every app with a nonzero named-only list:
   storm-clamped parallax, dark-room dimming rather than blanking). `EguiLib`
   is the audit's CamelCase of the crate name itself, not a portable surface —
   same phantom-name class as `AmbientLearnerApp` noted a few sections up.
-  `DebugScreenTempsPage` not independently re-checked this pass.
+  `DebugScreenTempsPage` also confirmed: `screen_temps.rs`'s header says
+  "`DebugScreenTempsPage` and the frame it reads", defines `ScreenTempsPage`/
+  `screen_temps_ui`, and is tested. So all 4 non-phantom items in this app's
+  named-only list are ported; `EguiLib` remains the one phantom name.
 * **bo-suite** (14 of 46) is unchanged from an earlier pass and already
   confirmed ported under Rust names in the "misreading the code column"
   section above.
@@ -860,3 +863,99 @@ stays host-side by design, since a UI crate that opens a device node cannot be
 tested or run in this sandbox. The viewfinder, ring and voice bar views are
 ported; nothing feeds them a live frame or a live call yet. That gap is
 correctly described already and is not something a sandbox session can close.
+
+## wiring_check.py: ambient-learner has a real dead-code collision, not a false positive
+
+Ran `maintenance/tools/wiring_check.py`, which is stricter than either audit
+above — it asks whether a page's actual `*_ui` render function is CALLED, the
+class of bug that made snapclone draw a placeholder rectangle for months.
+
+It reported 11 of ambient-learner's renderers as dead. Checked each against
+the real running binary (`egui-frontend/src/main.rs`, the crate the parity
+audit's own binary/app-def/manifest columns already confirm is the runnable
+one) rather than trusting the tool:
+
+**10 of 11 are a false positive**, and a new instance of the by-now-familiar
+class: `main.rs` is a separate crate (`ambient-learner-egui`) that imports
+`ambient_learner_egui::ui::egui::{ambience, chrome, history, live, locations,
+map, model, screen_temps, sync}` and calls every one of `ambience_ui`,
+`section_header`, `history_ui`, `live_ui`, `locations_ui`, `map_ui`,
+`model_ui`, `screen_temps_ui`, `sync_ui` directly in its `update()` match —
+read the file, they're all there. `wiring_check.py` only scans
+`src/ui/egui/mod.rs`'s own module tree for callers, so it can't see the
+sibling `egui-frontend` crate calling in, same blind spot as `reachability.py`
+on gitmind/logscope/av1tuner above.
+
+**The 11th, `router.rs`'s `tab_bar_ui`, is real** — and it's a specific and
+useful kind of real: not a missing feature, a **duplicate one**. `router.rs`
+was built by an earlier session specifically to fix "ten renderers and no way
+to reach any of them" (its own header says so). But `main.rs` independently
+grew its own dispatch — a hand-written `Page` enum, its own
+`ui.horizontal_wrapped` tab row, its own `match self.page { ... }` — that does
+the identical job without ever calling into `router.rs`. Grepped the whole app
+tree: `Router::`, `router::`, and `tab_bar_ui` appear NOWHERE outside
+`router.rs` itself. Two sessions solved the same missing-dispatch bug in two
+different files, and only one ended up wired into the binary. `router.rs`'s 7
+tests all pass in isolation and prove nothing about the app, for the same
+reason the doc's own "misreading" sections keep finding: a test suite
+exercises the module, not its caller.
+
+**A second, more interesting duplicate, found while checking the first:**
+`mod.rs` ALSO has its own complete `LiveView` struct with a `ui()` method —
+different from, and more capable than, the `LiveState`/`live::live_ui`
+combination `main.rs` actually wires up. `LiveView` has a working
+weather-sharing row (`WeatherShare`, a contact picker, `pressure::gauge_ui`)
+that `mod.rs`'s own module doc advertises as a headline feature: "a 'Share
+with…' row that exposes the current reading to snapclone contacts through the
+weather-share kit." Grepped: `LiveView` is referenced nowhere outside its own
+file. **The weather-sharing feature this app's own top-level doc comment
+describes does not exist in the app anyone can run.** `main.rs`'s actual Live
+page (`egui_lib.rs`'s `LiveState` + `live.rs`'s sensor panel) has no sharing
+UI at all.
+
+**Not fixed this session, and why**: reconciling three competing
+implementations of the same page (`LiveState`+`live_ui`, `LiveView`, and the
+`Router`/`tab_bar_ui` dispatch layer) is a real design decision — which one is
+the intended shape going forward — not a mechanical wire-up, and picking
+wrong risks discarding the sharing feature or the sensor panel rather than
+merging them. Recording it precisely instead so whoever does the merge knows
+exactly what exists and where: `main.rs`'s dispatch is correct and running;
+`router.rs` is safe to delete once confirmed nobody else is about to build on
+it; `LiveView`'s weather-sharing logic is the one piece of real, tested,
+user-visible functionality actually missing from the runnable app, and porting
+IT (not rewriting the Live page around it) is the concrete next step.
+
+## wiring_check.py: two more real gaps, in voiceterm
+
+The same tool flagged 2 of voiceterm's 61 modules dead. Checked both against
+`bin/voiceterm_egui.rs`, the actual running binary:
+
+**`detect::picker_ui` is real.** `detect.rs`'s own header explains the design:
+two detection engines (`entity_extract`, `dumb_summary::detect_progress_bars`)
+had no surface at all before this file. Its sibling `progress_ui` IS wired —
+called directly in the binary's draw loop — but `picker_ui`, the disambiguation
+UI for when a spoken reference matches more than one on-screen entity equally
+well ("connect to the headphones" when two Bluetooth devices both plausibly
+match), is not. `EntityPicker` has zero references outside `detect.rs` itself.
+The progress-bar half of this file's job works; the entity-disambiguation half
+does not reach the user.
+
+**`archived_view::bar_ui` is real.** The archive page's main renderer
+(`archive_ui`) is wired and working — confirmed in `CentralView::Archive`'s
+match arm. But its sibling `bar_ui` — a fan-out bottom action bar, with the
+specific rule "a button with no options must not fan out into an empty popup"
+documented and presumably tested — is a different surface for the same page
+that `archive_ui` does not call and nothing else does either. `BottomBar` has
+zero references in the binary.
+
+Both are the same shape as the ambient-learner `LiveView` finding above: a
+page got ported with two halves, one wired and one not, rather than one whole
+page missing. Recorded as two more concrete next steps rather than guessed at
+blind, for the same no-compiler reason as tomescope's orphans in `TODO.md`:
+
+- [ ] voiceterm: wire `detect::picker_ui` into the ambiguous-reference path —
+      wherever the engine currently falls back when a spoken entity reference
+      doesn't resolve to one match, show the picker instead of failing silent.
+- [ ] voiceterm: wire `archived_view::bar_ui` into the Archive view alongside
+      `archive_ui` — likely a per-page action row (share/re-fetch/delete),
+      matching the "fan out" pattern described in the module doc.
