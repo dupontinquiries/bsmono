@@ -112,6 +112,14 @@ struct TomeApp {
     figures_open: bool,
     info_open: bool,
 
+    /// The pasted catalog XML, kept even after a failed parse so the user can
+    /// fix a typo rather than retype the whole blob.
+    opds_xml: String,
+    /// Last parse result: `Ok` holds the feed to browse, `Err` holds the
+    /// message to show — kept as a `Result` rather than two `Option` fields
+    /// so a stale success can't linger on screen next to a fresh error.
+    opds_result: Option<Result<tomescope::opds::OpdsFeed, String>>,
+
     last_frame_time: f64,
 }
 
@@ -168,6 +176,9 @@ impl TomeApp {
             search_open: false,
             figures_open: false,
             info_open: false,
+
+            opds_xml: String::new(),
+            opds_result: None,
 
             last_frame_time: 0.0,
         }
@@ -575,6 +586,70 @@ impl TomeApp {
             colors.text_weak,
             "Paste catalog XML below, or use `shelfctl` to script imports. Network fetch is opt-in and disabled by default.",
         );
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.opds_xml)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("<feed xmlns=\"http://www.w3.org/2005/Atom\">…</feed>"),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            let can_parse = !self.opds_xml.trim().is_empty();
+            if ui.add_enabled(can_parse, egui::Button::new("Parse catalog")).clicked() {
+                self.opds_result = Some(
+                    tomescope::opds::parse_opds_xml(&self.opds_xml).map_err(|e| e.to_string()),
+                );
+            }
+            if ui.button("Clear").clicked() {
+                self.opds_xml.clear();
+                self.opds_result = None;
+            }
+        });
+
+        ui.add_space(8.0);
+        match &self.opds_result {
+            None => {}
+            Some(Err(msg)) => {
+                ui.colored_label(colors.danger, format!("could not parse: {msg}"));
+            }
+            Some(Ok(feed)) => {
+                if feed.entries.is_empty() {
+                    ui.colored_label(colors.text_weak, "the feed parsed but has no entries");
+                    return;
+                }
+                if !feed.title.is_empty() {
+                    ui.label(RichText::new(&feed.title).color(colors.text).strong());
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for entry in &feed.entries {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&entry.title).color(colors.text));
+                                if let Some(author) = &entry.author {
+                                    ui.colored_label(colors.text_weak, author);
+                                }
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if entry.is_navigation() {
+                                    ui.colored_label(colors.text_weak, "catalog ›");
+                                } else if let Some(link) = entry.acquisition_link() {
+                                    // Downloading is the network-fetch step this module
+                                    // deliberately stubs (NoNetworkFetcher) — surfacing
+                                    // the link is honest about what parsing alone gets
+                                    // you; wiring a real fetch is separate, opt-in work.
+                                    ui.colored_label(colors.text_weak, &link.mime_type);
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+            }
+        }
     }
 
     fn draw_settings_screen(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {

@@ -314,8 +314,23 @@ builds it. Recorded here as three concrete, scoped next steps instead:
 
 - [ ] tomescope: wire `Lookup::lookup()` to a long-press/selection → define
       popover (natural home: alongside `draw_footnote_popover` in `reader.rs`).
-- [ ] tomescope: wire `opds.rs` to a "browse catalog" entry in the library
-      view, with a URL/paste-XML input for the network-stub trait.
+      Not done: extracting text under a `Selection`/`LocusRange` needs real
+      understanding of `BookContent`'s block/run text model, which is a
+      bigger job than the OPDS item below turned out to be — left open.
+- [x] tomescope: `opds.rs` wired for real (2026-08-22, compiler now
+      available). `Screen::OpdsBrowser` already existed in the nav but
+      `draw_opds_screen` was a static label with no textbox — the exact
+      "placeholder feed" class `wiring_check.py`'s docstring warns about.
+      Added a paste-XML `TextEdit::multiline`, a "Parse catalog" button
+      calling the already-tested `opds::parse_opds_xml` for real, and a
+      results list (title/author, navigation-vs-download distinction via
+      `is_navigation()`/`acquisition_link()`, both already-tested methods).
+      Verified: `cargo check --bin tomescope` clean (same 9 pre-existing
+      warnings, none new), full `cargo test --lib` 45/45 passing including
+      the 3 untouched `opds::tests`. Network fetch stays intentionally out
+      of scope — `NoNetworkFetcher` is the deliberate stub the module was
+      built around, so downloading an acquisition link is separate, opt-in
+      work, not part of this fix.
 - [ ] tomescope: wire `tts.rs` to a "read aloud" control in the reader toolbar,
       building the `Utterance` queue from the current locus forward.
 
