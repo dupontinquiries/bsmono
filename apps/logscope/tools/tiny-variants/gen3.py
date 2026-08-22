@@ -147,7 +147,32 @@ def emit_qwen3(out):
     kv_f32("qwen3.attention.layer_norm_rms_epsilon", 1e-6)
     kv_f32("qwen3.rope.freq_base", 10000.0)
     kv_u32("qwen3.vocab_size", VOCAB)
-    kv_str("tokenizer.ggml.model", "none")
+    # A vocabulary that can actually TOKENIZE, not just exist.
+    #
+    # The ctxwin tests read this exact file and then do
+    # `Tokenizer::from_gguf(&g)`, with `Err(_) => return` — so a weights-only
+    # fixture (`tokenizer.ggml.model = "none"`) makes them skip SILENTLY and
+    # report as passing. Three of them were doing that: the marker-budget test,
+    # the reported-overflow test, and the window plan, all of which exist
+    # specifically to price a marker in TOKENS against a real vocabulary,
+    # which is the one thing arithmetic cannot do for them.
+    #
+    # A placeholder vocabulary is not enough, and this is the part that is easy
+    # to get wrong: `tok0..tok255` constructs a Tokenizer fine, but matches no
+    # English, so `encode` returns ZERO tokens for every input and the tests
+    # pass VACUOUSLY — which is worse than skipping, because it looks like
+    # coverage. Verified that outcome before fixing it.
+    #
+    # So: single CHARACTERS for printable ASCII, which makes encode roughly
+    # one-token-per-character on any English marker text. Lengths then differ
+    # between inputs, which is the whole property under test — and the digits
+    # of an elided count cost one token each, which is exactly the overflow the
+    # marker-budget test is checking for.
+    kv_str("tokenizer.ggml.model", "gpt2")
+    toks = [f"tok{i}" for i in range(VOCAB)]
+    for i in range(32, 127):
+        toks[i] = chr(i)
+    kv_arr_str("tokenizer.ggml.tokens", toks)
     tensors = [("token_embd.weight", [D, VOCAB]), ("output_norm.weight", [D]), ("output.weight", [D, VOCAB])]
     for i in range(L):
         p = f"blk.{i}."
