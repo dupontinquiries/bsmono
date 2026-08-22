@@ -1019,19 +1019,25 @@ missing dirs rather than trusting the gap to be empty:
   you browse it. `Browser`'s navigation is a pure, injectable-SSH-callback
   model specifically so it's testable without a real device — the tests exist,
   the page that would call it does not.
-  **Re-checked once a compiler became available (see below): the gap is
-  bigger than "wire an unused widget."** `push.rs`'s `Build & push` button
-  calls `cockpit::flow::deploy_app_remote_logged(app, target, user, host,
-  on_line)` — no destination-path parameter at all. The actual install
-  location is hardcoded inside `crate::installer::push_install_script`, not a
-  knob the push flow exposes anywhere. So wiring `remote_browse` for real
-  means adding a destination-path parameter through `deploy_app_remote_logged`
-  → `push_install_script` → the push page's state, not just calling an
-  existing function from a button — a real (small) feature addition, not a
-  mechanical connection. Left as the checklist item below with the corrected
-  scope, rather than either doing unplanned surgery on a shared `cockpit`
-  function signature (which every deploy call site depends on) or overstating
-  how close it is to done.
+
+**Follow-up: checked whether the Qt original actually used this feature, and
+it didn't either.** `list_remote_dirs` is exposed to QML as a `qt_method!` in
+`crates/gui/src/main.rs`, but grepped every `.qml` file in the app for it —
+`listRemoteDirs`, `list_remote_dirs`, anything close — and found zero call
+sites. **The folder-browsing feature was never wired in the original Qt build,
+not just the egui port.** So this isn't "the GTK build could browse the
+destination and the port regressed it" as `remote_browse.rs`'s own module doc
+implies — it's a `qt_method!` that was exposed and never used by any page in
+either era, carried forward as dead weight into the port along with the code
+that could theoretically call it. Combined with the earlier finding that
+`push_install_script` always installs to the fixed, conventional
+`$HOME/.local/bin` + a registered `.desktop` entry (arguably a *better* UX
+than an arbitrary-folder drop — it shows up in app menus and stays on PATH),
+the real open question is not "wire the browser" but **"does gitmind still
+want free-destination installs at all, or was the fixed XDG location always
+the better design and this method should be retired instead of wired?"** That
+is a product call, not a coding task — recording it precisely rather than
+guessing an answer.
 * **logscope**: 44 modules, 12 dead — `repo`, `spatial_audio`, `workbench`,
   `tab_layout`, `log_gestures`, `chat_layout`, `debatepanel`, `voiceconfirm`,
   `micresponse`, `textsurface`, `assets`, `workergen`. Checked all 12 by grep
