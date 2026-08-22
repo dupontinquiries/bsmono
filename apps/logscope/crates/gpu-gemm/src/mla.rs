@@ -467,4 +467,64 @@ mod shape_check_tests {
         let d = check_shapes(q, o, Some(&kb), Some(&vb), nh, nope, rope, lora, 128);
         assert!(d.iter().any(|x| matches!(x, ShapeDisagreement::OutputWidth { .. })));
     }
+
+    /// What allocating BOTH caches actually costs, as a number.
+    ///
+    /// `Gpu::new_cache_for` allocates the standard per-head K/V vectors for MLA
+    /// models too, and its comment justifies that: "They cost little relative
+    /// to the weights ... trimming the unused allocation is an optimisation
+    /// with a measurement attached, not a guess."
+    ///
+    /// This is the measurement. It does not agree with "little".
+    ///
+    /// On the GLM-4.7-Flash shapes quoted in this file's own `check_shapes`
+    /// doc, the dense cache the MLA path never reads is **17.8x** the latent
+    /// cache it does: 12.50 GiB against 0.70 GiB at 8k context. On DeepSeek-V3
+    /// it is **85x** — 91.5 GiB against 1.07 GiB.
+    ///
+    /// Compare that to the 31 GiB single-allocation ceiling `Gpu::new` clamps
+    /// to on this driver (see ASAHI_GPU.md, "ASSUMED, and loudly"). GLM-4.7-
+    /// Flash at 8k spends 13.2 GiB of it on caches to use 0.7, and DeepSeek-V3
+    /// is over the ceiling at 4k. Long context is the entire reason MLA exists,
+    /// so an allocator that hands the compression straight back is not a small
+    /// inefficiency — it removes the feature at exactly the sizes it was built
+    /// for.
+    ///
+    /// The test asserts the ratio is LARGE, deliberately. It is not guarding a
+    /// performance target; it is stopping the "costs little" claim from being
+    /// re-inferred by someone who has not run these numbers. If the allocator
+    /// is ever taught to skip the dense side for a fully-MLA checkpoint, this
+    /// fails and points at the comment to rewrite — the same expiry discipline
+    /// archcfg's note_claims module uses.
+    ///
+    /// Not fixed here. The comment names the real obstacle: a MIXED checkpoint,
+    /// some layers MLA and some standard, would need the dense side for the
+    /// standard layers, so the trim has to be per-layer or gated on "every
+    /// layer is MLA" — and no MLA checkpoint loads at all yet, so there is
+    /// nothing to test a fix against.
+    #[test]
+    fn the_dense_cache_an_mla_model_never_reads_dwarfs_the_one_it_uses() {
+        // GLM-4.7-Flash (deepseek2), the checkpoint check_shapes documents.
+        let (n_layers, n_head, qk_nope, qk_rope, kv_lora) = (40usize, 20usize, 192usize, 64usize, 512usize);
+        let head_dim = qk_nope + qk_rope;
+        let latent_w = kv_lora + qk_rope;
+
+        // Exactly what Model::kv_bytes_per_token sums.
+        let dense = crate::ctxwin::kv_bytes_per_token(n_layers, n_head, head_dim, 4);
+        let latent = (n_layers * latent_w * 4) as u64;
+
+        assert!(
+            dense > latent * 10,
+            "dense {dense} B/token vs latent {latent} B/token — if this ratio has fallen below 10x the shapes changed or the allocator was fixed; either way the cost-little comment on new_cache_for needs rewriting against the new numbers"
+        );
+
+        // And the figure that decides whether it matters: against the driver's
+        // clamped 31 GiB buffer ceiling, at a context people actually use.
+        let ctx = 8192u64;
+        let wasted_gib = (dense * ctx) as f64 / (1u64 << 30) as f64;
+        assert!(
+            wasted_gib > 10.0,
+            "the unread dense cache is {wasted_gib:.2} GiB at {ctx} context; it was 12.50 GiB when this was measured"
+        );
+    }
 }

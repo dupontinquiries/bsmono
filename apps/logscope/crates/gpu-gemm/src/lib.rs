@@ -13737,10 +13737,35 @@ impl Gpu {
     }
     /// A cache for `m`, adding the compressed MLA side when the model needs it.
     ///
-    /// The standard k/v vectors are still allocated for MLA models. They cost little relative to the
-    /// weights and a mixed checkpoint — some layers MLA, some standard — would otherwise need a second
-    /// cache type threaded everywhere. Correctness first; trimming the unused allocation is an
-    /// optimisation with a measurement attached, not a guess.
+    /// The standard k/v vectors are still allocated for MLA models, and that is
+    /// EXPENSIVE — the earlier version of this comment said they "cost little
+    /// relative to the weights" and asked for a measurement before trimming.
+    /// Here is the measurement (`mla::tests::the_dense_cache_an_mla_model_never
+    /// _reads_dwarfs_the_one_it_uses`):
+    ///
+    /// | model | dense B/token | latent B/token | ratio | both @8k |
+    /// |---|---:|---:|---:|---:|
+    /// | GLM-4.7-Flash | 1,638,400 | 92,160 | 17.8x | 13.20 GiB |
+    /// | DeepSeek-V3 | 11,993,088 | 140,544 | 85.3x | 92.57 GiB |
+    ///
+    /// Against the 31 GiB buffer ceiling `Gpu::new` clamps to on this driver,
+    /// GLM-4.7-Flash at 8k spends 13.2 GiB of caches to use 0.7, and
+    /// DeepSeek-V3 is over the ceiling at 4k. Long context is the whole reason
+    /// MLA exists, so this hands the compression back at exactly the sizes it
+    /// was built for.
+    ///
+    /// STILL NOT TRIMMED, and the reason is unchanged and good: a MIXED
+    /// checkpoint — some layers MLA, some standard — needs the dense side for
+    /// its standard layers, so the trim must be per-layer or gated on "every
+    /// layer is MLA". And no MLA checkpoint loads at all yet (see archcfg's
+    /// deepseek2 note), so there is nothing to test a fix against. What has
+    /// changed is that this is now a known cost with a number, not an assumed
+    /// small one — and it belongs in the same change as the loader, because a
+    /// loader that makes MLA work while the allocator defeats it is not worth
+    /// shipping.
+    ///
+    /// `Model::kv_bytes_per_token` already reports the honest sum, so the
+    /// context planner is not fooled by this; only the allocation is wasteful.
     pub fn new_cache_for(&self, m: &Model, max_seq: usize) -> KvCache {
         self.activate_model(m);
         let mut c = self.new_cache(m.n_layers, max_seq, m.kv_dim());
