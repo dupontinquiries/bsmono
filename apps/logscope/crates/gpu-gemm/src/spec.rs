@@ -391,7 +391,7 @@ mod against_the_existing_engine_path {
 
     #[test]
     fn a_self_draft_accepts_everything_and_matches_plain_decoding() {
-        let Ok(bytes) = std::fs::read("/tmp/tiny-qwen3-q8.gguf") else { return };
+        let Some(bytes) = crate::testfix::read("/tmp/tiny-qwen3-q8.gguf") else { return };
         let gpu = Gpu::new();
         let Ok(m) = gpu.load_gguf_opt(&bytes, true) else { return };
         let prompt: Vec<u32> = (1..9u32).map(|i| i % (m.vocab as u32).max(1)).collect();
@@ -421,7 +421,7 @@ mod drafter_against_the_real_engine {
 
     #[test]
     fn a_model_free_drafter_matches_plain_decoding() {
-        let Ok(bytes) = std::fs::read("/tmp/tiny-qwen3-q8.gguf") else { return };
+        let Some(bytes) = crate::testfix::read("/tmp/tiny-qwen3-q8.gguf") else { return };
         let gpu = Gpu::new();
         let Ok(m) = gpu.load_gguf_opt(&bytes, true) else { return };
         let prompt: Vec<u32> = (1..9u32).map(|i| i % (m.vocab as u32).max(1)).collect();
@@ -450,7 +450,7 @@ mod drafter_against_the_real_engine {
     /// speculation only made it visible.
     #[test]
     fn spec_prefill_paths_agree() {
-        let Ok(bytes) = std::fs::read("/tmp/tiny-qwen3-q8.gguf") else { return };
+        let Some(bytes) = crate::testfix::read("/tmp/tiny-qwen3-q8.gguf") else { return };
         let gpu = Gpu::new();
         let Ok(m) = gpu.load_gguf_opt(&bytes, true) else { return };
         let prompt: Vec<u32> = (1..40u32).map(|i| i % (m.vocab as u32).max(1)).collect();
@@ -473,7 +473,7 @@ mod drafter_against_the_real_engine {
     /// by hand.
     #[test]
     fn a_seeded_prefill_matches_a_fresh_one() {
-        let Ok(bytes) = std::fs::read("/tmp/tiny-qwen3-q8.gguf") else { return };
+        let Some(bytes) = crate::testfix::read("/tmp/tiny-qwen3-q8.gguf") else { return };
         let gpu = Gpu::new();
         let Ok(m) = gpu.load_gguf_opt(&bytes, true) else { return };
         let prompt: Vec<u32> = (1..40u32).map(|i| i % (m.vocab as u32).max(1)).collect();
@@ -501,7 +501,7 @@ mod drafter_against_the_real_engine {
             fn draft(&mut self, _: &[u32], _: usize) -> Vec<u32> { Vec::new() }
             fn name(&self) -> &'static str { "silent" }
         }
-        let Ok(bytes) = std::fs::read("/tmp/tiny-qwen3-q8.gguf") else { return };
+        let Some(bytes) = crate::testfix::read("/tmp/tiny-qwen3-q8.gguf") else { return };
         let gpu = Gpu::new();
         let Ok(m) = gpu.load_gguf_opt(&bytes, true) else { return };
         let prompt: Vec<u32> = (1..9u32).map(|i| i % (m.vocab as u32).max(1)).collect();

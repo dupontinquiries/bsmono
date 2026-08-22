@@ -545,7 +545,7 @@ mod borrowed_tokenizer {
     /// which reads as fluent nonsense rather than as an error.
     #[test]
     fn a_donor_of_the_wrong_width_is_refused() {
-        let Ok(none) = std::fs::read("/tmp/tiny-notok.gguf") else { return };
+        let Some(none) = crate::testfix::read("/tmp/tiny-notok.gguf") else { return };
         let Ok(gn) = crate::gguf::parse(&none) else { return };
         std::env::set_var("LOGSCOPE_TOKENIZER_GGUF", "/tmp/tiny-llada2.gguf");
         let err = match Tokenizer::from_gguf_with_fallback(&gn, 999_999) { Err(e) => e, Ok(_) => panic!("a mismatched donor must be refused") };

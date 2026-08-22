@@ -146,7 +146,7 @@ mod against_a_real_tokenizer {
     /// over-reserving silently spends context.
     #[test]
     fn the_reserved_budget_holds_the_real_marker() {
-        let bytes = match std::fs::read("/tmp/tiny-qwen3.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen3.gguf") { Some(b) => b, None => return };
         let g = match crate::gguf::parse(&bytes) { Ok(g) => g, Err(_) => return };
         let tok = match crate::tokenizer::Tokenizer::from_gguf(&g) { Ok(t) => t, Err(_) => return };
 
@@ -165,7 +165,7 @@ the digits must not blow the budget");
     /// tokenizer, nothing exceeding the window.
     #[test]
     fn the_reported_overflow_fits_exactly() {
-        let bytes = match std::fs::read("/tmp/tiny-qwen3.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen3.gguf") { Some(b) => b, None => return };
         let g = match crate::gguf::parse(&bytes) { Ok(g) => g, Err(_) => return };
         let tok = match crate::tokenizer::Tokenizer::from_gguf(&g) { Ok(t) => t, Err(_) => return };
         let mlen = tok.encode(&marker_text(0)).len().max(8);
@@ -357,7 +357,7 @@ mod on_a_real_paste {
     /// and half of another, and it cannot tell where one stopped.
     #[test]
     fn both_edges_of_a_source_paste_land_on_line_boundaries() {
-        let bytes = match std::fs::read("/tmp/tiny-qwen3.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen3.gguf") { Some(b) => b, None => return };
         let g = match crate::gguf::parse(&bytes) { Ok(g) => g, Err(_) => return };
         let tok = match crate::tokenizer::Tokenizer::from_gguf(&g) { Ok(t) => t, Err(_) => return };
 

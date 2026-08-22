@@ -143,6 +143,11 @@ pub mod governor; // backend-agnostic GPU resource governor: per-device budget +
 #[allow(dead_code)] pub mod kvstage; // staging policy for the hot(f32)/warm(int8) KV cache — speed + 1M ctx
 pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod sparse; // sparse-residency planner (+ gated binder) — the arena's architectural replacement
+// Fixture reader for the tests below: returns None exactly as `fs::read().ok()`
+// did, but PRINTS which fixture is missing and how to generate it. 28 sites
+// used to skip in silence, which is why a green suite could mean the loader
+// never ran.
+#[cfg(test)] mod testfix;
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
 #[allow(dead_code)] pub mod moe;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
 #[allow(dead_code)] pub mod mla;     // Multi-head Latent Attention (DeepSeek/GLM) compressed-KV — CPU reference
@@ -19845,7 +19850,7 @@ mod small_chunk_equivalence {
 mod diffusion_stop_cancel {
     use super::*;
     fn model(gpu: &Gpu) -> Option<Model> {
-        let bytes = std::fs::read("/tmp/tiny-llada2.gguf").ok()?;
+        let bytes = crate::testfix::read("/tmp/tiny-llada2.gguf")?;
         gpu.load_gguf_opt(&bytes, false).ok()
     }
 
@@ -19920,7 +19925,7 @@ mod kv_cache_soundness {
     #[test]
     fn prefix_rows_still_depend_on_the_current_block() {
         let gpu = Gpu::new();
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let mask = match m.mask_token_id { Some(x) => x, None => return };
         let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
@@ -19946,7 +19951,7 @@ mod block_causal_mode {
     #[test]
     fn block_causal_makes_the_prefix_independent_of_the_current_block() {
         let gpu = Gpu::new();
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let mask = match m.mask_token_id { Some(x) => x, None => return };
         let blk = 4usize;
@@ -20020,7 +20025,7 @@ mod block_causal_alignment {
 mod diffusion_sampling {
     use super::*;
     fn model(gpu: &Gpu) -> Option<Model> {
-        let bytes = std::fs::read("/tmp/tiny-llada2.gguf").ok()?;
+        let bytes = crate::testfix::read("/tmp/tiny-llada2.gguf")?;
         gpu.load_gguf_opt(&bytes, false).ok()
     }
     fn prompt() -> Vec<u32> { (0..12u32).map(|i| 1 + (i * 13) % 200).collect() }
@@ -20075,7 +20080,7 @@ mod diffusion_repeat_penalty {
     #[test]
     fn the_repeat_penalty_changes_diffusion_output() {
         let gpu = Gpu::new();
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 13) % 200).collect();
         let run = |penalty: f32| {
@@ -20251,7 +20256,7 @@ pub fn q4_0_blocks(nblk: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
 mod mask_never_committed {
     use super::*;
     fn model(gpu: &Gpu) -> Option<(Model, u32)> {
-        let bytes = std::fs::read("/tmp/tiny-llada2.gguf").ok()?;
+        let bytes = crate::testfix::read("/tmp/tiny-llada2.gguf")?;
         let m = gpu.load_gguf_opt(&bytes, false).ok()?;
         let mask = m.mask_token_id?;
         Some((m, mask))
@@ -20401,7 +20406,7 @@ mod threshold_end_to_end {
     /// accelerator changes HOW MANY positions commit per forward, never whether the reply is whole.
     #[test]
     fn a_thresholded_run_still_fills_every_position() {
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let gpu = Gpu::new();
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let mask = match m.mask_token_id { Some(x) => x, None => return };
@@ -20427,7 +20432,7 @@ mod bidir_kv_cache {
     /// itself.
     #[test]
     fn a_cached_window_matches_the_uncached_forward() {
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let gpu = Gpu::new();
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let mask = m.mask_token_id.unwrap_or(0);
@@ -20462,7 +20467,7 @@ mod bidir_kv_cache {
     /// bug, and reading uninitialised rows as context would look like plausible gibberish.
     #[test]
     fn a_misaligned_window_is_refused() {
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let gpu = Gpu::new();
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let toks: Vec<u32> = (0..12u32).map(|i| 1 + i).collect();
@@ -20489,7 +20494,7 @@ mod long_prompt_prefill {
     /// whole-canvas path.
     #[test]
     fn a_long_prompt_prefills_without_touching_the_head() {
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let gpu = Gpu::new();
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let mask = m.mask_token_id.unwrap_or(0);
@@ -20514,7 +20519,7 @@ mod long_prompt_prefill {
     /// than degrade into dropped dispatches and an empty answer.
     #[test]
     fn an_oversized_readout_is_named_not_dropped() {
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let gpu = Gpu::new();
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         let cap = gpu.max_buffer_bytes() as u64;
@@ -20540,7 +20545,7 @@ mod shift_logits_cached {
     /// exhausted the driver's VMA at 2471 rows and degraded into an empty readout and a panic.
     #[test]
     fn a_shift_logits_model_still_generates_with_the_cache() {
-        let bytes = match std::fs::read("/tmp/tiny-llada2-shift.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2-shift.gguf") { Some(b) => b, None => return };
         let gpu = Gpu::new();
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         assert!(m.shift_logits, "this fixture exists to exercise shift_logits");
@@ -20660,7 +20665,7 @@ mod bidir_attention_grid {
     #[test]
     fn a_wide_attention_matches_a_narrow_one() {
         let gpu = Gpu::new();
-        let bytes = match std::fs::read("/tmp/tiny-llada2.gguf") { Ok(b) => b, Err(_) => return };
+        let bytes = match crate::testfix::read("/tmp/tiny-llada2.gguf") { Some(b) => b, None => return };
         let m = match gpu.load_gguf_opt(&bytes, false) { Ok(m) => m, Err(_) => return };
         // Same tokens, two lengths — the longer one is where a y-spill would first bite on a real
         // model; on the tiny it exercises the same index arithmetic.
