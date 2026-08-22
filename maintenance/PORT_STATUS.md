@@ -1116,3 +1116,66 @@ same reason `reachability.py` wasn't touched: three confirmed missing rows is
 enough to know the fix is needed, but generalizing the fix (scanning any
 `crates/*-egui` sibling automatically) risks changing what every other app's
 count means, with no compiler here to check the result against anything.
+
+## ambient-learner-egui did not compile at all — the biggest finding this session
+
+Every audit tool in this repo (`parity_audit.py`, `reachability.py`,
+`wiring_check.py`) works by reading source text. None of them run `cargo`.
+That's a real blind spot, and this app was it: with a compiler finally
+available, `cargo check --bin ambient-learner-egui` in
+`apps/ambient-learner/egui-frontend` failed outright —
+
+```
+error[E0432]: unresolved import `applib`
+  --> src/lib.rs:19:9
+19 | pub use applib::*;
+   |         ^^^^^^ use of unresolved module or unlinked crate `applib`
+```
+
+**Root cause:** `egui-frontend/src/lib.rs` mounts the parent crate's
+`src/egui_lib.rs` via `#[path = "../../src/egui_lib.rs"] mod applib;` — the
+documented, deliberate way this app shares view code with its GTK-only parent
+without copying it. But `egui_lib.rs`'s own first line is
+`#![cfg(feature = "egui")]`, and inner `cfg` attributes are evaluated against
+the CURRENT crate's Cargo features, not the parent's. `egui-frontend`'s
+manifest never declared an `egui` feature at all — so that `cfg` was always
+false in this crate's build, the entire mounted file compiled to nothing, and
+`mod applib` produced an empty module. `pub use applib::*` then failed
+because there was nothing to import.
+
+**Every ported page in this app — ambience, chrome, history, live, locations,
+map, model, screen_temps, sync, router, `LiveState`, all of it — has been
+compiling to an empty crate.** Every test this doc has cited for this app in
+earlier sections (the 13 `ambience.rs` tests, `screen_temps.rs`'s tests, the
+`router.rs` tests confirming dispatch, all of it) was real, correct, and
+**had never once actually run** as part of this crate — they'd only run
+under whatever ad-hoc invocation an earlier session used to check them in
+isolation, never via the crate's own documented `cargo test` path. All the
+verification work earlier in this document about ambient-learner's named-only
+surfaces being "confirmed ported" was true in the sense that the code exists
+and is correct — but the crate containing it didn't build. This is precisely
+the gap a compiler-less audit cannot see, and precisely why this session kept
+noting "no compiler, so verify by reading" as a limitation rather than a
+guarantee.
+
+**Fixed:** added an `egui` feature to `egui-frontend/Cargo.toml`, had `app`
+imply it (`app = ["dep:eframe", "egui"]`) so the eframe binary always gets the
+view code it needs, and documented in the manifest itself why the feature has
+to exist and what breaks without it — so the next person editing this
+manifest doesn't remove it as apparently-unused.
+
+**Verified, all three real configurations, not asserted:**
+- `cargo check --bin ambient-learner-egui` (default: `app` → `dep:eframe` +
+  `egui`): clean, one pre-existing deprecation warning, unrelated.
+- `cargo check --lib --no-default-features --features egui` (the headless
+  testing mode this file's other comment documents — view code without a
+  window system): clean.
+- `cargo test --lib`: **147 tests, all passing** — the true count of every
+  test this app's egui port has ever had, now actually run for what is very
+  likely the first time since this crate split was introduced.
+
+Left `--no-default-features` with no features at all (a build with neither
+the window host nor the view code) failing to compile, deliberately: that
+combination isn't a real use case the manifest's own documentation claims to
+support, so making it "succeed" by producing a silently-empty crate would
+just reintroduce a milder version of the same bug this fix closes.
