@@ -153,6 +153,8 @@ const LEAFBARE_PATROL: usize = 3;    // patrol size in leaf-bare
 
 const RESPAWN_BASE: f32 = 14.0;
 const REACH: f32 = 2.8;              // claw range
+/// What a ranged strike is worth while giving ground. See the kiting branch.
+const KITE_STRIKE: f32 = 0.5;
 const ENGAGE_R: f32 = 16.0;          // how far a warrior will break trail to fight
 const MATCH_LEN: f32 = 12.0 * 60.0;
 
@@ -997,17 +999,33 @@ impl Battleground {
                     let (tx, tz) = (self.warriors[t].x, self.warriors[t].z);
                     let reach = self.warriors[i].reach;
                     let d = dist(x, z, tx, tz);
-                    if d > reach { self.walk_toward(i, tx, tz, dt); }
-                    else {
-                        let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
+                    if d > reach {
+                        self.walk_toward(i, tx, tz, dt);
+                    } else {
+                        // A ranged cat keeps its distance — but backing away and
+                        // biting are not the same motion. Measured: with the kite
+                        // free, Faryowl outran every kit slower than 6.4 while
+                        // still landing every yowl, and finished 61% across 160
+                        // games, the last kit outside ±7. Now giving ground costs
+                        // the blow, which is what it costs a real cat.
+                        let kiting = reach > 4.0 && d < reach * 0.45;
+                        if kiting {
+                            let (nx, nz) = norm(x - tx, z - tz);
+                            self.walk_toward(i, x + nx * 6.0, z + nz * 6.0, dt);
+                        }
+                        // A yowl thrown over the shoulder is a weaker yowl, not a
+                        // silent one. Both extremes were measured across 160
+                        // games: kiting free left Faryowl at 61% (dispersion sd
+                        // 4.2 overall), kiting silent dropped it to 42% and took
+                        // Stillsmoke to 37% with it (sd 6.2). Half is the version
+                        // that keeps the trade real without deleting the archetype.
+                        let mult = if kiting { KITE_STRIKE } else { 1.0 };
+                        let dmg = self.strike_of(i) * self.strike_vs(i, t) * mult * dt;
                         let was_alive = self.warriors[t].alive();
                         self.hurt(t, dmg);
                         self.on_hit(i, t);
-                        if was_alive && !self.warriors[t].alive() { self.warriors[i].kills += 1; }
-                        // a ranged cat keeps its distance: yowl, and give ground
-                        if reach > 4.0 && d < reach * 0.45 {
-                            let (nx, nz) = norm(x - tx, z - tz);
-                            self.walk_toward(i, x + nx * 6.0, z + nz * 6.0, dt);
+                        if was_alive && !self.warriors[t].alive() {
+                            self.warriors[i].kills += 1;
                         }
                     }
                     if role == Role::Ancestor { self.auto_cast(i); }
@@ -2474,6 +2492,58 @@ mod tests {
         bg.set_input(0.0, 0.0, false, Some(9));
         bg.step(1.0 / 30.0);
         assert!(bg.warriors[0].cds[2] > 0.0, "slot 9 clamps to the ultimate");
+    }
+
+    #[test]
+    fn giving_ground_costs_the_blow() {
+        use crate::ancestor::kit;
+        // A yowler pressed to muzzle range backs off instead of striking; the
+        // same yowler at comfortable range strikes and holds. Melee kits never
+        // kite at all, so their blow is never traded away.
+        let step = |a: Ancestor, gap: f32| -> (f32, f32) {
+            let mut bg = Battleground::new_draft(
+                [a, Ancestor::Lion, Ancestor::Puma],
+                [Ancestor::Puma, Ancestor::Leopard, Ancestor::Panther],
+            );
+            bg.patrol_t = [1e9; 2];
+            bg.warriors[0].is_player = false;
+            // out in the middle: within LAST_STAND_R of a camp a warrior defends
+            // the Great Tree instead, and that branch does not kite — the first
+            // draft of this test staged the duel on the doorstep and measured
+            // the last stand
+            bg.warriors[0].x = 10.0;
+            bg.warriors[0].z = -10.0;
+            let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+            let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+            bg.warriors[e].x = x + gap;
+            bg.warriors[e].z = z;
+            bg.warriors[e].root_t = 100.0; // hold the target still
+            bg.warriors[e].hp = bg.warriors[e].max_hp;
+            // abilities on cooldown: this is about the BASIC blow. A yowler
+            // backing off can still spend Piercing Yowl, and should — spacing is
+            // what its abilities are paid for; it is the free auto-attack while
+            // retreating that was the problem.
+            bg.warriors[0].cds = [30.0; 3];
+            let hp0 = bg.warriors[e].hp;
+            bg.step(1.0 / 30.0);
+            let moved = dist(bg.warriors[0].x, bg.warriors[0].z, x, z);
+            (hp0 - bg.warriors[e].hp, moved)
+        };
+        let close = kit(Ancestor::Serval).reach * 0.3; // inside the kite threshold
+        let far = kit(Ancestor::Serval).reach * 0.8;
+        let (dmg_close, moved_close) = step(Ancestor::Serval, close);
+        let (dmg_far, moved_far) = step(Ancestor::Serval, far);
+        assert!(moved_close > 0.0, "pressed close, the yowler gives ground");
+        assert!(dmg_far > 0.0, "at range it strikes");
+        assert!(
+            dmg_close < dmg_far * 0.75,
+            "a yowl thrown over the shoulder lands softer: {dmg_close} against {dmg_far}"
+        );
+        assert!(dmg_close > 0.0, "but it is not silent");
+        assert!(moved_far < 0.01, "and holds its ground");
+        // a melee kit at the same close distance strikes and stays
+        let (dmg_melee, moved_melee) = step(Ancestor::Smilodon, 2.0);
+        assert!(dmg_melee > 0.0 && moved_melee < 0.01, "melee never kites");
     }
 
     #[test]

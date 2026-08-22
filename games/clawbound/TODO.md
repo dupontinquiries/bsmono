@@ -195,8 +195,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   runs being compared, exactly the noise-chasing this switch exists to prevent.
 - [x] The frailty term was itself found by measurement: sorting on ally-facing tools alone
   sent the 130-hp yowler down the river and cost it 19 points (55% -> 36%) in 168 games.
-- [ ] Faryowl at 61% is the one kit outside +-7 in the winning arm — the next thing to look
-  at, and the first candidate for an actual kit change rather than a doctrine one
+- [x] Faryowl's 61% traced to a mechanism, not a number: the kite in the Fight branch let a
+  ranged cat give ground *and* land its blow in the same tick, so at speed 6.4 it outran
+  every kit slower than itself while still hitting — free damage against half the roster.
+  Backing away and biting are not the same motion, so giving ground now costs the strike.
+- [x] Three arms measured on identical drafts and lands (160 games each), because the first
+  fix overshot: kite free -> Faryowl 61%, sd 4.2, 1 kit outside +-7; kite **silent** ->
+  Faryowl 42% and Stillsmoke 37%, sd 6.2, 3 outside; kite at **half** -> Faryowl 53%,
+  sd 4.3, 1 outside. Half keeps the trade real without deleting the archetype, and a yowl
+  thrown over the shoulder being a weaker yowl is the version that was true anyway.
+  Abilities still land at full while kiting — spacing is what a yowler's abilities are paid
+  for; it was the free auto-attack that was wrong.
+- [ ] Nightpelt at 62% in the half-kite arm is the new candidate outlier (was 50% in the
+  same drafts). 12 points is ~2 SE at n=72 and it is melee stealth, untouched by the kite
+  change, so it is as likely to be noise as signal — needs its own A/B before anyone
+  touches the kit
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
   a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
   every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
@@ -209,8 +222,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   clans' wounds in the first tick any appear gives A 9, simultaneous 23, B 8. An
   instrument that shares the thing it measures' index order will measure its own index
   order.
-- [ ] Faryowl at 61% is the one kit outside +-7 in the winning arm — the next thing to look
-  at, and the first candidate for an actual kit change rather than a doctrine one
+- [x] Faryowl's 61% traced to a mechanism, not a number: the kite in the Fight branch let a
+  ranged cat give ground *and* land its blow in the same tick, so at speed 6.4 it outran
+  every kit slower than itself while still hitting — free damage against half the roster.
+  Backing away and biting are not the same motion, so giving ground now costs the strike.
+- [x] Three arms measured on identical drafts and lands (160 games each), because the first
+  fix overshot: kite free -> Faryowl 61%, sd 4.2, 1 kit outside +-7; kite **silent** ->
+  Faryowl 42% and Stillsmoke 37%, sd 6.2, 3 outside; kite at **half** -> Faryowl 53%,
+  sd 4.3, 1 outside. Half keeps the trade real without deleting the archetype, and a yowl
+  thrown over the shoulder being a weaker yowl is the version that was true anyway.
+  Abilities still land at full while kiting — spacing is what a yowler's abilities are paid
+  for; it was the free auto-attack that was wrong.
+- [ ] Nightpelt at 62% in the half-kite arm is the new candidate outlier (was 50% in the
+  same drafts). 12 points is ~2 SE at n=72 and it is melee stealth, untouched by the kite
+  change, so it is as likely to be noise as signal — needs its own A/B before anyone
+  touches the kit
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean
