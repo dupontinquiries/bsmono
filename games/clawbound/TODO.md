@@ -248,10 +248,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   `concealment_at` and `sees`, which run once per warrior pair per tick. Cached behind a
   OnceLock with slice accessors for the hot path: **12,209 -> 27,883 sim steps/s (2.3x)**,
   and the pooled protocol went from nineteen minutes to eight.
-- [ ] Mechanism hunt for the three outliers: what do Windclaw and Rainspots get for free
-  (kill-stacked speed with no cap on the stacking rate? Riverborn mending with no cost?),
-  and what does Snowhush pay for that it does not collect (chill-on-hit needs someone to
-  punish the chilled — does the AI ever follow up?)
+- [x] Mechanism hunt done, and all three hypotheses were right (`docs/BALANCE.md` has the
+  before/after): Windclaw stacked Skyward Hunger off **prey** because the prey rework
+  credited mice as kills (55% -> 49%); Riverborn mended with no cost, cooldown or cap so
+  Rainspots could outlast anything that came to the water, and now mends only between
+  fights (55% -> 53%); Snowhush's chill was value only a packmate could spend, so the lynx
+  collects on it itself now, +25% into the slowed or rooted (44% -> 48%).
+- [x] Found while testing those: `Mind::AtMedic` healed **unconditionally**, so anything
+  that put a warrior in that state healed it wherever it stood. `think` never does that
+  from far away, so it never showed in play — two earlier tests were written around the
+  quirk before it was understood as a bug. Now the den heals only at the den.
+- [ ] Dispersion did NOT improve: sd 3.3 before and after, kits outside 2se 3 -> 2, with
+  Faryowl and Duskstripe drifting up into the space Windclaw left. Worth sitting with
+  before the next fix — it may be that this AI's spread is dominated by lane assignment
+  and draft luck rather than kit power, in which case the next real gain is in the AI, not
+  the kits.
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
   a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
   every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
@@ -317,10 +328,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   `concealment_at` and `sees`, which run once per warrior pair per tick. Cached behind a
   OnceLock with slice accessors for the hot path: **12,209 -> 27,883 sim steps/s (2.3x)**,
   and the pooled protocol went from nineteen minutes to eight.
-- [ ] Mechanism hunt for the three outliers: what do Windclaw and Rainspots get for free
-  (kill-stacked speed with no cap on the stacking rate? Riverborn mending with no cost?),
-  and what does Snowhush pay for that it does not collect (chill-on-hit needs someone to
-  punish the chilled — does the AI ever follow up?)
+- [x] Mechanism hunt done, and all three hypotheses were right (`docs/BALANCE.md` has the
+  before/after): Windclaw stacked Skyward Hunger off **prey** because the prey rework
+  credited mice as kills (55% -> 49%); Riverborn mended with no cost, cooldown or cap so
+  Rainspots could outlast anything that came to the water, and now mends only between
+  fights (55% -> 53%); Snowhush's chill was value only a packmate could spend, so the lynx
+  collects on it itself now, +25% into the slowed or rooted (44% -> 48%).
+- [x] Found while testing those: `Mind::AtMedic` healed **unconditionally**, so anything
+  that put a warrior in that state healed it wherever it stood. `think` never does that
+  from far away, so it never showed in play — two earlier tests were written around the
+  quirk before it was understood as a bug. Now the den heals only at the den.
+- [ ] Dispersion did NOT improve: sd 3.3 before and after, kits outside 2se 3 -> 2, with
+  Faryowl and Duskstripe drifting up into the space Windclaw left. Worth sitting with
+  before the next fix — it may be that this AI's spread is dominated by lane assignment
+  and draft luck rather than kit power, in which case the next real gain is in the AI, not
+  the kits.
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean

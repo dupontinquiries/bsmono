@@ -42,6 +42,41 @@ sim runs at ~28k steps/s; it was ~12k, and the same run cost nineteen minutes).
 
 `*` = outside two standard errors. Dispersion **sd 3.3**, range 12 points.
 
+## After the mechanism hunt (same protocol, 800 matches)
+
+The three outliers above were each traced to something the kit got for free, and
+each fix is a rule rather than a number:
+
+* **Windclaw 55% -> 49%.** Skyward Hunger quickened its paws on *every* kill —
+  and the prey rework had started counting mice. A caracal could stack its whole
+  speed bonus off a hillside of things that do not fight back. Prey now credits
+  `prey_taken`; only warriors credit `kills`.
+* **Rainspots 55% -> 53%.** Riverborn mended 3 hp/s in water with no cost, no
+  cooldown and no cap, so the kit could stand in the shallows and outlast
+  anything that came to the bank. The river closes wounds *between* fights now —
+  not with an enemy inside engage range.
+* **Snowhush 44% -> 48%.** The one significant underperformer, and its passive
+  was value it handed to packmates the AI never spent: Hush of Snows chills, and
+  nothing in the lynx's own kit collected on a chilled target. It does now
+  (+25% into the slowed or rooted), which is the same teamwork idea stated so
+  that a kit can pay itself.
+
+| | before | after | delta |
+|---|---|---|---|
+| Windclaw | 55%* | 49% | −7 |
+| Rainspots | 55%* | 53% | −3 |
+| Snowhush | 44%* | 48% | +5 |
+| dispersion | sd 3.3, range 12 | sd 3.3, range 13 | |
+| kits outside 2se | 3 | **2** | |
+
+Note what did *not* happen: dispersion did not improve. Three targeted fixes,
+800 games each side, and the roster is exactly as spread as it was — the kits
+outside two standard errors went 3 to 2, and Faryowl and Duskstripe drifted up
+into the space Windclaw left. That is the honest shape of balance work at this
+resolution: the fixes were right on their mechanisms, the aggregate barely
+moved, and anyone reading a ±5 point delta as a result should remember that two
+of these three deltas are inside their own error bar.
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three

@@ -238,7 +238,14 @@ pub struct Warrior {
     pub cds: [f32; 3],    // ability 1, ability 2, ult
     pub respawn_t: f32,
     pub gather_t: f32,
+    /// Warriors felled. **Prey does not count** — see `prey_taken`. Skyward
+    /// Hunger reads this, and a caracal that could stack its whole speed bonus
+    /// off a hillside of mice was quickening its paws on nothing that fought
+    /// back: the fastest kit on the roster, free, by farming.
     pub kills: u32,
+    /// Prey brought down. Kept separate so the hunt is still legible, and so a
+    /// future kit *can* be paid in prey if that is its identity.
+    pub prey_taken: u32,
     /// Which seat this warrior holds **within its own clan** — 0..2 for the
     /// ancestors, then patrol cats by wave. Every per-warrior random roll hashes
     /// on the seat rather than on the index into `warriors`, so a warrior and
@@ -406,6 +413,14 @@ impl Battleground {
         if w.ancestor == Some(Ancestor::Jaguar) && (t.slow_t > 0.0 || t.root_t > 0.0 || t.fear_t > 0.0) {
             m *= 1.2;   // The River Remembers: the held are already caught
         }
+        if w.ancestor == Some(Ancestor::Lynx) && (t.slow_t > 0.0 || t.root_t > 0.0) {
+            // Hush of Snows put the cold there; the lynx should be allowed to
+            // collect on it. Measured: Snowhush was the roster's one significant
+            // underperformer (44% over 800 games) and its whole passive was value
+            // it handed to packmates the AI never spent — a kit paying a bill
+            // somebody else forgot to collect.
+            m *= 1.25;
+        }
         m
     }
 
@@ -557,7 +572,7 @@ impl Battleground {
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
                     shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
-                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: slot as u32, still_t: 0.0, duty: Duty::Border,
+                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, prey_taken: 0, seat: slot as u32, still_t: 0.0, duty: Duty::Border,
                     is_player: team == CLAN_A && slot == 0, seg: 0,
                 });
             }
@@ -599,7 +614,7 @@ impl Battleground {
                 mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
                 carry: Carry::Nothing,
                 shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
-                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0,
+                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, prey_taken: 0,
                 seat: 100 + wave_seat * 8 + i as u32, still_t: 0.0, duty,
                 is_player: false, seg: 0,
             });
@@ -937,6 +952,16 @@ impl Battleground {
                 }
             }
             Mind::AtMedic => {
+                // Only at the den. `think` never sets this state from far away,
+                // so in play it never mattered — but the heal was unconditional,
+                // which meant anything that put a warrior into AtMedic healed it
+                // wherever it stood. Two tests were written around that quirk
+                // before it was a bug; now it is a rule.
+                let (mx, mz) = self.medics[team as usize];
+                if dist(x, z, mx, mz) > MEDIC_R {
+                    self.warriors[i].mind = Mind::Retreat;
+                    return;
+                }
                 self.heal(i, MEDIC_HEAL * dt);
                 if self.warriors[i].power_frac() >= REJOIN {
                     if let Some(l) = self.breach_lane(team) { self.warriors[i].lane = l; }
@@ -1007,7 +1032,7 @@ impl Battleground {
                                 self.prey[p].x = hx0; self.prey[p].z = hz0;
                                 self.warriors[i].carry = Carry::Freshkill(kind.worth());
                                 self.warriors[i].mind = Mind::CarryHome;
-                                self.warriors[i].kills += 1;
+                                self.warriors[i].prey_taken += 1;
                             }
                         }
                     }
@@ -1391,7 +1416,16 @@ impl Battleground {
             if !alive { continue; }
             if self.under_aura(team, x, z) { self.heal(i, aura_heal * dt); }
             if anc == Some(Ancestor::Leopard) && world::height_at(x, z) < world::WATER_Y + 0.2 {
-                self.heal(i, 3.0 * dt);
+                // Riverborn mends *between* fights, not during one. Standing in
+                // the shallows regenerating with an enemy on the bank was a heal
+                // with no cost, no cooldown and no cap — the one kit that could
+                // simply outlast anything that came to the water.
+                let pressed = self.warriors.iter().any(|e| {
+                    e.team != team && e.alive() && dist(e.x, e.z, x, z) < ENGAGE_R
+                });
+                if !pressed {
+                    self.heal(i, 3.0 * dt);
+                }
             }
         }
 
@@ -1501,7 +1535,7 @@ mod tests {
             hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0, reach: REACH,
             mind: Mind::Trail, carry: Carry::Nothing,
             shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
-            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: 999, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
+            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, prey_taken: 0, seat: 999, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
         });
         bg.step(1.0 / 30.0);
         assert_eq!(bg.warriors[p].mind, Mind::LastStand, "at the Great Tree a warrior stands");
@@ -2634,6 +2668,102 @@ mod tests {
         }
         assert_eq!(bg.warriors[0].shield, 0.0, "and then it settles");
         assert_eq!(bg.warriors[0].shield_t, 0.0);
+    }
+
+    #[test]
+    fn a_hillside_of_mice_does_not_make_a_war_hero() {
+        // Skyward Hunger quickens the caracal's paws with every kill. Prey are
+        // not kills: a kit should not stack a war passive off things that do not
+        // fight back.
+        let mut bg = Battleground::new(Ancestor::Caracal);
+        quiet(&mut bg);
+        bg.warriors[0].x = 20.0;
+        bg.warriors[0].z = -20.0;
+        let base = bg.speed_of(0);
+        bg.warriors[0].prey_taken = 10;
+        assert_eq!(bg.speed_of(0), base, "prey must not quicken the paws");
+        bg.warriors[0].kills = 10;
+        assert!(bg.speed_of(0) > base * 1.3, "warriors do");
+        // and a hunt credits prey_taken, not kills
+        let mut bg = Battleground::new(Ancestor::Caracal);
+        quiet(&mut bg);
+        let p = bg.prey.iter().position(|p| p.alive()).unwrap();
+        let (px, pz) = (bg.prey[p].x, bg.prey[p].z);
+        bg.warriors[1].x = px;
+        bg.warriors[1].z = pz;
+        bg.warriors[1].mind = Mind::Hunt;
+        for _ in 0..30 * 20 {
+            bg.step(1.0 / 30.0);
+            if bg.warriors[1].carry != Carry::Nothing {
+                break;
+            }
+        }
+        assert!(bg.warriors[1].prey_taken > 0, "the hunt should be counted");
+        assert_eq!(bg.warriors[1].kills, 0, "but not as a war record");
+    }
+
+    #[test]
+    fn the_river_mends_between_fights_not_during_one() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Leopard, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Caracal, Ancestor::Panther],
+        );
+        bg.patrol_t = [1e9; 2];
+        bg.heal_trees.clear(); // isolate Riverborn from the aura
+        let Some((wx, wz)) = world::nearest_water((0.0, 0.0), 140.0) else { return };
+        bg.warriors[0].x = wx;
+        bg.warriors[0].z = wz;
+        bg.warriors[0].hp = 50.0;
+        bg.warriors[0].mind = Mind::AtMedic; // hold position
+        bg.warriors[0].is_player = false;
+        // an enemy on the bank: no mending
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = wx + 5.0;
+        bg.warriors[e].z = wz;
+        bg.warriors[e].root_t = 100.0;
+        bg.warriors[e].attack = 0.0;
+        let before = bg.warriors[0].hp;
+        for _ in 0..30 {
+            bg.warriors[0].x = wx;
+            bg.warriors[0].z = wz;
+            bg.warriors[0].mind = Mind::AtMedic;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[0].hp <= before + 0.01, "pressed, the river gives nothing");
+        // send the enemy away and the shallows close the wounds
+        bg.warriors[e].x = wx + 120.0;
+        let mid = bg.warriors[0].hp;
+        for _ in 0..30 {
+            bg.warriors[0].x = wx;
+            bg.warriors[0].z = wz;
+            bg.warriors[0].mind = Mind::AtMedic;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[0].hp > mid + 1.0, "alone in the shallows, it mends");
+    }
+
+    #[test]
+    fn the_cold_bites_deeper_for_the_cat_that_made_it() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Lynx, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Leopard, Ancestor::Panther],
+        );
+        bg.patrol_t = [1e9; 2];
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = bg.warriors[0].x + 2.0;
+        bg.warriors[e].z = bg.warriors[0].z;
+        let warm = bg.strike_vs(0, e);
+        bg.warriors[e].slow_t = 1.0;
+        assert!(bg.strike_vs(0, e) > warm * 1.2, "the lynx collects on its own chill");
+        // and it is the lynx's alone — a lion gets nothing from a chilled target
+        let mut lion = Battleground::new(Ancestor::Lion);
+        lion.patrol_t = [1e9; 2];
+        let le = lion.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        lion.warriors[le].x = lion.warriors[0].x + 2.0;
+        lion.warriors[le].z = lion.warriors[0].z;
+        let plain = lion.strike_vs(0, le);
+        lion.warriors[le].slow_t = 1.0;
+        assert_eq!(lion.strike_vs(0, le), plain);
     }
 
     #[test]
