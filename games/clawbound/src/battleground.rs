@@ -403,12 +403,20 @@ impl Battleground {
         m
     }
 
-    /// On-hit riders that come with a warrior's blows — Snowhush's chill.
+    /// On-hit riders that come with a warrior's blows — Snowhush's chill, and
+    /// the veil breaking.
     fn on_hit(&mut self, i: usize, target: usize) {
         if self.warriors[i].ancestor == Some(Ancestor::Lynx) {
             let t = &mut self.warriors[target];
             t.slow_t = t.slow_t.max(0.5);   // Hush of Snows
         }
+        // **Striking breaks the veil.** You cannot rake a warrior and remain
+        // unseen: the blow is where the ambush ends. The bonus is already banked
+        // — `strike_of` read the veil when the damage was computed — so a kit
+        // still gets its whole opening strike from the dark, and then has to be
+        // somewhere. Without this, stealth was the same free lunch the kite was:
+        // untargetable in `nearest_enemy` while still landing every blow.
+        self.warriors[i].stealth_t = 0.0;
     }
 
     fn respawn_time(&self, team: u8) -> f32 {
@@ -804,6 +812,13 @@ impl Battleground {
                     }
                 }
             }
+        }
+        // any ability that draws blood ends the ambush too — but Veilwalker
+        // itself, and the shields and heals, do not
+        let bloodies = !matches!(spec.verb, Verb::Stealth | Verb::Shield | Verb::Heal | Verb::Rain)
+            && spec.power > 0.0;
+        if bloodies {
+            self.warriors[i].stealth_t = 0.0;
         }
         self.warriors[i].cds[slot] = spec.cd;
     }
@@ -2544,6 +2559,46 @@ mod tests {
         // a melee kit at the same close distance strikes and stays
         let (dmg_melee, moved_melee) = step(Ancestor::Smilodon, 2.0);
         assert!(dmg_melee > 0.0 && moved_melee < 0.01, "melee never kites");
+    }
+
+    #[test]
+    fn the_blow_from_the_dark_lands_and_then_the_veil_is_gone() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Panther, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Leopard, Ancestor::Caracal],
+        );
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].is_player = false;
+        bg.warriors[0].x = 10.0;
+        bg.warriors[0].z = -10.0;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = x + 2.0;
+        bg.warriors[e].z = z;
+        bg.warriors[e].root_t = 100.0;
+        bg.warriors[0].cds = [30.0; 3];
+        // struck from the veil: the bonus is banked into THIS blow…
+        bg.warriors[0].stealth_t = 5.0;
+        let veiled = bg.strike_of(0);
+        bg.warriors[0].stealth_t = 0.0;
+        let plain = bg.strike_of(0);
+        assert!(veiled > plain * 1.2, "Night's Hunger should feed the opening strike");
+        // …and then the ambush is over
+        bg.warriors[0].stealth_t = 5.0;
+        bg.step(1.0 / 30.0);
+        assert_eq!(bg.warriors[0].stealth_t, 0.0, "the blow ends the ambush");
+        assert!(bg.warriors[e].hp < bg.warriors[e].max_hp, "and it still landed");
+        // a warder's own shield does not give them away
+        let mut lion = Battleground::new(Ancestor::Lion);
+        lion.patrol_t = [1e9; 2];
+        lion.warriors[0].stealth_t = 5.0;
+        lion.cast(0, 1); // Mane of Dawn
+        assert_eq!(lion.warriors[0].stealth_t, 5.0, "shielding is not a blow");
+        // nor does casting Veilwalker itself
+        let mut cat = Battleground::new(Ancestor::Tiger);
+        cat.patrol_t = [1e9; 2];
+        cat.cast(0, 1); // Stripes in the Reeds
+        assert!(cat.warriors[0].stealth_t > 0.0, "the veil may still be raised");
     }
 
     #[test]

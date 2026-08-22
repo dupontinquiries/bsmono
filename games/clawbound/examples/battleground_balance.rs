@@ -61,6 +61,7 @@ fn main() {
     let mut clan_a_wins = 0u32;
     let mut total = 0u32;
     let mut fells = 0u32;
+    let (mut pairs, mut pair_a_both, mut pair_b_both, mut pair_split) = (0u32, 0u32, 0u32, 0u32);
     let mut rng: u64 = 0x243f_6a88_85a3_08d3;
     let mut next = move || {
         rng ^= rng << 13;
@@ -81,9 +82,13 @@ fn main() {
             }
             let side_a = [pool[picked[0]], pool[picked[1]], pool[picked[2]]];
             let side_b = [pool[picked[3]], pool[picked[4]], pool[picked[5]]];
+            let mut pair_a_wins = 0u32;   // how many of the two orientations clan A took
+            let mut pair_played = 0u32;
             for swap in [false, true] {
                 let (x, y) = if swap { (side_b, side_a) } else { (side_a, side_b) };
                 let Some(o) = play(x, y, seed, wombo, policy) else { continue };
+                pair_played += 1;
+                if o == CLAN_A { pair_a_wins += 1; }
                 total += 1;
                 if o != 2 {
                     fells += 1;
@@ -98,6 +103,19 @@ fn main() {
                     if o != 2 && (o == CLAN_A) == on_a {
                         wins[pi] += 1;
                     }
+                }
+            }
+            // Orientation bookkeeping. If the map and sim are fair, a draft pair
+            // played both ways should split 1-1 (the stronger COMPOSITION wins
+            // both times, once as A and once as B). Pairs where one SIDE takes
+            // both are where a side bias would hide, and counting them separates
+            // "clan A is disadvantaged" from "this draft set favoured clan B".
+            if pair_played == 2 {
+                pairs += 1;
+                match pair_a_wins {
+                    2 => pair_a_both += 1,
+                    0 => pair_b_both += 1,
+                    _ => pair_split += 1,
                 }
             }
         }
@@ -119,6 +137,9 @@ fn main() {
     eprintln!(
         "  {fells} decided by felling a Great Tree ({:.0}%)",
         fells as f64 / total as f64 * 100.0
+    );
+    eprintln!(
+        "  of {pairs} draft pairs played both ways: {pair_split} split 1-1, {pair_a_both} taken by clan A twice, {pair_b_both} by clan B twice"
     );
     let mut rows: Vec<(f64, &str, u32, u32)> = pool
         .iter()

@@ -206,10 +206,22 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   thrown over the shoulder being a weaker yowl is the version that was true anyway.
   Abilities still land at full while kiting — spacing is what a yowler's abilities are paid
   for; it was the free auto-attack that was wrong.
-- [ ] Nightpelt at 62% in the half-kite arm is the new candidate outlier (was 50% in the
-  same drafts). 12 points is ~2 SE at n=72 and it is melee stealth, untouched by the kite
-  change, so it is as likely to be noise as signal — needs its own A/B before anyone
-  touches the kit
+- [x] Nightpelt's 62% was the same class of bug as Faryowl's kite, found by asking what the
+  kit got for free rather than by tuning: **stealth did not break on striking**. A veiled
+  cat was skipped by `nearest_enemy` entirely while still landing every blow — untargetable
+  and undiminished. Now the blow ends the ambush. The bonus is banked first (`strike_of`
+  reads the veil when the damage is computed), so a kit still gets its whole opening strike
+  from the dark and then has to be somewhere; shields, heals and Veilwalker itself do not
+  give a cat away.
+  Result on the same 160 games: Nightpelt 62% -> 46%, and the **tightest roster yet** —
+  sd 4.2, range 15, every kit within 8 points of even (was range 18, worst 12).
+- [x] The balance harness now separates side bias from draft-set luck: it reports how many
+  draft pairs split 1-1 (composition decided it) against how many one side took twice.
+  Latest: 33 split, 18 to clan A twice, 29 to clan B twice — a 1.6 SD lean, i.e. not
+  enough to act on, and the mirror probe's 51% over identical drafts remains the authority
+  on side fairness. The harness's 43% is mostly orientation-decided pairs, which is chaos.
+- [ ] If the A/B-both imbalance persists past ~400 pairs it stops being noise; re-check with
+  `battleground_balance 8 20` when there is time to spend on a 40-minute run
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
   a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
   every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
@@ -233,10 +245,22 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   thrown over the shoulder being a weaker yowl is the version that was true anyway.
   Abilities still land at full while kiting — spacing is what a yowler's abilities are paid
   for; it was the free auto-attack that was wrong.
-- [ ] Nightpelt at 62% in the half-kite arm is the new candidate outlier (was 50% in the
-  same drafts). 12 points is ~2 SE at n=72 and it is melee stealth, untouched by the kite
-  change, so it is as likely to be noise as signal — needs its own A/B before anyone
-  touches the kit
+- [x] Nightpelt's 62% was the same class of bug as Faryowl's kite, found by asking what the
+  kit got for free rather than by tuning: **stealth did not break on striking**. A veiled
+  cat was skipped by `nearest_enemy` entirely while still landing every blow — untargetable
+  and undiminished. Now the blow ends the ambush. The bonus is banked first (`strike_of`
+  reads the veil when the damage is computed), so a kit still gets its whole opening strike
+  from the dark and then has to be somewhere; shields, heals and Veilwalker itself do not
+  give a cat away.
+  Result on the same 160 games: Nightpelt 62% -> 46%, and the **tightest roster yet** —
+  sd 4.2, range 15, every kit within 8 points of even (was range 18, worst 12).
+- [x] The balance harness now separates side bias from draft-set luck: it reports how many
+  draft pairs split 1-1 (composition decided it) against how many one side took twice.
+  Latest: 33 split, 18 to clan A twice, 29 to clan B twice — a 1.6 SD lean, i.e. not
+  enough to act on, and the mirror probe's 51% over identical drafts remains the authority
+  on side fairness. The harness's 43% is mostly orientation-decided pairs, which is chaos.
+- [ ] If the A/B-both imbalance persists past ~400 pairs it stops being noise; re-check with
+  `battleground_balance 8 20` when there is time to spend on a 40-minute run
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean
