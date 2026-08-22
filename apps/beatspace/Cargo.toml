@@ -98,4 +98,9 @@ debug = "line-tables-only"
 
 
 [dev-dependencies]
-naga = "29"
+# `wgsl-in` explicitly: naga ships default = [] and puts `front::wgsl`
+# behind that feature, so a bare `naga = "29"` compiles the crate fine and
+# fails every `cargo test` with "cannot find `wgsl` in `front`". The shader
+# validation tests in wgpu_train.rs are the only consumer, and they are the
+# reason it is a dev-dependency rather than a real one.
+naga = { version = "29", features = ["wgsl-in"] }
