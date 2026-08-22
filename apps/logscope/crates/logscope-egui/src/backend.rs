@@ -1095,6 +1095,46 @@ tokens seeded from the previous speculative turn, {} to prefill",
 verification pass (1.00 means the drafter paid for nothing)",
                     self.name, produced, secs, produced as f32 / secs,
                     st.accepted, st.rounds * k, st.rounds, per_pass);
+
+                // WHEN THE DRAFTER IS A NET LOSS, and why — the two causes are
+                // sampling settings, and they are settings the operator chose.
+                //
+                // Reported by DavidAU for Qwen3.6-27B's MTP quants and it
+                // generalises to any speculative path, because the mechanism is
+                // the same: a draft is accepted when the target agrees, and
+                // both temperature and a repetition penalty MOVE the target's
+                // distribution away from the greedy token the drafter guessed.
+                // Their break-even, measured on a 2-token draft, was 50%
+                // acceptance — below it the plain path is faster.
+                //
+                // We report tokens-per-pass rather than a rate (c4-829: a high
+                // rate on short drafts can be worth less than a mediocre one on
+                // long drafts), so the break-even here is 1.00 — the drafter
+                // paid for its verification and returned exactly what one
+                // ordinary forward would have.
+                if per_pass < 1.15 && st.rounds > 8 {
+                    let mut why: Vec<String> = Vec::new();
+                    if params.temperature > 1.0 {
+                        why.push(format!("temperature {:.2} is above 1.0 — sampling away from the \
+drafter's greedy guess is exactly what rejects it", params.temperature));
+                    }
+                    if (params.repeat_penalty - 1.0).abs() > 0.01 {
+                        why.push(format!("repeat_penalty {:.2} is not 1.0 — it reshapes the \
+target distribution per position, so the draft is scored against something the drafter never saw",
+                            params.repeat_penalty));
+                    }
+                    let tail = if why.is_empty() {
+                        "sampling is not the cause (temperature <= 1.0, penalty off), so this text \
+is genuinely unpredictable to a prompt-lookup drafter — prose rather than code, or a first pass \
+over unfamiliar material. LOGSCOPE_SPEC_DRAFT=0 turns it off.".to_string()
+                    } else {
+                        format!("{}. Either lower them for this run or turn the drafter off.",
+                                why.join("; "))
+                    };
+                    crate::diag!("wgpu-engine: [{}] speculative NET LOSS — {per_pass:.2} tokens \
+per verification pass is at or below the 1.00 break-even, so the drafting cost bought nothing. {}",
+                        self.name, tail);
+                }
                 if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
                 return Ok(produced);
             }

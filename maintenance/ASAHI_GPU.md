@@ -277,3 +277,51 @@ rate is reported at the end of a run.
 So for DiffuCoder the lever is tau, and for an AR model on this engine it is
 the speculative loop that already exists. Two different answers, and the vLLM
 number is evidence for the second one only.
+
+---
+
+## Speculative decoding: what a real MTP release measured
+
+From DavidAU's Qwen3.6-27B MTP quants (Aug 2026), which ship regular and
+multi-token-prediction GGUFs of the same weights so the two can be compared
+directly. Their numbers, and what transfers:
+
+| | their measurement |
+|---|---|
+| regular GGUF, Q4_K_S, RTX 5090 | ~75 tok/s |
+| MTP GGUF, 60% acceptance, 2 draft tokens | ~90 tok/s |
+| break-even | **50% acceptance** — below it, the plain quant is faster |
+
+**Acceptance is a function of the SAMPLER, not only the model.** Their guidance
+is explicit: keep temperature at or below 1.0, and keep repetition penalty at
+1.0 (off), because both degrade MTP performance. The mechanism is the same in
+any speculative scheme — a draft is accepted when the target agrees with it, and
+temperature and a per-position penalty both move the target's distribution away
+from the greedy token the drafter guessed. **A repetition penalty is worse than
+temperature here**: it reshapes the distribution per position based on history,
+so the draft is scored against something the drafter never saw.
+
+logscope now says this out loud. The spec path reports tokens per verification
+pass (not acceptance rate — c4-829: a high rate on short drafts can be worth
+less than a mediocre rate on long ones), and below the 1.00 break-even it names
+the cause, checking the operator's own temperature and penalty first.
+
+**They also observe acceptance RISING as the context fills and across multi-turn
+chats.** That fits prompt-lookup drafting exactly: more context means more
+n-grams to match. Worth knowing before judging a drafter on a cold first turn.
+
+## Mixed precision by tensor ROLE, not one number for the file
+
+The same release keeps the output tensor at f16 while the body is 4-bit, and
+holds MTP tensors at Q8_0 regardless of the body quant. Both are role-based
+choices: the output projection is 10-20% of the bytes and all of the vocabulary
+resolution, and a draft head that is noisier than the target it feeds wastes
+verification slots.
+
+**And a Vulkan-specific note worth testing here.** They ship separate "AMD"
+quants whose only difference is the output tensor in f16 rather than bf16,
+because bf16 there provoked an "odd CPU offload of the OT" that hurt
+throughput. This fleet is Vulkan-on-Asahi via Honeykrisp, which is exactly the
+class of driver that would do that — if a model's output tensor is bf16 and
+decode is slower than the roofline says it should be, that is a cheap thing to
+check.
