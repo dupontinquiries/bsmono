@@ -275,10 +275,17 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   old flatness this is not the AI hiding the roster, it is the roster being closer together
   when played competently. Biggest gainers are the kits that were dying for nothing:
   Oldroar +7, Snowhush +8, Riptail +6.
-- [ ] Remaining AI levers, same success metric (composition-determinism should rise or
-  hold): group to push a broken lane instead of only respawning onto it; hold an ult for a
-  structure push; call a packmate to a fight worth winning rather than only fleeing a lost
-  one
+- [x] Collapse-on-breach: healthy warriors abandon an intact trail for the lane whose Heal
+  Tree fell (before, only patrol spawns and respawns funnelled there, so a clan could break
+  a border and keep walking past the hole). Correct play, and it **measured worse** —
+  dispersion 2.9 -> 4.2, kits outside 2se 1 -> 2, composition-determinism 54% -> 52%. Lives
+  behind `collapse_on_breach`, default off. Suspected cause is in the rule: *every* healthy
+  warrior goes, so the clan trades one broken border for two empty lanes.
+- [ ] The version worth testing next: collapse but leave one cat holding each remaining
+  lane. That is the difference between a push and an abandonment, and the switch exists to
+  answer it
+- [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
+  winning rather than only fleeing a lost one
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
   a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
   every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
@@ -371,10 +378,17 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   old flatness this is not the AI hiding the roster, it is the roster being closer together
   when played competently. Biggest gainers are the kits that were dying for nothing:
   Oldroar +7, Snowhush +8, Riptail +6.
-- [ ] Remaining AI levers, same success metric (composition-determinism should rise or
-  hold): group to push a broken lane instead of only respawning onto it; hold an ult for a
-  structure push; call a packmate to a fight worth winning rather than only fleeing a lost
-  one
+- [x] Collapse-on-breach: healthy warriors abandon an intact trail for the lane whose Heal
+  Tree fell (before, only patrol spawns and respawns funnelled there, so a clan could break
+  a border and keep walking past the hole). Correct play, and it **measured worse** —
+  dispersion 2.9 -> 4.2, kits outside 2se 1 -> 2, composition-determinism 54% -> 52%. Lives
+  behind `collapse_on_breach`, default off. Suspected cause is in the rule: *every* healthy
+  warrior goes, so the clan trades one broken border for two empty lanes.
+- [ ] The version worth testing next: collapse but leave one cat holding each remaining
+  lane. That is the difference between a push and an abandonment, and the switch exists to
+  answer it
+- [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
+  winning rather than only fleeing a lost one
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean

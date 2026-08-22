@@ -359,6 +359,19 @@ pub struct Battleground {
     /// waiting on an AI that can promise the follow-up rather than hope for it,
     /// and on a human player who can. Turn it on to measure that day's version.
     pub wombo: bool,
+    /// Whether a clan collapses onto a broken border: healthy warriors abandon
+    /// an intact trail for the lane whose Heal Tree has fallen.
+    ///
+    /// **Defaults off, on the evidence**, and it is the more interesting of the
+    /// two switches because the behaviour is *correct play* — collapsing on a
+    /// broken lane is what a conquest team does. Measured over 800 games against
+    /// the same drafts and lands: dispersion 2.9 -> 4.2, kits outside two
+    /// standard errors 1 -> 2, composition-decided matches 54% -> 52%. Both
+    /// metrics flat-to-worse, so the default follows the measurement rather than
+    /// the theory. Kept because a better AI — one that leaves a lane held while
+    /// the rest collapse, rather than emptying all three — should get a
+    /// different answer, and this is the switch that will test it.
+    pub collapse_on_breach: bool,
     player_driven: bool,   // becomes true on the first set_input; until then the player's warrior is AI-driven
     input: Option<(f32, f32, bool, Option<usize>)>,   // move dir, claw, ability index
 }
@@ -599,7 +612,7 @@ impl Battleground {
             camps, medics, contention: (0.0, 0.0), contention_holder: None,
             skyrock: (-92.0, 92.0), skyrock_holder: None,
             time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], wave_n: [0; 2], tick: 0,
-            wombo: false, player_driven: false, input: None,
+            wombo: false, collapse_on_breach: false, player_driven: false, input: None,
         }
     }
 
@@ -1133,6 +1146,24 @@ impl Battleground {
                     return;
                 }
                 self.warriors[i].mind = Mind::Trail;
+
+                // A broken border is where the clan goes. Patrol spawns and
+                // respawning warriors already funnelled onto a breach; the cats
+                // already out on an intact trail did not, so a clan could fell a
+                // Heal Tree and then keep walking three separate lanes past the
+                // hole it had just made. Wounded cats are exempt — they are
+                // heading for a sanctuary, and a push is not worth a life.
+                if self.collapse_on_breach
+                    && role == Role::Ancestor
+                    && self.warriors[i].power_frac() > NERVE * 1.5
+                {
+                    if let Some(b) = self.breach_lane(team) {
+                        if self.warriors[i].lane != b {
+                            self.warriors[i].lane = b;
+                            self.warriors[i].seg = 0;
+                        }
+                    }
+                }
 
                 // ancestors sometimes peel off the trail for the economy objectives
                 // `is_player` gates the AI economy detour so a human's warrior is
@@ -2890,6 +2921,41 @@ mod tests {
         bg.warriors[1].mind = Mind::Trail;
         bg.step(1.0 / 30.0);
         assert_ne!(bg.warriors[1].mind, Mind::Retreat, "unseen cats do not count against the odds");
+    }
+
+    #[test]
+    fn the_clan_collapses_onto_a_broken_border() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        bg.collapse_on_breach = true;
+        // fell one of clan B's Heal Trees: clan A now has a breach to push
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let breach = bg.heal_trees[t].lane;
+        bg.heal_trees[t].hp = 0.0;
+        // put clan A's ancestors out on their own intact trails, whole and healthy
+        for i in 0..bg.warriors.len() {
+            if bg.warriors[i].team == CLAN_A {
+                bg.warriors[i].x = -40.0;
+                bg.warriors[i].z = -40.0;
+                bg.warriors[i].hp = bg.warriors[i].max_hp;
+                bg.warriors[i].mind = Mind::Trail;
+            } else {
+                bg.warriors[i].x = 140.0;
+                bg.warriors[i].z = 140.0;
+            }
+        }
+        bg.step(1.0 / 30.0);
+        for w in bg.warriors.iter().filter(|w| w.team == CLAN_A && w.role == Role::Ancestor) {
+            assert_eq!(w.lane, breach, "a healthy warrior heads for the hole in their border");
+        }
+        // a wounded one does not: it is going to a sanctuary, and a push is not
+        // worth a life
+        let hurt = bg.warriors.iter().position(|w| w.team == CLAN_A).unwrap();
+        bg.warriors[hurt].lane = (breach + 1) % LANES;
+        bg.warriors[hurt].hp = bg.warriors[hurt].max_hp * 0.3;
+        bg.warriors[hurt].mind = Mind::Trail;
+        bg.step(1.0 / 30.0);
+        assert_ne!(bg.warriors[hurt].lane, breach);
     }
 
     #[test]

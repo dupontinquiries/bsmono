@@ -136,6 +136,34 @@ stops walking into threes it cannot escape), Snowhush +8, Riptail +6.
 Every kit now sits within about five points of even, one of thirteen outside
 two standard errors, on 800 games.
 
+## Collapsing on a breach: correct play that measured worse
+
+Third AI lever from the queue, and the one that did not pay. When a clan fells a
+Heal Tree, its healthy warriors abandon their intact trails for the hole —
+which is simply what a conquest team does, and which the sim previously only did
+for patrol spawns and respawning cats, so a clan could break a border and then
+keep walking three separate lanes past it.
+
+| | odds | + collapse |
+|---|---|---|
+| dispersion | sd 2.9 | sd 4.2 |
+| kits outside 2se | 1 | 2 |
+| composition-decided pairs | 54% | 52% |
+
+Flat-to-worse on both metrics over 800 games, so it lives behind
+`Battleground::collapse_on_breach`, defaulting **off**. The likely reason is
+visible in the rule itself: *every* healthy warrior collapses, so the clan
+empties its other two lanes and trades a border for two borders. A version that
+leaves one cat holding should get a different answer — and the switch is how
+that gets tested rather than argued.
+
+Both behaviour switches (`wombo`, `collapse_on_breach`) default off for the same
+reason and can be turned on per run:
+
+```sh
+cargo run --release --example battleground_balance -- 4 20 wombo kit 1 push
+```
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three

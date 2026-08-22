@@ -28,6 +28,7 @@ use clawbound_rs::battleground::{Battleground, LanePolicy, CLAN_A};
 fn play(a: [Ancestor; 3], b: [Ancestor; 3], seed: u32, wombo: bool, policy: LanePolicy) -> Option<u8> {
     let mut bg = Battleground::new_with(a, b, seed, policy);
     bg.wombo = wombo;
+    bg.collapse_on_breach = std::env::args().any(|s| s == "push");
     let mut steps = 0u32;
     while bg.outcome.is_none() && steps < 30 * 60 * 13 {
         bg.step(1.0 / 30.0);
