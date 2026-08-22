@@ -17,32 +17,43 @@ Status legend, matching `SCRATCHPAD.md`: `idea` · `queued` · `in-progress` ·
 
 ---
 
-## 0. Hard constraint: the size budget
+## 0. Size budget — resolved, and the method matters more than the answer
 
-`REPO_SIZE.md` sets 500 MiB. Measured now: **370.34 MiB packed, 1 pack, 173
-loose** (`git count-objects -vH`, `verified`). Headroom ≈ **130 MiB**.
+`REPO_SIZE.md` sets 500 MiB. Measured now, after merging c8-003 and extracting
+step-counter: **370.31 MiB, 1 pack, 0 loose** (`verified`). It was 370.34 MiB
+before both. The incoming work was effectively free.
 
-Three staged artifacts each exceed that headroom **on their own**:
+- **C9-0a — Why REPO_SIZE.md said 551 MiB and this clone says 370.** `done` ·
+  `verified`. Not a discrepancy, a sequence: the `filter-repo` pass already ran
+  here. Our history carries **zero** objects for all three paths REPO_SIZE.md §2
+  lists as rewrite candidates (`parts_web_full.bin.gz`, `parts_web.bin.gz`,
+  `logscope-linux-x64`). That doc measured a pre-rewrite clone.
 
-| artifact | size | note |
-|---|---:|---|
-| `step-counter--c4-803-gait.bundle` | 459 M | self-contained, contents uninspected |
-| blackstar checkpoint bundle (in `wip/`) | 509 M | nested bundle, `refs/heads/main` = `5d0ec126` |
-| `c8-003-monorepo.bundle` | 369 M | sibling monorepo, mostly shared history — real cost is much lower |
+- **C9-0b — A bundle's file size is the sender's repo size, not the cost of
+  receiving it.** `done` · `verified`. This is the finding worth keeping. A
+  self-contained bundle carries its whole history, so `ls -la` says nothing
+  about what we lack. Measured properly — scratch repo with
+  `objects/info/alternates` pointing at ours, fetch, then `git repack -a -d -l`
+  (`--local` excludes anything the alternate supplies) — the pack that remains
+  IS the incremental cost:
 
-- **C9-0a — Reconcile REPO_SIZE.md against this clone.** `queued` · `verified`
-  the discrepancy, `assumed` the cause. That doc measured 551 MiB post-`gc` on
-  a clone with launcher/blackstar/studio-trap fetched; this clone reads 370 MiB
-  with those refs present. Either the planned `filter-repo` pass already
-  happened or the two measurements are not of the same thing. **Do this before
-  trusting the 130 MiB headroom for any large merge** — the number that governs
-  every decision below is currently unexplained.
+  | bundle | on disk | actually new | verdict |
+  |---|---:|---:|---|
+  | `c8-003-monorepo` | 369 M | **888 K** | merged, 31 commits |
+  | `step-counter--c4-803-gait` | 459 M | 256 M | **extracted**, 6 files |
+  | `c8parallel--session-work` | 76 K | 339 K | merged, 23 commits |
 
-- **C9-0b — Decide what step-counter and blackstar actually contain before
-  merging either.** `blocked` on inspection · `read` only.
-  If the bulk is assets, the answer is probably that they do not enter `main`'s
-  history at all, which is the same class of decision `REPO_SIZE.md` §3 says
-  must be made *before* a rewrite rather than after.
+  step-counter is the one that was genuinely heavy, and for a reason that makes
+  merging it wrong rather than expensive: it forked at `b985c6d1`, **before**
+  our rewrite, so ~247 MiB of its 256 is the blackstar/logscope assets the
+  rewrite deliberately removed. Merging would have undone it. Its real payload
+  was one commit, 7 files, 1178 lines, all under `shared/` — applied via
+  format-patch + am in `ee2d00ae` so the original authorship survived.
+
+- **C9-0c — Still unmeasured: the blackstar checkpoint bundle.** `queued`.
+  509 MiB in `wip/archives/`, `refs/heads/main` = `5d0ec126`. Run the same probe
+  on it before deciding anything. Given step-counter's result, expect a large
+  fraction to be pre-rewrite assets — but expect is not measured.
 
 ---
 
@@ -74,13 +85,19 @@ origin/incoming/trap-session   +23    byte-identical to trap-autotune (c9c51289)
   Per `BRANCH_INDEX.md`, the manifest reconciliation is its own commit on top
   of the import, not part of it.
 
-- **C9-1d — c8-003 sibling monorepo.** `queued` · `verified` refs only.
-  Shares `bots-pack-v4`, `cp4`, `hatch2`, `launcher`, `ls-spec`, `ls-ui`, all
-  three `trap*` refs and both tags; `main` is `945f74eb` vs our `fbcfd6a7`; it
-  lacks `incoming/c7-935`, which is ours. **It carries its own
-  `refs/notes/toolcalls` (`3984102`) — the capture log has to be merged too,
-  not just the commits.** `git bundle create --all` does not include the notes
-  ref; see C9-3b.
+- **C9-1d — c8-003 sibling monorepo.** `done` (merge) / `queued` (notes) ·
+  `verified`. Merged in `96e35966`: 31 commits, 888 KiB, one conflict in
+  `av1tuner_core/src/scene.rs` where both sides independently added the same
+  `audio_streams: Vec::new()` and ours also explained why — kept ours as the
+  superset. Lands the app repoints TODO.md had open under "the payoff"
+  (bo-suite/voiceterm/snapclone-audio/rusty-board rms and ct_eq onto
+  audio-kit/net-kit, rusty-board model_path onto voice-kit) plus twenty
+  projects compiled and tested for the first time.
+  **Still open:** their capture notes are parked at
+  `refs/notes/toolcalls-c8003`, not merged. 99 commits on their side carry
+  notes against 138 on ours, over disjoint commits, so the merge is mechanical
+  but not obviously lossless — and a capture log lost to a careless notes merge
+  is the one thing `SKILL_session_capture.md` says cannot be reconstructed.
 
 - **C9-1e — c4-858-delta is currently unusable.** `blocked` · `verified`.
   Incremental, prerequisite `a9a8cb0b` is **not in this repo** and is **not**
@@ -161,9 +178,15 @@ place in `maintenance/tools/`.
   which `--all` does **not** include; refuses a dirty tree and fails hard over
   500 MiB.
 
-- **C9-3c — Bundle survey / prereq-check scripts.** `idea`.
-  Answer "self-contained or incremental, and do I have the prerequisite" without
-  fetching anything. Useful every time a bundle arrives, which is often.
+- **C9-3c — Bundle survey + incremental-cost probe.** `queued` (promoted from
+  `idea`) · `verified` on three bundles.
+  Two scripts. The survey answers "self-contained or incremental, and do I have
+  the prerequisite" without fetching. The probe answers "what would this
+  actually cost", via an alternates-backed scratch repo and
+  `git repack -a -d -l`. The probe is the one that earned its keep: it turned
+  a 369 MiB bundle into a measured 888 KiB and stopped a 459 MiB one from
+  silently undoing the history rewrite. Both belong in `maintenance/tools/`
+  next to `zips_to_history.sh`.
 
 - **C9-3d — `build/build.sh --run` cannot build anything on an x86_64 host.**
   `queued` · `verified`.
@@ -271,6 +294,10 @@ read-only under `/mnt/user-data/uploads/`.
   waves to catch mode collapse after every architecture change. **The only item
   in the whole staged set that is self-contained and fully verifiable in this
   sandbox** — pure CPU, no GPU, no GUI. `apps/beatspace` exists but is 17 files.
+  **New cross-reference:** `sensor-kit`'s `gait::Features::cadence_hz` (landed in
+  `ee2d00ae`) already reports dominant walking cadence, gated to 0.5–4.0 Hz.
+  ×60 is steps/min, which is the quantity the BPM-matching idea would key on.
+  The producer exists; what is missing is a consumer.
 
 - **C9-6b — HiveMind → logscope architecture.** `idea`.
   `HiveMind_Strategy_Logscope.md`: logscope as a typed engineering pipeline
