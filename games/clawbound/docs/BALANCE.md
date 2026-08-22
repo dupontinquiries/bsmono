@@ -218,7 +218,7 @@ metric moved almost to neutral (**−0.28 → −0.07** borders-standing lead) a
 probe's conversion went 34% → 41%.
 
 **The conversion rate is still not fixed.** Pooled over 793 harness games it
-sits at 40.9% (se 1.8) — five standard errors below even, so defending remains
+sits at 39.8% (se 1.8) — five standard errors below even, so defending remains
 genuinely stronger than attacking here, and two of the three explanations tried
 have now been eliminated rather than confirmed. Candidates left: the defender
 fights beside its medic den and inside its own auras, respawns closer, and gets
