@@ -602,6 +602,13 @@ kind = "cargo"
 role = "game"
 notes = "The game centre: profiles, presence, launch kinds, and the cross-game tournament host built on shared/netcode (brackets, lobbies, attested results)."
 
+[games.road-warrior]
+path = "games/road-warrior"
+kind = "cargo"
+role = "game"
+targets = ["desktop", "phone"]
+notes = "Side-view combat racer, from-scratch Rust (not a port — the 2014 original is closed-source). Two-crate workspace: `core` is headless (physics, terrain, boss AI, level data, save, campaign) with zero rendering deps and 60 tests that run in a sandbox; `shell` is eframe/egui + wgpu + zbus. Build `-p road_warrior_core` to verify anything in CI; `-p shell` needs a GPU and a display. Gyro flip control reads net.hadess.SensorProxy over D-Bus — a THIRD accelerometer surface in this tree beside shared/sensor-kit (monitor-sensor events) and voiceterm's iio_accel (sysfs in_accel_*_raw); a sensor-source kit is the obvious lift and has not been attempted. gyro.rs has never run against a live iio-sensor-proxy, only its failure path."
+
 [games.soldier]
 path = "games/soldier"
 kind = "cargo"
