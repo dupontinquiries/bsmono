@@ -288,7 +288,7 @@ false positives from the `-egui` frontend being a separate crate from the
 core the tool scans). The SMALL apps are cheap to hand-verify and worth
 recording precisely because a small orphan list is actually trustworthy:
 
-**tomescope — 3 real orphans, all tested, all user-facing, none wired:**
+**tomescope — 3 orphans found, all now wired (2026-08-22):**
 
 - `lookup.rs` — `Lookup::lookup()`, checks the book's own back-of-book index
   first then a builtin glossary. Nothing calls it; there is no "define this
@@ -312,11 +312,37 @@ at UI glue in a 500-line rendering file with no build feedback is how a
 "working" commit turns into a broken one nobody notices until a real host
 builds it. Recorded here as three concrete, scoped next steps instead:
 
-- [ ] tomescope: wire `Lookup::lookup()` to a long-press/selection → define
-      popover (natural home: alongside `draw_footnote_popover` in `reader.rs`).
-      Not done: extracting text under a `Selection`/`LocusRange` needs real
-      understanding of `BookContent`'s block/run text model, which is a
-      bigger job than the OPDS item below turned out to be — left open.
+- [x] tomescope: `lookup.rs` wired for real (2026-08-22). Added
+      `lookup::selection_text(content, range)` (single-block only — a
+      multi-block selection returns `None` rather than guessing how to join
+      text across a paragraph break) and `lookup::draw_lookup_popover`,
+      mirroring `draw_footnote_popover`'s shape. `ReaderState` gained
+      `lookup_open: bool`; `TomeApp` gained a shared `lookup: Lookup`; the
+      reader toolbar gained a "🔤 Define" button enabled only when
+      `selection.is_active()`.
+      **A test caught a real bug before it shipped**: the first version
+      built `selection_text` on top of `BookContent::snippet()` (the
+      existing search/dictionary-context helper), which turned out to
+      unconditionally wrap the result in `…ellipsis…` whenever the range
+      doesn't start at 0 or end at the block's length — correct for
+      `snippet`'s actual job (showing context around a search hit) but wrong
+      here, since it would make every lookup search for `"…ephemeral…"`
+      instead of `"ephemeral"` and silently fail. Caught by
+      `selection_text_extracts_the_highlighted_word` actually asserting the
+      exact string rather than just "is Some" — fixed by slicing the
+      block's `plain_text()` directly instead of going through `snippet`.
+      Kept a regression test
+      (`a_lookup_looks_up_the_real_selected_word_not_the_whole_block`)
+      specifically for this failure mode.
+      Also fixed, while here: `egui::Context::run` is deprecated in 0.34 in
+      favor of `run_ui` — both this file's own new test and the two added to
+      voiceterm's `bars.rs` two commits ago had used the deprecated form;
+      fixed all three once the correct replacement was known, re-verified
+      both crates still clean.
+      Verified: `cargo check --bin tomescope` clean in both the default and
+      `--features espeak` configurations (9 warnings, same as before both
+      times), `shelfctl` still builds, full `cargo test --lib`: 50/50
+      passing (45 previous + 5 new `lookup::` tests).
 - [x] tomescope: `opds.rs` wired for real (2026-08-22, compiler now
       available). `Screen::OpdsBrowser` already existed in the nav but
       `draw_opds_screen` was a static label with no textbox — the exact

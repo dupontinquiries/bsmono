@@ -122,6 +122,11 @@ struct TomeApp {
     /// so a stale success can't linger on screen next to a fresh error.
     opds_result: Option<Result<tomescope::opds::OpdsFeed, String>>,
 
+    /// Shared across all open books — the built-in glossary is fixed and
+    /// book-index terms come from whichever book is passed to `lookup()`, so
+    /// there is nothing per-book to store here.
+    lookup: tomescope::lookup::Lookup,
+
     /// Deferred: set by the reader toolbar's Read button, consumed once the
     /// CentralPanel below has computed a live Pagination to read the current
     /// page's start locus from.
@@ -205,6 +210,8 @@ impl TomeApp {
 
             opds_xml: String::new(),
             opds_result: None,
+
+            lookup: tomescope::lookup::Lookup::default(),
 
             tts_start_requested: false,
             tts_backend: default_tts_backend(),
@@ -409,6 +416,9 @@ impl TomeApp {
                     if ui.button("TOC").clicked() {
                         self.toc_open = !self.toc_open;
                     }
+                    if ui.add_enabled(ob.reader.selection.is_active(), egui::Button::new("🔤 Define")).clicked() {
+                        ob.reader.lookup_open = true;
+                    }
                     // No auto-advance: TtsBackend::speak fires the backend
                     // (a subprocess for espeak, a no-op for SilentBackend)
                     // and returns immediately — the trait has no "finished"
@@ -529,6 +539,14 @@ impl TomeApp {
         });
 
         tomescope::reader::draw_footnote_popover(ctx, &ob.loaded.content, &mut ob.reader.show_footnote, colors);
+        tomescope::lookup::draw_lookup_popover(
+            ctx,
+            &ob.loaded.content,
+            &self.lookup,
+            &ob.reader.selection,
+            &mut ob.reader.lookup_open,
+            colors,
+        );
     }
 
     fn draw_stats_screen(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
