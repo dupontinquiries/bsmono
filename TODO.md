@@ -319,7 +319,46 @@ builds it. Recorded here as three concrete, scoped next steps instead:
 - [ ] tomescope: wire `tts.rs` to a "read aloud" control in the reader toolbar,
       building the `Utterance` queue from the current locus forward.
 
+**Confirmed false-positive theory for the big multi-crate apps.** Checked
+gitmind's three highest-profile "orphans" (`flow`, `incoming`, `appcatalog`,
+1868/922/566 lines, 14/20/15 tests) by grep across the whole app tree, not just
+within `crates/cockpit`. All three are extensively used — `cockpit::flow` alone
+has 50+ call sites across `crates/gui`, `crates/gui-egui/src/pages/{apps,
+network,artifacts,fleet,dupes,push,import}.rs`, and `crates/cli`. The tool
+scans one crate directory at a time and can't see a sibling crate importing it
+as a path dependency, so gitmind's 38, snapclone's 42, logscope's 216 are very
+likely almost entirely this same false-positive class rather than real gaps.
+**Not claiming this generalizes without checking** — but the one app checked
+confirms the mechanism, so treat the large multi-crate counts as noise until
+someone teaches the tool to scan a whole workspace rather than one directory,
+not as a queue of real orphans to work through.
+
+**A second false-positive class, checked on snapclone.** Its top "orphans" by
+line count are `ffi.rs` files (`snapclone-face`, `snapclone-group`) — `extern
+"C"`, `#[no_mangle]` functions called from the C++ side (`ffi.rs`'s own header
+says so directly: "Exposes the face library... to C/C++ callers"). A Rust-only
+reachability scanner cannot see a C++ call site by construction, so every FFI
+boundary module in a hybrid Rust/C++ app like snapclone will show as an orphan
+regardless of real usage. Between the cross-crate class (gitmind) and the FFI
+class (snapclone), that likely accounts for most of both apps' counts — still
+not verified item-by-item, but two different confirmed mechanisms now explain
+away the two biggest numbers in the table without needing to check all 80.
+
+**logscope's 216 checked the same way, same result.** Its top orphan by tests,
+`machinery.rs` (97 tests, `crates/logscope/src/machinery.rs`), IS referenced —
+from `crates/logscope-egui/src/{scene3d,enginestrip}.rs` and
+`crates/logscope/src/{persona,dupscan}.rs` — same core/`-egui`-frontend crate
+split as gitmind's `cockpit`/`gui-egui`. Three confirmed false-positive
+instances across the three biggest counts in the table now (gitmind, snapclone,
+logscope), all from the same root cause (single-directory scan on a
+multi-crate app). Fixing the tool to walk a whole workspace's `Cargo.toml`
+members rather than one path would be the real fix; not attempted here since
+it risks silently changing what the tool reports for every app, and there's no
+compiler in this sandbox to validate the fix against the actual crate graph.
+
 Other small-app orphans found, not yet triaged: `av1tuner`/`av1tuner-m1`'s
 `eta.rs` (ETA estimation, 5 tests) and `config.rs` (2 tests) are identical
-orphans in both the stale and live fork — worth checking whether the live
-`av1tuner-m1` fork actually needs them wired or whether they're superseded.
+orphans in both the stale and live fork, confirmed genuinely unreferenced by
+grep (single-crate apps, so the false-positive mechanism above doesn't apply)
+— worth checking whether the live `av1tuner-m1` fork actually needs them wired
+or whether they're superseded.
