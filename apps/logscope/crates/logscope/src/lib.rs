@@ -29,6 +29,18 @@ pub mod fanplan;
 pub mod reflex;
 pub mod traceval;
 pub mod exploration;
+/// Which capabilities need the network, and which must never require it.
+///
+/// Declared late, and that is the point: this file existed in `src/` for a long
+/// time with no `mod autonomy` anywhere, so it was never compiled and its two
+/// tests never ran — while `cratecheck.rs`, `buildpolicy.rs` and
+/// `buildsignal.rs` all cite `autonomy::Reach` in prose as the invariant they
+/// uphold, and `buildpolicy`'s own test comments "The Reach invariant: no core
+/// capability REQUIRES the network."
+///
+/// Three modules were enforcing a rule whose definition the compiler had never
+/// seen. Found by `maintenance/tools/orphan_check.py`.
+pub mod autonomy;
 pub mod blackboard;
 pub mod budget;
 pub mod toolreg;
