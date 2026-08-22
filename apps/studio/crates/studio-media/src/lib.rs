@@ -46,6 +46,9 @@
 use std::fmt;
 use std::path::Path;
 
+#[cfg(feature = "opus")]
+mod opus;
+
 use studio_audio::SourceAudio;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -84,6 +87,38 @@ impl From<std::io::Error> for DecodeError {
     fn from(e: std::io::Error) -> Self { DecodeError::Io(e) }
 }
 
+#[derive(Debug)]
+pub enum EncodeError {
+    /// Input shape this encoder does not take (rate, channel count) — a
+    /// caller bug named plainly, never resampled over quietly.
+    Unsupported(String),
+    Encode(String),
+}
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EncodeError::Unsupported(m) => write!(f, "cannot encode: {m}"),
+            EncodeError::Encode(m) => write!(f, "opus encode failed: {m}"),
+        }
+    }
+}
+impl std::error::Error for EncodeError {}
+
+/// Encode 48 kHz mono/stereo audio to Ogg Opus bytes — the export mirror of
+/// this crate's `.opus` decode, sharing its trimming discipline (see the
+/// `opus` module). `bitrate_bps`: 96_000 is transparent for most music;
+/// 128_000 is a safe default for a master.
+#[cfg(feature = "opus")]
+pub fn encode_opus(audio: &SourceAudio, bitrate_bps: i32) -> Result<Vec<u8>, EncodeError> {
+    opus::encode_opus(audio, bitrate_bps)
+}
+#[cfg(not(feature = "opus"))]
+pub fn encode_opus(_audio: &SourceAudio, _bitrate_bps: i32) -> Result<Vec<u8>, EncodeError> {
+    Err(EncodeError::Unsupported(
+        "studio-media was built without the `opus` feature (needs system libopus)".into(),
+    ))
+}
+
 /// Decode an entire audio file into memory as planar `f32`, at the file's
 /// own sample rate. Intended for the same use `studio_live::Recorder::
 /// to_audio` and a pattern bounce already serve: producing a
@@ -92,9 +127,46 @@ impl From<std::io::Error> for DecodeError {
 /// decoder, which matches how every other source (a recorded take, a
 /// bounced pattern) already reaches the mix.
 pub fn decode_file(path: &Path) -> Result<SourceAudio, DecodeError> {
+    if path.extension().and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("opus"))
+    {
+        return decode_opus_or_explain(|| opus_impl::decode_opus_file(path));
+    }
     let file = std::fs::File::open(path)?;
     let hint = extension_hint(path);
     decode_source(Box::new(file), hint)
+}
+
+// The two build flavours share one dispatch point, so the no-libopus build
+// FAILS a .opus with a sentence naming the fix rather than Symphonia's
+// generic "unrecognised container" — which would send someone debugging a
+// perfectly good file instead of a build flag.
+#[cfg(feature = "opus")]
+use opus as opus_impl;
+#[cfg(feature = "opus")]
+fn decode_opus_or_explain(
+    f: impl FnOnce() -> Result<SourceAudio, DecodeError>,
+) -> Result<SourceAudio, DecodeError> {
+    f()
+}
+#[cfg(not(feature = "opus"))]
+fn decode_opus_or_explain(
+    _f: impl FnOnce() -> Result<SourceAudio, DecodeError>,
+) -> Result<SourceAudio, DecodeError> {
+    Err(DecodeError::Decode(
+        "this is an Opus file, but studio-media was built without the `opus`          feature (needs system libopus)".into(),
+    ))
+}
+#[cfg(not(feature = "opus"))]
+mod opus_impl {
+    use super::*;
+    pub(crate) fn decode_opus_file(_: &Path) -> Result<SourceAudio, DecodeError> {
+        unreachable!("gated by decode_opus_or_explain")
+    }
+    pub(crate) fn decode_opus_bytes(_: Vec<u8>) -> Result<SourceAudio, DecodeError> {
+        unreachable!("gated by decode_opus_or_explain")
+    }
+    pub(crate) fn sniff_opus(_: &[u8]) -> bool { false }
 }
 
 /// Decode audio already in memory — e.g. a subprocess's captured stdout
@@ -102,6 +174,14 @@ pub fn decode_file(path: &Path) -> Result<SourceAudio, DecodeError> {
 /// rather than round-tripping through a temp file), or bytes fetched over
 /// the network. Same decode loop as `decode_file`, minus the filesystem.
 pub fn decode_bytes(bytes: Vec<u8>, extension_hint_str: Option<&str>) -> Result<SourceAudio, DecodeError> {
+    // Route Opus by hint OR by sniffing the first page: bytes arriving from
+    // `studio-video`'s extraction or a collab asset have no filename, and
+    // Symphonia would otherwise fail them as an unknown-codec ogg.
+    if extension_hint_str.is_some_and(|e| e.eq_ignore_ascii_case("opus"))
+        || opus_impl::sniff_opus(&bytes)
+    {
+        return decode_opus_or_explain(move || opus_impl::decode_opus_bytes(bytes));
+    }
     let mut hint = Hint::new();
     if let Some(ext) = extension_hint_str {
         hint.with_extension(ext);
@@ -389,5 +469,177 @@ mod tests {
         let format = probe_wav(&samples, 1, 48_000);
         let audio = decode_format(format).unwrap();
         assert_eq!(audio.frames(), n as usize, "every sample must survive, not just the first packet");
+    }
+}
+
+#[cfg(all(test, feature = "opus"))]
+mod opus_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Encode a lavfi-described signal to a temp .opus with the real ffmpeg,
+    /// the same convention `studio-video`'s tests set: fixtures from a real
+    /// encoder, not hand-built bytes a hand-built parser would tautologically
+    /// pass.
+    fn ffmpeg_opus(name: &str, filter: &str, channels: u32) -> std::path::PathBuf {
+        let out = std::env::temp_dir().join(format!("studio-media-{name}.opus"));
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", filter, "-ac", &channels.to_string(),
+                   "-c:a", "libopus", "-b:a", "96k"])
+            .arg(&out)
+            .output()
+            .expect("ffmpeg present (studio-video's tests already require it)");
+        assert!(status.status.success(), "ffmpeg failed: {}",
+                String::from_utf8_lossy(&status.stderr));
+        out
+    }
+
+    #[test]
+    fn a_stereo_opus_decodes_at_48k_stereo_and_exactly_its_length() {
+        let p = ffmpeg_opus("stereo-sine", "sine=frequency=440:duration=1:sample_rate=48000", 2);
+        let a = decode_file(&p).expect("decodes");
+        assert_eq!(a.sample_rate, 48_000, "opus is a 48k codec by contract");
+        assert_eq!(a.channels.len(), 2, "stereo stays stereo — this is a sampler, not a mel front-end");
+        // BOTH trims proven by one number: without the pre-skip trim this
+        // would be ~312 samples long; without the granule end-trim, up to a
+        // frame of padding long. 48_000 ± a muxer's rounding means both cut.
+        let n = a.frames();
+        assert!((47_900..=48_100).contains(&n), "1.0s should be ~48000 frames, got {n}");
+        // 440 Hz sine crosses zero ~880 times a second.
+        let zc = a.channels[0].windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        assert!((850..=910).contains(&zc), "440Hz sine, got {zc} crossings");
+    }
+
+    #[test]
+    fn the_loop_seam_is_audio_not_padding() {
+        // The reason the granule trim exists: a melody loop's last
+        // milliseconds must be the music, not codec padding, or the loop
+        // ticks at every bar line. A constant sine's tail RMS must match its
+        // overall RMS; trailing zeros would crater it.
+        let p = ffmpeg_opus("loop-tail", "sine=frequency=220:duration=1:sample_rate=48000", 1);
+        let a = decode_file(&p).expect("decodes");
+        let rms = |s: &[f32]| (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt();
+        let whole = rms(&a.channels[0]);
+        let tail = rms(&a.channels[0][a.channels[0].len() - 240..]);
+        assert!(tail > whole * 0.7, "tail rms {tail} vs whole {whole}: padding survived the trim");
+    }
+
+    #[test]
+    fn mono_stays_mono() {
+        let p = ffmpeg_opus("mono", "sine=frequency=330:duration=0.25:sample_rate=48000", 1);
+        let a = decode_file(&p).expect("decodes");
+        assert_eq!(a.channels.len(), 1);
+    }
+
+    #[test]
+    fn bytes_with_no_name_decode_the_same_as_the_file() {
+        // Bytes from a collab asset or a video's extracted track arrive
+        // nameless; the OggS/OpusHead sniff has to carry them to the same
+        // decoder the path took.
+        let p = ffmpeg_opus("sniff", "sine=frequency=550:duration=0.25:sample_rate=48000", 2);
+        let by_path = decode_file(&p).expect("file decodes");
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(super::opus::sniff_opus(&bytes), "first page carries OpusHead");
+        let by_bytes = decode_bytes(bytes, None).expect("bytes decode");
+        assert_eq!(by_path.channels, by_bytes.channels, "one decoder, one answer");
+    }
+
+    #[test]
+    fn a_vorbis_ogg_is_not_mistaken_for_opus() {
+        // Same container, different codec: the sniff must let Symphonia keep
+        // the .ogg files it already handles.
+        let out = std::env::temp_dir().join("studio-media-vorbis.ogg");
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.25:sample_rate=48000",
+                   "-c:a", "libvorbis"])
+            .arg(&out).output().expect("ffmpeg runs");
+        assert!(ok.status.success());
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(!super::opus::sniff_opus(&bytes));
+        assert!(decode_bytes(bytes, Some("ogg")).is_ok(), "vorbis still decodes via symphonia");
+    }
+}
+
+#[cfg(all(test, feature = "opus"))]
+mod encode_tests {
+    use super::*;
+
+    fn sine(hz: f32, secs: f32, channels: usize) -> SourceAudio {
+        let n = (48_000.0 * secs) as usize;
+        let plane: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / 48_000.0 * hz * std::f32::consts::TAU).sin() * 0.5)
+            .collect();
+        SourceAudio { sample_rate: 48_000, channels: vec![plane; channels] }
+    }
+
+    #[test]
+    fn our_encode_roundtrips_through_our_decode_to_the_exact_length() {
+        // The decoder demanded honest pre-skip and end-granule from
+        // everyone else's files; this proves the encoder pays the same tax.
+        // BOTH alignments, deliberately: an unaligned tail's padding can
+        // hide an unflushed encoder (its zeros stand in for the missing
+        // audio), and a frame-aligned input has no padding to hide behind —
+        // the first draft passed on 1.003s and lost 312 samples on 1.0s.
+        for secs in [1.003f32, 1.0] {
+            let input = sine(440.0, secs, 2);
+            let bytes = encode_opus(&input, 96_000).expect("encodes");
+            let back = decode_bytes(bytes, None).expect("our own decoder reads it (sniff, no hint)");
+            assert_eq!(back.channels.len(), 2);
+            assert_eq!(back.frames(), input.frames(),
+                       "pre-skip and end-trim cancel to the sample at {secs}s");
+        }
+        let input = sine(440.0, 1.0, 2);
+        let bytes = encode_opus(&input, 96_000).expect("encodes");
+        let back = decode_bytes(bytes, None).expect("decodes");
+        // Lossy, but a mid-band sine at 96kbps comes back close: compare RMS
+        // of the error against RMS of the signal, skipping the first 5ms
+        // where the codec is still converging.
+        let skip = 240;
+        let (mut se, mut ss) = (0f64, 0f64);
+        for i in skip..input.frames() {
+            let d = (input.channels[0][i] - back.channels[0][i]) as f64;
+            se += d * d;
+            ss += (input.channels[0][i] as f64).powi(2);
+        }
+        let rel = (se / ss).sqrt();
+        assert!(rel < 0.15, "error RMS {rel:.3} of signal RMS — not the same sound");
+    }
+
+    #[test]
+    fn mono_encodes_as_mono() {
+        let input = sine(220.0, 0.25, 1);
+        let bytes = encode_opus(&input, 64_000).expect("encodes");
+        let back = decode_bytes(bytes, Some("opus")).expect("decodes");
+        assert_eq!(back.channels.len(), 1);
+        assert_eq!(back.frames(), input.frames());
+    }
+
+    #[test]
+    fn ffmpeg_agrees_our_files_are_opus_of_the_right_length() {
+        // Roundtripping through our own decoder proves self-consistency; a
+        // third-party reader proves the files leave the building. ffprobe
+        // is already a hard requirement of studio-video's tests.
+        let input = sine(330.0, 1.0, 2);
+        let bytes = encode_opus(&input, 96_000).expect("encodes");
+        let path = std::env::temp_dir().join("studio-media-encoded.opus");
+        std::fs::write(&path, &bytes).unwrap();
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=codec_name,duration",
+                   "-of", "default=noprint_wrappers=1"])
+            .arg(&path)
+            .output().expect("ffprobe runs");
+        let text = String::from_utf8_lossy(&probe.stdout);
+        assert!(text.contains("codec_name=opus"), "ffprobe said: {text}");
+        let dur: f32 = text.lines()
+            .find_map(|l| l.strip_prefix("duration=")).and_then(|d| d.parse().ok())
+            .expect("a duration line");
+        assert!((dur - 1.0).abs() < 0.02, "ffprobe duration {dur} vs 1.0s");
+    }
+
+    #[test]
+    fn the_wrong_rate_is_refused_with_the_fix_in_the_message() {
+        let wrong = SourceAudio { sample_rate: 44_100, channels: vec![vec![0.0; 100]] };
+        let err = encode_opus(&wrong, 96_000).unwrap_err();
+        assert!(err.to_string().contains("48"), "message was: {err}");
     }
 }

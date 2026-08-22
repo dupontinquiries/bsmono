@@ -41,6 +41,7 @@ pub mod carrier;
 pub mod file;
 pub mod assets;
 pub mod session;
+pub mod stream;
 pub mod dht;
 
 use serde::{Deserialize, Serialize};
@@ -305,9 +306,9 @@ mod tests {
     fn seed() -> Project {
         let mut p = Project { name: "session".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false, route: None }, at: 1 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "take1.mov".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         p

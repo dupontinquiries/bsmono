@@ -42,6 +42,9 @@ pub struct SaveFile {
     pub snapshot: Vec<Op>,
     /// The edit history, when the user asked to keep it.
     pub history: Vec<StampedOp>,
+    /// The rack — the beat half of a project, absent only in files from
+    /// before the rack was saved (or projects that never touched it).
+    pub rack: Option<studio_live::Rack>,
 }
 
 /// The ops that rebuild `project`, in an order that always applies cleanly:
@@ -107,8 +110,12 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
 }
 
 impl SaveFile {
-    pub fn from_project(project: &Project, history: Vec<StampedOp>) -> SaveFile {
-        SaveFile { name: project.name.clone(), snapshot: snapshot(project), history }
+    pub fn from_project(
+        project: &Project,
+        history: Vec<StampedOp>,
+        rack: Option<studio_live::Rack>,
+    ) -> SaveFile {
+        SaveFile { name: project.name.clone(), snapshot: snapshot(project), history, rack }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -129,6 +136,20 @@ impl SaveFile {
         let hist = Packet::Catchup { ops: self.history.clone() }.encode();
         o.extend_from_slice(&(hist.len() as u32).to_le_bytes());
         o.extend_from_slice(&hist);
+        // Fourth section, the rack — length 0 when there is none. Same wire
+        // codec as everything else (Packet::Rack with a zeroed sync stamp:
+        // a FILE has no author sequence to claim, and the loader treats what
+        // it reads as local truth, not as an LWW contender).
+        match &self.rack {
+            Some(r) => {
+                let rk = Packet::Rack(crate::RackSync {
+                    rack: r.clone(), seq: 0, site: SiteId(0),
+                }).encode();
+                o.extend_from_slice(&(rk.len() as u32).to_le_bytes());
+                o.extend_from_slice(&rk);
+            }
+            None => o.extend_from_slice(&0u32.to_le_bytes()),
+        }
         o
     }
 
@@ -159,7 +180,25 @@ impl SaveFile {
             Packet::Catchup { ops } => ops,
             _ => return None,
         };
-        Some(SaveFile { name, snapshot, history })
+        i += hl;
+        // The rack section is MANDATORY (length 0 = "no rack"), not a
+        // tolerated absence: the header's version gate means no legitimate
+        // file of this version can end after three sections, so a missing
+        // tail is truncation — and a truncated file that quietly loaded
+        // rack-less would, on the next save, overwrite a complete original
+        // with the beat gone. The first draft here was tolerant; the
+        // damaged-file test's every-prefix-refuses sweep caught the hole.
+        let rl = take_u32(b, &mut i)?;
+        let rack = if rl == 0 {
+            None
+        } else {
+            if i + rl > b.len() { return None; }
+            match Packet::decode(&b[i..i + rl])? {
+                Packet::Rack(rs) => Some(rs.rack),
+                _ => return None,
+            }
+        };
+        Some(SaveFile { name, snapshot, history, rack })
     }
 
     /// Rebuild the project by replaying the snapshot — the same `apply` the
@@ -189,9 +228,9 @@ mod tests {
             sends: Vec::new(), muted: false,
         } }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-            name: "A1 — vocals".into(), muted: true, locked: false, route: Some(studio_core::BusId(1)) }, at: 1 }).unwrap();
+            name: "A1 — vocals".into(), muted: true, locked: false, gain: 1.0, route: Some(studio_core::BusId(1)) }, at: 1 }).unwrap();
         for i in 0..12u64 {
             let mut params = std::collections::BTreeMap::new();
             params.insert("gain".to_string(), 0.5 + i as f32 * 0.01);
@@ -207,7 +246,7 @@ mod tests {
     #[test]
     fn a_project_round_trips_through_a_file_exactly() {
         let p = built();
-        let f = SaveFile::from_project(&p, Vec::new());
+        let f = SaveFile::from_project(&p, Vec::new(), None);
         let bytes = f.encode();
         let back = SaveFile::decode(&bytes).expect("decodes");
         assert_eq!(back, f);
@@ -224,7 +263,7 @@ mod tests {
         // have caught this on its own; this test names the failure mode
         // explicitly rather than relying on the general round-trip alone.
         let p = built();
-        let reloaded = SaveFile::from_project(&p, Vec::new()).to_project();
+        let reloaded = SaveFile::from_project(&p, Vec::new(), None).to_project();
         assert_eq!(reloaded.busses.len(), 1, "the bus itself must survive");
         let bus = reloaded.busses.get(&studio_core::BusId(1)).expect("bus 1 should exist after reload");
         assert_eq!(bus.gain, 0.8);
@@ -246,7 +285,7 @@ mod tests {
         } }).unwrap();
         p.busses.get_mut(&studio_core::BusId(1)).unwrap().parent = Some(studio_core::BusId(2));
 
-        let f = SaveFile::from_project(&p, Vec::new());
+        let f = SaveFile::from_project(&p, Vec::new(), None);
         // Directly confirm the ORDER within the snapshot, not just the end
         // result — replaying it through fresh `apply` calls in file order
         // must never hit NoSuchBus.
@@ -264,7 +303,7 @@ mod tests {
         let mut p = built();
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
         let clips_before = p.clips.len();
-        let reloaded = SaveFile::from_project(&p, Vec::new()).to_project();
+        let reloaded = SaveFile::from_project(&p, Vec::new(), None).to_project();
         assert_eq!(reloaded.clips.len(), clips_before, "clips survive a locked track");
         assert!(reloaded.tracks.iter().find(|t| t.id == TrackId(1)).unwrap().locked,
                 "and the track is still locked afterwards");
@@ -280,7 +319,7 @@ mod tests {
         let mut p = built(); // built() now always includes a bus
         p.apply(&Op::SetTrackFlags { id: TrackId(2), muted: true, locked: true }).unwrap();
         let clips_before = p.clips.len();
-        let reloaded = SaveFile::from_project(&p, Vec::new()).to_project();
+        let reloaded = SaveFile::from_project(&p, Vec::new(), None).to_project();
         assert_eq!(reloaded.clips.len(), clips_before, "clips must survive a locked track even with a bus present in the snapshot");
         assert!(reloaded.tracks.iter().find(|t| t.id == TrackId(2)).unwrap().locked);
         assert_eq!(reloaded.busses.len(), 1, "the bus itself must also still be there");
@@ -306,7 +345,7 @@ mod tests {
         // that loses it.
         assert!(SaveFile::decode(b"").is_none());
         assert!(SaveFile::decode(b"not a studio file at all").is_none());
-        let good = SaveFile::from_project(&built(), Vec::new()).encode();
+        let good = SaveFile::from_project(&built(), Vec::new(), None).encode();
         for cut in 0..good.len() {
             assert!(SaveFile::decode(&good[..cut]).is_none(), "a {cut}-byte prefix must not load");
         }
@@ -323,9 +362,9 @@ mod tests {
         let p = built();
         let hist = vec![StampedOp { stamp: Stamp { lamport: 9, site: SiteId(4) },
             op: Op::SetGain { id: ClipId(2), gain: 0.1 } }];
-        let with = SaveFile::from_project(&p, hist.clone());
+        let with = SaveFile::from_project(&p, hist.clone(), None);
         assert_eq!(SaveFile::decode(&with.encode()).unwrap().history, hist);
-        let without = SaveFile::from_project(&p, Vec::new());
+        let without = SaveFile::from_project(&p, Vec::new(), None);
         assert!(SaveFile::decode(&without.encode()).unwrap().history.is_empty());
         // history does not alter the project the file rebuilds
         assert_eq!(with.to_project(), without.to_project());
@@ -335,7 +374,7 @@ mod tests {
     fn a_saved_file_can_be_opened_straight_into_a_live_session() {
         // Because the file IS ops, opening a project while collaborating is the
         // same path a joiner takes — no separate import.
-        let f = SaveFile::from_project(&built(), Vec::new());
+        let f = SaveFile::from_project(&built(), Vec::new(), None);
         let mut doc = Doc::new(SiteId(2), Project { name: f.name.clone(), ..Default::default() });
         for op in &f.snapshot {
             doc.local(op.clone()).ok();
@@ -346,5 +385,35 @@ mod tests {
         let answer = doc.receive(peer.hello()).unwrap();
         peer.receive(answer);
         assert_eq!(peer.project, doc.project);
+    }
+}
+
+#[cfg(test)]
+mod rack_section_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_rack_comes_back_and_a_rackless_file_still_loads() {
+        let p = Project { name: "beat".into(), ..Default::default() };
+        let rack = studio_live::Rack::trap_kit();
+        let with = SaveFile::from_project(&p, Vec::new(), Some(rack.clone()));
+        let back = SaveFile::decode(&with.encode()).expect("decodes");
+        assert_eq!(back.rack.as_ref(), Some(&rack), "the beat survives the file");
+
+        let without = SaveFile::from_project(&p, Vec::new(), None);
+        let back = SaveFile::decode(&without.encode()).expect("decodes");
+        assert_eq!(back.rack, None);
+    }
+
+    #[test]
+    fn a_file_cut_at_the_rack_boundary_is_damage_and_refuses() {
+        // The tempting "tolerate a missing tail for old files" reading is a
+        // truncation hole: no legitimate file of this version has three
+        // sections, so a clean cut at the boundary must refuse like any
+        // other prefix does.
+        let p = Project { name: "beat".into(), ..Default::default() };
+        let bytes = SaveFile::from_project(&p, Vec::new(), Some(studio_live::Rack::trap_kit()))
+            .encode();
+        assert!(SaveFile::decode(&bytes[..bytes.len() - 4]).is_none());
     }
 }

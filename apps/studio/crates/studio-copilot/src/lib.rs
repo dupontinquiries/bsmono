@@ -435,6 +435,13 @@ pub fn change_song_key(rack: &studio_live::Rack, from: studio_fx::retune::Scale,
                 *hz *= 2f32.powf(delta as f32 / 12.0);
             }
             studio_live::SynthKind::Sampler { .. } | studio_live::SynthKind::Beatspace { .. } => {}
+            // Deliberately NOT transposed: a kit is not in the key. Moving a
+            // song from C to F should carry the 808 and the melodic channels
+            // with it and leave the kick, snare and hats exactly where they
+            // were — retuning the drums five semitones on a key change is
+            // the mistake, not the feature. Per-hit drum retunes stay a
+            // `StepMod::tune` decision, made by a person, on a step.
+            studio_live::SynthKind::Drum { .. } => {}
         }
     }
     new_rack
@@ -728,12 +735,12 @@ mod tests {
         pattern.toggle(1, 4);
         studio_live::Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.0, 0.0, 0.0], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.0, 0.0, 0.0], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
             ],
             patterns: vec![pattern],
-            tempo_bpm: 140.0,
+            tempo_bpm: 140.0, swing: 0.0,
         }
     }
 
@@ -833,13 +840,13 @@ mod tests {
         use studio_live::{Channel, SynthKind};
         studio_live::Rack {
             channels: vec![
-                Channel { name: "808".into(), kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 300.0 }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "lead".into(), kind: SynthKind::Sine { hz: 440.0 }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.1, 0.2, 0.3], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false },
+                Channel { name: "808".into(), kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 300.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "lead".into(), kind: SynthKind::Sine { hz: 440.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.1, 0.2, 0.3], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
             ],
             patterns: vec![],
-            tempo_bpm: 140.0,
+            tempo_bpm: 140.0, swing: 0.0,
         }
     }
 

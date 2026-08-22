@@ -80,6 +80,7 @@ impl Command {
                 Op::AddTrack { .. } => CommandKind::EditAddTrack,
                 Op::RemoveTrack { .. } => CommandKind::EditRemoveTrack,
                 Op::SetTrackFlags { .. } => CommandKind::EditSetTrackFlags,
+                Op::SetTrackGain { .. } => CommandKind::EditSetTrackGain,
                 Op::AddClip { .. } => CommandKind::EditAddClip,
                 Op::RemoveClip { .. } => CommandKind::EditRemoveClip,
                 Op::MoveClip { .. } => CommandKind::EditMoveClip,
@@ -151,6 +152,7 @@ pub enum CommandKind {
     EditRemoveSource,
     EditAddBus,
     EditRemoveBus,
+    EditSetTrackGain,
     EditSetBusGain,
     EditSetBusFlags,
     EditSetBusChain,
@@ -188,6 +190,7 @@ impl CommandKind {
         CommandKind::EditRemoveSource,
         CommandKind::EditAddBus,
         CommandKind::EditRemoveBus,
+        CommandKind::EditSetTrackGain,
         CommandKind::EditSetBusGain,
         CommandKind::EditSetBusFlags,
         CommandKind::EditSetBusChain,
@@ -235,6 +238,7 @@ pub static COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { kind: CommandKind::EditRemoveSource, name: "remove source", phrases: &["remove this file", "delete the recording"], destructive: true },
     CommandSpec { kind: CommandKind::EditAddBus, name: "add bus", phrases: &["add a bus", "new bus"], destructive: false },
     CommandSpec { kind: CommandKind::EditRemoveBus, name: "remove bus", phrases: &["delete this bus", "remove the bus"], destructive: true },
+    CommandSpec { kind: CommandKind::EditSetTrackGain, name: "set track gain", phrases: &["turn up the track", "turn down the track", "fader"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusGain, name: "set bus gain", phrases: &["turn up the bus", "turn down the bus"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusFlags, name: "set bus flags", phrases: &["mute the bus", "unmute the bus"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusChain, name: "set bus chain", phrases: &["add a bus effect"], destructive: false },
@@ -350,7 +354,7 @@ mod tests {
     #[test]
     fn edit_is_persistent_transport_and_engine_are_not() {
         let edit = Command::Edit(Op::AddTrack {
-            track: studio_core::Track { id: TrackId(0), kind: studio_core::TrackKind::Audio, name: "V".into(), muted: false, locked: false, route: None },
+            track: studio_core::Track { id: TrackId(0), kind: studio_core::TrackKind::Audio, name: "V".into(), muted: false, locked: false, gain: 1.0, route: None },
             at: 0,
         });
         assert!(edit.is_persistent());

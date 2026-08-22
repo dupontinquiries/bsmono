@@ -16,12 +16,25 @@ studio-egui = { path = "../studio-egui" }
 studio-live = { path = "../studio-live" }
 studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
+studio-media = { path = "../studio-media" }
+analog-kit = { path = "../../../../shared/analog-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+arc-swap = "1"
+# Same major as studio-io's device feature, so the workspace resolves ONE cpal.
+cpal = { version = "0.15", optional = true }
+# MIDI hardware in. Same shape as the audio feature: ALSA-backed on Linux,
+# optional so a build without those headers still produces a working editor.
+midir = { version = "0.10", optional = true }
 
 [features]
 # Default-on so `cargo build --release` produces the deployable binary directly,
 # the same convention every other egui frontend in the fleet uses.
-default = ["app"]
+default = ["app", "audio", "midi"]
 app = ["dep:eframe"]
+# Loop audition through cpal. Off => NullSink: the app still runs, silently,
+# with a wall-clock playhead — a build box without ALSA headers must not lose
+# the ability to build the editor.
+audio = ["dep:cpal"]
+midi = ["dep:midir"]

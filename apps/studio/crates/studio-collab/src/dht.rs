@@ -220,7 +220,7 @@ mod tests {
         );
         host.doc
             .local(Op::AddTrack {
-                track: Track { id: TrackId(1), kind: TrackKind::Video, name: "V1".into(), muted: false, locked: false, route: None },
+                track: Track { id: TrackId(1), kind: TrackKind::Video, name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None },
                 at: 0,
             })
             .unwrap();

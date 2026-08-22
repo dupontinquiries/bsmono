@@ -14,10 +14,12 @@
 
 pub mod touch;
 pub mod keys;
+pub mod playkeys;
 pub mod spectrum;
 
 /// The step-sequencer surface for studio-live.
 pub mod grid;
+pub mod lanes;
 
 /// Time-range selection — the audio editor's unit, distinct from clip picking.
 pub mod range;
@@ -48,11 +50,119 @@ pub struct View {
     pub track_h: f32,
     /// Width of the track-header gutter on the left.
     pub gutter: f32,
+    /// A clip mid-drag. Interaction state, not camera — it lives here because
+    /// both answer "what is this window doing right now", the view is already
+    /// the `&mut` the timeline holds across frames, and a `None` default
+    /// keeps every existing constructor working. The drag never touches the
+    /// project: the ghost is drawn from THIS, and only the drop becomes an
+    /// edit for the host to apply — grid's own returns-edits rule.
+    pub drag: Option<ClipDrag>,
+}
+
+/// A grabbed clip: which one, and what the grab means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipDrag {
+    pub id: ClipId,
+    pub kind: DragKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DragKind {
+    /// Body grab: the whole clip moves. `grab_dt` is pointer time minus
+    /// clip.pos at grab, so the clip doesn't jump to put its left edge under
+    /// the finger.
+    Move { grab_dt: Ticks },
+    /// Edge grab: that edge follows the pointer, the other stays put.
+    TrimLeft,
+    TrimRight,
+}
+
+/// Which edge an ambiguous grab prefers (a clip a few pixels wide has both
+/// edges under one finger). `alt-;` flips it — the job `Action::
+/// FlipTrimSide` was minted for, back when the keymap was designed ahead of
+/// this drag existing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrimSide {
+    #[default]
+    Left,
+    Right,
+}
+
+/// How many pixels from a clip edge count as grabbing THAT EDGE rather than
+/// the body.
+pub const TRIM_GRIP_PX: f32 = 7.0;
+
+/// Classify a grab at `at`: which clip, and move vs trim. Pure, so the
+/// pointer-free tests can hold it still.
+pub fn grab(
+    project: &Project,
+    view: &View,
+    at: Pos2,
+    origin: Pos2,
+    prefer: TrimSide,
+) -> Option<ClipDrag> {
+    let id = hit_test(project, view, at, origin)?;
+    let clip = project.clips.get(&id)?;
+    let rows = track_rows(project);
+    let row = rows.iter().position(|t| *t == clip.track)?;
+    let r = view.clip_rect(clip.pos, clip.len, row, origin);
+    let near_l = (at.x - r.min.x).abs() <= TRIM_GRIP_PX;
+    let near_r = (r.max.x - at.x).abs() <= TRIM_GRIP_PX;
+    let kind = match (near_l, near_r) {
+        (true, true) => match prefer {
+            TrimSide::Left => DragKind::TrimLeft,
+            TrimSide::Right => DragKind::TrimRight,
+        },
+        (true, false) => DragKind::TrimLeft,
+        (false, true) => DragKind::TrimRight,
+        (false, false) => DragKind::Move {
+            grab_dt: view.x_to_time(at.x, origin.x).saturating_sub(clip.pos),
+        },
+    };
+    Some(ClipDrag { id, kind })
+}
+
+/// Where a trim drag would leave the clip: `(pos, src_in, len)` — the full
+/// placement, because a LEFT trim moves the start while eating source
+/// material, and pretending otherwise would smear audio in time. Clamped so
+/// the clip keeps at least a sliver and never claims source it doesn't have;
+/// the op still has the final word.
+pub fn trim_target(
+    project: &Project,
+    view: &View,
+    drag: &ClipDrag,
+    at: Pos2,
+    origin: Pos2,
+    playhead: Ticks,
+) -> Option<(Ticks, Ticks, Ticks)> {
+    let clip = project.clips.get(&drag.id)?;
+    let src_len = project.sources.get(&clip.source)?.len;
+    let tolerance = Ticks((0.25 * TICKS_PER_SECOND as f64 * (100.0 / view.px_per_sec as f64)) as i64);
+    let t = snap(project, view.x_to_time(at.x, origin.x), playhead, tolerance, Some(drag.id));
+    let min = Ticks(TICKS_PER_SECOND / 100); // 10ms sliver, never zero
+    match drag.kind {
+        DragKind::TrimRight => {
+            let max_len = src_len.saturating_sub(clip.src_in);
+            let len = Ticks(t.0.saturating_sub(clip.pos.0).clamp(min.0, max_len.0));
+            Some((clip.pos, clip.src_in, len))
+        }
+        DragKind::TrimLeft => {
+            let end = Ticks(clip.pos.0 + clip.len.0);
+            // The new start may not pass the end (minus the sliver), may not
+            // go before time zero, and may not eat more source than exists
+            // before the current in-point.
+            let lo = (clip.pos.0 - clip.src_in.0).max(0);
+            let pos = Ticks(t.0.clamp(lo, end.0 - min.0));
+            let d = pos.0 - clip.pos.0;
+            Some((pos, Ticks(clip.src_in.0 + d), Ticks(clip.len.0 - d)))
+        }
+        DragKind::Move { .. } => None,
+    }
 }
 
 impl Default for View {
     fn default() -> Self {
-        View { px_per_sec: 100.0, scroll: Ticks::ZERO, track_h: 64.0, gutter: 132.0 }
+        View { px_per_sec: 100.0, scroll: Ticks::ZERO, track_h: 64.0, gutter: 132.0, drag: None }
     }
 }
 
@@ -72,6 +182,13 @@ impl View {
 
     /// Zoom about a fixed point on screen, so the frame under the cursor stays
     /// put — the behaviour every editor has and every reimplementation forgets.
+    /// Pan horizontally by screen pixels (positive = later times come into
+    /// view). Clamped at zero: there is nothing before the origin to see.
+    pub fn pan(&mut self, dx_px: f32) {
+        let dt = (dx_px / self.px_per_sec * TICKS_PER_SECOND as f32) as i64;
+        self.scroll = Ticks((self.scroll.0 + dt).max(0));
+    }
+
     pub fn zoom_about(&mut self, factor: f32, anchor_x: f32, origin_x: f32) {
         let anchor_t = self.x_to_time(anchor_x, origin_x);
         self.px_per_sec = (self.px_per_sec * factor).clamp(0.5, 20_000.0);
@@ -101,6 +218,52 @@ pub const RULER_H: f32 = 26.0;
 /// Which clip (if any) sits under a point. Pure, so it is unit-testable — and
 /// it searches in reverse draw order so the clip you can SEE on top is the one
 /// you get, which matters the moment two tracks overlap visually.
+/// Where a dragged clip would land: snapped time (never negative), and the
+/// track under the pointer — but ONLY if that track carries the same kind as
+/// the clip's current one. Dragging audio "through" a video row keeps the
+/// original track: a vertical move between kinds is a re-route the mixer
+/// cannot honour, so refusing it at the gesture beats refusing it at the op.
+pub fn move_target(
+    project: &Project,
+    view: &View,
+    drag: &ClipDrag,
+    at: Pos2,
+    origin: Pos2,
+    playhead: Ticks,
+) -> Option<(Ticks, TrackId)> {
+    let clip = project.clips.get(&drag.id)?;
+    let DragKind::Move { grab_dt } = drag.kind else { return None };
+    let raw = view.x_to_time(at.x, origin.x).saturating_sub(grab_dt);
+    let tolerance = Ticks((0.25 * TICKS_PER_SECOND as f64 * (100.0 / view.px_per_sec as f64)) as i64);
+    let pos = Ticks(snap(project, raw, playhead, tolerance, Some(drag.id)).0.max(0));
+    let rows = track_rows(project);
+    let row = ((at.y - origin.y - RULER_H) / view.track_h).floor();
+    let from_kind = project.tracks.iter().find(|t| t.id == clip.track)?.kind;
+    let track = if row >= 0.0 {
+        rows.get(row as usize)
+            .and_then(|tid| project.tracks.iter().find(|t| t.id == *tid))
+            .filter(|t| t.kind == from_kind && !t.locked)
+            .map(|t| t.id)
+            .unwrap_or(clip.track)
+    } else {
+        clip.track
+    };
+    Some((pos, track))
+}
+
+/// What one timeline frame produced for the host.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TimelineResponse {
+    /// A clip was clicked (selection is the host's business).
+    pub clicked: Option<ClipId>,
+    /// A drag ended: move this clip here. An op-shaped fact, not a mutation.
+    pub moved: Option<(ClipId, Ticks, TrackId)>,
+    /// A trim drag ended: the clip's new full placement `(pos, src_in,
+    /// len)`. A left trim changes all three, which is why this is not just
+    /// a length.
+    pub trimmed: Option<(ClipId, Ticks, Ticks, Ticks)>,
+}
+
 pub fn hit_test(project: &Project, view: &View, at: Pos2, origin: Pos2) -> Option<ClipId> {
     let rows = track_rows(project);
     let row = view.row_at(at.y, origin.y, rows.len())?;
@@ -156,7 +319,8 @@ pub fn timeline(
     // clip whose audio has not been scanned yet is still editable — analysis
     // must never gate editing.
     peaks: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
-) -> Option<ClipId> {
+    trim_side: TrimSide,
+) -> TimelineResponse {
     let rows = track_rows(&doc.project);
     let height = RULER_H + rows.len().max(1) as f32 * view.track_h;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
@@ -273,9 +437,74 @@ pub fn timeline(
                              Stroke::new(2.0_f32, colors.danger));
     }
 
-    resp.interact_pointer_pos()
+    // ── wheel: pan; ctrl-wheel / pinch: zoom about the pointer ─────────────
+    // Hover-gated so a scrolling page elsewhere never moves the timeline.
+    if resp.hovered() {
+        let (scroll, zoom, pointer_x) = ui.input(|i| {
+            (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos().map(|p| p.x))
+        });
+        if zoom != 1.0 {
+            if let Some(x) = pointer_x {
+                view.zoom_about(zoom, x, origin.x);
+            }
+        } else if scroll != Vec2::ZERO {
+            // A mouse wheel reports y; a trackpad reports both. Either way
+            // the timeline is a horizontal thing, so both axes pan time —
+            // wheel-down meaning "later" matches every horizontal list.
+            view.pan(-(scroll.x + scroll.y));
+        }
+    }
+
+    // ── drag a clip: move from the body, trim from an edge ─────────────────
+    let mut out = TimelineResponse::default();
+    if resp.drag_started() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            view.drag = grab(&doc.project, view, p, origin, trim_side);
+        }
+    }
+    if let Some(drag) = view.drag {
+        // The clip can vanish mid-drag — a peer's RemoveClip is not obliged
+        // to wait for our finger. A dead drag just ends.
+        if !doc.project.clips.contains_key(&drag.id) {
+            view.drag = None;
+        } else if let Some(p) = resp.interact_pointer_pos() {
+            // Ghost or drop, per kind — the project is not touched until the
+            // release becomes an op.
+            let ghost = |pos: Ticks, len: Ticks, track: TrackId| {
+                track_rows(&doc.project).iter().position(|t| *t == track)
+                    .map(|row| view.clip_rect(pos, len, row, origin))
+            };
+            match drag.kind {
+                DragKind::Move { .. } => {
+                    if let Some((pos, track)) = move_target(&doc.project, view, &drag, p, origin, playhead) {
+                        if resp.drag_stopped() {
+                            out.moved = Some((drag.id, pos, track));
+                        } else if let Some(r) = ghost(pos, doc.project.clips[&drag.id].len, track) {
+                            painter.rect_stroke(r, 3.0, Stroke::new(2.0_f32, colors.accent),
+                                                egui::StrokeKind::Inside);
+                        }
+                    }
+                }
+                DragKind::TrimLeft | DragKind::TrimRight => {
+                    if let Some((pos, src_in, len)) = trim_target(&doc.project, view, &drag, p, origin, playhead) {
+                        if resp.drag_stopped() {
+                            out.trimmed = Some((drag.id, pos, src_in, len));
+                        } else if let Some(r) = ghost(pos, len, doc.project.clips[&drag.id].track) {
+                            painter.rect_stroke(r, 3.0, Stroke::new(2.0_f32, colors.warning),
+                                                egui::StrokeKind::Inside);
+                        }
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            view.drag = None;
+        }
+    }
+    out.clicked = resp.interact_pointer_pos()
         .filter(|_| resp.clicked())
-        .and_then(|p| hit_test(&doc.project, view, p, origin))
+        .and_then(|p| hit_test(&doc.project, view, p, origin));
+    out
 }
 
 /// A stable, well-separated colour per site id. Deterministic so the same peer
@@ -310,9 +539,9 @@ mod tests {
     fn project() -> Project {
         let mut p = Project { name: "t".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false, route: None }, at: 1 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "/media/take1.mov".into(),
             len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(10), source: SourceId(1), track: TrackId(1),
@@ -426,5 +655,163 @@ mod tests {
         assert_eq!(format_timecode(Ticks::from_seconds(61.5)), "0:01:01.500");
         assert_eq!(format_timecode(Ticks::from_seconds(3661.25)), "1:01:01.250");
         assert_eq!(format_timecode(Ticks::from_seconds(-2.0)), "-0:00:02.000");
+    }
+}
+
+#[cfg(test)]
+mod move_target_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId};
+
+    // Reuses the sibling module's fixture shape: V1 (video) row 0 with clip
+    // 10 at 2s..6s, A1 (audio) row 1 with clip 20 at 3s..8s.
+    fn project() -> Project {
+        let mut p = Project::default();
+        for (i, (kind, nm)) in [(studio_core::TrackKind::Video, "V1"),
+                                 (studio_core::TrackKind::Audio, "A1"),
+                                 (studio_core::TrackKind::Audio, "A2")].iter().enumerate() {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(i as u64 + 1), kind: *kind,
+                name: (*nm).into(), muted: false, locked: false, gain: 1.0, route: None },
+                at: i }).unwrap();
+        }
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2,
+            has_video: true } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(20), source: SourceId(1),
+            track: TrackId(2), pos: Ticks::from_seconds(3.0), src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        p
+    }
+
+    fn drag() -> ClipDrag {
+        ClipDrag { id: ClipId(20), kind: DragKind::Move { grab_dt: Ticks::ZERO } }
+    }
+    fn v() -> View { View::default() }
+
+    #[test]
+    fn a_vertical_move_lands_on_the_same_kind_and_never_on_the_wrong_one() {
+        let p = project();
+        // Pointer over row 2 (A2, audio): the audio clip may move there.
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(20.0), 0.0),
+                           RULER_H + v().track_h * 2.5);
+        let (_, track) = move_target(&p, &v(), &drag(), at, Pos2::ZERO,
+                                     Ticks::ZERO).unwrap();
+        assert_eq!(track, TrackId(3), "audio moved to the other audio track");
+        // Pointer over row 0 (V1, video): the kind mismatch keeps the track.
+        let at = Pos2::new(at.x, RULER_H + v().track_h * 0.5);
+        let (_, track) = move_target(&p, &v(), &drag(), at, Pos2::ZERO,
+                                     Ticks::ZERO).unwrap();
+        assert_eq!(track, TrackId(2), "audio does not land on a video row");
+    }
+
+    #[test]
+    fn the_drop_snaps_to_edges_and_never_goes_negative() {
+        let p = project();
+        // Near the clip's own old start (3.0s) — must NOT snap to itself,
+        // but 0s is far, so an open-space drop is exact.
+        let x = v().time_to_x(Ticks::from_seconds(20.02), 0.0);
+        let at = Pos2::new(x, RULER_H + v().track_h * 1.5);
+        let (pos, _) = move_target(&p, &v(), &drag(), at, Pos2::ZERO, Ticks::from_seconds(20.0)).unwrap();
+        assert_eq!(pos, Ticks::from_seconds(20.0), "snapped to the playhead");
+        // A grab deep inside the clip dragged left of zero clamps at zero.
+        let deep = ClipDrag { id: ClipId(20),
+            kind: DragKind::Move { grab_dt: Ticks::from_seconds(4.0) } };
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(1.0), 0.0),
+                           RULER_H + v().track_h * 1.5);
+        let (pos, _) = move_target(&p, &v(), &deep, at, Pos2::ZERO, Ticks::from_seconds(500.0)).unwrap();
+        assert_eq!(pos, Ticks::ZERO, "a clip cannot be dragged before the origin");
+    }
+}
+
+#[cfg(test)]
+mod grab_and_trim_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId};
+
+    // A1 (row 0 here: audio-only project) with clip 20 at 3s..8s over a 60s
+    // source whose in-point is 1s — so there is material on BOTH sides.
+    fn project() -> Project {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: studio_core::TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(20), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::from_seconds(3.0), src_in: Ticks::from_seconds(1.0),
+            len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        p
+    }
+    fn v() -> View { View::default() }
+    fn mid_y() -> f32 { RULER_H + v().track_h * 0.5 }
+
+    #[test]
+    fn edges_trim_and_the_body_moves() {
+        let p = project();
+        let left_x = v().time_to_x(Ticks::from_seconds(3.0), 0.0) + 2.0;
+        let body_x = v().time_to_x(Ticks::from_seconds(5.5), 0.0);
+        let right_x = v().time_to_x(Ticks::from_seconds(8.0), 0.0) - 2.0;
+        let k = |x: f32| grab(&p, &v(), Pos2::new(x, mid_y()), Pos2::ZERO,
+                              TrimSide::default()).unwrap().kind;
+        assert_eq!(k(left_x), DragKind::TrimLeft);
+        assert!(matches!(k(body_x), DragKind::Move { .. }));
+        assert_eq!(k(right_x), DragKind::TrimRight);
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_preferred_side_and_flips() {
+        // Zoom out until the whole clip is narrower than two grips: both
+        // edges under the finger, the exact case alt-; exists for.
+        let p = project();
+        let mut view = v();
+        view.px_per_sec = 2.0; // 5s clip -> 10px wide
+        let x = view.time_to_x(Ticks::from_seconds(5.5), 0.0);
+        let at = Pos2::new(x, mid_y());
+        let g = |side| grab(&p, &view, at, Pos2::ZERO, side).unwrap().kind;
+        assert_eq!(g(TrimSide::Left), DragKind::TrimLeft);
+        assert_eq!(g(TrimSide::Right), DragKind::TrimRight);
+    }
+
+    #[test]
+    fn a_right_trim_stops_at_the_source_and_a_sliver() {
+        let p = project();
+        let d = ClipDrag { id: ClipId(20), kind: DragKind::TrimRight };
+        // Way past the source's material (in at 1s of 60s → max len 59s).
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(500.0), 0.0), mid_y());
+        let (pos, src_in, len) = trim_target(&p, &v(), &d, at, Pos2::ZERO, Ticks::from_seconds(900.0)).unwrap();
+        assert_eq!((pos, src_in), (Ticks::from_seconds(3.0), Ticks::from_seconds(1.0)));
+        assert_eq!(len, Ticks::from_seconds(59.0), "the clip cannot claim audio the source lacks");
+        // And dragged left of its own start it keeps a 10ms sliver.
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(1.0), 0.0), mid_y());
+        let (_, _, len) = trim_target(&p, &v(), &d, at, Pos2::ZERO, Ticks::from_seconds(900.0)).unwrap();
+        assert_eq!(len, Ticks(TICKS_PER_SECOND / 100));
+    }
+
+    #[test]
+    fn a_left_trim_moves_the_start_and_the_in_point_together() {
+        let p = project();
+        let d = ClipDrag { id: ClipId(20), kind: DragKind::TrimLeft };
+        // Pull the left edge one second later: pos 3→4, src_in 1→2, len 5→4.
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(4.0), 0.0), mid_y());
+        let (pos, src_in, len) = trim_target(&p, &v(), &d, at, Pos2::ZERO, Ticks::from_seconds(900.0)).unwrap();
+        assert_eq!(pos, Ticks::from_seconds(4.0));
+        assert_eq!(src_in, Ticks::from_seconds(2.0), "the material window slides with the edge");
+        assert_eq!(len, Ticks::from_seconds(4.0));
+        // Pulled EARLIER it reveals material — but only the 1s that exists
+        // before the in-point.
+        let at = Pos2::new(v().time_to_x(Ticks::from_seconds(0.5), 0.0), mid_y());
+        let (pos, src_in, len) = trim_target(&p, &v(), &d, at, Pos2::ZERO, Ticks::from_seconds(900.0)).unwrap();
+        assert_eq!(src_in, Ticks::ZERO, "no material exists before the source's start");
+        assert_eq!(pos, Ticks::from_seconds(2.0));
+        assert_eq!(len, Ticks::from_seconds(6.0));
+    }
+
+    #[test]
+    fn panning_never_shows_time_before_zero() {
+        let mut view = v();
+        view.pan(500.0);
+        assert!(view.scroll > Ticks::ZERO);
+        view.pan(-100_000.0);
+        assert_eq!(view.scroll, Ticks::ZERO, "there is nothing before the origin to see");
     }
 }

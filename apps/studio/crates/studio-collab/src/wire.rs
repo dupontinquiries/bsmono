@@ -41,6 +41,14 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// variants (`AddBus`/`RemoveBus`/`SetBusGain`/`SetBusChain`/`SetBusSends`/
 /// `SetRoute`).
 ///
+/// v8: `Packet` gained the asset quartet — `AssetRequest`(6) /
+/// `AssetManifest`(7) / `ChunkRequest`(8) / `Chunk`(9) — so a source's
+/// media can follow its `AddSource` op, content-addressed through
+/// `assets::Manifest`.
+///
+/// v7: `Track` gained `gain: f32` (the mixer fader) and `Op` gained
+/// `SetTrackGain` (tag 19).
+///
 /// v3: `Bus` gained `muted: bool`, and `Op` gained `SetBusFlags`. A separate
 /// bump from v2 rather than folding it in, because v2 had already landed and
 /// been tested as its own shape before mute was designed — the "one bump per
@@ -55,7 +63,7 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 4;
+pub const WIRE_VERSION: u8 = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -69,6 +77,20 @@ pub enum Packet {
     Catchup { ops: Vec<StampedOp> },
     /// A rack sync — whole-value LWW, not an op. See [`RackSync`]'s docs.
     Rack(RackSync),
+    /// "Send me the manifest for this source's media." Sent by a peer whose
+    /// project references a source it has no bytes for — an `AddSource` op
+    /// travels light, and the media follows content-addressed.
+    AssetRequest { source: studio_core::SourceId },
+    /// The asset's shape: chunk ids only, so a receiver asks for exactly
+    /// what its content-addressed store lacks (a re-bounce that changed one
+    /// bar re-ships one bar).
+    AssetManifest { source: studio_core::SourceId, manifest: crate::assets::Manifest },
+    /// "Send these chunks" — first-appearance order, straight from
+    /// `Manifest::need`.
+    ChunkRequest { ids: Vec<crate::assets::ChunkId> },
+    /// One content-addressed chunk. The id IS the integrity check: a
+    /// receiver re-hashes and drops a mismatch on the floor.
+    Chunk { id: crate::assets::ChunkId, bytes: Vec<u8> },
 }
 
 // ── primitives ──────────────────────────────────────────────────────────────
@@ -217,6 +239,7 @@ fn put_track(o: &mut Vec<u8>, t: &Track) {
     put_str(o, &t.name);
     put_u8(o, t.muted as u8);
     put_u8(o, t.locked as u8);
+    put_f32(o, t.gain);
     put_opt_bus_id(o, t.route);
 }
 fn get_track(r: &mut R) -> Option<Track> {
@@ -224,6 +247,7 @@ fn get_track(r: &mut R) -> Option<Track> {
         id: TrackId(r.u64()?),
         kind: if r.u8()? != 0 { TrackKind::Audio } else { TrackKind::Video },
         name: r.str()?, muted: r.u8()? != 0, locked: r.u8()? != 0,
+        gain: r.f32()?,
         route: get_opt_bus_id(r)?,
     })
 }
@@ -273,6 +297,7 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
         Op::RemoveSource { id } => { put_u8(o, 18); put_u64(o, id.0); }
+        Op::SetTrackGain { id, gain } => { put_u8(o, 19); put_u64(o, id.0); put_f32(o, *gain); }
     }
 }
 
@@ -311,6 +336,7 @@ fn get_op(r: &mut R) -> Option<Op> {
         15 => Op::SetBusSends { id: BusId(r.u64()?), sends: get_sends(r)? },
         16 => Op::SetRoute { track: TrackId(r.u64()?), bus: get_opt_bus_id(r)? },
         18 => Op::RemoveSource { id: SourceId(r.u64()?) },
+        19 => Op::SetTrackGain { id: TrackId(r.u64()?), gain: r.f32()? },
         _ => return None, // an op kind from a newer build: refuse, don't guess
     })
 }
@@ -345,7 +371,28 @@ fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
             put_f32(o, *drive);
             put_f32(o, *decay_ms);
         }
+        SynthKind::Drum { voice, tone, decay_ms, tune } => {
+            put_u8(o, 4);
+            put_u8(o, drum_voice_tag(*voice));
+            put_f32(o, *tone);
+            put_f32(o, *decay_ms);
+            put_u8(o, *tune as u8);
+        }
     }
+}
+
+// The voice's wire tag is written out by hand rather than derived from the
+// enum's discriminant: `DrumVoice as u64` would silently renumber the wire
+// if someone reorders the enum, and this file's whole job is that bytes on
+// the wire never mean something different than they used to.
+fn drum_voice_tag(v: studio_live::DrumVoice) -> u8 {
+    use studio_live::DrumVoice::*;
+    match v { Kick => 0, Snare => 1, Clap => 2, HatClosed => 3, HatOpen => 4 }
+}
+fn drum_voice_from(tag: u8) -> Option<studio_live::DrumVoice> {
+    use studio_live::DrumVoice::*;
+    Some(match tag { 0 => Kick, 1 => Snare, 2 => Clap, 3 => HatClosed, 4 => HatOpen,
+                     _ => return None })
 }
 fn get_synthkind(r: &mut R) -> Option<SynthKind> {
     Some(match r.u8()? {
@@ -364,6 +411,13 @@ fn get_synthkind(r: &mut R) -> Option<SynthKind> {
             let decay_ms = r.f32()?;
             SynthKind::Sub { note, glide_from: has_glide.then_some(glide_val), glide_ms, drive, decay_ms }
         }
+        4 => {
+            let voice = drum_voice_from(r.u8()?)?;
+            let tone = r.f32()?;
+            let decay_ms = r.f32()?;
+            let tune = r.u8()? as i8;
+            SynthKind::Drum { voice, tone, decay_ms, tune }
+        }
         _ => return None, // a synth kind from a newer build: refuse, don't guess
     })
 }
@@ -374,9 +428,19 @@ fn put_channel(o: &mut Vec<u8>, c: &Channel) {
     put_f32(o, c.gain);
     put_f32(o, c.pan);
     put_u8(o, c.muted as u8);
+    put_u8(o, c.choke_group.is_some() as u8);
+    put_u8(o, c.choke_group.unwrap_or(0));
 }
 fn get_channel(r: &mut R) -> Option<Channel> {
-    Some(Channel { name: r.str()?, kind: get_synthkind(r)?, gain: r.f32()?, pan: r.f32()?, muted: r.u8()? != 0 })
+    let name = r.str()?;
+    let kind = get_synthkind(r)?;
+    let gain = r.f32()?;
+    let pan = r.f32()?;
+    let muted = r.u8()? != 0;
+    let has_choke = r.u8()? != 0;
+    let choke = r.u8()?;
+    Some(Channel { name, kind, gain, pan, muted,
+                   choke_group: has_choke.then_some(choke) })
 }
 
 fn put_stepmod(o: &mut Vec<u8>, m: &StepMod) {
@@ -437,6 +501,7 @@ fn put_rack(o: &mut Vec<u8>, rack: &Rack) {
     put_u16(o, rack.patterns.len().min(u16::MAX as usize) as u16);
     for p in &rack.patterns { put_pattern(o, p); }
     put_f32(o, rack.tempo_bpm);
+    put_f32(o, rack.swing);
 }
 fn get_rack(r: &mut R) -> Option<Rack> {
     let cn = r.u16()? as usize;
@@ -446,7 +511,8 @@ fn get_rack(r: &mut R) -> Option<Rack> {
     let mut patterns = Vec::with_capacity(pn.min(4096));
     for _ in 0..pn { patterns.push(get_pattern(r)?); }
     let tempo_bpm = r.f32()?;
-    Some(Rack { channels, patterns, tempo_bpm })
+    let swing = r.f32()?;
+    Some(Rack { channels, patterns, tempo_bpm, swing })
 }
 
 impl Packet {
@@ -479,6 +545,29 @@ impl Packet {
                 put_u64(&mut o, rs.seq);
                 put_u64(&mut o, rs.site.0);
                 put_rack(&mut o, &rs.rack);
+            }
+            Packet::AssetRequest { source } => {
+                put_u8(&mut o, 6);
+                put_u64(&mut o, source.0);
+            }
+            Packet::AssetManifest { source, manifest } => {
+                put_u8(&mut o, 7);
+                put_u64(&mut o, source.0);
+                put_u64(&mut o, manifest.asset);
+                put_u64(&mut o, manifest.total_len as u64);
+                put_u32(&mut o, manifest.chunks.len() as u32);
+                for c in &manifest.chunks { put_u64(&mut o, *c); }
+            }
+            Packet::ChunkRequest { ids } => {
+                put_u8(&mut o, 8);
+                put_u32(&mut o, ids.len() as u32);
+                for c in ids { put_u64(&mut o, *c); }
+            }
+            Packet::Chunk { id, bytes } => {
+                put_u8(&mut o, 9);
+                put_u64(&mut o, *id);
+                put_u32(&mut o, bytes.len() as u32);
+                o.extend_from_slice(bytes);
             }
         }
         o
@@ -521,6 +610,29 @@ impl Packet {
                 let site = SiteId(r.u64()?);
                 let rack = get_rack(&mut r)?;
                 Packet::Rack(RackSync { rack, seq, site })
+            }
+            6 => Packet::AssetRequest { source: SourceId(r.u64()?) },
+            7 => {
+                let source = SourceId(r.u64()?);
+                let asset = r.u64()?;
+                let total_len = r.u64()? as usize;
+                let n = r.u32()? as usize;
+                let mut chunks = Vec::with_capacity(n.min(1 << 20));
+                for _ in 0..n { chunks.push(r.u64()?); }
+                Packet::AssetManifest { source,
+                    manifest: crate::assets::Manifest { asset, total_len, chunks } }
+            }
+            8 => {
+                let n = r.u32()? as usize;
+                let mut ids = Vec::with_capacity(n.min(1 << 20));
+                for _ in 0..n { ids.push(r.u64()?); }
+                Packet::ChunkRequest { ids }
+            }
+            9 => {
+                let id = r.u64()?;
+                let n = r.u32()? as usize;
+                let bytes = r.take(n)?.to_vec();
+                Packet::Chunk { id, bytes }
             }
             _ => return None,
         };
@@ -586,6 +698,12 @@ impl super::Doc {
             Packet::Presence(pr) => { self.presence(pr); None }
             Packet::Rack(rs) => { self.integrate_rack(rs); None }
             Packet::Hello { since, .. } => Some(self.catchup_for(since)),
+            // Assets are bytes, and the Doc holds no bytes — media transfer
+            // is the SHELL's layer (it owns the chunk store and the decode
+            // path), so these fall through untouched rather than this struct
+            // growing a second job.
+            Packet::AssetRequest { .. } | Packet::AssetManifest { .. }
+            | Packet::ChunkRequest { .. } | Packet::Chunk { .. } => None,
         }
     }
 }
@@ -595,6 +713,26 @@ mod tests {
     use super::*;
     use crate::Doc;
     use studio_core::Project;
+
+    #[test]
+    fn the_asset_quartet_survives_the_wire() {
+        // Built through Manifest::build so the ids in flight are REAL
+        // content hashes, not fixture numbers a codec bug could permute
+        // without anyone noticing.
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let (manifest, store) = crate::assets::Manifest::build(&data);
+        let (first_id, first_bytes) = store.iter().next().map(|(k, v)| (*k, v.clone())).unwrap();
+        let packets = vec![
+            Packet::AssetRequest { source: SourceId(7) },
+            Packet::AssetManifest { source: SourceId(7), manifest: manifest.clone() },
+            Packet::ChunkRequest { ids: manifest.chunks.clone() },
+            Packet::Chunk { id: first_id, bytes: first_bytes },
+        ];
+        for p in packets {
+            let back = Packet::decode(&p.encode()).expect("decodes");
+            assert_eq!(back, p);
+        }
+    }
 
     fn effects() -> Vec<Effect> {
         let mut p = std::collections::BTreeMap::new();
@@ -611,7 +749,7 @@ mod tests {
         };
         vec![
             Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-                name: "A1 — vocals".into(), muted: true, locked: false, route: None }, at: 3 },
+                name: "A1 — vocals".into(), muted: true, locked: false, gain: 1.0, route: None }, at: 3 },
             Op::RemoveTrack { id: TrackId(2) },
             Op::SetTrackFlags { id: TrackId(2), muted: false, locked: true },
             Op::AddClip { clip: clip.clone() },
@@ -640,6 +778,7 @@ mod tests {
             Op::SetRoute { track: TrackId(2), bus: Some(BusId(1)) },
             Op::SetRoute { track: TrackId(2), bus: None },
             Op::RemoveSource { id: SourceId(3) },
+            Op::SetTrackGain { id: TrackId(2), gain: 0.7 },
         ]
     }
 
@@ -682,12 +821,12 @@ mod tests {
         pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)) });
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false },
-                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2) },
+                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false, choke_group: None },
+                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true, choke_group: Some(0) },
             ],
             patterns: vec![pattern],
-            tempo_bpm: 140.0,
+            tempo_bpm: 140.0, swing: 0.11,
         }
     }
 
@@ -700,7 +839,7 @@ mod tests {
         rack.channels.push(Channel {
             name: "gan".into(),
             kind: SynthKind::Beatspace { z: [0.25, -0.5, 0.9], crossfade: 0.4 },
-            gain: 1.0, pan: 0.0, muted: false,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
         });
         let p = Packet::Rack(RackSync { rack, seq: 12, site: SiteId(3) });
         let bytes = p.encode();
@@ -815,7 +954,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 4, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 8, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -859,7 +998,7 @@ mod tests {
         // on another that started cold.
         let mut host = Doc::new(SiteId(1), Project { name: "cut".into(), ..Default::default() });
         host.local(Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         host.local(Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         for i in 0..6u64 {

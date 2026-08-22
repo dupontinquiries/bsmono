@@ -56,6 +56,13 @@ edits exactly reversible, which floats are not.
 | `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
 | `studio-video` | video probing, thumbnails, audio-track extraction (real `ffmpeg`/`ffprobe`) | 11 |
 
+**Toolchain note:** egui/eframe 0.34 declare `rust-version = 1.92`, so the
+GUI crates need rustc ≥ 1.92 (the offline `rustup.zip` toolchain pack, 1.96,
+works). On an older rustc, `cargo build --ignore-rust-version` compiles them
+anyway — the declared MSRV is policy, not a used language feature — but a
+real 1.92+ is the supported path. With that in place every row above,
+including `studio-egui` and `studio-app`, builds and its tests run directly.
+
 `studio-egui` DID get re-verified this pass, for the first time — a real
 rustc 1.96 toolchain cleared egui 0.34's MSRV, which no prior session here
 could do. Its count above (93, up from 28) is a real `cargo test` result,
@@ -66,6 +73,190 @@ time too. Both had zero errors; the only warnings are pre-existing
 `egui::Panel`/`TopBottomPanel` API-rename deprecations (0.34 renamed
 `.show()` to `.show_inside()` and split `TopBottomPanel` into
 `Panel::top`/`Panel::bottom`), not bugs, not touched here.
+
+**The rack is now an application, not just a model.** `studio-app` renders
+the Rack panel: the step grid (paint on/off, per the grid module's rules), a
+per-step modifier lane (velocity, hat-roll ratchet, retune, 808 slide,
+probability — `studio-egui::lanes`), channel strip, BPM and swing, and a
+bounce button that lands the pattern on the timeline as an ordinary
+undoable/shareable `AddSource`+`AddClip`. Space on the Rack panel drives the
+loop; on the Timeline it stays the tape transport. Audition playback loops
+the rendered pattern through cpal (`studio-app::audition`, `audio` feature,
+default on) and degrades to a silent wall-clock playhead when no device
+exists — the status line says which sink you got. `studio-live` grew the
+trap half the rack existed for: synthesized `Drum` voices (kick, snare,
+clap, closed/open hats — deterministic, zero assets), `Tempo::swing`
+(placement-time, off-16ths only), `Rack::trap_kit()` as the demo groove, and
+rate-correct `Sampler` playback (linear resample when source rate ≠ render
+rate). `.opus` decodes natively via `studio-media`'s `opus` feature (ogg +
+libopus, default on) — stereo preserved, pre-skip and final-granule
+trimmed so loops seam cleanly — and files dropped on the window import as
+rack sampler channels; the project stores the file's own path (and, through
+collab assets, its compressed bytes), never inflated PCM. **The timeline plays.** The transport now renders the arrangement through
+the tested `mixdown` (whole-project, offline, re-rendered on any edit or
+undo) and drives it out the same sink audition uses — generalized to
+interleaved one-shot/loop buffers with seek. One sink, one owner: starting
+the rack loop stops the tape and vice versa; a finished arrangement stops
+the transport and says so. This is a deliberate trade against
+`studio-engine`'s streaming path: at beat-project sizes a full re-render per
+edit is cheap and cannot glitch; `DeviceEngine` remains the named path for
+when projects outgrow it. Channels also gained **choke groups** (`Channel::
+choke_group`, wire v6): a group hit cuts the group's ringing voice with a
+~2ms fade; same-sample hits layer; the kit's hats ship in group 1. Drops are
+panel-routed: a file dropped on the Rack becomes a sampler channel, dropped
+on the Timeline it becomes a clip at the playhead on the first audio track
+*with room* — a melody loop is arrangement material, not a truncated
+one-shot. **Beats leave the building.** `studio-media` gained the encode half of its
+Opus support — Ogg Opus out (RFC 7845), pre-skip declared from the
+encoder's real lookahead, final granule marking the true end, and the
+encoder over-fed by one lookahead of silence so a frame-aligned input
+doesn't leave its last 312 samples inside libopus (a bug the unaligned test
+case couldn't see and the aligned one caught; both alignments are pinned
+now). Exports roundtrip sample-exact through this crate's own decoder and
+read correctly in ffprobe. The shell exports the arrangement as 16-bit
+dithered WAV or 128k Opus to `./exports/<project>-<stamp>.*` — no dialog,
+the status line prints the path — and a bounce now writes its WAV to the
+path its `AddSource` op records, so the project's references are real
+files. **The Mixer is a panel now, and the model paid its tax first.** `Track`
+gained `gain` (`Op::SetTrackGain`, wire v7, refused on a locked track,
+serde-defaulted to UNITY so a pre-fader project cannot load silent) and
+`mixdown` multiplies it with each clip's own gain — pinned at the usual
+half-gain-is-6dB. The panel: fader per track committing ONE op on drag
+release (a value per frame would be sixty undo entries and sixty packets
+per gesture — `Paint`'s rationale, one layer up; the drag preview is visual
+only, audio follows on release, and a live fader ride is honestly the
+streaming engine's job), mute as the existing `SetTrackFlags` op, and solo
+as deliberately-local monitoring state that shapes renders and exports but
+never the project. **The shell is a peer now.** `Studio::edit` goes through the Doc's op log
+(`Doc::local` — stamped, replay-safe) instead of mutating the project
+directly; the old `History` wiring bypassed the log, which would have LOST
+every local edit on the first remote-conflict replay. Undo/redo are inverse
+ops routed back through the same door, so an undo travels to peers as the
+edit it is — and a refusal after remote conflict is said out loud. Local
+activity (ops and whole-rack LWW syncs, published from one per-frame choke
+point) lands in `Studio::drain_outbox()`; `Studio::integrate_packet()`
+accepts everything a peer sends, answers `Hello` with a log catch-up, and
+adopts the LWW winner's rack. Six two-peer tests exercise the seam headless:
+groove convergence both directions, concurrent project edits without a
+referee, undo-as-op, flaky-link catch-up, snapshot join (the documented
+broadcast()+rack_broadcast() flow — NOT snapshot+log, whose double-apply bug
+broadcast()'s own docs record), and simultaneous-edit LWW agreement. **Media follows its op.** The wire gained the asset quartet (v8):
+`AssetRequest`/`AssetManifest`/`ChunkRequest`/`Chunk`, built on the assets
+module's content-defined chunking — an `AddSource` travels light and the
+peer pulls exactly the chunks its content-addressed store lacks, so a
+shared sample or a re-bounce that changed one bar transfers one bar (or
+nothing — pinned by test). Chunks are verified by their id on arrival; a
+corrupt chunk is dropped, never assembled into a take that is subtly wrong
+at the mix. Bounces register their WAV bytes (one encode feeds both the
+file the op's path promises and the chunk store); imports register the
+COMPRESSED original — a .opus stays .opus on the wire, which is the whole
+size story. The flagship test is the point end to end: A bounces, and B's
+own `mixdown` renders A's kick. **The wire is real.** `studio-collab::stream` is a TCP carrier: two
+threads per connection over `Packet::frame`/`drain`, mpsc facing the shell
+so the `Studio` stays single-threaded around the Doc, and dumb on purpose —
+it never reads a packet. Every thread exit path shuts the socket down (an
+abandoned socket leaves the far side blocked in `read()` forever, which is
+exactly how the dropped-peer test first failed). The shell opens it from
+`STUDIO_LISTEN=addr:port` / `STUDIO_CONNECT=addr:port` and pumps it per
+frame; on connect it sends `Hello { since: 0 }` EXPLICITLY rather than
+`Doc::hello()` — that helper reports our own max lamport, which under-asks
+on first contact between peers who both edited offline and would silently
+lose their concurrent ops; the seen-set makes over-fetching free. The
+flagship now runs over 127.0.0.1: A bounces, and B — connected only by
+TCP — renders A's kick, holds A's groove, and the projects converge. One
+peer, no reconnect, no discovery, no encryption: stated in the module docs;
+the dht network half stays the named future. **Beats survive restarts.** The collab file format grew a fourth,
+MANDATORY rack section (length 0 = no rack; a file cut at the boundary
+refuses like any other prefix — the tempting "tolerate a missing tail"
+reading was a truncation hole the damaged-file test's every-prefix sweep
+caught, since a truncated file loaded rack-less would overwrite a complete
+original on the next save). `Studio::save_to`/`load_from` write and open
+whole sessions: project, history, rack; media stays as path references
+resolved RELATIVE TO THE FILE, so a project folder moves as a unit, and
+reloaded sources arrive through `incoming_audio` — the same door peer
+media uses. A missing sample is counted out loud and its clip stays
+silent; garbage refuses to open rather than becoming an empty project.
+The shell opens `STUDIO_PROJECT` (default `./project.studio`) at startup
+— a load FAILURE starts a demo but warns that Ctrl+S will overwrite —
+and saves on Ctrl+S or the save button. **Clips answer the mouse.** The timeline's `hit_test`/`snap` helpers were
+built and never wired: clicks were thrown away by the shell and no drag
+path existed. `timeline` now returns a `TimelineResponse` — click (the
+shell selects; shift toggles) and drop (`MoveClip`, an op like any other:
+undoable, on the wire, and refusable out loud when `check_room` says no).
+The drag itself lives on the `View` as transient state, draws a ghost, and
+never touches the project; `move_target` is a pure, tested function that
+snaps, clamps at zero, and refuses to land audio on a video row (a
+cross-kind vertical move is a re-route the mixer cannot honour — refused
+at the gesture, not the op). The rack grew pattern LENGTH (1–64 steps, the
+rows' u64; shortening hides bits without eating them, so
+shorten-then-lengthen round-trips) and DUPLICATE (variations start from
+the groove, not silence). **The timeline scrolls, zooms, and trims.** The wheel pans (both axes —
+a timeline is a horizontal thing), ctrl-wheel/pinch zooms about the
+pointer, both hover-gated; panning clamps at zero. Edge grabs trim (7px
+grips), body grabs move; `grab` classifies purely, `trim_target` clamps to
+a 10ms sliver, the source's material, and — for a LEFT trim — moves start
+and in-point together so audio never smears in time, revealing earlier
+material only as far as the source actually has it. An ambiguous grab on a
+tiny clip goes to the preferred side, and `alt-;` (`FlipTrimSide` — a key
+the map minted before the drag existed) finally flips it. A left trim
+lands as its two true facts, TrimClip then MoveClip: two ops, two undos,
+the precedent a bounce set. The Rack panel scrolls on both axes (a 64-step pattern is ~1.5k px of
+grid, and the stated targets include phone-sized viewports) and the Mixer
+scrolls vertically. Also still named: streaming pattern playback inside
+`DeviceEngine`'s realtime render, group-undo for multi-op gestures (a
+left-trim is TrimClip+MoveClip — two undo presses for one gesture; the
+core has `History::apply_group`, the shell's op-log undo has no grouping
+yet), and the Program panel, which says so on screen instead of showing
+nothing.
+
+**Toward the full studio shape.** mixdown had the sampler's old chipmunk
+bug hiding one layer up — sources were indexed at the RENDER rate, so a
+44.1k file on the timeline played ~9% sharp; fixed with the same
+fractional-position interpolation, pinned by a 24k-ramp test, which is
+what makes render rates a real parameter: WAV exports at 44.1/48/96/192
+(a 96k export is the same music at twice the frames, tested), Opus stays
+48k by codec contract. The Mixer shows the BUS half the model always had:
+create busses, route tracks (SetRoute), per-bus gain/mute, and effect
+chains built from the studio-fx registry (saturation/eq/compressor/
+limiter/color) — the track→saturated-drum-bus→master shape is one test,
+including its four-op undo. A library sidebar (STUDIO_LIBRARY, default
+./library; two-level scan, audio-only, sorted) offers every sample the
+two doors drops already had: rack channel or timeline clip. Tape stop and halftime are native effects now
+(`studio-fx::playrate`) and addable from any bus chain. **The keyboard plays.** The sink grew additive one-shot VOICES (an SPSC
+channel the audio callback drains, so triggering a note never locks and
+never disturbs the loop it mixes over, with an oldest-drops cap so a stuck
+key cannot grow unbounded work per buffer) — which is what both playing
+mode and the library's ▶ preview needed. `shared/analog-kit` is the
+Wooting Analog SDK behind a plain value: dlopen by documented name, HID
+usage → depth, digital fallback with no cfg at the call site, and a
+MUSICAL velocity curve rather than skydribble's steering curve (a high
+floor is right for turning a car and wrong for playing quietly). It is
+factored from `games/skydribble/src/analog.rs`, which proved the approach;
+that game is deliberately NOT refactored onto it in the same breath.
+studio-app supplies it as the real backend for `studio_egui::playkeys`'s
+`AnalogSource` seam. **Controllers play it.** `studio-app::midi` splits at the line that
+matters: a PURE parser (running status, note-on-velocity-0-is-note-off,
+14-bit bend, truncated packets dropped — all tested with nothing plugged
+in) under a feature-gated `midir` connection, so a build without ALSA
+still compiles and reports no ports. A controller note becomes the same
+`playkeys::PlayNote` the computer keyboard makes, so there is ONE note
+path: voiced through the sink now, and landed in the pattern when the
+transport is recording — quantised to the NEAREST step, both because a
+note struck a hair early belongs on the beat and because Transport stores
+position in frames, so an exact boundary reads back a fraction below it
+(flooring recorded a whole step early; a test caught it). CC and pitch
+bend are parsed and deliberately unrouted until there is a learn-and-bind
+UI: a mod wheel that silently moved an unrelated fader is worse than one
+that does nothing. MIDI clock is not parsed at all — syncing to an
+external clock means resampling against drifting wall time, which belongs
+with the streaming engine, not a 0xF8 match arm. Named, not built, from
+the same wishlist: batch multi-clip editing,
+clip-level chain editing,  
+ a playing
+mode for keys — now built, see below — Wooting analog input, and VST/CLAP
+hosting — studio-fx::retune is the native autotune seed; for external
+FOSS instruments (Surge XT, Dexed, sfizz + Salamander for piano) a plugin
+host is its own project.
 
 ## Realtime collaboration, concretely
 
@@ -956,3 +1147,144 @@ newcomer therefore received a clip op with no track to put it on. It now sends a
 full snapshot via `file::snapshot`, so the ops that rebuild a project for a
 collaborator are literally the ones that rebuild it from disk. Same class of bug
 as `Doc::rebuild` starting from an empty project, caught the same way.
+
+
+**The keyboard is an instrument (and still a keyboard).** `studio-egui::playkeys`
+adds a Playing mode beside the Helix motions keymap: the tracker layout
+(`asdfghjk` white, `we tyu` black, `zxcvbnm` an octave down) keyed on egui's
+PHYSICAL key rather than the logical one — on AZERTY a character-keyed layout
+scatters C major across the board, and position is what "locale adaptive"
+actually means. Playing mode makes the editing keys inert (in it, `d` is a
+note, not a delete) with Escape as the guaranteed way out — tested, because a
+mode you cannot leave is a trap. Notes land in the pattern as tuned steps on
+the selected channel at the playhead's column: recording into the grid rather
+than sounding a live voice is a deliberate line — step entry works today and
+its result is what the grid, the bounce, and a peer all already understand,
+while a live voice needs a polyphonic one-shot mixer over the audition sink
+(named, with audition-on-click, as the next input milestone). Velocity comes
+through an `AnalogSource` seam: `NullAnalog` gives a held key full velocity,
+and an analog keyboard's travel becomes the step's velocity — a soft press
+stays soft in the pattern. The Wooting binding itself is NOT written here:
+`games/skydribble/src/analog.rs` already dlopens the Analog SDK behind a cargo
+feature with a no-op fallback, and lifting that into a shared crate (rather
+than copying 200 lines of FFI no test in this repo can exercise without the
+hardware) is the honest next step.
+
+
+**Sends: the parallel taps.** The Mixer's bus rows gained a sends line —
+add a send to any other bus, set its level (commit-on-release, like every
+fader here), flip pre/post-fader, remove it. Self-sends and duplicates are
+filtered out of the menu: a bus sending to itself is a feedback path the
+mixdown would have to defend against, and two sends down one path are two
+faders fighting. This closes the gap that made "a reverb bus" unbuildable
+in the UI even though `mixdown` implemented sends all along: ROUTING a drum
+bus into a reverb replaces the drums with reverb, while SENDING gives it a
+copy — two tests pin exactly that distinction (a send raises the mix's
+energy over the dry path; muting the return brings the dry mix back
+unchanged; level scales the copy).
+
+
+**Autotune, print-side — where its own docs say it belongs.** `studio-fx::
+autotune` (retune's brain + psola's hands) has been complete and unwired;
+the tempting move was a chain effect kind, and it would have been wrong:
+the module is explicitly a whole-buffer pass — epoch continuity and the
+ratio track both need more context than a realtime callback has — so a
+chain effect that silently required the whole take would be a lie about
+what chains are. Instead the shell exposes it as a take-bounce: select a
+clip, pick a key and mode, "tune take", and the corrected version lands as
+a NEW source and clip beside the dry one (a new recording, not an edit in
+place: the dry take stays on disk, stays undoable, stays audible to a peer,
+and A/B is a mute away). It goes to the first audio track with room, the
+same rule import follows. Tests pin a 452 Hz take pulled home toward A440
+in A minor, identical length so it still lines up with the beat, both ops
+undoable, and refusals said out loud for no-selection and for a clip whose
+media has not arrived yet — tuning an absent source would land a silent
+'take' you would only discover later. Live-monitor autotune remains what
+the module says it is: separate work needing a streaming wrapper that
+carries epoch and ratio state across calls.
+
+
+**The clip inspector — the per-clip half of the signal path, finally
+reachable.** `Clip` has carried `gain` and `effects` from the start and
+`mixdown` has always rendered both (per-clip instances, cached by clip id),
+but nothing in the shell could edit them: that half was reachable only by
+writing ops in a test. The inspector sits above the arrangement — it is
+about the thing you just clicked, so it belongs where your eyes already
+are — and collapses to nothing when nothing is selected. Per-clip gain
+(commit-on-release, like every fader here) and a chain built from the same
+`ADDABLE_FX` catalog the Mixer uses, deliberately shared rather than
+re-listed so two catalogs cannot drift. Disabling an effect keeps it in the
+chain at its position, because the A/B a person wants is "with and without
+this one", not "delete it and add it back at the end". Why per-clip effects
+exist beside bus chains at all: a bus treats everything reaching it the
+same way — that is what a bus is — while "this one ad-lib needs a filter
+sweep and the other twelve do not" is a per-clip fact, and routing that
+ad-lib to its own bus to express it would be inventing structure to hold a
+single decision. Tests pin that a clip's chain reaches the render, that its
+neighbour never hears it, that bypass is audible while the effect keeps its
+place, and that clip gain is one undoable gesture. Multi-selection edits the
+first clip and says so rather than pretending — a batch shape this panel
+does not have yet.
+
+
+**Live autotune — the other algorithm, not the same one rewrapped.**
+`studio-fx::realtune` is the streaming counterpart to the offline pass:
+detection on a rolling ring (YIN every ~5 ms), the pitch snapped to a
+`Target` — either a key (`Scale`) or, the point of the exercise, an
+explicit set of MIDI notes so a hook that only lands on chord tones snaps
+to exactly those and a passing note goes to the nearer MEMBER rather than
+to some other in-key degree — and resynthesis by a two-tap crossfading
+delay line rather than PSOLA. A delay ramping at rate `1 - ratio` IS a
+pitch shift; the ramp's wrap hides under Hann windows that sum to unity at
+50% overlap. That is cheaper than PSOLA, needs no lookahead, and has fixed
+reportable latency (~22 ms), which is what a monitoring path must be able
+to state about itself. It IS registered as a chain kind (`"autotune"`),
+because unlike the whole-buffer pass it is honestly an insert. Measured,
+not asserted: the shifter is exact to under a cent, while the LOOP is
+open — the ratio comes from YIN's estimate of the input and is never
+checked against the output — so the detector's own bias (~6 cents at 452
+Hz, ~16 at 554) passes through. Tests measure by zero crossings on
+purpose: verifying with the same YIN that produced the bias would have
+hidden it, which is exactly what the first draft of those tests did.
+
+
+**The tuner, smoothed and made affordable.** Three changes, each with a
+measurement behind it. (1) `analyse()` allocated a Vec every hop — a malloc
+inside the audio path, invisible in tests and audible as a dropout the
+first time the allocator takes a lock; the scratch buffers are now
+preallocated. (2) Detection was full-rate YIN at a 70 Hz floor, ~2M
+multiply-adds per 5 ms hop, most of a core for ONE voice; it is now a
+coarse search on 4× decimated audio followed by a local full-rate
+difference search with parabolic interpolation. The suite time for these
+tests fell from 5.1 s to 0.5 s, and accuracy IMPROVED — the refinement
+closed most of the open-loop bias the previous pass documented, so the
+assertions went from 15–25 cents to under 5. (3) The applied ratio now
+ramps across the hop instead of jumping at each analysis boundary: a step
+in the delay line's read rate is a tick every 5 ms on a sustained note, and
+a test pins that no single sample moves the ratio by more than a thousandth
+even with smoothing set to hard-snap. A cost test asserts 1 s of stereo
+processes in under 0.25 s so a regression shows up as a failure rather
+than as a crackle.
+
+**Adaptive saturation — character from the material.** `studio-fx::
+adaptive_sat` (chain kind `adaptivesat`) drives from two independent
+detectors: REGISTER (the fundamental, via the same coarse+refine detector
+the tuner uses, mapped log-wise between 60 Hz and 600 Hz) and SIBILANCE
+(high-band energy over total, from one-poles — cheap, pitch-free, responds
+in milliseconds like an "s" demands). Low notes get more drive and high
+notes less, because an 808 wants tape and a lead is already bright;
+sibilance always pulls drive DOWN, because a saturator's job is adding
+harmonics and sibilance is the last thing that needs more. Either amount
+set to zero disables that detector alone — plain register-following drive,
+or plain de-essing — and both at zero is bit-identical to the fixed
+`Saturator` it wraps, which is what makes it A/B-able against what it
+replaces. `Link::Tied` scales the sibilance response by register: careful
+up top, relaxed down low, one gesture instead of two knobs kept consistent
+— a mode rather than the default, because material whose sibilance lives
+in the low register (a distorted bass with fret noise) wants them apart.
+Profiles deliberately do NOT crossfade per-sample — different harmonic
+signatures and DC behaviour would smear the very character the stage
+picks; the amount and asymmetry move instead. Unvoiced stretches HOLD the
+register so a drum hit between two sung notes cannot swing the character,
+and `detectors()` exposes both numbers, because an adaptive effect whose
+decisions you cannot see is indistinguishable from a broken one.

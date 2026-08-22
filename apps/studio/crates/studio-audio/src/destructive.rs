@@ -282,7 +282,7 @@ mod tests {
         // clip and its source must be byte-identical after the edit ops
         // apply — nothing here removes or mutates them, only adds.
         let mut project = Project { name: "t".into(), ..Default::default() };
-        project.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+        project.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         project.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "original.wav".into(), len: Ticks::from_seconds(2.0), sample_rate: SR, channels: 1, has_video: false } }).unwrap();
         project.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(2.0), gain: 1.0, effects: Vec::new() } }).unwrap();
         let original_source = project.sources[&SourceId(1)].clone();
@@ -317,7 +317,7 @@ mod tests {
         let (ops_b, _b) = delete_range_ops(&base, 400, 500, 64, SourceId(11), ClipId(11), TrackId(1), Ticks::from_seconds(1.0), "b.wav");
 
         let mut project_a = Project { name: "t".into(), ..Default::default() };
-        project_a.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+        project_a.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         let mut project_b = project_a.clone();
 
         for op in ops_a.iter().cloned().chain(ops_b.iter().cloned()) {
@@ -344,7 +344,7 @@ mod tests {
         let (ops, edited) = delete_range_ops(&original, cut_start, cut_end, 65_536, SourceId(1), ClipId(1), TrackId(1), Ticks::ZERO, "cut.wav");
 
         let mut project = Project { name: "t".into(), ..Default::default() };
-        project.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+        project.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         for op in ops {
             project.apply(&op).unwrap();
         }

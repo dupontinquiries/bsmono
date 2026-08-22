@@ -24,6 +24,7 @@
 //! (project, sources, window) so a render is reproducible and testable — no
 //! device, no callback, no clock.
 
+pub mod format;
 pub mod stems;
 pub mod block;
 pub mod destructive;
@@ -585,18 +586,41 @@ pub fn mixdown_into(
             for i in 0..n {
                 let at = Ticks::from_samples(start.to_samples(rate) + i as i64, rate);
                 let into_clip = at.saturating_sub(clip.pos);
-                let src_frame = (clip.src_in.saturating_add(into_clip)).to_samples(rate) as usize;
-                if src_frame >= src.frames() { break; }
-                let g = clip.gain * fade.gain_at(into_clip, clip.len);
+                // Index the SOURCE at the source's own rate — indexing a
+                // 44.1k file at 48k-sample positions plays it ~9% sharp and
+                // runs out early, the exact chipmunk bug the rack sampler
+                // already had fixed while this path kept it. Same cure:
+                // fractional position, linear interpolation; a same-rate
+                // source takes the exact integer path untouched.
+                let src_t = clip.src_in.saturating_add(into_clip);
+                let g = clip.gain * track.gain * fade.gain_at(into_clip, clip.len);
                 let oi = (out_off + i) * 2;
                 if oi + 1 >= dest.len() { break; }
-                // a mono source feeds both sides; a stereo one keeps its image
-                let (mut l, mut r) = if src.channels.len() >= 2 {
-                    (src.channels[0][src_frame], src.channels[1][src_frame])
-                } else {
-                    let v = src.channels[0][src_frame];
-                    (v, v)
+                let read = |c: &[f32], pos: f64| -> Option<f32> {
+                    let i0 = pos as usize;
+                    if i0 + 1 >= c.len() { return None; }
+                    let frac = (pos - i0 as f64) as f32;
+                    Some(c[i0] * (1.0 - frac) + c[i0 + 1] * frac)
                 };
+                let (mut l, mut r);
+                if src.sample_rate == rate {
+                    let f = src_t.to_samples(rate) as usize;
+                    if f >= src.frames() { break; }
+                    if src.channels.len() >= 2 {
+                        l = src.channels[0][f];
+                        r = src.channels[1][f];
+                    } else {
+                        l = src.channels[0][f];
+                        r = l;
+                    }
+                } else {
+                    let pos = src_t.to_seconds() * src.sample_rate as f64;
+                    let Some(v0) = read(&src.channels[0], pos) else { break };
+                    l = v0;
+                    r = if src.channels.len() >= 2 {
+                        match read(&src.channels[1], pos) { Some(v) => v, None => break }
+                    } else { v0 };
+                }
                 for inst in clip_fx.iter_mut() {
                     l = inst.process_audio(l);
                     r = inst.process_audio(r);
@@ -727,7 +751,7 @@ mod tests {
         let rate = 48_000;
         let mut p = Project { name: "mix".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "t.wav".into(),
             len: Ticks::from_seconds(len_s), sample_rate: rate, channels: 1, has_video: false } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
@@ -1494,7 +1518,7 @@ mod tests {
         let (mut p, audio) = project_with(0.5, 1.0);
         p.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(2), kind: studio_core::TrackKind::Audio, name: "A2".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 1 }).unwrap();
         let mut audio2 = audio.clone();
         audio2.insert(studio_core::SourceId(2), tone(24_000, 48_000, 660.0, 0.5));
@@ -1525,5 +1549,76 @@ mod tests {
             assert!((drums_only[i] - expected[i]).abs() < 1e-5,
                 "sample {i}: soloing Drums must equal muting Melody — Beat (their shared ancestor) must stay open either way");
         }
+    }
+}
+
+#[cfg(test)]
+mod track_fader_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn one_clip_project(track_gain: f32) -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: track_gain, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![vec![0.5; 48_000]] });
+        (p, audio)
+    }
+
+    #[test]
+    fn the_track_fader_scales_its_clips_like_the_clip_fader_does() {
+        // Half gain is 6 dB down — the same rule the clip-gain test pins,
+        // now one stage upstream, and multiplicative with it.
+        let (p_full, audio) = one_clip_project(1.0);
+        let (p_half, _) = one_clip_project(0.5);
+        let full = mixdown(&p_full, &audio, &BTreeMap::new(),
+                           Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        let half = mixdown(&p_half, &audio, &BTreeMap::new(),
+                           Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        let sum = |v: &[f32]| v.iter().map(|s| s.abs()).sum::<f32>();
+        let ratio = sum(&half) / sum(&full);
+        assert!((ratio - 0.5).abs() < 1e-4, "fader at 0.5 halves the level, ratio {ratio}");
+    }
+}
+
+#[cfg(test)]
+mod source_rate_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    #[test]
+    fn a_low_rate_source_plays_at_pitch_on_the_timeline() {
+        // A 24k ramp rendered at 48k must stretch to its true duration with
+        // the same content — out frame 2n sits at source frame n — exactly
+        // the contract the rack sampler's test pins, now for mixdown.
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 24_000, channels: 1,
+            has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        let ramp: Vec<f32> = (0..24_000).map(|i| i as f32 / 24_000.0).collect();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 24_000, channels: vec![ramp] });
+
+        let out = mixdown(&p, &audio, &BTreeMap::new(),
+                          Ticks::ZERO, Ticks::from_seconds(1.0), 48_000, &[], &[]);
+        // At 0.5s of render (frame 24000, interleaved index 48000), the ramp
+        // must read 0.5 — the pre-fix code read 1.0-and-then-silence there.
+        let mid_l = out[24_000 * 2];
+        assert!((mid_l - 0.5).abs() < 0.01, "half a second in is half the ramp, got {mid_l}");
+        // And the last audible frames are near the ramp's top, not silence:
+        // the source lasts the whole second at pitch.
+        let late_l = out[(47_990) * 2];
+        assert!(late_l > 0.95, "the source fills its true duration, got {late_l}");
     }
 }

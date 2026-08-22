@@ -226,7 +226,7 @@ mod tests {
 
     fn project_with_tone(rate: u32, len_s: f64) -> (Project, BTreeMap<SourceId, SourceAudio>) {
         let mut p = Project { name: "t".into(), ..Default::default() };
-        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "t.wav".into(), len: Ticks::from_seconds(len_s), sample_rate: rate, channels: 1, has_video: true } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(len_s), gain: 1.0, effects: Vec::new() } }).unwrap();
         let mut audio = BTreeMap::new();

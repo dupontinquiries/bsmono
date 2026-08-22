@@ -45,15 +45,31 @@ pub struct Tempo {
     pub bpm: f32,
     /// Steps per beat — 4 gives the classic 16-steps-per-bar rack.
     pub steps_per_beat: u32,
+    /// 0..=1. Swing delays every SECOND step (the off-16ths) by up to half a
+    /// step — 0 is straight, ~0.15 is a typical trap hat feel, 1 pushes the
+    /// off-step all the way to the following 32nd-triplet-ish extreme. It is
+    /// a render-time placement offset, not a change to the grid: [`Tempo::
+    /// step_at`] and the grid playhead stay on the straight grid, which is
+    /// how every hardware sequencer draws it — the LEDs march evenly while
+    /// the audio swings.
+    pub swing: f32,
 }
 
 impl Default for Tempo {
-    fn default() -> Self { Tempo { bpm: 120.0, steps_per_beat: 4 } }
+    fn default() -> Self { Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 } }
 }
 
 impl Tempo {
     pub fn step_len(&self) -> Ticks {
         Ticks::from_seconds(60.0 / self.bpm as f64 / self.steps_per_beat as f64)
+    }
+    /// How many samples late a hit on `step` starts, from swing. Even steps
+    /// are never moved — swing that shifted the downbeats would just be a
+    /// slower tempo wearing a costume.
+    pub fn swing_delay_samples(&self, step: u32, rate: u32) -> usize {
+        if step % 2 == 0 || self.swing <= 0.0 { return 0; }
+        let step_samples = self.step_len().to_samples(rate).max(1) as f32;
+        (self.swing.clamp(0.0, 1.0) * step_samples * 0.5) as usize
     }
     pub fn bar_len(&self, beats_per_bar: u32) -> Ticks {
         Ticks(self.step_len().0 * self.steps_per_beat as i64 * beats_per_bar as i64)
@@ -101,6 +117,44 @@ pub enum SynthKind {
         /// Amplitude decay time: roughly the time to fall to -60dB.
         decay_ms: f32,
     },
+    /// A synthesised drum voice — kick, snare, clap, hats — built in for the
+    /// same reason `Sub` is: a trap rack has to be playable with zero sample
+    /// packs loaded, or the first thing a new project asks for is an asset
+    /// hunt. `Sampler` remains the path for anyone who brings their own kit.
+    Drum {
+        voice: DrumVoice,
+        /// 0..=1, voice-specific colour: the kick's start pitch and click,
+        /// the snare's and hats' brightness, the clap's tail darkness. One
+        /// knob per channel rather than a synth page of them — the rack is a
+        /// performance surface, and detailed sound design belongs to a
+        /// dedicated synth kind later, not to more fields here.
+        tone: f32,
+        /// Amplitude decay to -60dB, same convention as [`SynthKind::Sub`].
+        /// This is also the only difference between a closed and an open
+        /// hat besides their default — there is no choke group yet (a closed
+        /// hat does not yet cut a ringing open one), which is named here
+        /// rather than pretended: choke is a cross-channel rule and belongs
+        /// in [`render_pattern`], not inside a voice.
+        decay_ms: f32,
+        /// Semitone offset applied to the voice's internal frequencies, so a
+        /// [`StepMod::tune`] means the same thing here it does on `Sub`.
+        tune: i8,
+    },
+}
+
+/// Which drum a [`SynthKind::Drum`] channel is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DrumVoice {
+    /// Sine with a fast exponential pitch drop and a click transient.
+    Kick,
+    /// A short tonal body plus high-passed noise.
+    Snare,
+    /// One noise stream through the classic multi-burst envelope.
+    Clap,
+    /// A metallic square-bank plus noise, high-passed hard, short decay.
+    HatClosed,
+    /// The same metal, allowed to ring.
+    HatOpen,
 }
 
 /// Reference fundamental for [`SynthKind::Sub`]'s semitone offsets: 55 Hz,
@@ -120,6 +174,15 @@ pub struct Channel {
     pub gain: f32,
     pub pan: f32,
     pub muted: bool,
+    /// Channels sharing a group id choke each other: a new hit in the group
+    /// cuts (with a ~2ms fade) whatever the group was still ringing — the
+    /// 808's closed-hat-silences-open-hat rule, which is most of why a real
+    /// hat line breathes. `None` (the default, and what any pre-choke rack
+    /// deserializes to) never chokes or is choked. Hits that land on the
+    /// same sample LAYER rather than choke — simultaneity is a chord, not a
+    /// cut, and which one "wins" would otherwise be channel-order trivia.
+    #[serde(default)]
+    pub choke_group: Option<u8>,
 }
 
 /// A pattern: for each channel, which steps fire.
@@ -237,6 +300,84 @@ pub struct Rack {
     pub channels: Vec<Channel>,
     pub patterns: Vec<Pattern>,
     pub tempo_bpm: f32,
+    /// 0..=1, see [`Tempo::swing`]. `serde(default)` so a rack saved before
+    /// swing existed still loads — straight, which is what it was.
+    #[serde(default)]
+    pub swing: f32,
+}
+
+impl Rack {
+    /// The [`Tempo`] this rack renders at. One source of truth: the rack is
+    /// the serialized value, `Tempo` is its render-time view, and deriving
+    /// the second from the first here is what keeps a BPM knob in a UI from
+    /// quietly disagreeing with what a bounce used.
+    pub fn tempo(&self) -> Tempo {
+        Tempo { bpm: self.tempo_bpm.max(1.0), steps_per_beat: 4, swing: self.swing }
+    }
+
+    /// Add a channel, keeping every pattern's row count in step. The
+    /// invariant (one row per channel) lives HERE because breaking it fails
+    /// silently everywhere else: `Pattern::set` on a missing row is a no-op
+    /// by design, so a channel added without its rows would be a grid you
+    /// can paint on that never plays — the silently-dropped-edit failure,
+    /// wearing a synth.
+    pub fn add_channel(&mut self, channel: Channel) -> usize {
+        self.channels.push(channel);
+        for p in &mut self.patterns {
+            while p.rows.len() < self.channels.len() {
+                p.rows.push(0);
+            }
+        }
+        self.channels.len() - 1
+    }
+
+    /// A playable trap kit with a one-bar starter groove — the rack analogue
+    /// of `Studio::demo()`'s timeline, for the same stated reason: an empty
+    /// grid gives a new user nothing to press, and is indistinguishable from
+    /// a broken one. 140 BPM, light swing, an 808 that slides.
+    pub fn trap_kit() -> Rack {
+        let ch = |name: &str, kind: SynthKind, gain: f32| Channel {
+            name: name.into(), kind, gain, pan: 0.0, muted: false, choke_group: None,
+        };
+        let channels = vec![
+            ch("808",   SynthKind::Sub { note: 0, glide_from: None, glide_ms: 70.0,
+                                          drive: 0.35, decay_ms: 420.0 }, 0.9),
+            ch("Kick",  SynthKind::Drum { voice: DrumVoice::Kick, tone: 0.45,
+                                          decay_ms: 160.0, tune: 0 }, 0.95),
+            ch("Snare", SynthKind::Drum { voice: DrumVoice::Snare, tone: 0.55,
+                                          decay_ms: 190.0, tune: 0 }, 0.8),
+            ch("Clap",  SynthKind::Drum { voice: DrumVoice::Clap, tone: 0.5,
+                                          decay_ms: 220.0, tune: 0 }, 0.7),
+            ch("Hat",   SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.6,
+                                          decay_ms: 55.0, tune: 0 }, 0.55),
+            ch("OHat",  SynthKind::Drum { voice: DrumVoice::HatOpen, tone: 0.6,
+                                          decay_ms: 320.0, tune: 0 }, 0.5),
+        ];
+        let mut channels = channels;
+        // The hats choke each other — the open hat breathes until the next
+        // closed hat shuts it, which is most of what makes a hat line a line.
+        channels[4].choke_group = Some(1);
+        channels[5].choke_group = Some(1);
+        let mut p = Pattern::new("Trap A", 16, channels.len());
+        // 808 shadows the kick and slides down through the bar.
+        for s in [0, 6, 10] { p.set(0, s, true); }
+        p.set_mod(0, 6,  StepMod { tune: -2, ..StepMod::default() });
+        p.set_mod(0, 10, StepMod { tune: -5, slide: true, ..StepMod::default() });
+        for s in [0, 6, 10] { p.set(1, s, true); }
+        for s in [4, 12] { p.set(2, s, true); }
+        p.set(3, 12, true);
+        for s in 0..16 { p.set(4, s, true); }
+        // Hat accents on the beats, a ghost between, and rolls into beat 3
+        // and the next bar — the part of a trap groove the mods exist for.
+        for s in [1u32, 3, 5, 9, 11, 13] {
+            p.set_mod(4, s, StepMod { vel: 0.65, ..StepMod::default() });
+        }
+        p.set_mod(4, 7,  StepMod { vel: 0.8, ratchet: 2, ..StepMod::default() });
+        p.set_mod(4, 15, StepMod { vel: 0.85, ratchet: 3, ..StepMod::default() });
+        p.set(5, 14, true);
+        p.set_mod(5, 14, StepMod { vel: 0.6, ..StepMod::default() });
+        Rack { channels, patterns: vec![p], tempo_bpm: 140.0, swing: 0.14 }
+    }
 }
 
 /// Anything that can turn a channel hit into samples.
@@ -272,8 +413,27 @@ impl Synth for BuiltinSynth<'_> {
             }
             SynthKind::Sampler { source } => {
                 if let Some(src) = self.sources.get(source) {
-                    for (i, s) in out.iter_mut().enumerate() {
-                        *s = if i < src.frames() { src.mono(i) } else { 0.0 };
+                    if src.sample_rate == rate {
+                        for (i, s) in out.iter_mut().enumerate() {
+                            *s = if i < src.frames() { src.mono(i) } else { 0.0 };
+                        }
+                    } else {
+                        // Linear resample at render time, so a 44.1k drum
+                        // library plays at pitch on a 48k render (and vice
+                        // versa) instead of shifting ~9% sharp — the classic
+                        // "why is my sample chipmunked" bug. Linear is
+                        // audibly fine for one-shots; a windowed-sinc pass
+                        // is a quality upgrade for later, not a correctness
+                        // requirement for now.
+                        let step = src.sample_rate as f64 / rate as f64;
+                        let frames = src.frames();
+                        for (i, s) in out.iter_mut().enumerate() {
+                            let pos = i as f64 * step;
+                            let i0 = pos as usize;
+                            if i0 + 1 >= frames { *s = 0.0; continue; }
+                            let frac = (pos - i0 as f64) as f32;
+                            *s = src.mono(i0) * (1.0 - frac) + src.mono(i0 + 1) * frac;
+                        }
                     }
                 }
             }
@@ -320,6 +480,135 @@ impl Synth for BuiltinSynth<'_> {
                     sat.process_block(out);
                 }
             }
+            SynthKind::Drum { voice, tone, decay_ms, tune } => {
+                render_drum(*voice, tone.clamp(0.0, 1.0), decay_ms.max(1.0), *tune, rate, out);
+            }
+        }
+    }
+}
+
+// ── drum synthesis ──────────────────────────────────────────────────────────
+//
+// Everything below is deterministic: the "noise" is core_kit's SplitMix64
+// from a seed fixed per voice, so the same hit renders the same samples every
+// time — the property render_pattern's own docs promise ("the same pass of
+// the same pattern always renders identically"), extended to the voices
+// themselves. A system RNG here would make every bounce a different file.
+
+/// -60dB decay time constant, same convention as `SynthKind::Sub`.
+fn tau_60(decay_ms: f32) -> f32 { (decay_ms.max(1.0) / 1000.0) / 6.907_755 }
+
+/// One-pole high-pass. Small enough to live here; `studio_fx`'s EQ is a
+/// block-based effect with its own state and is the wrong shape for a voice
+/// that filters while it synthesises.
+struct OnePoleHp { a: f32, y: f32, x1: f32 }
+impl OnePoleHp {
+    fn new(fc: f32, rate: u32) -> OnePoleHp {
+        let rc = 1.0 / (std::f32::consts::TAU * fc.max(1.0));
+        let dt = 1.0 / rate as f32;
+        OnePoleHp { a: rc / (rc + dt), y: 0.0, x1: 0.0 }
+    }
+    fn step(&mut self, x: f32) -> f32 {
+        self.y = self.a * (self.y + x - self.x1);
+        self.x1 = x;
+        self.y
+    }
+}
+
+/// One-pole low-pass, the same size and for the same reason.
+struct OnePoleLp { a: f32, y: f32 }
+impl OnePoleLp {
+    fn new(fc: f32, rate: u32) -> OnePoleLp {
+        let rc = 1.0 / (std::f32::consts::TAU * fc.max(1.0));
+        let dt = 1.0 / rate as f32;
+        OnePoleLp { a: dt / (rc + dt), y: 0.0 }
+    }
+    fn step(&mut self, x: f32) -> f32 {
+        self.y += self.a * (x - self.y);
+        self.y
+    }
+}
+
+fn render_drum(voice: DrumVoice, tone: f32, decay_ms: f32, tune: i8, rate: u32, out: &mut [f32]) {
+    let pitch = 2f32.powf(tune as f32 / 12.0);
+    let dt = 1.0 / rate as f32;
+    let tau = tau_60(decay_ms);
+    let mut rng = core_kit::rng::SplitMix64::new(0x_D2_B0 + voice as u64);
+    let mut noise = move || (rng.next_f64() as f32) * 2.0 - 1.0;
+
+    match voice {
+        DrumVoice::Kick => {
+            // Pitch falls exponentially from a tone-set start to the ~50Hz
+            // fundamental; phase is integrated and never reset, the same
+            // phase-continuity argument Sub's glide makes.
+            let f_end = 48.0 * pitch;
+            let f_start = (140.0 + tone * 220.0) * pitch;
+            let pitch_tau = 0.020;
+            let click = 0.15 + tone * 0.35;
+            let mut hp = OnePoleHp::new(1800.0, rate);
+            let mut phase = 0.0f64;
+            for (i, s) in out.iter_mut().enumerate() {
+                let t = i as f32 * dt;
+                let hz = f_end + (f_start - f_end) * (-t / pitch_tau).exp();
+                phase += std::f64::consts::TAU * hz as f64 * dt as f64;
+                let body = phase.sin() as f32 * (-t / tau).exp();
+                // The click is the first two milliseconds of high-passed
+                // noise — the part of a kick that survives a phone speaker.
+                let c = if t < 0.002 { hp.step(noise()) * click * (1.0 - t / 0.002) } else { 0.0 };
+                *s = body + c;
+            }
+        }
+        DrumVoice::Snare => {
+            let body_hz = 190.0 * pitch;
+            let body_tau = tau_60((decay_ms * 0.4).min(90.0));
+            let mut hp = OnePoleHp::new(1200.0 + tone * 4000.0, rate);
+            let mut phase = 0.0f64;
+            for (i, s) in out.iter_mut().enumerate() {
+                let t = i as f32 * dt;
+                phase += std::f64::consts::TAU * body_hz as f64 * dt as f64;
+                let body = phase.sin() as f32 * (-t / body_tau).exp() * (0.9 - tone * 0.4);
+                let snap = hp.step(noise()) * (-t / tau).exp();
+                *s = body * 0.6 + snap * 0.85;
+            }
+        }
+        DrumVoice::Clap => {
+            // One noise stream, retriggered envelope: three short bursts
+            // ~11ms apart, then the real hit rings for decay_ms — the 909
+            // recipe, which reads as hands rather than as a snare.
+            let bursts = [0.0f32, 0.011, 0.022];
+            let burst_tau = tau_60(9.0);
+            let main_at = 0.033;
+            let mut hp = OnePoleHp::new(900.0, rate);
+            let mut lp = OnePoleLp::new(5200.0 - tone * 2600.0, rate);
+            for (i, s) in out.iter_mut().enumerate() {
+                let t = i as f32 * dt;
+                let mut env = 0.0f32;
+                for b in bursts {
+                    if t >= b { env = env.max((-(t - b) / burst_tau).exp() * 0.8); }
+                }
+                if t >= main_at { env = env.max((-(t - main_at) / tau).exp()); }
+                *s = lp.step(hp.step(noise())) * env * 1.4;
+            }
+        }
+        DrumVoice::HatClosed | DrumVoice::HatOpen => {
+            // Six detuned squares (the 808's cymbal bank ratios, near enough)
+            // high-passed twice, plus a little noise so the top end shimmers.
+            let ratios = [2.0f32, 3.0, 4.16, 5.43, 6.79, 8.21];
+            let base = 100.0 * pitch * (0.9 + tone * 0.4);
+            let mut phases = [0.0f64; 6];
+            let fc = 6500.0 + tone * 2500.0;
+            let mut hp1 = OnePoleHp::new(fc, rate);
+            let mut hp2 = OnePoleHp::new(fc, rate);
+            for (i, s) in out.iter_mut().enumerate() {
+                let t = i as f32 * dt;
+                let mut metal = 0.0f32;
+                for (p, r) in phases.iter_mut().zip(ratios) {
+                    *p += (base * r) as f64 * dt as f64;
+                    metal += if p.fract() < 0.5 { 1.0 } else { -1.0 };
+                }
+                let x = metal / 6.0 * 0.8 + noise() * 0.3;
+                *s = hp2.step(hp1.step(x)) * (-t / tau).exp();
+            }
         }
     }
 }
@@ -329,7 +618,11 @@ impl Synth for BuiltinSynth<'_> {
 /// last played in this render (tracked by [`render_pattern`]'s own loop, not
 /// by the synth) — see `SynthKind::Sub::glide_from`'s docs on why glide
 /// state lives in the value passed to `render`, not in hidden state.
-fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> SynthKind {
+/// The step's modifiers folded into a voice. Public because a PLAYED note
+/// is the same operation a sequenced one is — tune and velocity applied to
+/// the channel's synth — and the shell must not grow a second, drifting copy
+/// of that rule for its keyboard.
+pub fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> SynthKind {
     match kind {
         SynthKind::Sub { note, glide_ms, drive, decay_ms, .. } => SynthKind::Sub {
             note: note.saturating_add(m.tune),
@@ -339,6 +632,10 @@ fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> Synth
             decay_ms: *decay_ms,
         },
         SynthKind::Sine { hz } => SynthKind::Sine { hz: hz * 2f32.powf(m.tune as f32 / 12.0) },
+        SynthKind::Drum { voice, tone, decay_ms, tune } => SynthKind::Drum {
+            voice: *voice, tone: *tone, decay_ms: *decay_ms,
+            tune: tune.saturating_add(m.tune),
+        },
         // Sampler and Beatspace have no pitch parameter `tune` or `slide`
         // could act on — left untouched rather than pretending to apply
         // something that has no defined meaning for them.
@@ -390,6 +687,19 @@ pub fn render_pattern(
     // this render, not the synth's business. See `apply_step_mod`'s docs.
     let mut last_note: BTreeMap<usize, i8> = BTreeMap::new();
 
+    // ── pass 1: place ───────────────────────────────────────────────────
+    // Decide WHERE every voice starts before rendering ANY of them, because
+    // choke needs to know the group's next hit to know where this one ends —
+    // a single interleaved pass would be adding tails it hasn't yet learned
+    // are cut.
+    struct Placed {
+        ch_i: usize,
+        at: usize,
+        kind: SynthKind,
+        amp: f32,
+        group: Option<u8>,
+    }
+    let mut placed: Vec<Placed> = Vec::new();
     for (ch_i, step_i) in pattern.hits() {
         let Some(ch) = rack.channels.get(ch_i) else { continue };
         if ch.muted { continue; }
@@ -415,15 +725,68 @@ pub fn render_pattern(
 
         let ratchet = m.ratchet.clamp(1, 4) as usize;
         let sub_step = (step / ratchet).max(1);
+        // Swing moves the hit, not the grid: the delay is applied here, at
+        // placement, so step_at / the playhead keep reporting the straight
+        // column the hit belongs to. Ratchet subdivisions ride along with
+        // their (possibly swung) parent step rather than being re-swung
+        // individually — a roll is one gesture, not four independent notes.
+        let swing = tempo.swing_delay_samples(step_i, rate);
         for r in 0..ratchet {
-            scratch.fill(0.0);
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
-            synth.render(&this_kind, rate, &mut scratch);
-            let at = step_i as usize * step + r * sub_step;
-            for (i, v) in scratch.iter().enumerate() {
-                if at + i >= out.len() { break; }
-                out[at + i] += v * ch.gain * m.vel;
+            placed.push(Placed {
+                ch_i,
+                at: step_i as usize * step + swing + r * sub_step,
+                kind: this_kind,
+                amp: ch.gain * m.vel,
+                group: ch.choke_group,
+            });
+        }
+    }
+
+    // Every group's hit-start list, sorted, so "when does the group fire
+    // next" is a partition-point lookup per voice.
+    let mut group_starts: BTreeMap<u8, Vec<usize>> = BTreeMap::new();
+    for p in &placed {
+        if let Some(g) = p.group {
+            group_starts.entry(g).or_default().push(p.at);
+        }
+    }
+    for starts in group_starts.values_mut() {
+        starts.sort_unstable();
+    }
+
+    // ── pass 2: render ──────────────────────────────────────────────────
+    let fade = (rate as usize / 500).max(1); // ~2ms: cut, not click
+    for p in &placed {
+        if p.at >= out.len() { continue; }
+        // What the voice would naturally occupy (its ring, clipped by the
+        // buffer end) vs what choke allows. The synth ALWAYS renders its full
+        // window: some voices (Sine's percussive envelope) shape themselves
+        // to the buffer they're given, so "render into fewer samples" is a
+        // different, faster sound than "render fully, cut at add time" — and
+        // add-time cutting is what the pre-choke renderer did.
+        let natural = voice_len.min(out.len() - p.at);
+        let mut allowed = natural;
+        if let Some(starts) = p.group.and_then(|g| group_starts.get(&g)) {
+            // First group start STRICTLY after this one — simultaneous group
+            // hits layer (see `choke_group`'s docs), and a voice must not
+            // choke itself at its own start index.
+            let next = starts.partition_point(|&s| s <= p.at);
+            if let Some(&cut_at) = starts.get(next) {
+                allowed = allowed.min(cut_at - p.at);
             }
+        }
+        if allowed == 0 { continue; }
+        scratch.fill(0.0);
+        synth.render(&p.kind, rate, &mut scratch);
+        let choked = allowed < natural;
+        for (i, v) in scratch[..allowed.min(scratch.len())].iter().enumerate() {
+            let mut v = *v;
+            if choked && allowed >= fade && i >= allowed - fade {
+                // Linear ramp over the last ~2ms before the cut.
+                v *= (allowed - i) as f32 / fade as f32;
+            }
+            out[p.at + i] += v * p.amp;
         }
     }
     out
@@ -566,20 +929,20 @@ mod tests {
     fn rack() -> Rack {
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false },
-                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false, choke_group: None },
                 Channel { name: "beatspace".into(),
                           kind: SynthKind::Beatspace { z: [0.1, -0.4, 0.0], crossfade: 0.5 },
-                          gain: 1.0, pan: 0.0, muted: false },
+                          gain: 1.0, pan: 0.0, muted: false, choke_group: None },
             ],
             patterns: vec![],
-            tempo_bpm: 120.0,
+            tempo_bpm: 120.0, swing: 0.0,
         }
     }
 
     #[test]
     fn steps_land_on_the_beat_grid() {
-        let t = Tempo { bpm: 120.0, steps_per_beat: 4 };
+        let t = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
         // 120bpm = 0.5s a beat, so a 16th is 0.125s
         assert!((t.step_len().to_seconds() - 0.125).abs() < 1e-9);
         // a 4/4 bar is 2 seconds
@@ -621,7 +984,7 @@ mod tests {
         let mut p = Pattern::new("A", 8, 3);
         p.set(0, 0, true);
         p.set(0, 4, true);
-        let t = Tempo { bpm: 120.0, steps_per_beat: 4 };
+        let t = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
         let out = render_pattern(&p, &r, &mut synth, &t, 48_000, 0);
@@ -723,7 +1086,7 @@ mod tests {
         let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(2), kind: studio_core::TrackKind::Audio, name: "Vox".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 0 }).unwrap();
         let before = project.clone();
 
@@ -919,11 +1282,11 @@ mod tests {
         rack.channels.push(Channel {
             name: "808".into(),
             kind: SynthKind::Sub { note: -5, glide_from: None, glide_ms: 0.0, drive: 0.3, decay_ms: 300.0 },
-            gain: 1.0, pan: 0.0, muted: false,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
         });
         let mut pattern = Pattern::new("beat", 16, rack.channels.len());
         pattern.toggle(3, 0); // the new 808 channel, on step 0
-        let tempo = Tempo { bpm: 140.0, steps_per_beat: 4 };
+        let tempo = Tempo { bpm: 140.0, steps_per_beat: 4, swing: 0.0 };
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
         let out = render_pattern(&pattern, &rack, &mut synth, &tempo, 48_000, 0);
@@ -936,7 +1299,7 @@ mod tests {
         let mut pattern = Pattern::new("beat", 16, rack.channels.len());
         pattern.toggle(0, 0);
         pattern.toggle(1, 4);
-        let tempo = Tempo { bpm: 128.0, steps_per_beat: 4 };
+        let tempo = Tempo { bpm: 128.0, steps_per_beat: 4, swing: 0.0 };
         let rate = 48_000;
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
@@ -959,7 +1322,7 @@ mod tests {
         let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(1), kind: studio_core::TrackKind::Audio, name: "Drums".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 0 }).unwrap();
 
         let ops = bounce_ops(&pattern, &tempo, 48_000, SourceId(1), ClipId(1), TrackId(1), Ticks::from_seconds(2.0), "bounce.wav");
@@ -982,7 +1345,7 @@ mod tests {
         let mut pattern = Pattern::new("beat", 16, rack.channels.len());
         pattern.toggle(0, 0);
         pattern.toggle(0, 8);
-        let tempo = Tempo { bpm: 128.0, steps_per_beat: 4 };
+        let tempo = Tempo { bpm: 128.0, steps_per_beat: 4, swing: 0.0 };
         let rate = 48_000;
         let sources_for_render = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources_for_render };
@@ -992,7 +1355,7 @@ mod tests {
         let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: studio_core::Track {
             id: TrackId(1), kind: studio_core::TrackKind::Audio, name: "Drums".into(),
-            muted: false, locked: false, route: None,
+            muted: false, locked: false, gain: 1.0, route: None,
         }, at: 0 }).unwrap();
         for op in bounce_ops(&pattern, &tempo, rate, SourceId(1), ClipId(1), TrackId(1), Ticks::ZERO, "bounce.wav") {
             project.apply(&op).unwrap();
@@ -1077,15 +1440,15 @@ mod tests {
             channels: vec![Channel {
                 name: "808".into(),
                 kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 30.0, drive: 0.0, decay_ms: 2000.0 },
-                gain: 1.0, pan: 0.0, muted: false,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
             }],
-            patterns: vec![], tempo_bpm: 120.0,
+            patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
         };
         let mut pattern = Pattern::new("beat", 16, 1);
         pattern.toggle(0, 0);
         pattern.toggle(0, 4);
         pattern.set_mod(0, 4, StepMod { tune: 12, slide: true, ..StepMod::default() });
-        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4 };
+        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
         let rate = 48_000;
         let step_samples = tempo.step_len().to_samples(rate) as usize;
 
@@ -1113,7 +1476,7 @@ mod tests {
         let mut pattern = Pattern::new("beat", 4, rack.channels.len());
         pattern.toggle(0, 0);
         pattern.set_mod(0, 0, StepMod { ratchet: 4, ..StepMod::default() });
-        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4 };
+        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
         let rate = 48_000;
         let step_samples = tempo.step_len().to_samples(rate) as usize;
         let sources = std::collections::BTreeMap::new();
@@ -1244,5 +1607,341 @@ mod tests {
             let fired = out.iter().any(|s| *s != 0.0);
             assert_eq!(fired, pass % 2 == 0, "pass {pass}: every=(0,2) should fire only on even passes");
         }
+    }
+}
+
+#[cfg(test)]
+mod trap_tests {
+    use super::*;
+
+    fn render_voice(voice: DrumVoice, decay_ms: f32, len: usize) -> Vec<f32> {
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let mut out = vec![0.0f32; len];
+        synth.render(&SynthKind::Drum { voice, tone: 0.5, decay_ms, tune: 0 }, 48_000, &mut out);
+        out
+    }
+
+    fn energy(buf: &[f32], from: usize, to: usize) -> f32 {
+        buf[from.min(buf.len())..to.min(buf.len())].iter().map(|s| s.abs()).sum()
+    }
+
+    #[test]
+    fn every_drum_voice_makes_sound_and_the_same_sound_every_time() {
+        // The noise is a seeded PRNG, not a system RNG, so a bounce is a
+        // reproducible artifact — render_pattern's own promise, extended to
+        // the voices. A kit that renders differently per run makes every
+        // test of a mix flaky and every re-bounce a different file.
+        for v in [DrumVoice::Kick, DrumVoice::Snare, DrumVoice::Clap,
+                  DrumVoice::HatClosed, DrumVoice::HatOpen] {
+            let a = render_voice(v, 150.0, 4800);
+            let b = render_voice(v, 150.0, 4800);
+            assert!(energy(&a, 0, 4800) > 0.5, "{v:?} is audible");
+            assert_eq!(a, b, "{v:?} renders deterministically");
+        }
+    }
+
+    #[test]
+    fn a_kick_starts_high_and_lands_low() {
+        // The pitch drop is the kick. Count zero crossings early vs late:
+        // ~200+Hz at the attack must cross more often than the ~50Hz tail.
+        let k = render_voice(DrumVoice::Kick, 300.0, 48_000 / 5);
+        let crossings = |from: usize, to: usize| k[from..to].windows(2)
+            .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        let early = crossings(0, 1440);          // first 30ms
+        let late = crossings(4320, 5760);        // 90..120ms
+        assert!(early > late * 2, "early={early} late={late}: the sweep fell");
+    }
+
+    #[test]
+    fn a_closed_hat_is_short_and_an_open_hat_rings() {
+        let closed = render_voice(DrumVoice::HatClosed, 55.0, 48_000 / 2);
+        let open = render_voice(DrumVoice::HatOpen, 320.0, 48_000 / 2);
+        let after_150ms = 7200;
+        let c = energy(&closed, after_150ms, closed.len());
+        let o = energy(&open, after_150ms, open.len());
+        assert!(o > c * 5.0, "open tail {o} vs closed tail {c}");
+    }
+
+    #[test]
+    fn a_clap_is_several_hands_not_one() {
+        // The 909 recipe: retriggered envelope over one noise stream. After
+        // each pre-burst decays the next one must bring the level back UP —
+        // a single-burst clap only ever falls.
+        let c = render_voice(DrumVoice::Clap, 200.0, 4800);
+        let ms = |t: f32| (t / 1000.0 * 48_000.0) as usize;
+        let fall_1 = energy(&c, ms(8.0), ms(10.5));
+        let rise_2 = energy(&c, ms(11.5), ms(14.0));
+        let fall_2 = energy(&c, ms(19.0), ms(21.5));
+        let rise_3 = energy(&c, ms(22.5), ms(25.0));
+        assert!(rise_2 > fall_1 * 1.3, "second burst retriggers ({rise_2} vs {fall_1})");
+        assert!(rise_3 > fall_2 * 1.3, "third burst retriggers ({rise_3} vs {fall_2})");
+    }
+
+    #[test]
+    fn swing_delays_the_off_steps_and_leaves_the_beats_alone() {
+        let rack = Rack {
+            channels: vec![Channel { name: "hat".into(),
+                kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5,
+                                        decay_ms: 40.0, tune: 0 },
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None }],
+            patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
+        };
+        let mut p = Pattern::new("A", 4, 1);
+        p.set(0, 0, true);
+        p.set(0, 1, true);
+        let sources = std::collections::BTreeMap::new();
+        let straight = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
+        let swung = Tempo { swing: 0.5, ..straight };
+        let mut synth = BuiltinSynth { sources: &sources };
+        let a = render_pattern(&p, &rack, &mut synth, &straight, 48_000, 0);
+        let mut synth = BuiltinSynth { sources: &sources };
+        let b = render_pattern(&p, &rack, &mut synth, &swung, 48_000, 0);
+
+        let step = straight.step_len().to_samples(48_000) as usize;
+        let onset = |buf: &[f32], from: usize| buf[from..].iter()
+            .position(|s| s.abs() > 1e-4).map(|i| i + from);
+        // The downbeat does not move.
+        assert_eq!(onset(&a, 0), onset(&b, 0));
+        // The off-16th moves late by exactly half of half a step.
+        let expected_delay = swung.swing_delay_samples(1, 48_000);
+        assert_eq!(expected_delay, step / 4);
+        assert_eq!(onset(&b, step), onset(&a, step).map(|i| i + expected_delay));
+        // And swing never moves a hit EARLIER — that would be a different
+        // (and wrong) feature wearing swing's name.
+        assert_eq!(swung.swing_delay_samples(2, 48_000), 0);
+    }
+
+    #[test]
+    fn the_trap_kit_renders_a_bar_out_of_the_box() {
+        // Same argument as Studio::demo(): an empty grid gives a new user
+        // nothing to press. The kit must be audible with zero assets loaded.
+        let rack = Rack::trap_kit();
+        assert!(rack.channels.iter().any(|c| matches!(c.kind, SynthKind::Sub { .. })),
+                "a trap kit without an 808 is a drum kit");
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let t = rack.tempo();
+        let out = render_pattern(&rack.patterns[0], &rack, &mut synth, &t, 48_000, 0);
+        let step = t.step_len().to_samples(48_000) as usize;
+        assert_eq!(out.len(), step * 16);
+        // Every quarter of the bar has audio in it — hats run through.
+        for q in 0..4 {
+            let e: f32 = out[q * step * 4..(q + 1) * step * 4].iter().map(|s| s.abs()).sum();
+            assert!(e > 10.0, "quarter {q} is audible");
+        }
+    }
+
+    #[test]
+    fn a_rack_saved_before_swing_existed_still_loads_straight() {
+        // serde(default) is a compatibility promise, so it gets a test, not
+        // an assumption: the field's absence must mean 0, not a parse error.
+        let old = r#"{"channels":[],"patterns":[],"tempo_bpm":140.0}"#;
+        let rack: Rack = serde_json::from_str(old).expect("pre-swing rack loads");
+        assert_eq!(rack.swing, 0.0);
+        assert_eq!(rack.tempo().bpm, 140.0);
+    }
+
+    #[test]
+    fn step_tune_reaches_a_drum_voice() {
+        let base = SynthKind::Drum { voice: DrumVoice::Kick, tone: 0.5,
+                                     decay_ms: 150.0, tune: 0 };
+        let m = StepMod { tune: 3, ..StepMod::default() };
+        match apply_step_mod(&base, &m, None) {
+            SynthKind::Drum { tune, .. } => assert_eq!(tune, 3),
+            other => panic!("stayed a drum, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn adding_a_channel_grows_every_pattern_so_its_steps_actually_land() {
+        let mut rack = Rack::trap_kit();
+        rack.patterns.push(Pattern::new("B", 16, rack.channels.len()));
+        let ch = rack.add_channel(Channel {
+            name: "snap".into(),
+            kind: SynthKind::Sampler { source: studio_core::SourceId(7) },
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+        });
+        for p in &rack.patterns {
+            assert_eq!(p.rows.len(), rack.channels.len(), "'{}' kept up", p.name);
+        }
+        // The whole point: a toggle on the new channel is not a silent no-op.
+        rack.patterns[0].toggle(ch, 5);
+        assert!(rack.patterns[0].is_set(ch, 5));
+    }
+
+    #[test]
+    fn a_sample_at_the_wrong_rate_plays_at_pitch_not_chipmunked() {
+        // A 24k source rendered at 48k must stretch to twice the frames with
+        // the same content, not play double-speed. A ramp makes it checkable
+        // sample-by-sample: out[i] should sit at src[i/2].
+        let ramp: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(studio_core::SourceId(1),
+                       SourceAudio { sample_rate: 24_000, channels: vec![ramp] });
+        let mut synth = BuiltinSynth { sources: &sources };
+        let mut out = vec![0.0f32; 190];
+        synth.render(&SynthKind::Sampler { source: studio_core::SourceId(1) }, 48_000, &mut out);
+        assert!((out[100] - 0.50).abs() < 0.02, "halfway out is halfway up the ramp, got {}", out[100]);
+        assert!((out[180] - 0.90).abs() < 0.02, "and it lasts twice the source frames");
+        // And at a matching rate the fast path is untouched, bit for bit.
+        let mut same = vec![0.0f32; 50];
+        synth.render(&SynthKind::Sampler { source: studio_core::SourceId(1) }, 24_000, &mut same);
+        assert_eq!(same[10], 10.0 / 100.0);
+    }
+}
+
+#[cfg(test)]
+mod choke_tests {
+    use super::*;
+
+    fn hat_rack() -> Rack {
+        let ch = |name: &str, voice: DrumVoice, decay: f32, grp: Option<u8>| Channel {
+            name: name.into(),
+            kind: SynthKind::Drum { voice, tone: 0.5, decay_ms: decay, tune: 0 },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: grp,
+        };
+        Rack {
+            channels: vec![
+                ch("ohat", DrumVoice::HatOpen, 600.0, Some(1)),
+                ch("hat",  DrumVoice::HatClosed, 40.0, Some(1)),
+            ],
+            patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
+        }
+    }
+
+    fn render(rack: &Rack, p: &Pattern) -> (Vec<f32>, usize) {
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let t = rack.tempo();
+        let out = render_pattern(p, rack, &mut synth, &t, 48_000, 0);
+        (out, t.step_len().to_samples(48_000) as usize)
+    }
+
+    #[test]
+    fn a_closed_hat_shuts_the_open_hat_it_shares_a_group_with() {
+        let rack = hat_rack();
+        let mut p = Pattern::new("A", 8, 2);
+        p.set(0, 0, true); // open hat rings 600ms...
+        p.set(1, 2, true); // ...until the closed hat two steps later
+        let (choked, step) = render(&rack, &p);
+
+        let mut open_only = Pattern::new("B", 8, 2);
+        open_only.set(0, 0, true);
+        let (free, _) = render(&rack, &open_only);
+
+        let e = |b: &[f32], from: usize, to: usize| b[from..to].iter().map(|s| s.abs()).sum::<f32>();
+        // Before the cut the two renders are the same sound...
+        assert!((e(&choked, 0, step) - e(&free, 0, step)).abs() < e(&free, 0, step) * 0.01,
+                "the open hat is untouched before the choke");
+        // ...after it, the free render still rings and the choked one holds
+        // only the closed hat's own short burst, which dies within a step.
+        let ring_free = e(&free, step * 3, step * 4);
+        let ring_choked = e(&choked, step * 3, step * 4);
+        assert!(ring_free > 1.0, "unchoked open hat is still ringing ({ring_free})");
+        assert!(ring_choked < ring_free * 0.15,
+                "choke cut the tail: {ring_choked} vs free {ring_free}");
+    }
+
+    #[test]
+    fn the_cut_is_a_fade_not_a_cliff() {
+        // A hard truncation of a ringing waveform is a click. Compare the
+        // choked render against an unchoked one: inside the ~2ms fade window
+        // the choked signal must only ever be the free signal scaled DOWN,
+        // and the last pre-cut sample must carry almost none of it.
+        let rack = hat_rack();
+        let mut p = Pattern::new("A", 8, 2);
+        p.set(0, 0, true);
+        // Cut at step 2, well INSIDE the open hat's natural 4-step window —
+        // a cut at the window's own edge would make choke a no-op and this
+        // test vacuous (which is exactly how its first draft shipped).
+        p.set(1, 2, true);
+        let (out, step) = render(&rack, &p);
+        let mut solo_open = Pattern::new("B", 8, 2);
+        solo_open.set(0, 0, true);
+        let (free, _) = render(&rack, &solo_open);
+
+        let cut = step * 2;
+        let fade = 48_000 / 500;
+        assert!(free[cut - fade..cut].iter().any(|s| s.abs() > 1e-3),
+                "test premise: the open hat is actually ringing at the cut");
+        for i in (cut - fade)..cut {
+            assert!(out[i].abs() <= free[i].abs() + 1e-4,
+                    "sample {i}: faded exceeds unfaded — that is not a fade");
+        }
+        assert!(out[cut - 1].abs() <= free[cut - 1].abs() / fade as f32 + 1e-4,
+                "the ramp's last sample is ~zero, not a cliff edge");
+    }
+
+    #[test]
+    fn simultaneous_group_hits_layer_instead_of_fighting() {
+        let rack = hat_rack();
+        let mut both = Pattern::new("A", 4, 2);
+        both.set(0, 0, true);
+        both.set(1, 0, true);
+        let (layered, step) = render(&rack, &both);
+        let mut just_open = Pattern::new("B", 4, 2);
+        just_open.set(0, 0, true);
+        let (open, _) = render(&rack, &just_open);
+        // The open hat's late tail survives a same-instant closed hat.
+        let e = |b: &[f32]| b[step * 2..step * 3].iter().map(|s| s.abs()).sum::<f32>();
+        assert!(e(&layered) > e(&open) * 0.9,
+                "same-sample hits are a chord, not a cut: {} vs {}", e(&layered), e(&open));
+    }
+
+    #[test]
+    fn ungrouped_channels_never_choke_anything() {
+        let mut rack = hat_rack();
+        rack.channels[1].choke_group = None;
+        let mut p = Pattern::new("A", 8, 2);
+        p.set(0, 0, true);
+        p.set(1, 2, true);
+        let (out, step) = render(&rack, &p);
+        let mut solo = Pattern::new("B", 8, 2);
+        solo.set(0, 0, true);
+        let (free, _) = render(&rack, &solo);
+        let e = |b: &[f32]| b[step * 3..step * 4].iter().map(|s| s.abs()).sum::<f32>();
+        assert!(e(&out) > e(&free) * 0.9, "no group, no cut");
+    }
+}
+
+#[cfg(test)]
+mod pattern_length_tests {
+    use super::*;
+
+    #[test]
+    fn shortening_a_pattern_hides_steps_without_eating_them() {
+        // The rack panel edits `steps` directly; the bits past the new end
+        // must survive so shorten-then-lengthen round-trips — losing the
+        // back half of a 32-step groove to a moment of 16-step curiosity
+        // would be a silent edit nobody made.
+        let mut p = Pattern::new("A", 32, 1);
+        p.set(0, 30, true);
+        p.set(0, 5, true);
+        p.steps = 16;
+        assert_eq!(p.hits(), vec![(0, 5)], "hidden steps do not render");
+        p.steps = 32;
+        assert_eq!(p.hits(), vec![(0, 5), (0, 30)], "and come back intact");
+    }
+
+    #[test]
+    fn a_long_pattern_renders_its_whole_length() {
+        let rack = Rack::trap_kit();
+        let mut p = Pattern::new("long", 64, rack.channels.len());
+        p.set(1, 0, true);
+        p.set(1, 63, true);
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let t = rack.tempo();
+        let out = render_pattern(&p, &rack, &mut synth, &t, 48_000, 0);
+        let step = t.step_len().to_samples(48_000) as usize;
+        assert_eq!(out.len(), step * 64, "four bars of buffer");
+        let tail: f32 = out[step * 63..].iter().map(|v| v.abs()).sum();
+        assert!(tail > 1.0, "the step-63 kick is in the last step's audio");
     }
 }

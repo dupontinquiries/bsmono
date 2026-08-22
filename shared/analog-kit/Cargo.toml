@@ -1,0 +1,18 @@
+[package]
+name = "analog-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Analog keyboard depth (Wooting Analog SDK) as a plain value, with a digital fallback and a musical velocity curve. UI-framework-free: callers map their own key events to HID usage codes. The reusable half of games/skydribble's analog input, for apps that want expression (velocity from key depth) rather than steering."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Loaded at runtime by documented name: a machine without the SDK installed
+# falls back to digital keys instead of failing to start.
+libloading = { version = "0.8", optional = true }
+
+[features]
+default = ["sdk"]
+sdk = ["dep:libloading"]

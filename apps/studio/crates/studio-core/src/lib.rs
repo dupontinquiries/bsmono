@@ -124,6 +124,13 @@ pub struct Track {
     pub name: String,
     pub muted: bool,
     pub locked: bool,
+    /// The track's fader, applied to every clip it carries (multiplied with
+    /// each clip's own gain) — the mixer's per-track level. `serde(default)`
+    /// to UNITY, deliberately not to `f32::default()`: a pre-fader project
+    /// loading silent would be the worst possible reading of "missing
+    /// field".
+    #[serde(default = "unity_gain")]
+    pub gain: f32,
     /// Which bus this track's signal feeds. `None` means straight to master —
     /// the implicit root every bus graph has whether or not any `Bus` value
     /// exists for it, so a project with no busses at all still mixes exactly
@@ -194,12 +201,18 @@ pub struct Source {
     pub has_video: bool,
 }
 
+fn unity_gain() -> f32 { 1.0 }
+
 /// Every edit, as a value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     AddTrack { track: Track, at: usize },
     RemoveTrack { id: TrackId },
     SetTrackFlags { id: TrackId, muted: bool, locked: bool },
+    /// The track fader. Refused on a locked track — the fader is a mix
+    /// edit, not the lock toggle; `SetTrackFlags` stays the only edit a
+    /// locked track accepts, because something has to be able to unlock it.
+    SetTrackGain { id: TrackId, gain: f32 },
     AddClip { clip: Clip },
     RemoveClip { id: ClipId },
     /// Absolute placement, not a delta — see the module docs on convergence.
@@ -305,6 +318,14 @@ impl Project {
                 let inv = Op::SetTrackFlags { id: *id, muted: t.muted, locked: t.locked };
                 t.muted = *muted;
                 t.locked = *locked;
+                Ok(inv)
+            }
+            Op::SetTrackGain { id, gain } => {
+                self.check_track(*id)?; // exists, and not locked
+                let t = self.tracks.iter_mut().find(|t| t.id == *id)
+                    .ok_or(EditError::NoSuchTrack(*id))?;
+                let inv = Op::SetTrackGain { id: *id, gain: t.gain };
+                t.gain = *gain;
                 Ok(inv)
             }
             Op::AddClip { clip } => {
@@ -731,7 +752,7 @@ mod tests {
     fn proj() -> Project {
         let mut p = Project { name: "t".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
             len: Ticks::from_seconds(30.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
         p
@@ -1189,5 +1210,48 @@ mod tests {
         p.busses.insert(BusId(1), Bus { id: BusId(1), name: "A".into(), parent: Some(BusId(2)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
         p.busses.insert(BusId(2), Bus { id: BusId(2), name: "B".into(), parent: Some(BusId(1)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
         assert!(matches!(p.bus_order(), Err(EditError::BusCycle { .. })));
+    }
+}
+
+#[cfg(test)]
+mod track_gain_tests {
+    use super::*;
+
+    fn track(id: u64) -> Track {
+        Track { id: TrackId(id), kind: TrackKind::Audio, name: "A".into(),
+                muted: false, locked: false, gain: 1.0, route: None }
+    }
+
+    #[test]
+    fn the_fader_applies_and_its_inverse_restores() {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: track(1), at: 0 }).unwrap();
+        let inv = p.apply(&Op::SetTrackGain { id: TrackId(1), gain: 0.5 }).unwrap();
+        assert_eq!(p.tracks[0].gain, 0.5);
+        p.apply(&inv).unwrap();
+        assert_eq!(p.tracks[0].gain, 1.0, "the inverse op is a real undo");
+    }
+
+    #[test]
+    fn a_locked_track_keeps_its_fader() {
+        // SetTrackFlags stays the only edit a locked track accepts; the
+        // fader is a mix edit like any clip move.
+        let mut p = Project::default();
+        let mut t = track(1);
+        t.locked = true;
+        p.apply(&Op::AddTrack { track: t, at: 0 }).unwrap();
+        assert!(matches!(p.apply(&Op::SetTrackGain { id: TrackId(1), gain: 0.2 }),
+                         Err(EditError::TrackLocked(_))));
+        assert_eq!(p.tracks[0].gain, 1.0);
+    }
+
+    #[test]
+    fn a_pre_fader_track_deserializes_at_unity_not_silence() {
+        // serde(default) is a compatibility promise: a project saved before
+        // faders existed must load sounding exactly as it did, and the
+        // zero-default a bare f32 would give is the one wrong answer.
+        let old = r#"{"id":3,"kind":"Audio","name":"A1","muted":false,"locked":false,"route":null}"#;
+        let t: Track = serde_json::from_str(old).expect("pre-fader track loads");
+        assert_eq!(t.gain, 1.0);
     }
 }

@@ -91,6 +91,12 @@ pub fn playhead_step(tempo: &Tempo, pattern: &Pattern, now: Ticks) -> Option<u32
 /// whole reason hardware sequencers colour every fourth pad.
 pub fn is_beat(step: u32) -> bool { step % 4 == 0 }
 
+/// One step cell's square side, shared with `lanes` so a lane's columns sit
+/// exactly under the grid's.
+pub const CELL: f32 = 22.0;
+/// The channel-name gutter width, shared with `lanes` for the same reason.
+pub const LABEL_W: f32 = 96.0;
+
 /// Draw the grid. Returns edits for the host to apply.
 pub fn grid(ui: &mut egui::Ui, pattern: &Pattern, channels: &[studio_live::Channel],
             paint: &mut Paint, playhead: Option<u32>,
@@ -101,8 +107,8 @@ pub fn grid(ui: &mut egui::Ui, pattern: &Pattern, channels: &[studio_live::Chann
         return edits;
     }
 
-    let cell = 22.0;
-    let label_w = 96.0;
+    let cell = CELL;
+    let label_w = LABEL_W;
     let width = label_w + pattern.steps as f32 * cell;
     let height = channels.len() as f32 * cell;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height),
