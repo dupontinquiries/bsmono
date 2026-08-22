@@ -40,6 +40,10 @@ pub mod chrome;
 /// every renderer, and nothing dispatched between them.
 pub mod router;
 
+/// Owns the page state and dispatches to the renderer for the current
+/// section — the caller the ten ported pages never had.
+pub mod shell;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
