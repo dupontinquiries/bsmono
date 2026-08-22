@@ -19,8 +19,13 @@ can also drag the files onto the window — `.jsonl` is treated as events,
 anything else as runs).
 
 Pinned versions (verified current, May 2026): `eframe 0.34`, `egui 0.34`,
-`egui_plot 0.35`. MSRV is **1.92** (eframe 0.34). On Linux you need the usual
-egui native deps:
+`egui_plot 0.35`. MSRV is **1.92** (eframe 0.34) — confirmed buildable: a
+session with a real rustc 1.96 got `cargo check` clean on the actual crate
+for the first time (previously "compile-blind" per the toolkit README —
+written against these pinned versions but never run through a compiler
+that could clear the MSRV). Zero errors; ~17 dead-code warnings for
+plotting/widget helpers not yet wired into the UI, none touched. On Linux
+you need the usual egui native deps:
 
 ```bash
 # Debian/Ubuntu
