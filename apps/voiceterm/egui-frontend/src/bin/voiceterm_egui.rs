@@ -2262,6 +2262,35 @@ impl eframe::App for VoicetermApp {
                                     &card.body, &self.doc_freq, &self.accepted_tags, 6);
                             }
                         }
+                        // THE PREVIEW SHEET, over the grid the deck just drew.
+                        // deck_ui already owns selection, so this only has to
+                        // ask whether there is one — no second source of truth
+                        // for which card is open.
+                        if let Some(a) = voiceterm_egui::card_preview::card_preview_ui(
+                            ui, &self.deck, &c)
+                        {
+                            use voiceterm_egui::card_preview::PreviewAction as P;
+                            match a {
+                                // Typed, not run — same rule as a clicked
+                                // search hit: the operator presses Enter.
+                                P::Stage(body) => {
+                                    self.pty_out.extend_from_slice(body.as_bytes());
+                                    self.deck.clear_selection();
+                                }
+                                P::OpenSource(url) => {
+                                    self.pty_out.extend_from_slice(
+                                        format!("xdg-open {url}").as_bytes());
+                                    self.deck.clear_selection();
+                                }
+                                P::MergeNext => {
+                                    // The deck decides whether a merge is
+                                    // possible; a false return means this was
+                                    // the last card and nothing happened.
+                                    let _ = self.deck.merge_with_next();
+                                }
+                                P::Dismiss => self.deck.clear_selection(),
+                            }
+                        }
                         if !self.tag_suggestions.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.colored_label(c.text_weak, "tags:");
