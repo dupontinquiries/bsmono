@@ -1224,3 +1224,33 @@ to eliminate elsewhere.
 **Conclusion: ambient-learner-egui's bug was real and unique in the fleet**,
 not a symptom of a wider pattern. The fleet-wide compile health, now actually
 verified rather than inferred from source-reading, is good.
+
+## Fleet-wide TEST run, not just compile (2026-08-22)
+
+The previous section's sweep ran `cargo check` on every app — enough to
+catch ambient-learner's compile-to-nothing bug, but `check` doesn't run a
+single test. Given that exact lesson, ran the full `cargo test --lib` on
+every app checked in that sweep, not just the ones already tested earlier in
+this document:
+
+| app | tests | result |
+|---|---|---|
+| bo-suite | 394 | all pass |
+| snapclone | 1299 | all pass |
+| rusty-board | 227 | all pass |
+| fao-codec | 57 | all pass |
+| bot-arena | 35 | all pass |
+| hatch | 24 | all pass |
+| krapper | 17 | all pass |
+| tadpole | 94 | all pass |
+| dialer | 5 | all pass |
+
+Combined with the earlier-verified gitmind, voiceterm, tomescope, and
+ambient-learner test runs, **every app in the fleet with an egui port now has
+its actual test suite run and passing, in this sandbox, this session** — not
+inferred from source, not assumed from an audit tool's text match. 2,152+
+tests across the fleet's egui frontends, zero failures found once
+ambient-learner's build was fixed.
+
+Kept `target/` cleared after each app to avoid repeating the fao-codec disk
+false-alarm from the previous section.
