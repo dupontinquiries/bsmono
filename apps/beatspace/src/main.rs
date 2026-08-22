@@ -17,6 +17,7 @@ mod gui;
 mod model;
 #[cfg(feature = "app")]
 mod player;
+mod smoke;
 mod train;
 mod trainpage;
 mod wgpu_train;
@@ -43,6 +44,10 @@ enum Cmd {
     /// Open the realtime latent-space GUI.
     #[cfg(feature = "app")]
     Gui(GuiArgs),
+    /// Train a tiny model on synthetic waveforms for a few seconds and report
+    /// whether the architecture is sound. CPU-only, no data, no GPU — run it
+    /// after every architecture change.
+    Smoke(SmokeArgs),
     /// Validate + benchmark the GPU generator (batched) against the CPU.
     #[cfg(feature = "gpu")]
     Gpu(GpuArgs),
@@ -91,6 +96,18 @@ struct TrainArgs {
     resume: bool,
 }
 
+#[derive(Args)]
+struct SmokeArgs {
+    /// Training steps. The default is the smallest number that reliably moves
+    /// every parameter group; raise it to make the diversity numbers steadier,
+    /// not to make the model good.
+    #[arg(long, default_value_t = 12)]
+    steps: usize,
+    /// Seed, so a failure reproduces exactly.
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+}
+
 #[cfg(feature = "app")]
 #[derive(Args)]
 struct GuiArgs {
@@ -120,6 +137,46 @@ fn main() -> Result<()> {
                 cfg.ckpt_every = v;
             }
             train::run(&cfg, a.resume)?;
+        }
+        Cmd::Smoke(a) => {
+            // Prints and then sets the exit code, rather than only asserting:
+            // the same run is useful as a CI gate and as something a person
+            // reads after changing a layer.
+            let r = smoke::run(a.steps, a.seed)?;
+            println!("[smoke] {}", r.line());
+            let mut bad: Vec<String> = Vec::new();
+            if r.params_moved <= 0.5 {
+                bad.push(format!(
+                    "only {:.1}% of generator parameters moved — something is detached",
+                    r.params_moved * 100.0
+                ));
+            }
+            if r.z_diversity <= 1e-4 {
+                bad.push(format!(
+                    "z-diversity {:.8} — the generator is ignoring its latent (mode collapse)",
+                    r.z_diversity
+                ));
+            }
+            if r.z_repeatability != 0.0 {
+                bad.push(format!(
+                    "the same latent gave different output twice ({:.8}) — eval mode is not deterministic",
+                    r.z_repeatability
+                ));
+            }
+            if r.d_score_spread <= 0.0 {
+                bad.push(format!(
+                    "discriminator scores are bit-identical ({:?}) — its head is seeing one value, not {}",
+                    r.d_scores, r.d_score_count
+                ));
+            }
+            if bad.is_empty() {
+                println!("[smoke] architecture looks sound");
+            } else {
+                for b in &bad {
+                    eprintln!("[smoke] FAIL: {b}");
+                }
+                anyhow::bail!("{} smoke check(s) failed", bad.len());
+            }
         }
         #[cfg(feature = "app")]
         Cmd::Gui(a) => {
