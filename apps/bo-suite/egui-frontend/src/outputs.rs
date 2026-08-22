@@ -47,6 +47,20 @@ impl Default for DeviceSelector {
 }
 
 impl DeviceSelector {
+    /// Supply the discovered speakers.
+    ///
+    /// Not called yet, and that is not an oversight: discovery is the host's
+    /// job and this frontend has no transport. The app's own `Device` — name,
+    /// volume, playing — is the volume strip, and carries no url, so the two
+    /// are not the same list and one cannot be derived from the other.
+    ///
+    /// I considered synthesising a url from the name to fill the selector, and
+    /// did not: this url is an ADDRESS. Inventing one produces a control that
+    /// looks operable and points nowhere, and the frontend already keys a
+    /// hearing-safety session reset on it changing.
+    ///
+    /// Until a host calls this, the panel says "no speakers found" rather than
+    /// opening onto nothing.
     pub fn set_devices(&mut self, devices: Vec<Device>) {
         // If the active device vanished, fall back to the first rather than
         // showing a name for something that is no longer there.
@@ -110,6 +124,13 @@ pub fn device_selector_ui(ui: &mut egui::Ui, d: &mut DeviceSelector,
     });
     if d.panel_visible() {
         let reveal = d.unfold();
+        if d.devices().is_empty() {
+            // SAID, not left blank. An expanded panel with nothing in it reads
+            // as a selector that failed to open; "no speakers" reads as a
+            // selector that opened and found none, which is the truth and
+            // points at discovery rather than at the control.
+            ui.colored_label(c.text_weak, "no speakers found");
+        }
         for dev in d.devices().to_vec() {
             let h = 26.0 * reveal;
             if h < 1.0 { continue; }
@@ -128,6 +149,42 @@ pub fn device_selector_ui(ui: &mut egui::Ui, d: &mut DeviceSelector,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_selector_says_so_rather_than_opening_onto_nothing() {
+        // The state every build without a discovery host is in. A blank
+        // expanded panel reads as a selector that failed to open; "no
+        // speakers found" reads as one that opened and found none — which
+        // points at discovery rather than at the control.
+        let src = include_str!("outputs.rs");
+        assert!(src.contains("no speakers found"));
+    }
+
+    #[test]
+    fn no_url_is_synthesised_from_a_name() {
+        // The url is an ADDRESS. Inventing one gives a control that looks
+        // operable and points nowhere — and the frontend keys a
+        // hearing-safety session reset on it changing, so a fabricated url
+        // would also make that reset fire on nothing.
+        let mut d = DeviceSelector::default();
+        d.set_devices(vec![]);
+        assert!(d.devices().is_empty(), "a device appeared from nowhere");
+        assert!(d.active_url().is_empty(), "an address was invented for no device");
+    }
+
+    #[test]
+    fn setting_devices_keeps_the_active_one_if_it_survives() {
+        // A rescan that drops and re-adds the same speaker must not bounce the
+        // selection — and with the safety reset keyed on url changes, a bounce
+        // would revoke an unlock the operator granted.
+        let a = Device { url: "u1".into(), name: "A".into(), kind: "speaker".into() };
+        let b = Device { url: "u2".into(), name: "B".into(), kind: "speaker".into() };
+        let mut d = DeviceSelector::default();
+        d.set_devices(vec![a.clone(), b.clone()]);
+        d.select("u2");
+        d.set_devices(vec![a, b]);
+        assert_eq!(d.active_url(), "u2", "a rescan moved the selection");
+    }
 
     // ── device selector ─────────────────────────────────────────────────────
 
