@@ -1106,7 +1106,7 @@ supported: {}", for_arch("qwen2").note);
              "the 2026-07-26 shader extraction (90 .wgsl + kernels.rs) was written and never \
 wired. lib.rs still carries 57 inline r#\"...\"# copies and has been edited continuously since, \
 so 13 of 82 comparable shaders have DRIFTED and the inline copy is the live one. Do not fix by \
-adding `mod kernels;` — that silently swaps 13 shaders on real hardware with no GPU here to \
+declaring it as a module — that silently swaps 13 shaders on real hardware with no GPU here to \
 check, which is what LOGSCOPE_PASS_FUSE did. Regenerate the .wgsl from lib.rs, or delete them."),
             ("llada2",
              "LLaDA2.0's layer plan, 12 tests, zero references. archcfg lists llada2 as supported, \
