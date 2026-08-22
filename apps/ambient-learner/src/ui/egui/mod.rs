@@ -36,6 +36,10 @@ pub mod screen_temps;
 /// Section titles and card headings — the chrome the pages share.
 pub mod chrome;
 
+/// The routing the port never got: chrome had every Section, the pages had
+/// every renderer, and nothing dispatched between them.
+pub mod router;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 

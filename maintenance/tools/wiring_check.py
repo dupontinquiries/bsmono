@@ -150,15 +150,37 @@ def uncalled_renderers(src):
     return sorted(out)
 
 
+# WHERE AN APP KEEPS ITS EGUI VIEWS.
+#
+# `egui-frontend/src` is the common layout and it was the only one this tool
+# looked in, so any app that puts its views elsewhere reported "0 modules, 0
+# DEAD" — which reads as CLEAN and means NOT SCANNED. ambient-learner has 11
+# view files and 3,566 lines under `src/ui/egui/`, and every audit this tool
+# has run has skipped all of it.
+#
+# Returning a list rather than a path because an app may have both, and
+# checking one while a second exists is the same silence in a new place.
+def egui_dirs(app_dir):
+    out = []
+    for rel in (('egui-frontend', 'src'), ('src', 'ui', 'egui')):
+        d = os.path.join(app_dir, *rel)
+        if os.path.isdir(d):
+            out.append(d)
+    return out
+
+
 def main():
     apps = os.path.join(ROOT, 'apps')
     rows = []
     for name in sorted(os.listdir(apps)):
-        src = os.path.join(apps, name, 'egui-frontend', 'src')
-        if not os.path.isdir(src): continue
-        mods = [m for m in modules_of(src) if m not in ('util', 'config')]
-        dead = [m for m in mods if not reached(src, m)]
-        rows.append((name, len(mods), dead))
+        for src in egui_dirs(os.path.join(apps, name)):
+            mods = [m for m in modules_of(src) if m not in ('util', 'config')]
+            dead = [m for m in mods if not reached(src, m)]
+            # Labelled by the directory when an app has more than one, so a
+            # dead module can be found rather than merely counted.
+            label = name if src.endswith(os.path.join('egui-frontend', 'src')) \
+                else f"{name} (ui/egui)"
+            rows.append((label, len(mods), dead))
     w = max((len(r[0]) for r in rows), default=8)
     print(f"{'app':<{w}}  modules  wired  DEAD")
     total_dead = 0
@@ -174,8 +196,7 @@ def main():
     # while a whole page inside it is never painted.
     total_unrendered = 0
     for name in sorted(os.listdir(apps)):
-        src = os.path.join(apps, name, 'egui-frontend', 'src')
-        if not os.path.isdir(src): continue
+      for src in egui_dirs(os.path.join(apps, name)):
         hits = uncalled_renderers(src)
         if not hits: continue
         total_unrendered += len(hits)
@@ -191,8 +212,7 @@ def main():
     # Reachable is not the same as FED.
     total_stub = 0
     for name in sorted(os.listdir(apps)):
-        src = os.path.join(apps, name, 'egui-frontend', 'src')
-        if not os.path.isdir(src): continue
+      for src in egui_dirs(os.path.join(apps, name)):
         hits = placeholder_feeds(src)
         if not hits: continue
         total_stub += len(hits)
