@@ -1264,6 +1264,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "irc-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+ "net-kit",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3084,6 +3092,7 @@ dependencies = [
  "crypto_secretbox",
  "encoding_rs",
  "flate2",
+ "irc-kit",
  "libc",
  "llama-cpp-2",
  "nifty-core",

@@ -523,6 +523,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-kit"
+version = "0.1.0"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -572,10 +576,13 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 name = "dialer-core"
 version = "0.1.0"
 dependencies = [
+ "irc-kit",
  "roxmltree",
+ "rustls",
  "serde",
  "serde_json",
  "ureq",
+ "webpki-roots 0.26.11",
  "zbus",
 ]
 
@@ -1360,6 +1367,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "irc-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+ "net-kit",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1638,6 +1653,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "net-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
 ]
 
 [[package]]

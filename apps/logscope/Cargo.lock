@@ -979,6 +979,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-kit"
+version = "0.1.0"
+
+[[package]]
 name = "coreaudio-rs"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2516,6 +2520,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "irc-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+ "net-kit",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2912,6 +2924,7 @@ name = "logscope-fan"
 version = "0.1.0"
 dependencies = [
  "crypto-kit",
+ "irc-kit",
 ]
 
 [[package]]
@@ -3063,6 +3076,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "net-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
 ]
 
 [[package]]

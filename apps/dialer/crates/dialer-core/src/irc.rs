@@ -164,15 +164,25 @@ fn connect(acct: &Account) -> Result<Stream, String> {
 
     #[cfg(feature = "irc-tls")]
     {
-        use std::sync::Arc;
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let cfg = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        // The provider is named rather than left to `ClientConfig::builder()`,
+        // which resolves a *process-level* default. That default depends on
+        // which provider features happen to be enabled across the whole
+        // dependency graph, so a crate elsewhere in the fleet turning on
+        // aws-lc-rs would change what this line means — and the failure mode
+        // is a panic at connect time, not a build error. Naming it makes the
+        // choice local and the behaviour unchangeable from outside.
+        let cfg = rustls::ClientConfig::builder_with_provider(
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("tls provider: {e}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let server = rustls::pki_types::ServerName::try_from(acct.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", acct.host))?;
-        let conn = rustls::ClientConnection::new(Arc::new(cfg), server)
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), server)
             .map_err(|e| format!("tls setup: {e}"))?;
         return Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))));
     }

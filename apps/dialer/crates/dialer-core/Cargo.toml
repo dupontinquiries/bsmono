@@ -31,7 +31,13 @@ ureq = { version = "2", optional = true }
 # (std + two std-only path kits), so the default feature set gains nothing;
 # TLS is a separate opt-in because rustls is the only heavy part.
 irc-kit = { path = "../../../../shared/irc-kit", optional = true }
-rustls = { version = "0.23", features = ["ring"], optional = true }
+# default-features = false is load-bearing: rustls 0.23 defaults to the
+# aws-lc-rs provider, which builds AWS-LC from C via cmake. That drags a C
+# toolchain into a cross build for aarch64 phones — the exact thing that turns
+# `cargo build --target` into an afternoon. ring is pure-Rust-plus-asm and
+# cross-compiles clean, which is why it is named explicitly rather than added
+# alongside the default.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
 
 [features]
