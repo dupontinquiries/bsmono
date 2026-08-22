@@ -1034,6 +1034,52 @@ and return a plausible-looking tensor: {unguarded:?}. Add \
 block_decode_mla.");
     }
 
+    /// The same expiry, extended to the two design notes that state engine state in prose.
+    ///
+    /// The registry's notes have this module. `DEEPSEEK_SUPPORT.md` and `BIGGER_MODELS.md` had
+    /// nothing, and both went stale in the way this module exists to prevent: each still described
+    /// the loader as llama-only, and `BIGGER_MODELS.md` quoted the `general.architecture != "llama"`
+    /// refusal by name. That refusal has been an `archcfg` lookup for some time — qwen2, qwen3,
+    /// qwen3.5, qwen3moe, gemma3, llama4, llada2, dream and ornith all load — so a reader following
+    /// either doc's headline conclusion would plan work that is already done.
+    ///
+    /// That is not a hypothetical reader. Both docs name Qwen2 as the highest-value next unlock, and
+    /// it is the first thing anyone surveying this tree would pick up.
+    ///
+    /// Checked against `for_arch` rather than against a copy of the claim, so the test tracks the
+    /// registry instead of restating it: whichever arch flips next, the docs' phrasing has to keep up.
+    #[test]
+    fn the_design_notes_do_not_still_call_the_loader_llama_only() {
+        let docs = [
+            ("DEEPSEEK_SUPPORT.md", include_str!("../../../DEEPSEEK_SUPPORT.md")),
+            ("BIGGER_MODELS.md", include_str!("../../../BIGGER_MODELS.md")),
+        ];
+        // Non-llama architectures the registry says load today. If any of these is true, prose
+        // asserting the loader is llama-only is false.
+        let also_supported: Vec<&str> = ["qwen2", "qwen3", "qwen3moe", "gemma3", "llama4", "dream"]
+            .into_iter().filter(|a| for_arch(a).supported).collect();
+        if also_supported.is_empty() { return; } // llama-only really is true; nothing to expire.
+
+        for (name, body) in docs {
+            let low = body.to_ascii_lowercase();
+            // The exact phrasings that were wrong, ASCII and the en-dash spelling both docs use.
+            for claim in ["llama-architecture only", "llama\u{2011}architecture only",
+                          "llama-family only", "llama\u{2011}family only",
+                          "hard-refuses any `general.architecture != \"llama\"`"] {
+                assert!(!low.contains(&claim.to_ascii_lowercase()),
+                    "{name} still says {claim:?}, but the registry reports these non-llama \
+architectures as supported: {also_supported:?}. Correct the doc — a design note that is wrong \
+about the engine sends its reader to build something that exists.");
+            }
+            // The Qwen2 row specifically: both docs called it the next unlock.
+            if for_arch("qwen2").supported {
+                assert!(!low.contains("needs qwen2 arch"),
+                    "{name} still lists targets as blocked on \"needs Qwen2 arch\", but qwen2 is \
+supported: {}", for_arch("qwen2").note);
+            }
+        }
+    }
+
     /// The mirror: notes must not describe as PENDING anything the engine already honours. Group
     /// routing was reported pending for 50 bundles after it landed.
     #[test]

@@ -3,8 +3,21 @@
 Groundwork while the M2 is unavailable. Pure, tested pieces are in `crates/gpu-gemm/src/memplan.rs`
 and `archcfg.rs`; everything that touches the GPU hot path is flagged as **M2-gated** and not started.
 
+> **Corrected — axis 2 has largely resolved.** As written, this section described a loader that
+> took one architecture and named Qwen2 as the highest-value unlock. That was right and it was
+> done. Left uncorrected the doc was actively misleading: its own headline conclusion pointed at
+> finished work, and it is the first thing a newcomer to the inference stack reads.
+> `note_claims::the_design_notes_do_not_still_call_the_loader_llama_only` expires it now, so the
+> next arch to flip forces the edit. The memory analysis below is untouched and still current.
+
 ## Where the engine is today
-- **Architecture: llama-family only.** `load_gguf_opt` hard-refuses any `general.architecture != "llama"`.
+- **Architecture: a registry, not a string compare.** `load_gguf_opt` resolves the architecture
+  through `archcfg::for_arch`, which carries the metadata key prefix, tensor-name quirks and kernel
+  differences per arch. Loading today: llama, qwen2, qwen3, qwen3.5, qwen3moe, gemma3, llama4,
+  llada2, dream, ornith. Refused with a reason: gemma2, gemma4, phi3, deepseek2/glm4moe (MLA),
+  glm-dsa. Prefix resolution is also recovered from the hparam keys when a converter mislabels
+  `general.architecture`, so a mislabeled-but-supported file loads and a genuinely unsupported one
+  is still named correctly.
   Quant dequant is already broad (F32, F16, Q4_0/1, Q5_0/1, Q8_0, Q4_K, Q5_K, Q6_K) — *quant coverage
   is not the blocker.*
 - **Memory: materialize-then-resident, no planner.** Every tensor is dequantized to f32, then the
@@ -14,8 +27,11 @@ and `archcfg.rs`; everything that touches the GPU hot path is flagged as **M2-ga
 ## The three axes (and which actually bite)
 1. **Memory** — the real ceiling on a 39.5 GiB M2. int8-resident caps out around ~32B; 70B needs q4 or
    streaming. *Biggest lever.*
-2. **Architecture** — gates *which* bigger models load at all. Qwen2 (0.5–72B) is one bias add away from
-   llama; that's the highest-value unlock. Gemma2/Phi-3 need more.
+2. **Architecture** — gates *which* bigger models load at all. Qwen2 (0.5–72B) was the highest-value
+   unlock and has landed, along with the rest of the Qwen line and gemma3/llama4. What remains is
+   MLA **loading** for deepseek2/glm4moe — the kernels, the compressed-latent cache and both `kv_b`
+   layouts are wired, but nothing puts those tensors into a `Model`, so an MLA checkpoint fails at
+   `blk.0`. Then gemma2 (geglu + dual soft-cap) and phi3 (fused QKV split + partial rotary).
 3. **Quant** — already handled for loading. (A *q4-resident* path is a memory lever, not a coverage one.)
 
 ## What the planner says (computed by `memplan`, real output)

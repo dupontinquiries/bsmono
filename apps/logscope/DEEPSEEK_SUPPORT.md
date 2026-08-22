@@ -1,6 +1,23 @@
 # Supporting DeepSeek‑style models — design analysis
 
-*This is a design note, not an implementation. It maps what "DeepSeek support" actually requires against the engine as it stands (llama‑architecture only) and lays out a realistic path.*
+*This is a design note, not an implementation. It maps what "DeepSeek support" actually requires against the engine and lays out a realistic path.*
+
+> **Corrected — Tiers 0 and 1 have both landed.** This note was written when the loader took a
+> single architecture, and its conclusion — "the high-leverage move is to add Qwen2" — was right
+> and has been acted on. The loader now dispatches through the `archcfg` registry, and qwen2,
+> qwen3, qwen3.5, qwen3moe, gemma3, llama4, llada2, dream and ornith all load. The R1‑Distill‑Qwen
+> line and Qwen2.5 are **not** blocked; the table rows below marked historical say so.
+>
+> What survives unchanged is the note's actual subject: **native DeepSeek‑V2/V3.** Tier 2 is still
+> open, and the shape of what remains is narrower than "implement MLA" — the MLA kernels, the
+> compressed-latent cache, per-layer routing and both `kv_b` layouts are wired and gated. What is
+> missing is the loader path that puts those tensors into a `Model`, so every MLA checkpoint still
+> fails at `blk.0`. Read `archcfg`'s `deepseek2` entry for the current line; it is maintained by a
+> test and this file is not the authority.
+>
+> `note_claims::the_design_notes_do_not_still_call_the_loader_llama_only` now expires this section
+> the same way, so the next architecture to flip forces an edit here rather than being discovered
+> by accident.
 
 ## Verdict up front
 
@@ -13,14 +30,14 @@ So the high‑leverage move is **not** to chase native V3. It's to (a) confirm t
 
 ## What each target needs vs. what the engine has
 
-The engine implements the Llama path: interleaved‑NORM RoPE, GQA, dense SwiGLU FFN, RMSNorm, and a full per‑KV‑head K/V cache. It reads GGUF metadata under the **`llama.*`** prefix.
+The engine dispatches through `archcfg::for_arch`, which records per architecture the GGUF metadata key prefix, the tensor-name quirks and the kernel differences (QKV bias, QK-norm, activation, norm variant, soft-capping, RoPE style). The Llama path — interleaved‑NORM RoPE, GQA, dense SwiGLU FFN, RMSNorm, a full per‑KV‑head K/V cache — is one entry in it, not the whole loader.
 
 | Target | Attention | FFN | Extra vs. Llama | Runs on engine now? |
 |---|---|---|---|---|
 | R1‑Distill‑**Llama**‑8B | GQA (same) | dense SwiGLU (same) | none — it *is* Llama | **Yes** (try it) |
-| R1‑Distill‑**Qwen**‑1.5B…32B | GQA | dense SwiGLU | **Q/K/V bias terms**, different RoPE θ, `qwen2.*` metadata keys | No — needs Qwen2 arch |
-| Qwen2.5 / Qwen2 base | GQA | dense SwiGLU | same as above | No — needs Qwen2 arch |
-| DeepSeek‑V2‑Lite (16 B, ~2.4 B active) | **MLA** | **MoE** (+ shared experts) | new attention + routing | No — large lift |
+| R1‑Distill‑**Qwen**‑1.5B…32B | GQA | dense SwiGLU | **Q/K/V bias terms**, different RoPE θ, `qwen2.*` metadata keys | **Yes** — qwen2 landed |
+| Qwen2.5 / Qwen2 base | GQA | dense SwiGLU | same as above | **Yes** — qwen2 landed |
+| DeepSeek‑V2‑Lite (16 B, ~2.4 B active) | **MLA** | **MoE** (+ shared experts) | MLA kernels + cache wired; MoE routing wired | No — **loader** cannot put MLA tensors in a `Model` |
 | DeepSeek‑V3 / R1 (671 B) | **MLA** | **MoE** (256 experts) | new attention + routing | No — and far too large for 32 GB |
 
 > The current "qwen2.5 fails to load → *missing embedding_length*" is exactly this: the loader looks up `llama.embedding_length`, but a Qwen GGUF stores `qwen2.embedding_length`. The model isn't broken; the engine just isn't reading its metadata namespace.
