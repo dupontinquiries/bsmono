@@ -71,6 +71,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "audio-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3076,6 +3083,7 @@ name = "web2qml"
 version = "0.1.900"
 dependencies = [
  "aho-corasick",
+ "audio-kit",
  "bcrypt",
  "candle-core",
  "candle-nn",
@@ -3086,6 +3094,7 @@ dependencies = [
  "flate2",
  "libc",
  "llama-cpp-2",
+ "net-kit",
  "nifty-core",
  "peer-handshake",
  "portable-pty",
