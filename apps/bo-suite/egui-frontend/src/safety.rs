@@ -148,6 +148,39 @@ impl Safety {
     }
 }
 
+/// The slide-down safety toast. Draws nothing when nothing is clamped.
+///
+/// Ported from `SafetyToast.qml`. The model was here and tested; there was no
+/// renderer and no caller, so a manual volume above the threshold went
+/// straight through — this module's whole reason for existing did not happen.
+pub fn safety_toast_ui(
+    ui: &mut egui::Ui,
+    s: &Safety,
+    c: &uikit_egui::PaletteColors,
+) -> Option<ToastAction> {
+    let (applied, requested) = match s.pending_pair() {
+        Some(p) => p,
+        None => return None,
+    };
+    let mut act = None;
+    egui::Frame::popup(ui.style()).fill(c.bg_raised).show(ui, |ui| {
+        ui.label(egui::RichText::new("volume limited").strong().color(c.warning));
+        ui.label(egui::RichText::new(format!(
+            "asked for {requested}, held at {applied} — sustained listening above this level \
+damages hearing")).small());
+        ui.horizontal(|ui| {
+            if ui.button("keep the limit").clicked() { act = Some(ToastAction::Dismiss); }
+            // NOT styled as the primary action. The QML calls this unlock
+            // "deliberately awkward", and a warning whose accept button is the
+            // prettiest thing on screen is a warning that gets accepted.
+            if ui.small_button("unlock for this session").clicked() {
+                act = Some(ToastAction::Unlock);
+            }
+        });
+    });
+    act
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,39 +280,6 @@ pub enum ToastAction {
     /// volume `unlock()` hands back — this only reports the press, so the
     /// "nothing pending" guard stays in one place.
     Unlock,
-}
-
-/// The slide-down safety toast. Draws nothing when nothing is clamped.
-///
-/// Ported from `SafetyToast.qml`. The model was here and tested; there was no
-/// renderer and no caller, so a manual volume above the threshold went
-/// straight through — this module's whole reason for existing did not happen.
-pub fn safety_toast_ui(
-    ui: &mut egui::Ui,
-    s: &Safety,
-    c: &uikit_egui::PaletteColors,
-) -> Option<ToastAction> {
-    let (applied, requested) = match s.pending_pair() {
-        Some(p) => p,
-        None => return None,
-    };
-    let mut act = None;
-    egui::Frame::popup(ui.style()).fill(c.bg_raised).show(ui, |ui| {
-        ui.label(egui::RichText::new("volume limited").strong().color(c.warning));
-        ui.label(egui::RichText::new(format!(
-            "asked for {requested}, held at {applied} — sustained listening above this level \
-damages hearing")).small());
-        ui.horizontal(|ui| {
-            if ui.button("keep the limit").clicked() { act = Some(ToastAction::Dismiss); }
-            // NOT styled as the primary action. The QML calls this unlock
-            // "deliberately awkward", and a warning whose accept button is the
-            // prettiest thing on screen is a warning that gets accepted.
-            if ui.small_button("unlock for this session").clicked() {
-                act = Some(ToastAction::Unlock);
-            }
-        });
-    });
-    act
 }
 
 #[cfg(test)]

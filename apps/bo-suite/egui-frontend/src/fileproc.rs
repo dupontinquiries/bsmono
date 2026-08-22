@@ -310,6 +310,90 @@ pub fn step_key_ui(ui: &mut egui::Ui, k: &mut StepKey, d: f32,
     resp.clicked()
 }
 
+/// The processing section at the bottom of the mixer page.
+///
+/// The model was complete and had no renderer, so `set_output`, `set_bitrate`,
+/// `clear_output` and `set_progress` were reachable only from tests — meaning
+/// the section this module exists for could not be operated at all. Found by
+/// the tested-but-uncalled check.
+///
+/// Returns the action the host should perform; nothing here touches a file.
+pub fn fileproc_ui(
+    ui: &mut egui::Ui,
+    p: &mut FileProcessor,
+    c: &uikit_egui::PaletteColors,
+) -> Option<ProcAction> {
+    let mut act = None;
+    ui.label(egui::RichText::new("process a file").strong());
+    ui.label(egui::RichText::new(
+        "runs a stereo WAV through the CURRENT mixer settings — if the file comes out right, \
+the live path is right")
+        .small().weak());
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("in").small().weak());
+        ui.text_edit_singleline(&mut p.input);
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("out").small().weak());
+        // THE SUGGESTION IS A PLACEHOLDER, not prefilled text. The model's own
+        // note: the suggestion is "a placeholder they can accept by doing
+        // nothing", and it stops following the input once the user types. A
+        // prefilled box would look edited before it was, and the model could
+        // not tell the difference.
+        let mut shown = p.output_field().to_string();
+        let hint = suggest_output(&p.input);
+        if ui.add(egui::TextEdit::singleline(&mut shown).hint_text(hint)).changed() {
+            p.set_output(&shown);
+        }
+        if !p.output_field().is_empty() && ui.small_button("reset").clicked() {
+            // Back to following the input, which is what clear_output means —
+            // not an empty path.
+            p.clear_output();
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("kbps").small().weak());
+        // The Opus range that matters, not a free number field: below 64 is
+        // audibly lossy on music and above 256 buys nothing at stereo.
+        for k in [96u32, 128, 192, 256] {
+            if ui.selectable_label(p.bitrate == k, k.to_string()).clicked() {
+                p.set_bitrate(k);
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        // can_run is the model's rule — an empty input, or a run already in
+        // flight. Disabled rather than absent here, because unlike the safety
+        // unlock this control DOES become available: typing a path enables it,
+        // and hiding it would leave nothing to explain what to do.
+        if ui.add_enabled(p.can_run(), egui::Button::new("run")).clicked() {
+            act = p.run();
+        }
+        for (label, which) in [("preview", "preview"), ("mix + play", "mixplay"),
+                               ("stream", "stream"), ("spectrum", "spectrum")] {
+            if ui.add_enabled(p.can_run(), egui::Button::new(label)).clicked() {
+                act = p.act(which);
+            }
+        }
+        ui.label(egui::RichText::new(p.state.chip()).small().color(c.accent));
+    });
+
+    if p.state.running() {
+        ui.add(egui::ProgressBar::new(p.progress).desired_height(4.0));
+        // The bar only moves if the host reports; repaint so it is not stuck
+        // between reports.
+        ui.ctx().request_repaint();
+    }
+    if let Some(t) = p.result_text() {
+        ui.label(egui::RichText::new(t).small());
+    }
+    act
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,90 +640,6 @@ mod tests {
         assert_eq!(k.flash_alpha(), 0.0);
         assert!(k.wide, "MUTE is a pill");
     }
-}
-
-/// The processing section at the bottom of the mixer page.
-///
-/// The model was complete and had no renderer, so `set_output`, `set_bitrate`,
-/// `clear_output` and `set_progress` were reachable only from tests — meaning
-/// the section this module exists for could not be operated at all. Found by
-/// the tested-but-uncalled check.
-///
-/// Returns the action the host should perform; nothing here touches a file.
-pub fn fileproc_ui(
-    ui: &mut egui::Ui,
-    p: &mut FileProcessor,
-    c: &uikit_egui::PaletteColors,
-) -> Option<ProcAction> {
-    let mut act = None;
-    ui.label(egui::RichText::new("process a file").strong());
-    ui.label(egui::RichText::new(
-        "runs a stereo WAV through the CURRENT mixer settings — if the file comes out right, \
-the live path is right")
-        .small().weak());
-
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("in").small().weak());
-        ui.text_edit_singleline(&mut p.input);
-    });
-
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("out").small().weak());
-        // THE SUGGESTION IS A PLACEHOLDER, not prefilled text. The model's own
-        // note: the suggestion is "a placeholder they can accept by doing
-        // nothing", and it stops following the input once the user types. A
-        // prefilled box would look edited before it was, and the model could
-        // not tell the difference.
-        let mut shown = p.output_field().to_string();
-        let hint = suggest_output(&p.input);
-        if ui.add(egui::TextEdit::singleline(&mut shown).hint_text(hint)).changed() {
-            p.set_output(&shown);
-        }
-        if !p.output_field().is_empty() && ui.small_button("reset").clicked() {
-            // Back to following the input, which is what clear_output means —
-            // not an empty path.
-            p.clear_output();
-        }
-    });
-
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("kbps").small().weak());
-        // The Opus range that matters, not a free number field: below 64 is
-        // audibly lossy on music and above 256 buys nothing at stereo.
-        for k in [96u32, 128, 192, 256] {
-            if ui.selectable_label(p.bitrate == k, k.to_string()).clicked() {
-                p.set_bitrate(k);
-            }
-        }
-    });
-
-    ui.horizontal(|ui| {
-        // can_run is the model's rule — an empty input, or a run already in
-        // flight. Disabled rather than absent here, because unlike the safety
-        // unlock this control DOES become available: typing a path enables it,
-        // and hiding it would leave nothing to explain what to do.
-        if ui.add_enabled(p.can_run(), egui::Button::new("run")).clicked() {
-            act = p.run();
-        }
-        for (label, which) in [("preview", "preview"), ("mix + play", "mixplay"),
-                               ("stream", "stream"), ("spectrum", "spectrum")] {
-            if ui.add_enabled(p.can_run(), egui::Button::new(label)).clicked() {
-                act = p.act(which);
-            }
-        }
-        ui.label(egui::RichText::new(p.state.chip()).small().color(c.accent));
-    });
-
-    if p.state.running() {
-        ui.add(egui::ProgressBar::new(p.progress).desired_height(4.0));
-        // The bar only moves if the host reports; repaint so it is not stuck
-        // between reports.
-        ui.ctx().request_repaint();
-    }
-    if let Some(t) = p.result_text() {
-        ui.label(egui::RichText::new(t).small());
-    }
-    act
 }
 
 #[cfg(test)]

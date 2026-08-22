@@ -100,6 +100,16 @@ impl Anc {
     /// Off does not merely ignore the result — it resets the canceller, so
     /// returning to Auto re-acquires rather than resuming a lock formed before
     /// the operator switched away.
+    ///
+    /// Not called yet, and that is not an oversight: this frontend has no
+    /// audio capture. `cpal` lives in `bo-controller`, which owns
+    /// `anc_engine` and `drone_canceller` and feeds them; the egui app is the
+    /// control surface over that engine and has no samples to hand it.
+    ///
+    /// Left public and tested because the DSP path is the part worth pinning,
+    /// and because whichever process ends up owning capture — the controller
+    /// today, this binary if it ever grows a device — calls exactly this.
+    ///
     pub fn process(&mut self, samples: &[f32]) -> DronePhase {
         if self.mode == Mode::Off {
             self.engine.reset();
@@ -222,6 +232,10 @@ const PERIOD_MAX: usize = 2400;
 
 impl PatternProbe {
     /// Feed a window; returns the periodicity score.
+    ///
+    /// Not called yet, and that is not an oversight: same reason as
+    /// `Anc::process` above — this frontend has no audio capture, and
+    /// `bo-controller` owns the samples.
     ///
     /// The template is relearned whenever a period is found rather than
     /// averaged across windows: the source changes speed (a mower bogs down in

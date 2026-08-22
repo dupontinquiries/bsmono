@@ -566,6 +566,28 @@ impl Controller {
             let page = page_from_source(src, offset, self.all_tracks.sort());
             self.supply_tracks(&page);
         }
+        // BROWSE IS FILLED FROM THE SAME SOURCE, once. Its grids were empty by
+        // construction because nothing called load_local — and last commit I
+        // wrote the adapter for it and did not call that either, which the
+        // tested-but-uncalled report said plainly on the next run.
+        //
+        // Guarded on being empty rather than refreshed per call: this runs
+        // once a frame for an in-process host, and re-aggregating the whole
+        // catalogue at 60Hz would be the most expensive thing the app does.
+        // A host whose library changes calls `reload_browse`.
+        if self.browse_tracks.is_empty() && src.total() > 0 {
+            self.reload_browse(src);
+        }
+    }
+
+    /// Re-read the catalogue into the browse grids.
+    ///
+    /// Separate from `answer_tracks_from` so a host that knows its library
+    /// changed can say so, rather than the frame loop guessing from a count
+    /// that would miss an edit which kept the total the same.
+    pub fn reload_browse(&mut self, src: &dyn crate::catalog_source::CatalogSource) {
+        self.browse_tracks = browse_tracks_from_source(src);
+        self.browse.load_local(&self.browse_tracks);
     }
 
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
