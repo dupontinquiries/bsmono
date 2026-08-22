@@ -162,13 +162,20 @@ creep-like spread, high-ground vision.
 - **M2 net core — done in-process** (this drop): `echelon-net` sessions;
   remaining: UDP/relay transport over `shared/net-kit`, reconnect, drift
   buffering under real latency.
-- **M1 client — written** (this drop, `client/`): Bevy 0.16 front-end over
-  the same sim (Bevy owns its wgpu; `shared/gpu-kit` policy doesn't apply
-  — decision recorded in the project prompt). Human vs bot playable:
-  selection, orders, training, placement, HUD, win/lose. Builds on a
-  rustup toolchain — Bevy's MSRV is far past distro 1.75, hence the
-  detached workspace. Still open: fog, health bars, minimap, replays as
-  spectator input.
+- **M1 client — builds clean** (verified this session, first time ever: a
+  real rustc 1.96 finally cleared Bevy 0.16's MSRV, well past distro 1.75,
+  hence the detached workspace). `client/`: Bevy 0.16 front-end over the
+  same sim (Bevy owns its wgpu; `shared/gpu-kit` policy doesn't apply —
+  decision recorded in the project prompt). Human vs bot playable:
+  selection, orders, training, placement, HUD, win/lose. `cargo check`
+  caught one real pre-existing bug the untested "written" state had been
+  carrying: `order_label` (a `#[allow(dead_code)]` function kept "for a
+  future rally UI") didn't match `Order::Hold`, a real `E0004` non-
+  exhaustive-patterns error that had simply never been compiled before.
+  Fixed (labeled `"holding"`, matching `Hold`'s own doc comment — "stand
+  and fight: fire in place, never chase"). Not run on a real display
+  (headless sandbox) — compiling clean is confirmed, playing it is not.
+  Still open: fog, health bars, minimap, replays as spectator input.
 - **M3+**: abilities/upgrades, the classic trio, maps, editor.
 
 ## Monorepo integration

@@ -856,6 +856,7 @@ fn order_label(o: &Order) -> &'static str {
         Order::Idle => "idle",
         Order::Move(_) => "moving",
         Order::AttackMove(_) => "attacking",
+        Order::Hold => "holding",
         Order::HarvestGo(_) | Order::HarvestReturn(_) => "harvesting",
         Order::BuildGo(_) | Order::Constructing(_) => "building",
     }
