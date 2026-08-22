@@ -84,6 +84,18 @@ cargo bench          # Run benchmarks
 RUST_LOG=debug cargo run  # Debug mode
 ```
 
+### egui-frontend (2026-08-19)
+
+`egui-frontend/` (a separate crate, deliberately — see its own Cargo.toml
+comment on why iced and eframe can't coexist in one manifest here) had no
+build-status record anywhere. A session with a real rustc 1.96 (clears egui
+0.34's MSRV) ran it for the first time: `cargo test` is 141/141, spanning
+the map view (lat/long projection round-trips, nearest-point tap selection,
+non-finite-coordinate defense), the pressure/barometer dial, the screen-
+temperature heatmap (including version/staleness/corruption defenses on
+the published frame format), model sync/calibration display, and the shared
+UI model layer. Compiles clean.
+
 ## License
 
 MIT License
