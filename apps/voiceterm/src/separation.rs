@@ -214,10 +214,12 @@ impl Default for Separator {
     fn default() -> Self { Self::new() }
 }
 
+/// RMS of a frame — repointed onto audio-kit (its own doc names this exact
+/// copy, "voiceterm separation," as one of three it unifies with bo-suite's
+/// podcast_diar and snapclone-audio; confirmed byte-identical before
+/// repointing: same empty-guard, same sum-of-squares-over-n-then-sqrt).
 fn compute_rms(audio: &[f32]) -> f32 {
-    if audio.is_empty() { return 0.0; }
-    let sum_sq: f32 = audio.iter().map(|&s| s * s).sum();
-    (sum_sq / audio.len() as f32).sqrt()
+    audio_kit::level::rms(audio)
 }
 
 /// Match profile against registered speakers at the per-chunk threshold.

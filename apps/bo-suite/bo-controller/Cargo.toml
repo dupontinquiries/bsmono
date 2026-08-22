@@ -9,6 +9,10 @@ path = "examples/api_explorer.rs"
 
 [dependencies]
 bo-core = { path = "../bo-core" }
+# rms (podcast_diar.rs) — audio-kit's own doc names this exact function
+# (podcast_diar) as one of three byte-identical copies it unifies (with
+# voiceterm/separation.rs and snapclone-audio). Zero-dependency itself.
+audio-kit = { path = "../../../shared/audio-kit" }
 qmetaobject = "0.2"
 reqwest = { version = "0.11", features = ["json"] }
 serde_json = "1.0"

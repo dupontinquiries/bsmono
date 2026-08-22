@@ -16,6 +16,9 @@ voice-kit = { path = "../../shared/voice-kit" }
 # of which optional crypto backend is enabled) as one of 5+ byte-identical
 # copies across the monorepo. Zero-dependency itself (std only).
 net-kit = { path = "../../shared/net-kit" }
+# rms (separation.rs) — audio-kit's own doc names this exact copy
+# ("voiceterm `separation`") as one of three it unifies. Zero-dependency.
+audio-kit = { path = "../../shared/audio-kit" }
 qmetaobject = "0.2"
 scraper = "0.14"
 ureq = { version = "2", features = ["gzip"] }

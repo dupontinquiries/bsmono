@@ -22,6 +22,15 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 
 - [x] bo-suite audio_features.rs (both copies) → audio-kit shim (+ engine_timbre_score local). (This checkbox was stale as of 2026-08-19: the file was consolidated to ONE copy in bo-core with bo-controller re-exporting it, but the copy itself still had the full local implementation, never actually pointed at audio-kit. Actually repointed now — bo-core/src/audio_features.rs re-exports audio_kit::goertzel's SpectrogramConfig/spectrogram/spectrogram_at_freqs verbatim (byte-identical logic — audio-kit's own doc already said these were "lifted from bo-suite's audio_features"), engine_timbre_score stays local per the original plan, now calling audio_kit::goertzel::goertzel instead of a local copy. cargo test -p bo-core: 41/41. bo-controller itself (the actual Qt consumer) is unbuildable here — got past its OpenSSL blocker by installing libssl-dev, then hit a real qmake-not-found wall, consistent with every other Qt app this session — but its only touch point is a one-line `pub use bo_core::audio_features;` re-export with no signature changes, so risk is low.)
 - [x] bo-controller podcast_diar rms + voiceterm separation rms → audio_kit::level::rms.
+      (This checkbox was stale as of 2026-08-19 — both were still full local
+      implementations, byte-identical to audio-kit's own `rms`, which itself
+      already claimed both as unified copies. Actually repointed now, in the
+      same "bo-suite audio-kit round" as `audio_features.rs` and `bo-mux`'s
+      `ct_eq`. Both apps are Qt-blocked in this sandbox (qmetaobject/qmake) —
+      unverified by compilation, verified instead by line-by-line comparison;
+      `cargo test -p audio-kit level::` — 5/5 — confirms the primitive
+      itself, including the exact zero/full-scale-DC cases both apps'
+      original test suites also covered under different names.)
 - [x] rusty-board voice/hallucination.rs → voice-kit shim. (This checkbox was
       stale as of 2026-08-19 — the file was still a full standalone
       implementation, not a shim. Actually done now; see the "rusty-board
