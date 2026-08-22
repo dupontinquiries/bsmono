@@ -36,12 +36,41 @@ observed:
   round-trip asserts mean reconstruction error `< 5.0` for a uniform
   +10 offset; failed, meaning either the codec's quality regressed or the
   threshold is now wrong.
-- `v8_reconstruction_codec::feature_tests::fast_finds_synthetic_corner`,
-  `::feature_track_pass_assigns_stable_ids`, `::lk_tracks_pure_translation`
-  — FAST corner detection and Lucas-Kanade optical flow tracking on
-  synthetic test images; all three failed.
+- `v8_reconstruction_codec::feature_tests::fast_finds_synthetic_corner` —
+  **root-caused, not just observed**: the test builds a 32×32 image with a
+  16×16 dark square notched out of a bright field (a right-angle "step"
+  corner) and expects `FastDetector::detect` to fire near the tip. Worked
+  through the actual math: this detector's `arc_score` requires 9+ of the
+  16 circle points (radius 3) to agree in polarity — more than half the
+  circle. At the exact corner tip, the dark quadrant subtends only a ~90°
+  wedge of that circle (~4 of 16 points), and points just inside either
+  straight edge only ever get 2 of the 4 quick-reject cardinal probes to
+  cross the threshold (the other 2 cardinals point further into the same
+  region, away from the boundary) — geometrically, a single right-angle
+  step notch can never satisfy a "same polarity over half the circle"
+  test at any point near its tip. This isn't what FAST is generally weak
+  at in practice (real image corners usually aren't pure right-angle
+  steps against a flat field) — it means either the test's synthetic
+  geometry doesn't actually exercise what this implementation can detect,
+  or the 9-of-16 threshold is stricter than intended for this use case.
+  Either fix is a design call (change the test's corner shape, or loosen
+  the algorithm's arc threshold) — not a bug to patch blind.
+- `v8_reconstruction_codec::feature_tests::feature_track_pass_assigns_
+  stable_ids` ("frame 0 should produce features") — NOT the same root
+  cause as the FAST test above (this one runs `FeatureTrackPass::process`
+  over a diagonal-stripe gradient image, not a step-corner), so whatever
+  is stopping it from producing features here needs its own look.
+- `v8_reconstruction_codec::feature_tests::lk_tracks_pure_translation` —
+  independent of both of the above: seeds fixed points directly (no
+  `FastDetector` involved) and tracks a synthetic +2px x-shift via
+  `LkTracker`; the tracker reports `dx≈0.0005` instead of `≈2.0` — the
+  optical flow essentially isn't moving the estimate at all. A real
+  Lucas-Kanade implementation issue (iteration not converging, a sign/
+  Jacobian error, or similar) worth a dedicated look, distinct from the
+  corner-detection question above.
 - `v8_reconstruction_codec::densify_tests::anchor_cadence_correct` — an
-  anchor-frame cadence check for the densification pass.
+  anchor-frame cadence check for the densification pass. Not investigated
+  in the same depth as the three above.
 
 None of these were touched. They span real computer-vision/codec algorithm
 correctness (corner detection, optical flow, lossy compression quality) —
