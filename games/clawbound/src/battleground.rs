@@ -224,6 +224,12 @@ pub struct Warrior {
     pub mind: Mind,
     pub carry: Carry,
     pub shield: f32,      // absorbs damage first (Mane of Dawn / Stone Patience)
+    /// How long the shield lasts. Every kit's shield declares a `dur` and the sim
+    /// ignored it, so guard-hair held until something finally broke it — a lion
+    /// could raise Mane of Dawn once and carry it for the rest of the match. The
+    /// third free lunch of the week, after the kite and the veil, and found the
+    /// same way: by asking what a kit gets without paying.
+    pub shield_t: f32,
     pub stealth_t: f32,   // unseen/untargetable
     pub fear_t: f32,      // fleeing a Great Roar
     pub slow_t: f32,
@@ -550,7 +556,7 @@ impl Battleground {
                     x: sx, z: sz, heading: 0.0,
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
-                    shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
+                    shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
                     cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: slot as u32, still_t: 0.0, duty: Duty::Border,
                     is_player: team == CLAN_A && slot == 0, seg: 0,
                 });
@@ -592,7 +598,7 @@ impl Battleground {
                 hp: PATROL_HP, max_hp: PATROL_HP, attack: PATROL_ATK, speed: PATROL_SPEED, reach: REACH,
                 mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
                 carry: Carry::Nothing,
-                shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
+                shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
                 cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0,
                 seat: 100 + wave_seat * 8 + i as u32, still_t: 0.0, duty,
                 is_player: false, seg: 0,
@@ -633,7 +639,7 @@ impl Battleground {
             w.mind = Mind::Dead;
             // a carried kill or sprig is dropped and lost
             w.carry = Carry::Nothing;
-            w.shield = 0.0; w.stealth_t = 0.0;
+            w.shield = 0.0; w.shield_t = 0.0; w.stealth_t = 0.0;
             if w.role == Role::Ancestor {
                 w.respawn_t = respawn;
             }
@@ -721,6 +727,7 @@ impl Battleground {
                     let w = &self.warriors[j];
                     if w.team == team && w.alive() && dist(x, z, w.x, w.z) < spec.range.max(0.1) {
                         self.warriors[j].shield = self.warriors[j].shield.max(amount);
+                        self.warriors[j].shield_t = self.warriors[j].shield_t.max(spec.dur);
                     }
                 }
             }
@@ -1220,6 +1227,10 @@ impl Battleground {
             w.slow_t = (w.slow_t - dt).max(0.0);
             w.root_t = (w.root_t - dt).max(0.0);
             w.pulled_t = (w.pulled_t - dt).max(0.0);
+            w.shield_t = (w.shield_t - dt).max(0.0);
+            if w.shield_t <= 0.0 {
+                w.shield = 0.0;   // guard-hair settles
+            }
         }
         for p in self.prey.iter_mut() { p.respawn_t = (p.respawn_t - dt).max(0.0); }
         // land prey bolts from a close hunter, leashed to its home ground
@@ -1489,7 +1500,7 @@ mod tests {
             x: cx + 8.0, z: cz, heading: 0.0,
             hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0, reach: REACH,
             mind: Mind::Trail, carry: Carry::Nothing,
-            shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
+            shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
             cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: 999, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
         });
         bg.step(1.0 / 30.0);
@@ -2599,6 +2610,30 @@ mod tests {
         cat.patrol_t = [1e9; 2];
         cat.cast(0, 1); // Stripes in the Reeds
         assert!(cat.warriors[0].stealth_t > 0.0, "the veil may still be raised");
+    }
+
+    #[test]
+    fn guard_hair_settles_when_its_moment_passes() {
+        use crate::ancestor::kit;
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors.retain(|w| w.team == CLAN_A);
+        bg.heal_trees.clear();
+        bg.warriors[0].is_player = false;
+        bg.cast(0, 1); // Mane of Dawn
+        let dur = kit(Ancestor::Lion).abilities[1].dur;
+        assert!(bg.warriors[0].shield > 0.0 && bg.warriors[0].shield_t > 0.0);
+        // it holds for its declared moment…
+        for _ in 0..((dur - 0.5) * 30.0) as usize {
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[0].shield > 0.0, "the guard-hair should still be up at {dur}s");
+        // …and not a match longer
+        for _ in 0..30 {
+            bg.step(1.0 / 30.0);
+        }
+        assert_eq!(bg.warriors[0].shield, 0.0, "and then it settles");
+        assert_eq!(bg.warriors[0].shield_t, 0.0);
     }
 
     #[test]

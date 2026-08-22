@@ -55,6 +55,13 @@ fn main() {
     } else {
         LanePolicy::Kit
     };
+    // arg 5: a draft-set seed. Arms are compared on IDENTICAL drafts by default
+    // (same seed, same lands), which is what makes a delta meaningful; change it
+    // to pool independent draft sets and shrink the per-kit error bar.
+    let draft_seed: u64 = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x243f_6a88_85a3_08d3);
     let pool = ancestor::ALL;
     let mut wins = vec![0u32; pool.len()];
     let mut games = vec![0u32; pool.len()];
@@ -62,7 +69,7 @@ fn main() {
     let mut total = 0u32;
     let mut fells = 0u32;
     let (mut pairs, mut pair_a_both, mut pair_b_both, mut pair_split) = (0u32, 0u32, 0u32, 0u32);
-    let mut rng: u64 = 0x243f_6a88_85a3_08d3;
+    let mut rng: u64 = draft_seed;
     let mut next = move || {
         rng ^= rng << 13;
         rng ^= rng >> 7;
@@ -151,7 +158,13 @@ fn main() {
         .collect();
     rows.sort_by(|a, b| b.0.total_cmp(&a.0));
     eprintln!("\n  by ancestor, over random drafts (both sides of every draft played):");
+    // With the error bar printed beside it, a ten-point difference stops looking
+    // like a finding. At n≈70 games a kit's standard error is about six points,
+    // so nothing inside ±12 of even is evidence of anything on one arm.
     for (rate, name, w, g) in rows {
-        eprintln!("    {name:<12} {w:2}/{g:2}  {:.0}%", rate * 100.0);
+        let se = if g > 0 { (0.25f64 / g as f64).sqrt() * 100.0 } else { 0.0 };
+        let flag = if (rate * 100.0 - 50.0).abs() > 2.0 * se { " *" } else { "" };
+        eprintln!("    {name:<12} {w:2}/{g:2}  {:.0}% ± {se:.0}{flag}", rate * 100.0);
     }
+    eprintln!("  (* = outside two standard errors; anything else is this arm's noise)");
 }

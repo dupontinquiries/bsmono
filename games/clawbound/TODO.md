@@ -220,8 +220,28 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   Latest: 33 split, 18 to clan A twice, 29 to clan B twice — a 1.6 SD lean, i.e. not
   enough to act on, and the mirror probe's 51% over identical drafts remains the authority
   on side fairness. The harness's 43% is mostly orientation-decided pairs, which is chaos.
-- [ ] If the A/B-both imbalance persists past ~400 pairs it stops being noise; re-check with
-  `battleground_balance 8 20` when there is time to spend on a 40-minute run
+- [x] Shields honour their declared `dur` now — every kit's shield spec carried a duration
+  the sim ignored, so guard-hair held until something broke it and a lion could raise Mane
+  of Dawn once and wear it all match. Third free lunch of the week after the kite and the
+  veil, found the same way: asking what a kit gets without paying.
+- [x] **A correction to how the last few passes were argued.** Two independent draft sets
+  (same code, same 160-game shape, different draft seed) disagree wildly per kit: Riptail
+  66% then 39%, Suneye 55% then 40%, Faryowl 47% then 64%. At n≈70-90 games a kit's
+  standard error is ±6, and *which drafts it lands in* swamps that again. So the per-kit
+  table cannot resolve a kit-sized effect on one arm, and the rate improvements quoted for
+  the kite and veil fixes were weaker evidence than they read as. Those changes stand on
+  their mechanism — a cat that backs away while biting, a cat that strikes while
+  untargetable — which is why it was worth finding mechanisms rather than tuning numbers.
+- [x] Proof by counter-example, kept because it is the clearest one: *lengthening* the
+  shield durations to compensate for the nerf measured the buffed kit eleven points WORSE
+  (Goldenmane 49 -> 38). No buff does that; noise does. The durations went back to their
+  authored values and the lesson went into the harness instead — it now prints ± standard
+  error per kit and flags only rates outside two of them, and takes a draft-set seed so
+  independent sets can be pooled.
+- [ ] Protocol from here: doctrine-level changes (they move every kit, so the arm-to-arm
+  noise partly cancels) or mechanism fixes with an argument that stands without the table.
+  A genuine kit-strength claim needs ~5 pooled draft seeds, about 800 games, and nobody
+  should touch a number on less.
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
   a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
   every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
@@ -259,8 +279,28 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   Latest: 33 split, 18 to clan A twice, 29 to clan B twice — a 1.6 SD lean, i.e. not
   enough to act on, and the mirror probe's 51% over identical drafts remains the authority
   on side fairness. The harness's 43% is mostly orientation-decided pairs, which is chaos.
-- [ ] If the A/B-both imbalance persists past ~400 pairs it stops being noise; re-check with
-  `battleground_balance 8 20` when there is time to spend on a 40-minute run
+- [x] Shields honour their declared `dur` now — every kit's shield spec carried a duration
+  the sim ignored, so guard-hair held until something broke it and a lion could raise Mane
+  of Dawn once and wear it all match. Third free lunch of the week after the kite and the
+  veil, found the same way: asking what a kit gets without paying.
+- [x] **A correction to how the last few passes were argued.** Two independent draft sets
+  (same code, same 160-game shape, different draft seed) disagree wildly per kit: Riptail
+  66% then 39%, Suneye 55% then 40%, Faryowl 47% then 64%. At n≈70-90 games a kit's
+  standard error is ±6, and *which drafts it lands in* swamps that again. So the per-kit
+  table cannot resolve a kit-sized effect on one arm, and the rate improvements quoted for
+  the kite and veil fixes were weaker evidence than they read as. Those changes stand on
+  their mechanism — a cat that backs away while biting, a cat that strikes while
+  untargetable — which is why it was worth finding mechanisms rather than tuning numbers.
+- [x] Proof by counter-example, kept because it is the clearest one: *lengthening* the
+  shield durations to compensate for the nerf measured the buffed kit eleven points WORSE
+  (Goldenmane 49 -> 38). No buff does that; noise does. The durations went back to their
+  authored values and the lesson went into the harness instead — it now prints ± standard
+  error per kit and flags only rates outside two of them, and takes a draft-set seed so
+  independent sets can be pooled.
+- [ ] Protocol from here: doctrine-level changes (they move every kit, so the arm-to-arm
+  noise partly cancels) or mechanism fixes with an argument that stands without the table.
+  A genuine kit-strength claim needs ~5 pooled draft seeds, about 800 games, and nobody
+  should touch a number on less.
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean

@@ -496,6 +496,24 @@ mod tests {
     }
 
     #[test]
+    fn a_shield_is_worth_holding_for() {
+        // The shields' declared durations were dead numbers until the sim began
+        // honouring them; uptime went from permanent to dur/cd. The durations
+        // themselves are left at their authored values: an attempt to compensate
+        // by lengthening them measured WORSE (dispersion 4.6 -> 7.0), but on a
+        // single 160-game arm where the buffed kit's own rate fell eleven points,
+        // which is a result no buff can produce and noise easily can. The lesson
+        // went into the harness rather than into these numbers.
+        for a in [Ancestor::Lion, Ancestor::Puma] {
+            let k = kit(a);
+            let s = k.abilities.iter().find(|ab| ab.verb == Verb::Shield).expect("has a shield");
+            let uptime = s.dur / s.cd;
+            assert!(uptime > 0.2, "{}: shield uptime {uptime:.2} is too thin to build around", k.name);
+            assert!(uptime < 0.6, "{}: shield uptime {uptime:.2} is close enough to permanent", k.name);
+        }
+    }
+
+    #[test]
     fn a_controllers_cooldowns_come_back_fast() {
         // the specialists' techniques cycle faster than anyone's ultimate and
         // faster than the bruisers' techniques — control has to be *available*
