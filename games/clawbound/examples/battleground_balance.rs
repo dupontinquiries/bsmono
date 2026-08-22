@@ -109,9 +109,12 @@ fn main() {
         if wombo { "on" } else { "off" },
         policy
     );
+    // decided games only: a draw is not half a win for clan A, and counting it
+    // in the denominator quietly depresses the number the whole harness is for
+    let decided = fells;
     eprintln!(
-        "  clan A took {clan_a_wins} ({:.0}%) — the map claims symmetry, so this wants ~50%",
-        clan_a_wins as f64 / total as f64 * 100.0
+        "  clan A took {clan_a_wins} of {decided} decided ({:.0}%) — the map claims symmetry, so this wants ~50%",
+        clan_a_wins as f64 / decided.max(1) as f64 * 100.0
     );
     eprintln!(
         "  {fells} decided by felling a Great Tree ({:.0}%)",

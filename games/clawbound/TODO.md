@@ -197,10 +197,20 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   sent the 130-hp yowler down the river and cost it 19 points (55% -> 36%) in 168 games.
 - [ ] Faryowl at 61% is the one kit outside +-7 in the winning arm — the next thing to look
   at, and the first candidate for an actual kit change rather than a doctrine one
-- [ ] Clan A pooled across every run to date is 544/1160 = **46.9% (se 1.5%)**, about 2 SD
-  low. Both A/B arms show it equally, so it is not laning; suspect residual first-contact
-  ordering. Worth a mirror-probe pass that tolerates the first blow and checks what
-  diverges *after* it
+- [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
+  a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
+  every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
+  There is no side bias in the simulation. The harness number was partly draw accounting
+  (draws sat in the denominator but never in clan A's column) and the rest is sample noise
+  across differing draft sets; the balance harness now reports decided games only.
+- [x] The probe's own first-blood metric caught a lesson worth keeping: scanning for "the
+  first wounded warrior" reported a 78/22 skew that was **pure artefact** — clan A holds
+  the low indices and wins every simultaneous tie in the iteration order. Counting both
+  clans' wounds in the first tick any appear gives A 9, simultaneous 23, B 8. An
+  instrument that shares the thing it measures' index order will measure its own index
+  order.
+- [ ] Faryowl at 61% is the one kit outside +-7 in the winning arm — the next thing to look
+  at, and the first candidate for an actual kit change rather than a doctrine one
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean
