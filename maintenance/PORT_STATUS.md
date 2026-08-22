@@ -940,13 +940,28 @@ match), is not. `EntityPicker` has zero references outside `detect.rs` itself.
 The progress-bar half of this file's job works; the entity-disambiguation half
 does not reach the user.
 
-**`archived_view::bar_ui` is real.** The archive page's main renderer
-(`archive_ui`) is wired and working — confirmed in `CentralView::Archive`'s
-match arm. But its sibling `bar_ui` — a fan-out bottom action bar, with the
-specific rule "a button with no options must not fan out into an empty popup"
-documented and presumably tested — is a different surface for the same page
-that `archive_ui` does not call and nothing else does either. `BottomBar` has
-zero references in the binary.
+**`archived_view::bar_ui` is real, and — like the gitmind item — deeper than
+it first looked.** Re-checked with the compiler available: the running binary
+has a `bar_state: voiceterm_egui::bars::BarState` field (`VoicetermApp`,
+constructed, never read — the compiler's own `dead_code` lint flags it
+independently, confirming this by a second method). `bars::BarState` is a
+*different* module from `archived_view::BottomBar`, though both mount the same
+underlying `src/bottom_bar.rs` engine file by `#[path]`: `BarState` is a
+press-vs-hold gesture state machine (`press`, `tick`, `release`, `abort`) with
+no drawing code, built specifically so a tap fires the primary action and only
+a hold fans out to the option list — its own module doc calls this the rule
+that "makes the bar work on a phone" and states plainly what breaks without
+it. `archived_view::bar_ui`, by contrast, is a complete but simpler
+click-to-toggle renderer that does not implement that hold-vs-tap distinction
+at all — reading its body, a single click opens the fan-out. So there are two
+unwired half-answers to the same problem, not one function missing a call
+site: the properly-designed gesture model (`BarState`, sitting inert) and a
+working-but-simpler renderer that doesn't use it (`bar_ui`). Wiring these
+together (driving `bar_ui`-style rendering from `BarState`'s gesture events,
+or wiring `BarState` to a still-unwritten renderer) is a small design decision
+about which behaviour is correct, not a mechanical connection — left as-is for
+that reason, with the more precise finding recorded here instead of the
+original single-function framing.
 
 Both are the same shape as the ambient-learner `LiveView` finding above: a
 page got ported with two halves, one wired and one not, rather than one whole
@@ -960,7 +975,27 @@ blind, for the same no-compiler reason as tomescope's orphans in `TODO.md`:
       `archive_ui` — likely a per-page action row (share/re-fetch/delete),
       matching the "fan out" pattern described in the module doc.
 
-## wiring_check.py has its own blind spot: `crates/<x>-egui` layouts
+## A real Rust toolchain is now available in-sandbox (2026-08-22)
+
+Everything above this point in the session was audited by reading source only
+— no compiler existed in this environment. An offline rustc/cargo 1.96.0
+bundle was provided and installed to `/usr/local` this session. `cargo check`
+now works and reaches crates.io for dependencies (confirmed: `gitmind-egui
+--features app` and `voiceterm-egui --bin voiceterm-egui --features app` both
+built clean, warnings only).
+
+This matters for everything recorded above: every "not wired this session,
+no compiler to verify" caveat in this document no longer applies to sessions
+that check for a working `cargo` first. Two items were re-examined with the
+compiler and turned out to need a real design decision rather than a
+mechanical wire-up once actually looked at closely (gitmind's `remote_browse`
+needs a new parameter threaded through a shared `cockpit` function signature;
+voiceterm's bar duplication is two incomplete answers, not one missing call) —
+both corrected in place above rather than left as the shallower original
+framing. The lesson: "no compiler" was a reason not to guess blindly, not a
+license to stop reading the actual call sites before writing down a fix's
+scope — the deeper read happened anyway and changed the record for the
+better.
 
 `egui_dirs()` only looks at two hardcoded paths per app: `egui-frontend/src`
 and `src/ui/egui`. `gitmind` (`crates/gui-egui/src`), `logscope`
@@ -984,6 +1019,19 @@ missing dirs rather than trusting the gap to be empty:
   you browse it. `Browser`'s navigation is a pure, injectable-SSH-callback
   model specifically so it's testable without a real device — the tests exist,
   the page that would call it does not.
+  **Re-checked once a compiler became available (see below): the gap is
+  bigger than "wire an unused widget."** `push.rs`'s `Build & push` button
+  calls `cockpit::flow::deploy_app_remote_logged(app, target, user, host,
+  on_line)` — no destination-path parameter at all. The actual install
+  location is hardcoded inside `crate::installer::push_install_script`, not a
+  knob the push flow exposes anywhere. So wiring `remote_browse` for real
+  means adding a destination-path parameter through `deploy_app_remote_logged`
+  → `push_install_script` → the push page's state, not just calling an
+  existing function from a button — a real (small) feature addition, not a
+  mechanical connection. Left as the checklist item below with the corrected
+  scope, rather than either doing unplanned surgery on a shared `cockpit`
+  function signature (which every deploy call site depends on) or overstating
+  how close it is to done.
 * **logscope**: 44 modules, 12 dead — `repo`, `spatial_audio`, `workbench`,
   `tab_layout`, `log_gestures`, `chat_layout`, `debatepanel`, `voiceconfirm`,
   `micresponse`, `textsurface`, `assets`, `workergen`. Checked all 12 by grep
