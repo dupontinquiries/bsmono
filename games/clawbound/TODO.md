@@ -238,10 +238,20 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   authored values and the lesson went into the harness instead — it now prints ± standard
   error per kit and flags only rates outside two of them, and takes a draft-set seed so
   independent sets can be pooled.
-- [ ] Protocol from here: doctrine-level changes (they move every kit, so the arm-to-arm
-  noise partly cancels) or mechanism fixes with an argument that stands without the table.
-  A genuine kit-strength claim needs ~5 pooled draft seeds, about 800 games, and nobody
-  should touch a number on less.
+- [x] Protocol written down and *run*: `docs/BALANCE.md` holds the pooled baseline — five
+  independent draft sets, **800 matches, 4,800 kit appearances**, ±2se ≈ ±5 points.
+  Result: **sd 3.3, range 12, ten of thirteen kits statistically even.** The three outside
+  two standard errors are Windclaw 55%, Rainspots 55%, Snowhush 44% — the weakest kind of
+  real, and each worth a mechanism hunt rather than a number nudge.
+- [x] The 800-game run is affordable because the jungle stopped reallocating: `thickets()`,
+  `walls()` and `mists()` rebuilt three Vecs on every call, and their callers are
+  `concealment_at` and `sees`, which run once per warrior pair per tick. Cached behind a
+  OnceLock with slice accessors for the hot path: **12,209 -> 27,883 sim steps/s (2.3x)**,
+  and the pooled protocol went from nineteen minutes to eight.
+- [ ] Mechanism hunt for the three outliers: what do Windclaw and Rainspots get for free
+  (kill-stacked speed with no cap on the stacking rate? Riverborn mending with no cost?),
+  and what does Snowhush pay for that it does not collect (chill-on-hit needs someone to
+  punish the chilled — does the AI ever follow up?)
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
   a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
   every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
@@ -297,10 +307,20 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   authored values and the lesson went into the harness instead — it now prints ± standard
   error per kit and flags only rates outside two of them, and takes a draft-set seed so
   independent sets can be pooled.
-- [ ] Protocol from here: doctrine-level changes (they move every kit, so the arm-to-arm
-  noise partly cancels) or mechanism fixes with an argument that stands without the table.
-  A genuine kit-strength claim needs ~5 pooled draft seeds, about 800 games, and nobody
-  should touch a number on less.
+- [x] Protocol written down and *run*: `docs/BALANCE.md` holds the pooled baseline — five
+  independent draft sets, **800 matches, 4,800 kit appearances**, ±2se ≈ ±5 points.
+  Result: **sd 3.3, range 12, ten of thirteen kits statistically even.** The three outside
+  two standard errors are Windclaw 55%, Rainspots 55%, Snowhush 44% — the weakest kind of
+  real, and each worth a mechanism hunt rather than a number nudge.
+- [x] The 800-game run is affordable because the jungle stopped reallocating: `thickets()`,
+  `walls()` and `mists()` rebuilt three Vecs on every call, and their callers are
+  `concealment_at` and `sees`, which run once per warrior pair per tick. Cached behind a
+  OnceLock with slice accessors for the hot path: **12,209 -> 27,883 sim steps/s (2.3x)**,
+  and the pooled protocol went from nineteen minutes to eight.
+- [ ] Mechanism hunt for the three outliers: what do Windclaw and Rainspots get for free
+  (kill-stacked speed with no cap on the stacking rate? Riverborn mending with no cost?),
+  and what does Snowhush pay for that it does not collect (chill-on-hit needs someone to
+  punish the chilled — does the AI ever follow up?)
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean
