@@ -356,9 +356,27 @@ members rather than one path would be the real fix; not attempted here since
 it risks silently changing what the tool reports for every app, and there's no
 compiler in this sandbox to validate the fix against the actual crate graph.
 
-Other small-app orphans found, not yet triaged: `av1tuner`/`av1tuner-m1`'s
-`eta.rs` (ETA estimation, 5 tests) and `config.rs` (2 tests) are identical
-orphans in both the stale and live fork, confirmed genuinely unreferenced by
-grep (single-crate apps, so the false-positive mechanism above doesn't apply)
-— worth checking whether the live `av1tuner-m1` fork actually needs them wired
-or whether they're superseded.
+**av1tuner/av1tuner-m1's `eta.rs`/`config.rs` triaged — a fourth confirmed
+false positive, not a real gap.** `av1tuner_core::eta::EtaTracker` and
+`av1tuner_core::config::UserConfig` are both extensively used — imported and
+called throughout `av1tuner_app/src/app.rs` (`EtaTracker::new()`,
+`record_chunk`, `frames_per_second`, `eta_string`; `UserConfig::load()`, a
+`current_config()` builder). The reachability tool flagged them because
+`av1tuner_core` and `av1tuner_app` are separate crates in a two-crate
+workspace — same cross-crate blind spot as gitmind and logscope above, just on
+a smaller, two-crate example that made it easy to confirm by hand in under a
+minute. Fourth confirmed instance of the same root cause; not fixing anything
+here, just closing the loop on the one item this doc left untriaged.
+
+Separately, `apps/av1tuner/DUPLICATE.md` (written by an earlier session)
+already says `av1tuner` is the stale fork and `av1tuner-m1` is live, "should be
+retired once someone confirms nothing external references it." Checked:
+`manifest/projects.toml`'s `av1tuner` entry notes `av1tuner-m1` is "the live
+fork and is ahead in all five" differing files, matching `DUPLICATE.md`
+exactly, and nothing in `build/`, other apps, or the manifest points at
+`apps/av1tuner` as a build target distinct from `apps/av1tuner-m1`. That
+confirmation was already implicitly done by whoever wrote `DUPLICATE.md`;
+not re-litigating it further since deleting an app tree is a one-way,
+non-code-verifiable action better left for the user to greenlight explicitly
+(matches the repo's own "Parked backlog (no execute without greenlight)"
+policy for anything destructive).
