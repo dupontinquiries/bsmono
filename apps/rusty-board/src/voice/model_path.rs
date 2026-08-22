@@ -5,38 +5,30 @@
 //! The actual whisper-rs `Transcriber` consumer of these paths IS
 //! feature-gated; this module just answers "where's the model file?"
 //! without depending on whisper-rs.
+//!
+//! Repointed onto voice-kit (TODO.md's "voice-kit consumers, model half"):
+//! the candidate-filename list and the "does any of these filenames exist
+//! in any of these directories, in priority order" scan are now
+//! `voice_kit::model::find_model_in` — that list was a byte-for-byte
+//! duplicate of voice-kit's `MODEL_CANDIDATES` (12 entries, same order,
+//! confirmed before repointing). What stays local: the actual list of
+//! *directories* to search, since it's genuinely rusty-board-specific
+//! (its own XDG data dir, a hardcoded interop path to voiceterm's config
+//! dir, etc.) — voice-kit's `find_model_in` takes the directory list as a
+//! parameter for exactly this reason (its own doc: "the app supplies its
+//! own search directories").
+//!
+//! One real API-shape mismatch, handled deliberately rather than papered
+//! over: this app's `WHISPER_MODELS_DIR` env var names a *directory* to
+//! search (using the same candidate-filename list as every other
+//! directory); `find_model_in`'s own `env_override` parameter is a
+//! *file* override (an exact path, checked directly). Those are different
+//! shapes, so the env var is prepended to the directory list instead of
+//! passed as `env_override` — preserves the original priority (env dir
+//! searched first, same filename preference within it) rather than
+//! silently changing what the env var means.
 
 use std::path::{Path, PathBuf};
-
-/// Filename candidates per directory. Order matters: first existing
-/// wins. Quantized .gguf first, then .bin, then full-precision variants.
-///
-/// `.gguf` is the modern unified format (used by llama.cpp and recent
-/// whisper.cpp builds). `.bin` is the older GGML format. Whisper.cpp's
-/// `WhisperContext::new` auto-detects from the file header, so the
-/// resolver doesn't need to care — it just returns a path.
-///
-/// Quantized variants are 2-4x smaller than fp16 with negligible WER
-/// loss, important on phone where the fp16 base model is half the
-/// app's RAM budget.
-const FILENAMES: &[&str] = &[
-    // Quantized GGUF — modern preferred format
-    "ggml-base.en-q5_1.gguf",
-    "ggml-base.en-q5_0.gguf",
-    "ggml-tiny.en-q5_1.gguf",
-    "ggml-tiny.en-q5_0.gguf",
-    // Quantized GGML
-    "ggml-base.en-q5_1.bin",
-    "ggml-tiny.en-q5_1.bin",
-    // Full-precision GGUF
-    "ggml-base.en.gguf",
-    "ggml-base.gguf",
-    "ggml-tiny.en.gguf",
-    // Full-precision GGML
-    "ggml-base.en.bin",
-    "ggml-base.bin",
-    "ggml-tiny.en.bin",
-];
 
 /// Look in standard places for a whisper model. Returns the first
 /// existing path, or `None`.
@@ -50,6 +42,9 @@ const FILENAMES: &[&str] = &[
 ///   5. `~/.local/share/whisper/models/` — whisper.cpp convention
 ///   6. `/usr/share/rusty-board/models/` — system-wide
 ///   7. `/usr/share/whisper/models/`
+///
+/// Filename preference within each directory (quantized `.gguf` first,
+/// then `.bin`, then full-precision) comes from `voice_kit::model`.
 pub fn find_default_model() -> Option<PathBuf> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
@@ -57,7 +52,9 @@ pub fn find_default_model() -> Option<PathBuf> {
 
     let mut dirs: Vec<PathBuf> = Vec::new();
 
-    // 1. Env override.
+    // 1. Env override — a DIRECTORY to search first, not a direct file
+    // path (see the module doc for why this isn't passed as
+    // find_model_in's own env_override parameter).
     if let Ok(env_dir) = std::env::var("WHISPER_MODELS_DIR") {
         if !env_dir.is_empty() {
             dirs.push(PathBuf::from(env_dir));
@@ -80,15 +77,7 @@ pub fn find_default_model() -> Option<PathBuf> {
     dirs.push(PathBuf::from("/usr/share/rusty-board/models"));
     dirs.push(PathBuf::from("/usr/share/whisper/models"));
 
-    for dir in &dirs {
-        for filename in FILENAMES {
-            let p = dir.join(filename);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
+    voice_kit::model::find_model_in(&dirs, None)
 }
 
 fn dirs_share() -> PathBuf {
