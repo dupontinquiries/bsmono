@@ -802,6 +802,55 @@ check the renamed ones by hand since the source moved. Read snapclone's `code`
 column (51%, 25/49) as the same kind of floor as bo-suite's — real coverage is
 close to `named` (100%), not to `code`.
 
+## Checked the small named-only lists on the other apps too
+
+Same method as snapclone above — read the actual code, don't trust the name
+match — applied to every app with a nonzero named-only list:
+
+* **voiceterm** (`GestureHost`, `SlidePopup`, 2 of 15): both real. QML's
+  `GestureHost.qml`/`SlidePopup.qml` is the press→drag→release popup-menu
+  pattern for the toolbar's pipe/brace buttons; `action_compass.rs` says so
+  directly in its own module doc — "the QML toolbar's GestureHost/SlidePopup
+  pattern, egui-native" — built on `uikit_egui::slide_menu` and wired to real
+  `App` actions (clear/copy/interrupt/search), with a pure unit-tested
+  direction→action map. Ported, not missing.
+* **gitmind** (`FileRow`, 1 of 22): confirmed ported.
+  `crates/gui-egui/src/status_rows.rs` opens with "the changed-file list from
+  `qml/FileRow.qml`, as a model" and defines `Row` (not `FileRow` — the
+  false-negative pattern again), with `parse_porcelain`, `counts`, and a full
+  test suite (rename handling, malformed-output skipping, quoted paths).
+* **logscope** (`BlocTab`, `CargoTab`, `ChatTab`, `CodeTab`, `ModifyTab`,
+  `RotationTab`, `SourcesTab`; 7 of 28): confirmed ported, all seven.
+  `crates/logscope-egui/src/tabs/{bloc,cargo,chat,code,modify,rotate,sources}.rs`
+  map 1:1; `bloc.rs`'s own header says outright "Ports `ui/bloc_tab.rs`", and
+  `tabs/mod.rs` explains the shape — non-UI logic (engine, providers, bloc,
+  conversation_db) reused as-is, each tab module carrying representative UI
+  state so the shell is alive and faithful to the original `src/ui/*`.
+* **ambient-learner** (`AnimatedBackground`, `DebugScreenTempsPage`, `EguiLib`,
+  `HumiditySparkles`, `PressureGauge`; 5 of 16): all real except one phantom.
+  `PressureGauge` is confirmed ported already, in the doc's own "ambient-learner
+  joins the table" section above. `AnimatedBackground` and `HumiditySparkles`
+  are BOTH in `src/ui/egui/ambience.rs`, whose own header states it outright:
+  "`HumiditySparkles` and `AnimatedBackground`, ported" — `Sparkles` and
+  `Ambience`/`ambience_ui`, with 13 tests covering the exact contract the doc
+  above cares about (clamped humidity, session-stable droplet placement,
+  storm-clamped parallax, dark-room dimming rather than blanking). `EguiLib`
+  is the audit's CamelCase of the crate name itself, not a portable surface —
+  same phantom-name class as `AmbientLearnerApp` noted a few sections up.
+  `DebugScreenTempsPage` not independently re-checked this pass.
+* **bo-suite** (14 of 46) is unchanged from an earlier pass and already
+  confirmed ported under Rust names in the "misreading the code column"
+  section above.
+
+So across every app in the fleet, every named-only surface with a real
+predecessor that was checked this session — 24 in snapclone, 2 in voiceterm, 1
+in gitmind, 7 in logscope, 4 of 5 in ambient-learner — turned out to be ported,
+just under an idiomatic Rust name the string-matching audit can't see. The
+`code`/`wired` percentage column is a floor, not a measure, exactly as the
+doc's own "misreading the code column" section already concluded for bo-suite;
+this extends that conclusion to the rest of the fleet with actual evidence
+rather than assuming it generalizes.
+
 **What is still genuinely open** — not a naming artifact, confirmed by reading
 the code rather than assumed from the table above — is exactly what the
 "Reported defects" section already says: `camera_source.rs` is the *selection*
