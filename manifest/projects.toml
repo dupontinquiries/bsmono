@@ -5,7 +5,6 @@
 # runtime: kde | gnome | freedesktop | none | tbd   (Flatpak runtime)
 # targets: subset of manifest/targets.toml ids; "all" = every linux target
 
-
 [apps.voiceterm]
 path = "apps/voiceterm"
 kind = "cargo"            # qmetaobject cdylib (Rust↔Qt, not Rust↔C++)
@@ -81,35 +80,6 @@ runtime = "none"          # pure egui/glow (wayland/x11) — no GTK/Qt runtime, 
 targets = ["desktop"]
 primary = true            # THE default keyboard: gitmind selects this, not the GTK build
 notes = "the egui port of rusty-board (GTK4 keyboard), and now the default build. Shares the engine's own Config AND voice stack via #[path] rather than reimplementing them, so the two front ends cannot drift. Dictation drives the streaming partials directly (see dictation.rs): partials REPLACE rather than accumulate and the last one is committed, which removes the double-transcription and the wait for a second inference pass. `cargo build --release` gives the deployable bin; add `--features voice` for dictation (whisper-rs is a native build and wants a model). Still GTK-only: the LLM assistant, the minimised tray and the microterm."
-
-[apps.launcher-egui]
-path = "apps/launcher/egui-frontend"
-kind = "cargo"
-role = "app"
-daemon = false
-flatpak = false
-runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
-targets = ["desktop", "phone"]  # phone (FP5) is the actual target; cross build unverified in this sandbox (x86_64, no aarch64-musl cross toolchain)
-primary = true            # the egui port is the intended build
-notes = "the egui-primary port of the tile launcher (Plasma kickerdash-fork plasmoid) — see UI_STRATEGY.md. Fullscreen fuzzy-searchable app grid; a headless tick-based Board (src/anim.rs) drives the plasmoid's slide-in + restack tile animation, so the whole visible behaviour — filtering, restack convergence, tap-vs-close — runs under `cargo test` with no display. Reads `[launcher]` prefs (palette id, slide pattern, timings, icon_theme) from config-kit. `cargo build --release` produces the deployable `launcher-egui` bin directly (the `app` feature is default-on). The on-screen-keyboard inset (`Shell::kb_inset_px`) is a layout seam that nothing feeds yet: winit/egui 0.34 don't surface the compositor's input-panel rect, so a maliit/zwp_input_panel listener is an open on-device task, same shape as snapclone-egui's keyboard_inset.rs. Icons resolve via a real freedesktop icon-theme lookup (src/icontheme.rs: index.theme parsing, directory size-matching, Inherits chain, hicolor fallback — 9 tests, verified against this build host's actual Adwaita/hicolor trees) and render through either `image` (PNG, native resolution) or `resvg`+`tiny-skia` (SVG, rasterized directly at the tile's on-screen size rather than the icon's often-tiny intrinsic viewBox, since most modern themes — Adwaita/Breeze included — ship scalable/*.svg as their primary art). `resvg` runs with its default text/font features disabled (icon artwork is vector shapes, not text) to keep the dependency tree lean. Remaining gap: raster formats embedded inside an SVG (rare in icon themes) aren't decoded, same `image`-crate-only limitation as the top-level PNG path."
-
-[apps.launcher-plasmoid]
-path = "apps/launcher/plasmoid"
-kind = "kpackage"          # deviation from cargo|hybrid|cmake|python+rust: a Plasma KPackage has
-                            # no compile step at all — kpackagetool6 installs the QML/metadata.json
-                            # tree as-is. build.sh's kind dispatch has a safe unknown-kind fallback
-                            # (prints "(unknown kind)", doesn't error), so this doesn't need a new
-                            # orchestrator case, just documentation here.
-role = "app"
-daemon = false
-flatpak = false
-runtime = "kde"             # Plasma 6 shell (X-Plasma-API-Minimum-Version 6.0 in metadata.json)
-targets = []                 # not architecture-specific — install target is "whichever Plasma 6
-                            # shell has kpackagetool6", not a build triple; leaving empty rather
-                            # than guessing a meaningless desktop/phone split for a script+QML bundle
-primary = false             # per UI_STRATEGY.md: egui (launcher-egui) is primary, this is the
-                            # archived-maintained Qt/QML tier
-notes = "the archived-maintained Qt/QML tier of the tile launcher — see UI_STRATEGY.md and apps/launcher/plasmoid/README.md (touch-input fixes, carry-over files this package expects copied in, install/iterate commands via kpackagetool6/plasmoidviewer). Verified with Qt 6.4.2's qmllint (apt-installed from Ubuntu's own repos) — zero syntax errors across all six QML files; semantic type-checking against actual Plasma 6 types is still unverified since Plasma 6's libplasma isn't packaged for generic Ubuntu (only the incompatible KF5/Plasma 5 plasma-framework is). Never run as a live dashboard in this sandbox — no Plasma host, no display."
 
 [apps.bo-suite]
 path = "apps/bo-suite"
@@ -397,7 +367,6 @@ flatpak = false
 runtime = "none"
 targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
 notes = "whisper post-proc: hallucination filter + model resolution; zero-dep; consumed by rusty-board (repointed)"
-
 
 # --- games (new tier; consolidated from apps/ duplicates — keeping the larger games/ trees) ---
 [games.clawbound]
@@ -724,7 +693,6 @@ kind = "cargo"
 role = "app"
 daemon = false
 notes = "A local camera. Captures land on this device and go nowhere until the user picks a target: photosync (their own machines, content-addressed) or a snapclone contact (a person, not recallable). The two are kept distinct in the type system because collapsing them is how a backup becomes a disclosure. Headless core + eframe shell, so the sharing rules test without a camera."
-
 
 [apps.dialer]
 path = "apps/dialer"

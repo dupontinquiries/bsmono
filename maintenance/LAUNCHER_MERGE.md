@@ -86,6 +86,46 @@ they could reproduce it.
 
 ## Status
 
+**Done.** All four steps.
+
+Steps 1 and 2 landed earlier: `icontheme` and the animation `Board` plus its
+`grid`, ported into `hatch-core`. Step 3 turned out to need no port — the
+Appearance surface was folded into `ConfigGeneral.qml` instead of shipped as a
+second page, because KCM `cfg_` aliases must be unique per config key and two
+pages cannot both alias the same one. `ConfigGeneral.qml` already carries
+`iconAnimateOn{Hover,Press,Appear}`, `tileSlideStyle`, `restackDuration` and
+`restackStagger`; its own header says the 30KB artifact page was deliberately
+not shipped because it also configured five feature groups that do not exist.
+
+Step 4 is now done too: `apps/launcher` and both manifest entries are removed,
+and the UI_STRATEGY row points at hatch. hatch-core: 70 tests.
+
+One correction to the reasoning above. This file said `incoming/launcher`
+"stays as a ref until they are, because it is still the only copy of that
+work" — and that is why deleting was deferred. It is no longer true: the
+branch was merged to `main` at `66cb0786`, so the work is in ordinary history
+and `git show 66cb0786^2:apps/launcher/...` reaches any of it. The merge was
+made without reading this file first, which was a mistake — this file says
+plainly "**Do not** merge both branches and rename one" — but its effect was
+to make step 4 safe rather than dangerous, so the deletion happens now instead
+of waiting for a port that turned out to be unnecessary.
+
+Two things found while finishing it, neither previously recorded:
+
+* `apps/launcher/plasmoid/contents/config/config.qml` declared two
+  `ConfigCategory` pages, `ConfigGeneral.qml` and `ConfigAppearance.qml`, and
+  **`ConfigGeneral.qml` does not exist in that tree.** `source:` is a plain
+  string, so qmllint cannot see it; the branch's own "verified QML with a real
+  parser" commit would not have caught it, and Plasma would have shown an
+  empty General page. Another argument for hatch's single-page shape, arrived
+  at independently.
+* The two trees' `anim.rs` and `grid.rs` had already converged — hatch's are
+  the launcher's with the `uikit_egui::motion::ease` import inlined and the
+  ini-name accessor added. `icontheme.rs` differs by 36 lines, all of them
+  hatch's added provenance comment plus the `icons::resolve` fallback wiring.
+
+## Original recommendation (kept for the record)
+
 **hatch is merged** (`8444e17b`), clean. Steps 1 and 2 are done: `icontheme`
 and now the animation `Board` plus its `grid`, in `hatch-core` at 67 tests.
 Steps 3 and 4 — the plasmoid config surface, and deleting `apps/launcher` —
