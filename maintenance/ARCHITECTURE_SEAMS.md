@@ -66,3 +66,34 @@ credible rather than aspirational:
 actually buys on your hardware. The serial-frontend argument is structural and
 holds regardless, but **the size of the win needs `cargo build --timings` on a
 real machine** before anyone spends a week on the refactor.
+
+## Source-scan tests: assemble the needle, never spell it
+
+A test that greps its own crate for a forbidden pattern is a good tool — it
+catches structural rules no runtime assertion can reach, like "this view never
+advances the state machine" or "this module does not detect SSH itself". It has
+one failure mode, and it is guaranteed rather than likely:
+
+**If the needle is a string literal, it appears in the file being scanned, and
+the test fails on itself.**
+
+Hit four times in one session before it was written down: twice in
+ambient-learner's shell (once on a comment quoting the rule, once on the
+assertion's own literal), once in the uikit Area guard, once in voiceterm's
+fs_results. The first time it looked like the rule was inexpressible and the
+test was deleted. It is not — the needle just cannot be spelled inline:
+
+```rust
+// Fails on itself:
+assert!(!src.contains("env::var"));
+
+// Works:
+let needle = format!("env::{}", "var");
+assert!(!src.contains(needle.as_str()));
+```
+
+Two related habits from the same session: skip comment lines when scanning for
+code (`if line.trim_start().starts_with("//") { continue }`), because the
+explanation of a rule usually quotes it; and scan to the next arm rather than a
+fixed character window, because a comment inside a match arm will push the code
+you are looking for past a 220-char cutoff and fail a correct arm.
