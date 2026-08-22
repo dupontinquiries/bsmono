@@ -14,7 +14,9 @@
 //! The natural decomposition is per-row dot-product against the DCT basis. 
 //! For each output coefficient k:
 //! 
-//!     out[k] = sum_i input[i] * DCT[k][i]
+//! ```text
+//! out[k] = sum_i input[i] * DCT[k][i]
+//! ```
 //! 
 //! With f32x8 (AVX) the row-DCT becomes a single FMA-chain: 8 input lanes, 
 //! 8 basis lanes, horizontal reduction. NEON/SSE fall back to two f32x4 

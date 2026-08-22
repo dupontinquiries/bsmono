@@ -49,3 +49,15 @@ verifying a fix would need either domain expertise in the specific
 algorithms or a way to visually inspect the reconstructed output, neither
 of which this pass had. `cargo test -p fao-codec-lib` after the integrate()
 fix: 65 passed, 8 failed (up from a hard compile failure that hid all 73).
+
+**Also fixed** — 4 doctest compile failures across `fao_codec_core::dct`
+and `fao_codec_lib::library_db`: unlabeled indented text/fenced blocks in
+module doc comments (a DCT pseudocode formula, a directory-layout diagram,
+two binary record-format layouts) were being parsed as real Rust code by
+rustdoc, which they never were. Fixed by marking them ` ```text ` (the
+same convention `fao_codec_lib::library.rs`'s equivalent blocks already
+correctly used one file over) — rustdoc then correctly excludes them from
+doctest execution entirely rather than trying to compile prose as Rust.
+Full workspace `cargo test --no-fail-fast` (excluding `egui-frontend`,
+not attempted this pass): every crate green except the 8 pre-existing
+`fao-codec-lib` failures above.
