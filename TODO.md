@@ -276,3 +276,166 @@ the next scene co-change:
   its chrono local time to keep true local solar time.
 - Then delete the copies and let scene3d's inscriptions use real UVs — the
   street signs and runestones textsurface.rs already designed for.
+
+## Reachability audit — real orphans found (2026-08-22)
+
+`maintenance/tools/reachability.py` asks a different question than
+`parity_audit.py`: not "does a surface exist" but "does anything in the crate
+call it". Ran it fleet-wide. Most apps' orphan counts are dominated by
+cross-crate re-exports the single-crate scan can't see (logscope at 216,
+gitmind at 38, snapclone at 42 — not independently verified, likely mostly
+false positives from the `-egui` frontend being a separate crate from the
+core the tool scans). The SMALL apps are cheap to hand-verify and worth
+recording precisely because a small orphan list is actually trustworthy:
+
+**tomescope — 3 orphans found, all now wired (2026-08-22):**
+
+- `lookup.rs` — `Lookup::lookup()`, checks the book's own back-of-book index
+  first then a builtin glossary. Nothing calls it; there is no "define this
+  word" affordance anywhere in `reader.rs`/`panels.rs`.
+- `opds.rs` — parses OPDS 1.2 Atom catalogs (Calibre-Web, COPS, etc), network
+  fetch stubbed behind a trait so the parser is unit-tested standalone.
+  Nothing calls it; there is no "add a catalog" UI.
+- `tts.rs` — sentence-queue builder + optional espeak-ng subprocess backend
+  behind an `espeak` feature. Nothing calls it; no "read aloud" button.
+
+All three are declared `pub mod` in `lib.rs` and fully implemented with their
+own test suites (3 tests each) — this is the expensive kind of orphan the
+tool's own docstring calls out: it passed review, it passes CI, and it does
+nothing for a user.
+
+**Not wired in this session, and why:** wiring any of these into
+`reader.rs`/`panels.rs` means touching the actual selection/rendering flow
+(`Selection`, `draw_page`, `draw_footnote_popover` in `reader.rs`) without a
+compiler in this sandbox to catch a wrong borrow or a wrong signature. Guessing
+at UI glue in a 500-line rendering file with no build feedback is how a
+"working" commit turns into a broken one nobody notices until a real host
+builds it. Recorded here as three concrete, scoped next steps instead:
+
+- [x] tomescope: `lookup.rs` wired for real (2026-08-22). Added
+      `lookup::selection_text(content, range)` (single-block only — a
+      multi-block selection returns `None` rather than guessing how to join
+      text across a paragraph break) and `lookup::draw_lookup_popover`,
+      mirroring `draw_footnote_popover`'s shape. `ReaderState` gained
+      `lookup_open: bool`; `TomeApp` gained a shared `lookup: Lookup`; the
+      reader toolbar gained a "🔤 Define" button enabled only when
+      `selection.is_active()`.
+      **A test caught a real bug before it shipped**: the first version
+      built `selection_text` on top of `BookContent::snippet()` (the
+      existing search/dictionary-context helper), which turned out to
+      unconditionally wrap the result in `…ellipsis…` whenever the range
+      doesn't start at 0 or end at the block's length — correct for
+      `snippet`'s actual job (showing context around a search hit) but wrong
+      here, since it would make every lookup search for `"…ephemeral…"`
+      instead of `"ephemeral"` and silently fail. Caught by
+      `selection_text_extracts_the_highlighted_word` actually asserting the
+      exact string rather than just "is Some" — fixed by slicing the
+      block's `plain_text()` directly instead of going through `snippet`.
+      Kept a regression test
+      (`a_lookup_looks_up_the_real_selected_word_not_the_whole_block`)
+      specifically for this failure mode.
+      Also fixed, while here: `egui::Context::run` is deprecated in 0.34 in
+      favor of `run_ui` — both this file's own new test and the two added to
+      voiceterm's `bars.rs` two commits ago had used the deprecated form;
+      fixed all three once the correct replacement was known, re-verified
+      both crates still clean.
+      Verified: `cargo check --bin tomescope` clean in both the default and
+      `--features espeak` configurations (9 warnings, same as before both
+      times), `shelfctl` still builds, full `cargo test --lib`: 50/50
+      passing (45 previous + 5 new `lookup::` tests).
+- [x] tomescope: `opds.rs` wired for real (2026-08-22, compiler now
+      available). `Screen::OpdsBrowser` already existed in the nav but
+      `draw_opds_screen` was a static label with no textbox — the exact
+      "placeholder feed" class `wiring_check.py`'s docstring warns about.
+      Added a paste-XML `TextEdit::multiline`, a "Parse catalog" button
+      calling the already-tested `opds::parse_opds_xml` for real, and a
+      results list (title/author, navigation-vs-download distinction via
+      `is_navigation()`/`acquisition_link()`, both already-tested methods).
+      Verified: `cargo check --bin tomescope` clean (same 9 pre-existing
+      warnings, none new), full `cargo test --lib` 45/45 passing including
+      the 3 untouched `opds::tests`. Network fetch stays intentionally out
+      of scope — `NoNetworkFetcher` is the deliberate stub the module was
+      built around, so downloading an acquisition link is separate, opt-in
+      work, not part of this fix.
+- [x] tomescope: `tts.rs` wired for real (2026-08-22). `ReaderState` gained a
+      `tts: TtsQueuePlayer` field; the reader toolbar gained Read/Stop/Next
+      buttons; `TomeApp` gained a `tts_backend: Box<dyn TtsBackend>` chosen by
+      `default_tts_backend()` (real `EspeakBackend` if the `espeak` feature is
+      on AND `espeak-ng` is actually on PATH, `SilentBackend` otherwise, so
+      the button never appears broken on a machine without the binary).
+      Read builds the queue from the CURRENT page's start locus
+      (`page.start`, already computed for pagination — reused rather than
+      duplicated), not from the top of the book. **Deliberately NOT
+      auto-advancing**: `TtsBackend::speak` fires-and-returns (a spawned
+      subprocess for espeak, a no-op for silent) with no completion signal in
+      the trait, so this session shipped Play/Stop/Next rather than invent a
+      fake "done speaking" detector — real auto-advance needs a
+      completion-detection addition to the trait itself, which is a
+      different, slightly bigger task than wiring the existing pieces.
+      Verified both feature configurations: `cargo check --bin tomescope`
+      clean (9 warnings, same as before) and `--features espeak` also clean
+      (9 warnings) after adding the `#[cfg(feature = "espeak")]`-gated
+      `TtsBackend` trait import the `is_available()` call needs. Full
+      `cargo test --lib`: 45/45 passing, unchanged.
+
+**Confirmed false-positive theory for the big multi-crate apps.** Checked
+gitmind's three highest-profile "orphans" (`flow`, `incoming`, `appcatalog`,
+1868/922/566 lines, 14/20/15 tests) by grep across the whole app tree, not just
+within `crates/cockpit`. All three are extensively used — `cockpit::flow` alone
+has 50+ call sites across `crates/gui`, `crates/gui-egui/src/pages/{apps,
+network,artifacts,fleet,dupes,push,import}.rs`, and `crates/cli`. The tool
+scans one crate directory at a time and can't see a sibling crate importing it
+as a path dependency, so gitmind's 38, snapclone's 42, logscope's 216 are very
+likely almost entirely this same false-positive class rather than real gaps.
+**Not claiming this generalizes without checking** — but the one app checked
+confirms the mechanism, so treat the large multi-crate counts as noise until
+someone teaches the tool to scan a whole workspace rather than one directory,
+not as a queue of real orphans to work through.
+
+**A second false-positive class, checked on snapclone.** Its top "orphans" by
+line count are `ffi.rs` files (`snapclone-face`, `snapclone-group`) — `extern
+"C"`, `#[no_mangle]` functions called from the C++ side (`ffi.rs`'s own header
+says so directly: "Exposes the face library... to C/C++ callers"). A Rust-only
+reachability scanner cannot see a C++ call site by construction, so every FFI
+boundary module in a hybrid Rust/C++ app like snapclone will show as an orphan
+regardless of real usage. Between the cross-crate class (gitmind) and the FFI
+class (snapclone), that likely accounts for most of both apps' counts — still
+not verified item-by-item, but two different confirmed mechanisms now explain
+away the two biggest numbers in the table without needing to check all 80.
+
+**logscope's 216 checked the same way, same result.** Its top orphan by tests,
+`machinery.rs` (97 tests, `crates/logscope/src/machinery.rs`), IS referenced —
+from `crates/logscope-egui/src/{scene3d,enginestrip}.rs` and
+`crates/logscope/src/{persona,dupscan}.rs` — same core/`-egui`-frontend crate
+split as gitmind's `cockpit`/`gui-egui`. Three confirmed false-positive
+instances across the three biggest counts in the table now (gitmind, snapclone,
+logscope), all from the same root cause (single-directory scan on a
+multi-crate app). Fixing the tool to walk a whole workspace's `Cargo.toml`
+members rather than one path would be the real fix; not attempted here since
+it risks silently changing what the tool reports for every app, and there's no
+compiler in this sandbox to validate the fix against the actual crate graph.
+
+**av1tuner/av1tuner-m1's `eta.rs`/`config.rs` triaged — a fourth confirmed
+false positive, not a real gap.** `av1tuner_core::eta::EtaTracker` and
+`av1tuner_core::config::UserConfig` are both extensively used — imported and
+called throughout `av1tuner_app/src/app.rs` (`EtaTracker::new()`,
+`record_chunk`, `frames_per_second`, `eta_string`; `UserConfig::load()`, a
+`current_config()` builder). The reachability tool flagged them because
+`av1tuner_core` and `av1tuner_app` are separate crates in a two-crate
+workspace — same cross-crate blind spot as gitmind and logscope above, just on
+a smaller, two-crate example that made it easy to confirm by hand in under a
+minute. Fourth confirmed instance of the same root cause; not fixing anything
+here, just closing the loop on the one item this doc left untriaged.
+
+Separately, `apps/av1tuner/DUPLICATE.md` (written by an earlier session)
+already says `av1tuner` is the stale fork and `av1tuner-m1` is live, "should be
+retired once someone confirms nothing external references it." Checked:
+`manifest/projects.toml`'s `av1tuner` entry notes `av1tuner-m1` is "the live
+fork and is ahead in all five" differing files, matching `DUPLICATE.md`
+exactly, and nothing in `build/`, other apps, or the manifest points at
+`apps/av1tuner` as a build target distinct from `apps/av1tuner-m1`. That
+confirmation was already implicitly done by whoever wrote `DUPLICATE.md`;
+not re-litigating it further since deleting an app tree is a one-way,
+non-code-verifiable action better left for the user to greenlight explicitly
+(matches the repo's own "Parked backlog (no execute without greenlight)"
+policy for anything destructive).

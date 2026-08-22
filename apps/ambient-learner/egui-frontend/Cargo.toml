@@ -21,8 +21,32 @@ edition = "2021"
 # against without a window system. That matters here more than elsewhere —
 # eframe pulls glutin and winit, and this container cannot even LINK them, so
 # without this split the pages would be untestable in CI.
+#
+# `egui` here is NOT optional in the usual sense — it must always be on for
+# this crate to contain anything at all. lib.rs mounts the parent's
+# src/egui_lib.rs via #[path], and that file's own top line is
+# `#![cfg(feature = "egui")]`. Inner cfg attributes are evaluated against the
+# CURRENT crate's features, not the parent's, so without an `egui` feature
+# declared HERE — enabled unconditionally — that cfg is always false in this
+# crate's build, `mod applib` (the #[path] mount) resolves to nothing, and
+# `pub use applib::*` in lib.rs fails with "unresolved import `applib`".
+# That's not a lint or a warning: `cargo check --bin ambient-learner-egui`
+# fails to compile without this. Every text-based audit in this repo
+# (parity_audit.py, reachability.py, wiring_check.py) reported this app by
+# grepping source that was never actually reachable — none of them run
+# cargo, so none of them could see that the crate didn't build at all.
+#
+# `app` implies `egui` rather than listing both in `default`: the eframe
+# binary obviously needs the view code, so there is no state where you'd want
+# `app` without it. The headless-testing mode this file's other comment
+# documents is `--no-default-features --features egui` (egui without eframe),
+# not bare `--no-default-features` — a build with neither feature has no
+# window host AND no view code to test, which isn't a real use case, so it's
+# left failing rather than papered over with a third, meaningless feature
+# combination.
 default = ["app"]
-app = ["dep:eframe"]
+app = ["dep:eframe", "egui"]
+egui = []
 
 [dependencies]
 egui = "0.34"

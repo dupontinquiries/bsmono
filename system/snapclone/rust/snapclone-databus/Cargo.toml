@@ -15,6 +15,12 @@ crate-type = ["rlib"]
 [[bin]]
 name = "snapclone-bus"
 path = "src/main.rs"
+# Needs tracing-subscriber, which is optional and gated behind the `bin`
+# feature below. Without required-features, `cargo check --workspace`
+# builds this target with default (non-bin) features and fails to find
+# tracing_subscriber at all — the same class of bug the rest of the fleet
+# guards against with `required-features = ["app"]` on every eframe binary.
+required-features = ["bin"]
 
 [dependencies]
 anyhow     = "1"

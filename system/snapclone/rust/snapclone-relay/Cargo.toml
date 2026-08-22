@@ -13,6 +13,14 @@ anyhow   = "1"
 bytes    = "1"
 tokio    = { version = "1", features = ["net", "time", "rt", "sync"] }
 tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+# Used directly in transport.rs (WebSocketStream::split needs StreamExt/
+# SinkExt in scope) and for the wire payload's base64 encode/decode. Both
+# were used unconditionally in src/transport.rs without being declared here
+# at all -- this crate had never compiled; only present as *transitive*
+# dependencies of tokio-tungstenite before this, so `use futures_util::...`
+# and `use base64::...` resolved to nothing.
+futures-util = "0.3"
+base64 = "0.22"
 tracing  = "0.1"
 serde    = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -762,3 +762,559 @@ name in a module doc.
 That does not make `code` useless — it caught WayfinderPage and GroupVoiceBar,
 which is why it exists. It makes it a *lower bound* rather than a score, and the
 gap between the columns is a work queue to check, not a work queue to build.
+
+## Correction: snapclone's named-only list is now current, and it is empty
+
+The table above says snapclone had 32 named-only surfaces with only 6 confirmed
+under a Rust name — as of this session that is stale on both counts. A fresh
+`parity_audit.py` run puts snapclone at 49 surfaces / 25 in code (the surface
+count moved as the source moved), and re-deriving the named-only set directly
+from `surfaces()` / `covered()` / `covered_in_code()` gives **24** names, not 32.
+
+Checked each of the 24 by hand — not by filename pattern-matching, by opening
+the file and reading the actual `pub struct`/`pub fn` — and all 24 are real,
+tested, ported code under an idiomatic Rust name:
+
+| Qt/QML name | lives in | as |
+|---|---|---|
+| ContactCard, ContactPickerDialog, ContactEditorDialog, ConversationSecurityBar | `contacts.rs` | `Contact`, `Picker`, `SecurityBar` |
+| ExportReminderCard | `export_reminder.rs` | `ReminderState` |
+| FocusReticle | `reticle.rs` | `Reticle` |
+| FriendListWidget | `friends.rs` | `Roster` |
+| GlassIconButton | `glass.rs` | glass-effect primitives (`Img`, `downscale`, `box_blur`) |
+| GlassScrim | `modal.rs` | `ModalSurface` / `scrims_ui` |
+| GroupVoiceBar | `voicebar.rs` | `VoiceBar` / `voicebar_ui` |
+| GroupVoiceRoster | `roster.rs` | `Roster` (voice-call variant, distinct from friends') |
+| CarouselAwareScrollArea, HorizontalScrollArea | `scroll_areas.rs` | `Wheel`, `HScroll` |
+| MediaSendSummary | `send_summary.rs` | `SendSummary` |
+| PeerPunchAddrView | `punch_addrs.rs` | `PunchAddrs` |
+| SegmentedTabStrip, PagePeelHint | `nav_chrome.rs` | `TabStrip`/`strip_ui` (moved to `uikit_egui::segmented_tabs`), `PeelHint` |
+| SnapComposerDialog, SnapViewerDialog | `composer.rs` | `Composer`, `Snap` |
+| SnapTile | `tile_strip.rs` | `tile_strip_ui` over `VisibleTile` |
+| SwipeNavigator | `swipe_physics.rs` | `Swipe` |
+| UnifiedNavBar | `unified_nav.rs` | `UnifiedNav` |
+| VideoSnapViewerDialog | `video_viewer.rs` | `VideoViewer` / `video_viewer_ui` |
+| ConversationDetailDialog | `conversation.rs` | `Conversation` |
+
+So the earlier "6 of 32" undercounted for the same reason bo-suite's did: the
+detector cannot match a name the port renamed, and nobody had gone back to
+check the renamed ones by hand since the source moved. Read snapclone's `code`
+column (51%, 25/49) as the same kind of floor as bo-suite's — real coverage is
+close to `named` (100%), not to `code`.
+
+## Checked the small named-only lists on the other apps too
+
+Same method as snapclone above — read the actual code, don't trust the name
+match — applied to every app with a nonzero named-only list:
+
+* **voiceterm** (`GestureHost`, `SlidePopup`, 2 of 15): both real. QML's
+  `GestureHost.qml`/`SlidePopup.qml` is the press→drag→release popup-menu
+  pattern for the toolbar's pipe/brace buttons; `action_compass.rs` says so
+  directly in its own module doc — "the QML toolbar's GestureHost/SlidePopup
+  pattern, egui-native" — built on `uikit_egui::slide_menu` and wired to real
+  `App` actions (clear/copy/interrupt/search), with a pure unit-tested
+  direction→action map. Ported, not missing.
+* **gitmind** (`FileRow`, 1 of 22): confirmed ported.
+  `crates/gui-egui/src/status_rows.rs` opens with "the changed-file list from
+  `qml/FileRow.qml`, as a model" and defines `Row` (not `FileRow` — the
+  false-negative pattern again), with `parse_porcelain`, `counts`, and a full
+  test suite (rename handling, malformed-output skipping, quoted paths).
+* **logscope** (`BlocTab`, `CargoTab`, `ChatTab`, `CodeTab`, `ModifyTab`,
+  `RotationTab`, `SourcesTab`; 7 of 28): confirmed ported, all seven.
+  `crates/logscope-egui/src/tabs/{bloc,cargo,chat,code,modify,rotate,sources}.rs`
+  map 1:1; `bloc.rs`'s own header says outright "Ports `ui/bloc_tab.rs`", and
+  `tabs/mod.rs` explains the shape — non-UI logic (engine, providers, bloc,
+  conversation_db) reused as-is, each tab module carrying representative UI
+  state so the shell is alive and faithful to the original `src/ui/*`.
+* **ambient-learner** (`AnimatedBackground`, `DebugScreenTempsPage`, `EguiLib`,
+  `HumiditySparkles`, `PressureGauge`; 5 of 16): all real except one phantom.
+  `PressureGauge` is confirmed ported already, in the doc's own "ambient-learner
+  joins the table" section above. `AnimatedBackground` and `HumiditySparkles`
+  are BOTH in `src/ui/egui/ambience.rs`, whose own header states it outright:
+  "`HumiditySparkles` and `AnimatedBackground`, ported" — `Sparkles` and
+  `Ambience`/`ambience_ui`, with 13 tests covering the exact contract the doc
+  above cares about (clamped humidity, session-stable droplet placement,
+  storm-clamped parallax, dark-room dimming rather than blanking). `EguiLib`
+  is the audit's CamelCase of the crate name itself, not a portable surface —
+  same phantom-name class as `AmbientLearnerApp` noted a few sections up.
+  `DebugScreenTempsPage` also confirmed: `screen_temps.rs`'s header says
+  "`DebugScreenTempsPage` and the frame it reads", defines `ScreenTempsPage`/
+  `screen_temps_ui`, and is tested. So all 4 non-phantom items in this app's
+  named-only list are ported; `EguiLib` remains the one phantom name.
+* **bo-suite** (14 of 46) is unchanged from an earlier pass and already
+  confirmed ported under Rust names in the "misreading the code column"
+  section above.
+
+So across every app in the fleet, every named-only surface with a real
+predecessor that was checked this session — 24 in snapclone, 2 in voiceterm, 1
+in gitmind, 7 in logscope, 4 of 5 in ambient-learner — turned out to be ported,
+just under an idiomatic Rust name the string-matching audit can't see. The
+`code`/`wired` percentage column is a floor, not a measure, exactly as the
+doc's own "misreading the code column" section already concluded for bo-suite;
+this extends that conclusion to the rest of the fleet with actual evidence
+rather than assuming it generalizes.
+
+**What is still genuinely open** — not a naming artifact, confirmed by reading
+the code rather than assumed from the table above — is exactly what the
+"Reported defects" section already says: `camera_source.rs` is the *selection*
+layer (`choose()` picks a `Device` + `VideoFormat` via `device-kit`, tested,
+real) but capture itself — actually opening `/dev/videoN` and pumping frames —
+stays host-side by design, since a UI crate that opens a device node cannot be
+tested or run in this sandbox. The viewfinder, ring and voice bar views are
+ported; nothing feeds them a live frame or a live call yet. That gap is
+correctly described already and is not something a sandbox session can close.
+
+## wiring_check.py: ambient-learner has a real dead-code collision, not a false positive
+
+Ran `maintenance/tools/wiring_check.py`, which is stricter than either audit
+above — it asks whether a page's actual `*_ui` render function is CALLED, the
+class of bug that made snapclone draw a placeholder rectangle for months.
+
+It reported 11 of ambient-learner's renderers as dead. Checked each against
+the real running binary (`egui-frontend/src/main.rs`, the crate the parity
+audit's own binary/app-def/manifest columns already confirm is the runnable
+one) rather than trusting the tool:
+
+**10 of 11 are a false positive**, and a new instance of the by-now-familiar
+class: `main.rs` is a separate crate (`ambient-learner-egui`) that imports
+`ambient_learner_egui::ui::egui::{ambience, chrome, history, live, locations,
+map, model, screen_temps, sync}` and calls every one of `ambience_ui`,
+`section_header`, `history_ui`, `live_ui`, `locations_ui`, `map_ui`,
+`model_ui`, `screen_temps_ui`, `sync_ui` directly in its `update()` match —
+read the file, they're all there. `wiring_check.py` only scans
+`src/ui/egui/mod.rs`'s own module tree for callers, so it can't see the
+sibling `egui-frontend` crate calling in, same blind spot as `reachability.py`
+on gitmind/logscope/av1tuner above.
+
+**The 11th, `router.rs`'s `tab_bar_ui`, is real** — and it's a specific and
+useful kind of real: not a missing feature, a **duplicate one**. `router.rs`
+was built by an earlier session specifically to fix "ten renderers and no way
+to reach any of them" (its own header says so). But `main.rs` independently
+grew its own dispatch — a hand-written `Page` enum, its own
+`ui.horizontal_wrapped` tab row, its own `match self.page { ... }` — that does
+the identical job without ever calling into `router.rs`. Grepped the whole app
+tree: `Router::`, `router::`, and `tab_bar_ui` appear NOWHERE outside
+`router.rs` itself. Two sessions solved the same missing-dispatch bug in two
+different files, and only one ended up wired into the binary. `router.rs`'s 7
+tests all pass in isolation and prove nothing about the app, for the same
+reason the doc's own "misreading" sections keep finding: a test suite
+exercises the module, not its caller.
+
+**A second, more interesting duplicate, found while checking the first:**
+`mod.rs` ALSO has its own complete `LiveView` struct with a `ui()` method —
+different from, and more capable than, the `LiveState`/`live::live_ui`
+combination `main.rs` actually wires up. `LiveView` has a working
+weather-sharing row (`WeatherShare`, a contact picker, `pressure::gauge_ui`)
+that `mod.rs`'s own module doc advertises as a headline feature: "a 'Share
+with…' row that exposes the current reading to snapclone contacts through the
+weather-share kit." Grepped: `LiveView` is referenced nowhere outside its own
+file. **The weather-sharing feature this app's own top-level doc comment
+describes does not exist in the app anyone can run.** `main.rs`'s actual Live
+page (`egui_lib.rs`'s `LiveState` + `live.rs`'s sensor panel) has no sharing
+UI at all.
+
+**Not fixed this session, and why**: reconciling three competing
+implementations of the same page (`LiveState`+`live_ui`, `LiveView`, and the
+`Router`/`tab_bar_ui` dispatch layer) is a real design decision — which one is
+the intended shape going forward — not a mechanical wire-up, and picking
+wrong risks discarding the sharing feature or the sensor panel rather than
+merging them. Recording it precisely instead so whoever does the merge knows
+exactly what exists and where: `main.rs`'s dispatch is correct and running;
+`router.rs` is safe to delete once confirmed nobody else is about to build on
+it; `LiveView`'s weather-sharing logic is the one piece of real, tested,
+user-visible functionality actually missing from the runnable app, and porting
+IT (not rewriting the Live page around it) is the concrete next step.
+
+**Done (2026-08-22, compiler available):** extracted the sharing block from
+`LiveView::ui` into a standalone `pub fn share_row_ui(ui, snap, contacts,
+share, shared_note)` in `mod.rs`, and had `LiveView::ui` itself call it (so
+there's exactly one copy of this logic, not two). Wired `share_row_ui` into
+the ACTUAL running Live page in `egui-frontend/src/main.rs`'s `Page::Live`
+arm, alongside the existing `LiveState`/`live::live_ui` rendering — this
+sidesteps the "which of the three Live-page implementations wins" question
+entirely rather than answering it: the running page keeps its own headline
+reading and sensor panel exactly as before, and gains only the one feature
+that was genuinely missing from it. `App` gained `contacts: Vec<(String,
+String)>` (empty — honest about a demo with no live snapclone connection,
+matching this app's own convention for History/Places/Sync elsewhere),
+`share: weather_share::WeatherShare`, and `shared_note: Option<String>`.
+
+Verified: `cargo check --bin ambient-learner-egui` clean (same single
+pre-existing `CentralPanel::show` warning, nothing new), `cargo test --lib`
+147/147 still passing, and the parent `ambient-learner` crate's own `--features
+egui` build (which `mod.rs` is also compiled under) still clean. `LiveView`
+itself remains unwired — deduplicating its logic doesn't answer whether it or
+`LiveState` should be the page going forward, and that's still a real design
+call left for whoever does that merge.
+
+## wiring_check.py: two more real gaps, in voiceterm
+
+The same tool flagged 2 of voiceterm's 61 modules dead. Checked both against
+`bin/voiceterm_egui.rs`, the actual running binary:
+
+**`detect::picker_ui` is real.** `detect.rs`'s own header explains the design:
+two detection engines (`entity_extract`, `dumb_summary::detect_progress_bars`)
+had no surface at all before this file. Its sibling `progress_ui` IS wired —
+called directly in the binary's draw loop — but `picker_ui`, the disambiguation
+UI for when a spoken reference matches more than one on-screen entity equally
+well ("connect to the headphones" when two Bluetooth devices both plausibly
+match), is not. `EntityPicker` has zero references outside `detect.rs` itself.
+The progress-bar half of this file's job works; the entity-disambiguation half
+does not reach the user.
+
+**`archived_view::bar_ui` is real, and — like the gitmind item — deeper than
+it first looked.** Re-checked with the compiler available: the running binary
+has a `bar_state: voiceterm_egui::bars::BarState` field (`VoicetermApp`,
+constructed, never read — the compiler's own `dead_code` lint flags it
+independently, confirming this by a second method). `bars::BarState` is a
+*different* module from `archived_view::BottomBar`, though both mount the same
+underlying `src/bottom_bar.rs` engine file by `#[path]`: `BarState` is a
+press-vs-hold gesture state machine (`press`, `tick`, `release`, `abort`) with
+no drawing code, built specifically so a tap fires the primary action and only
+a hold fans out to the option list — its own module doc calls this the rule
+that "makes the bar work on a phone" and states plainly what breaks without
+it. `archived_view::bar_ui`, by contrast, is a complete but simpler
+click-to-toggle renderer that does not implement that hold-vs-tap distinction
+at all — reading its body, a single click opens the fan-out. So there are two
+unwired half-answers to the same problem, not one function missing a call
+site: the properly-designed gesture model (`BarState`, sitting inert) and a
+working-but-simpler renderer that doesn't use it (`bar_ui`). Wiring these
+together (driving `bar_ui`-style rendering from `BarState`'s gesture events,
+or wiring `BarState` to a still-unwritten renderer) is a small design decision
+about which behaviour is correct, not a mechanical connection — left as-is for
+that reason, with the more precise finding recorded here instead of the
+original single-function framing.
+
+**Update, with a compiler: wrote and shipped the missing renderer, reusing an
+existing tested primitive instead of building `BarState`'s gesture logic a
+second time.** `uikit_egui::slide_menu::SlideMenu` already implements exactly
+the press-vs-hold-vs-cancel rules `BarState`'s doc comment describes — it's
+the same primitive the toolkit uses elsewhere for long-press fan-outs, tested,
+and specifically has a memory-backed `show_stored` mode built for callers who
+"needn't hold a `SlideMenu`" in their own app state. So rather than write a
+second renderer that manually drives `BarState`'s `press`/`tick`/`release`
+against raw pointer events, `bars::bar_ui(ui, &BottomBar) -> Option<BarEvent>`
+now composes `BottomBar`'s model with `SlideMenu` directly: one button per
+`BarButton`, `SlideMenu::new(id).hold(HOLD_SECONDS)` for buttons with options,
+a plain click check for buttons without (preserving the "no options must not
+fan out" rule literally, as an early continue before `SlideMenu` is ever
+reached), and `SlideOutcome` mapped onto the existing `BarEvent` enum so
+callers don't need to know `SlideMenu` was involved. `HOLD_SECONDS` and
+`BarEvent` — the parts of `BarState`'s design worth keeping — are reused
+as-is; the hand-rolled timer/state fields inside `BarState` become
+unnecessary, since `SlideMenu` owns that state in egui memory now. Verified,
+not asserted: `cargo check --features app` on both the lib and the
+`voiceterm-egui` binary is clean, the 19 pre-existing `bars`/`bottom_bar`
+tests still pass unchanged, and two new tests were added and pass —
+`bar_ui_renders_one_frame_without_panicking` (a real one-frame `egui::Context`
+smoke test, not just a compile check) and
+`a_button_with_no_options_never_reaches_the_slide_menu` (pins the early-return
+path against regression).
+
+**Not done, and precisely why:** the function exists and is tested but is not
+yet called from `VoicetermApp`'s draw loop — no layout decision was made
+about where the bar goes. Checked the GTK original's own history for a
+default answer before guessing: `crates/gui` (via `src/main.rs`'s
+`bottom_bar_model`) documents this AS A STAGED, UNFINISHED FEATURE in its own
+comment — "placeholder feed... no live tab/workspace/card sources wired
+yet... the full GestureHost+SlidePopup row + real sources are the staged
+live-surface step" — and feeds `default_bar` two hardcoded tab labels
+(`"Terminal"`, `"Browser"`), no real workspaces, no real quick-launch list.
+**This was never a finished feature in either build, and the egui port isn't
+regressing anything by not having it either.** So the remaining work isn't
+"wire the missing piece" — the missing piece (the renderer) is now written
+and tested — it's the two decisions the GTK build itself never made: where in
+the layout the bar goes, and what live data (real open tabs, real
+workspaces, real recent-command list — the app already has session/workspace
+state for the sidebar and `workspaces_view` that could feed this) replaces
+the placeholder. That's product/layout judgment, not a compile-checkable fact,
+so it's recorded as the next step rather than guessed at.
+
+Both are the same shape as the ambient-learner `LiveView` finding above: a
+page got ported with two halves, one wired and one not, rather than one whole
+page missing. Recorded as two more concrete next steps rather than guessed at
+blind, for the same no-compiler reason as tomescope's orphans in `TODO.md`:
+
+- [ ] voiceterm: wire `detect::picker_ui` into the ambiguous-reference path —
+      wherever the engine currently falls back when a spoken entity reference
+      doesn't resolve to one match, show the picker instead of failing silent.
+- [x] voiceterm: `bars::bar_ui` written, tested, compiled clean (see the
+      "wrote and shipped the missing renderer" note below) — DONE except for
+      the layout placement + live-data decision, which is now its own item:
+- [ ] voiceterm: decide where `bars::bar_ui` goes in `VoicetermApp`'s layout
+      (a phone-narrow bottom bar alongside/replacing the always-on sidebar?)
+      and feed it real tabs/workspaces/recent-commands instead of the
+      placeholder two-tab list the GTK build itself never got past. Remove
+      the now-genuinely-unused `bar_state: BarState` field once `bar_ui`
+      (which doesn't need it — `SlideMenu` owns its own gesture state) is
+      wired in.
+
+## A real Rust toolchain is now available in-sandbox (2026-08-22)
+
+Everything above this point in the session was audited by reading source only
+— no compiler existed in this environment. An offline rustc/cargo 1.96.0
+bundle was provided and installed to `/usr/local` this session. `cargo check`
+now works and reaches crates.io for dependencies (confirmed: `gitmind-egui
+--features app` and `voiceterm-egui --bin voiceterm-egui --features app` both
+built clean, warnings only).
+
+This matters for everything recorded above: every "not wired this session,
+no compiler to verify" caveat in this document no longer applies to sessions
+that check for a working `cargo` first. Two items were re-examined with the
+compiler and turned out to need a real design decision rather than a
+mechanical wire-up once actually looked at closely (gitmind's `remote_browse`
+needs a new parameter threaded through a shared `cockpit` function signature;
+voiceterm's bar duplication is two incomplete answers, not one missing call) —
+both corrected in place above rather than left as the shallower original
+framing. The lesson: "no compiler" was a reason not to guess blindly, not a
+license to stop reading the actual call sites before writing down a fix's
+scope — the deeper read happened anyway and changed the record for the
+better.
+
+`egui_dirs()` only looks at two hardcoded paths per app: `egui-frontend/src`
+and `src/ui/egui`. `gitmind` (`crates/gui-egui/src`), `logscope`
+(`crates/logscope-egui/src`), and `dialer` (`crates/dialer-egui/src`) all use a
+third layout — a sibling crate named `<x>-egui` — and none of them appeared in
+the tool's output AT ALL, not even as a zero row. That is the identical
+"missing row reads as nothing to do" failure `parity_audit.py` had for
+ambient-learner/gitmind/logscope before this doc's history added them by hand.
+
+Ran the tool's own `modules_of`/`reached` functions manually against all three
+missing dirs rather than trusting the gap to be empty:
+
+* **dialer**: 2 modules, 0 dead. Clean.
+* **gitmind**: 8 modules, 1 dead — `remote_browse`. Confirmed real: it's
+  `pub mod`-declared in `lib.rs` and referenced nowhere else. Its own header
+  explains exactly what it's for and why it matters: the GTK build lets you
+  browse the deploy target's filesystem for where to land the build
+  (`deploy::list_remote_dirs` + a folder picker); the egui push page uses five
+  of `cockpit::deploy`'s other functions and not this one, so **the deploy
+  destination has to be typed blind** in the egui port where the GTK build let
+  you browse it. `Browser`'s navigation is a pure, injectable-SSH-callback
+  model specifically so it's testable without a real device — the tests exist,
+  the page that would call it does not.
+
+**Follow-up: checked whether the Qt original actually used this feature, and
+it didn't either.** `list_remote_dirs` is exposed to QML as a `qt_method!` in
+`crates/gui/src/main.rs`, but grepped every `.qml` file in the app for it —
+`listRemoteDirs`, `list_remote_dirs`, anything close — and found zero call
+sites. **The folder-browsing feature was never wired in the original Qt build,
+not just the egui port.** So this isn't "the GTK build could browse the
+destination and the port regressed it" as `remote_browse.rs`'s own module doc
+implies — it's a `qt_method!` that was exposed and never used by any page in
+either era, carried forward as dead weight into the port along with the code
+that could theoretically call it. Combined with the earlier finding that
+`push_install_script` always installs to the fixed, conventional
+`$HOME/.local/bin` + a registered `.desktop` entry (arguably a *better* UX
+than an arbitrary-folder drop — it shows up in app menus and stays on PATH),
+the real open question is not "wire the browser" but **"does gitmind still
+want free-destination installs at all, or was the fixed XDG location always
+the better design and this method should be retired instead of wired?"** That
+is a product call, not a coding task — recording it precisely rather than
+guessing an answer.
+* **logscope**: 44 modules, 12 dead — `repo`, `spatial_audio`, `workbench`,
+  `tab_layout`, `log_gestures`, `chat_layout`, `debatepanel`, `voiceconfirm`,
+  `micresponse`, `textsurface`, `assets`, `workergen`. Checked all 12 by grep
+  (including alias forms) for any reference outside their own file: zero for
+  every one. Sampled several of their headers to characterize rather than
+  assuming they're worth wiring: `tab_layout`/`chat_layout` are the adaptive
+  phone/desktop layout rules for logscope's tabs (pure, no egui dependency,
+  built on `uikit_egui::DeviceClass`); `voiceconfirm` is a voice-interjection
+  confirm dialog with a hard timeout defaulting to DISCARD, ported from
+  voiceterm's `ConfirmDialog.qml`; `textsurface`/`spatial_audio` are part of
+  the physical-UI scene work this doc already tracks separately (the
+  scene-kit migration section above); `workergen` is corpus-recombined worker
+  prompt variety, already mentioned once elsewhere in this doc's git history
+  in passing. This is a bigger and more varied list than the single-app
+  findings above, and 12 items in a 49k-line, 1492-test app is not something
+  to triage item-by-item in one pass — recording the list precisely, with the
+  grep-confirmed "zero references" fact for each, is the useful contribution
+  here; picking which of the 12 actually belong on-screen (some may be
+  intentionally-standalone library pieces rather than pages) is a design
+  question for whoever owns logscope's tab layout next.
+
+Not fixing `wiring_check.py`'s directory list itself this session, for the
+same reason `reachability.py` wasn't touched: three confirmed missing rows is
+enough to know the fix is needed, but generalizing the fix (scanning any
+`crates/*-egui` sibling automatically) risks changing what every other app's
+count means, with no compiler here to check the result against anything.
+
+## ambient-learner-egui did not compile at all — the biggest finding this session
+
+Every audit tool in this repo (`parity_audit.py`, `reachability.py`,
+`wiring_check.py`) works by reading source text. None of them run `cargo`.
+That's a real blind spot, and this app was it: with a compiler finally
+available, `cargo check --bin ambient-learner-egui` in
+`apps/ambient-learner/egui-frontend` failed outright —
+
+```
+error[E0432]: unresolved import `applib`
+  --> src/lib.rs:19:9
+19 | pub use applib::*;
+   |         ^^^^^^ use of unresolved module or unlinked crate `applib`
+```
+
+**Root cause:** `egui-frontend/src/lib.rs` mounts the parent crate's
+`src/egui_lib.rs` via `#[path = "../../src/egui_lib.rs"] mod applib;` — the
+documented, deliberate way this app shares view code with its GTK-only parent
+without copying it. But `egui_lib.rs`'s own first line is
+`#![cfg(feature = "egui")]`, and inner `cfg` attributes are evaluated against
+the CURRENT crate's Cargo features, not the parent's. `egui-frontend`'s
+manifest never declared an `egui` feature at all — so that `cfg` was always
+false in this crate's build, the entire mounted file compiled to nothing, and
+`mod applib` produced an empty module. `pub use applib::*` then failed
+because there was nothing to import.
+
+**Every ported page in this app — ambience, chrome, history, live, locations,
+map, model, screen_temps, sync, router, `LiveState`, all of it — has been
+compiling to an empty crate.** Every test this doc has cited for this app in
+earlier sections (the 13 `ambience.rs` tests, `screen_temps.rs`'s tests, the
+`router.rs` tests confirming dispatch, all of it) was real, correct, and
+**had never once actually run** as part of this crate — they'd only run
+under whatever ad-hoc invocation an earlier session used to check them in
+isolation, never via the crate's own documented `cargo test` path. All the
+verification work earlier in this document about ambient-learner's named-only
+surfaces being "confirmed ported" was true in the sense that the code exists
+and is correct — but the crate containing it didn't build. This is precisely
+the gap a compiler-less audit cannot see, and precisely why this session kept
+noting "no compiler, so verify by reading" as a limitation rather than a
+guarantee.
+
+**Fixed:** added an `egui` feature to `egui-frontend/Cargo.toml`, had `app`
+imply it (`app = ["dep:eframe", "egui"]`) so the eframe binary always gets the
+view code it needs, and documented in the manifest itself why the feature has
+to exist and what breaks without it — so the next person editing this
+manifest doesn't remove it as apparently-unused.
+
+**Verified, all three real configurations, not asserted:**
+- `cargo check --bin ambient-learner-egui` (default: `app` → `dep:eframe` +
+  `egui`): clean, one pre-existing deprecation warning, unrelated.
+- `cargo check --lib --no-default-features --features egui` (the headless
+  testing mode this file's other comment documents — view code without a
+  window system): clean.
+- `cargo test --lib`: **147 tests, all passing** — the true count of every
+  test this app's egui port has ever had, now actually run for what is very
+  likely the first time since this crate split was introduced.
+
+Left `--no-default-features` with no features at all (a build with neither
+the window host nor the view code) failing to compile, deliberately: that
+combination isn't a real use case the manifest's own documentation claims to
+support, so making it "succeed" by producing a silently-empty crate would
+just reintroduce a milder version of the same bug this fix closes.
+
+## Fleet-wide compile sweep, since one app failed to compile at all
+
+Given ambient-learner-egui's silent compile-to-nothing bug above, checked
+whether the same *class* of bug (not necessarily the same cause) exists
+anywhere else in the fleet, rather than assuming it was isolated.
+
+Two things were checked:
+
+1. **Every `#[path]`-mounted file repo-wide**, for the specific mechanism
+   that broke ambient-learner (a mounted file whose own top line is
+   `#![cfg(feature = "...")]`, evaluated against the mounting crate's
+   features rather than the file's origin crate's). Scripted a check across
+   every `#[path = "..."]` occurrence in the repo and the file it resolves
+   to: **ambient-learner was the only one.** voiceterm's and krapper's
+   `#[path]` mounts (terminal_workspace, row_cache, nlp, entity_extract,
+   vibe, scale, etc.) all mount plain, ungated files.
+2. **`cargo check` on every app's actual binary**, not just the one that had
+   already failed — since a text-based repo-wide grep can rule out one
+   mechanism but can't rule out a compile failure with a different cause.
+   Checked all of: bo-suite, snapclone, rusty-board, fao-codec, bot-arena,
+   hatch, krapper, tadpole, dialer (plus gitmind and voiceterm-egui, already
+   checked in earlier sections). **Every one compiles clean** — warnings
+   only (mostly the same handful of egui 0.34 deprecations: `CentralPanel`/
+   `Panel::show` → `show_inside()`, `SelectableLabel::new` →
+   `Button::selectable()`, `screen_rect()` → `content_rect()`, seen
+   repeatedly enough across the fleet that fixing them once in `uikit-egui`
+   and letting it propagate would be worth a follow-up, though none of them
+   block a build).
+
+One false alarm during this sweep, worth recording so it isn't mistaken for
+a code bug later: `fao-codec-egui` initially failed with a linker crash
+(`ld terminated with signal 7`, `thiserror-impl` failing to compile). Checked
+`df`/`free` before assuming a code cause: the container's disk was at 100%
+(3.4MB free) from accumulated `target/` directories across the many crates
+checked this session — cargo's linker was failing on write, not the code
+being wrong. Cleared roughly 8GB of `target/` output and it compiled clean
+immediately after. Left the fleet's `target/` directories removed at the end
+of this sweep rather than accumulated, since disk exhaustion masquerading as
+a compile error is exactly the kind of false signal this document is trying
+to eliminate elsewhere.
+
+**Conclusion: ambient-learner-egui's bug was real and unique in the fleet**,
+not a symptom of a wider pattern. The fleet-wide compile health, now actually
+verified rather than inferred from source-reading, is good.
+
+## Fleet-wide TEST run, not just compile (2026-08-22)
+
+The previous section's sweep ran `cargo check` on every app — enough to
+catch ambient-learner's compile-to-nothing bug, but `check` doesn't run a
+single test. Given that exact lesson, ran the full `cargo test --lib` on
+every app checked in that sweep, not just the ones already tested earlier in
+this document:
+
+| app | tests | result |
+|---|---|---|
+| bo-suite | 394 | all pass |
+| snapclone | 1299 | all pass |
+| rusty-board | 227 | all pass |
+| fao-codec | 57 | all pass |
+| bot-arena | 35 | all pass |
+| hatch | 24 | all pass |
+| krapper | 17 | all pass |
+| tadpole | 94 | all pass |
+| dialer | 5 | all pass |
+
+Combined with the earlier-verified gitmind, voiceterm, tomescope, and
+ambient-learner test runs, **every app in the fleet with an egui port now has
+its actual test suite run and passing, in this sandbox, this session** — not
+inferred from source, not assumed from an audit tool's text match. 2,152+
+tests across the fleet's egui frontends, zero failures found once
+ambient-learner's build was fixed.
+
+Kept `target/` cleared after each app to avoid repeating the fao-codec disk
+false-alarm from the previous section.
+
+## aperture and studio: the two remaining apps, checked (2026-08-22)
+
+Both are native egui apps with no Qt/GTK predecessor (confirmed earlier this
+session — out of scope for porting, but not for compile/test verification,
+which nothing had done yet).
+
+**aperture** (own nested workspace: `aperture-core`, `aperture-complete`,
+`aperture-egui`, `aperture-scene`): `cargo check --bin aperture --features
+app` clean, zero warnings. Full test run across all four crates: **200
+tests, all passing** (23 + 73 + 62 + 42).
+
+**studio** (own nested workspace, 14 crates): `cargo check --bin studio`
+clean (5 pre-existing deprecation warnings, the same `Panel::show`/
+`TopBottomPanel` class already known not to have a safe drop-in fix — see
+below). Full test run across all 14 crates: **524 tests, all passing**
+(6+83+63+8+29+93+105+43+12+20+9+9+11+33).
+
+That's every app in the fleet now compile-and-test verified this session:
+gitmind, voiceterm, tomescope, ambient-learner (fixed), bo-suite, snapclone,
+rusty-board, fao-codec, bot-arena, hatch, krapper, tadpole, dialer, aperture,
+studio. 2,876+ tests total across the whole fleet, zero failures once
+ambient-learner's manifest bug was fixed.
+
+## The remaining `Panel::show`/`CentralPanel::show` deprecation warnings are NOT a safe mechanical fix
+
+Checked before doing a repo-wide sweep of these (the same warning class
+appears in `studio-app`, `bo-suite-egui`, `bot-arena-egui`, `hatch-egui`,
+`snapclone-egui`, `ambient-learner-egui`, `krapper-egui`, and others).
+`egui::Panel::show`/`CentralPanel::show`'s deprecation notice points to
+`show_inside()` — but `show_inside()` takes `&mut Ui`, not `&Context`, because
+it's designed for nesting a panel inside an already-open `Ui` (e.g. inside a
+custom compound widget). Every one of these call sites is the top-level panel
+in an `eframe::App::update(&mut self, ctx: &egui::Context, ...)` — there is no
+`Ui` to nest inside at that point; `show(ctx, ...)` is the correct, current
+way to open a panel at the root of a frame, and the deprecation warning is
+guidance for a different call shape that doesn't apply here. Unlike the
+`SelectableLabel`/`screen_rect` fixes earlier in this document (verified
+identical by reading the deprecated function's own body before swapping it),
+this one has no such equivalence — "fixing" it would mean restructuring how
+each app opens its root panel, which is a real (if probably small) per-app
+change, not a mechanical rename, and not attempted here.

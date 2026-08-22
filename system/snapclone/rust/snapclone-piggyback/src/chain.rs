@@ -24,6 +24,7 @@
 
 use crate::limits::MAX_HOP_DEPTH;
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 /// One hop's signed declaration. Append-only — once a hop signs its
 /// entry, no later hop can modify it without breaking the signature.
@@ -48,6 +49,11 @@ pub struct ChainEntry {
 
     /// 64-byte ed25519 signature over the deterministic byte encoding
     /// of (prev_hop_id || my_id || signed_at_ms || blob_hash).
+    ///
+    /// serde's built-in array impl stops at 32 elements, so this is the
+    /// one field of the four that needs `serde_big_array` — checked by
+    /// building this crate for the first time, which had never compiled.
+    #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }
 

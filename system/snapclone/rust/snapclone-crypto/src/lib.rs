@@ -73,6 +73,7 @@ pub const MLKEM_SS_LEN: usize = 32;
 // ─── Error codes returned to C++ ─────────────────────────────────────────────
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
     Ok               = 0,
     InvalidInput     = 1,

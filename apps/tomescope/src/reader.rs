@@ -150,6 +150,15 @@ pub struct ReaderState {
     pub show_footnote: Option<usize>,
     pub rtl: bool,
     pub pending_locus: Option<Locus>,
+    /// Read-aloud state. `SilentBackend`-driven unless the `espeak` feature
+    /// is compiled in — the queue and sentence highlighting work either way,
+    /// per `tts.rs`'s own design; only actual sound depends on the backend.
+    pub tts: crate::tts::TtsQueuePlayer,
+    /// Whether the "define selection" popover is open. Separate from
+    /// `selection` itself so dismissing the popover doesn't also clear the
+    /// highlight — closing "what does this mean" should leave the selection
+    /// there to copy, re-look-up, or extend.
+    pub lookup_open: bool,
 }
 
 impl Default for ReaderState {
@@ -170,6 +179,8 @@ impl Default for ReaderState {
             show_footnote: None,
             rtl: false,
             pending_locus: None,
+            tts: crate::tts::TtsQueuePlayer::default(),
+            lookup_open: false,
         }
     }
 }

@@ -1,22 +1,33 @@
 [
  {
   "app": "bo-suite",
-  "surfaces": 47,
+  "surfaces": 46,
   "covered": 46,
-  "pct": 98,
+  "pct": 100,
   "wired": 32,
-  "wired_pct": 68,
+  "wired_pct": 70,
   "live": 46,
-  "live_pct": 98,
+  "live_pct": 100,
   "stranded": [],
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": [
-   "LyricsTranscriber"
-  ]
+  "missing": [],
+  "engine": [
+   [
+    "bo-core",
+    "bo-mux"
+   ],
+   []
+  ],
+  "kit": {
+   "a11y": 2,
+   "nav": 0,
+   "adaptive": 0,
+   "gesture": 1
+  }
  },
  {
   "app": "bot-arena",
@@ -33,35 +44,26 @@
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": []
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 0,
+   "adaptive": 0,
+   "gesture": 1
+  }
  },
  {
   "app": "fao-codec",
-  "surfaces": 3,
-  "covered": 2,
-  "pct": 67,
-  "wired": 2,
-  "wired_pct": 67,
-  "live": 2,
-  "live_pct": 67,
-  "stranded": [],
-  "bin": true,
-  "app_default": true,
-  "manifest": true,
-  "primary": true,
-  "role": "app",
-  "missing": [
-   "V8GpuRasterizer"
-  ]
- },
- {
-  "app": "rusty-board",
-  "surfaces": 6,
-  "covered": 6,
+  "surfaces": 1,
+  "covered": 1,
   "pct": 100,
-  "wired": 5,
-  "wired_pct": 83,
-  "live": 6,
+  "wired": 1,
+  "wired_pct": 100,
+  "live": 1,
   "live_pct": 100,
   "stranded": [],
   "bin": true,
@@ -69,7 +71,47 @@
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": []
+  "missing": [],
+  "engine": [
+   [
+    "fao-codec-core",
+    "fao-codec-lib"
+   ],
+   []
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 0,
+   "adaptive": 1,
+   "gesture": 0
+  }
+ },
+ {
+  "app": "rusty-board",
+  "surfaces": 4,
+  "covered": 4,
+  "pct": 100,
+  "wired": 4,
+  "wired_pct": 100,
+  "live": 4,
+  "live_pct": 100,
+  "stranded": [],
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 0,
+   "adaptive": 1,
+   "gesture": 1
+  }
  },
  {
   "app": "snapclone",
@@ -86,16 +128,26 @@
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": []
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 1,
+   "adaptive": 0,
+   "gesture": 1
+  }
  },
  {
   "app": "voiceterm",
-  "surfaces": 22,
-  "covered": 22,
+  "surfaces": 15,
+  "covered": 15,
   "pct": 100,
-  "wired": 19,
-  "wired_pct": 86,
-  "live": 22,
+  "wired": 13,
+  "wired_pct": 87,
+  "live": 15,
   "live_pct": 100,
   "stranded": [],
   "bin": true,
@@ -103,7 +155,17 @@
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": []
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 0,
+   "adaptive": 1,
+   "gesture": 1
+  }
  },
  {
   "app": "krapper",
@@ -120,68 +182,97 @@
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": []
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 0,
+   "adaptive": 0,
+   "gesture": 0
+  }
  },
  {
   "app": "ambient-learner",
-  "surfaces": 18,
-  "covered": 17,
-  "pct": 94,
-  "wired": 12,
-  "wired_pct": 67,
-  "live": 17,
-  "live_pct": 94,
+  "surfaces": 16,
+  "covered": 16,
+  "pct": 100,
+  "wired": 11,
+  "wired_pct": 69,
+  "live": 16,
+  "live_pct": 100,
   "stranded": [],
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": [
-   "AmbientLearnerApp"
-  ]
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 0,
+   "adaptive": 0,
+   "gesture": 0
+  }
  },
  {
   "app": "gitmind",
-  "surfaces": 25,
-  "covered": 21,
-  "pct": 84,
-  "wired": 20,
-  "wired_pct": 80,
-  "live": 21,
-  "live_pct": 84,
+  "surfaces": 22,
+  "covered": 22,
+  "pct": 100,
+  "wired": 21,
+  "wired_pct": 95,
+  "live": 22,
+  "live_pct": 100,
   "stranded": [],
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": [
-   "DevicePicker",
-   "FileRow",
-   "GestureHost",
-   "PeekViewer"
-  ]
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 1,
+   "nav": 0,
+   "adaptive": 4,
+   "gesture": 1
+  }
  },
  {
   "app": "logscope",
-  "surfaces": 40,
-  "covered": 37,
-  "pct": 92,
-  "wired": 30,
+  "surfaces": 28,
+  "covered": 28,
+  "pct": 100,
+  "wired": 21,
   "wired_pct": 75,
-  "live": 37,
-  "live_pct": 92,
+  "live": 28,
+  "live_pct": 100,
   "stranded": [],
   "bin": true,
   "app_default": true,
   "manifest": true,
   "primary": true,
   "role": "app",
-  "missing": [
-   "CargoTab",
-   "Fanassemble",
-   "Simconvo"
-  ]
+  "missing": [],
+  "engine": [
+   null,
+   null
+  ],
+  "kit": {
+   "a11y": 0,
+   "nav": 0,
+   "adaptive": 2,
+   "gesture": 0
+  }
  }
 ]

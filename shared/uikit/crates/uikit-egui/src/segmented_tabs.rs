@@ -109,7 +109,7 @@ pub fn strip_ui(ui: &mut egui::Ui, s: &TabStrip, c: &PaletteColors) -> Option<us
                 None => t.label.clone(),
             };
             let resp = ui.add_sized([w - 4.0, 28.0],
-                egui::SelectableLabel::new(sel, egui::RichText::new(label)
+                egui::Button::selectable(sel, egui::RichText::new(label)
                     .color(if sel { c.text } else { c.text_weak })));
             if resp.clicked() { picked = Some(i); }
         }

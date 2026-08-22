@@ -10,6 +10,8 @@ use tomescope::library::{Library, ShelfSel, SortKey, TextureCache};
 use tomescope::persist;
 use tomescope::reader::ReaderState;
 use tomescope::stats::{ActiveSession, StatsLog};
+#[cfg(feature = "espeak")]
+use tomescope::tts::TtsBackend as _;
 use tomescope::study::Deck;
 use tomescope::theme::ReaderPrefs;
 // Toasts moved into its own module when it was promoted to the shared kit; the
@@ -112,7 +114,44 @@ struct TomeApp {
     figures_open: bool,
     info_open: bool,
 
+    /// The pasted catalog XML, kept even after a failed parse so the user can
+    /// fix a typo rather than retype the whole blob.
+    opds_xml: String,
+    /// Last parse result: `Ok` holds the feed to browse, `Err` holds the
+    /// message to show — kept as a `Result` rather than two `Option` fields
+    /// so a stale success can't linger on screen next to a fresh error.
+    opds_result: Option<Result<tomescope::opds::OpdsFeed, String>>,
+
+    /// Shared across all open books — the built-in glossary is fixed and
+    /// book-index terms come from whichever book is passed to `lookup()`, so
+    /// there is nothing per-book to store here.
+    lookup: tomescope::lookup::Lookup,
+
+    /// Deferred: set by the reader toolbar's Read button, consumed once the
+    /// CentralPanel below has computed a live Pagination to read the current
+    /// page's start locus from.
+    tts_start_requested: bool,
+    /// `SilentBackend` unless the `espeak` feature is compiled in — real
+    /// audio depends on `espeak-ng` being installed, which this sandbox
+    /// cannot verify; the queue/highlighting logic works either way.
+    tts_backend: Box<dyn tomescope::tts::TtsBackend>,
+
     last_frame_time: f64,
+}
+
+/// `EspeakBackend` when the feature is compiled in AND the binary is
+/// actually on PATH — falling back to `SilentBackend` either way means the
+/// queue/highlighting still work with no audio, rather than a read-aloud
+/// button that appears to do nothing on a machine without espeak-ng.
+fn default_tts_backend() -> Box<dyn tomescope::tts::TtsBackend> {
+    #[cfg(feature = "espeak")]
+    {
+        let backend = tomescope::tts::EspeakBackend::default();
+        if backend.is_available() {
+            return Box::new(backend);
+        }
+    }
+    Box::new(tomescope::tts::SilentBackend)
 }
 
 impl TomeApp {
@@ -168,6 +207,14 @@ impl TomeApp {
             search_open: false,
             figures_open: false,
             info_open: false,
+
+            opds_xml: String::new(),
+            opds_result: None,
+
+            lookup: tomescope::lookup::Lookup::default(),
+
+            tts_start_requested: false,
+            tts_backend: default_tts_backend(),
 
             last_frame_time: 0.0,
         }
@@ -369,6 +416,41 @@ impl TomeApp {
                     if ui.button("TOC").clicked() {
                         self.toc_open = !self.toc_open;
                     }
+                    if ui.add_enabled(ob.reader.selection.is_active(), egui::Button::new("🔤 Define")).clicked() {
+                        ob.reader.lookup_open = true;
+                    }
+                    // No auto-advance: TtsBackend::speak fires the backend
+                    // (a subprocess for espeak, a no-op for SilentBackend)
+                    // and returns immediately — the trait has no "finished"
+                    // signal to poll, so this is Play/Stop/Next rather than
+                    // a queue that plays itself through. Building real
+                    // auto-advance means adding completion detection to the
+                    // backend trait, which is separate scope from wiring the
+                    // existing queue+backend together.
+                    if ob.reader.tts.is_speaking {
+                        if ui.button("⏹ Stop").clicked() {
+                            ob.reader.tts.is_speaking = false;
+                            let _ = self.tts_backend.stop();
+                        }
+                        if ui.button("⏭ Next").clicked() {
+                            if ob.reader.tts.advance() {
+                                if let Some(u) = ob.reader.tts.current() {
+                                    let _ = self.tts_backend.speak(
+                                        &u.text, ob.reader.tts.rate, ob.reader.tts.pitch, &ob.reader.tts.voice,
+                                    );
+                                }
+                            } else {
+                                let _ = self.tts_backend.stop();
+                            }
+                        }
+                    } else if ui.button("🔊 Read").clicked() {
+                        // The actual queue build needs the current page's
+                        // start locus, which needs a live Pagination — that
+                        // isn't computed until the CentralPanel below runs
+                        // (it needs the panel's width/height). Deferred via
+                        // this flag rather than duplicating pagination here.
+                        self.tts_start_requested = true;
+                    }
                     if ui.button("🔖").clicked() {
                         self.bookmarks_open = !self.bookmarks_open;
                     }
@@ -405,6 +487,25 @@ impl TomeApp {
             let page_idx = ob.reader.current_page.min(pagination.pages.len().saturating_sub(1));
             let page = pagination.pages[page_idx].clone();
 
+            if self.tts_start_requested {
+                self.tts_start_requested = false;
+                // build_queue skips non-text blocks and, within the starting
+                // block, anything at or before from.ch — so starting exactly
+                // at page.start is correct even when that locus falls
+                // mid-sentence: the sentence containing it is still emitted
+                // in full (split_sentences ranges are checked by their END
+                // against from.ch, not their start).
+                let queue = tomescope::tts::build_queue(&ob.loaded.content, page.start, 0);
+                let has_queue = !queue.is_empty();
+                ob.reader.tts.load(queue);
+                ob.reader.tts.is_speaking = has_queue;
+                if let Some(u) = ob.reader.tts.current() {
+                    let _ = self.tts_backend.speak(
+                        &u.text, ob.reader.tts.rate, ob.reader.tts.pitch, &ob.reader.tts.voice,
+                    );
+                }
+            }
+
             if let Some(zone) = tomescope::reader::draw_page(
                 ui,
                 &ob.loaded.content,
@@ -438,6 +539,14 @@ impl TomeApp {
         });
 
         tomescope::reader::draw_footnote_popover(ctx, &ob.loaded.content, &mut ob.reader.show_footnote, colors);
+        tomescope::lookup::draw_lookup_popover(
+            ctx,
+            &ob.loaded.content,
+            &self.lookup,
+            &ob.reader.selection,
+            &mut ob.reader.lookup_open,
+            colors,
+        );
     }
 
     fn draw_stats_screen(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
@@ -575,6 +684,70 @@ impl TomeApp {
             colors.text_weak,
             "Paste catalog XML below, or use `shelfctl` to script imports. Network fetch is opt-in and disabled by default.",
         );
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.opds_xml)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("<feed xmlns=\"http://www.w3.org/2005/Atom\">…</feed>"),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            let can_parse = !self.opds_xml.trim().is_empty();
+            if ui.add_enabled(can_parse, egui::Button::new("Parse catalog")).clicked() {
+                self.opds_result = Some(
+                    tomescope::opds::parse_opds_xml(&self.opds_xml).map_err(|e| e.to_string()),
+                );
+            }
+            if ui.button("Clear").clicked() {
+                self.opds_xml.clear();
+                self.opds_result = None;
+            }
+        });
+
+        ui.add_space(8.0);
+        match &self.opds_result {
+            None => {}
+            Some(Err(msg)) => {
+                ui.colored_label(colors.danger, format!("could not parse: {msg}"));
+            }
+            Some(Ok(feed)) => {
+                if feed.entries.is_empty() {
+                    ui.colored_label(colors.text_weak, "the feed parsed but has no entries");
+                    return;
+                }
+                if !feed.title.is_empty() {
+                    ui.label(RichText::new(&feed.title).color(colors.text).strong());
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for entry in &feed.entries {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&entry.title).color(colors.text));
+                                if let Some(author) = &entry.author {
+                                    ui.colored_label(colors.text_weak, author);
+                                }
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if entry.is_navigation() {
+                                    ui.colored_label(colors.text_weak, "catalog ›");
+                                } else if let Some(link) = entry.acquisition_link() {
+                                    // Downloading is the network-fetch step this module
+                                    // deliberately stubs (NoNetworkFetcher) — surfacing
+                                    // the link is honest about what parsing alone gets
+                                    // you; wiring a real fetch is separate, opt-in work.
+                                    ui.colored_label(colors.text_weak, &link.mime_type);
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+            }
+        }
     }
 
     fn draw_settings_screen(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
