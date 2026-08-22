@@ -612,6 +612,9 @@ struct VoicetermApp {
     /// The favorites panel. Open state only — the list is read fresh on every
     /// draw, so someone editing Dolphin's favorites mid-session sees it.
     favorites_open: bool,
+    /// When the memory footprint was last sampled, in seconds since start.
+    /// Only moves when WEB2QML_MEMLOG is set; see voiceterm_egui::memlog.
+    last_memlog_s: f64,
     /// The acoustic peer handshake, when one is running. Held as the ENGINE's
     /// state rather than a mirror of it — the QML kept a hand-copied string
     /// and a hand-copied enum is one that drifts.
@@ -794,6 +797,31 @@ impl eframe::App for VoicetermApp {
         // they are for: a modal that a panel can cover is not modal, and a
         // voice halo that only shows on one tab is a status light behind a
         // door.
+        // THE MEMORY POLL. The QML runs this on a 15s Timer; here it rides the
+        // frame loop, which is equivalent because the gate is checked first and
+        // caches in a OnceLock — a build nobody enabled it on pays an atomic
+        // load per frame and nothing else.
+        {
+            use voiceterm_egui::memlog;
+            let now = ctx.input(|i| i.time);
+            if memlog::due(now, self.last_memlog_s) {
+                self.last_memlog_s = now;
+                let h = memlog::Holders {
+                    terminals: 1,
+                    scrollback_rows: self.grid.rows,
+                    // self.workspace (singular) holds the tabs; self.workspaces
+                    // is the VIEW over saved ones and has no count.
+                    workspaces: self.workspace.tabs.len(),
+                    cards: self.deck.cards.len(),
+                    blocks: self.blocks.blocks.len(),
+                    audio_kb: 0,
+                };
+                // Printed HERE rather than in memlog, so the diagnostic can be
+                // routed — the QML pairs it with WEB2QML_LOG=mem.
+                if let Some(l) = memlog::line(h) { eprintln!("{l}"); }
+            }
+        }
+
         // FAVORITES. Read fresh each draw rather than on open: the QML
         // refreshes on open for the same reason, and "each draw" is strictly
         // fresher for the cost of parsing one small XML file.
@@ -3179,6 +3207,7 @@ fn main() -> eframe::Result<()> {
                 cmd_sheet: Default::default(),
                 missing_pkg_open: false,
                 favorites_open: false,
+                last_memlog_s: 0.0,
                 peer: None,
                 deck: Default::default(),
                 captured: String::new(),

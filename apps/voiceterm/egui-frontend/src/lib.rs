@@ -40,6 +40,7 @@ pub mod data {
     pub fn source_exts() -> &'static [String] { &[] }
     pub fn init() {}
 }
+pub mod memlog;        // v0.1.896 memory-footprint poll, off unless WEB2QML_MEMLOG
 pub mod favorites;     // KDE Places plus a Home anchor (favoritesPopup)
 pub mod missing_pkg;   // packages recent commands reported missing (missingPkgDrawer)
 pub mod cmd_sheet;     // touch-friendly command history, tap to place / drag up to star
