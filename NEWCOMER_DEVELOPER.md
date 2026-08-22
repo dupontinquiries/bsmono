@@ -68,6 +68,13 @@ object store (`.gitmind/store.redb`) is gitignored and reproducible:
 
 See `maintenance/gitmind-eval.md` for what's been verified.
 
+## If you are an agent
+
+Read [CLAUDE.md](CLAUDE.md) first. It is the operating manual: session capture,
+the build wrapper that halves target directories, the crates whose native
+dependencies need a feature flag here, and the checks to run before committing.
+This file explains what the tools ARE; that one says which to reach for.
+
 ## First things to run
 
 ```sh
@@ -76,6 +83,13 @@ build/build.sh                  # see the build plan (no compiling)
 build/build.sh --run --only peek    # prove a real cargo build
 maintenance/gitmind-sync.sh     # (optional) materialize the gitmind store
 ```
+
+Build note: prefer `maintenance/tools/cargo-ailite check` over bare `cargo
+check` — same result, 42% smaller target directory (measured), which is the
+resource that actually runs out. `maintenance/tools/ailite-cache` makes a warm
+target survive a sandbox reset (8830 ms → 39 ms, verified). Details and the
+one claim that did NOT reproduce are in
+[maintenance/SANDBOX_BUILD_LIMITS.md](maintenance/SANDBOX_BUILD_LIMITS.md).
 
 Toolchain note: you'll want Rust **1.96** and **1.75** both available (some
 benches need rustc < 1.81). System build deps (Qt6, Vulkan, GStreamer, GTK4, …)

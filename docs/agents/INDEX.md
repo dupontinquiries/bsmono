@@ -5,6 +5,18 @@ monorepo. This is the **catalog**; the **synthesis** — a Claude-specific vs
 general-LLM split with the logscope-tree mapping — now lives at
 [[claude-vs-general]]. ZBracket nav (`[[name]]`) is the next wiring step.
 
+## Operational directives — read first
+
+[**/CLAUDE.md**](../../CLAUDE.md) at the repo root is the agent's operating
+manual: how to arm session capture, how to build without filling the disk,
+which crates need `--no-default-features` and why, how to measure a bundle
+before merging it, and what to verify before committing. It is rules; this file
+is a catalog.
+
+That also settles plan item 4 below for one role: **CLAUDE.md is the directive
+file**, `HANDOFF.md` stays the per-task handover, `TOOLBOX.md` the per-project
+tool list.
+
 ## Catalog (≈40 docs)
 
 **games/unendlich** — by far the largest cluster. (Moved from `apps/`; the old path was purged, so references to `apps/unendlich` in older notes are historical.)
