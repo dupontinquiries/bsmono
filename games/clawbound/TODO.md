@@ -290,10 +290,19 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] First explanation found and fixed: the Great Tree's root guard was all-or-nothing, so
   two standing Heal Trees hardened it exactly as much as three and a felled border bought
   nothing. It scales now, a third of the guard per border. Tested.
-- [ ] **But the conversion rate did not move** (48%/39% on the same two seeds, before and
-  after), so that was not the binding constraint. Next suspect: the breaching clan
-  overextends and pays for the border in bodies — a retreat-rule question, not a structure
-  one. Worth instrumenting deaths-per-clan in the minute after a border falls.
+- [x] Instrumented it (`examples/breach_probe.rs`) and the overextension theory was **wrong**:
+  deaths after a break were even (21 v 25) and at identical depth (103m from each cat's own
+  camp), and the breacher was *ahead* on freshkill at the moment of the break in 17/29.
+  What the probe found instead: the breacher ended with fewer of its **own** borders
+  standing (-0.28), because `breach_lane` funnelled *every* patrol wave into the hole while
+  the defender kept covering three trails. Half the waves press the breach now; mechanism
+  metric -0.28 -> -0.07, probe conversion 34% -> 41%.
+- [ ] Conversion still isn't fixed: **40.9% pooled over 793 games (se 1.8)**, five standard
+  errors below even. Two explanations eliminated, one repaired, and defending is still
+  stronger than attacking. The remaining candidates are structural rather than buggy — the
+  defender fights beside its medic den, inside its own auras, respawns closer, and has the
+  last-stand rule. Deciding whether attacking should pay (and what with) is a design call,
+  not a bug hunt.
 - [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
   winning rather than only fleeing a lost one
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
@@ -403,10 +412,19 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] First explanation found and fixed: the Great Tree's root guard was all-or-nothing, so
   two standing Heal Trees hardened it exactly as much as three and a felled border bought
   nothing. It scales now, a third of the guard per border. Tested.
-- [ ] **But the conversion rate did not move** (48%/39% on the same two seeds, before and
-  after), so that was not the binding constraint. Next suspect: the breaching clan
-  overextends and pays for the border in bodies — a retreat-rule question, not a structure
-  one. Worth instrumenting deaths-per-clan in the minute after a border falls.
+- [x] Instrumented it (`examples/breach_probe.rs`) and the overextension theory was **wrong**:
+  deaths after a break were even (21 v 25) and at identical depth (103m from each cat's own
+  camp), and the breacher was *ahead* on freshkill at the moment of the break in 17/29.
+  What the probe found instead: the breacher ended with fewer of its **own** borders
+  standing (-0.28), because `breach_lane` funnelled *every* patrol wave into the hole while
+  the defender kept covering three trails. Half the waves press the breach now; mechanism
+  metric -0.28 -> -0.07, probe conversion 34% -> 41%.
+- [ ] Conversion still isn't fixed: **40.9% pooled over 793 games (se 1.8)**, five standard
+  errors below even. Two explanations eliminated, one repaired, and defending is still
+  stronger than attacking. The remaining candidates are structural rather than buggy — the
+  defender fights beside its medic den, inside its own auras, respawns closer, and has the
+  last-stand rule. Deciding whether attacking should pay (and what with) is a design call,
+  not a bug hunt.
 - [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
   winning rather than only fleeing a lost one
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the

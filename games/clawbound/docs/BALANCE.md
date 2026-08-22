@@ -198,6 +198,35 @@ explanation is that the breaching clan simply overextends and pays for the
 border in bodies, which is a question for the retreat rules rather than the
 structures.
 
+## Where the border advantage actually went
+
+`examples/breach_probe.rs` asks what happens in the minute after the first Heal
+Tree falls. The overextension theory — the breacher dies deep in enemy ground
+paying for its prize — is **wrong**: deaths were even (21 against 25) and at
+identical depth (103 m from each cat's own camp). Nor is breaking a symptom of
+losing; at the moment of the break the breacher was *ahead* on freshkill in
+17 of 29 matches.
+
+What the probe did find was in the end state: the breacher finished with **fewer
+of its own borders standing** (−0.28). It had traded the map for a lane —
+because `breach_lane` funnelled *every* patrol wave into the hole it had made,
+while the defender, having no breach of its own, kept covering three trails.
+Concentration is right; total concentration is a gift.
+
+Half the waves press the breach now, the rest walk the rota. The mechanism
+metric moved almost to neutral (**−0.28 → −0.07** borders-standing lead) and the
+probe's conversion went 34% → 41%.
+
+**The conversion rate is still not fixed.** Pooled over 793 harness games it
+sits at 40.9% (se 1.8) — five standard errors below even, so defending remains
+genuinely stronger than attacking here, and two of the three explanations tried
+have now been eliminated rather than confirmed. Candidates left: the defender
+fights beside its medic den and inside its own auras, respawns closer, and gets
+the last-stand rule that suspends retreat at the Great Tree. That is a real
+asymmetry in the mode's design rather than a bug, and worth deciding
+deliberately — a MOBA usually pays the attacker for the risk, and this one does
+not yet.
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three

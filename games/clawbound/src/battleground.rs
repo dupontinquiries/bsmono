@@ -1417,7 +1417,19 @@ impl Battleground {
                 self.wave_n[team as usize] += 1;
                 // mid every other wave — nobody's ancestors hold it
                 let rota = [MID_LANE, DUO_LANE, MID_LANE, SOLO_LANE];
-                let lane = self.breach_lane(team).unwrap_or(rota[wave % rota.len()]);
+                let normal = rota[wave % rota.len()];
+                // A breach pulls patrols, but not *every* patrol. Measured: the
+                // clan that broke the enemy's first border won only 34% of its
+                // matches, and the probe found why — deaths were even and no
+                // deeper on either side, but the breacher ended with fewer of its
+                // OWN borders standing. It had funnelled every wave into the hole
+                // it made while the defender's waves still covered three lanes,
+                // so it traded the map for a lane. Half the waves press the
+                // breach now; the rest walk the rota.
+                let lane = match self.breach_lane(team) {
+                    Some(b) if wave % 2 == 0 => b,
+                    _ => normal,
+                };
                 let duty = if wave % 3 == 2 { Duty::Hunting } else { Duty::Border };
                 self.spawn_patrol(team, lane, duty);
             }
@@ -3054,6 +3066,31 @@ mod tests {
         let (none, one, all) = (gnaw_rate(0), gnaw_rate(1), gnaw_rate(3));
         assert!(one > none * 1.1, "the first border must buy something: {none} -> {one}");
         assert!(all > one * 1.1, "and the next ones more: {one} -> {all}");
+    }
+
+    #[test]
+    fn a_breach_pulls_patrols_but_not_every_patrol() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        // fell a clan B border: clan A now has somewhere to press
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let breach = bg.heal_trees[t].lane;
+        bg.heal_trees[t].hp = 0.0;
+        let mut on_breach = 0;
+        let mut elsewhere = 0;
+        for wave in 0..8 {
+            let before = bg.warriors.len();
+            bg.spawn_patrol(CLAN_A, {
+                let rota = [MID_LANE, DUO_LANE, MID_LANE, SOLO_LANE];
+                match bg.breach_lane(CLAN_A) {
+                    Some(b) if wave % 2 == 0 => b,
+                    _ => rota[wave % rota.len()],
+                }
+            }, Duty::Border);
+            let lane = bg.warriors[before].lane;
+            if lane == breach { on_breach += 1 } else { elsewhere += 1 }
+        }
+        assert!(on_breach > 0, "the breach should pull patrols");
+        assert!(elsewhere > 0, "but the other trails must not be abandoned");
     }
 
     #[test]
