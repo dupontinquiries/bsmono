@@ -10,6 +10,8 @@ use tomescope::library::{Library, ShelfSel, SortKey, TextureCache};
 use tomescope::persist;
 use tomescope::reader::ReaderState;
 use tomescope::stats::{ActiveSession, StatsLog};
+#[cfg(feature = "espeak")]
+use tomescope::tts::TtsBackend as _;
 use tomescope::study::Deck;
 use tomescope::theme::ReaderPrefs;
 // Toasts moved into its own module when it was promoted to the shared kit; the
@@ -120,7 +122,31 @@ struct TomeApp {
     /// so a stale success can't linger on screen next to a fresh error.
     opds_result: Option<Result<tomescope::opds::OpdsFeed, String>>,
 
+    /// Deferred: set by the reader toolbar's Read button, consumed once the
+    /// CentralPanel below has computed a live Pagination to read the current
+    /// page's start locus from.
+    tts_start_requested: bool,
+    /// `SilentBackend` unless the `espeak` feature is compiled in — real
+    /// audio depends on `espeak-ng` being installed, which this sandbox
+    /// cannot verify; the queue/highlighting logic works either way.
+    tts_backend: Box<dyn tomescope::tts::TtsBackend>,
+
     last_frame_time: f64,
+}
+
+/// `EspeakBackend` when the feature is compiled in AND the binary is
+/// actually on PATH — falling back to `SilentBackend` either way means the
+/// queue/highlighting still work with no audio, rather than a read-aloud
+/// button that appears to do nothing on a machine without espeak-ng.
+fn default_tts_backend() -> Box<dyn tomescope::tts::TtsBackend> {
+    #[cfg(feature = "espeak")]
+    {
+        let backend = tomescope::tts::EspeakBackend::default();
+        if backend.is_available() {
+            return Box::new(backend);
+        }
+    }
+    Box::new(tomescope::tts::SilentBackend)
 }
 
 impl TomeApp {
@@ -179,6 +205,9 @@ impl TomeApp {
 
             opds_xml: String::new(),
             opds_result: None,
+
+            tts_start_requested: false,
+            tts_backend: default_tts_backend(),
 
             last_frame_time: 0.0,
         }
@@ -380,6 +409,38 @@ impl TomeApp {
                     if ui.button("TOC").clicked() {
                         self.toc_open = !self.toc_open;
                     }
+                    // No auto-advance: TtsBackend::speak fires the backend
+                    // (a subprocess for espeak, a no-op for SilentBackend)
+                    // and returns immediately — the trait has no "finished"
+                    // signal to poll, so this is Play/Stop/Next rather than
+                    // a queue that plays itself through. Building real
+                    // auto-advance means adding completion detection to the
+                    // backend trait, which is separate scope from wiring the
+                    // existing queue+backend together.
+                    if ob.reader.tts.is_speaking {
+                        if ui.button("⏹ Stop").clicked() {
+                            ob.reader.tts.is_speaking = false;
+                            let _ = self.tts_backend.stop();
+                        }
+                        if ui.button("⏭ Next").clicked() {
+                            if ob.reader.tts.advance() {
+                                if let Some(u) = ob.reader.tts.current() {
+                                    let _ = self.tts_backend.speak(
+                                        &u.text, ob.reader.tts.rate, ob.reader.tts.pitch, &ob.reader.tts.voice,
+                                    );
+                                }
+                            } else {
+                                let _ = self.tts_backend.stop();
+                            }
+                        }
+                    } else if ui.button("🔊 Read").clicked() {
+                        // The actual queue build needs the current page's
+                        // start locus, which needs a live Pagination — that
+                        // isn't computed until the CentralPanel below runs
+                        // (it needs the panel's width/height). Deferred via
+                        // this flag rather than duplicating pagination here.
+                        self.tts_start_requested = true;
+                    }
                     if ui.button("🔖").clicked() {
                         self.bookmarks_open = !self.bookmarks_open;
                     }
@@ -415,6 +476,25 @@ impl TomeApp {
             let pagination = ob.reader.paginate_now(ob.id, &ob.loaded.content, width, height);
             let page_idx = ob.reader.current_page.min(pagination.pages.len().saturating_sub(1));
             let page = pagination.pages[page_idx].clone();
+
+            if self.tts_start_requested {
+                self.tts_start_requested = false;
+                // build_queue skips non-text blocks and, within the starting
+                // block, anything at or before from.ch — so starting exactly
+                // at page.start is correct even when that locus falls
+                // mid-sentence: the sentence containing it is still emitted
+                // in full (split_sentences ranges are checked by their END
+                // against from.ch, not their start).
+                let queue = tomescope::tts::build_queue(&ob.loaded.content, page.start, 0);
+                let has_queue = !queue.is_empty();
+                ob.reader.tts.load(queue);
+                ob.reader.tts.is_speaking = has_queue;
+                if let Some(u) = ob.reader.tts.current() {
+                    let _ = self.tts_backend.speak(
+                        &u.text, ob.reader.tts.rate, ob.reader.tts.pitch, &ob.reader.tts.voice,
+                    );
+                }
+            }
 
             if let Some(zone) = tomescope::reader::draw_page(
                 ui,

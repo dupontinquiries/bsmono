@@ -331,8 +331,26 @@ builds it. Recorded here as three concrete, scoped next steps instead:
       of scope — `NoNetworkFetcher` is the deliberate stub the module was
       built around, so downloading an acquisition link is separate, opt-in
       work, not part of this fix.
-- [ ] tomescope: wire `tts.rs` to a "read aloud" control in the reader toolbar,
-      building the `Utterance` queue from the current locus forward.
+- [x] tomescope: `tts.rs` wired for real (2026-08-22). `ReaderState` gained a
+      `tts: TtsQueuePlayer` field; the reader toolbar gained Read/Stop/Next
+      buttons; `TomeApp` gained a `tts_backend: Box<dyn TtsBackend>` chosen by
+      `default_tts_backend()` (real `EspeakBackend` if the `espeak` feature is
+      on AND `espeak-ng` is actually on PATH, `SilentBackend` otherwise, so
+      the button never appears broken on a machine without the binary).
+      Read builds the queue from the CURRENT page's start locus
+      (`page.start`, already computed for pagination — reused rather than
+      duplicated), not from the top of the book. **Deliberately NOT
+      auto-advancing**: `TtsBackend::speak` fires-and-returns (a spawned
+      subprocess for espeak, a no-op for silent) with no completion signal in
+      the trait, so this session shipped Play/Stop/Next rather than invent a
+      fake "done speaking" detector — real auto-advance needs a
+      completion-detection addition to the trait itself, which is a
+      different, slightly bigger task than wiring the existing pieces.
+      Verified both feature configurations: `cargo check --bin tomescope`
+      clean (9 warnings, same as before) and `--features espeak` also clean
+      (9 warnings) after adding the `#[cfg(feature = "espeak")]`-gated
+      `TtsBackend` trait import the `is_available()` call needs. Full
+      `cargo test --lib`: 45/45 passing, unchanged.
 
 **Confirmed false-positive theory for the big multi-crate apps.** Checked
 gitmind's three highest-profile "orphans" (`flow`, `incoming`, `appcatalog`,

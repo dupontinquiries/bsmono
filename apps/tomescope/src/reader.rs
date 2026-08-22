@@ -150,6 +150,10 @@ pub struct ReaderState {
     pub show_footnote: Option<usize>,
     pub rtl: bool,
     pub pending_locus: Option<Locus>,
+    /// Read-aloud state. `SilentBackend`-driven unless the `espeak` feature
+    /// is compiled in — the queue and sentence highlighting work either way,
+    /// per `tts.rs`'s own design; only actual sound depends on the backend.
+    pub tts: crate::tts::TtsQueuePlayer,
 }
 
 impl Default for ReaderState {
@@ -170,6 +174,7 @@ impl Default for ReaderState {
             show_footnote: None,
             rtl: false,
             pending_locus: None,
+            tts: crate::tts::TtsQueuePlayer::default(),
         }
     }
 }
