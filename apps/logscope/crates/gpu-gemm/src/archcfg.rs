@@ -1080,6 +1080,92 @@ supported: {}", for_arch("qwen2").note);
         }
     }
 
+    /// Every `.rs` beside lib.rs is reachable from some crate root.
+    ///
+    /// `specloop.rs` sat in `src/` for a long time with no `mod specloop`
+    /// anywhere. Not "no caller" — NOT COMPILED. Its six tests had never run,
+    /// and nothing in the build could notice. Two documents disagreed about
+    /// whether it existed: `dupscan.rs` recorded the audit decision to delete
+    /// it and described that as done, while `ASAHI_GPU.md` listed it as the
+    /// speculative control loop and told the reader to wire it up. Both were
+    /// written in good faith against a file the compiler had never seen.
+    ///
+    /// An orphan is worse than dead code. Dead code is compiled, type-checked
+    /// and tested, so it stays honest; an undeclared file rots silently and
+    /// still reads like the real implementation to anyone grepping.
+    ///
+    /// Roots are lib.rs AND the `[[bin]]` targets — a module declared only in
+    /// `main.rs` is compiled, just not into the library.
+    #[test]
+    fn no_source_file_is_orphaned_from_the_module_tree() {
+        // KNOWN ORPHANS, each with the decision that keeps it here. The point
+        // of an allowlist rather than a silent skip: a NEW orphan fails
+        // immediately, and each existing one has to carry a reason.
+        const KNOWN: &[(&str, &str)] = &[
+            ("kernels",
+             "the 2026-07-26 shader extraction (90 .wgsl + kernels.rs) was written and never \
+wired. lib.rs still carries 57 inline r#\"...\"# copies and has been edited continuously since, \
+so 13 of 82 comparable shaders have DRIFTED and the inline copy is the live one. Do not fix by \
+adding `mod kernels;` — that silently swaps 13 shaders on real hardware with no GPU here to \
+check, which is what LOGSCOPE_PASS_FUSE did. Regenerate the .wgsl from lib.rs, or delete them."),
+            ("llada2",
+             "LLaDA2.0's layer plan, 12 tests, zero references. archcfg lists llada2 as supported, \
+so whatever implements it is elsewhere; this is a second copy nobody calls."),
+            ("quant_mix",
+             "which checkpoint types survive loading, 16 tests, zero references."),
+        ];
+
+        let roots: Vec<&str> = vec![
+            include_str!("lib.rs"),
+            include_str!("main.rs"),
+            include_str!("serve.rs"),
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut orphans = Vec::new();
+
+        for entry in std::fs::read_dir(&dir).expect("read src/") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            if matches!(stem.as_str(), "lib" | "main" | "serve") {
+                continue;
+            }
+            let declared = roots.iter().any(|r| {
+                r.contains(&format!("mod {stem};")) || r.contains(&format!("mod {stem} "))
+            });
+            if !declared && !KNOWN.iter().any(|(k, _)| *k == stem) {
+                orphans.push(stem);
+            }
+        }
+
+        orphans.sort();
+        assert!(
+            orphans.is_empty(),
+            "these files are in src/ but no `mod` declaration in lib.rs, main.rs or serve.rs \
+reaches them, so they are not compiled and their tests never run: {orphans:?}. Declare them, \
+delete them, or add them to KNOWN above with the reason — an undeclared file still reads like \
+the real implementation to whoever greps for it next."
+        );
+
+        // And the allowlist must not outlive its entries: an orphan that got
+        // wired or deleted should be struck from the list, not left asserting
+        // something untrue. Same expiry discipline as the rest of this module.
+        for (name, why) in KNOWN {
+            let exists = dir.join(format!("{name}.rs")).exists();
+            let declared = roots.iter().any(|r| {
+                r.contains(&format!("mod {name};")) || r.contains(&format!("mod {name} "))
+            });
+            assert!(
+                exists && !declared,
+                "KNOWN lists `{name}` as an orphan, but it is now \
+{} — remove the entry. Its recorded reason was: {why}",
+                if !exists { "deleted" } else { "declared" }
+            );
+        }
+    }
+
     /// The mirror: notes must not describe as PENDING anything the engine already honours. Group
     /// routing was reported pending for 50 bundles after it landed.
     #[test]

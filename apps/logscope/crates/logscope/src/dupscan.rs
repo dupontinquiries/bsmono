@@ -337,7 +337,14 @@ mod live_tests {
         // SAME IDEA ACCRETING — propose and accept_rate collided across lookahead/specloop
         // because the speculative area held THREE generations of machinery. The follow-up the
         // audit recorded is now DONE: specloop (zero callers) and lookahead (one probe bin,
-        // deleted with it) are gone; spec.rs is the one wired Drafter. tokens_per_pass remains
+        // deleted with it) are gone; spec.rs is the one wired Drafter.
+        //
+        // HALF of that was true when written. lookahead.rs was gone; specloop.rs was
+        // still on disk, and had never even been declared as a module — no `mod
+        // specloop` anywhere, so it was not compiled and its six tests had never run.
+        // A comment asserting a deletion is not a deletion. Actually removed now, and
+        // this note stays as the reason the next reader should check the tree rather
+        // than the claim. tokens_per_pass remains
         // (spec vs specdecode — the live pair). The ceiling RATCHETS DOWN with the deletion:
         // a ceiling that only ever rises is a counter, not a ratchet.
         //

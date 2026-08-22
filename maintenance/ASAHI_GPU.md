@@ -238,13 +238,17 @@ Every piece is built and tested:
 
 | piece | where | state |
 |---|---|---|
-| the control loop | `specloop.rs` — `propose()` / `settle()` | 6 tests, **no caller** |
+| the control loop | `Gpu::speculative_generate_drafter*` (`lib.rs`, over `spec.rs`) | **wired** — main.rs, logscope-egui/backend.rs |
 | the accept rule | `specverify.rs` | present |
 | a drafter needing no second model | `lookupdraft.rs` (n-gram from context) | present |
 | the batched verify pass | `Gpu::decode_batched` | present |
 | draft rollback | `Session::rewind(rows)` | present |
 
-`specloop`'s own header explains the sequencing it was designed for:
+`specloop.rs` was a SECOND, earlier control loop for the same job. It had no
+`mod` declaration anywhere, so it was never compiled and its six tests never
+ran; `dupscan.rs` had already recorded the audit decision to delete it and
+described it as done. Removed for real now. Its header, kept because the
+sequencing it describes is still the right shape and `spec.rs` implements it:
 
 ```text
 let d = spec.propose(&context);        // tokens to draft, possibly empty
@@ -257,14 +261,22 @@ second checkpoint sharing a tokenizer, and the n-gram drafter needs nothing —
 which for a fleet that loads one GGUF at a time is the difference between a
 feature and a deployment problem.
 
-**This was NOT wired in that session, deliberately.** `specloop`'s header calls
-the generation loop "the hardest code in the engine to change safely", the
-rejection path has to `rewind` the KV cache by exactly the count that failed,
-and there is no hardware here to check the output against. Wiring it blind is
-what `LOGSCOPE_PASS_FUSE` did — it changed generated tokens on 3 of 6
-configurations and is now retracted. The right shape is an env flag, off by
-default, reporting `accept_rate()` — the same way every other risky lever in
-this engine ships.
+**CORRECTION (this pass).** The section above said nothing calls it, and that
+sent a reader toward wiring `specloop`. Both halves were wrong by the time they
+were read. Speculative decoding IS wired, through `spec.rs`: `main.rs:1122` and
+`logscope-egui/src/backend.rs:1068` both drive
+`speculative_generate_drafter*` with a `spec::PromptLookup` drafter, behind
+`LOGSCOPE_SPEC_DRAFT`, reporting tokens-per-pass. What had no caller was the
+duplicate.
+
+The caution the paragraph carried is still correct and still applies to any
+change here — the generation loop is the hardest code in the engine to change
+safely, the rejection path has to `rewind` the KV cache by exactly the count
+that failed, and `LOGSCOPE_PASS_FUSE` is the standing example of what wiring
+something blind costs (it changed generated tokens on 3 of 6 configurations and
+is retracted). The lever that remains genuinely unexplored is `k`: this page
+predicts the optimum sits above the default of 4 on submit-bound hardware, and
+that is still a prediction.
 
 ## It does not apply to the diffusion path at all
 
