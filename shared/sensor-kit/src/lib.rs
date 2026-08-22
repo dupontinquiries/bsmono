@@ -9,6 +9,9 @@
 //! an Android SensorManager bridge) feeds lines/events in; the control math lives here and is tested.
 //! Reuses `touchkit::Vec2` — no second vector type in the tree.
 
+pub mod carry;
+pub mod gait;
+
 pub use touchkit::Vec2;
 
 /// A tilt state from `monitor-sensor --accel`.

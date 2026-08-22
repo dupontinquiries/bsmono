@@ -1,0 +1,8 @@
+[package]
+name = "routine-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Daily-routine autolearner: time-of-week-bucketed Markov transition models over composite context states (motion class × wifi association), learned online from a periodic tick with exponential forgetting. Pure — the clock, the sensor classifier, and the wifi watcher are injected; an nmcli-monitor line parser is included for the postmarketOS shell. Zero deps, std only, so it cross-compiles to the phone targets."
+
+[lib]
+path = "src/lib.rs"
