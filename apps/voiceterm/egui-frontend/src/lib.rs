@@ -27,6 +27,7 @@ pub mod mail_selector;
 pub mod token_log;
 pub mod connections_graph;
 pub mod summary_queue;
+pub mod peer_panel;   // the acoustic handshake — the last QML surface with no egui counterpart
 pub mod password_prompt;
 pub mod audit_chain;
 pub mod context_redact;

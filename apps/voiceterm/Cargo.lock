@@ -1765,6 +1765,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "peer-handshake"
+version = "0.1.0"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3083,11 +3087,13 @@ dependencies = [
  "libc",
  "llama-cpp-2",
  "nifty-core",
+ "peer-handshake",
  "portable-pty",
  "qmetaobject",
  "scraper",
  "unicode-width 0.1.14",
  "ureq",
+ "voice-kit",
  "voiced-core",
  "vte",
  "whisper-rs",

@@ -4,6 +4,9 @@ version = "0.1.900"
 edition = "2021"
 
 [dependencies]
+# The acoustic handshake, hoisted so the egui frontend can share it. See the
+# note in src/peer_handshake.rs.
+peer-handshake = { path = "../../shared/peer-handshake" }
 voiced-core = { path = "../../shared/voiced-core" }
 nifty-core = { path = "../../shared/nifty-core" }
 # hallucination filtering shared with rusty-board (voice keyboard) — see

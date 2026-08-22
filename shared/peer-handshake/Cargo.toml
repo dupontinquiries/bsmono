@@ -1,0 +1,12 @@
+[package]
+name = "peer-handshake"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Acoustic peer handshake: a payload, its tone encoding, and a pure state machine for establishing trust between two devices over sound with optional voice-print verification."
+
+# NO DEPENDENCIES, and that is the point of hoisting it. Both modules were
+# already dependency-free inside voiceterm — the only thing keeping them there
+# was the crate boundary, and that boundary was dragging qmetaobject into
+# anything that wanted the state machine.
+[dependencies]
