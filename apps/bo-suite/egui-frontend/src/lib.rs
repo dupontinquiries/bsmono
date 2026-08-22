@@ -503,6 +503,10 @@ impl Controller {
         VIEWS[self.view_idx]
     }
 
+    /// Not called yet, and that is not an oversight: see below — the gesture
+    /// was deliberately removed from the live UI and this is kept as the index
+    /// arithmetic its replacement is checked against.
+    ///
     /// Switch view by a swipe sign (wraps at the ends — clamped, see `page()`). Pure index arithmetic;
     /// used by tests. NOT gesture-driven in the live UI any more — compact mode uses the vertical-tabs
     /// sidebar instead of a whole-surface swipe (see `ui()`'s doc comment for why: the Devices view's
@@ -845,6 +849,28 @@ impl Controller {
     }
 
     /// The host confirmed a rating.
+    ///
+    /// Until something calls this, every rating stays PENDING — `pending()` is
+    /// `value != confirmed`, and tags.rs draws a dot beside a pending star. So
+    /// with no echo the dot never clears and every rating the operator has
+    /// ever set looks like it is still in flight.
+    ///
+    /// `rate` IS called from the UI, so this is not a dormant pair: the
+    /// optimistic half runs and the reconciling half never did.
+    ///
+    /// Not called yet, and that is not an oversight — but it IS a live defect,
+    /// which is a distinction worth keeping. Closing it needs a host that can
+    /// report a stored rating, and this repo has none: `CatalogSource` exposes
+    /// `page` and `total`, and `CatalogTrack` carries no rating.
+    ///
+    /// I started to add `confirm_ratings_from(&dyn CatalogSource)` to match
+    /// `answer_tracks_from`, and stopped: it needed a `rating()` on the trait,
+    /// and widening a host data contract so an internal checker goes quiet is
+    /// the worst available reason to change an interface.
+    ///
+    /// What a host must do: call this with the stored value after writing a
+    /// rating. Until one does, the pending dot in `tags.rs` never clears and
+    /// every rating ever set reads as still in flight.
     pub fn confirm_rating(&mut self, track_id: i64, stars: u8) {
         if let Some(r) = self.ratings.get_mut(&track_id) { r.reconcile(track_id, stars); }
     }
