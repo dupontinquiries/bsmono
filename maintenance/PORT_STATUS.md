@@ -959,3 +959,54 @@ blind, for the same no-compiler reason as tomescope's orphans in `TODO.md`:
 - [ ] voiceterm: wire `archived_view::bar_ui` into the Archive view alongside
       `archive_ui` — likely a per-page action row (share/re-fetch/delete),
       matching the "fan out" pattern described in the module doc.
+
+## wiring_check.py has its own blind spot: `crates/<x>-egui` layouts
+
+`egui_dirs()` only looks at two hardcoded paths per app: `egui-frontend/src`
+and `src/ui/egui`. `gitmind` (`crates/gui-egui/src`), `logscope`
+(`crates/logscope-egui/src`), and `dialer` (`crates/dialer-egui/src`) all use a
+third layout — a sibling crate named `<x>-egui` — and none of them appeared in
+the tool's output AT ALL, not even as a zero row. That is the identical
+"missing row reads as nothing to do" failure `parity_audit.py` had for
+ambient-learner/gitmind/logscope before this doc's history added them by hand.
+
+Ran the tool's own `modules_of`/`reached` functions manually against all three
+missing dirs rather than trusting the gap to be empty:
+
+* **dialer**: 2 modules, 0 dead. Clean.
+* **gitmind**: 8 modules, 1 dead — `remote_browse`. Confirmed real: it's
+  `pub mod`-declared in `lib.rs` and referenced nowhere else. Its own header
+  explains exactly what it's for and why it matters: the GTK build lets you
+  browse the deploy target's filesystem for where to land the build
+  (`deploy::list_remote_dirs` + a folder picker); the egui push page uses five
+  of `cockpit::deploy`'s other functions and not this one, so **the deploy
+  destination has to be typed blind** in the egui port where the GTK build let
+  you browse it. `Browser`'s navigation is a pure, injectable-SSH-callback
+  model specifically so it's testable without a real device — the tests exist,
+  the page that would call it does not.
+* **logscope**: 44 modules, 12 dead — `repo`, `spatial_audio`, `workbench`,
+  `tab_layout`, `log_gestures`, `chat_layout`, `debatepanel`, `voiceconfirm`,
+  `micresponse`, `textsurface`, `assets`, `workergen`. Checked all 12 by grep
+  (including alias forms) for any reference outside their own file: zero for
+  every one. Sampled several of their headers to characterize rather than
+  assuming they're worth wiring: `tab_layout`/`chat_layout` are the adaptive
+  phone/desktop layout rules for logscope's tabs (pure, no egui dependency,
+  built on `uikit_egui::DeviceClass`); `voiceconfirm` is a voice-interjection
+  confirm dialog with a hard timeout defaulting to DISCARD, ported from
+  voiceterm's `ConfirmDialog.qml`; `textsurface`/`spatial_audio` are part of
+  the physical-UI scene work this doc already tracks separately (the
+  scene-kit migration section above); `workergen` is corpus-recombined worker
+  prompt variety, already mentioned once elsewhere in this doc's git history
+  in passing. This is a bigger and more varied list than the single-app
+  findings above, and 12 items in a 49k-line, 1492-test app is not something
+  to triage item-by-item in one pass — recording the list precisely, with the
+  grep-confirmed "zero references" fact for each, is the useful contribution
+  here; picking which of the 12 actually belong on-screen (some may be
+  intentionally-standalone library pieces rather than pages) is a design
+  question for whoever owns logscope's tab layout next.
+
+Not fixing `wiring_check.py`'s directory list itself this session, for the
+same reason `reachability.py` wasn't touched: three confirmed missing rows is
+enough to know the fix is needed, but generalizing the fix (scanning any
+`crates/*-egui` sibling automatically) risks changing what every other app's
+count means, with no compiler here to check the result against anything.
