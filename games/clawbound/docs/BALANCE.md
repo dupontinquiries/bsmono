@@ -77,6 +77,37 @@ resolution: the fixes were right on their mechanisms, the aggregate barely
 moved, and anyone reading a ±5 point delta as a result should remember that two
 of these three deltas are inside their own error bar.
 
+## Focus fire, and why the spread going UP was the good outcome
+
+The flat aggregate above had a suspicious explanation, and it turned out to be
+the right one: **the AI was hiding the roster.** Warriors picked the nearest
+visible enemy, so three cats routinely chewed three different healthy targets
+and killed nobody. The harness measures this directly — a draft pair is played
+both ways, and if the same *composition* wins both times, composition decided
+it; otherwise the chaos of first contact did. Before: **44%** of pairs were
+composition-decided. Over half of all matches were being settled by which
+orientation the dice favoured.
+
+Warriors now prefer the enemy closest to falling, trading up to eight lengths
+of distance for it (`FOCUS_WEIGHT`) — the patrol turns on the one already
+bleeding. Result over 800 games:
+
+| | before | focus fire |
+|---|---|---|
+| composition-decided pairs | 44% | **54%** |
+| dispersion | sd 3.3 | sd 4.5 |
+| kits outside 2se | 2 | 3 |
+
+Dispersion rose, and that is not a regression. A roster cannot express itself
+through an AI that spreads its damage at random; the earlier flatness was
+partly noise standing in for balance. The honest reading is that the *new*
+spread contains more signal than the old one did, and that every kit-level
+number measured before this change was measured through a duller instrument.
+
+Anything comparing kit strength should be re-run under focus fire. The
+before-and-after tables above are kept as they were taken — they were true of
+the AI that produced them.
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three
