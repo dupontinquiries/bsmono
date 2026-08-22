@@ -245,10 +245,8 @@ mod tests {
         let b = bar();
         let ctx = egui::Context::default();
         let mut seen = None;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                seen = bar_ui(ui, &b);
-            });
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            seen = bar_ui(ui, &b);
         });
         assert!(seen.is_none(), "no pointer input, so nothing should resolve: {seen:?}");
     }
@@ -267,10 +265,8 @@ mod tests {
         // itself), so the real assertion is `fans_out`-equivalent reasoning
         // done in code review — this test exists to pin the early-continue
         // path stays reachable as the function changes.
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = bar_ui(ui, &b);
-            });
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = bar_ui(ui, &b);
         });
     }
 
