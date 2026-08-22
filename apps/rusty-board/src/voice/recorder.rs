@@ -305,14 +305,14 @@ fn push_samples_mono(
         return;
     }
 
-    // Compute peak of this buffer.
-    let mut peak: f32 = 0.0;
-    for &s in data {
-        let a = s.abs();
-        if a > peak {
-            peak = a;
-        }
-    }
+    // Peak of this buffer — audio_kit::level::peak (TODO.md's audio-kit
+    // consumers item: mic-level metering). Only the raw "max abs sample in
+    // this frame" primitive is repointed; the exponential-decay smoothing
+    // below stays local since it's a stateful UI-metering STRATEGY built on
+    // top of the primitive, not a leaf DSP primitive itself (same "strategy
+    // stays local, primitive moves" split as bo-suite's engine_timbre_score
+    // this session).
+    let peak = audio_kit::level::peak(data);
 
     // Push to buffer (mono mixdown). GrowBuf::push appends without
     // dropping newest samples; it only drops OLDEST if the safety

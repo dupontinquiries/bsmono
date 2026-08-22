@@ -71,6 +71,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+]
+
+[[package]]
 name = "audiomix-kit"
 version = "0.1.0"
 
@@ -235,6 +242,9 @@ dependencies = [
 [[package]]
 name = "bo-core"
 version = "0.1.0"
+dependencies = [
+ "audio-kit",
+]
 
 [[package]]
 name = "bo-mux"
@@ -362,6 +372,10 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "core-kit"
+version = "0.1.0"
 
 [[package]]
 name = "cpp"

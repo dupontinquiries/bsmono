@@ -5980,7 +5980,11 @@ mod mesh_integrator_tests {
         let dm = DepthMap::new(8, 8, 0);  // all confidences = 0
         let pose = CameraPose::default();
         let mi = MeshIntegrator::default();
-        let n = mi.integrate(&dm, &pose, 4, &mut mesh);
+        // No source YUV in this test — pure depth/mesh geometry check.
+        // integrate's own doc: source_yuv.is_empty() || w == 0 || h == 0
+        // skips color sampling entirely, so this is the documented "no
+        // source frame available" path, not a stand-in for real data.
+        let n = mi.integrate(&dm, &pose, 4, &mut mesh, &[], 0, 0);
         assert_eq!(n, 0);
         assert!(mesh.vertices.is_empty());
     }
@@ -5997,7 +6001,7 @@ mod mesh_integrator_tests {
         let pose = CameraPose::default();
         let mut mesh = SceneMesh::new();
         let mi = MeshIntegrator { sample_stride: 2, ..MeshIntegrator::default() };
-        let tris = mi.integrate(&dm, &pose, 1, &mut mesh);
+        let tris = mi.integrate(&dm, &pose, 1, &mut mesh, &[], 0, 0);
         assert!(tris > 0, "expected some triangles for a flat depth field");
         // Verify all indices reference valid vertices
         for &i in &mesh.indices {
@@ -6025,7 +6029,7 @@ mod mesh_integrator_tests {
             discontinuity_threshold: 5.0,
             ..MeshIntegrator::default() 
         };
-        mi.integrate(&dm, &pose, 1, &mut mesh);
+        mi.integrate(&dm, &pose, 1, &mut mesh, &[], 0, 0);
         // Triangles should exist on EACH side but not bridging the boundary.
         // Verify no triangle has vertices from both depth regions.
         // (px<2 = left, px>=2 = right)

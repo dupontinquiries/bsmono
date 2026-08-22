@@ -9,6 +9,10 @@ license     = "MIT"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+# rms (lib.rs) — audio-kit's own doc names this as one of three
+# byte-identical copies it unifies (with bo-suite's podcast_diar and
+# voiceterm's separation, both repointed this session). Zero-dependency.
+audio-kit    = { path = "../../../../shared/audio-kit" }
 # VAD/capture are pure stdlib. The voice wire format uses serde + MessagePack
 # (compact `bin` payloads via serde_bytes). The Opus codec is OPTIONAL and
 # feature-gated: audiopus pulls/builds libopus, which needs a system libopus

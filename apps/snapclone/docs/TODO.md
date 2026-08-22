@@ -6708,6 +6708,21 @@ Camera bridge node overrides (rarely needed; auto-discovery usually works):
     committed), purpose-built for "MSRV mismatch in transitive deps." With it set,
     snapclone-crypto COMPILES under cargo 1.75 (incl fips203 ML-KEM-768 +
     x25519-dalek) — first time.
+    UPDATE (2026-08-19): with a real rustc/cargo 1.96, this whole escape hatch
+    is unnecessary — the edition2024 MSRV mismatch this worked around no
+    longer exists on a current toolchain. `cargo test` (no
+    SNAPCLONE_SKIP_CBINDGEN set) ran cbindgen for real, generated the header,
+    and compiled clean. Found and fixed a real, separate, pre-existing bug
+    while at it: `CryptoError` (the `#[repr(C)]` FFI error enum) had no
+    `Debug`/`PartialEq`, so its own `assert_eq!`/`assert_ne!`-based tests
+    (checking a valid signature verifies and a tampered one doesn't) had
+    never actually compiled — added `#[derive(Debug, Clone, Copy, PartialEq,
+    Eq)]`, which changes nothing about the enum's layout or the generated C
+    header (cbindgen reflects on variants/discriminants, not Rust trait
+    impls). `cargo test -p snapclone-crypto`: 14/14 (1 ignored — a timing
+    benchmark, correctly not a pass/fail assertion). The escape hatch itself
+    is left in place (harmless, and still useful on an actually-1.75
+    toolchain), just no longer the only path to a working build.
     ISSUE 2 — vtable/typeinfo undefined for RustCryptoService at link. Root cause:
     the class had NO out-of-line virtual, so its vtable had no definite emission
     TU → "undefined reference to vtable/typeinfo". FIX: declared ~RustCryptoService()

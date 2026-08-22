@@ -105,6 +105,30 @@ cargo test
 If you build without `--features app`, the binary just prints these
 instructions; everything except the window still compiles.
 
+### Verification (2026-08-19)
+
+Had no build-status record anywhere. A session with a real rustc 1.96 ran
+the full suite for the first time: **all 337 tests pass** — 323 in one run,
+plus `rosetta` (8) and `sightline` (4) confirmed separately, plus two
+individually-slow tests (`mapeval::tests::the_report_renders`,
+`mapeval::tests::the_role_model_is_its_own_closest_match_and_breeds_
+lookalikes`, each ~35-45s — they generate many procedural maps for a
+report/breeding pass, not hangs) confirmed in isolation. Spans combat
+(hitboxes, weapon behavior, damage), player movement (vaulting, mantling,
+prone, jetpack, ragdoll physics), the procedural level generator across
+dozens of biomes/presets/setpieces (connectivity, tri budgets, determinism
+for a seed, playability scoring), map quality evaluation, sightline/cover
+analysis, and the natural-language "rosetta" spec-to-level pipeline.
+Compiles clean.
+
+**Sandbox note for anyone re-running this**: the default `cargo test`
+debug build produces a very large test binary for this crate (deep
+recursion/monomorphization across ~13,000+ lines of level-generation code)
+— building the full suite pushed a constrained sandbox's disk usage into
+the single-digit-GB danger zone twice before `CARGO_PROFILE_TEST_DEBUG=0
+cargo test` fixed it. Not an issue on a normal dev machine; worth knowing
+if you're re-verifying somewhere disk-constrained.
+
 ---
 
 ## How the two references shaped this

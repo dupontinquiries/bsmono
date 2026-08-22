@@ -14,7 +14,7 @@
 //!   without depending on an external DB.
 //!
 //! ## File layout
-//! ```
+//! ```text
 //! library_dir/
 //!     webs.log            current append-only log
 //!     webs.log.bak.0      most recent backup (pre-compact or pre-rollback)
@@ -23,7 +23,7 @@
 //! ```
 //!
 //! ## Record format (binary, little-endian)
-//! ```
+//! ```text
 //! offset 0:  magic "WLR1"          4 bytes
 //! offset 4:  crc32 of (offset 8..) 4 bytes
 //! offset 8:  kind                  1 byte   (0 = put, 1 = tombstone)
@@ -33,7 +33,7 @@
 //! ```
 //!
 //! ## Payload format (LibraryWebStub serialized)
-//! ```
+//! ```text
 //! source_video_len   u16
 //! source_video       N bytes (UTF-8)
 //! source_chunk_start u32

@@ -24,15 +24,44 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 
 ## App repoints (the payoff) — STATUS
 
-- [x] bo-suite audio_features.rs (both copies) → audio-kit shim (+ engine_timbre_score local).
+- [x] bo-suite audio_features.rs (both copies) → audio-kit shim (+ engine_timbre_score local). (This checkbox was stale as of 2026-08-19: the file was consolidated to ONE copy in bo-core with bo-controller re-exporting it, but the copy itself still had the full local implementation, never actually pointed at audio-kit. Actually repointed now — bo-core/src/audio_features.rs re-exports audio_kit::goertzel's SpectrogramConfig/spectrogram/spectrogram_at_freqs verbatim (byte-identical logic — audio-kit's own doc already said these were "lifted from bo-suite's audio_features"), engine_timbre_score stays local per the original plan, now calling audio_kit::goertzel::goertzel instead of a local copy. cargo test -p bo-core: 41/41. bo-controller itself (the actual Qt consumer) is unbuildable here — got past its OpenSSL blocker by installing libssl-dev, then hit a real qmake-not-found wall, consistent with every other Qt app this session — but its only touch point is a one-line `pub use bo_core::audio_features;` re-export with no signature changes, so risk is low.)
 - [x] bo-controller podcast_diar rms + voiceterm separation rms → audio_kit::level::rms.
+      (This checkbox was stale as of 2026-08-19 — both were still full local
+      implementations, byte-identical to audio-kit's own `rms`, which itself
+      already claimed both as unified copies. Actually repointed now, in the
+      same "bo-suite audio-kit round" as `audio_features.rs` and `bo-mux`'s
+      `ct_eq`. Both apps are Qt-blocked in this sandbox (qmetaobject/qmake) —
+      unverified by compilation, verified instead by line-by-line comparison;
+      `cargo test -p audio-kit level::` — 5/5 — confirms the primitive
+      itself, including the exact zero/full-scale-DC cases both apps'
+      original test suites also covered under different names.)
 - [x] rusty-board voice/hallucination.rs → voice-kit shim. (This checkbox was
       stale as of 2026-08-19 — the file was still a full standalone
       implementation, not a shim. Actually done now; see the "rusty-board
       (newly ingested)" section's voice-kit consumers item below for the
       real commits.)
 - [x] Verified: standalone harness crates cargo-check green vs the kits.
-- [ ] User builds + runs all apps via GUI to confirm full builds (Qt/GTK, not sandbox-buildable).
+- [ ] User builds + runs all apps via GUI to confirm full builds and actual
+      on-screen behavior (a display/window/touch input, not a toolchain, is
+      the remaining gap). Toolchain-wise, this sandbox is less GTK/Qt-blocked
+      than earlier sessions assumed — see the note below.
+- [x] **Correction, 2026-08-19: rusty-board's GTK4 profile DOES compile in a
+      sandbox** — apt has `libgtk-4-dev` 4.14.5 and `libadwaita-1-dev` 1.5.0
+      (the exact versions rusty-board's own Cargo.toml comment calls for),
+      plus `libasound2-dev` for the alsa-sys build dependency. `cargo test
+      --lib --no-default-features` (the `basic`/GTK-only profile, no
+      whisper-rs/reqwest/gtk4-layer-shell) is 531/531 real, on this actual
+      crate, for the first time. `--features voice` (whisper-rs) goes
+      further — needs `cmake` too, to build whisper.cpp's C++ sources from
+      source via `whisper-rs-sys`'s build script — not attempted, real disk/
+      time cost for a native build, past the point this pass's checks
+      needed to land. `--features wayland` needs `gtk4-layer-shell-0`,
+      which apt doesn't package on Ubuntu 24.04 (only the GTK3 fork) — would
+      need building from source too. Bo-controller's Qt build got one step
+      further too this session (OpenSSL blocker resolved with `libssl-dev`)
+      before hitting a real `qmake`-not-found wall — Qt itself remains
+      unattempted, a much larger toolchain than GTK4's handful of `-dev`
+      packages.
 - [x] voiceterm voice.rs hallucination fns → voice-kit (embedded; fix
       loop-trimmer off-by-one at source — DONE). Repoint done in 3 small
       commits (dependency add, `is_sane_transcription`, `trim_hallucination_
@@ -75,15 +104,47 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       co-members = the seal-to set); a higher-level `Channel`/`Group` over the
       mailbox.
 - [ ] **app repointing** (the payoff): apps still carry their pre-extraction
-      copies. Repoint them onto the kits — voiceterm/bo-suite/logscope `ct_eq` +
+      copies. `ct_eq` half: ~~voiceterm/bo-suite~~ DONE this session (bo-mux's
+      `peer_auth.rs` and voiceterm's `mail_crypto.rs` both now delegate to
+      `net_kit::auth::ct_eq`, confirmed byte-identical before repointing).
+      bo-mux verified with a real `cargo test` (264/264, incl. the specific
+      `ct_eq_works` and `peer_auth::` tests) — it's a headless daemon, no
+      Qt/GTK. voiceterm's is unverified by compilation (Qt/qmetaobject) but
+      line-by-line confirmed, same standard as this session's other
+      Qt-blocked repoints. logscope's TWO copies (`logscope-fan::enlist`,
+      `gpu-gemm::netserve` — the very two net-kit's own doc says its `ct_eq`
+      was "lifted as the union of") are deliberately left untouched: logscope
+      has heavy concurrent commit activity this session (other work landing
+      on `main` throughout), and touching shared files there risked a
+      collision with in-flight work rather than a clean repoint. Still open:
       hand-rolled HTTP + percent-codec → net-kit; snapclone-crypto/group →
       crypto-kit; snapclone groups → share-kit (epoch-gated cutover; feed
       `namespace="group-feed"` gives byte-compatible keys).
 
-- [ ] **audio-kit consumers** (the payoff): repoint **bo-suite** (speaker control)
-      `audio_features` → audio-kit (delete both copies); voiceterm/snapclone-audio
-      `rms`; logscope voice-reaction level/voicing gate; unendlich synthesis on
-      `gen`; **rusty-board** (voice keyboard) mic-level metering → `level::rms`.
+- [ ] **audio-kit consumers** (the payoff): ~~bo-suite (speaker control)
+      audio_features~~ DONE this session (see the checkbox above — was
+      partially stale). ~~rusty-board mic-level metering~~ DONE this session,
+      but this TODO's own "→ level::rms" was wrong about what to repoint:
+      the actual code (`voice/recorder.rs`'s `push_samples_mono`) is a PEAK
+      meter with exponential decay for UI display, not RMS — repointing it
+      to `level::rms` would have been a real behavior change (a peak meter
+      reads bursty transients; an RMS meter reads average loudness), not a
+      safe repoint. Repointed the raw "max abs sample in this buffer" line
+      onto `audio_kit::level::peak` instead (byte-identical primitive; the
+      exponential-decay smoothing around it stays local as the UI-metering
+      strategy it is). Unverified by compilation — this file is behind the
+      `voice` feature, which needs `cmake` to build whisper.cpp from source
+      (see the GTK4 correction above; not attempted) — but the substitution
+      is a single-line, type-matching primitive swap (`peak(&[f32]) -> f32`
+      exactly matches the call site), about as low-risk as an unverified
+      change gets. Remaining: voiceterm/snapclone-audio `rms`; logscope
+      voice-reaction level/voicing gate; unendlich synthesis on `gen`
+      (already uses `core_kit::rng` per an earlier check this session — the
+      remaining gap, if any, is audio-kit's own `gen` module specifically,
+      not RNG). snapclone-audio's `rms` (the third of the three copies
+      audio-kit's own doc names) is DONE — pure Rust, no Qt/GTK, so this
+      one got a real `cargo test`: 104/104. All three named `rms` copies
+      (bo-suite, voiceterm, snapclone-audio) are now repointed.
 - [ ] **bo-dsp split** (app-local, NOT a kit): bo-suite's drone/passby cancellers
       (~27K tok beyond audio_features, bo-controller↔bo-mux) are STRATEGIES — pull
       into a bo-internal shared crate/module that consumes audio-kit primitives.
@@ -119,18 +180,26 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       + `trim_hallucination_loop` are now real shims over voice-kit (both
       repointed this session, in small verified-by-comparison commits — a
       previous session's [x] for the rusty-board half was stale, it had
-      never actually happened). Neither app compiles in this sandbox (GTK4/
-      libadwaita and Qt/qmetaobject respectively aren't installed/available
-      here), so both repoints are unverified by compilation — verified
-      instead by direct line-by-line comparison against voice-kit's actual
-      source before each substitution, and by voice-kit's own 43/43 tests
-      covering the functions being delegated to.
-- [ ] **voice-kit consumers, model half**: whisper model discovery/resolution
-      in both apps still has its own local copy; voice-kit's `model.rs`
-      exists and is tested (part of the same 43) but neither app has been
-      repointed onto it yet. Wire voice/recorder level metering onto
-      audio-kit `level`; a VAD gate (voice-kit over audio-kit) is the next
-      voice-kit growth.
+      never actually happened). Verified at the time by direct line-by-line
+      comparison against voice-kit's actual source plus voice-kit's own
+      43/43 tests, since neither app compiled in this sandbox yet. UPDATE,
+      later in this same session: rusty-board's GTK4 profile turned out to
+      be buildable after all (see "Correction" above) — but `hallucination.rs`
+      itself is gated behind the `voice` feature (whisper-rs), which needs
+      `cmake` to build whisper.cpp from source, not attempted. So the
+      rusty-board half is now ONE step closer to real compilation (the base
+      crate compiles; the specific feature gating this file doesn't, yet)
+      but still not directly `cargo test`-verified — voiceterm's Qt half
+      remains unverified by compilation on both counts. `model_path.rs`
+      (below) DID get a real `cargo test` this session, since it lives
+      outside the `voice` feature gate entirely.
+- [ ] **voice-kit consumers, model half**: rusty-board's half is DONE, real
+      `cargo test`-verified (531/531, see the commit). voiceterm's half is
+      still open: whisper model discovery/resolution there still has its
+      own local copy; voice-kit's `model.rs` exists and is tested (part of
+      the same 43) but voiceterm hasn't been repointed onto it yet. Wire
+      voice/recorder level metering onto audio-kit `level`; a VAD gate
+      (voice-kit over audio-kit) is the next voice-kit growth.
 
 ## Source-of-truth hygiene
 
@@ -202,15 +271,25 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   No `APERTURE_CMD` set = zero cost, same as `describe`: tier one still
   works standalone.
 
-- **Instruct-edit shell wiring**: `aperture-complete::edit::make_edit_request`
-  (headless, tested) packs an instruction + selection into the existing
-  `CompletionRequest` envelope for `CommandProvider` — the request-building
-  half of "ask AI to rewrite this selection" exists. NOT wired into the
-  shell: needs a way to route an outcome back as "this is an edit result,
-  render a diff/accept/reject view" rather than feeding it into ghost text
-  the way every other `Engine::poll()` outcome is — the generation-gate
-  design assumes one semantic per outcome today. Adding a tag (or a second
-  `Engine`) is the shape of the fix; not attempted this pass.
+- **"AI: Edit Selection…"** — DONE, wired end to end. `aperture-complete::
+  edit::make_edit_request` packs an instruction + selection into the
+  `CompletionRequest` envelope; the shell now sends it through
+  `AppState::edit_engine` — a FOURTH independent `Engine` instance (own
+  `APERTURE_CMD` provider, own generation counter, alongside `engine`
+  (ghost completion), `describe` (revision notes), and `route_engine`
+  (go-to-route's AI tier)) — exactly the fix this note used to describe as
+  "not attempted this pass." Palette command opens `Mode::AiEditPrompt` for
+  the instruction; on landing, a review overlay shows original vs. proposed
+  with explicit Accept (Enter)/Reject (Esc) — never auto-applied, unlike
+  ghost completion's Tab-to-accept (an instruct-edit result is a bigger,
+  easier-to-get-wrong bet than "what comes next"). Accept applies via
+  `Editor::replace_range` at the ORIGINAL selection's char offsets (not
+  wherever the caret ended up while the request was in flight) as one
+  undo step. Two new integration tests drive a real `CommandProvider` end
+  to end (request → poll → land → accept-changes-the-buffer, and
+  request → poll → land → reject-leaves-the-buffer-untouched) — not mocks.
+  `cargo test -p aperture-egui --lib`: 64/64 (was 62). No `APERTURE_CMD` =
+  zero cost; no selection = a status message, not a panic.
 
 - **tree-sitter** behind the existing `LineLexer` seam (`aperture-core/syntax.rs`).
   The seam is `(line, entry_state) -> (spans, exit_state)` so an incremental

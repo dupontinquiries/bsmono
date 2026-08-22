@@ -135,7 +135,12 @@ impl JobState {
 pub fn derive_state_dir(output: &Path) -> PathBuf {
     let mut name = output.file_name().map(|s| s.to_os_string()).unwrap_or_default();
     name.push(".av1tuner");
-    output.parent().unwrap_or(Path::new(".")).join(name)
+    // `Path::parent()` returns `Some("")` for a single-segment relative path
+    // like "video.mp4" — NOT `None` — so the `unwrap_or` fallback below never
+    // fired for exactly the no-parent case it exists to handle. Treat an
+    // empty parent the same as no parent.
+    let parent = output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    parent.join(name)
 }
 
 fn now_secs() -> u64 {

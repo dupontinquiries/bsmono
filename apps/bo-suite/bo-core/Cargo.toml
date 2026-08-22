@@ -2,4 +2,12 @@
 name = "bo-core"
 version = "0.1.0"
 edition = "2021"
-description = "Shared bo-suite modules used by both bo-controller and bo-mux (audio features, music masker, backup beeper, pattern learner) — std-only, so the two binaries stop carrying byte-identical copies."
+description = "Shared bo-suite modules used by both bo-controller and bo-mux (audio features, music masker, backup beeper, pattern learner) — std-only aside from the shared, equally zero-external-dependency audio-kit, so the two binaries stop carrying byte-identical copies."
+
+[dependencies]
+# Goertzel/spectrogram primitives — audio-kit's own doc says these were
+# "Lifted from bo-suite's audio_features... copied verbatim across bo-mux
+# and bo-controller," i.e. this repoint was the intended destination from
+# the start. Zero-dependency itself (std + f32 math, one path dep on
+# core-kit), so this doesn't pull anything heavy into a std-only crate.
+audio-kit = { path = "../../../shared/audio-kit" }

@@ -107,7 +107,14 @@ impl Traits {
     /// exists: "70% tank, 30% hoverer" is a sentence about a real chassis.
     pub fn blend(self, other: Traits, w: f32) -> Traits {
         let w = w.clamp(0.0, 1.0);
-        let m = |a: f32, b: f32| a + (b - a) * w;
+        // `a * (1.0 - w) + b * w` rather than `a + (b - a) * w`: the latter
+        // is not exact at w == 1.0 (floating-point rounding in `(b - a)`
+        // means `a + (b - a)` can differ from `b` by an ULP or two), which
+        // broke `blending_is_clamped_at_both_ends`'s exact equality against
+        // `other`. This form is exact at both clamped ends: at w == 0.0,
+        // `1.0 - w == 1.0` so the result is exactly `a`; at w == 1.0,
+        // `1.0 - w == 0.0` so the result is exactly `b`.
+        let m = |a: f32, b: f32| a * (1.0 - w) + b * w;
         Traits {
             traction: m(self.traction, other.traction),
             lift: m(self.lift, other.lift),

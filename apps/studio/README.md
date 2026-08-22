@@ -48,7 +48,7 @@ edits exactly reversible, which floats are not.
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
 | `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
-| `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
+| `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 93 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **streaming render** + **block-backed edit sequences** + **destructive editing** | 83 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
@@ -56,9 +56,16 @@ edits exactly reversible, which floats are not.
 | `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
 | `studio-video` | video probing, thumbnails, audio-track extraction (real `ffmpeg`/`ffprobe`) | 11 |
 
-`studio-egui` couldn't be re-verified in this pass — it needs `egui`/`eframe`,
-which needs a newer cargo than was available; the number above is carried
-over unchanged rather than guessed at. Every other row was re-run directly.
+`studio-egui` DID get re-verified this pass, for the first time — a real
+rustc 1.96 toolchain cleared egui 0.34's MSRV, which no prior session here
+could do. Its count above (93, up from 28) is a real `cargo test` result,
+not carried over; every row in this table now reflects an actual run.
+`studio-app` (the eframe binary crate wiring everything together) also
+compiles clean — `cargo check -p studio-app` — confirmed for the first
+time too. Both had zero errors; the only warnings are pre-existing
+`egui::Panel`/`TopBottomPanel` API-rename deprecations (0.34 renamed
+`.show()` to `.show_inside()` and split `TopBottomPanel` into
+`Panel::top`/`Panel::bottom`), not bugs, not touched here.
 
 ## Realtime collaboration, concretely
 

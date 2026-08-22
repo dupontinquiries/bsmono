@@ -381,11 +381,13 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
 /// Constant-time byte-array comparison. `a` and `b` must be the same
 /// length. Returns true iff every byte matches; the time taken is
 /// independent of where the first mismatch occurs.
+/// Constant-time byte-slice equality — repointed onto net-kit (its own doc
+/// names this exact module, "bo-suite peer_auth," as one of the two
+/// byte-identical copies it unifies; confirmed identical before repointing:
+/// same length check, same full XOR-accumulate loop with no early exit on
+/// mismatch).
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut diff = 0u8;
-    for i in 0..a.len() { diff |= a[i] ^ b[i]; }
-    diff == 0
+    net_kit::auth::ct_eq(a, b)
 }
 
 /// Wrap a message body in a signed envelope using our self key.

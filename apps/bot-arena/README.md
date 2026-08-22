@@ -20,6 +20,24 @@ crates are pinned to the **0.8 generation** (see `Cargo.toml`), which builds on
 1.75. On a newer toolchain (rustc >= 1.80) bump to gtk4 0.9 / libadwaita 0.7 and
 delete the transitive pins. `Cargo.lock` is included for a reproducible build.
 
+**egui-frontend, verified separately (2026-08-19)**: `egui-frontend/` is a full
+port of this dashboard onto `eframe`/`uikit-egui` — Setup/Arena/Standings/
+Replays/Logs/Studio as swipe-paged views, driving the real GTK-free
+`bot-arena` engine (`default-features = false`) on a worker thread. Had never
+been compiled before this session; a real rustc 1.96 cleared egui 0.34's
+MSRV. `cargo test` in `egui-frontend/`: 35/35, including a real simulation
+run streaming through to completion and the full Corpus Studio pipeline
+(preflight, per-stage argv matching the GTK version, artifact gating). Zero
+errors; the only warning is a pre-existing `egui::CentralPanel::show`
+deprecation (0.34 renamed it `show_inside()`), not touched.
+
+The default (GTK-free) `bot-arena` lib build also got a real `cargo test`
+this session: 104/104 initially reported 2 failures, both `pytest`-dependent
+(`python3 -m pytest` wasn't installed in that sandbox) — installing `pytest`
+made them pass too, confirming the failures were an environment gap, not a
+code bug. `symfind`/`todos`/`treelite` (the GTK-free auxiliary binaries) all
+compile and their own tests pass.
+
 ## What you get
 
 Three pages in an Adwaita view-switcher:

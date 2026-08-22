@@ -24,6 +24,23 @@ with zero extra system deps. Optional controller support:
 left stick steer/pitch, A jump, B/RB boost, X powerslide + air roll, triggers
 throttle, Y ball cam, Start pause.
 
+### Verification (2026-08-19)
+
+Had no build-status record anywhere. A session with a real rustc 1.96 ran it
+for the first time: `cargo build`/`cargo test` compile clean (43 pre-existing
+dead-code warnings for not-yet-wired fields/methods, none touched; `cargo
+test` itself only has one real `#[test]` — a WGSL shader validation test,
+since this game's actual verification story is the `--sim <name>` subcommands
+described throughout this README, not `#[test]` functions). Ran several of
+those for real: `--sim portal` (PASS — speed conservation, exit alignment,
+the fling, no ping-pong), `--sim trials` (PASS — all 15 trials across 11 maps
+are winnable, ghost replay recording/clamping), `--sim gyro` (PASS — the full
+tilt-sensor-to-stick-input pipeline including deadzone and calibration), and
+`--sim all` (a bot-play benchmark across five scenarios — ran to a clean
+exit with real per-scenario stats, not a pass/fail check). Not run on a real
+display or GPU: these sims are headless by design, but the actual windowed
+render path is unverified here.
+
 CLI flags: `--seed N`, `--map 0..15`, `--gfx rays|classic`, `--fullscreen` /
 `--windowed`, `--mute`,
 `--dvorak` (apply the Dvorak binding preset), `--name NAME`, `--host`,

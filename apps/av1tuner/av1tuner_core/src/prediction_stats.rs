@@ -492,7 +492,12 @@ mod tests {
         assert_eq!(frames.len(), 3);
         assert!(frames[0].is_keyframe);
         assert!(!frames[1].is_keyframe);
-        assert_eq!(frames[0].bytes, 102400 / 8 + 1);  // div_ceil
+        // 102400 bits is an exact multiple of 8 (12800 bytes) — true
+        // div_ceil only rounds up when there's a remainder, so no "+ 1"
+        // here despite the name. The code (`bits.div_ceil(8)`) already gets
+        // this right; this assertion used to hand-roll `n/8 + 1`, which
+        // over-rounds on exact multiples.
+        assert_eq!(frames[0].bytes, 102400_u64.div_ceil(8));
     }
     
     #[test]

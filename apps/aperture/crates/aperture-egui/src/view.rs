@@ -38,6 +38,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     state.poll_completions(now_ms);
     state.poll_note();
     state.poll_route_ai();
+    state.poll_edit_ai(now_ms);
     state.tick_completion(now_ms);
     if state.debounce.armed() || state.ghost.is_pending() {
         // A request may become due (or land) without any input event —
@@ -66,6 +67,70 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     }
     if state.palette.is_some() {
         palette_overlay(ctx, state, &colors, now_ms);
+    }
+    if state.pending_edit.is_some() {
+        edit_review_overlay(ctx, state, &colors);
+    }
+}
+
+/// "AI: Edit Selection…"'s review step — original vs. proposed, explicit
+/// Accept/Reject (see `AppState::pending_edit`'s doc for why this is never
+/// auto-applied). Modeled on `palette_overlay`'s centered-Area shape rather
+/// than a modal window, so it reads as part of the same command surface.
+fn edit_review_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors) {
+    let Some(pending) = state.pending_edit.clone() else { return };
+    let mut accept = false;
+    let mut reject = false;
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        reject = true;
+    }
+    egui::Area::new(Id::new("aperture_edit_review"))
+        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(colors.bg_raised)
+                .stroke(Stroke::new(1.0_f32, colors.border))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(520.0);
+                    ui.label(egui::RichText::new(format!("AI edit: {}", pending.instruction)).color(colors.text_weak).small());
+                    ui.add_space(4.0);
+                    match &pending.proposed {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(egui::RichText::new("asking the assistant…").color(colors.text_weak).italics());
+                            });
+                        }
+                        Some(proposed) => {
+                            ui.label(egui::RichText::new("current:").color(colors.text_weak).small());
+                            egui::ScrollArea::vertical().id_salt("edit_review_original").max_height(120.0).show(ui, |ui| {
+                                ui.label(egui::RichText::new(&pending.original).monospace().color(colors.text_weak));
+                            });
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("proposed:").color(colors.accent).small());
+                            egui::ScrollArea::vertical().id_salt("edit_review_proposed").max_height(200.0).show(ui, |ui| {
+                                ui.label(egui::RichText::new(proposed).monospace().color(colors.text));
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Accept (Enter)").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    accept = true;
+                                }
+                                if ui.button("Reject (Esc)").clicked() {
+                                    reject = true;
+                                }
+                            });
+                        }
+                    }
+                });
+        });
+    if accept {
+        state.accept_pending_edit();
+    } else if reject {
+        state.reject_pending_edit();
     }
 }
 
@@ -654,6 +719,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let mut apply: Option<palette_ui::Cmd> = None;
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
+    let mut submit_edit: Option<String> = None;
 
     // Go-to-route's AI tier: trigger from a tight, self-contained borrow
     // scope (owned String + Vec) so it doesn't overlap the palette borrow
@@ -688,6 +754,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                         Mode::ProjectSearch => "text to find in project…",
                         Mode::WorkspaceSymbol => "symbol name…",
                         Mode::GoToRoute => "describe what you're looking for…",
+                        Mode::AiEditPrompt => "instruction for the selection…",
                     };
                     let edit = egui::TextEdit::singleline(&mut p.input)
                         .hint_text(hint)
@@ -950,9 +1017,25 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 ui.label(egui::RichText::new("no keyword matches — try different words").color(colors.text_weak).italics());
                             }
                         }
+                        Mode::AiEditPrompt => {
+                            ui.label(
+                                egui::RichText::new("describe the change, then Enter · Esc cancel")
+                                    .color(colors.text_weak)
+                                    .small(),
+                            );
+                            if enter && !p.input.trim().is_empty() {
+                                submit_edit = Some(p.input.trim().to_string());
+                            }
+                        }
                     }
                 });
         });
+
+    if let Some(instruction) = submit_edit {
+        state.request_edit(&instruction, now_ms);
+        state.palette = None;
+        return;
+    }
 
     if let Some(cmd) = apply {
         palette_ui::apply(cmd, state, now_ms);

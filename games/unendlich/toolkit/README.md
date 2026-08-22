@@ -62,7 +62,7 @@ Then **Load sample** for the bundled 2-run demo, or point the path fields at a
 real `run_summaries.txt` + `events.jsonl` (or drag-drop them). You can also load
 `brick_apply_log.txt` from the launcher run, since it shares the VERSION framing.
 
-Pinned to egui 0.34 / eframe 0.34 / egui_plot 0.35 (MSRV 1.92). Linux deps and a
-wgpu→glow fallback are noted in `unendlich-dash/README.md`. It's compile-blind
-code; if the egui API drifted, paste the first `cargo` errors and they're quick
-fixes.
+Pinned to egui 0.34 / eframe 0.34 / egui_plot 0.35 (MSRV 1.92). Linux deps and
+the verified-clean-build confirmation are in `unendlich-dash/README.md` (this
+was "compile-blind" code until a session with rustc 1.96 finally cleared the
+MSRV and ran a real `cargo check` against it — clean, no API drift).

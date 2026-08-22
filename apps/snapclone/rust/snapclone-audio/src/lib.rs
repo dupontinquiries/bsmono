@@ -116,13 +116,12 @@ fn norm(s: i16) -> f32 {
     s as f32 / 32768.0
 }
 
-/// Root-mean-square of a normalized frame.
+/// Root-mean-square of a normalized frame — repointed onto audio-kit (its
+/// own doc names this exact copy as one of three it unifies; confirmed
+/// byte-identical before repointing: same empty-guard, same
+/// sum-of-squares-over-n-then-sqrt).
 fn rms(frame: &[f32]) -> f32 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f32 = frame.iter().map(|x| x * x).sum();
-    (sum_sq / frame.len() as f32).sqrt()
+    audio_kit::level::rms(frame)
 }
 
 /// Zero-crossing rate as a fraction of sample count (0..~1).
