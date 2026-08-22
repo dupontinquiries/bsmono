@@ -184,6 +184,65 @@ fn watermark_paint(ui: &Ui, wm: &crate::dial_watermark::DialWatermark,
     if run.len() > 1 { p.add(egui::Shape::line(run, stroke)); }
 }
 
+/// The whole catalogue in the BROWSE shape, for `Browse::load_local`.
+///
+/// `browse` had two data paths and neither was connected: `load_local` for an
+/// in-memory catalogue, and a paged `Request`/`Page` protocol for on-device
+/// SQL. `browse_tracks` sat on the app, was read only when opening a detail
+/// page, and nothing ever filled it — so the albums and artists grids were
+/// empty by construction. Found by the tested-but-uncalled check.
+///
+/// This is the in-memory half, which is the one that works today: the paged
+/// half needs a host that answers `Request`, and `page_from_source` above is
+/// the shape that would take.
+///
+/// WHAT THE SOURCE CANNOT SUPPLY is left at its default rather than invented.
+/// `CatalogTrack` has no artist_id, year, play_count or last_played_at, so:
+///
+/// * `artist_id` is a stable hash of the artist NAME. Browse groups by it and
+///   opens a detail page from it, so it has to be consistent within a run —
+///   but it is not a database id and must not be persisted as one.
+/// * `play_count` stays 0, which means the TOP mode ranks nothing. That is
+///   visible and correct; fabricating counts would make a play-ranked list
+///   that ranks by accident.
+pub fn browse_tracks_from_source(
+    src: &dyn crate::catalog_source::CatalogSource,
+) -> Vec<crate::browse::BrowseTrack> {
+    // The whole catalogue: load_local's own doc says it is "correct only when
+    // the whole catalogue is in memory", so a partial page here would silently
+    // produce a partial album list.
+    let total = src.total().max(0);
+    let rows = src.page(0, total, "title");
+    rows.into_iter().map(|t| crate::browse::BrowseTrack {
+        id: t.id,
+        title: t.title,
+        album: t.album,
+        // Reduced the way the All-tracks adapter does, so one track does not
+        // land under two artists in two views.
+        primary_artist: t.artists.first().cloned().unwrap_or_default(),
+        artist_id: artist_id_of(t.artists.first().map(String::as_str).unwrap_or("")),
+        year: None,
+        play_count: 0,
+        last_played_at: None,
+    }).collect()
+}
+
+/// A stable within-run id for an artist name.
+///
+/// FNV-1a, not a database key. Browse needs to group tracks and open a detail
+/// page by id; the source has no artist table, so this derives one that is
+/// consistent for the same name. Two different artists sharing a name collide
+/// — which is the same thing the name itself does, so nothing is lost.
+fn artist_id_of(name: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.trim().to_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    // Positive: the field is i64 and a negative id reads as a sentinel.
+    (h >> 1) as i64
+}
+
 /// One page of the catalogue, in the All-tracks channel shape.
 ///
 /// The adapter between `catalog_source` (the host data contract) and
@@ -1285,6 +1344,74 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
+
+    /// A source with two artists and a shared album.
+    struct FakeSrc(Vec<crate::catalog_source::CatalogTrack>);
+    impl crate::catalog_source::CatalogSource for FakeSrc {
+        fn page(&self, offset: i64, limit: i64, _sort: &str)
+            -> Vec<crate::catalog_source::CatalogTrack>
+        {
+            self.0.iter().skip(offset.max(0) as usize).take(limit.max(0) as usize)
+                .cloned().collect()
+        }
+        fn total(&self) -> i64 { self.0.len() as i64 }
+    }
+
+    fn ct(id: i64, title: &str, album: &str, artist: &str)
+        -> crate::catalog_source::CatalogTrack
+    {
+        crate::catalog_source::CatalogTrack {
+            id, title: title.into(), album: Some(album.into()),
+            artists: vec![artist.into()], tags: vec![], bpm: None, key_text: None,
+        }
+    }
+
+    #[test]
+    fn browse_is_filled_from_the_whole_catalogue_not_one_page() {
+        // load_local's doc: "correct only when the whole catalogue is in
+        // memory". A partial fetch here would silently produce a partial album
+        // list that looks complete.
+        let src = FakeSrc((0..250).map(|i| ct(i, &format!("t{i}"), "A", "X")).collect());
+        let tracks = super::browse_tracks_from_source(&src);
+        assert_eq!(tracks.len(), 250, "the adapter fetched one page, not the catalogue");
+    }
+
+    #[test]
+    fn the_same_artist_name_gets_the_same_id_within_a_run() {
+        // Browse groups by artist_id and opens a detail page from it. The
+        // source has no artist table, so the id is derived — and it has to be
+        // consistent or one artist appears twice.
+        let src = FakeSrc(vec![ct(1, "a", "A", "Cocteau Twins"),
+                               ct(2, "b", "B", "cocteau twins"),
+                               ct(3, "c", "C", "Slowdive")]);
+        let t = super::browse_tracks_from_source(&src);
+        assert_eq!(t[0].artist_id, t[1].artist_id, "case split one artist in two");
+        assert_ne!(t[0].artist_id, t[2].artist_id);
+        assert!(t.iter().all(|x| x.artist_id >= 0), "a negative id reads as a sentinel");
+    }
+
+    #[test]
+    fn play_counts_are_not_invented() {
+        // TOP mode is play-ranked. The source has no counts, so leaving them
+        // at zero makes TOP visibly empty — fabricating them would produce a
+        // ranked list that ranks by accident, which is worse than no ranking.
+        let src = FakeSrc(vec![ct(1, "a", "A", "X")]);
+        let t = super::browse_tracks_from_source(&src);
+        assert_eq!(t[0].play_count, 0);
+        assert!(t[0].year.is_none());
+        assert!(t[0].last_played_at.is_none());
+    }
+
+    #[test]
+    fn the_primary_artist_matches_the_all_tracks_adapter() {
+        // Both reduce a multi-artist track to its first. If they disagreed,
+        // one track would land under two different artists in two views.
+        let mut multi = ct(1, "a", "A", "First");
+        multi.artists.push("Second".into());
+        let src = FakeSrc(vec![multi]);
+        let t = super::browse_tracks_from_source(&src);
+        assert_eq!(t[0].primary_artist, "First");
+    }
     use super::*;
 
     fn sample() -> Controller {
