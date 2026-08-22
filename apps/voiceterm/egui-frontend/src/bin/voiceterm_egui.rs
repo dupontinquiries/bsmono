@@ -598,6 +598,13 @@ struct VoicetermApp {
     glow: voiceterm_egui::repl_voice_glow::ReplVoiceGlow,
     /// A destructive action awaiting confirmation (confirm_dialog).
     pending_confirm: Option<(String, voiceterm_egui::confirm_dialog::ConfirmDialog)>,
+    /// The find bar's FILES mode. `None` until a file search is started, so
+    /// the panel costs no terminal rows in the common case.
+    fs_search: voiceterm_egui::fs_results::Search,
+    /// The acoustic peer handshake, when one is running. Held as the ENGINE's
+    /// state rather than a mirror of it — the QML kept a hand-copied string
+    /// and a hand-copied enum is one that drifts.
+    peer: Option<(voiceterm_egui::peer_panel::PeerPanel, peer_handshake::HsState)>,
     /// The note-card deck: captured text split into atomic cards.
     deck: voiceterm_egui::cards_view::Deck,
     /// What the user has captured so far, re-split on change. Held because
@@ -776,6 +783,58 @@ impl eframe::App for VoicetermApp {
         // they are for: a modal that a panel can cover is not modal, and a
         // voice halo that only shows on one tab is a status light behind a
         // door.
+        // THE FIND BAR'S FILE RESULTS. Drawn before the modal below, because
+        // it is not modal — it sits under the find bar and the terminal keeps
+        // working around it.
+        if self.fs_search.occupies_space() {
+            let colors = self.colors;
+            egui::TopBottomPanel::bottom("fs_results").show(ctx, |ui| {
+                if let Some(hit) = voiceterm_egui::fs_results::fs_results_ui(
+                    ui, &self.fs_search, &colors, 220.0)
+                {
+                    // TYPED, NOT RUN. The command lands on the input line
+                    // without a trailing return, so the operator sees what is
+                    // about to happen and presses Enter themselves.
+                    //
+                    // The confirm-dialog path above appends b'\r' because the
+                    // command was already reviewed in a modal. This was not:
+                    // clicking a search result is a navigation gesture, and
+                    // spawning an editor from one is a surprise.
+                    let cmd = format!("${{EDITOR:-vi}} +{} {}", hit.line, hit.path);
+                    self.pty_out.extend_from_slice(cmd.as_bytes());
+                    self.fs_search.cancel();
+                }
+            });
+        }
+
+        // THE PEER HANDSHAKE. Modal: it is an identity decision and letting
+        // the terminal run underneath it invites approving a peer by reflex
+        // while reading something else.
+        if let Some((panel, state)) = &mut self.peer {
+            let colors = self.colors;
+            let mut act = None;
+            egui::Window::new("peer")
+                .collapsible(false).resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    act = voiceterm_egui::peer_panel::peer_panel_ui(ui, panel, state, &colors);
+                });
+            match act {
+                Some(voiceterm_egui::peer_panel::Action::Event(ev)) => {
+                    // The ENGINE advances the state. The panel only says which
+                    // event a press means — see the test in peer_panel that
+                    // asserts the view never calls step itself.
+                    *state = peer_handshake::step(state.clone(), ev);
+                }
+                Some(voiceterm_egui::peer_panel::Action::Dismiss) => self.peer = None,
+                None => {}
+            }
+            // A trusted handshake is NOT auto-dismissed. The panel shows the
+            // peer's fingerprint and a Close button, and closing it the moment
+            // trust is established would hide the identity just verified —
+            // which is the one thing the operator is there to read.
+        }
+
         if let Some((cmd, dlg)) = &mut self.pending_confirm {
             use voiceterm_egui::confirm_dialog::Outcome;
             match dlg.show(ctx) {
@@ -2958,6 +3017,8 @@ fn main() -> eframe::Result<()> {
                 chat: Default::default(),
                 glow: Default::default(),
                 pending_confirm: None,
+                fs_search: Default::default(),
+                peer: None,
                 deck: Default::default(),
                 captured: String::new(),
                 backlinks: Default::default(),
