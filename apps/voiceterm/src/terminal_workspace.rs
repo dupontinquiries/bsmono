@@ -526,6 +526,38 @@ impl TermWorkspace {
     /// Close the focused pane (won't close the last pane in the last tab; if
     /// it's the last pane of a non-last tab, closes the tab). Returns the
     /// removed pane id, if any.
+    /// Close a WEB pane if the active tab has one, else the focused pane.
+    ///
+    /// v0.1.881 in the QML, and the reason is in its comment: *"web panes are
+    /// never focused, so the old 'close pane' path could only ever close the
+    /// focused terminal pane"*. Without this, opening a web pane and pressing
+    /// close-pane shuts the terminal you were working in and leaves the web
+    /// pane sitting there — the opposite of what the key was pressed for.
+    ///
+    /// Falls back to `close_pane`, which is focus-aware and closes the TAB on
+    /// its last pane. The fallback is the whole reason this is a wrapper
+    /// rather than a branch in the caller: two frontends would each have to
+    /// remember to fall through, and one of them would not.
+    pub fn close_web_or_focused_pane(&mut self) -> Option<u64> {
+        // First web pane in the active tab, in layout order. Layout order
+        // rather than most-recent, because with two open the operator is
+        // looking at a screen, not at a history — closing the one they can
+        // point to is the predictable answer.
+        let web = self.active().root.pane_ids().into_iter()
+            // pane_kind, the public accessor — find_kind is Node-private and
+            // widening it to reach this would expose the tree's internals for
+            // a query the workspace already answers.
+            .find(|id| matches!(self.pane_kind(*id), Some(PaneKind::Web { .. })));
+        match web {
+            Some(id) => {
+                // close_pane_id, not close_pane: web panes are never focused,
+                // so the focus-aware primitive would target the wrong pane.
+                if self.close_pane_id(id) { Some(id) } else { None }
+            }
+            None => self.close_pane(),
+        }
+    }
+
     pub fn close_pane(&mut self) -> Option<u64> {
         let target = self.active().focused_pane;
         if self.active().root.count() <= 1 {
@@ -1298,5 +1330,68 @@ mod tests {
         if let Node::Split { ratio, .. } = &ws.tabs[0].root {
             assert!((ratio - 0.5).abs() < 0.01);
         } else { panic!("expected split"); }
+    }
+}
+
+#[cfg(test)]
+mod close_web_tests {
+    use super::*;
+
+    /// A tab with a terminal pane and a web pane beside it.
+    fn split_with_web() -> TermWorkspace {
+        let mut w = TermWorkspace::default();
+        let term = w.active().focused_pane;
+        // split_web already exists and does both halves — I wrote
+        // split_right() + set_pane_kind() from memory and neither is the API.
+        w.split_web(Dir::Right, "https://x");
+        // Focus stays on the terminal: the QML's premise is that web panes are
+        // never focused, and set here explicitly so the test asserts against
+        // that rather than against whatever split_web happened to leave.
+        w.active_mut().focused_pane = term;
+        w
+    }
+
+    #[test]
+    fn closing_prefers_the_web_pane_over_the_focused_terminal() {
+        // v0.1.881. Without this, opening a web pane and pressing close-pane
+        // shuts the terminal you were working in and leaves the web pane
+        // sitting there — the opposite of what the key was pressed for.
+        let mut w = split_with_web();
+        let focused = w.active().focused_pane;
+        let closed = w.close_web_or_focused_pane().expect("nothing closed");
+        assert_ne!(closed, focused, "it closed the focused terminal");
+        assert!(w.active_tab_web_urls().is_empty(), "the web pane survived");
+        assert!(w.active().root.pane_ids().contains(&focused), "the terminal was destroyed");
+    }
+
+    #[test]
+    fn with_no_web_pane_it_falls_back_to_the_focused_one() {
+        // The fallback is why this is a wrapper rather than a branch in the
+        // caller: two frontends would each have to remember it.
+        let mut w = TermWorkspace::default();
+        w.split(Dir::Right);
+        let focused = w.active().focused_pane;
+        let closed = w.close_web_or_focused_pane().expect("nothing closed");
+        assert_eq!(closed, focused);
+    }
+
+    #[test]
+    fn the_last_pane_of_a_tab_still_closes_the_tab() {
+        // close_pane's documented behaviour, which the fallback must not lose.
+        let mut w = TermWorkspace::default();
+        w.new_tab();
+        assert_eq!(w.tabs.len(), 2);
+        w.close_web_or_focused_pane();
+        assert_eq!(w.tabs.len(), 1, "the last pane did not close its tab");
+    }
+
+    #[test]
+    fn it_refuses_rather_than_emptying_the_workspace() {
+        // One tab, one pane: there is nothing to close that leaves a usable
+        // workspace, and returning None lets the caller say so.
+        let mut w = TermWorkspace::default();
+        assert!(w.close_web_or_focused_pane().is_none());
+        assert_eq!(w.tabs.len(), 1);
+        assert_eq!(w.active().root.pane_ids().len(), 1);
     }
 }

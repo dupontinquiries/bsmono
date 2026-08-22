@@ -544,7 +544,15 @@ impl Workspace {
             // QML behaviour. It returns None only when that would close the last tab too.
             // close_pane_id is for web panes, which are never focused, and would leave
             // focused_pane dangling here.
-            self.model.close_pane();
+            //
+            // v0.1.881: prefer a WEB pane when the tab has one. The QML's
+            // comment is the reason — "web panes are never focused, so the old
+            // 'close pane' path could only ever close the focused terminal
+            // pane" — so opening a web pane and pressing close-pane shut the
+            // terminal you were working in and left the web pane there.
+            // close_web_or_focused_pane falls back to close_pane, keeping the
+            // close-the-tab-on-last-pane behaviour intact.
+            self.model.close_web_or_focused_pane();
             true
         } else {
             false
