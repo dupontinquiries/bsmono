@@ -276,3 +276,50 @@ the next scene co-change:
   its chrono local time to keep true local solar time.
 - Then delete the copies and let scene3d's inscriptions use real UVs — the
   street signs and runestones textsurface.rs already designed for.
+
+## Reachability audit — real orphans found (2026-08-22)
+
+`maintenance/tools/reachability.py` asks a different question than
+`parity_audit.py`: not "does a surface exist" but "does anything in the crate
+call it". Ran it fleet-wide. Most apps' orphan counts are dominated by
+cross-crate re-exports the single-crate scan can't see (logscope at 216,
+gitmind at 38, snapclone at 42 — not independently verified, likely mostly
+false positives from the `-egui` frontend being a separate crate from the
+core the tool scans). The SMALL apps are cheap to hand-verify and worth
+recording precisely because a small orphan list is actually trustworthy:
+
+**tomescope — 3 real orphans, all tested, all user-facing, none wired:**
+
+- `lookup.rs` — `Lookup::lookup()`, checks the book's own back-of-book index
+  first then a builtin glossary. Nothing calls it; there is no "define this
+  word" affordance anywhere in `reader.rs`/`panels.rs`.
+- `opds.rs` — parses OPDS 1.2 Atom catalogs (Calibre-Web, COPS, etc), network
+  fetch stubbed behind a trait so the parser is unit-tested standalone.
+  Nothing calls it; there is no "add a catalog" UI.
+- `tts.rs` — sentence-queue builder + optional espeak-ng subprocess backend
+  behind an `espeak` feature. Nothing calls it; no "read aloud" button.
+
+All three are declared `pub mod` in `lib.rs` and fully implemented with their
+own test suites (3 tests each) — this is the expensive kind of orphan the
+tool's own docstring calls out: it passed review, it passes CI, and it does
+nothing for a user.
+
+**Not wired in this session, and why:** wiring any of these into
+`reader.rs`/`panels.rs` means touching the actual selection/rendering flow
+(`Selection`, `draw_page`, `draw_footnote_popover` in `reader.rs`) without a
+compiler in this sandbox to catch a wrong borrow or a wrong signature. Guessing
+at UI glue in a 500-line rendering file with no build feedback is how a
+"working" commit turns into a broken one nobody notices until a real host
+builds it. Recorded here as three concrete, scoped next steps instead:
+
+- [ ] tomescope: wire `Lookup::lookup()` to a long-press/selection → define
+      popover (natural home: alongside `draw_footnote_popover` in `reader.rs`).
+- [ ] tomescope: wire `opds.rs` to a "browse catalog" entry in the library
+      view, with a URL/paste-XML input for the network-stub trait.
+- [ ] tomescope: wire `tts.rs` to a "read aloud" control in the reader toolbar,
+      building the `Utterance` queue from the current locus forward.
+
+Other small-app orphans found, not yet triaged: `av1tuner`/`av1tuner-m1`'s
+`eta.rs` (ETA estimation, 5 tests) and `config.rs` (2 tests) are identical
+orphans in both the stale and live fork — worth checking whether the live
+`av1tuner-m1` fork actually needs them wired or whether they're superseded.
