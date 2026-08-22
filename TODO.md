@@ -28,7 +28,27 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       (newly ingested)" section's voice-kit consumers item below for the
       real commits.)
 - [x] Verified: standalone harness crates cargo-check green vs the kits.
-- [ ] User builds + runs all apps via GUI to confirm full builds (Qt/GTK, not sandbox-buildable).
+- [ ] User builds + runs all apps via GUI to confirm full builds and actual
+      on-screen behavior (a display/window/touch input, not a toolchain, is
+      the remaining gap). Toolchain-wise, this sandbox is less GTK/Qt-blocked
+      than earlier sessions assumed — see the note below.
+- [x] **Correction, 2026-08-19: rusty-board's GTK4 profile DOES compile in a
+      sandbox** — apt has `libgtk-4-dev` 4.14.5 and `libadwaita-1-dev` 1.5.0
+      (the exact versions rusty-board's own Cargo.toml comment calls for),
+      plus `libasound2-dev` for the alsa-sys build dependency. `cargo test
+      --lib --no-default-features` (the `basic`/GTK-only profile, no
+      whisper-rs/reqwest/gtk4-layer-shell) is 531/531 real, on this actual
+      crate, for the first time. `--features voice` (whisper-rs) goes
+      further — needs `cmake` too, to build whisper.cpp's C++ sources from
+      source via `whisper-rs-sys`'s build script — not attempted, real disk/
+      time cost for a native build, past the point this pass's checks
+      needed to land. `--features wayland` needs `gtk4-layer-shell-0`,
+      which apt doesn't package on Ubuntu 24.04 (only the GTK3 fork) — would
+      need building from source too. Bo-controller's Qt build got one step
+      further too this session (OpenSSL blocker resolved with `libssl-dev`)
+      before hitting a real `qmake`-not-found wall — Qt itself remains
+      unattempted, a much larger toolchain than GTK4's handful of `-dev`
+      packages.
 - [x] voiceterm voice.rs hallucination fns → voice-kit (embedded; fix
       loop-trimmer off-by-one at source — DONE). Repoint done in 3 small
       commits (dependency add, `is_sane_transcription`, `trim_hallucination_
@@ -119,18 +139,26 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       + `trim_hallucination_loop` are now real shims over voice-kit (both
       repointed this session, in small verified-by-comparison commits — a
       previous session's [x] for the rusty-board half was stale, it had
-      never actually happened). Neither app compiles in this sandbox (GTK4/
-      libadwaita and Qt/qmetaobject respectively aren't installed/available
-      here), so both repoints are unverified by compilation — verified
-      instead by direct line-by-line comparison against voice-kit's actual
-      source before each substitution, and by voice-kit's own 43/43 tests
-      covering the functions being delegated to.
-- [ ] **voice-kit consumers, model half**: whisper model discovery/resolution
-      in both apps still has its own local copy; voice-kit's `model.rs`
-      exists and is tested (part of the same 43) but neither app has been
-      repointed onto it yet. Wire voice/recorder level metering onto
-      audio-kit `level`; a VAD gate (voice-kit over audio-kit) is the next
-      voice-kit growth.
+      never actually happened). Verified at the time by direct line-by-line
+      comparison against voice-kit's actual source plus voice-kit's own
+      43/43 tests, since neither app compiled in this sandbox yet. UPDATE,
+      later in this same session: rusty-board's GTK4 profile turned out to
+      be buildable after all (see "Correction" above) — but `hallucination.rs`
+      itself is gated behind the `voice` feature (whisper-rs), which needs
+      `cmake` to build whisper.cpp from source, not attempted. So the
+      rusty-board half is now ONE step closer to real compilation (the base
+      crate compiles; the specific feature gating this file doesn't, yet)
+      but still not directly `cargo test`-verified — voiceterm's Qt half
+      remains unverified by compilation on both counts. `model_path.rs`
+      (below) DID get a real `cargo test` this session, since it lives
+      outside the `voice` feature gate entirely.
+- [ ] **voice-kit consumers, model half**: rusty-board's half is DONE, real
+      `cargo test`-verified (531/531, see the commit). voiceterm's half is
+      still open: whisper model discovery/resolution there still has its
+      own local copy; voice-kit's `model.rs` exists and is tested (part of
+      the same 43) but voiceterm hasn't been repointed onto it yet. Wire
+      voice/recorder level metering onto audio-kit `level`; a VAD gate
+      (voice-kit over audio-kit) is the next voice-kit growth.
 
 ## Source-of-truth hygiene
 
