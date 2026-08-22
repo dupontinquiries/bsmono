@@ -1,0 +1,13 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+road_warrior_core = { path = "../core" }
+eframe = { version = "0.27", default-features = false, features = ["wgpu", "default_fonts", "x11"] }
+egui = "0.27"
+zbus = { version = "3", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+bytemuck = { version = "1", features = ["derive"] }
+rand = "0.8"
