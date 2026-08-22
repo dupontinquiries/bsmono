@@ -268,9 +268,17 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   and every kit number taken before this was taken through a duller instrument.
 - [ ] Re-run the mechanism hunt under focus fire — Duskstripe -6 and Oldroar at 41% are the
   new candidates, but they are one arm-set old and the instrument just changed
-- [ ] Next AI levers, in the same spirit (each should raise composition-determinism):
-  retreat when *outnumbered* rather than only when wounded; group to push a broken lane
-  instead of only respawning onto it; hold an ult for a structure push
+- [x] Odds doctrine: a warrior breaks off when outmatched, not only when wounded — counts
+  what it can *see* within 16 lengths, margin of two (one flaps as packmates cross the
+  radius), veiled cats uncounted. **The flattest roster yet: sd 4.5 -> 2.9, range 17 -> 10,
+  kits outside 2se 3 -> 1**, while composition-determinism *held* at 54% — so unlike the
+  old flatness this is not the AI hiding the roster, it is the roster being closer together
+  when played competently. Biggest gainers are the kits that were dying for nothing:
+  Oldroar +7, Snowhush +8, Riptail +6.
+- [ ] Remaining AI levers, same success metric (composition-determinism should rise or
+  hold): group to push a broken lane instead of only respawning onto it; hold an ult for a
+  structure push; call a packmate to a fight worth winning rather than only fleeing a lost
+  one
 - [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
   a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
   every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
@@ -356,9 +364,17 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   and every kit number taken before this was taken through a duller instrument.
 - [ ] Re-run the mechanism hunt under focus fire — Duskstripe -6 and Oldroar at 41% are the
   new candidates, but they are one arm-set old and the instrument just changed
-- [ ] Next AI levers, in the same spirit (each should raise composition-determinism):
-  retreat when *outnumbered* rather than only when wounded; group to push a broken lane
-  instead of only respawning onto it; hold an ult for a structure push
+- [x] Odds doctrine: a warrior breaks off when outmatched, not only when wounded — counts
+  what it can *see* within 16 lengths, margin of two (one flaps as packmates cross the
+  radius), veiled cats uncounted. **The flattest roster yet: sd 4.5 -> 2.9, range 17 -> 10,
+  kits outside 2se 3 -> 1**, while composition-determinism *held* at 54% — so unlike the
+  old flatness this is not the AI hiding the roster, it is the roster being closer together
+  when played competently. Biggest gainers are the kits that were dying for nothing:
+  Oldroar +7, Snowhush +8, Riptail +6.
+- [ ] Remaining AI levers, same success metric (composition-determinism should rise or
+  hold): group to push a broken lane instead of only respawning onto it; hold an ult for a
+  structure push; call a packmate to a fight worth winning rather than only fleeing a lost
+  one
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean

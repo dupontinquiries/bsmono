@@ -111,6 +111,13 @@ const PATROL_HP: f32 = 130.0;
 const PATROL_ATK: f32 = 8.0;
 const PATROL_SPEED: f32 = 6.4;
 const NERVE: f32 = 0.45;             // retreat below this hp fraction…
+/// How far a warrior counts the odds before deciding a fight is not worth it.
+const ODDS_R: f32 = 16.0;
+/// How many more enemies than kin it takes to break off. Two rather than one:
+/// at one the AI flaps, retreating and re-engaging as a packmate crosses the
+/// radius, and a patrol that cannot commit to a fight is worse than one that
+/// loses it.
+const ODDS_MARGIN: i32 = 2;
 const REJOIN: f32 = 0.9;             // …rejoin the trail above this
 const LAST_STAND_R: f32 = 26.0;      // …unless the Great Tree itself is threatened
 
@@ -937,8 +944,29 @@ impl Battleground {
             self.warriors[i].mind = Mind::Trail;
         }
 
-        // wounded past nerve → break off and go home (patrol doctrine; ancestors too)
-        if frac < NERVE && !matches!(mind, Mind::Retreat | Mind::AtMedic | Mind::Dead) {
+        // Wounded past nerve → break off and go home (patrol doctrine; ancestors
+        // too). And the other half of the same doctrine, which was missing: a
+        // patrol that meets a bigger patrol withdraws. Nerve is not only about
+        // how hurt you are, it is about the odds — a cat at full strength facing
+        // three does not have good odds, and the books' patrols know it.
+        let outnumbered = {
+            let mut foes = 0i32;
+            let mut kin = 0i32;
+            for w in self.warriors.iter() {
+                if !w.alive() || dist(w.x, w.z, x, z) > ODDS_R {
+                    continue;
+                }
+                if w.team == team {
+                    kin += 1;   // counts self, which is right: you are one cat
+                } else if w.stealth_t <= 0.0 && junglemap::sees(x, z, w.x, w.z) {
+                    foes += 1;  // you cannot fear what you cannot see
+                }
+            }
+            foes - kin >= ODDS_MARGIN
+        };
+        if (frac < NERVE || outnumbered)
+            && !matches!(mind, Mind::Retreat | Mind::AtMedic | Mind::Dead)
+        {
             self.warriors[i].mind = Mind::Retreat;
         }
 
@@ -2820,6 +2848,48 @@ mod tests {
         // but not from across the clearing: distance still counts
         bg.warriors[foes[1]].x = x + 28.0;
         assert_eq!(bg.nearest_enemy(0, 30.0), Some(foes[0]));
+    }
+
+    #[test]
+    fn a_patrol_that_meets_a_bigger_patrol_withdraws() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        // out in the open, away from either camp's last-stand radius
+        let (x, z) = (20.0f32, -20.0f32);
+        bg.warriors[1].x = x;
+        bg.warriors[1].z = z;
+        bg.warriors[1].hp = bg.warriors[1].max_hp; // whole and hearty
+        let foes: Vec<usize> =
+            (0..bg.warriors.len()).filter(|&i| bg.warriors[i].team == CLAN_B).collect();
+        // one enemy: a fair fight, and it stays
+        for (n, &f) in foes.iter().enumerate() {
+            bg.warriors[f].x = if n == 0 { x + 4.0 } else { 140.0 };
+            bg.warriors[f].z = if n == 0 { z } else { 140.0 };
+        }
+        bg.warriors[0].x = 140.0;
+        bg.warriors[0].z = 140.0;
+        bg.step(1.0 / 30.0);
+        assert_ne!(bg.warriors[1].mind, Mind::Retreat, "one against one is a fight");
+        // three of them: the odds are the other half of nerve
+        for (n, &f) in foes.iter().enumerate() {
+            bg.warriors[f].x = x + 4.0 + n as f32;
+            bg.warriors[f].z = z;
+        }
+        bg.warriors[1].x = x;
+        bg.warriors[1].z = z;
+        bg.warriors[1].mind = Mind::Trail;
+        bg.step(1.0 / 30.0);
+        assert_eq!(bg.warriors[1].mind, Mind::Retreat, "three against one is a retreat");
+        // and a veiled enemy cannot frighten anyone: you do not count what you
+        // cannot see
+        for &f in &foes {
+            bg.warriors[f].stealth_t = 5.0;
+        }
+        bg.warriors[1].x = x;
+        bg.warriors[1].z = z;
+        bg.warriors[1].mind = Mind::Trail;
+        bg.step(1.0 / 30.0);
+        assert_ne!(bg.warriors[1].mind, Mind::Retreat, "unseen cats do not count against the odds");
     }
 
     #[test]

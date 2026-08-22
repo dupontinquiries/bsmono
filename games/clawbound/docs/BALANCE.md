@@ -108,6 +108,34 @@ Anything comparing kit strength should be re-run under focus fire. The
 before-and-after tables above are kept as they were taken — they were true of
 the AI that produced them.
 
+## Counting the odds — the flattest roster so far, and this time it means it
+
+The other half of nerve was missing. A warrior broke off when *wounded* and
+never when *outmatched*, so cats at full strength walked into three enemies and
+died there, over and over. Nerve is not only about how hurt you are; the books'
+patrols withdraw from a bigger patrol. Warriors now count what they can see
+within sixteen lengths and break off at a margin of two (one flaps: the AI
+oscillates as a packmate crosses the radius, and a patrol that cannot commit is
+worse than one that loses). Veiled cats do not count — you cannot fear what you
+cannot see.
+
+| | focus fire | + odds |
+|---|---|---|
+| dispersion | sd 4.5 | **sd 2.9** |
+| range | 17 | **10** |
+| kits outside 2se | 3 | **1** |
+| composition-decided pairs | 54% | 54% |
+
+That last row is what makes this different from the old flatness. Dispersion
+halved while composition-determinism *held*, so this is not the AI hiding the
+roster again — matches are still decided by who was drafted as often as before,
+and the kits are simply closer together when played competently. The kits that
+gained most are the ones that were dying for nothing: Oldroar +7 (the slow hulk
+stops walking into threes it cannot escape), Snowhush +8, Riptail +6.
+
+Every kit now sits within about five points of even, one of thirteen outside
+two standard errors, on 800 games.
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three
