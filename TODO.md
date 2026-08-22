@@ -137,7 +137,10 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       voice-reaction level/voicing gate; unendlich synthesis on `gen`
       (already uses `core_kit::rng` per an earlier check this session — the
       remaining gap, if any, is audio-kit's own `gen` module specifically,
-      not RNG).
+      not RNG). snapclone-audio's `rms` (the third of the three copies
+      audio-kit's own doc names) is DONE — pure Rust, no Qt/GTK, so this
+      one got a real `cargo test`: 104/104. All three named `rms` copies
+      (bo-suite, voiceterm, snapclone-audio) are now repointed.
 - [ ] **bo-dsp split** (app-local, NOT a kit): bo-suite's drone/passby cancellers
       (~27K tok beyond audio_features, bo-controller↔bo-mux) are STRATEGIES — pull
       into a bo-internal shared crate/module that consumes audio-kit primitives.
