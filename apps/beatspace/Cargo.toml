@@ -31,17 +31,22 @@ candle-core = "0.11"
 candle-nn   = "0.11"
 
 # --- GUI ---
-eframe = { version = "0.34", default-features = true }
+eframe = { version = "0.34", default-features = true, optional = true }
 # 0.34, matching the other thirteen egui apps and uikit-egui. beatspace was the
 # only crate on 0.35, which meant the kit's Ui and this app's Ui were different
 # types and no shared widget could cross — another manifest in this tree already
 # carries the comment "must match uikit-egui, or Color32 and Sense are different
 # types", learned the same way.
-egui   = "0.34"
-uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+egui   = { version = "0.34", optional = true }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
 
 # --- realtime audio out ---
-cpal = "0.18"
+# Optional, behind the default-on `app` feature. cpal pulls alsa-sys, which
+# needs libasound2-dev present at BUILD time — so with cpal unconditional the
+# whole crate, including the headless trainer and the smoke test, could not be
+# compiled on a machine without ALSA headers. Same shape as blackstar-rs
+# gating `audio` and studio-media gating `opus`, and for the same reason.
+cpal = { version = "0.18", optional = true }
 
 # --- DSP ---
 rustfft = "6.4"
@@ -53,8 +58,13 @@ hound   = "3.5"          # wav export of generated beats
 symphonia = { version = "0.6", default-features = false, features = [
     "wav", "pcm", "flac", "mp3", "isomp4", "aac", "alac", "ogg", "vorbis",
 ] }
-ogg  = "0.9"             # ogg container demux for .opus
-opus = "0.3"             # libopus codec  (needs system libopus + pkg-config)
+# Both optional, behind the default-on `opus` feature. The `opus` crate pulls
+# audiopus_sys, which BUILDS libopus from C via cmake — so with it
+# unconditional, a machine without cmake could not compile the crate at all,
+# including the trainer and the smoke test, neither of which decodes anything.
+# Same treatment studio-media already gives its own opus support.
+ogg  = { version = "0.9", optional = true }   # ogg container demux for .opus
+opus = { version = "0.3", optional = true }   # libopus codec (system libopus + pkg-config)
 
 # --- misc ---
 anyhow = "1"
@@ -82,7 +92,15 @@ lto = "thin"
 #   cargo run --release --features metal -- gui   ...
 
 [features]
-default = []
+default = ["app", "opus-decode"]
+# The interactive application: the realtime player (cpal) and the egui GUI.
+# Off means a CLI-only build — `train` and `smoke` — which is what CI, a
+# sandbox, and a headless phone image actually need, and what lets the smoke
+# test hold to its promise of running anywhere.
+app = ["dep:cpal", "dep:eframe", "dep:egui", "dep:uikit-egui"]
+# .opus decoding. Off means .opus files are refused with a message naming the
+# feature, rather than the crate failing to build.
+opus-decode = ["dep:ogg", "dep:opus"]
 cuda  = ["candle-core/cuda",  "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 # Batched generator inference on the GPU via wgpu (Vulkan on Asahi/Linux).

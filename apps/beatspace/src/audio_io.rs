@@ -17,7 +17,20 @@ pub fn decode_to_mono(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
         .unwrap_or("")
         .to_ascii_lowercase();
     let (samples, sr) = if ext == "opus" {
-        decode_opus(path)?
+        #[cfg(feature = "opus-decode")]
+        {
+            decode_opus(path)?
+        }
+        // Named rather than skipped: a training set that silently lost every
+        // .opus file would just look like a smaller dataset.
+        #[cfg(not(feature = "opus-decode"))]
+        {
+            anyhow::bail!(
+                "{}: .opus decoding needs the `opus-decode` feature (it builds libopus \
+and wants cmake); rebuild with it, or convert to wav/flac",
+                path.display()
+            )
+        }
     } else {
         decode_symphonia(path)?
     };
@@ -28,6 +41,7 @@ pub fn decode_to_mono(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
 // Opus (.opus in an ogg container)
 // ----------------------------------------------------------------------------
 
+#[cfg(feature = "opus-decode")]
 fn decode_opus(path: &Path) -> Result<(Vec<f32>, u32)> {
     use ogg::reading::PacketReader;
     use opus::{Channels, Decoder};

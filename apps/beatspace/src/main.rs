@@ -12,8 +12,10 @@ mod dataset;
 mod dsp;
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(feature = "app")]
 mod gui;
 mod model;
+#[cfg(feature = "app")]
 mod player;
 mod train;
 mod trainpage;
@@ -39,6 +41,7 @@ enum Cmd {
     /// Train the GAN on a folder of audio files.
     Train(TrainArgs),
     /// Open the realtime latent-space GUI.
+    #[cfg(feature = "app")]
     Gui(GuiArgs),
     /// Validate + benchmark the GPU generator (batched) against the CPU.
     #[cfg(feature = "gpu")]
@@ -88,6 +91,7 @@ struct TrainArgs {
     resume: bool,
 }
 
+#[cfg(feature = "app")]
 #[derive(Args)]
 struct GuiArgs {
     /// Directory containing config.json + gen_latest.safetensors.
@@ -117,6 +121,7 @@ fn main() -> Result<()> {
             }
             train::run(&cfg, a.resume)?;
         }
+        #[cfg(feature = "app")]
         Cmd::Gui(a) => {
             // Prefer the config saved alongside the checkpoints so the model
             // shape matches what was trained; fall back to defaults.
