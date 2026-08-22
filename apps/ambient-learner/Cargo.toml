@@ -15,6 +15,25 @@ edition = "2021"
 name = "ambient_learner_egui"
 path = "src/egui_lib.rs"
 
+# The GTK binary. Declared rather than auto-discovered from src/main.rs,
+# because an auto-discovered [[bin]] carries no required-features and so builds
+# on every invocation — 239 "cannot find crate gtk" errors the moment anyone
+# builds --no-default-features, which is how the egui frontend has to be built.
+#
+# Same shape as the [lib] problem one section down: the manifest could not say
+# what it meant, so the error surfaced in the source files instead.
+[[bin]]
+name = "ambient-learner"
+path = "src/main.rs"
+required-features = ["gtk"]
+
+# The runnable egui frontend. required-features is honoured on [[bin]] — unlike
+# on [lib], where it is silently ignored (see the note above the [lib] section).
+[[bin]]
+name = "ambient-egui"
+path = "src/bin/ambient-egui.rs"
+required-features = ["egui-app"]
+
 [features]
 default = ["gtk"]
 gtk = ["gtk4", "libadwaita", "glib"]

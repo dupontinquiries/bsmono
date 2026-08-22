@@ -7,8 +7,17 @@
 //! manifest line was trying to say.
 #![cfg(feature = "egui")]
 
-//! The egui build's library root: the Live view plus the state a running app
-//! needs around it.
+//! The egui build's library root.
+//!
+//! It used to hold its OWN one-screen Live view — temperature, confidence bar,
+//! sparkline — drawn from scratch here rather than calling the ported
+//! `ui::egui::live` page. That is why the port looked alive from outside while
+//! nine of its ten pages had no route in: the visible screen was a duplicate
+//! that worked, and the real frontend was unreachable behind it.
+//!
+//! The duplicate is gone. `App` holds a `Shell`, the Shell owns the page state
+//! and dispatches to the renderers, and `LiveState` remains only as the eased
+//! reading it always was — the animation, not the screen.
 //!
 //! Separate from `main.rs` because that file is GTK-only — 7,048 lines that do
 //! not compile without gtk4, adw and glib. This root pulls in only what the
@@ -20,6 +29,41 @@ pub mod ui {
 }
 
 pub use ui::egui::{confidence_tint, format_temp, norm, LiveSnapshot};
+pub use ui::egui::shell::Shell;
+
+/// The whole egui frontend.
+///
+/// Thin on purpose: it holds the Shell and a clock. Everything a page needs is
+/// on the Shell, and everything a page draws is in the page.
+pub struct App {
+    pub shell: Shell,
+    /// Animation clock, in milliseconds since start. Owned here so a test can
+    /// freeze it — an animated surface with a clock it cannot stop is one no
+    /// test can assert against.
+    start: std::time::Instant,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App { shell: Shell::default(), start: std::time::Instant::now() }
+    }
+}
+
+impl App {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let colors = uikit_egui::palette_colors("midnight");
+        let t_ms = self.start.elapsed().as_secs_f32() * 1000.0;
+        self.shell.ui(ui, &colors, t_ms);
+    }
+
+    /// Actions raised by pages this frame, drained for the host to apply.
+    ///
+    /// Drained rather than read, so the host cannot apply the same add twice
+    /// by rendering two frames before handling one.
+    pub fn take_actions(&mut self) -> Vec<ui::egui::locations::LocationAction> {
+        std::mem::take(&mut self.shell.pending)
+    }
+}
 
 /// The running Live view: a snapshot, plus the eased values that make it feel
 /// alive rather than stepping between readings.
@@ -88,31 +132,15 @@ impl LiveState {
             || (self.snapshot.confidence - self.shown_conf).abs() > 0.005
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
-        let (label, tint) = confidence_tint(self.shown_conf);
-        ui.vertical_centered(|ui| {
-            ui.add_space(18.0);
-            ui.label(egui::RichText::new(&self.snapshot.location).size(16.0).weak());
-            // The reading is the focal point, through size.
-            ui.label(egui::RichText::new(format_temp(self.shown)).size(64.0).strong());
-            ui.label(egui::RichText::new(&self.snapshot.condition).size(15.0).weak());
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new(label).color(tint).size(13.0));
-            // confidence bar
-            let (rect, _) = ui.allocate_exact_size(
-                egui::Vec2::new(ui.available_width() * 0.7, 6.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 3.0, tint.gamma_multiply(0.22));
-            let mut filled = rect;
-            filled.set_width(rect.width() * self.shown_conf.clamp(0.0, 1.0));
-            ui.painter().rect_filled(filled, 3.0, tint);
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new(format!("{} – {}",
-                format_temp(self.snapshot.min_temp), format_temp(self.snapshot.max_temp)))
-                .size(13.0).weak());
-            ui.add_space(20.0);
-            sparkline(ui, &self.snapshot.series, tint);
-        });
-    }
+    // THE DUPLICATE LIVE SCREEN WAS HERE, and removing it is the point of this
+    // commit. It drew location, temperature, condition, a confidence bar, the
+    // min/max range and a sparkline — a working screen, drawn from scratch,
+    // that shadowed the ported `ui::egui::live` page and made a frontend with
+    // nine unreachable pages look finished.
+    //
+    // LiveState keeps its easing (`tick`, `animating`) because that is a real
+    // job and nothing else does it: the reading glides toward the sensor value
+    // rather than snapping. What it no longer does is draw.
 }
 
 /// The recent trend. Drawn from the series directly so it cannot disagree with
