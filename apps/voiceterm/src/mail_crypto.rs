@@ -264,17 +264,14 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
 // Safe-inert default providers (feature off)
 // ---------------------------------------------------------------------
 
-/// Constant-time byte comparison. Tiny and dependency-free; used by the
-/// default gate and worth having in-tree regardless.
+/// Constant-time byte comparison — repointed onto net-kit (its own doc
+/// names this exact copy as one of the 5+ it unifies; confirmed identical
+/// before repointing: same length check, same zip-and-XOR-accumulate loop
+/// with no early exit on mismatch). Tiny and dependency-free either way;
+/// used by the default gate regardless of which optional crypto backend
+/// (`mail-crypto`) is compiled in.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    net_kit::auth::ct_eq(a, b)
 }
 
 /// Refuses to write secrets to disk. This is the safety net for builds

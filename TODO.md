@@ -91,7 +91,19 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       co-members = the seal-to set); a higher-level `Channel`/`Group` over the
       mailbox.
 - [ ] **app repointing** (the payoff): apps still carry their pre-extraction
-      copies. Repoint them onto the kits — voiceterm/bo-suite/logscope `ct_eq` +
+      copies. `ct_eq` half: ~~voiceterm/bo-suite~~ DONE this session (bo-mux's
+      `peer_auth.rs` and voiceterm's `mail_crypto.rs` both now delegate to
+      `net_kit::auth::ct_eq`, confirmed byte-identical before repointing).
+      bo-mux verified with a real `cargo test` (264/264, incl. the specific
+      `ct_eq_works` and `peer_auth::` tests) — it's a headless daemon, no
+      Qt/GTK. voiceterm's is unverified by compilation (Qt/qmetaobject) but
+      line-by-line confirmed, same standard as this session's other
+      Qt-blocked repoints. logscope's TWO copies (`logscope-fan::enlist`,
+      `gpu-gemm::netserve` — the very two net-kit's own doc says its `ct_eq`
+      was "lifted as the union of") are deliberately left untouched: logscope
+      has heavy concurrent commit activity this session (other work landing
+      on `main` throughout), and touching shared files there risked a
+      collision with in-flight work rather than a clean repoint. Still open:
       hand-rolled HTTP + percent-codec → net-kit; snapclone-crypto/group →
       crypto-kit; snapclone groups → share-kit (epoch-gated cutover; feed
       `namespace="group-feed"` gives byte-compatible keys).

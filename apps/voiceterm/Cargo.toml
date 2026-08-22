@@ -11,6 +11,11 @@ nifty-core = { path = "../../shared/nifty-core" }
 # voice-kit" item. Zero-dependency itself (only models-kit, a path dep),
 # so this doesn't add anything to the qmetaobject/whisper-rs build tree.
 voice-kit = { path = "../../shared/voice-kit" }
+# ct_eq (mail_crypto.rs) — net-kit's own doc names this exact function
+# (constant-time compare, used by the default mail-crypto gate regardless
+# of which optional crypto backend is enabled) as one of 5+ byte-identical
+# copies across the monorepo. Zero-dependency itself (std only).
+net-kit = { path = "../../shared/net-kit" }
 qmetaobject = "0.2"
 scraper = "0.14"
 ureq = { version = "2", features = ["gzip"] }
