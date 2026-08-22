@@ -1254,3 +1254,45 @@ ambient-learner's build was fixed.
 
 Kept `target/` cleared after each app to avoid repeating the fao-codec disk
 false-alarm from the previous section.
+
+## aperture and studio: the two remaining apps, checked (2026-08-22)
+
+Both are native egui apps with no Qt/GTK predecessor (confirmed earlier this
+session — out of scope for porting, but not for compile/test verification,
+which nothing had done yet).
+
+**aperture** (own nested workspace: `aperture-core`, `aperture-complete`,
+`aperture-egui`, `aperture-scene`): `cargo check --bin aperture --features
+app` clean, zero warnings. Full test run across all four crates: **200
+tests, all passing** (23 + 73 + 62 + 42).
+
+**studio** (own nested workspace, 14 crates): `cargo check --bin studio`
+clean (5 pre-existing deprecation warnings, the same `Panel::show`/
+`TopBottomPanel` class already known not to have a safe drop-in fix — see
+below). Full test run across all 14 crates: **524 tests, all passing**
+(6+83+63+8+29+93+105+43+12+20+9+9+11+33).
+
+That's every app in the fleet now compile-and-test verified this session:
+gitmind, voiceterm, tomescope, ambient-learner (fixed), bo-suite, snapclone,
+rusty-board, fao-codec, bot-arena, hatch, krapper, tadpole, dialer, aperture,
+studio. 2,876+ tests total across the whole fleet, zero failures once
+ambient-learner's manifest bug was fixed.
+
+## The remaining `Panel::show`/`CentralPanel::show` deprecation warnings are NOT a safe mechanical fix
+
+Checked before doing a repo-wide sweep of these (the same warning class
+appears in `studio-app`, `bo-suite-egui`, `bot-arena-egui`, `hatch-egui`,
+`snapclone-egui`, `ambient-learner-egui`, `krapper-egui`, and others).
+`egui::Panel::show`/`CentralPanel::show`'s deprecation notice points to
+`show_inside()` — but `show_inside()` takes `&mut Ui`, not `&Context`, because
+it's designed for nesting a panel inside an already-open `Ui` (e.g. inside a
+custom compound widget). Every one of these call sites is the top-level panel
+in an `eframe::App::update(&mut self, ctx: &egui::Context, ...)` — there is no
+`Ui` to nest inside at that point; `show(ctx, ...)` is the correct, current
+way to open a panel at the root of a frame, and the deprecation warning is
+guidance for a different call shape that doesn't apply here. Unlike the
+`SelectableLabel`/`screen_rect` fixes earlier in this document (verified
+identical by reading the deprecated function's own body before swapping it),
+this one has no such equivalence — "fixing" it would mean restructuring how
+each app opens its root panel, which is a real (if probably small) per-app
+change, not a mechanical rename, and not attempted here.
