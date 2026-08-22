@@ -50,10 +50,17 @@ before both. The incoming work was effectively free.
   was one commit, 7 files, 1178 lines, all under `shared/` — applied via
   format-patch + am in `ee2d00ae` so the original authorship survived.
 
-- **C9-0c — Still unmeasured: the blackstar checkpoint bundle.** `queued`.
-  509 MiB in `wip/archives/`, `refs/heads/main` = `5d0ec126`. Run the same probe
-  on it before deciding anything. Given step-counter's result, expect a large
-  fraction to be pre-rewrite assets — but expect is not measured.
+- **C9-0c — blackstar checkpoint bundle.** `done` · `verified`. 487 MiB on
+  disk, 279 MiB of objects we lack, and the same story as step-counter for the
+  same reason: forked at `b985c6d1`, before the rewrite, carrying
+  `parts_web*.bin.gz`, `logscope-linux-x64` and pre-rewrite `.iqm`/`scene.bin`
+  revisions. We already hold every heavy `.pack` it ships. Source extracted in
+  `952f4a5f` (10 commits); the assets stayed out. Pack after all three bundles:
+  **370.38 MiB**, from 370.34 at session start.
+
+  The extract-not-merge rule now has three data points and one clear statement:
+  **a bundle that forked before the history rewrite cannot be merged, only
+  harvested.** Its asset history is the purge, running backwards.
 
 ---
 
@@ -99,36 +106,24 @@ origin/incoming/trap-session   +23    byte-identical to trap-autotune (c9c51289)
   but not obviously lossless — and a capture log lost to a careless notes merge
   is the one thing `SKILL_session_capture.md` says cannot be reconstructed.
 
-- **C9-1e — c4-858-delta is currently unusable.** `blocked` · `verified`.
-  Incremental, prerequisite `a9a8cb0b` is **not in this repo** and is **not**
-  the head of the blackstar checkpoint bundle (`5d0ec126`). It may be an
-  ancestor inside that bundle's history — unpacking it is the way to find out,
-  and that costs ~510 MiB of disk. This is exactly the failure
-  `INCOMING_BUNDLE_REBASE.md` documents; the standing rule there says the fix
-  is a self-contained re-export from the sending side.
+- **C9-1e — c4-858-delta: unblocked, not yet applied.** `queued` · `verified`.
+  Its prerequisite `a9a8cb0b` ("snapclone-egui: wire confirm, requests,
+  freshness, snap_export") IS inside the blackstar checkpoint bundle and IS an
+  ancestor of its head, so the delta is applyable. Expect the same
+  extract-not-merge route: the base it hangs off is pre-rewrite.
 
 ---
 
 ## 2. Bugs found, not yet fixed
 
-- **C9-2a — `snapclone-crypto`'s build.rs silently rewrites a committed
-  source file.** `queued` · `verified` (reproduced, then reverted).
-  `build.rs` regenerates `include/crypto/snapclone_crypto_ffi.h` **into the
-  source tree** on every build. The committed header is hand-maintained: it
-  carries `CryptoError_Ok`-style alias macros with a comment explaining that
-  cbindgen's variant naming shifts between versions, and `cbindgen.toml` sets
-  `QualifiedScreamingSnakeCase`. So regeneration replaces `CryptoError_Ok` with
-  `CRYPTO_ERROR_OK` and **deletes the alias block the C++ side depends on**.
-  `SNAPCLONE_SKIP_CBINDGEN=1` exists but is opt-*out*, so the default behaviour
-  destroys the file. The c8parallel session hit this too and worked around it
-  by hand rather than fixing it ("left that committed header untouched rather
-  than risk a mismatched regeneration").
-  **Proposed fix:** generate to `OUT_DIR` by default — cbindgen still runs, so
-  it still catches a Rust API that cannot be expressed in C — and write the
-  committed path only under an explicit `SNAPCLONE_WRITE_FFI_HEADER=1`. That
-  inverts the default from *destroy* to *no-op*.
-  Anyone building this crate before the fix lands should set
-  `SNAPCLONE_SKIP_CBINDGEN=1` and check `git status` afterwards.
+- **C9-2a — `snapclone-crypto`'s build.rs rewrote a committed header.** `done`
+  · `verified` both directions, in `9932142f`. Default is now OUT_DIR — cbindgen
+  still runs, so it still fails the build on an API that cannot be expressed in
+  C, but nothing is written into the source tree. `SNAPCLONE_WRITE_FFI_HEADER=1`
+  regenerates deliberately and warns that the hand-written `CryptoError_*` alias
+  block will be lost. The tell that the old default was wrong: an escape hatch
+  already existed and the trap was still the default path, and two sessions paid
+  the tax before either changed it.
 
 - **C9-2b — Ported crates may carry more doc examples written against the C++
   surface.** `idea` · `read`.
@@ -145,6 +140,25 @@ origin/incoming/trap-session   +23    byte-identical to trap-autotune (c9c51289)
   build unifies features. c8parallel independently hit the same class in
   `scene-kit`. A `cargo check -p <each>` sweep, one crate at a time, is the
   test; there is no reason to think two instances is all of them.
+  **Note the asymmetry with C9-2e:** the stale-lock class got a cheap static
+  checker because absence is visible in a text file. Feature unification is not
+  — it needs a real per-crate resolve, which is minutes per crate here. This one
+  stays a sweep, not a tool.
+
+- **C9-2e — Stale lockfiles: found by accident three times, now checked.**
+  `done` · `verified`. `maintenance/tools/lock_check.py` scans every committed
+  Cargo.lock for dependencies declared in its own Cargo.toml and absent from
+  it. 110 lockfiles, 12 skipped as workspace members, **1 stale** —
+  `apps/voiceterm`, missing `audio-kit`, left behind by c8-003's repoint
+  commits. Fixed in `2557301d`.
+  The failure is quiet by construction: a stale lock is fine online, because
+  cargo resolves the name and rewrites the file. It bites offline, on a clean
+  clone, or in CI.
+  **Known limit, stated so the checker is not trusted past its range:** it
+  verifies a package APPEARS in the lock, not that the dependency EDGE is
+  recorded. Regenerating voiceterm's lock also added `net-kit` to web2qml's
+  dependency list and the scan did not flag it, because net-kit was already
+  present as a package. Edge drift needs the real resolver.
 
 - **C9-2d — `snapclone-relay` cannot build here.** `parked` · `verified`.
   `openssl-sys` needs `libssl-dev`, absent in this sandbox. Environment, not
@@ -184,9 +198,10 @@ place in `maintenance/tools/`.
   the prerequisite" without fetching. The probe answers "what would this
   actually cost", via an alternates-backed scratch repo and
   `git repack -a -d -l`. The probe is the one that earned its keep: it turned
-  a 369 MiB bundle into a measured 888 KiB and stopped a 459 MiB one from
+  a 369 MiB bundle into a measured 888 KiB and stopped two large ones from
   silently undoing the history rewrite. Both belong in `maintenance/tools/`
-  next to `zips_to_history.sh`.
+  next to `zips_to_history.sh` — `lock_check.py` landed there this session and
+  these are the same kind of thing, so there is now a precedent and no excuse.
 
 - **C9-3d — `build/build.sh --run` cannot build anything on an x86_64 host.**
   `queued` · `verified`.
