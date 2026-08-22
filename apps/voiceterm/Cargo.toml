@@ -22,6 +22,10 @@ net-kit = { path = "../../shared/net-kit" }
 # rms (separation.rs) — audio-kit's own doc names this exact copy
 # ("voiceterm `separation`") as one of three it unifies. Zero-dependency.
 audio-kit = { path = "../../shared/audio-kit" }
+# IRC channel-log search (src/irc_search.rs). Zero-dependency itself — std plus
+# net-kit/core-kit, both std-only — so this adds nothing to the qmetaobject /
+# whisper-rs build tree, same rationale as voice-kit above.
+irc-kit = { path = "../../shared/irc-kit" }
 qmetaobject = "0.2"
 scraper = "0.14"
 ureq = { version = "2", features = ["gzip"] }

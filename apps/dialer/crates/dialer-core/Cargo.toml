@@ -27,8 +27,24 @@ zbus = { version = "4.4", optional = true }
 # matrix HTTP; blocking, fits the visible-loop style. The pure JSON layer of
 # matrix.rs compiles and tests without it.
 ureq = { version = "2", optional = true }
+# IRC as a fourth transport on the same Link. irc-kit is zero-dependency
+# (std + two std-only path kits), so the default feature set gains nothing;
+# TLS is a separate opt-in because rustls is the only heavy part.
+irc-kit = { path = "../../../../shared/irc-kit", optional = true }
+# default-features = false is load-bearing: rustls 0.23 defaults to the
+# aws-lc-rs provider, which builds AWS-LC from C via cmake. That drags a C
+# toolchain into a cross build for aarch64 phones — the exact thing that turns
+# `cargo build --target` into an afternoon. ring is pure-Rust-plus-asm and
+# cross-compiles clean, which is why it is named explicitly rather than added
+# alongside the default.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 [features]
 default = []
 mm = ["dep:zbus"]
 matrix = ["dep:ureq"]
+irc = ["dep:irc-kit"]
+# Plaintext IRC needs no crypto; TLS ports (6697) do. Split so a build that
+# only ever talks to a local bouncer does not pull rustls.
+irc-tls = ["irc", "dep:rustls", "dep:webpki-roots"]

@@ -43,6 +43,7 @@
 #[allow(dead_code)] pub mod workerkit;
 #[allow(dead_code)] pub mod buildfarm;
 pub mod agentscore;
+#[allow(dead_code)] pub mod ircsrc;
 pub mod engmode;
 #[allow(dead_code)] pub mod stepverify;
 #[allow(dead_code)] pub mod treeexport;

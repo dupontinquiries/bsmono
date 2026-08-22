@@ -1,0 +1,18 @@
+[package]
+name = "irc-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Headless IRCv3 client primitives: a pure message parser/formatter (tags, prefix, params, trailing), a pure registration/channel state machine driven by ticks rather than a clock, an append-only JSONL channel log, a pure relevance ranker over logged lines, and a fail-closed source-consent policy for feeding your own participation logs to a model. Zero-dependency (std only); generic over Read + Write so TLS is the host's choice, not the kit's."
+
+[lib]
+path = "src/lib.rs"
+
+# Zero dependencies — std only, like net-kit and config-kit. TLS is deliberately
+# absent: the session layer is generic over Read + Write, so the app supplies a
+# TcpStream or a rustls stream and the kit never grows a crypto dependency.
+[dependencies]
+# Both zero-dependency std-only kits themselves, so irc-kit stays offline-buildable.
+# net-kit for JSON escaping/field extraction (the JSONL log), core-kit for now_secs.
+net-kit = { path = "../net-kit" }
+core-kit = { path = "../core-kit" }
