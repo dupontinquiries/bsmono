@@ -12,6 +12,16 @@ of the file — this session found three separate docs asserting engine state
 that had stopped being true, and the fix is not to write more carefully but to
 record what was actually checked.
 
+**And a rule the first draft was missing: a tag records when a thing was
+established, not that it stays true.** Section 4 below was written `read`, with
+"not verifiable in this sandbox" as its premise, and both halves of that
+premise were false within the same session — the crates build under cargo 1.96,
+and `Gpu::new()` works despite there being no Vulkan ICD. A `verified` tag ages
+exactly the same way: it means a command ran once, on one day, in one
+environment. When an item blocks work, **retest its premise before believing
+it** — this file's own worst entry was one nobody thought to recheck because it
+looked rigorous.
+
 Status legend, matching `SCRATCHPAD.md`: `idea` · `queued` · `in-progress` ·
 `blocked` · `done` · `parked`
 
@@ -241,35 +251,75 @@ Context: `vllm-main` is staged in `wip/archives/` as a reference. Its **Rust
 workspace** (15 crates, edition 2024, toolchain pinned 1.95) is the more
 relevant half for this stack than the Python side.
 
-- **C9-4a — MLA layer loading.** `queued` · `read`, and **not verifiable in
-  this sandbox**.
-  The remaining gap is narrower than `archcfg`'s note implies. `Model.mla` is
-  already populated (lib.rs:12075), `BlockWeights.mla` is already populated
-  (lib.rs:~11738), and `block_decode_mla` is complete. What blocks it is one
-  early `return Err` in the dense `wqkv` construction that fires *before* the
-  layer loop reaches the MLA branch. The dense attention fields are not
-  `Option`, so an MLA layer needs placeholders in `wq`/`wk`/`wv`/`wo`/`wqkv` —
-  which is why the guard in `fa6eb6b9` landed first.
-  **Verification honesty:** no Vulkan ICD, no `/dev/dri`, and the loader tests
-  all `return` early on a missing `/tmp/tiny-*.gguf`. Writing this here would
-  land in the same "unverified by compilation" category as the voiceterm and
-  rusty-board repoints in `TODO.md`. `tools/tiny-variants/gen_glmdsa.py`
-  reproduces the failure in 3 layers at d=64 and is the fixture to use on
-  hardware.
+> **CORRECTION (later the same session).** Everything below originally said
+> this work was not verifiable here, on two premises that were retested and
+> both failed. The first: these crates could not be built in this sandbox —
+> true under cargo 1.75, false under 1.96 (`logscope` checks in 68 s under
+> `cargo-ailite`; plain cargo gets OOM-killed, so the profile is what matters
+> now, not the toolchain). The second: there is no GPU — there is no Vulkan ICD
+> and no `/dev/dri`, but **`Gpu::new()` succeeds and real dispatches produce
+> correct results**, via Mesa's software drivers in
+> `/usr/lib/x86_64-linux-gnu/dri`. A test that had been passing in every run of
+> this suite all session — `a_view_downloads_its_own_bytes_not_the_buffer_head`
+> — was demonstrating a working device the whole time.
+>
+> This file exists to stop exactly that: a confident claim whose provenance
+> nobody rechecks. It became the clearest example of the thing it was written
+> to prevent, which is worth leaving on the record rather than editing away.
 
-- **C9-4b — MLA would double-allocate its KV cache.** `idea` · `read`.
-  `decode_step_full` indexes `c.k[li]`/`c.v[li]` before the MLA match, so an
-  MLA model appears to allocate a full dense KV cache alongside the compressed
-  latent — defeating the ~7× compression that is the entire point of MLA. I
-  have not checked whether `new_cache` skips them when `m.mla` is set. Worth
-  settling *before* C9-4a, since it may change what loading should build.
+- **C9-4a — MLA layer loading.** `queued` · `verified` where it stops, and
+  **now drivable in this sandbox**.
 
-- **C9-4c — No test exercises `load_gguf` at all.** `queued` · `verified`.
-  All 1155 gpu-gemm tests are pure; every loader test guards on a fixture file
-  that does not exist here and returns. That is the reason both MLA gaps went
-  unnoticed, and it is why the two tests added this session are *structural*
-  (`include_str!` over the source) rather than behavioural. A committed tiny
-  GGUF fixture would convert a whole class of these into real tests.
+  The remaining code gap is as described: `Model.mla` is populated
+  (lib.rs:12075), `BlockWeights.mla` is populated (~11738), `block_decode_mla`
+  is complete, and one early `return Err` in the dense `wqkv` construction
+  fires before the layer loop reaches the MLA branch. The dense attention
+  fields are not `Option`, which is why the guard in `fa6eb6b9` landed first.
+
+  **What driving it revealed, which the notes did not say.** With
+  `gen_glmdsa.py`'s fixture, `load_gguf_opt` prints the MLA diagnostic,
+  RECOVERS the dimensions from the tensor shapes — and is then refused by the
+  ARCHITECTURE gate (glm-dsa: sparse attention unimplemented), which sits in
+  FRONT of MLA layer loading. Closing the MLA gap alone will not make this
+  fixture load. Pinned by
+  `mla::tests::an_mla_checkpoint_reaches_the_loader_and_stops_where_the_notes_say`.
+
+  So the work is: the loader path, the allocator trim from C9-4b, and a
+  decision about the arch gate — one change, not three.
+
+- **C9-4b — the dual KV allocation, measured.** `done` · `verified`.
+  Not a bug: `new_cache_for` allocates the dense K/V for MLA models
+  deliberately (a mixed checkpoint needs them), and `Model::kv_bytes_per_token`
+  already sums both rather than reporting the compressed figure, so the context
+  planner is not fooled. What was unknown was the size, and the justifying
+  comment guessed it as "little":
+
+  | model | dense B/token | latent B/token | ratio | both @8k |
+  |---|---:|---:|---:|---:|
+  | GLM-4.7-Flash | 1,638,400 | 92,160 | 17.8x | 13.20 GiB |
+  | DeepSeek-V3 | 11,993,088 | 140,544 | 85.3x | 92.57 GiB |
+
+  Against the 31 GiB clamped buffer ceiling, GLM-4.7-Flash at 8k spends 13.2
+  GiB of cache to use 0.7, and DeepSeek-V3 is over the ceiling at 4k. Long
+  context is the whole point of MLA, so the trim belongs in the SAME change as
+  the loader — a loader that makes MLA work while the allocator hands the
+  compression back is not worth shipping. Comment corrected, cost pinned by a
+  test that fails if the allocator is ever fixed.
+
+- **C9-4c — loader tests: substantially unblocked.** `in-progress` ·
+  `verified`.
+  One real end-to-end loader test now exists (above). The remaining piece is
+  smaller than it looked: `gen2.py`/`gen3.py` emit weights-only GGUFs with **no
+  `tokenizer.ggml.tokens`**, so the fixture-gated tests in `ctxwin` still
+  return early even with the file present — they need a tokenizer, not just a
+  model. Traced with a throwaway probe rather than guessed: the guard chain is
+  three `Err(_) => return` in a row and only the third fires. Teaching the
+  generators to emit vocab metadata would light those up.
+
+  **And the pattern worth fixing beyond this crate:** a fixture-gated test that
+  returns early passes silently. The new test prints `SKIPPED` and the exact
+  command to generate its fixture; every other one in this tree does not, which
+  is how the whole area stayed unexamined.
 
 - **C9-4d — Prefix caching over the existing fork/COW.** `idea` · `read`.
   `crates/logscope/src/kvcache.rs` (note: the *logscope* crate, not gpu-gemm)
