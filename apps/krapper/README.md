@@ -198,3 +198,16 @@ based on spelling."
 The audio side is still RMS onset detection — useful as a hot-mic indicator,
 not yet useful as a "this is the vibe you hummed" extractor. That's Path A's
 job; see `docs/path-a-plan.md`.
+
+## Verification (2026-08-19)
+
+Neither this crate nor `egui-frontend/` had a build-status record anywhere.
+A session with a real rustc 1.96 ran both for the first time:
+`cargo test` in the crate root (the `iced`-based desktop app): 12/12. `cargo
+test` in `egui-frontend/`: 17/17, including the shared vibe/scale/syllable
+logic and the egui-specific bar-layout tests (wrapping vs. shrinking,
+desktop-vs-phone sizing, offering only suggestions that actually fit).
+Both compile clean; only pre-existing dead-code warnings (unused struct
+fields and helper methods, e.g. `Dict::nearest_phonetic`, `VibeSummary::
+bps`) and one `egui::CentralPanel::show` deprecation (0.34 renamed it
+`show_inside()`), none touched.
