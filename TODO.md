@@ -110,12 +110,25 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 
 - [ ] **audio-kit consumers** (the payoff): ~~bo-suite (speaker control)
       audio_features~~ DONE this session (see the checkbox above — was
-      partially stale). Remaining: voiceterm/snapclone-audio `rms`; logscope
+      partially stale). ~~rusty-board mic-level metering~~ DONE this session,
+      but this TODO's own "→ level::rms" was wrong about what to repoint:
+      the actual code (`voice/recorder.rs`'s `push_samples_mono`) is a PEAK
+      meter with exponential decay for UI display, not RMS — repointing it
+      to `level::rms` would have been a real behavior change (a peak meter
+      reads bursty transients; an RMS meter reads average loudness), not a
+      safe repoint. Repointed the raw "max abs sample in this buffer" line
+      onto `audio_kit::level::peak` instead (byte-identical primitive; the
+      exponential-decay smoothing around it stays local as the UI-metering
+      strategy it is). Unverified by compilation — this file is behind the
+      `voice` feature, which needs `cmake` to build whisper.cpp from source
+      (see the GTK4 correction above; not attempted) — but the substitution
+      is a single-line, type-matching primitive swap (`peak(&[f32]) -> f32`
+      exactly matches the call site), about as low-risk as an unverified
+      change gets. Remaining: voiceterm/snapclone-audio `rms`; logscope
       voice-reaction level/voicing gate; unendlich synthesis on `gen`
       (already uses `core_kit::rng` per an earlier check this session — the
       remaining gap, if any, is audio-kit's own `gen` module specifically,
-      not RNG); **rusty-board** (voice keyboard) mic-level metering →
-      `level::rms`.
+      not RNG).
 - [ ] **bo-dsp split** (app-local, NOT a kit): bo-suite's drone/passby cancellers
       (~27K tok beyond audio_features, bo-controller↔bo-mux) are STRATEGIES — pull
       into a bo-internal shared crate/module that consumes audio-kit primitives.

@@ -16,6 +16,9 @@ signal-kit = { path = "../../shared/signal-kit" }
 # Zero-dependency itself (only models-kit, a path dep) — doesn't add to the
 # GTK4/whisper-rs build tree.
 voice-kit = { path = "../../shared/voice-kit" }
+# Mic-level peak metering (voice/recorder.rs) — TODO.md's audio-kit
+# consumers item. Zero-dependency itself.
+audio-kit = { path = "../../shared/audio-kit" }
 # GTK4 and Adwaita
 # All gtk-rs crates must be from the same release matrix; mixing causes
 # duplicate `links = "gtk-4"` errors at link time. The 0.10/0.21 matrix
