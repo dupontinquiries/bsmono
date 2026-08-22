@@ -1179,3 +1179,48 @@ the window host nor the view code) failing to compile, deliberately: that
 combination isn't a real use case the manifest's own documentation claims to
 support, so making it "succeed" by producing a silently-empty crate would
 just reintroduce a milder version of the same bug this fix closes.
+
+## Fleet-wide compile sweep, since one app failed to compile at all
+
+Given ambient-learner-egui's silent compile-to-nothing bug above, checked
+whether the same *class* of bug (not necessarily the same cause) exists
+anywhere else in the fleet, rather than assuming it was isolated.
+
+Two things were checked:
+
+1. **Every `#[path]`-mounted file repo-wide**, for the specific mechanism
+   that broke ambient-learner (a mounted file whose own top line is
+   `#![cfg(feature = "...")]`, evaluated against the mounting crate's
+   features rather than the file's origin crate's). Scripted a check across
+   every `#[path = "..."]` occurrence in the repo and the file it resolves
+   to: **ambient-learner was the only one.** voiceterm's and krapper's
+   `#[path]` mounts (terminal_workspace, row_cache, nlp, entity_extract,
+   vibe, scale, etc.) all mount plain, ungated files.
+2. **`cargo check` on every app's actual binary**, not just the one that had
+   already failed — since a text-based repo-wide grep can rule out one
+   mechanism but can't rule out a compile failure with a different cause.
+   Checked all of: bo-suite, snapclone, rusty-board, fao-codec, bot-arena,
+   hatch, krapper, tadpole, dialer (plus gitmind and voiceterm-egui, already
+   checked in earlier sections). **Every one compiles clean** — warnings
+   only (mostly the same handful of egui 0.34 deprecations: `CentralPanel`/
+   `Panel::show` → `show_inside()`, `SelectableLabel::new` →
+   `Button::selectable()`, `screen_rect()` → `content_rect()`, seen
+   repeatedly enough across the fleet that fixing them once in `uikit-egui`
+   and letting it propagate would be worth a follow-up, though none of them
+   block a build).
+
+One false alarm during this sweep, worth recording so it isn't mistaken for
+a code bug later: `fao-codec-egui` initially failed with a linker crash
+(`ld terminated with signal 7`, `thiserror-impl` failing to compile). Checked
+`df`/`free` before assuming a code cause: the container's disk was at 100%
+(3.4MB free) from accumulated `target/` directories across the many crates
+checked this session — cargo's linker was failing on write, not the code
+being wrong. Cleared roughly 8GB of `target/` output and it compiled clean
+immediately after. Left the fleet's `target/` directories removed at the end
+of this sweep rather than accumulated, since disk exhaustion masquerading as
+a compile error is exactly the kind of false signal this document is trying
+to eliminate elsewhere.
+
+**Conclusion: ambient-learner-egui's bug was real and unique in the fleet**,
+not a symptom of a wider pattern. The fleet-wide compile health, now actually
+verified rather than inferred from source-reading, is good.
