@@ -75,12 +75,18 @@ impl TransportSelector {
                     choices.push(TransportChoice::DhtMailbox);
                 }
                 TraversalStrategy::Relay { relay_url } => {
-                    let url = if relay_url.is_empty() {
-                        relay_url.as_str().to_owned()
-                    } else if let Some(u) = relay_url {
-                        u.to_owned()
-                    } else { continue };
-                    choices.push(TransportChoice::Relay { relay_url: url });
+                    // relay_url is a plain String (see TraversalStrategy::Relay's
+                    // definition in snapclone-net-intel::hints) — never
+                    // Option<String>, so the `else if let Some(u) = relay_url`
+                    // this replaced was a type error and had never compiled.
+                    // Passed through as-is, empty or not: both current
+                    // producers (snapclone-net-intel::hints) always push this
+                    // as the "final fallback" strategy regardless of whether a
+                    // relay URL is known yet, and nothing downstream of
+                    // TransportChoice::Relay exists in this workspace to say
+                    // an empty URL should be treated differently — changing
+                    // that behavior isn't this fix's call to make.
+                    choices.push(TransportChoice::Relay { relay_url });
                 }
                 _ => {}
             }

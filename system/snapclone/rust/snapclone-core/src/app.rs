@@ -40,7 +40,6 @@ pub struct AppConfig {
 /// Thread-safe: `dispatch()` can be called from any thread.
 pub struct AppCore {
     cmd_tx: mpsc::SyncSender<AppCommand>,
-    evt_rx: mpsc::Receiver<AppEvent>,
 }
 
 impl AppCore {
@@ -55,7 +54,15 @@ impl AppCore {
         // For now this is a scaffold — the Qt AppController is the live impl.
         let _ = evt_tx; // suppress unused warning until impl is wired
 
-        (Self { cmd_tx, evt_rx }, evt_rx)
+        // evt_rx belongs to the CALLER (the return tuple), not to AppCore —
+        // it was never read anywhere in this impl, and this constructor's
+        // own doc comment says the receiver is what `new` hands back. A
+        // struct field storing a value that's also returned is a compile
+        // error (Receiver isn't Clone) and was never actually built; fixed
+        // by not double-owning it rather than by cloning or discarding one
+        // copy, since the caller genuinely needs a live receiver once the
+        // background thread starts sending on evt_tx.
+        (Self { cmd_tx }, evt_rx)
     }
 
     /// Send a command to the core. Non-blocking; returns Err if queue is full.

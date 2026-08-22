@@ -16,6 +16,9 @@ byteorder = "1"
 # Signing infrastructure — real signing landed elsewhere; we re-import
 # the dep for type compatibility with verification chains.
 ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
+# serde's own array impl doesn't cover [u8; 64] (only up to 32) — the
+# standard, minimal fix rather than hand-rolling ser/de for one field.
+serde-big-array = "0.5"
 
 [features]
 default = []

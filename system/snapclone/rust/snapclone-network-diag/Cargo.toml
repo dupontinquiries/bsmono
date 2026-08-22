@@ -13,3 +13,7 @@ anyhow  = "1"
 tokio   = { version = "1", features = ["net", "time", "rt", "macros"] }
 tracing = "0.1"
 serde   = { version = "1", features = ["derive"] }
+# Used directly in runner.rs (chrono::Utc) but never declared here — only
+# present transitively via other workspace members. Caught by building this
+# crate on its own for the first time.
+chrono  = "0.4"

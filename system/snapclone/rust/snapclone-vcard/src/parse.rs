@@ -50,7 +50,11 @@ pub fn parse_vcard(input: &str) -> Result<VCard> {
                 // Fallback: extract from N: field (family;given;...)
                 let parts: Vec<&str> = value.splitn(2, ';').collect();
                 if let Some(name) = parts.first() {
-                    if !name.is_empty() { card.display_name = name.to_owned(); }
+                    // `name` is `&&str` (Vec<&str>::first()); `.to_owned()`
+                    // on that yields `&str`, not `String` — needed the extra
+                    // deref, caught by checking this crate for the first
+                    // time (it had never compiled).
+                    if !name.is_empty() { card.display_name = (*name).to_owned(); }
                 }
             }
             _ => {} // unknown property — ignore per RFC
