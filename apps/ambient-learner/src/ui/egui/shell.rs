@@ -43,6 +43,10 @@ pub struct Shell {
     /// value (dry air draws no droplets) rather than an absent one. Built
     /// explicitly so nobody reads a default as "no data".
     pub sparkles: super::ambience::Sparkles,
+    /// Set when Back was pressed with no history left. The host decides what
+    /// that means — on a phone it is usually "close the app", and deciding
+    /// that here would make a UI module own the process lifetime.
+    pub back_unhandled: bool,
     /// Actions raised by a page this frame, for the host to apply.
     ///
     /// Queued rather than handled here: adding or removing a location touches
@@ -75,6 +79,20 @@ impl Shell {
             _ => None,
         }).collect());
         for c in typed { self.router.shortcut(c); }
+
+        // BACK. Written and tested two commits ago and called from nowhere —
+        // found by the new tested-but-uncalled check, which is a fair first
+        // catch since it is my own dead code.
+        //
+        // Escape and the browser/phone Back button both land here. `back`
+        // returns false when there is nowhere to go, and that return is passed
+        // on rather than swallowed: on a handset, swallowing Back is how an
+        // app stops being closeable.
+        let back_pressed = ui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
+        if back_pressed && !self.router.back() {
+            // Nowhere to go. Left for the host to handle as a close request.
+            self.back_unhandled = true;
+        }
 
         match self.router.current() {
             Section::Live => {
@@ -197,6 +215,7 @@ impl Default for Shell {
             // 0% is dry, which is a reading. See the field's note.
             sparkles: super::ambience::Sparkles { humidity_pct: 0.0 },
             pending: Vec::new(),
+            back_unhandled: false,
         }
     }
 }

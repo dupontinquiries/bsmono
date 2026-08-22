@@ -169,6 +169,68 @@ def egui_dirs(app_dir):
     return out
 
 
+def tested_but_uncalled(src):
+    """Public functions that only tests call.
+
+    A different question from `uncalled_renderers`, which asks about DRAWING.
+    This one asks about logic, and the case that motivated it is
+    `TermWorkspace::close_newest_web_pane`: the real v0.1.881 implementation,
+    documented, unit-tested, and reached from nothing but its own tests. The
+    dispatch beside it still used the older path, so the behaviour the function
+    exists to provide did not happen — and a second implementation of it got
+    written before anyone noticed the first.
+
+    That is the failure mode: a tested function looks finished. Coverage says
+    it works, and it does; nothing says it is unreachable.
+
+    Deliberately narrow. Only functions with at least one test mention and zero
+    production mentions outside their own definition — a function nobody calls
+    AND nobody tests is unfinished work, which is a different and more obvious
+    thing.
+    """
+    texts, out = {}, []
+    for dp, dn, fn in os.walk(src):
+        dn[:] = [d for d in dn if d != 'target']
+        for f in fn:
+            if not f.endswith('.rs'): continue
+            q = os.path.join(dp, f)
+            try: texts[q] = open(q, encoding='utf8', errors='replace').read()
+            except OSError: continue
+    # Split every file once: production above the first #[cfg(test)], tests below.
+    prod_all, test_all = [], []
+    for txt in texts.values():
+        parts = txt.split('#[cfg(test)]')
+        prod_all.append(parts[0])
+        test_all.extend(parts[1:])
+    prod_joined, test_joined = '\n'.join(prod_all), '\n'.join(test_all)
+
+    for q, txt in texts.items():
+        prod = txt.split('#[cfg(test)]')[0]
+        # MUTATORS ONLY, and the first cut proves why. Matching every `pub fn`
+        # reported 416 functions across the fleet — every pure helper a view
+        # inlines, every predicate reached through another path. A checker
+        # that reports 416 things is one nobody reads, which is the connected-
+        # placeholder failure applied to tooling.
+        #
+        # `&mut self` is the line that separates signal from noise. A pure
+        # function nobody calls is an unused helper: harmless, and obvious
+        # from its own body. A MUTATOR nobody calls is a state change the
+        # application never performs — which is exactly
+        # close_newest_web_pane, and exactly the shape worth a report.
+        for m in re.finditer(r'pub fn (\w+)\s*(?:<[^>]*>)?\s*\(\s*&mut self', prod):
+            name = m.group(1)
+            call = name + '('
+            prod_hits = prod_joined.count(call)
+            # One hit is the definition itself.
+            if prod_hits > 1: continue
+            if test_joined.count(call) == 0: continue
+            doc_start = prod.rfind('\n\n', 0, m.start())
+            if 'Not called yet, and that is not an oversight' in prod[doc_start:m.start()]:
+                continue
+            out.append((os.path.relpath(q, src), name))
+    return sorted(set(out))
+
+
 def main():
     apps = os.path.join(ROOT, 'apps')
     rows = []
@@ -219,6 +281,23 @@ def main():
         print(f"\n{name}: views fed placeholder data —")
         for rel, ln, why in hits:
             print(f"  {rel}:{ln}  {why}")
+    # Reachable is not the same as CALLED, and a test is not a caller.
+    total_orphan = 0
+    for name in sorted(os.listdir(apps)):
+      for src in egui_dirs(os.path.join(apps, name)):
+        hits = tested_but_uncalled(src)
+        if not hits: continue
+        total_orphan += len(hits)
+        print(f"\n{name}: tested but never called in production —")
+        for rel, fn in hits:
+            print(f"  {rel:<28} {fn}")
+    if total_orphan:
+        print(f"\n{total_orphan} function(s) are exercised only by their own tests. "
+              f"A tested function LOOKS finished — coverage says it works, and it "
+              f"does; nothing says it is unreachable. CHECK each: some are "
+              f"library API for another crate, and some are a behaviour the app "
+              f"was supposed to have.")
+
     if total_stub:
         print(f"\n{total_stub} views are wired to nothing. A view fed an empty "
               f"literal is a connected placeholder, and it is worse than an "
