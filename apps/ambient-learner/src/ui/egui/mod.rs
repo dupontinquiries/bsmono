@@ -111,6 +111,52 @@ pub struct LiveView {
     shared_note: Option<String>,
 }
 
+/// The "share this reading with a contact" row — extracted so it can be
+/// drawn from ANY page holding a `LiveSnapshot`, not just `LiveView`'s own
+/// (currently unwired) page. `egui-frontend/main.rs`'s actual running Live
+/// page (`LiveState` + `live::live_ui`) has no sharing UI at all despite
+/// this crate's own top-level module doc advertising it as a headline
+/// feature — see `wiring_check.py`'s finding, recorded in
+/// `maintenance/PORT_STATUS.md`. Pulling this block out lets the real page
+/// call it without adopting the rest of `LiveView` (which duplicates the
+/// headline reading/confidence/sparkline the running page already draws
+/// differently) or deciding which of the two "Live page" implementations
+/// wins — that's a separate, larger question this function sidesteps rather
+/// than answers.
+pub fn share_row_ui(
+    ui: &mut egui::Ui,
+    snap: &LiveSnapshot,
+    contacts: &[(String, String)],
+    share: &mut WeatherShare,
+    shared_note: &mut Option<String>,
+) {
+    crate::ui::egui::chrome::card_heading(ui, "Share this reading");
+    if contacts.is_empty() {
+        ui.label(egui::RichText::new("no contacts yet").weak().small());
+        return;
+    }
+    let rec = snap.record();
+    for (id, name) in contacts {
+        ui.horizontal(|ui| {
+            ui.label(name);
+            let already = share.shared_with("live").contains(id);
+            if already {
+                if ui.button("Stop sharing").clicked() {
+                    share.revoke(id, "live");
+                    *shared_note = Some(format!("stopped sharing with {name}"));
+                }
+                ui.label(egui::RichText::new("· sharing").small().color(egui::Color32::from_rgb(86, 211, 100)));
+            } else if ui.button("Share").clicked() {
+                share.share_with(id, "live", &rec);
+                *shared_note = Some(format!("shared with {name}"));
+            }
+        });
+    }
+    if let Some(note) = shared_note {
+        ui.label(egui::RichText::new(note.as_str()).weak().small());
+    }
+}
+
 impl LiveView {
     /// Render the Live page. `contacts` are `(sc_id, display_name)`; sharing goes through `share`.
     pub fn ui(
@@ -173,31 +219,7 @@ impl LiveView {
 
         ui.add_space(12.0);
         ui.separator();
-        // Share-with-contact row — the weather-share integration.
-        crate::ui::egui::chrome::card_heading(ui, "Share this reading");
-        if contacts.is_empty() {
-            ui.label(egui::RichText::new("no contacts yet").weak().small());
-        }
-        let rec = snap.record();
-        for (id, name) in contacts {
-            ui.horizontal(|ui| {
-                ui.label(name);
-                let already = share.shared_with("live").contains(id);
-                if already {
-                    if ui.button("Stop sharing").clicked() {
-                        share.revoke(id, "live");
-                        self.shared_note = Some(format!("stopped sharing with {name}"));
-                    }
-                    ui.label(egui::RichText::new("· sharing").small().color(egui::Color32::from_rgb(86, 211, 100)));
-                } else if ui.button("Share").clicked() {
-                    share.share_with(id, "live", &rec);
-                    self.shared_note = Some(format!("shared with {name}"));
-                }
-            });
-        }
-        if let Some(note) = &self.shared_note {
-            ui.label(egui::RichText::new(note).weak().small());
-        }
+        share_row_ui(ui, snap, contacts, share, &mut self.shared_note);
     }
 
     /// A minimal sparkline of the recent ambient series.

@@ -925,6 +925,28 @@ it; `LiveView`'s weather-sharing logic is the one piece of real, tested,
 user-visible functionality actually missing from the runnable app, and porting
 IT (not rewriting the Live page around it) is the concrete next step.
 
+**Done (2026-08-22, compiler available):** extracted the sharing block from
+`LiveView::ui` into a standalone `pub fn share_row_ui(ui, snap, contacts,
+share, shared_note)` in `mod.rs`, and had `LiveView::ui` itself call it (so
+there's exactly one copy of this logic, not two). Wired `share_row_ui` into
+the ACTUAL running Live page in `egui-frontend/src/main.rs`'s `Page::Live`
+arm, alongside the existing `LiveState`/`live::live_ui` rendering — this
+sidesteps the "which of the three Live-page implementations wins" question
+entirely rather than answering it: the running page keeps its own headline
+reading and sensor panel exactly as before, and gains only the one feature
+that was genuinely missing from it. `App` gained `contacts: Vec<(String,
+String)>` (empty — honest about a demo with no live snapclone connection,
+matching this app's own convention for History/Places/Sync elsewhere),
+`share: weather_share::WeatherShare`, and `shared_note: Option<String>`.
+
+Verified: `cargo check --bin ambient-learner-egui` clean (same single
+pre-existing `CentralPanel::show` warning, nothing new), `cargo test --lib`
+147/147 still passing, and the parent `ambient-learner` crate's own `--features
+egui` build (which `mod.rs` is also compiled under) still clean. `LiveView`
+itself remains unwired — deduplicating its logic doesn't answer whether it or
+`LiveState` should be the page going forward, and that's still a real design
+call left for whoever does that merge.
+
 ## wiring_check.py: two more real gaps, in voiceterm
 
 The same tool flagged 2 of voiceterm's 61 modules dead. Checked both against

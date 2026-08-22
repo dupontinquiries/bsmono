@@ -23,6 +23,14 @@ struct App {
     page: Page,
     history: history::History,
     places: locations::LocationsPage,
+    /// Weather-sharing to snapclone contacts. Empty contact list rather than
+    /// invented names: a demo with no snapclone connection has no contacts,
+    /// which is the true state, matching this app's own convention elsewhere
+    /// (History/Places/Sync/Model all render their real empty states rather
+    /// than fabricated data).
+    contacts: Vec<(String, String)>,
+    share: weather_share::WeatherShare,
+    shared_note: Option<String>,
     sync: sync::SyncPage,
     model: model::ModelPage,
     map: map::MapPage,
@@ -113,6 +121,17 @@ impl eframe::App for App {
                     self.dot.tick(dt_ms);
                     if self.dot.live { ui.ctx().request_repaint(); }
                     live::live_ui(ui, &self.sensors, &self.dot, &self.colors);
+                    // Weather-sharing, extracted from LiveView (a second,
+                    // unwired Live-page implementation this crate also has —
+                    // see PORT_STATUS.md) into a standalone function so this
+                    // page — the one actually running — gets the feature
+                    // without adopting LiveView's own duplicate headline
+                    // reading/sensor rendering.
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ambient_learner_egui::ui::egui::share_row_ui(
+                        ui, &self.live.snapshot, &self.contacts, &mut self.share, &mut self.shared_note,
+                    );
                 }
                 Page::History => history::history_ui(ui, &self.history, &self.colors),
                 Page::Map => map::map_ui(ui, &mut self.map, &self.colors),
@@ -157,6 +176,12 @@ fn main() -> eframe::Result<()> {
             // Empty, like the history: the page says "no saved locations, tap +
             // to add one", which is true, rather than inventing places.
             places: locations::LocationsPage::default(),
+            // Empty: this demo has no live snapclone connection to source
+            // contacts from, so the share row honestly shows "no contacts
+            // yet" rather than a fabricated list.
+            contacts: Vec::new(),
+            share: weather_share::WeatherShare::new("ambient-learner-demo"),
+            shared_note: None,
             // Zeroes, not invented counts: an empty database is a fact about a
             // device nobody has calibrated yet, and the page renders it as 0
             // rather than as a dash for exactly that reason.
