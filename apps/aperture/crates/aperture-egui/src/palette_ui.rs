@@ -26,6 +26,7 @@ pub enum Mode {
     ProjectSearch,
     WorkspaceSymbol,
     GoToRoute,
+    AiEditPrompt,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +72,12 @@ impl PaletteState {
         let symbols = aperture_core::workspace_symbols::index_files(&root, &files, 1500);
         PaletteState { mode: Mode::GoToRoute, input: String::new(), selected: 0, focus_placed: false, root, files, symbols }
     }
+    /// A plain text-entry mode: the typed line IS the instruction, sent to
+    /// `AppState::request_edit` on Enter. No candidate list, so `root`/
+    /// `files`/`symbols` stay empty — nothing in this mode reads them.
+    pub fn ai_edit_prompt() -> Self {
+        PaletteState { mode: Mode::AiEditPrompt, input: String::new(), selected: 0, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
+    }
 }
 
 /// Fuzzy-rank `symbols` by name against `query`, capped at `limit`. Same
@@ -90,6 +97,7 @@ pub enum Cmd {
     ProjectSearchMode,
     WorkspaceSymbolMode,
     GoToRouteMode,
+    AiEditMode,
     ToggleAi,
     CompleteNow,
     ToggleLoopPane,
@@ -110,6 +118,7 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("Find: In Project… (Ctrl+Shift+F)".to_string(), Cmd::ProjectSearchMode),
         ("Go to Symbol in Workspace… (Ctrl+T)".to_string(), Cmd::WorkspaceSymbolMode),
         ("Go to via Route… (Ctrl+G)".to_string(), Cmd::GoToRouteMode),
+        ("AI: Edit Selection…".to_string(), Cmd::AiEditMode),
         ("AI: Toggle ghost completions".to_string(), Cmd::ToggleAi),
         ("AI: Complete now".to_string(), Cmd::CompleteNow),
         ("View: Toggle loop pane".to_string(), Cmd::ToggleLoopPane),
@@ -167,6 +176,10 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
             let root = s.workspace_root();
             let files = crate::file_finder::walk_files(&root, 4000);
             s.palette = Some(PaletteState::go_to_route(root, files));
+            return; // keep the palette open, in its new mode
+        }
+        Cmd::AiEditMode => {
+            s.palette = Some(PaletteState::ai_edit_prompt());
             return; // keep the palette open, in its new mode
         }
         Cmd::ToggleAi => {

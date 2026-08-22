@@ -198,15 +198,25 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   No `APERTURE_CMD` set = zero cost, same as `describe`: tier one still
   works standalone.
 
-- **Instruct-edit shell wiring**: `aperture-complete::edit::make_edit_request`
-  (headless, tested) packs an instruction + selection into the existing
-  `CompletionRequest` envelope for `CommandProvider` — the request-building
-  half of "ask AI to rewrite this selection" exists. NOT wired into the
-  shell: needs a way to route an outcome back as "this is an edit result,
-  render a diff/accept/reject view" rather than feeding it into ghost text
-  the way every other `Engine::poll()` outcome is — the generation-gate
-  design assumes one semantic per outcome today. Adding a tag (or a second
-  `Engine`) is the shape of the fix; not attempted this pass.
+- **"AI: Edit Selection…"** — DONE, wired end to end. `aperture-complete::
+  edit::make_edit_request` packs an instruction + selection into the
+  `CompletionRequest` envelope; the shell now sends it through
+  `AppState::edit_engine` — a FOURTH independent `Engine` instance (own
+  `APERTURE_CMD` provider, own generation counter, alongside `engine`
+  (ghost completion), `describe` (revision notes), and `route_engine`
+  (go-to-route's AI tier)) — exactly the fix this note used to describe as
+  "not attempted this pass." Palette command opens `Mode::AiEditPrompt` for
+  the instruction; on landing, a review overlay shows original vs. proposed
+  with explicit Accept (Enter)/Reject (Esc) — never auto-applied, unlike
+  ghost completion's Tab-to-accept (an instruct-edit result is a bigger,
+  easier-to-get-wrong bet than "what comes next"). Accept applies via
+  `Editor::replace_range` at the ORIGINAL selection's char offsets (not
+  wherever the caret ended up while the request was in flight) as one
+  undo step. Two new integration tests drive a real `CommandProvider` end
+  to end (request → poll → land → accept-changes-the-buffer, and
+  request → poll → land → reject-leaves-the-buffer-untouched) — not mocks.
+  `cargo test -p aperture-egui --lib`: 64/64 (was 62). No `APERTURE_CMD` =
+  zero cost; no selection = a status message, not a panic.
 
 - **tree-sitter** behind the existing `LineLexer` seam (`aperture-core/syntax.rs`).
   The seam is `(line, entry_state) -> (spans, exit_state)` so an incremental

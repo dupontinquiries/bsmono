@@ -157,6 +157,18 @@ pub struct Popup {
     pub prefix_start: usize,
 }
 
+/// An instruct-edit request in flight or awaiting review (see
+/// `AppState::pending_edit`'s doc for why acceptance is always explicit).
+#[derive(Clone, Debug)]
+pub struct PendingEdit {
+    pub start: usize,
+    pub end: usize,
+    pub original: String,
+    pub instruction: String,
+    /// `None` while `edit_engine` hasn't answered yet.
+    pub proposed: Option<String>,
+}
+
 pub(crate) fn sel_range(a: usize, b: usize) -> aperture_core::Selection {
     aperture_core::Selection { anchor: a, head: b }
 }
@@ -273,6 +285,23 @@ pub struct AppState {
     /// currently in flight on `route_engine`, if any — what `poll_route_ai`
     /// calls `route_ai::fulfill` against when the outcome lands.
     route_pending_key: Option<u64>,
+    /// "AI: Edit Selection…"'s engine — a FOURTH independent instance,
+    /// same reasoning as `route_engine`'s doc: an instruct-edit prompt and
+    /// a route-search prompt are different jobs, and sharing a generation
+    /// counter across independently-firing features breaks "coalesce to
+    /// the newest." Same `APERTURE_CMD` provider construction as `describe`
+    /// and `route_engine` — all three are "ask the assistant a one-off
+    /// text question," differing only in what the question is.
+    edit_engine: Option<Engine>,
+    edit_generation: u64,
+    /// A proposed edit in flight or awaiting review. `proposed: None` means
+    /// still waiting on `edit_engine`; once it lands, the shell shows
+    /// original vs. proposed and applies via `Editor::replace_range` (one
+    /// undo step) only on explicit accept — an instruct-edit result is a
+    /// SUGGESTION, never auto-applied, unlike ghost completion's Tab-to-
+    /// accept (a FIM completion is "what comes next," low-stakes to accept
+    /// blind; a rewritten selection is a bigger, easier-to-get-wrong bet).
+    pub pending_edit: Option<PendingEdit>,
     fim_ctx: String,
     fim_ctx_version: u64,
     pub popup: Option<Popup>,
@@ -340,6 +369,12 @@ impl AppState {
             }),
             route_generation: 0,
             route_pending_key: None,
+            edit_engine: std::env::var("APERTURE_CMD").ok().map(|cmd| {
+                let argv = cmd.split_whitespace().map(str::to_string).collect();
+                Engine::new(Box::new(CommandProvider::new(argv)))
+            }),
+            edit_generation: 0,
+            pending_edit: None,
             fim_ctx: String::new(),
             fim_ctx_version: u64::MAX,
             popup: None,
@@ -583,6 +618,71 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// "AI: Edit Selection…" — ask the assistant to rewrite the current
+    /// selection given `instruction`. No-op (with a status message) if
+    /// there's no `edit_engine` configured or no real selection: an
+    /// instruct-edit on a bare caret has nothing to rewrite, unlike ghost
+    /// completion which is exactly for a caret.
+    pub fn request_edit(&mut self, instruction: &str, now_ms: u64) {
+        let Some(engine) = &self.edit_engine else {
+            self.set_status("no AI provider configured (set APERTURE_CMD)", now_ms);
+            return;
+        };
+        if self.editor.sel.is_caret() {
+            self.set_status("select text first to ask for an edit", now_ms);
+            return;
+        }
+        let start = self.editor.sel.min();
+        let end = self.editor.sel.max();
+        let original = self.editor.selected_text();
+        let lang = match self.lang {
+            Language::Rust => "rust",
+            Language::Plain => "text",
+        };
+        self.edit_generation += 1;
+        let req = aperture_complete::edit::make_edit_request(instruction, &original, lang, self.edit_generation, 4000);
+        engine.request(req);
+        self.pending_edit = Some(PendingEdit { start, end, original, instruction: instruction.to_string(), proposed: None });
+    }
+
+    /// Drain the edit engine; call once per frame, same as `poll_note`.
+    pub fn poll_edit_ai(&mut self, now_ms: u64) {
+        let Some(engine) = &self.edit_engine else { return };
+        let mut failure: Option<String> = None;
+        while let Some(out) = engine.poll() {
+            if out.generation != self.edit_generation {
+                continue; // a stale answer for a since-superseded request
+            }
+            let Some(pending) = &mut self.pending_edit else { continue };
+            match out.result {
+                Ok(text) => pending.proposed = Some(text),
+                Err(e) => failure = Some(e),
+            }
+        }
+        if let Some(e) = failure {
+            self.pending_edit = None;
+            self.set_status(&format!("edit request failed: {}", e.trim().lines().next().unwrap_or(&e)), now_ms);
+        }
+    }
+
+    /// Apply the proposed edit as one undo step, exactly at the ORIGINAL
+    /// selection range — not wherever the caret happens to be now, since
+    /// typing could have moved on while the request was in flight.
+    pub fn accept_pending_edit(&mut self) {
+        let Some(pending) = self.pending_edit.take() else { return };
+        let Some(proposed) = pending.proposed else { return };
+        let end = pending.end.min(self.editor.buffer.len_chars());
+        let start = pending.start.min(end);
+        self.editor.replace_range(start, end, &proposed);
+        self.dirty = true;
+    }
+
+    /// Discard a proposed (or still-in-flight) edit without touching the
+    /// buffer.
+    pub fn reject_pending_edit(&mut self) {
+        self.pending_edit = None;
     }
 
     /// Swap the buffer's content without touching `path`/`lang`/`git`;
@@ -2010,6 +2110,73 @@ mod tests {
         // the dedup path doesn't error or double-queue).
         s.request_route_ai("find the account setup wizard", &cands);
         assert!(aperture_complete::route_ai::take_pending().is_none(), "no duplicate request queued for the same key");
+    }
+
+    #[test]
+    fn ai_edit_selection_round_trips_from_request_to_accepted_buffer_change() {
+        let mut s = AppState::new(None, false);
+        assert!(s.edit_engine.is_none(), "no APERTURE_CMD in the test process: zero cost");
+        s.editor = aperture_core::Editor::from_str("fn get(v: &[i32], i: usize) -> i32 { v[i] }\n");
+
+        // No selection yet: request_edit should refuse, not panic or fire.
+        s.request_edit("add bounds checking", 0);
+        assert!(s.pending_edit.is_none(), "no selection to edit — request must be a no-op");
+
+        // Select the whole function.
+        let end = s.editor.buffer.len_chars() - 1; // exclude the trailing newline
+        s.editor.sel = aperture_core::Selection { anchor: 0, head: end };
+
+        s.edit_engine = Some(aperture_complete::engine::Engine::new(Box::new(
+            aperture_complete::providers::CommandProvider::new(vec![
+                "echo".into(), "-n".into(),
+                "fn get(v: &[i32], i: usize) -> Option<i32> { v.get(i).copied() }".into(),
+            ]),
+        )));
+        s.request_edit("add bounds checking", 0);
+        assert!(s.pending_edit.is_some(), "a request in flight should be recorded");
+        assert!(s.pending_edit.as_ref().unwrap().proposed.is_none(), "not landed yet");
+
+        let mut got = false;
+        for _ in 0..200 {
+            s.poll_edit_ai(0);
+            if s.pending_edit.as_ref().is_some_and(|p| p.proposed.is_some()) {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got, "the proposed edit should land within 1s");
+        assert_eq!(s.pending_edit.as_ref().unwrap().proposed.as_deref(), Some("fn get(v: &[i32], i: usize) -> Option<i32> { v.get(i).copied() }"));
+
+        s.accept_pending_edit();
+        assert!(s.pending_edit.is_none(), "accepting clears the pending edit");
+        assert!(s.editor.buffer.to_string().starts_with("fn get(v: &[i32], i: usize) -> Option<i32> { v.get(i).copied() }"));
+        assert!(s.dirty, "accepting an edit marks the buffer dirty");
+    }
+
+    #[test]
+    fn rejecting_a_pending_edit_never_touches_the_buffer() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::Editor::from_str("original text\n");
+        s.editor.sel = aperture_core::Selection { anchor: 0, head: 8 };
+        s.edit_engine = Some(aperture_complete::engine::Engine::new(Box::new(
+            aperture_complete::providers::CommandProvider::new(vec!["echo".into(), "-n".into(), "replaced".into()]),
+        )));
+        s.request_edit("rewrite this", 0);
+        let mut got = false;
+        for _ in 0..200 {
+            s.poll_edit_ai(0);
+            if s.pending_edit.as_ref().is_some_and(|p| p.proposed.is_some()) {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got);
+        let before = s.editor.buffer.to_string();
+        s.reject_pending_edit();
+        assert!(s.pending_edit.is_none());
+        assert_eq!(s.editor.buffer.to_string(), before, "rejecting must not change the buffer");
     }
 
     #[test]
