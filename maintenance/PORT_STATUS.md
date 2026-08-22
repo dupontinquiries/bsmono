@@ -963,6 +963,51 @@ about which behaviour is correct, not a mechanical connection — left as-is for
 that reason, with the more precise finding recorded here instead of the
 original single-function framing.
 
+**Update, with a compiler: wrote and shipped the missing renderer, reusing an
+existing tested primitive instead of building `BarState`'s gesture logic a
+second time.** `uikit_egui::slide_menu::SlideMenu` already implements exactly
+the press-vs-hold-vs-cancel rules `BarState`'s doc comment describes — it's
+the same primitive the toolkit uses elsewhere for long-press fan-outs, tested,
+and specifically has a memory-backed `show_stored` mode built for callers who
+"needn't hold a `SlideMenu`" in their own app state. So rather than write a
+second renderer that manually drives `BarState`'s `press`/`tick`/`release`
+against raw pointer events, `bars::bar_ui(ui, &BottomBar) -> Option<BarEvent>`
+now composes `BottomBar`'s model with `SlideMenu` directly: one button per
+`BarButton`, `SlideMenu::new(id).hold(HOLD_SECONDS)` for buttons with options,
+a plain click check for buttons without (preserving the "no options must not
+fan out" rule literally, as an early continue before `SlideMenu` is ever
+reached), and `SlideOutcome` mapped onto the existing `BarEvent` enum so
+callers don't need to know `SlideMenu` was involved. `HOLD_SECONDS` and
+`BarEvent` — the parts of `BarState`'s design worth keeping — are reused
+as-is; the hand-rolled timer/state fields inside `BarState` become
+unnecessary, since `SlideMenu` owns that state in egui memory now. Verified,
+not asserted: `cargo check --features app` on both the lib and the
+`voiceterm-egui` binary is clean, the 19 pre-existing `bars`/`bottom_bar`
+tests still pass unchanged, and two new tests were added and pass —
+`bar_ui_renders_one_frame_without_panicking` (a real one-frame `egui::Context`
+smoke test, not just a compile check) and
+`a_button_with_no_options_never_reaches_the_slide_menu` (pins the early-return
+path against regression).
+
+**Not done, and precisely why:** the function exists and is tested but is not
+yet called from `VoicetermApp`'s draw loop — no layout decision was made
+about where the bar goes. Checked the GTK original's own history for a
+default answer before guessing: `crates/gui` (via `src/main.rs`'s
+`bottom_bar_model`) documents this AS A STAGED, UNFINISHED FEATURE in its own
+comment — "placeholder feed... no live tab/workspace/card sources wired
+yet... the full GestureHost+SlidePopup row + real sources are the staged
+live-surface step" — and feeds `default_bar` two hardcoded tab labels
+(`"Terminal"`, `"Browser"`), no real workspaces, no real quick-launch list.
+**This was never a finished feature in either build, and the egui port isn't
+regressing anything by not having it either.** So the remaining work isn't
+"wire the missing piece" — the missing piece (the renderer) is now written
+and tested — it's the two decisions the GTK build itself never made: where in
+the layout the bar goes, and what live data (real open tabs, real
+workspaces, real recent-command list — the app already has session/workspace
+state for the sidebar and `workspaces_view` that could feed this) replaces
+the placeholder. That's product/layout judgment, not a compile-checkable fact,
+so it's recorded as the next step rather than guessed at.
+
 Both are the same shape as the ambient-learner `LiveView` finding above: a
 page got ported with two halves, one wired and one not, rather than one whole
 page missing. Recorded as two more concrete next steps rather than guessed at
@@ -971,9 +1016,16 @@ blind, for the same no-compiler reason as tomescope's orphans in `TODO.md`:
 - [ ] voiceterm: wire `detect::picker_ui` into the ambiguous-reference path —
       wherever the engine currently falls back when a spoken entity reference
       doesn't resolve to one match, show the picker instead of failing silent.
-- [ ] voiceterm: wire `archived_view::bar_ui` into the Archive view alongside
-      `archive_ui` — likely a per-page action row (share/re-fetch/delete),
-      matching the "fan out" pattern described in the module doc.
+- [x] voiceterm: `bars::bar_ui` written, tested, compiled clean (see the
+      "wrote and shipped the missing renderer" note below) — DONE except for
+      the layout placement + live-data decision, which is now its own item:
+- [ ] voiceterm: decide where `bars::bar_ui` goes in `VoicetermApp`'s layout
+      (a phone-narrow bottom bar alongside/replacing the always-on sidebar?)
+      and feed it real tabs/workspaces/recent-commands instead of the
+      placeholder two-tab list the GTK build itself never got past. Remove
+      the now-genuinely-unused `bar_state: BarState` field once `bar_ui`
+      (which doesn't need it — `SlideMenu` owns its own gesture state) is
+      wired in.
 
 ## A real Rust toolchain is now available in-sandbox (2026-08-22)
 

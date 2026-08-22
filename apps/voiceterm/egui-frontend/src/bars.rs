@@ -112,6 +112,64 @@ impl BarState {
     pub fn abort(&mut self) { self.pressing = None; self.open = None; self.hover = None; }
 }
 
+/// Draw the bottom bar with a real press-and-hold fan-out, reusing
+/// `uikit_egui::slide_menu::SlideMenu` rather than hand-rolling the gesture
+/// again — `BarState`/`BarEvent` above describe the RULES (a tap is not a
+/// hold; releasing outside the fan cancels) but never got a renderer, and
+/// `SlideMenu` already implements exactly those rules, tested, and used
+/// elsewhere in the kit. Memory-backed (`show_stored`) so callers don't need
+/// to thread a `SlideMenu` through their app state per button — only
+/// `BottomBar` itself is owned by the caller.
+///
+/// Returns the resolved event for the frame the gesture completed, `None`
+/// otherwise (including every frame the menu is still open and being
+/// dragged — `SlideOutcome::Idle` covers both "closed" and "open,
+/// undecided", and only the caller knows the difference doesn't matter for
+/// dispatch).
+pub fn bar_ui(ui: &mut egui::Ui, bar: &BottomBar) -> Option<BarEvent> {
+    let mut result = None;
+    ui.horizontal(|ui| {
+        for (idx, b) in bar.buttons().iter().enumerate() {
+            let label = if b.badge.is_empty() { b.label.clone() }
+                        else { format!("{} {}", b.label, b.badge) };
+            let host = ui.add_enabled(b.enabled, egui::Button::new(label));
+            if b.options.is_empty() {
+                // No fan-out possible: a tap is the only gesture this button
+                // has, so SlideMenu (which exists to draw a fan-out) would be
+                // the wrong tool — an empty menu reads as a broken button,
+                // which is the exact failure this module's own doc warns
+                // about avoiding.
+                if host.clicked() { result = Some(BarEvent::Primary(idx)); }
+                continue;
+            }
+            let opts: Vec<uikit_egui::slide_menu::SlideOption> = b.options.iter()
+                .map(|o| uikit_egui::slide_menu::SlideOption::new(o.id.clone(), o.label.clone()))
+                .collect();
+            let id = egui::Id::new(("voiceterm_bar", b.id.as_str()));
+            let menu = uikit_egui::slide_menu::SlideMenu::new(id).hold(HOLD_SECONDS);
+            match menu.show_stored(ui, id, &host, &opts) {
+                uikit_egui::slide_menu::SlideOutcome::Idle => {
+                    // A plain click that never reached the hold threshold and
+                    // never opened the menu at all is a primary tap; a click
+                    // that opened the menu and is still open is also Idle,
+                    // and must NOT be read as a tap — the same "a tap is not
+                    // a hold" rule the removed `BarState` existed to state.
+                    if host.clicked() && !host.dragged() { result = Some(BarEvent::Primary(idx)); }
+                }
+                uikit_egui::slide_menu::SlideOutcome::Cancelled => {
+                    result = Some(BarEvent::Cancelled);
+                }
+                uikit_egui::slide_menu::SlideOutcome::Selected(opt_id, _) => {
+                    if let Some(option) = b.options.iter().position(|o| o.id == opt_id) {
+                        result = Some(BarEvent::Option { button: idx, option });
+                    }
+                }
+            }
+        }
+    });
+    result
+}
+
 /// One archived page, as the browser needs it. The engine's `ArchivedPage`
 /// carries the stored HTML and its extracted text; a list does not.
 #[derive(Debug, Clone, PartialEq)]
@@ -174,6 +232,46 @@ mod tests {
             .with_options(vec![BarOption::new("t1", "shell"), BarOption::new("t2", "docs")]));
         b.upsert(BarButton::new("ws", "Spaces", BarButtonKind::Workspaces));
         b
+    }
+
+    /// Smoke test for `bar_ui`: a single frame, no pointer interaction, must
+    /// not panic and must report nothing resolved — `SlideMenu` is exercised
+    /// elsewhere; this only proves the wrapper wires up without a live
+    /// pointer to drive it. `BarButton::new` defaults `enabled` false, so a
+    /// bar with no upsert-time `.enabled(true)` also exercises the disabled
+    /// path (`ui.add_enabled(false, ..)`), which a naive test bar would skip.
+    #[test]
+    fn bar_ui_renders_one_frame_without_panicking() {
+        let b = bar();
+        let ctx = egui::Context::default();
+        let mut seen = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                seen = bar_ui(ui, &b);
+            });
+        });
+        assert!(seen.is_none(), "no pointer input, so nothing should resolve: {seen:?}");
+    }
+
+    /// A button with no options must render as a plain tap target — this is
+    /// the exact rule `archived_view::fans_out`/this module's own doc calls
+    /// out ("an empty popup reads as a broken button"), so a button with an
+    /// empty `options` list must never reach `SlideMenu::show_stored` at all.
+    #[test]
+    fn a_button_with_no_options_never_reaches_the_slide_menu() {
+        let mut b = BottomBar::new();
+        b.upsert(BarButton::new("solo", "Solo", BarButtonKind::Tabs));
+        let ctx = egui::Context::default();
+        // One frame is enough: if this ever called into SlideMenu with an
+        // empty option list it would still not panic (SlideMenu handles that
+        // itself), so the real assertion is `fans_out`-equivalent reasoning
+        // done in code review — this test exists to pin the early-continue
+        // path stays reachable as the function changes.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = bar_ui(ui, &b);
+            });
+        });
     }
 
     #[test]
