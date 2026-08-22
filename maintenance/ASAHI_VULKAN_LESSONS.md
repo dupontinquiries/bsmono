@@ -81,6 +81,38 @@ for later backend labeling; pure parser is unit-tested against an M2-shaped blob
 substring-trap blob, and non-Apple trees.
 
 ### 4. Verification method for the wgpu-29 crates — the harness
+**SUPERSEDED (2026-08-22): they build now.** The paragraph below was true under
+cargo 1.75 and is not under 1.96 — the edition-2024 `indexmap` requirement that
+no `--precise` pin could escape is simply satisfied by the newer cargo. Measured
+this session, in this sandbox:
+
+```
+cargo test -p gpu-gemm --lib          1156 passed, 0 failed
+cargo test -p logscope-fan --lib       295 passed, 0 failed, 1 ignored
+cargo ailite check -p logscope         EXIT=0 in 1m08s
+```
+
+Two cautions, because "it builds" is not "build it any way you like":
+
+* **The profile matters more than the toolchain did.** Plain `cargo check -p
+  logscope` was killed after several minutes with no output — memory, on a 3 GB
+  box, presenting as silence exactly as `SANDBOX_BUILD_LIMITS.md` describes.
+  The same check under `maintenance/tools/cargo-ailite` (debug=0, strip,
+  incremental=false, jobs=1) finished in 68 seconds. If a logscope crate
+  "cannot build", try the profile before believing it.
+* **`logscope-egui` is still untested here** and pulls eframe/glow, so it is
+  the remaining candidate for the harness treatment.
+
+The harness is therefore no longer the *only* option, but it stays the right
+tool for a single std-only module: extracting one file and running
+`rustc --edition 2021 --test` on it verbatim takes seconds and needs no
+dependency graph at all. It was used exactly that way this session to verify
+`logscope::autonomy` and logscope-fan's `liaison_fan`/`reflex`/`pathfan`/
+`styles` before declaring them — five modules that had never been compiled at
+all, because no `mod` line reached them.
+
+*Original note, kept for the record:*
+
 gpu-gemm and the logscope workspace **cannot build on this box at all**: wgpu-core 29 (via
 eframe 0.34/egui-wgpu, and gpu-gemm's own `wgpu = "29"`) hard-requires an edition-2024
 `indexmap`, and no `--precise` pin escapes it under cargo 1.75. Verification therefore ran on an
