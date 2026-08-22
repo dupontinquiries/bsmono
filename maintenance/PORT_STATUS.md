@@ -762,3 +762,52 @@ name in a module doc.
 That does not make `code` useless — it caught WayfinderPage and GroupVoiceBar,
 which is why it exists. It makes it a *lower bound* rather than a score, and the
 gap between the columns is a work queue to check, not a work queue to build.
+
+## Correction: snapclone's named-only list is now current, and it is empty
+
+The table above says snapclone had 32 named-only surfaces with only 6 confirmed
+under a Rust name — as of this session that is stale on both counts. A fresh
+`parity_audit.py` run puts snapclone at 49 surfaces / 25 in code (the surface
+count moved as the source moved), and re-deriving the named-only set directly
+from `surfaces()` / `covered()` / `covered_in_code()` gives **24** names, not 32.
+
+Checked each of the 24 by hand — not by filename pattern-matching, by opening
+the file and reading the actual `pub struct`/`pub fn` — and all 24 are real,
+tested, ported code under an idiomatic Rust name:
+
+| Qt/QML name | lives in | as |
+|---|---|---|
+| ContactCard, ContactPickerDialog, ContactEditorDialog, ConversationSecurityBar | `contacts.rs` | `Contact`, `Picker`, `SecurityBar` |
+| ExportReminderCard | `export_reminder.rs` | `ReminderState` |
+| FocusReticle | `reticle.rs` | `Reticle` |
+| FriendListWidget | `friends.rs` | `Roster` |
+| GlassIconButton | `glass.rs` | glass-effect primitives (`Img`, `downscale`, `box_blur`) |
+| GlassScrim | `modal.rs` | `ModalSurface` / `scrims_ui` |
+| GroupVoiceBar | `voicebar.rs` | `VoiceBar` / `voicebar_ui` |
+| GroupVoiceRoster | `roster.rs` | `Roster` (voice-call variant, distinct from friends') |
+| CarouselAwareScrollArea, HorizontalScrollArea | `scroll_areas.rs` | `Wheel`, `HScroll` |
+| MediaSendSummary | `send_summary.rs` | `SendSummary` |
+| PeerPunchAddrView | `punch_addrs.rs` | `PunchAddrs` |
+| SegmentedTabStrip, PagePeelHint | `nav_chrome.rs` | `TabStrip`/`strip_ui` (moved to `uikit_egui::segmented_tabs`), `PeelHint` |
+| SnapComposerDialog, SnapViewerDialog | `composer.rs` | `Composer`, `Snap` |
+| SnapTile | `tile_strip.rs` | `tile_strip_ui` over `VisibleTile` |
+| SwipeNavigator | `swipe_physics.rs` | `Swipe` |
+| UnifiedNavBar | `unified_nav.rs` | `UnifiedNav` |
+| VideoSnapViewerDialog | `video_viewer.rs` | `VideoViewer` / `video_viewer_ui` |
+| ConversationDetailDialog | `conversation.rs` | `Conversation` |
+
+So the earlier "6 of 32" undercounted for the same reason bo-suite's did: the
+detector cannot match a name the port renamed, and nobody had gone back to
+check the renamed ones by hand since the source moved. Read snapclone's `code`
+column (51%, 25/49) as the same kind of floor as bo-suite's — real coverage is
+close to `named` (100%), not to `code`.
+
+**What is still genuinely open** — not a naming artifact, confirmed by reading
+the code rather than assumed from the table above — is exactly what the
+"Reported defects" section already says: `camera_source.rs` is the *selection*
+layer (`choose()` picks a `Device` + `VideoFormat` via `device-kit`, tested,
+real) but capture itself — actually opening `/dev/videoN` and pumping frames —
+stays host-side by design, since a UI crate that opens a device node cannot be
+tested or run in this sandbox. The viewfinder, ring and voice bar views are
+ported; nothing feeds them a live frame or a live call yet. That gap is
+correctly described already and is not something a sandbox session can close.
