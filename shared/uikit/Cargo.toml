@@ -3,7 +3,7 @@
 # Three library crates, no demo binary here (the demo lives in the exploration):
 #   * uikit-gesture   — dependency-free two-tier gesture model (swipe/fling/pinch/…)
 #   * snapclone-theme — the 9 palettes + design tokens, dependency-free
-#   * uikit-egui      — carved widgets + gesture adapter + theme bridge (egui 0.29)
+#   * uikit-egui      — carved widgets + gesture adapter + theme bridge (egui 0.34)
 #
 # The gesture + theme crates are std-only so they cross-compile trivially to
 # aarch64 / musl / x86_64 / riscv64 — the point of lifting them into shared/.
