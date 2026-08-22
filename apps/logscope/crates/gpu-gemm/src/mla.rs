@@ -502,6 +502,71 @@ mod shape_check_tests {
     /// standard layers, so the trim has to be per-layer or gated on "every
     /// layer is MLA" — and no MLA checkpoint loads at all yet, so there is
     /// nothing to test a fix against.
+
+    /// The MLA loader gap, reproduced END TO END rather than asserted.
+    ///
+    /// Every other statement in this tree about MLA loading is structural — a
+    /// grep over lib.rs (`archcfg::note_claims::mla_loading_is_still_absent`)
+    /// or a comment. This drives the real thing: `Gpu::new`, then
+    /// `load_gguf_opt` over a real MLA checkpoint, and pins where it stops.
+    ///
+    /// That became possible only once two beliefs were retested. The first was
+    /// that this sandbox cannot build these crates (true under cargo 1.75, not
+    /// under 1.96). The second was that there is no GPU here — there is no
+    /// Vulkan ICD and no /dev/dri, but `Gpu::new()` succeeds anyway and real
+    /// dispatches produce correct results, which the view-download test beside
+    /// it has been proving all along. So "no hardware to check against", the
+    /// reason repeatedly given for not touching the MLA loader, was wrong for
+    /// the parts that do not need a real GPU.
+    ///
+    /// The fixture is `tools/tiny-variants/gen_glmdsa.py`, which archcfg's
+    /// deepseek2 note already names as reproducing this "in 3 layers at d=64".
+    /// It was never wired to a test.
+    ///
+    /// Skips when the fixture is absent, like every other fixture-gated test
+    /// here — but unlike them it says so, because a test that silently passes
+    /// by returning early is how this whole area went unexamined. Generate it:
+    ///
+    /// ```text
+    /// python3 tools/tiny-variants/gen_glmdsa.py /tmp/tiny-glmdsa.gguf
+    /// ```
+    #[test]
+    fn an_mla_checkpoint_reaches_the_loader_and_stops_where_the_notes_say() {
+        let path = "/tmp/tiny-glmdsa.gguf";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("SKIPPED: {path} absent — python3 tools/tiny-variants/gen_glmdsa.py {path}");
+            return;
+        };
+
+        // The file itself must carry MLA projections, or this test is checking
+        // nothing. Asserted rather than assumed: the generator could change.
+        let g = crate::gguf::parse(&bytes).expect("fixture parses");
+        assert!(g.tensor("blk.0.attn_kv_a_mqa.weight").is_some(),
+                "fixture has no attn_kv_a_mqa — it is not an MLA checkpoint");
+        assert!(g.tensor("blk.0.attn_k_b.weight").is_some(),
+                "fixture lacks the SPLIT k_b/v_b form this exercises");
+
+        let gpu = crate::Gpu::new();
+        let err = match gpu.load_gguf_opt(&bytes, false) {
+            Ok(_) => panic!(
+                "an MLA checkpoint LOADED. That is the good outcome, and it means the loader gap closed — update archcfg's deepseek2 and glm-dsa notes, mla_loading_is_still_absent, and this test."
+            ),
+            Err(e) => e,
+        };
+
+        // WHERE it stops matters more than THAT it stops. Today the refusal is
+        // the architecture gate (glm-dsa: sparse attention unimplemented),
+        // which fires BEFORE the MLA layer loading would. So closing the MLA
+        // gap alone would not make this fixture load — a reader planning that
+        // work should know the arch gate is in front of it.
+        assert!(err.contains("glm-dsa") || err.contains("MLA") || err.contains("Multi-head Latent"),
+                "refused for an unrelated reason, so this no longer pins the MLA path:\n{err}");
+
+        // And the diagnostic has to name the fixture that reproduces it —
+        // that pointer is the only reason this test could be written.
+        assert!(err.len() > 80, "the refusal should explain itself, got: {err}");
+    }
+
     #[test]
     fn the_dense_cache_an_mla_model_never_reads_dwarfs_the_one_it_uses() {
         // GLM-4.7-Flash (deepseek2), the checkpoint check_shapes documents.
