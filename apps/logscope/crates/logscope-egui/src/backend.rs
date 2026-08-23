@@ -2020,8 +2020,34 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name, bgh as f64 / per);
             let mut pending: Vec<u8> = Vec::new();
             let mut recent = String::new();
             let mut rng = self.rng;
+            // WHY A RESUME PRODUCED NOTHING.
+            //
+            // A fleet run shows 24 consecutive "continued 0 tokens in 0.4s =
+            // 0.00 tok/s" lines on Llama-3.3-8B. gpu-gemm already carries a
+            // note about this shape — it fixed the CONSEQUENCE, a governor that
+            // read each no-op as a clean window and grew its cap 8 -> 2172 on
+            // the evidence of generations that never happened. The cause was
+            // never established, and "0.00 tok/s" is indistinguishable between
+            // a broken session, an empty distribution, and a turn that had
+            // simply already finished.
+            //
+            // The resumed session carries the previous turn's next-token
+            // distribution (`s.logits = old.logits.clone()`), so if that turn
+            // ended by sampling EOS, the resume samples EOS again and stops
+            // before emitting anything. That is not a fault, it is a request to
+            // continue something already complete — but it currently reports
+            // identically to a fault.
+            //
+            // Recorded rather than guessed at: this cannot be reproduced
+            // without the model, so the next run says which it was.
+            let mut first_tok: Option<u32> = None;
+            let mut halt_reason: Option<&'static str> = None;
             let mut step = |next: u32| {
-                if stop.contains(&next) { return false; }
+                if first_tok.is_none() { first_tok = Some(next); }
+                if stop.contains(&next) {
+                    if halt_reason.is_none() { halt_reason = Some("a stop token"); }
+                    return false;
+                }
                 if tok.is_special(next) { return true; }
                 pending.extend_from_slice(&tok.decode_bytes(&[next]));
                 let valid = match std::str::from_utf8(&pending) { Ok(s) => s.len(), Err(e) => e.valid_up_to() };
@@ -2055,6 +2081,26 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name, bgh as f64 / per);
             let secs = td.elapsed().as_secs_f32().max(1e-3);
             crate::diag!("wgpu-engine: [{}] continued {produced} tokens in {secs:.1}s = {:.2} tok/s (warm resume, no prefill{})",
                 self.name, produced as f32 / secs, if sample_win_opt.is_some() { ", windowed" } else { "" });
+            if produced == 0 {
+                // Name the three cases apart. Twenty-four identical zero lines
+                // told the operator nothing except that something was wrong,
+                // and told the governor something false.
+                let why = match (first_tok, halt_reason) {
+                    (Some(t), Some(r)) if Some(t) == eos =>
+                        format!("the resumed distribution's first token was EOS ({t}) — this turn had \
+already finished, so there was nothing to continue. Not a fault: {r} halted it immediately."),
+                    (Some(t), Some(r)) =>
+                        format!("the first sampled token ({t}) was {r}, so generation halted before \
+emitting anything."),
+                    (Some(t), None) =>
+                        format!("the first token ({t}) was sampled but nothing was emitted — a \
+special token or an incomplete UTF-8 sequence swallowed it."),
+                    (None, _) =>
+                        "NO token was sampled at all — the session's logits were empty or the \
+window returned immediately, which is the case that indicates a real fault.".to_string(),
+                };
+                crate::diag!("wgpu-engine: [{}] resume produced nothing — {why}", self.name);
+            }
             if let Some(pool) = self.pool.as_mut() {
                 pool.insert(&self.gpu, seen, prefill_len, s, self.kv_cap * 4);
             } else {
