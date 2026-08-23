@@ -624,9 +624,27 @@ pub fn parse_plan(text: &str) -> Plan {
     // fenced ```plan … ```
     if let Some(start) = text.find("```plan") {
         let after = &text[start + "```plan".len()..];
-        if let Some(end) = after.find("```") {
-            return Plan { steps: lines_to_steps(after[..end].trim()) };
-        }
+        // THE LAST FENCE INSIDE THE PLAN REGION, not the first and not the last
+        // in the document.
+        //
+        // First was wrong: a plan quoting a snippet — "1. add the helper:
+        // ```rust fn h() {}```" — closed at the INNER fence and silently
+        // dropped every step after it. A three-step plan parsed as one.
+        //
+        // Plain `rfind` was ALSO wrong, and I shipped it before the tests said
+        // so: it reaches past the plan into the ```tool blocks that follow and
+        // swallows them, because JSON lines starting with a digit satisfy
+        // `is_list_item`. The comment I wrote claimed over-reach was harmless.
+        // It broke two existing tests immediately.
+        //
+        // So: bound the region at the next block marker first, then take the
+        // last fence within it. That is the same rule `extract_files` uses with
+        // `// file:` headers, and the same instinct `parse_tools` applies via
+        // brace balance.
+        let region_end = after.find("```tool").unwrap_or(after.len());
+        let region = &after[..region_end];
+        let end = region.rfind("\n```").or_else(|| region.find("```")).unwrap_or(region.len());
+        return Plan { steps: lines_to_steps(&strip_nested_fences(after[..end].trim())) };
     }
     // otherwise: a leading run of numbered/bulleted lines (before any tool block)
     let head = text.split("```tool").next().unwrap_or(text);
@@ -642,6 +660,30 @@ fn lines_to_steps(block: &str) -> Vec<PlanStep> {
     block.lines().map(|l| l.trim()).filter(|l| !l.is_empty())
         .map(|l| PlanStep { text: strip_marker(l), done: false }).collect()
 }
+/// Drop lines inside a nested fenced block.
+///
+/// Reaching the whole plan is only half the job: the snippet's own lines then
+/// arrive at `lines_to_steps`, and `fn h() {}` does not start with a digit or a
+/// bullet — but plenty of quoted code does. A three-step plan came back as six
+/// "steps", four of which were the snippet and its fence markers.
+///
+/// The content of a quoted block is never a step; it is what a step is about.
+fn strip_nested_fences(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut inside = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            inside = !inside;
+            continue;
+        }
+        if !inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn is_list_item(l: &str) -> bool {
     l.starts_with("- ") || l.starts_with("* ") ||
     l.chars().next().map_or(false, |c| c.is_ascii_digit()) && l.contains(['.', ')'])
@@ -2087,7 +2129,33 @@ error: could not compile `demo` (lib) due to 3 previous errors
         assert_eq!(r.output, "a_dir/\nb.txt"); // sorted, .git hidden
     }
 
-        #[test]
+    /// A plan that quotes code must not stop at the quote.
+    ///
+    /// `parse_tools` handles nested fences via brace balance and has a test
+    /// saying so; `parse_plan`, twenty lines away, used the naive first-fence
+    /// rule. A three-step plan with one snippet in it parsed as ONE step and
+    /// the rest vanished — no error, no truncation marker, just a shorter plan.
+    #[test]
+    fn a_plan_quoting_code_keeps_the_steps_after_the_snippet() {
+        let t = "```plan\n1. add the helper:\n```rust\nfn h() {}\n```\n\
+2. wire it into main\n3. run the tests\n```\n";
+        let p = parse_plan(t);
+        assert_eq!(p.steps.len(), 3,
+            "steps after the nested fence were dropped: {:?}",
+            p.steps.iter().map(|s| &s.text).collect::<Vec<_>>());
+        assert!(p.steps[2].text.contains("run the tests"));
+    }
+
+    #[test]
+    fn a_plan_without_nested_fences_is_unchanged() {
+        let t = "```plan\n1. one\n2. two\n```\ntrailing prose\n";
+        let p = parse_plan(t);
+        assert_eq!(p.steps.len(), 2);
+        assert!(!p.steps.iter().any(|s| s.text.contains("trailing")),
+                "the last-fence rule must not swallow text after the block");
+    }
+
+    #[test]
     fn tool_block_with_nested_fences_in_contents() {
         // A write_file whose CONTENTS contain markdown fences (README with ```rust examples) must not be
         // truncated at the inner fence — the block ends at the fence where the JSON is brace-balanced.
