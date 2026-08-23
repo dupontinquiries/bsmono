@@ -138,9 +138,18 @@ pub mod ctx {
                     force_fallback_adapter: false,
                 })
                 .await
-                .ok_or_else(|| "no suitable GPU adapter".to_string())?;
+                // wgpu 29 returns Result here, not Option. This said
+                // `.ok_or_else(..)`, which is the wgpu <= 27 shape — the crate
+                // pins 29 but the only code path that touches wgpu is behind an
+                // off-by-default feature, so nothing ever compiled it. The
+                // description promises "a pinned wgpu version"; it was pinned
+                // to a version this code had never been built against.
+                .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
             let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor::default(), None)
+                // Second churn point: wgpu 29 dropped `request_device`'s
+                // trace-path argument. Same cause as the line above — a pinned
+                // version nothing behind the gate had ever been compiled at.
+                .request_device(&wgpu::DeviceDescriptor::default())
                 .await
                 .map_err(|e| format!("request_device: {e}"))?;
             Ok(Gpu { instance, adapter, device, queue })

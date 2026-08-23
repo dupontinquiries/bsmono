@@ -20,7 +20,15 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 touchkit = { path = "../../../touchkit", features = ["egui"] }
-eframe = { version = "0.34", optional = true, default-features = false, features = ["glow"] }
+# `glow` alone leaves winit with NO Linux backend compiled, so the `demo`
+# feature failed to build anywhere on Linux with "The platform you're compiling
+# for is not supported by winit" — not a sandbox limitation, since the error is
+# a cfg check rather than a missing system library. Off by default, so no
+# ordinary build ever touched it and nothing noticed. scene-kit, krapper and
+# voiceterm's frontend all already spell it "glow", "wayland", "x11"; this was
+# the outlier. Found by feature_sweep.sh, which is the reason that tool checks
+# non-default features.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 egui = "0.34"
 uikit-gesture = { path = "../uikit-gesture" }
 
