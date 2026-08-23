@@ -44,6 +44,7 @@ mod custom;
 mod partcars;
 mod partdata;
 mod palevector;
+mod parity;
 mod patrol;
 mod perception;
 mod trials;
@@ -570,6 +571,7 @@ fn parse_args() -> Opts {
                 println!("  --powers       the human interface: what each power costs its host");
                 println!("  --keys         the live control scheme, overlaps and all");
                 println!("  --brain [what]  squad commanders: doctrines, the LLM seam, the wire");
+                println!("  --parity       invariants living at more than one call site");
                 println!("  --aboard [len] walk the ship: rooms, consoles, sealed doors");
                 println!("  --rescale      what a real-sized robot costs, per constant");
                 println!("  --guidance     the ball-chaser as a missile: pursuit vs PN");
@@ -1158,6 +1160,10 @@ fn main() {
     }
     if argv.iter().any(|a| a == "--brain") {
         brain::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--parity") {
+        parity::run();
         return;
     }
     if argv.iter().any(|a| a == "--aboard") {
@@ -6059,7 +6065,14 @@ impl Game {
             ship.sense_doors(at - *origin);
             ship.step_doors(dt);
             for (i, l) in ship.links.iter().enumerate().take(32) {
-                if l.door.void().is_some() {
+                // `passable()`, matching what `hull_mesh` now draws on. This
+                // read `void()` — so the mask flipped at travel 0.01 while
+                // the mesh changes at 0.75, and the hull was re-uploaded on
+                // frames where nothing about it had changed. Harmless and
+                // wasteful, and it is the same two-answers-to-one-question
+                // mistake `--parity` exists to find. The scan caught this one
+                // in my own code, written an hour after I wrote the scan.
+                if l.door.passable() {
                     doors_now |= 1 << i;
                 }
             }

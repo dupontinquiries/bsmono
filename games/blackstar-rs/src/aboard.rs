@@ -225,7 +225,19 @@ pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
         merge(&mut out, &b);
     }
     for l in &ship.links {
-        // a shut door is hull, so there is no corridor to draw through it
+        // ASK THE ROUTING QUESTION, NOT THE GEOMETRY ONE. This read
+        // `Door::void()`, which is `travel > 0.01` — so a door a hundredth of
+        // the way open had a corridor drawn through it while
+        // `reachable_from`, which wants `passable()` at `travel > 0.75`,
+        // called it shut. Between the two you could SEE through a door the
+        // game said was closed.
+        //
+        // Neither function is wrong: `void` is about geometry and `passable`
+        // is about whether a body fits. The mesh wants the second, because
+        // the mesh is what tells a player where they can go.
+        if !l.door.passable() {
+            continue;
+        }
         let Some((_, h)) = l.door.void() else { continue };
         let mut b = cbox(0.03);
         bake(&mut b, l.half.min(h * 4.0) * 2.0, Quat::IDENTITY, l.centre);

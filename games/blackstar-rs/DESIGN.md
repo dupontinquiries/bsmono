@@ -6394,6 +6394,42 @@ which names the bug in the failure. Verified in both directions this time.
 
 1127 passing.
 
+PARITY TESTS AND A SCAN, AND THE SCAN FOUND TWO THINGS I DID NOT KNOW ABOUT.
+
+The bug class: an invariant with more than one implementation is a divergence
+waiting for nobody to notice. `--parity` greps live code for expressions that
+look open-coded, skipping test modules because a test that models OLD
+behaviour open-codes deliberately — `seating_tests` does exactly that, and a
+scan that flags it teaches people to ignore the scan.
+
+FIRST FIND: THE MESH AND THE ROUTER DISAGREED ABOUT DOORS. `hull_mesh` carved
+a corridor on `Door::void()`, which is `travel > 0.01`. `reachable_from`
+routes on `Door::passable()`, which is `travel > 0.75`. Between them is a band
+three quarters wide where a corridor is DRAWN and NOT ROUTABLE — you could see
+through a door the game called shut.
+
+Neither function is wrong. `void` is geometry, `passable` is whether a body
+fits, and a half-open door genuinely is a hole you cannot walk through. What
+was wrong is that the MESH asked the geometry question when it wanted the
+routing one — the mesh is what tells a player where they can go.
+
+SECOND FIND: MY OWN `door_mask`, WRITTEN AN HOUR AFTER THE SCAN. It decided
+when to re-upload the hull using `void()` while the mesh draws on
+`passable()`, so the mask flipped at 0.01 and the geometry changed at 0.75.
+Harmless and wasteful, and exactly the mistake the scan exists to find.
+
+AND THE PARITY TEST NEEDED TWO GOES, AGAIN FOR A MEASUREMENT I ASSUMED. It
+counts corridors by vertex arithmetic and I divided by 8 verts per box;
+`cbox` is BEVELLED and has more, so it read 247 corridors where there were 9.
+Fixed by taking the per-corridor cost from the mesh itself — all doors open
+minus all shut, over the link count — rather than from a number in my head.
+
+Verified by reintroducing the divergence: it fails at step 8 with "9 corridors
+drawn, 2 routable". That check is the point, and it is the one I skipped the
+first time I wrote a regression test in this session.
+
+1133 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
