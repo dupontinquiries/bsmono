@@ -6238,6 +6238,39 @@ pointing at the neighbour that already said so.
 
 1119 passing.
 
+THREE MORE JOINS, AND THE DOORS HAD NEVER MOVED.
+
+`step_doors` existed, `Door::update` animated travel, `passable()` read it —
+and NOTHING TICKED THE CLOCK. Every door in the game has been frozen at
+whatever state it generated in, invisibly, because the ship was scenery and
+nobody could walk into one.
+
+THE CAMERA HAD TO COME IN. A 4.9 m chase boom is fine on a field and wrong in
+a corridor: the eye ends up outside the hull looking at the back of a wall,
+which reads as the ship VANISHING rather than as a bad clamp. It walks the
+boom in until the eye is in open volume, after the boom and before the shake,
+because it is a correction to a position rather than an input to one.
+
+`camera.rs` takes a CLOSURE — "is this point clear" — rather than a reference
+to the interior, so it does not learn about ships. That needed `Interior:
+Clone`, since a closure cannot borrow the world it is stored beside; eight
+cells and nine links is cheaper than a refcount and much cheaper than teaching
+the camera a new concept.
+
+AND THE SHIP WOULD HAVE VANISHED ON A MAP CHANGE. `World::generate` returns
+`parked: None`, so `load_map` silently unparked the hull — which would still
+DRAW, because the mesh slot lives on the gpu, and stop being solid. A hull you
+can see and walk through is worse than one that is not there: it reads as
+collision being broken. `repark` is now the single place that parks and both
+world-building paths call it.
+
+I ALSO ASSERTED SOMETHING FALSE ABOUT MY OWN FUNCTION. The door test claimed
+`unseal` animates. It sets `travel = 1.0` outright — it is "the ship is
+powered", a state, not an animation. What animates is `depower`, and the test
+now measures that instead.
+
+1121 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

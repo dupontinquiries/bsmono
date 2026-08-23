@@ -114,6 +114,13 @@ pub struct Camera {
     /// rather than a camera of its own, so ball cam, the gravity-aware up
     /// and the terrain clamp all keep working underneath it.
     pub look_yaw: f32,
+    /// Set while the player is inside a ship: "is this point open volume".
+    ///
+    /// A closure rather than a reference to the interior, so `camera.rs` does
+    /// not learn about ships — it needs to know whether a point is clear, and
+    /// nothing else. The terrain clamp already works this way in spirit.
+    #[allow(clippy::type_complexity)]
+    pub indoors: Option<Box<dyn Fn(Vec3) -> bool>>,
     pub look_pitch: f32,
     /// AUTOTARGET. Ball cam is a point-of-interest camera that happens to
     /// have been given the ball; hand it something else and the same rig
@@ -143,6 +150,7 @@ impl Camera {
             shake: 0.0,
             shake_t: 0.0,
             look_yaw: 0.0,
+            indoors: None,
             look_pitch: 0.0,
             poi: None,
             nose_cam: false,
@@ -359,6 +367,26 @@ impl Camera {
         };
         let want_look = aim + self.up * (0.35 - tilt);
         self.look += (want_look - self.look) * (1.0 - (-14.0 * cfg.stiffness * dt).exp());
+
+        // INDOORS THE BOOM HAS TO COME IN. A 4.9 m chase distance is fine on
+        // a field and wrong in a corridor: the eye ends up outside the hull
+        // looking at the back of a wall, which reads as the ship vanishing.
+        //
+        // Pulled toward the subject until the eye is in open volume. Done
+        // here, after the boom and before the shake, because it is a
+        // correction to a position rather than an input to one — and the
+        // shake should still be able to nudge it.
+        if let Some(clear) = &self.indoors {
+            let mut t = 1.0;
+            for _ in 0..8 {
+                let p = self.look + (self.pos - self.look) * t;
+                if clear(p) {
+                    break;
+                }
+                t *= 0.7;
+            }
+            self.pos = self.look + (self.pos - self.look) * t;
+        }
 
         self.shake_t += dt;
         self.shake = (self.shake - dt * 2.2).max(0.0);

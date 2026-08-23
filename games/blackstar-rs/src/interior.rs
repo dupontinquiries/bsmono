@@ -109,6 +109,13 @@ pub struct Link {
     pub door: Door,
 }
 
+/// Cloneable so the camera can hold a probe.
+///
+/// `camera.rs` takes a closure asking "is this point open volume", and a
+/// closure cannot borrow the world it is stored next to. Cloning is cheap
+/// here — eight cells and nine links — and far cheaper than teaching the
+/// camera about ships or wrapping the world in a refcount.
+#[derive(Clone)]
 pub struct Interior {
     pub cells: Vec<Cell>,
     pub links: Vec<Link>,

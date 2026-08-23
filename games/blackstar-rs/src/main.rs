@@ -1936,12 +1936,13 @@ fn main() {
     {
         let mut ab = std::mem::replace(&mut game.aboard, aboard::Aboard::new(1.0));
         ab.upload_hull(&mut game.gpu);
+        game.aboard = ab;
         // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
         // one object is how a hull you can see and a hull you can hit end up
-        // in different places, so both read `ground_lift`.
-        let at = Vec3::new(0.0, aboard::ground_lift(&ab.ship), 0.0);
-        game.world.park(at, aboard::Aboard::new(70.0).ship);
-        game.aboard = ab;
+        // in different places, so both read `ground_lift` — and this is the
+        // same call `load_map` makes, so there is ONE place that parks rather
+        // than a launch path and a map path that can drift.
+        game.repark();
     }
 
     // ---- launch-time multiplayer: bsgames handoff first, then CLI ---------
@@ -2247,6 +2248,14 @@ impl Game {
         self.car.reset(&self.world);
         apply_car_dims(&mut self.car, &self.cars.models[dims_i], self.cfg.car.size);
         self.ball.reset_in_front(&self.car);
+        // THE SHIP SURVIVES A MAP CHANGE. `World::generate` builds a fresh
+        // world with `parked: None`, so loading a map silently unparked the
+        // hull — it would still DRAW, because the mesh slot lives on the gpu,
+        // and stop being solid. A hull you can see and walk through is worse
+        // than one that is not there, because it reads as collision being
+        // broken rather than as the ship being gone.
+        self.repark();
+
         self.fx = fx::Fx::new(seed);
         self.bots.clear();
         self.game_mode = 0;
@@ -5973,7 +5982,49 @@ impl Game {
     /// An EVENT, not a state: the room is a fact every frame, and a HUD line
     /// that reprints it sixty times a second is noise. Only the transition is
     /// worth saying, and the useful thing to say is what you can do here.
+    /// Put the ship back in the world, wherever the world came from.
+    ///
+    /// The single place that parks. `World::generate` returns
+    /// `parked: None`, so every path that builds a world has to call this or
+    /// the hull keeps drawing and stops being solid.
+    fn repark(&mut self) {
+        let at = Vec3::new(0.0, aboard::ground_lift(&self.aboard.ship), 0.0);
+        self.world.park(at, self.aboard.ship.clone());
+        self.last_room = None;
+        self.cam.indoors = None;
+    }
+
     fn tick_aboard(&mut self) {
+        // THE DOORS HAVE NEVER MOVED. `step_doors` exists, `Door::update`
+        // animates travel, `passable()` reads it — and nothing ticked the
+        // clock, so every door in the game has been frozen at whatever state
+        // it was generated in. The ship being scenery is why nobody noticed.
+        let dt = 1.0 / 60.0;
+        if let Some((_, ship)) = self.world.parked.as_mut() {
+            ship.step_doors(dt);
+        }
+
+        // and the camera: pull the boom in while the player is inside, or it
+        // sits outside the hull looking at the back of a wall
+        let inside = self
+            .world
+            .parked
+            .as_ref()
+            .map(|(o, ship)| (*o, ship.room_at(self.car.pos - *o).is_some()))
+            .unwrap_or((Vec3::ZERO, false));
+        if inside.1 {
+            if self.cam.indoors.is_none() {
+                if let Some((origin, ship)) = self.world.parked.as_ref() {
+                    let o = *origin;
+                    let probe = ship.clone();
+                    self.cam.indoors =
+                        Some(Box::new(move |p: Vec3| probe.walkable(p - o)));
+                }
+            }
+        } else if self.cam.indoors.is_some() {
+            self.cam.indoors = None;
+        }
+
         let now = self
             .world
             .parked

@@ -482,6 +482,61 @@ mod tests {
     }
 
     #[test]
+    fn the_doors_move_when_something_ticks_them() {
+        // `step_doors` existed, `Door::update` animated travel, `passable`
+        // read it — and NOTHING TICKED THE CLOCK, so every door in the game
+        // was frozen at whatever state it generated in. Invisible while the
+        // ship was scenery.
+        let mut ship = Interior::generate(70.0);
+        let shut = ship.links.iter().filter(|l| l.door.passable()).count();
+        assert_eq!(shut, 0, "a freshly generated ship has open doors");
+
+        // `unseal` sets travel to 1.0 OUTRIGHT — it is "the ship is powered",
+        // a state rather than an animation, and I asserted it animated and
+        // was wrong about my own function. What animates is `depower`, which
+        // sets them CLOSING and lets the clock run them shut.
+        ship.unseal();
+        assert!(
+            ship.links.iter().all(|l| l.door.passable()),
+            "unseal did not open everything at once"
+        );
+
+        ship.depower();
+        let immediately = ship.links.iter().filter(|l| l.door.passable()).count();
+        for _ in 0..240 {
+            ship.step_doors(1.0 / 60.0);
+        }
+        let after = ship.links.iter().filter(|l| l.door.passable()).count();
+        assert!(
+            after < immediately,
+            "the doors never shut: {immediately} passable before ticking, {after} after"
+        );
+    }
+
+    #[test]
+    fn the_camera_probe_finds_open_volume() {
+        // the clamp walks the boom in until the eye is in open volume. If
+        // `walkable` were inverted the camera would clamp INTO the wall,
+        // which looks like the ship vanishing rather than like a bad clamp.
+        let a = Aboard::new(70.0);
+        let inside = a.ship.stand_in("bridge").unwrap();
+        assert!(a.ship.walkable(inside), "the bridge is not open volume");
+        let wall = a.ship.hull_half * 0.95;
+        assert!(!a.ship.walkable(wall), "the hull corner is open volume");
+        // and the walk-in terminates somewhere clear
+        let mut t = 1.0f32;
+        let eye = inside + Vec3::new(0.0, 2.0, 40.0); // well outside
+        for _ in 0..8 {
+            if a.ship.walkable(inside + (eye - inside) * t) {
+                break;
+            }
+            t *= 0.7;
+        }
+        assert!(a.ship.walkable(inside + (eye - inside) * t), "the clamp never found air");
+        assert!(t < 1.0, "the eye was already inside and did not need clamping");
+    }
+
+    #[test]
     fn the_broad_phase_keeps_the_ship_off_the_hot_path() {
         // `World::sdf` runs per contact per frame and `sdf_local` walks every
         // cell and every link. The hull box test has to reject the common
