@@ -538,6 +538,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   confirmed draft, reopen the menu) rather than a fake live match — the
   separate "--play wiring in app.rs" item below is what a real Battleground
   match needs, and isn't done yet.
+- [x] `draft.rs` — the pick screen's logic, headless so the TTY client, a future menu and the
+  tests share one set of rules: names resolve by warrior *or* species ("stillsmoke" or
+  "suanni"), no duplicates within a clan, undo, autofill, and a deterministic counter-pick
+  that scores each remaining ancestor against what you brought (reach or a gap-closer for
+  thin pelts, the sun-priest's light for veils, speed against siege, burst against menders).
+  Deterministic on purpose: an opponent you cannot predict is only unfair, and a rule you
+  can read is a rule you can learn to beat.
+- [x] `battleground_play --roster` prints the thirteen with their stats and passives;
+  `--draft` runs the pick screen and starts the match against the counter-picked clan.
+- [x] The counter excludes your own picks. The *rules* allow a mirror (side_probe needs it),
+  but answering a sun-priest by bringing the same sun-priest reads as a shrug.
+  MERGE NOTE: the draft exists TWICE after the split — `menu.rs`'s `Screen::Draft` above
+  (this side, GUI-facing) and `draft.rs` here (incoming, headless + TTY). Both kept: the
+  headless one is where the rules belong and the menu one is already wired to `app.rs`.
+  Collapsing menu.rs onto draft.rs is the obvious follow-up and is not done.
 - [x] Map fairness: the mid trail crosses the wide river basin (a genuine "river lane" —
   Rainspots country) — extend mapeval to grade lane water-fractions per clan side.
   `mapeval::lane_water_report(camp_a, camp_b, bends, samples)`: per lane, the water

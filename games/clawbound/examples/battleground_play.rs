@@ -24,6 +24,7 @@
 
 use clawbound_rs::ancestor::{self, Ancestor};
 use clawbound_rs::battleground::{Battleground, Carry, Mind, Role, CLAN_A};
+use clawbound_rs::draft::{roster_line, Draft};
 use std::io::{BufRead, Write};
 
 const W: usize = 78;
@@ -217,6 +218,51 @@ fn beat(bg: &mut Battleground, input: (f32, f32, bool, Option<usize>)) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // `--roster` prints the thirteen and exits; a player choosing between kits
+    // should not have to read ancestor.rs to find out what they do.
+    if args.iter().any(|a| a == "--roster") {
+        for a in ancestor::ALL {
+            println!("{}", roster_line(a));
+        }
+        return;
+    }
+
+    // `--draft` runs the pick screen: your three, then a clan chosen against
+    // them (see draft.rs — the counter is deterministic, so it can be learned).
+    if args.iter().any(|a| a == "--draft") {
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        let mut d = Draft::new();
+        while !d.full() {
+            for a in ancestor::ALL {
+                let taken = d.picks.contains(&a);
+                println!("{} {}", if taken { "·" } else { " " }, roster_line(a));
+            }
+            print!("pick {} of 3 (name, or 'undo') > ", d.picks.len() + 1);
+            let _ = std::io::stdout().flush();
+            let Some(Ok(line)) = lines.next() else { return };
+            if line.trim() == "undo" {
+                d.undo();
+                continue;
+            }
+            match d.pick(&line) {
+                Ok(a) => println!("  {} joins your clan.\n", ancestor::kit(a).name),
+                Err(e) => println!("  {}\n", e.say()),
+            }
+        }
+        let mine = d.autofill();
+        let theirs = d.counter();
+        println!(
+            "\nyour clan: {}\nthey answer with: {}\n",
+            mine.iter().map(|&a| ancestor::kit(a).name).collect::<Vec<_>>().join(", "),
+            theirs.iter().map(|&a| ancestor::kit(a).name).collect::<Vec<_>>().join(", "),
+        );
+        let mut bg = Battleground::new_draft(mine, theirs);
+        play_loop(&mut bg, lines);
+        return;
+    }
+
     let who = args.get(1).map(|s| s.as_str()).unwrap_or("lion");
     let mut bg = Battleground::new(pick(who));
 
@@ -243,10 +289,15 @@ fn main() {
     }
 
     let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
+    let lines = stdin.lock().lines();
+    play_loop(&mut bg, lines);
+}
+
+/// The interactive loop, shared by the plain and drafted entries.
+fn play_loop<I: Iterator<Item = std::io::Result<String>>>(bg: &mut Battleground, mut lines: I) {
     loop {
-        println!("{}", draw(&bg));
-        print!("{}", hud(&bg));
+        println!("{}", draw(bg));
+        print!("{}", hud(bg));
         if let Some(o) = bg.outcome {
             println!(
                 "\n{}",
@@ -267,12 +318,12 @@ fn main() {
         let mut acted = false;
         for c in line.chars() {
             if let Some(i) = key(c) {
-                beat(&mut bg, i);
+                beat(bg, i);
                 acted = true;
             }
         }
         if !acted {
-            beat(&mut bg, (0.0, 0.0, false, None));
+            beat(bg, (0.0, 0.0, false, None));
         }
     }
 }
