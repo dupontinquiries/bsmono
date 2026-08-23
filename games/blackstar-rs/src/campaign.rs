@@ -218,6 +218,17 @@ impl MissionRun {
     }
 
     /// Nightfall dress: an element burn and, some weeks, no field repair.
+    /// Arrive weakened. `loss` is 0..1 off the engagement's power.
+    ///
+    /// A method rather than a public field, because `power` is resolved once
+    /// against the mission's recommended energon and the invariant is that
+    /// nothing moves it afterwards except a NAMED cost — a landing, a burn.
+    /// Opening the field would make that invariant a convention.
+    pub fn arrived_badly(mut self, loss: f32) -> MissionRun {
+        self.power *= (1.0 - loss).clamp(0.05, 1.0);
+        self
+    }
+
     pub fn with_modifiers(mut self, burn: Option<Element>, exposure: bool) -> MissionRun {
         self.burn = burn;
         self.exposure = exposure;

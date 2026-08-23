@@ -105,9 +105,19 @@ fixed, and moving between them is a position and a walkable check.
 
 ### 3. Campaign missions you can play
 
-- [ ] `content::MISSIONS` has fifteen with sites, beats and gates.
-      `curriculum.rs` asserts each teaches one mechanic exactly once.
-      **None of them can be started from inside the game.**
+- [x] **A sortie flies to its destination before it resolves.** The Bridge
+      offers the next mission, the board advances, and the report now reads
+      *"the_pluto_line — clean drop on PLUTO — nightfall CLEARED"*. The chain
+      is `MISSIONS.dest -> patrol -> ground_for -> drop -> MissionRun`.
+- [x] **Arriving badly costs something.** A scattered landing takes up to 35%
+      off the engagement's power via `MissionRun::arrived_badly` — a named
+      method rather than a public field, because `power` is resolved once and
+      the invariant is that only a named cost moves it. This is the first
+      thing in the game where getting somewhere badly has a consequence at the
+      far end.
+- [ ] The mission itself is still `MissionRun::resolve` — a simulation, not
+      something you play. That is the renderer boundary, and it is the same
+      one the whole campaign sits behind.
 - [ ] `stations.rs` gives the ship consoles that plot and resolve — the
       Chartroom loop works — but resolution is a simulation, not a mission.
       The renderer is the boundary and always has been.

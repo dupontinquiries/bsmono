@@ -6064,6 +6064,35 @@ boarding means.
 
 1106 passing.
 
+A SORTIE FLIES TO ITS DESTINATION NOW. "Resolved, not flown" was the honest
+label on the Bridge for as long as there was nothing to fly. There is: a
+mission names a `dest`, `patrol` knows that world's gravity and surface, and
+`drop.rs` flies the fall — so the chain runs
+
+    MISSIONS.dest -> patrol -> mapsim::ground_for -> drop -> MissionRun
+
+and the report reads "the_pluto_line — clean drop on PLUTO — nightfall
+CLEARED". The board advances; two clears in and the Bridge offers
+`the_scavenger_king`.
+
+AND ARRIVING BADLY COSTS SOMETHING, which is the part worth having. A
+scattered landing takes up to 35% off the engagement's power — the first
+thing in this game where getting somewhere badly has a consequence at the far
+end rather than being scenery.
+
+`MissionRun::arrived_badly` is a METHOD, not a public field. `power` is
+resolved once against the mission'"'"'s recommended energon and the invariant is
+that nothing moves it afterwards except a NAMED cost — a landing, a burn.
+Opening the field would turn that invariant into a convention, and the
+compiler told me it was private, which was the right answer.
+
+A test asserts every one of the fifteen missions goes somewhere `patrol`
+knows, because a mission whose dest is off the route would silently skip the
+drop — which looks like the feature being off rather than the data being
+wrong.
+
+1110 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -302,6 +302,42 @@ fn unexamined(sb: &Shipboard) -> Vec<&'static crate::provenance::Finding> {
         .collect()
 }
 
+/// What happened on the way in.
+pub struct Arrival {
+    /// a phrase for the report line
+    pub line: String,
+    /// how much the landing cost the squad, 0..1 off their effective strength
+    pub penalty: f32,
+}
+
+/// Fly a mission's descent before it resolves.
+///
+/// The join the campaign has never had: a mission names a `dest`, `patrol`
+/// knows that world's gravity and surface, and `drop.rs` flies the fall. A
+/// scattered landing is the first thing in this game where arriving badly
+/// costs you at the far end rather than being scenery.
+pub fn arrive_at(dest: &str) -> Arrival {
+    let Some(d) = crate::patrol::ROUTE.iter().find(|d| d.id == dest) else {
+        return Arrival { line: String::new(), penalty: 0.0 };
+    };
+    if is_dock(d) {
+        return Arrival { line: "docked —".into(), penalty: 0.0 };
+    }
+    let g = crate::mapsim::ground_for(d);
+    let l = fly_the_drop(d, &g);
+    // a clean drop is free; a scattered one hurts, capped so a bad landing is
+    // a setback rather than a loss before the fight starts
+    let penalty = ((l.miss_distance - 20.0) / 300.0).clamp(0.0, 0.35);
+    let line = if l.miss_distance < 20.0 {
+        format!("clean drop on {} —", d.name)
+    } else if penalty < 0.2 {
+        format!("loose drop on {} ({:.0} m) —", d.name, l.miss_distance)
+    } else {
+        format!("SCATTERED on {} ({:.0} m) —", d.name, l.miss_distance)
+    };
+    Arrival { line, penalty }
+}
+
 /// Fly the descent for a destination, in simulation.
 ///
 /// The first time `patrol`, `mapsim` and `drop` run in sequence rather than
@@ -947,8 +983,26 @@ pub fn run_order(order: &Order) -> (String, bool) {
         return (format!("{order:?}"), false);
     };
 
+    // THE DROP COMES FIRST. A sortie used to go straight from the Bridge to a
+    // resolved result — "resolved, not flown" was the honest label and there
+    // was nothing to fly. There is now: the mission has a `dest`, `patrol` has
+    // its physics, and `drop.rs` flies the descent.
+    //
+    // A scattered landing costs you: the squad arrives spread and starts the
+    // engagement worse. That is the first thing in this game where getting
+    // somewhere badly has a consequence at the far end.
+    let arrival = arrive_at(m.dest);
+
     let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
     let mut run = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, have);
+    // SPEND THE PENALTY. `power` is the multiplier the whole engagement runs
+    // on, resolved once against the mission's recommended energon — which is
+    // exactly where arriving badly belongs. A cost that costs nothing is
+    // decoration, and this is the first consequence in the game for getting
+    // somewhere badly.
+    if arrival.penalty > 0.0 {
+        run = run.arrived_badly(arrival.penalty);
+    }
     if let Some(c) = &card {
         run = run.with_modifiers(Some(c.burn), c.exposure);
     }
@@ -956,7 +1010,10 @@ pub fn run_order(order: &Order) -> (String, bool) {
     let won = run.resolve(600.0);
 
     if !won {
-        return (format!("{} — lost. the squad did not hold (resolved)", m.id), false);
+        return (
+            format!("{} — {} lost. the squad did not hold", m.id, arrival.line),
+            false,
+        );
     }
     let mut sv = sv;
     let fresh = camp.record(m.id);
@@ -969,8 +1026,9 @@ pub fn run_order(order: &Order) -> (String, bool) {
     let what = if card.is_some() { "nightfall" } else { "sortie" };
     (
         format!(
-            "{} — {what} CLEARED (resolved, not flown){}",
+            "{} — {} {what} CLEARED{}",
             m.id,
+            arrival.line,
             if fresh { "" } else { "; already on the board" }
         ),
         true,
@@ -1055,6 +1113,71 @@ mod tests {
                 "Shipboard loads sv.{field} and never writes it back"
             );
         }
+    }
+
+    #[test]
+    fn a_sortie_flies_to_its_destination_before_it_resolves() {
+        // "resolved, not flown" was the honest label when there was nothing
+        // to fly. The mission names a dest, patrol knows its physics, and
+        // drop.rs flies the fall — so the report says where it landed.
+        for m in crate::content::MISSIONS.iter().take(6) {
+            let a = arrive_at(m.dest);
+            assert!(
+                !a.line.is_empty(),
+                "{} goes to '{}' and the drop said nothing",
+                m.id,
+                m.dest
+            );
+            assert!((0.0..=0.35).contains(&a.penalty), "{}: {}", m.id, a.penalty);
+        }
+    }
+
+    #[test]
+    fn every_mission_goes_somewhere_the_route_knows() {
+        // a mission whose dest is not on the route silently skips the drop,
+        // which would look like the feature being off rather than the data
+        // being wrong
+        for m in crate::content::MISSIONS {
+            assert!(
+                crate::patrol::ROUTE.iter().any(|d| d.id == m.dest),
+                "{} goes to '{}', which is not a destination",
+                m.id,
+                m.dest
+            );
+        }
+    }
+
+    #[test]
+    fn arriving_badly_costs_the_engagement() {
+        // a cost that costs nothing is decoration. `power` is the multiplier
+        // the whole fight runs on and `arrived_badly` is the only named way
+        // to move it after it is resolved.
+        use crate::campaign::{MissionRun, DEFAULT_DOCTRINE, DEFAULT_SQUAD};
+        let m = &crate::content::MISSIONS[0];
+        let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
+        let clean = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40);
+        let rough = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40).arrived_badly(0.3);
+        // resolve both from the same start and the weakened one should not do
+        // better
+        let mut a = clean;
+        let mut b = rough;
+        let (wa, wb) = (a.resolve(600.0), b.resolve(600.0));
+        assert!(wa || !wb, "arriving scattered helped");
+        // and the loss is clamped so a bad landing is a setback, not a loss
+        let floored = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40).arrived_badly(5.0);
+        let mut f = floored;
+        let _ = f.resolve(600.0); // must not panic or hang
+    }
+
+    #[test]
+    fn docking_costs_nothing_because_there_is_no_drop() {
+        let a = arrive_at("outer_rim");
+        assert_eq!(a.penalty, 0.0);
+        assert!(a.line.contains("docked"), "{}", a.line);
+        // and an unknown destination is silent rather than free-with-a-line
+        let none = arrive_at("nowhere_at_all");
+        assert!(none.line.is_empty());
+        assert_eq!(none.penalty, 0.0);
     }
 
     #[test]
