@@ -1950,6 +1950,21 @@ fn main() {
         // same call `load_map` makes, so there is ONE place that parks rather
         // than a launch path and a map path that can drift.
         game.repark();
+        // A ONE-LINE PROOF THE WIRING RAN. Reported at startup because
+        // "the game runs exactly as it did before" and reading the code
+        // could not distinguish a change that does not execute from a change
+        // that does nothing visible.
+        if let Some((o, ship)) = game.world.parked.as_ref() {
+            eprintln!(
+                "[ship] hull {:.1} m, {} rooms, slot {:?}, parked at {:.1},{:.1},{:.1}",
+                ship.hull_half.x * 2.0,
+                ship.cells.len(),
+                game.aboard.hull_slot,
+                o.x, o.y, o.z
+            );
+        } else {
+            eprintln!("[ship] NOT PARKED");
+        }
     }
 
     // ---- launch-time multiplayer: bsgames handoff first, then CLI ---------

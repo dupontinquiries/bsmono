@@ -824,7 +824,18 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     }
     let d = world.sdf(car.pos);
     let n = world.normal(car.pos);
-    let clearance = car.half_h;
+    // THE FRAME'S FEET, NOT ITS MIDDLE. This was `car.half_h`, so every
+    // contact test in the driving loop — grounded, the compression zone, the
+    // pushout at 1178 — measured to the body's half-height while the legs
+    // hung `ride_h` below it. A folded bot sank by exactly the difference and
+    // kept driving, because as far as this line was concerned it was resting
+    // on its waist.
+    //
+    // Three seating sites were fixed earlier with the same fallback and this
+    // one was missed: those run at spawn and on reset, and this runs EVERY
+    // FRAME, which is why the spawn looked right and the car went through the
+    // floor as soon as it moved.
+    let clearance = if car.ride_h > 0.0 { car.ride_h } else { car.half_h };
     // Wheels grip ANY surface (RL-style wall/ceiling driving): contact counts
     // as "grounded" when the car's underside faces the surface. Floors accept
     // any orientation (you land, the align sorts you out); walls and ceilings
@@ -2132,6 +2143,34 @@ mod reset_tests {
     /// hang well below the origin, so `ride_h` is much larger than `half_h`.
     fn bot_shaped() -> Car {
         Car { half_h: 0.9, ride_h: 1.5, half_len: 0.6, half_w: 0.5, ..Car::new() }
+    }
+
+    #[test]
+    fn the_driving_loop_measures_to_the_feet_not_the_waist() {
+        // THE FLOOR BUG, and the reason the earlier fix did not take. Three
+        // SEATING sites were corrected to fall back from `half_h` to
+        // `ride_h`; the per-frame contact in `step_car` was missed. Those run
+        // at spawn and on reset, this runs every frame — so the car was
+        // placed correctly and sank the moment it moved.
+        //
+        // No test covered it, which is why it survived a fix that named it.
+        let bot = bot_shaped();
+        let clearance = if bot.ride_h > 0.0 { bot.ride_h } else { bot.half_h };
+        assert_eq!(clearance, 1.5, "the loop would seat this bot at its waist");
+        assert!(
+            clearance > bot.half_h,
+            "a legged frame's feet are below its centre: {} vs {}",
+            clearance,
+            bot.half_h
+        );
+        // it sank by exactly the difference
+        assert!((clearance - bot.half_h - 0.6).abs() < 1e-5);
+
+        // and a wheeled car, which has no ride_h, is untouched by the change
+        let car = Car::new();
+        assert_eq!(car.ride_h, 0.0);
+        let c2 = if car.ride_h > 0.0 { car.ride_h } else { car.half_h };
+        assert_eq!(c2, car.half_h, "the fallback changed the wheeled case");
     }
 
     #[test]

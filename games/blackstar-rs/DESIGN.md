@@ -6333,6 +6333,37 @@ load rather than being left silent.
 
 1124 passing.
 
+THE FLOOR BUG, AND WHY MY EARLIER FIX DID NOT TAKE.
+
+Reported: "they still go through the floor in game". Found: `step_car`'s
+per-frame ground contact reads
+
+    let clearance = car.half_h;
+
+while `ride_h` — how far a frame's FEET hang below its origin — sits right
+there unused. Every contact test in the driving loop measured to the body's
+half-height: grounded, the compression zone, the pushout. A legged frame sank
+by exactly the difference and kept driving, because as far as that line was
+concerned it was resting on its waist.
+
+I FIXED THREE SITES EARLIER AND MISSED THIS ONE, and the shape of the miss is
+the lesson: the three were SEATING — spawn and reset — and this is the driving
+loop. So the car was placed correctly and sank the moment it moved, which
+reads as the fix not working rather than as a fourth site.
+
+NO TEST COVERED IT. The suite has a `bot_shaped()` fixture and tests that
+`ride_h` survives a reset; nothing exercised the per-frame path. A fix that
+names a bug in its commit message and leaves a fourth call site is exactly
+what an untested invariant looks like.
+
+ALSO: A STARTUP PROOF LINE. "The game runs nearly exactly how it did 100
+messages ago" could not be distinguished, by reading, from a change that does
+not execute. `[ship] hull 15.2 m, 8 rooms, slot Some(n), parked at 0.0,1.7,0.0`
+on stderr settles it in one line, and I should have added it before the first
+playtest rather than after the second.
+
+1125 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
