@@ -1076,6 +1076,12 @@ impl eframe::App for VoicetermApp {
             Some("revert") => self.ingest.revert(),
             _ => {}
         }
+        // RE-GATED. Removing the standalone `sidebar` panel deleted the
+        // `if show_chrome {` that also wrapped this, so the keycap and gesture
+        // rows stopped hiding in Voice mode — silently, because nothing counts
+        // panels. `chrome_mode`'s accounting still claimed BUTTONS_H back.
+        // Caught by maintenance/tools/egui_chrome_audit.py, not by eye.
+        if show_chrome {
         egui::TopBottomPanel::bottom("keycaps").show(ctx, |ui| {
             // The pipe/brace gesture chips sit on their own row above the keycaps (the QML toolbar
             // put them in modRow): hold + drag to a cell + release. The brace menu's deadband makes
@@ -1412,6 +1418,7 @@ impl eframe::App for VoicetermApp {
                 }
             }
         });
+        }  // if show_chrome — the keycap and gesture rows
 
         // the settings screen (QML settings page) as a right panel; edits persist + re-apply live
         if self.settings_open {
