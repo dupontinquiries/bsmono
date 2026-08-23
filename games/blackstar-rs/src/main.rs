@@ -2527,7 +2527,7 @@ impl Game {
         // corrects itself the moment the body is deep enough to trip the
         // smaller threshold, which is why it reads as the bot sinking rather
         // than as it spawning wrong.
-        let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+        let drop = self.car.stand_h();
         if d < drop {
             // Seat on the LOWEST POINT, not the half-height. They differ the
             // moment the body stops being centred on its bounding box, which is
@@ -2752,7 +2752,7 @@ impl Game {
         // corrects itself the moment the body is deep enough to trip the
         // smaller threshold, which is why it reads as the bot sinking rather
         // than as it spawning wrong.
-        let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+        let drop = self.car.stand_h();
         if d < drop {
             // Seat on the LOWEST POINT, not the half-height. They differ the
             // moment the body stops being centred on its bounding box, which is

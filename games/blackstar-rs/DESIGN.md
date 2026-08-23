@@ -6364,6 +6364,36 @@ playtest rather than after the second.
 
 1125 passing.
 
+PARITY TESTS FOR THE FRAME LOOP, AND MY FIRST ONE GUARDED NOTHING.
+
+The bug class is one invariant at many call sites with one missed. There were
+EIGHT copies of `if ride_h > 0.0 { ride_h } else { half_h }` — three seating,
+the driving loop, two in `main.rs`, two in tests — and a test that GREPPED
+`physics.rs` for the literal string to confirm one site still had it. That
+guard was a confession: an invariant you police with a text search is one you
+should have extracted. It is `Car::stand_h` now, with one definition, and the
+grep is replaced by a check that nobody open-codes it again outside tests.
+
+THEN THE FRAME-BY-FRAME TEST. `step_car_only` is the same function the shell
+calls at the same fixed step, so a hundred frames of driving is the real loop
+rather than a model of it.
+
+AND IT DID NOT CATCH THE BUG. I reintroduced `clearance = car.half_h` on
+purpose and the suite stayed green. The threshold asked for half the stand
+height: correct code rests at 1.44, BUGGY code rests at `half_h` = 0.90, and
+both clear 0.75. I had checked that the fixed code passed and never that the
+broken code failed — which is how you write a test that guards nothing, and I
+only found out because I tried to break it.
+
+Set against the bug instead — a frame seated at its WAIST rests at `half_h`,
+so the line is between the waist and standing — it now fails with
+
+    the frame sank to 0.90: it stands 1.50 tall and its waist is at 0.90
+
+which names the bug in the failure. Verified in both directions this time.
+
+1127 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
