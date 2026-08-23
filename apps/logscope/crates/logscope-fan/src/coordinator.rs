@@ -93,6 +93,51 @@ round shows whether your hint drove the conclusion or the question did.",
         }
     }
 
+    /// What actually happens when this mode is selected, today.
+    ///
+    /// The picker carried ONE blanket line — "Task decomposition + execution
+    /// wiring is in progress; selecting a mode here records the intent" — and
+    /// it was wrong in both directions. Some modes do considerably more than
+    /// record an intent, and the thing that is genuinely missing is the same
+    /// for all of them, so a per-mode sentence tells the operator what a shared
+    /// disclaimer cannot: whether choosing this changes anything yet.
+    ///
+    /// Established by reading the call graph rather than the comments:
+    /// [`plan`] builds a real [`Plan`] for every mode — system prompt, worker
+    /// list, best-of, aggregation — and NOTHING CALLS IT. The planner is
+    /// finished and unconsumed. What each mode already changes is whatever sits
+    /// outside that unused path.
+    pub fn wiring(self) -> &'static str {
+        match self {
+            Mode::Barebones =>
+                "Live. One worker, no fan — this is what runs today whatever else is selected.",
+            Mode::Replicator =>
+                "Live. Selecting it opens the replicator UI: N columns over one workspace, one KV cache each, steerable mid-run.",
+            Mode::Aggressive =>
+                "Partly live. Switches the chat to the fan-out view, and plan() gives it best-of-3 per unit — but no runner consumes that plan yet, so the extra runs do not happen.",
+            Mode::Coordinator =>
+                "Planned, not run. plan() decomposes the goal into one worker prompt per subtask with shared context; nothing executes the result yet.",
+            Mode::LongHorizon =>
+                "Advisory only. Its one real effect today is that it cannot interrupt — can_interrupt() is false, so a run in this mode will not stop to ask.",
+            Mode::ThinkerLiaison =>
+                "Planned, not run. plan() emits a single worker; which model answers and who relays is the runtime's decision, and that runtime does not exist yet.",
+            Mode::LiaisonDebate =>
+                "Planned, not run. is_panel() is true and the panel prompts exist; nothing spawns the debaters.",
+            Mode::StatefulGuide =>
+                "Partly live. The phase machine in engmode is real and tested — survey → plan → patch → check → diagnose, with the phase decided by compiler output — but the loop that drives it from a chat turn is not wired.",
+        }
+    }
+
+    /// Does selecting this mode change what happens on the next run?
+    ///
+    /// The picker greys nothing out — an operator should be able to record an
+    /// intent — but a mode that changes nothing yet should say so where it is
+    /// chosen rather than in a footnote under eight of them.
+    pub fn has_effect(self) -> bool {
+        matches!(self, Mode::Barebones | Mode::Replicator | Mode::Aggressive
+                     | Mode::LongHorizon | Mode::StatefulGuide)
+    }
+
     /// Does this mode run a debating panel?
     pub fn is_panel(self) -> bool { matches!(self, Mode::LiaisonDebate) }
 
@@ -372,4 +417,38 @@ mod tests {
             assert_eq!(p.aggregate, Aggregation::Single);
         }
     }
+
+    /// Every mode says what it does, and the claims match the code.
+    #[test]
+    fn every_mode_states_its_wiring() {
+        for m in Mode::all() {
+            let w = m.wiring();
+            assert!(w.len() > 30, "{:?} has no real wiring note", m);
+            assert!(w.ends_with('.'), "{:?}: {w}", m);
+        }
+    }
+
+    /// `has_effect` must agree with the other predicates rather than drift from
+    /// them — it is a summary of facts stated elsewhere in this file.
+    #[test]
+    fn has_effect_agrees_with_the_behaviour_it_summarises() {
+        // LongHorizon's only current effect IS the interrupt rule.
+        assert!(!Mode::LongHorizon.can_interrupt());
+        assert!(Mode::LongHorizon.has_effect());
+
+        // A mode whose note says "Planned, not run" must not claim an effect.
+        for m in Mode::all() {
+            if m.wiring().starts_with("Planned, not run") {
+                assert!(!m.has_effect(), "{:?} says planned-not-run but claims an effect", m);
+            }
+        }
+        // And one that claims an effect must not say it is unrun.
+        for m in Mode::all() {
+            if m.has_effect() {
+                assert!(!m.wiring().starts_with("Planned, not run"),
+                        "{:?} claims an effect and says it is not run", m);
+            }
+        }
+    }
+
 }

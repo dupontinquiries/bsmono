@@ -7256,10 +7256,31 @@ if let Some(msg) = self.error_banner.clone() {
                                               _ => {} }
                                 }
                                 ui.label(RichText::new(m.blurb()).color(theme::DIM()).small());
+                                // WHAT IT ACTUALLY DOES, per mode, under the
+                                // description of what it is for.
+                                //
+                                // The single footnote this replaces said every
+                                // mode merely "records the intent", which was
+                                // wrong in both directions: Replicator opens a
+                                // live UI, Aggressive switches the view,
+                                // LongHorizon already suppresses interrupts,
+                                // and StatefulGuide's phase machine is real.
+                                // Meanwhile the thing genuinely missing —
+                                // nothing consumes `coordinator::plan()` — was
+                                // not stated at all.
+                                //
+                                // Dimmer than the blurb and brighter than the
+                                // axis heading: it is the line that decides
+                                // whether to pick this, so it must be readable
+                                // without competing with the name.
+                                let live = m.has_effect();
+                                ui.label(RichText::new(m.wiring())
+                                    .color(if live { theme::DIM() } else { theme::FAINT() })
+                                    .small().italics());
                                 ui.add_space(6.0);
                             }
                             ui.separator();
-                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. Task decomposition + execution wiring is in progress; selecting a mode here records the intent.").color(theme::FAINT()).small());
+                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. The per-mode line above says what each one changes today; `coordinator::plan()` builds a full worker plan for every mode and no runner consumes it yet, which is the single gap behind most of them.").color(theme::FAINT()).small());
                             // Replicator is the exception to that sentence and says so where the
                             // sentence is, rather than leaving the operator to discover that one
                             // entry behaves differently from the other seven.
