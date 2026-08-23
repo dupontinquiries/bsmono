@@ -16301,7 +16301,17 @@ like a bad model rather than a wiring bug.");
         // cap. The governor knows this backend's ceiling shape (Metal buffer-objects / Vulkan allocation-
         // count) and self-tunes: a clean window nudges its cap up toward the request; any pressure signal
         // ratchets it down and latches. LOGSCOPE_WINDOW_MAX still hard-caps on top for manual control.
-        let live_objs = self.dims_buffer_count() + self.pool_live_estimate();
+        // SPLIT, because the two halves have different fixes and the clamp
+        // message reported only their sum. A fleet run on Llama-3.3-8B shows
+        // "soft cap 3072 objects, ~7535 live" — 2.45x over budget, window
+        // clamped 4 -> 2, 4.51 tok/s at 1 submit/token. That number says the
+        // window is small and nothing about what to do, and the two components
+        // want opposite work: dims buffers are per-dispatch uniform blocks
+        // (fix: cache or ring them harder), pool buffers are tensor storage
+        // (fix: reuse per call site, or fewer temporaries).
+        let dims_objs = self.dims_buffer_count();
+        let pool_objs = self.pool_live_estimate();
+        let live_objs = dims_objs + pool_objs;
         // LOGSCOPE_WINDOW_PIN=1 makes the requested window an exact value (governor won't probe up);
         // otherwise the request is a hint and the governor autotunes toward the device's real ceiling.
         let pinned = std::env::var("LOGSCOPE_WINDOW_PIN").ok().as_deref() == Some("1");
@@ -16316,8 +16326,23 @@ like a bad model rather than a wiring bug.");
             if k < k_req && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let g = self.governor.lock().unwrap();
                 let b = g.budget();
-                eprintln!("wgpu-engine: governor — requested window k={k_req} clamped to k={k} ({:?} budget: soft cap {} objects, ~{} live); it will self-tune upward if the device has headroom",
-                    b.kind, b.soft_object_cap, live_objs);
+                let over = live_objs as f32 / b.soft_object_cap.max(1) as f32;
+                eprintln!("wgpu-engine: governor — requested window k={k_req} clamped to k={k} ({:?} \
+budget: soft cap {} objects, ~{} live = {}x over — {} dims + {} pool); it will self-tune upward if \
+the device has headroom",
+                    b.kind, b.soft_object_cap, live_objs, format!("{over:.1}"), dims_objs, pool_objs);
+                // Which half to attack, said once, because "7535 live" alone
+                // sends you looking at whichever you happen to think of first.
+                if dims_objs > pool_objs {
+                    eprintln!("wgpu-engine: governor — the DIMS buffers dominate ({dims_objs} of \
+{live_objs}). These are per-dispatch uniform blocks; the cache and ring are what bound them, so a \
+dispatch shape that misses the cache every call is the thing to find.");
+                } else {
+                    eprintln!("wgpu-engine: governor — the POOL dominates ({pool_objs} of \
+{live_objs}): tensor storage created and not yet returned. `alloc` keys the free list by (size, \
+call site), so a site that allocates a shape nothing else returns never recycles. Note this is a \
+LOWER bound — KV and resident weights are not pooled and are covered by baseline_objects.");
+                }
             }
         }
         let rcap = 64usize;
