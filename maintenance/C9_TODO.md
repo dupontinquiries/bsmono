@@ -341,13 +341,60 @@ relevant half for this stack than the Python side.
   command to generate its fixture; every other one in this tree does not, which
   is how the whole area stayed unexamined.
 
-- **C9-4d — Prefix caching over the existing fork/COW.** `idea` · `read`.
-  `crates/logscope/src/kvcache.rs` (note: the *logscope* crate, not gpu-gemm)
-  already has PagedAttention-style ref-counted blocks with `fork` and
-  copy-on-write — the primitive prefix caching needs. What is missing is the
-  coordinator above it; vLLM's `v1/core/kv_cache_coordinator.py` is the
-  reference. This is also what `SERVING.md`'s "fleet endpoint /
-  `run_fleet_trie` shared prefill" next-step needs. Pure and testable here.
+- **C9-4d — Prefix caching: THREE implementations, and the wiring is an
+  ownership problem.** `blocked` on a decision · `verified` (c10). The original
+  entry pointed at the wrong one. What is actually in the tree:
+
+  1. **`gpu-gemm::run_fleet_trie`** (lib.rs:15632) — LIVE and validated
+     bit-exact. Builds a radix trie over request tokens, `extend_prefix`
+     per edge, deepest-shared-node grouping. But its `caches: HashMap<usize,
+     KvCache>` is **local to one call** — two successive fleet runs over the
+     same shared prefix re-prefill it from scratch. That is the real gap.
+  2. **`gpu-gemm::PrefixStore`** (lib.rs:13536) — the persistence layer that
+     would close it: GDSF-ranked, two-tier (hot f32 → warm int8 → drop).
+     Built and tested, but its ONLY caller is a gate in `main.rs:7028`.
+     FLEET.md names the wiring as its own next step and it has not happened.
+  3. **`logscope::kvcache::Paged`** (677 lines) — PagedAttention block
+     allocator, ref-counted with COW `fork`, content-addressed `admit_cached`,
+     retention tuning. **Zero callers anywhere**, `#[allow(dead_code)]`. This
+     is what the old entry proposed building a coordinator over; doing that
+     would add a third consumer to the least-connected of the three while the
+     live path still re-prefills every call.
+
+  **Why the wiring hasn't happened, which is not laziness.** The two
+  components' ownership models do not currently meet. `PrefixStore::get`
+  returns `Option<&Tier>` — a borrow — while `run_fleet_trie` needs to hold
+  parent caches AND insert freshly-built children in the same pass. `KvCache`
+  wraps wgpu `Tensor` buffers and is not `Clone`, so a hot hit can be neither
+  moved out nor copied; holding the borrow across the build loop conflicts
+  with the `&mut self` that `insert` needs. Verified by reading the
+  signatures, not inferred: `run_batched` takes `prefix: Option<(&KvCache,
+  usize)>` (a borrow is fine at the RUN phase), `promote_cache(&QKvCache,
+  len, kv_dim) -> KvCache` (warm→hot yields a fresh owned value), and
+  `KvCache` at lib.rs:13260 derives nothing.
+
+  **The seam that fits, designed but NOT implemented:** give `PrefixStore` a
+  `take(&mut self, gpu, key) -> Option<(usize, KvCache)>` that REMOVES the
+  entry and transfers ownership (promoting warm→hot on the way out). Then
+  `run_fleet_trie_cached(&self, …, store: &mut PrefixStore)` is a small delta
+  over the existing function: take-on-entry, build-on-miss exactly as today,
+  hand every node cache back with `insert` at the end and let `enforce` run
+  once. Ownership transfers fully in both directions, so no borrow is held
+  across a mutation. A NEW method rather than a change to `run_fleet_trie`,
+  so the bit-exact-validated path stays untouched and the two can be
+  differentially tested against each other.
+
+  **Two things the tests must say.** Same fleet run twice must be
+  byte-identical AND show prefill savings on the second run. And a warm
+  (int8) hit is LOSSY by construction, so the bit-exactness test needs a
+  budget large enough to keep entries hot; a separate test should pin that a
+  demoted-then-promoted prefix is within int8 error rather than equal. Both
+  are runnable here — the whole gpu-gemm suite (1216 tests) passes on
+  llvmpipe in 9 s.
+
+  **The decision that is not mine:** whether `logscope::kvcache` is the
+  intended future (block-level paging, which `PrefixStore` does not do) or
+  dead weight to delete. Same shape as C9-7a and C9-1f.
 
 - **C9-4e — `logscope-serve`'s three named gaps have a Rust reference now.**
   `idea` · `read`. `SERVING.md` lists token streaming, an OpenAI-compatible
@@ -516,6 +563,30 @@ only by its own tests.
   FOUR naga versions (0.19, 22, 27, 29) that disagree — naga 29 accepts `fn f16`
   and 22 rejects it. The duplication is load-bearing; recorded here so nobody
   "fixes" it into a shared kit.
+
+- **C9-10g — the dupscan ratchet went a whole session unrun.** `verified`
+  (c10), fixed in `0f3af0fa`. `logscope::dupscan`'s `duplicate_names_do_not_grow`
+  asserts a ceiling on duplicate public names and is the guard against the
+  seven duplicate implementations its own header documents. Its ceiling was set
+  to 347 in `0c599e55`; the C9-8 modules (`continuation`, `readmark`,
+  `powerbudget`, `sessiontime`) then landed in `crates/logscope/src/` and pushed
+  the real count to 353. c9 shipped with the test failing, because only
+  crypto-kit's tests were rerun against the baseline — the ratchet fires on
+  `cargo test -p logscope`, and nothing ran it. Caught in c10 by running the
+  suite; the 6 new collisions are all name-sharing (`Step`, `Command`,
+  `Source`, `decide`, `stalled`), not duplicate implementations, so the ceiling
+  was raised deliberately.
+
+  **Considered and rejected: porting the scan to `maintenance/tools/` as a fast
+  static checker** next to `lock_check.py`, so `verify.sh` would catch this at
+  session start without a 38 s compile. A Python port would be a SECOND
+  implementation of the duplicate-detector, in a language where nothing can
+  ever catch the two drifting apart — the exact failure `dupscan.rs` exists to
+  prevent, and its own header lists six of seven duplicates as found by
+  accident. The mechanism worked as designed; it was one session late because
+  the crate's tests were skipped, which is a procedure gap (CLAUDE.md rule 5c
+  already covers it) rather than a tooling one. If it recurs, the answer is a
+  CI gate that runs `cargo test -p logscope`, not a reimplementation.
 
 - **C9-7a — snapclone exists TWICE, and one copy absorbed two of my fixes.**
   `measured` · blocked on a decision that is not mine to make.
