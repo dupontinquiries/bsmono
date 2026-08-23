@@ -1545,7 +1545,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                                 state.prowl = Some(p);
                                                 state.tutorial = Some(TutorialRun { step: 0, intro_t: 4.0, advance_flash: 0.0 });
                                             }
-                                            MenuCmd::StartBattleground(a, b) => {
+                                            MenuCmd::StartBattlegroundDraft(a, b) => {
                                                 // Battleground has no live --play wiring yet (TODO.md:
                                                 // "--play wiring in app.rs: input -> set_input, ability
                                                 // keys, HUD ... camera follow; needs the app feature

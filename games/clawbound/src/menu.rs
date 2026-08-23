@@ -72,12 +72,25 @@ pub fn difficulty_mult(d: u8) -> f32 { match d { 0 => 0.82, 2 => 1.22, _ => 1.0 
 
 /// The game modes the player can launch from the menu.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GameMode { Rendezvous, Survive, Prowl, Capture }
-pub const GAME_MODES: [GameMode; 4] = [GameMode::Rendezvous, GameMode::Survive, GameMode::Prowl, GameMode::Capture];
+pub enum GameMode { Rendezvous, Survive, Prowl, Capture, Battleground }
+pub const GAME_MODES: [GameMode; 5] =
+    [GameMode::Rendezvous, GameMode::Survive, GameMode::Prowl, GameMode::Capture, GameMode::Battleground];
 impl GameMode {
     pub fn name(self) -> &'static str {
-        match self { GameMode::Rendezvous => "Rendezvous (6v1)", GameMode::Survive => "Survive (6v1)", GameMode::Prowl => "Prowl", GameMode::Capture => "Pop Island" }
+        match self {
+            GameMode::Rendezvous => "Rendezvous (6v1)",
+            GameMode::Survive => "Survive (6v1)",
+            GameMode::Prowl => "Prowl",
+            GameMode::Capture => "Pop Island",
+            GameMode::Battleground => "Battleground of the Ancestors",
+        }
     }
+
+    /// Whether this mode picks a **legendary ancestor** rather than a hunter,
+    /// class and clan. The battleground's row set is different because its
+    /// choices are: which of the thirteen you lead with, and nothing else the
+    /// other modes ask about.
+    pub fn picks_ancestor(self) -> bool { self == GameMode::Battleground }
     /// The two 6v1 modes map onto the existing sim; Prowl/Capture are their own sims.
     pub fn is_sim(self) -> bool { matches!(self, GameMode::Rendezvous | GameMode::Survive) }
     pub fn sim_mode(self) -> Mode { if self == GameMode::Survive { Mode::Survive } else { Mode::Rendezvous } }
@@ -91,7 +104,21 @@ pub enum MenuCmd {
     /// `battleground::new_draft`. A distinct variant from `StartMode` rather
     /// than shoehorning ancestor picks through `Class`/`Kind` — Battleground
     /// isn't a 6v1 sim and has nothing to say about hunter kind or class.
-    StartBattleground([Ancestor; 3], [Ancestor; 3]),
+    /// Lead ONE ancestor into a clan war, picked on the Play screen. Its own
+    /// command rather than a `StartMode` because the battleground takes an
+    /// ancestor and nothing else — no hunter, no class, no clan.
+    StartBattleground(Ancestor),
+    /// The clan-war draft is confirmed: three picks per side, straight into
+    /// `battleground::new_draft`. A distinct variant from `StartMode` rather
+    /// than shoehorning ancestor picks through `Class`/`Kind` — Battleground
+    /// isn't a 6v1 sim and has nothing to say about hunter kind or class.
+    ///
+    /// TWO ENTRY POINTS, BOTH KEPT. The c8/c9 split produced a one-ancestor
+    /// quick pick (incoming, Play screen) and a full six-pick draft (this side,
+    /// `Screen::Draft`, already wired to app.rs) under the SAME variant name
+    /// with different signatures. They are different journeys, not two attempts
+    /// at one, so the draft took the longer name and both survive.
+    StartBattlegroundDraft([Ancestor; 3], [Ancestor; 3]),
     Multiplayer, Quit, Close,
 }
 
@@ -105,6 +132,8 @@ pub struct Menu {
     pub sel_game: GameMode,
     pub sel_class: Class,
     pub sel_clan: u8,
+    /// Index into [`crate::ancestor::ALL`] — the battleground's only choice.
+    pub sel_ancestor: usize,
     /// The draft's six pick slots: clan A's three, then clan B's three (rows
     /// 0..3 and 3..6 of the Draft screen). Seeded to the roster's first six
     /// distinct ancestors so a player who never touches left/right still
@@ -118,7 +147,7 @@ impl Default for Menu { fn default() -> Self { Self::new() } }
 impl Menu {
     pub fn new() -> Self {
         Menu { open: true, screen: Screen::Title, cursor: 0, settings: Settings::default(),
-               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0,
+               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0, sel_ancestor: 0,
                draft: [ANCESTORS[0], ANCESTORS[1], ANCESTORS[2], ANCESTORS[3], ANCESTORS[4], ANCESTORS[5]],
                rebinding: None }
     }
@@ -127,6 +156,18 @@ impl Menu {
     pub fn items(&self) -> Vec<String> {
         match self.screen {
             Screen::Title => vec!["Single Player".into(), "Battleground of the Ancestors".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
+            Screen::Play if self.sel_game.picks_ancestor() => {
+                let a = self.ancestor();
+                let k = crate::ancestor::kit(a);
+                vec![
+                    format!("Game: {}", self.sel_game.name()),
+                    format!("Ancestor: {} ({})", k.name, crate::draft::species(a)),
+                    format!("  {} — {}", k.passive_name, k.passive),
+                    format!("  1 {}   2 {}   3 {}", k.abilities[0].name, k.abilities[1].name, k.ult.name),
+                    "Start".into(),
+                    "Back".into(),
+                ]
+            }
             Screen::Play => vec![
                 format!("Game: {}", self.sel_game.name()),
                 format!("Hunter: {}", self.sel_hunter.params().name),
@@ -163,6 +204,11 @@ impl Menu {
     }
 
     fn len(&self) -> usize { self.items().len() }
+
+    /// The currently highlighted ancestor.
+    pub fn ancestor(&self) -> crate::ancestor::Ancestor {
+        crate::ancestor::ALL[self.sel_ancestor % crate::ancestor::ALL.len()]
+    }
     pub fn up(&mut self) { let n = self.len(); self.cursor = (self.cursor + n - 1) % n; }
     pub fn down(&mut self) { let n = self.len(); self.cursor = (self.cursor + 1) % n; }
 
@@ -212,6 +258,12 @@ impl Menu {
     pub fn adjust(&mut self, dir: i32) {
         match (self.screen, self.cursor) {
             (Screen::Play, 0) => self.next_game(dir),
+            // the battleground's row 1 is its ancestor; rows 2-3 are that
+            // ancestor's own text, and adjusting them means the same thing
+            (Screen::Play, 1..=3) if self.sel_game.picks_ancestor() => {
+                let n = crate::ancestor::ALL.len() as i32;
+                self.sel_ancestor = (self.sel_ancestor as i32 + dir).rem_euclid(n) as usize;
+            }
             (Screen::Play, 1) => self.next_hunter(dir),
             (Screen::Play, 2) => self.next_class(dir),
             (Screen::Play, 3) => self.sel_clan = (self.sel_clan as i32 + dir).rem_euclid(crate::clan::CLAN_COUNT as i32) as u8,
@@ -244,8 +296,13 @@ impl Menu {
             Screen::Play => match self.cursor {
                 4 => {
                     self.open = false;
-                    if self.sel_game.is_sim() { MenuCmd::StartSingle(self.sel_hunter, self.sel_game.sim_mode()) }
-                    else { MenuCmd::StartMode(self.sel_game, self.sel_hunter, self.sel_class) }
+                    if self.sel_game.picks_ancestor() {
+                        MenuCmd::StartBattleground(self.ancestor())
+                    } else if self.sel_game.is_sim() {
+                        MenuCmd::StartSingle(self.sel_hunter, self.sel_game.sim_mode())
+                    } else {
+                        MenuCmd::StartMode(self.sel_game, self.sel_hunter, self.sel_class)
+                    }
                 }
                 5 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::None,   // rows 0..3 are adjusted with left/right
@@ -255,7 +312,7 @@ impl Menu {
                     self.open = false;
                     let a = [self.draft[0], self.draft[1], self.draft[2]];
                     let b = [self.draft[3], self.draft[4], self.draft[5]];
-                    MenuCmd::StartBattleground(a, b)
+                    MenuCmd::StartBattlegroundDraft(a, b)
                 }
                 7 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::None,   // rows 0..5 are adjusted with left/right
@@ -286,6 +343,55 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_battleground_is_reachable_and_starts_with_an_ancestor() {
+        // The mode existed, was tested, was playable in a terminal — and could
+        // not be reached from the menu, which is the only door most players use.
+        let mut m = Menu::new();
+        assert!(GAME_MODES.contains(&GameMode::Battleground));
+        m.screen = Screen::Play;
+        m.cursor = 0;
+        while m.sel_game != GameMode::Battleground {
+            m.adjust(1);
+        }
+        // its rows are its own: an ancestor, not a hunter and a clan
+        let items = m.items();
+        assert!(items[1].starts_with("Ancestor:"), "{items:?}");
+        assert!(items[2].contains('—'), "the passive is on screen: {items:?}");
+        assert!(items[3].contains('1') && items[3].contains('3'), "abilities listed: {items:?}");
+        // row 1 walks the roster, and rows 2-3 are the same choice by another name
+        m.cursor = 1;
+        let first = m.ancestor();
+        m.adjust(1);
+        assert_ne!(m.ancestor(), first);
+        m.cursor = 3;
+        m.adjust(-1);
+        assert_eq!(m.ancestor(), first, "the ancestor's own rows adjust the ancestor");
+        // and Start hands the app that ancestor, not a hunter it would ignore
+        m.cursor = 4;
+        assert_eq!(m.activate(), MenuCmd::StartBattleground(first));
+        assert!(!m.open, "starting a match closes the menu");
+    }
+
+    #[test]
+    fn the_other_modes_still_pick_a_hunter_and_a_clan() {
+        // Adding a mode with different rows is the kind of change that quietly
+        // rewires the rows of every other mode.
+        let mut m = Menu::new();
+        m.screen = Screen::Play;
+        m.sel_game = GameMode::Capture;
+        let items = m.items();
+        assert!(items[1].starts_with("Hunter:"), "{items:?}");
+        assert!(items[3].starts_with("Clan:"), "{items:?}");
+        m.cursor = 4;
+        assert!(matches!(m.activate(), MenuCmd::StartMode(GameMode::Capture, _, _)));
+        let mut m = Menu::new();
+        m.screen = Screen::Play;
+        m.sel_game = GameMode::Survive;
+        m.cursor = 4;
+        assert!(matches!(m.activate(), MenuCmd::StartSingle(_, _)));
+    }
 
     #[test]
     fn navigates_and_wraps() {
@@ -410,11 +516,11 @@ mod tests {
         m.screen = Screen::Draft;
         m.cursor = 6; // Start row
         match m.activate() {
-            MenuCmd::StartBattleground(a, b) => {
+            MenuCmd::StartBattlegroundDraft(a, b) => {
                 assert_eq!(a, [expected[0], expected[1], expected[2]]);
                 assert_eq!(b, [expected[3], expected[4], expected[5]]);
             }
-            c => panic!("expected StartBattleground, got {c:?}"),
+            c => panic!("expected StartBattlegroundDraft, got {c:?}"),
         }
         assert!(!m.open, "starting a battleground should close the menu");
     }

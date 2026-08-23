@@ -527,10 +527,45 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   clamps rather than panics, and the player's claw is the *same blow* an ancestor throws —
   target riders, on-hit effects (Hush of Snows fires from a human's paw) and kill credit,
   which it previously skipped.
-- [ ] --play wiring in app.rs (the real client): input → `set_input`, ability keys, HUD
-  (pile/herbs/tree hp), camera follow; needs the `app` feature stack (winit/wgpu) compiled.
-  NOTE: the incoming series wrote "still needs rustc >= 1.76" here; that blocker was
-  retired on this side and the wording is kept as-is deliberately.
+## The battleground in the app: what is done, what is left
+
+The mode is simulated, balanced, playable in a terminal and recorded/replayed —
+and until this pass it could not be reached from the menu, which is the only door
+most players use. The remaining work is now precisely bounded.
+
+- [x] `menu.rs`: `GameMode::Battleground` exists, appears in `GAME_MODES`, and brings its own
+  rows — an ancestor with its passive and three ability names, instead of hunter/class/clan,
+  because those are choices the mode does not have. Left/right walks the thirteen.
+  `MenuCmd::StartBattleground(Ancestor)` is its own command rather than being squeezed
+  through `StartMode`'s three arguments, two of which it would ignore. Tested, including
+  that the other four modes' rows and commands are unchanged.
+- [x] `battleview.rs`: the pure view model — `marks()` (every drawable thing with its ground
+  height, team, fill fraction, carried burden and whether it is *you*, culled to a radius),
+  `hud()` (one consistent read of ability cooldowns by name, piles, herbs, Great Tree hp,
+  borders standing, contention and Skyrock holders, respawn timer, outcome), and `focus()`
+  (follow the driven warrior; fall back to the centre of the living clan rather than
+  staring at a corpse). Tested, so what is left in `app.rs` is mapping rather than logic.
+- [ ] `app.rs`, mirroring `render_capture` (~1001-1135) exactly:
+  1. `battle: Option<Battleground>` beside `capture`/`prowl` on the app state, cleared in
+     the other `MenuCmd` arms the same way they clear each other;
+  2. a `MenuCmd::StartBattleground(a)` arm: `state.battle = Some(Battleground::new(a))`;
+  3. `render_battle(dt)`: `keys.move_vec()` → `move_world(yaw, ..)` → `set_input`, with
+     `keys.ability` mapped to slots 1/2/3 and left-click/dodge to the claw;
+  4. `build_battle_entities()` from `battleview::marks` — the shapes already exist in
+     `main.rs`'s `battle` mode (canopies scaled by `fill`, aura rings, crests, carries);
+  5. an egui panel from `battleview::hud`, laid out like the capture HUD;
+  6. `self.focus = v3(fx, height_at(fx,fz), fz)` from `battleview::focus`, `write_camera(34.0)`;
+  7. the `render()` dispatch line: `if self.battle.is_some() { self.render_battle(dt); return; }`.
+  **Unwritten because it cannot be compiled here**: the `app` feature needs rustc >= 1.76
+  (egui 0.28 / emath) and this sandbox is pinned at 1.75. Writing renderer glue that has
+  never been through a compiler is how a codebase acquires code nobody trusts.
+
+  MERGE NOTE on the blocker above: the incoming series was written in a sandbox
+  pinned to rustc 1.75, which is why the `app.rs` glue is specified but unwritten.
+  THAT CONSTRAINT DOES NOT HOLD HERE — this tree builds on 1.96. The seven steps
+  stay exactly as written because they are still the plan; only the reason for
+  their being unwritten has expired, and someone can now actually compile them.
+
 - [x] Player-pick draft UI in menu.rs — `Screen::Draft`, 6 pick slots (3 per
   clan) cycling through the 13-ancestor roster with no-duplicate cycling,
   `MenuCmd::StartBattleground([Ancestor;3], [Ancestor;3])`. Reachable from
