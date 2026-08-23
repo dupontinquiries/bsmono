@@ -516,4 +516,31 @@ in the fleet log had some other cause and this test is measuring nothing"
         );
     }
 
+
+    /// `DIMS_RETAIN_CAP` exceeding the object budget is CORRECT, and the reason
+    /// must stay written down.
+    ///
+    /// 8192 retained keeps against Apple Vulkan's 3072-object cap reads like
+    /// the bug fixed twice in this file's neighbours — a flat constant reasoned
+    /// in bytes while the binding constraint is object count. It is not: those
+    /// are `Arc` clones of buffers already counted in the dims cache and ring,
+    /// so retaining one allocates nothing.
+    ///
+    /// This pins the explanation rather than the number. If someone "fixes" the
+    /// constant by deriving it from the budget, the retain list starts flushing
+    /// far more often for no allocation benefit; if someone adds the retain
+    /// count to `dims_buffer_count`, the governor double-counts and understates
+    /// its own headroom.
+    #[test]
+    fn the_retain_cap_is_a_reference_bound_not_an_allocation_bound() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("Arc` CLONES of buffers that already live"),
+                "the reason DIMS_RETAIN_CAP may exceed the object budget is gone from lib.rs — without it the constant reads as the Metal-shaped bug its neighbours had");
+        // And the counter must still exclude them.
+        let counter = lib.split("pub fn dims_buffer_count").nth(1)
+            .and_then(|s| s.split('}').next()).unwrap_or("");
+        assert!(!counter.contains("keep") && !counter.contains("retain"),
+                "dims_buffer_count now includes the retain list: those are clones of buffers it already counts, so the governor would double-count and understate its headroom");
+    }
+
 }

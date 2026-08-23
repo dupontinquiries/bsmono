@@ -669,6 +669,25 @@ end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} submits attributed{} (
 /// Max retained (submitted-but-not-freed) keep-buffers before a mid-window flush forces a poll+free.
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
 /// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
+///
+/// ## Why this is NOT derived from the object budget, unlike the cache and ring
+///
+/// 8192 is larger than Apple Vulkan's entire 3072-object soft cap, which looks
+/// like the same bug just fixed twice next door — a flat constant reasoned in
+/// BYTES while the binding constraint on this backend is object COUNT. It is
+/// not, and the difference is worth stating because the next reader will have
+/// the same suspicion.
+///
+/// These are `Arc` CLONES of buffers that already live in the dims cache or the
+/// ring (`frame.keep.push(Keep::Buf(d.clone()))`). Retaining one does not
+/// allocate; it holds a reference so the buffer is not recycled while a submit
+/// is still reading it. The count bounds REFERENCES, and the allocations behind
+/// them are already bounded by `dims_cap + dims_ring_cap` — which is why
+/// `dims_buffer_count` deliberately does not add the retain list: doing so
+/// would double-count the same objects and understate the governor's headroom.
+///
+/// Checked rather than assumed, after the cache and ring both turned out to be
+/// Metal-shaped.
 const DIMS_RETAIN_CAP: usize = 8192;
 /// Largest batch allowed after a readback on a driver whose submit governor cannot run.
 ///
