@@ -49,6 +49,11 @@
 // The per-worker capability contract HiveMind_Strategy_Logscope.md makes
 // mandatory: Duty says where a worker may run and engmode::prompt_for says what
 // phase it is in, but nothing told a worker what it IS.
+// One correct fence scan, shared. Seven files look for triple backticks with
+// three different strategies and three of them had bugs; this is the primitive
+// they should have been policies over. Honours the CommonMark run-length rule
+// (a 4-tick block contains 3-tick blocks), which all four sites get wrong.
+#[allow(dead_code)] pub mod reply;
 #[allow(dead_code)] pub mod capability;
 #[allow(dead_code)] pub mod liaison_fan;
 #[allow(dead_code)] pub mod reflex;
