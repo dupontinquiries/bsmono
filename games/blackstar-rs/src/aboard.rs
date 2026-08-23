@@ -272,10 +272,20 @@ impl Aboard {
 
 pub fn run(argv: &[String]) {
     let i = argv.iter().position(|a| a == "--aboard").unwrap_or(0);
-    let hull: f32 = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(70.0);
+    // DEFAULT TO WHAT THE GAME ACTUALLY BUILDS. This was 70.0 — the old
+    // metres-based number — while `main.rs` had moved to `for_body`, so the
+    // driver described a 26 m ship the player would never see. A diagnostic
+    // that disagrees with the thing it diagnoses is worse than none.
+    let default_hull = hull_for(crate::physics::Car::new().half_h * 2.0);
+    let hull: f32 = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(default_hull);
 
     let mut a = Aboard::new(hull);
-    println!("ABOARD — a {hull:.0} m hull\n");
+    // the useful pair is the length and WHO it is for — the occupant-heights
+    // figure is HULL_HEIGHTS by construction and says nothing
+    println!(
+        "ABOARD — a {hull:.1} m hull, {HULL_HEIGHTS:.0} heights for a {:.2} m occupant\n",
+        hull / HULL_HEIGHTS
+    );
     println!("  {} rooms, {} corridors, deck at {:.1}\n",
         a.ship.cells.len(), a.ship.links.len(), a.ship.deck_y);
 
