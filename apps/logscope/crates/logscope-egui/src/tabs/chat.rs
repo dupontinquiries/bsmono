@@ -620,7 +620,20 @@ impl logscope::msgview::MessageStore for MsgSlice<'_> {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct MsgSave { role: u8, variants: Vec<String>, cur: usize }
+struct MsgSave {
+    role: u8,
+    variants: Vec<String>,
+    cur: usize,
+    /// Wall-clock seconds when the turn happened.
+    ///
+    /// `#[serde(default)]` for the same reason `replicator` below has one: an
+    /// autosave that refuses to parse costs the operator the conversation,
+    /// which is a far worse failure than a lost timestamp. Saves written before
+    /// this field load with `0`, which renders as "unknown" rather than as a
+    /// precise wrong date.
+    #[serde(default)]
+    at: u64,
+}
 /// A named, restorable snapshot of the whole conversation.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Checkpoint { label: String, at_unix: u64, msgs: Vec<MsgSave> }
@@ -637,11 +650,24 @@ struct ChatSave {
     replicator: Option<logscope::replicator::ReplicatorSave>,
 }
 
-fn msg_to_save(m: &Msg) -> MsgSave { MsgSave { role: if m.role == Role::User { 0 } else { 1 }, variants: m.variants.clone(), cur: m.cur } }
+fn msg_to_save(m: &Msg) -> MsgSave { MsgSave { role: if m.role == Role::User { 0 } else { 1 }, variants: m.variants.clone(), cur: m.cur, at: m.at } }
 fn save_to_msg(s: &MsgSave) -> Msg {
     let variants = if s.variants.is_empty() { vec![String::new()] } else { s.variants.clone() };
     let cur = s.cur.min(variants.len() - 1);
-    Msg { role: if s.role == 0 { Role::User } else { Role::Assistant }, variants, cur, born: Instant::now(), at: wall_now(), editing: false, edit_buf: String::new(), think_open: true, parent: None , model: None }
+    // THE STORED STAMP, not `wall_now()`.
+    //
+    // This is what makes the clock survive a reload. Taking the current time
+    // here would restamp every turn of a week-old conversation to the moment it
+    // was opened, so the transcript's "Started" line would say today, the
+    // between-turn gaps would all collapse to zero, and the prompt's time line
+    // would report a long session as brand new — the exact question it was
+    // added to answer.
+    //
+    // `0` for a save written before this field existed. `stamp_utc` renders
+    // that as "unknown" and the gap logic skips it, which is the honest
+    // outcome: those turns have no recorded time and inventing one would make
+    // an old transcript look precisely dated.
+    Msg { role: if s.role == 0 { Role::User } else { Role::Assistant }, variants, cur, born: Instant::now(), at: s.at, editing: false, edit_buf: String::new(), think_open: true, parent: None , model: None }
 }
 fn now_unix() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 
@@ -9023,11 +9049,11 @@ mod tests {
     #[test]
     fn save_to_msg_clamps_a_bad_cur() {
         // a corrupt/old save with cur past the end must not panic — clamp into range
-        let m = save_to_msg(&MsgSave { role: 1, variants: vec!["only".into()], cur: 9 });
+        let m = save_to_msg(&MsgSave { role: 1, variants: vec!["only".into()], cur: 9, at: 0 });
         assert_eq!(m.cur, 0);
         assert_eq!(m.text(), "only");
         // empty variants must yield a usable single empty variant
-        let e = save_to_msg(&MsgSave { role: 0, variants: vec![], cur: 3 });
+        let e = save_to_msg(&MsgSave { role: 0, variants: vec![], cur: 3, at: 0 });
         assert_eq!(e.variants.len(), 1);
         assert_eq!(e.cur, 0);
     }
@@ -9256,5 +9282,60 @@ mod time_line_tests {
     fn an_empty_chat_reports_nothing() {
         let c = chat_with(&[], None);
         assert!(c.time_line().is_none());
+    }
+}
+
+#[cfg(test)]
+mod stamp_persistence_tests {
+    use super::*;
+
+    /// A reloaded turn keeps the time it happened.
+    ///
+    /// `save_to_msg` used `wall_now()`, so reopening a week-old conversation
+    /// restamped every turn to the moment it was opened: the transcript's
+    /// "Started" line would say today, the between-turn gaps would collapse to
+    /// zero, and the prompt's time line would call a long session brand new —
+    /// the exact question it exists to answer.
+    #[test]
+    fn a_turn_keeps_its_stamp_across_save_and_load() {
+        let mut m = Msg::user("hello".into());
+        m.at = 1_700_000_000;
+        let back = save_to_msg(&msg_to_save(&m));
+        assert_eq!(back.at, 1_700_000_000, "the stamp must survive the round trip");
+    }
+
+    /// An autosave written before the field existed must still load.
+    ///
+    /// The neighbouring `replicator` field carries the same `serde(default)`
+    /// and says why: a save that refuses to parse costs the operator the
+    /// conversation, which is far worse than a lost timestamp.
+    #[test]
+    fn a_save_without_the_field_still_loads() {
+        let old = r#"{"role":0,"variants":["hi"],"cur":0}"#;
+        let s: MsgSave = serde_json::from_str(old).expect("pre-field saves must still parse");
+        assert_eq!(s.at, 0);
+        // And 0 renders as unknown rather than as 1970.
+        assert_eq!(stamp_utc(save_to_msg(&s).at), "unknown",
+                   "an unrecorded time must not be shown as a precise wrong date");
+    }
+
+    /// The whole point, end to end: a transcript exported after a reload still
+    /// reports when the conversation started.
+    #[test]
+    fn a_reloaded_conversation_exports_its_original_start_time() {
+        let mut c = Chat::default();
+        let mut a = Msg::user("first".into());   a.at = 1_700_000_000;
+        let mut b = Msg::assistant();            b.at = 1_700_003_600; // an hour later
+        c.msgs.push(a); c.msgs.push(b);
+
+        // Round-trip every turn through the on-disk form, as a reload does.
+        let reloaded: Vec<Msg> = c.msgs.iter().map(|m| save_to_msg(&msg_to_save(m))).collect();
+        let mut c2 = Chat::default();
+        c2.msgs = reloaded;
+
+        let md = c2.transcript();
+        assert!(md.contains("2023-11-14"), "the ORIGINAL start date, not today: {}",
+                md.lines().take(2).collect::<Vec<_>>().join(" "));
+        assert!(md.contains("1 hour later"), "the gap between turns must survive too: {md}");
     }
 }
