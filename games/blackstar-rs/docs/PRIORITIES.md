@@ -85,6 +85,13 @@ human moves at 0.45 of a bot's pace and the maps are built for neither.
 
 ### 2b. The ship as a place — DONE at the simulation layer
 
+**Sized in occupant-heights, not metres.** A 70 m hull is a reasonable
+starship for a person and 184 body-heights for the 0.38 m body this engine
+flies. `HULL_HEIGHTS = 40` gives 15 m today and automatically 340 m the day
+the player becomes an 8.5 m bot — which is what "Transformer scale" means,
+since it is a RATIO rather than a length. One number, no second one to keep in
+sync, and the rescale cannot miss it.
+
 The ship was the right thing to build before the scale work, because none of
 `--rescale`'s problem applies indoors: the rooms are authored, the scale is
 fixed, and moving between them is a position and a walkable check.

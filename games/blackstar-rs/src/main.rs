@@ -1821,7 +1821,10 @@ fn main() {
     let mut game = Game {
         bot_categories: bot_categories_loaded,
         gpu,
-        aboard: aboard::Aboard::new(70.0),
+        // Sized off the body that flies it, not a number in metres. See
+        // `aboard::HULL_HEIGHTS` — a 70 m hull was 184 body-heights for the
+        // 0.38 m body this engine actually uses.
+        aboard: aboard::Aboard::for_body(physics::Car::new().half_h * 2.0),
         last_room: None,
         world,
         car,

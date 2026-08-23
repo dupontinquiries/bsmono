@@ -6271,6 +6271,30 @@ now measures that instead.
 
 1121 passing.
 
+THE SHIP IS MEANT TO BE TRANSFORMER SCALE, AND THE FIX WAS THE UNIT.
+
+The playtest note was that the car is 0.38 m and the rooms are sized for a
+person, so the doorways would be meaningless. Measured: a 70 m hull is 184
+BODY-HEIGHTS for the body this engine actually flies. Cavernous, and the
+obvious response — make it bigger for bots — is the wrong direction with the
+same mistake in it.
+
+"Transformer scale" is a RATIO, not a length. A bot's ship should be as many
+bot-heights long as a person's ship is person-heights. So the hull is
+`HULL_HEIGHTS = 40` occupants long: 15 m today, 70 m for a person, and 340 m
+the day `--rescale` makes the player an 8.5 m bot. Nobody has to remember to
+change it, which matters because the whole point of that rescale is that a
+hundred numbers move at once and the ones that get missed are the ones written
+in metres.
+
+At the current body that is a ship SIX METRES ACROSS and 2.4 m tall — about
+five car-lengths and six car-heights, which is something you can drive around
+in rather than a cathedral. A test asserts the ratio holds at all three
+scales and that the plan does not lose rooms at the bottom of the range: a
+lander is a cramped carrier, not a smaller one.
+
+1123 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

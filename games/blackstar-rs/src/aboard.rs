@@ -52,7 +52,36 @@ pub struct Aboard {
     pub room: &'static str,
 }
 
+/// A hull, measured in OCCUPANT HEIGHTS rather than metres.
+///
+/// This is the unit the ship should always have used, and using metres was
+/// the mistake. A 70 m hull is a reasonable starship for a 1.75 m person and
+/// **184 body-heights for the 0.38 m body this engine actually flies** — so
+/// the rooms came out cavernous and the doorways meaningless.
+///
+/// Naming it in heights fixes it at both ends. Forty heights is a small
+/// starship: 15 m today, and automatically 340 m the day `--rescale` makes
+/// the player an 8.5 m bot. Nobody has to remember to change it, which
+/// matters because the whole point of the rescale is that a hundred numbers
+/// move at once and the ones that get missed are the ones written in metres.
+pub const HULL_HEIGHTS: f32 = 40.0;
+
+/// The hull length for a given occupant.
+pub fn hull_for(body_h_m: f32) -> f32 {
+    body_h_m * HULL_HEIGHTS
+}
+
 impl Aboard {
+    /// Board a ship sized for the body that flies it.
+    ///
+    /// The ship is meant to be Transformer scale, and "Transformer scale" is
+    /// a RATIO, not a length — a bot's ship should be as many bot-heights
+    /// long as a person's ship is person-heights. Sizing off the occupant is
+    /// what makes that true without a second number to keep in sync.
+    pub fn for_body(body_h_m: f32) -> Aboard {
+        Aboard::new(hull_for(body_h_m))
+    }
+
     /// Board at the bridge, which is where the plan puts the way in.
     ///
     /// **The doors start shut.** `Door::passable` wants `travel > 0.75` and a
@@ -479,6 +508,44 @@ mod tests {
         let span = m.verts.iter().map(|v| v.pos[0].abs()).fold(0.0f32, f32::max) * 2.0;
         assert!((20.0..200.0).contains(&span), "the hull spans {span:.0} m");
         assert!(hi_y - lo_y > 2.0, "the hull is {:.1} m tall", hi_y - lo_y);
+    }
+
+    #[test]
+    fn the_hull_is_measured_in_occupants_not_metres() {
+        // THE FIX FOR THE SCALE MISMATCH. A 70 m hull is a reasonable
+        // starship for a person and 184 body-heights for the 0.38 m body this
+        // engine flies, so the rooms were cavernous and the doorways
+        // meaningless.
+        //
+        // "Transformer scale" is a RATIO. A bot's ship should be as many
+        // bot-heights long as a person's ship is person-heights, and sizing
+        // off the occupant is what makes that true with no second number.
+        let car = hull_for(0.38);
+        let human = hull_for(1.75);
+        let bot = hull_for(8.5);
+        assert!((car - 15.2).abs() < 0.1, "the engine body gets a {car} m hull");
+        assert!(bot > 300.0, "a bot's ship is only {bot} m — building size was the ask");
+        // the RATIO is what is fixed, at every scale
+        for (h, hull) in [(0.38, car), (1.75, human), (8.5, bot)] {
+            assert!((hull / h - HULL_HEIGHTS).abs() < 0.01, "at {h} m");
+        }
+    }
+
+    #[test]
+    fn a_ship_sized_for_its_occupant_still_has_all_its_rooms() {
+        // 15 m is small, and the plan must not lose rooms at the bottom of
+        // the range — a lander is a cramped carrier, not a smaller one
+        for body in [0.38f32, 1.75, 8.5] {
+            let a = Aboard::for_body(body);
+            assert_eq!(
+                a.ship.cells.len(),
+                crate::content::HUB.len(),
+                "a {body} m occupant lost rooms"
+            );
+            assert!(a.console_here().is_some(), "no bridge console at {body} m");
+            // and you can still get about
+            assert!(a.consoles_reachable().len() > 1, "sealed in at {body} m");
+        }
     }
 
     #[test]
