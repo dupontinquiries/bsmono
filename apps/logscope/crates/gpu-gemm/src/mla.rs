@@ -678,6 +678,135 @@ silently WRONG rather than slow"
         }
     }
 
+    /// The prefix store must change WHEN work happens, never WHAT comes out.
+    ///
+    /// Two assertions, and the second is the one with teeth. Identical output to the
+    /// already-validated `run_fleet_trie` proves the cache is not corrupting KV. But a store that
+    /// silently never hit would also pass that — it would just rebuild everything and agree. So the
+    /// same fleet is run twice against one store: the second run must report hits, which is the
+    /// only evidence that a cache built by an earlier CALL was reused rather than rebuilt. That
+    /// cross-call reuse is the entire point; the trie already shared within a call.
+    #[test]
+    fn a_prefix_store_survives_the_call_that_filled_it() {
+        let path = "/tmp/tiny-qwen3.gguf";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("SKIPPED: {path} absent — sh tools/tiny-variants/gen-all.sh");
+            return;
+        };
+        let gpu = crate::Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) {
+            Ok(m) => m,
+            Err(e) => panic!("the qwen3 fixture no longer loads: {e}"),
+        };
+        let sp = crate::SamplerParams::default();
+        let reqs = || vec![
+            crate::FleetRequest { id: 0, tokens: vec![3u32, 1, 4, 1, 5, 9], max_new: 4 },
+            crate::FleetRequest { id: 1, tokens: vec![3u32, 1, 4, 1, 5, 2], max_new: 4 },
+            crate::FleetRequest { id: 2, tokens: vec![3u32, 1, 4, 8],       max_new: 3 },
+        ];
+
+        let baseline = gpu.run_fleet_trie(&m, reqs(), &sp, None, 2, 32, 2);
+
+        // A budget far above what three tiny prefixes need, so nothing demotes: the warm tier is
+        // lossy on promotion and this test is asserting equality, not closeness.
+        let mut store = crate::PrefixStore::new(1 << 30, m.n_layers, m.kv_dim());
+
+        let first = gpu.run_fleet_trie_cached(&m, reqs(), &sp, None, 2, 32, 2, &mut store);
+        assert_eq!(baseline, first,
+            "a cold store changed the output — the cache is corrupting KV, not just storing it");
+        assert_eq!(store.total_hits(), 0, "a cold store cannot have served anything");
+        assert_eq!(store.checked_out(), 0,
+            "every cache taken must be handed back, or the store leaks its budget");
+        let held = store.len();
+        assert!(held > 0, "the run built shared prefix nodes and kept none of them");
+
+        let second = gpu.run_fleet_trie_cached(&m, reqs(), &sp, None, 2, 32, 2, &mut store);
+        assert_eq!(baseline, second,
+            "a WARM store changed the output — a reused prefix cache is not equivalent to a \
+rebuilt one, which makes cross-call caching silently wrong rather than slow");
+        assert!(store.total_hits() > 0,
+            "the second run rebuilt every prefix — nothing was reused across calls, which is the \
+whole feature; the trie already shared within one call");
+        assert_eq!(store.checked_out(), 0, "a taken cache was never returned");
+        assert_eq!(store.len(), held, "the second run should reuse the same nodes, not add new ones");
+    }
+
+    /// A take must not reset the frequency half of the GDSF score.
+    ///
+    /// The store ranks by (hits+1)·len, and `take` REMOVES the entry — so without carrying the
+    /// count across a checkout, the most-reused prefix would return looking brand new and be first
+    /// in line for eviction. Exactly backwards.
+    #[test]
+    fn a_checked_out_prefix_does_not_forget_how_often_it_was_used() {
+        let path = "/tmp/tiny-qwen3.gguf";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("SKIPPED: {path} absent — sh tools/tiny-variants/gen-all.sh");
+            return;
+        };
+        let gpu = crate::Gpu::new();
+        let Ok(m) = gpu.load_gguf_opt(&bytes, false) else { panic!("qwen3 fixture no longer loads") };
+        let sp = crate::SamplerParams::default();
+        let reqs = || vec![
+            crate::FleetRequest { id: 0, tokens: vec![3u32, 1, 4, 1, 5, 9], max_new: 2 },
+            crate::FleetRequest { id: 1, tokens: vec![3u32, 1, 4, 1, 5, 2], max_new: 2 },
+        ];
+        let mut store = crate::PrefixStore::new(1 << 30, m.n_layers, m.kv_dim());
+        for _ in 0..3 { let _ = gpu.run_fleet_trie_cached(&m, reqs(), &sp, None, 2, 32, 2, &mut store); }
+        // Three runs: the first fills, the next two each take and return the same node.
+        assert_eq!(store.total_hits(), 2,
+            "expected one hit per run after the first; got {}", store.total_hits());
+    }
+
+    /// A key that maps to a cache of the WRONG LENGTH must be rebuilt, not used.
+    ///
+    /// `prefix_key` is a 64-bit hash, so two different prefixes can in principle collide, and the
+    /// consequence of trusting one would be attending over another sequence's KV — fluent, wrong
+    /// output rather than a crash. A collision cannot be produced on demand, so this poisons the
+    /// store instead: under the exact key the shared trie node looks up, a cache built from
+    /// unrelated tokens at a different length. The `total_hits` assertion is what makes the test
+    /// mean anything — it proves the poisoned key really was consulted rather than missed.
+    ///
+    /// KNOWN LIMIT, stated so this is not trusted past its range. **Deleting the length guard does
+    /// NOT fail this test.** With the guard gone the 2-row cache is attended over as if it held 5
+    /// rows; the unwritten rows are zeros, and this fixture's model is small enough that the greedy
+    /// argmax does not move. So what is verified here is that the poisoned entry is looked up and
+    /// the output is correct WITH the guard present. The guard itself is reasoned-correct, not
+    /// test-enforced — demonstrating its consequence needs a model whose output is sensitive to
+    /// garbage KV, which means real weights and therefore M2.
+    #[test]
+    fn a_cached_prefix_of_the_wrong_length_is_refused_not_attended_over() {
+        let path = "/tmp/tiny-qwen3.gguf";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("SKIPPED: {path} absent — sh tools/tiny-variants/gen-all.sh");
+            return;
+        };
+        let gpu = crate::Gpu::new();
+        let Ok(m) = gpu.load_gguf_opt(&bytes, false) else { panic!("qwen3 fixture no longer loads") };
+        let sp = crate::SamplerParams::default();
+        // Both requests share [3,1,4,1,5], so the trie's shared node is that 5-token prefix.
+        let shared: Vec<u32> = vec![3, 1, 4, 1, 5];
+        let reqs = || vec![
+            crate::FleetRequest { id: 0, tokens: vec![3u32, 1, 4, 1, 5, 9], max_new: 3 },
+            crate::FleetRequest { id: 1, tokens: vec![3u32, 1, 4, 1, 5, 2], max_new: 3 },
+        ];
+        let baseline = gpu.run_fleet_trie(&m, reqs(), &sp, None, 2, 32, 2);
+
+        let mut store = crate::PrefixStore::new(1 << 30, m.n_layers, m.kv_dim());
+        // Poison: the right key, a cache of two unrelated tokens.
+        let poison = gpu.prefill_prefix(&m, &[7u32, 7]);
+        store.insert(&gpu, crate::prefix_key(&shared), 2, poison);
+
+        let got = gpu.run_fleet_trie_cached(&m, reqs(), &sp, None, 2, 32, 2, &mut store);
+        assert_eq!(store.total_hits(), 1,
+            "the poisoned key was never looked up, so this test is not exercising the guard at \
+all — the trie's shared node is not keyed on {shared:?}");
+        assert_eq!(baseline, got,
+            "a wrong-length cache was attended over instead of rebuilt — a hash collision would \
+produce fluent, WRONG output rather than a crash");
+        assert_eq!(store.checked_out(), 0,
+            "the refused cache was taken and never accounted for — the store leaks its budget");
+    }
+
     #[test]
     fn an_mla_checkpoint_reaches_the_loader_and_stops_where_the_notes_say() {
         let path = "/tmp/tiny-glmdsa.gguf";

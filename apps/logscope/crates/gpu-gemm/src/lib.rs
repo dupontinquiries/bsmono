@@ -13517,6 +13517,18 @@ fn trie_insert(nodes: &mut Vec<TrieNode>, tokens: &[u32], w: usize) {
     }
 }
 
+/// Content key for a token prefix, for `PrefixStore`. FNV-1a over the ids; the store still checks
+/// the cached length matches before reusing, so a collision costs a rebuild rather than wrong KV.
+///
+/// PER-MODEL. The ids alone identify the prefix, not the weights that produced its KV, so a store
+/// must not be shared across models — which matches `PrefixStore::new` already taking `n_layers`
+/// and `kv_dim`.
+pub fn prefix_key(tokens: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &t in tokens { h = (h ^ t as u64).wrapping_mul(0x0000_0100_0000_01B3); }
+    h
+}
+
 /// A cached prefix in one of two compression tiers: hot f32 (fast to seed) or warm int8
 /// (~4x smaller, lossy on promotion).
 pub enum Tier { Hot(KvCache), Warm(QKvCache) }
@@ -13535,6 +13547,12 @@ struct CacheEntry { key: u64, len: usize, tier: Tier, hits: u32, last: u64 }
 /// least-shared caches first — what you want when a fleet is churning through many files.
 pub struct PrefixStore {
     entries: Vec<CacheEntry>,
+    /// Keys currently CHECKED OUT via `take`, with the hit count they carried. A taken entry is
+    /// removed from `entries` — the caller owns its `KvCache` — so without this the frequency half
+    /// of the GDSF score would reset to zero every time a prefix was actually used, ranking the
+    /// most-reused prefixes as if they were brand new. `insert` drains this to restore the count.
+    out: std::collections::HashMap<u64, u32>,
+    hits_total: u64,
     budget_bytes: usize,
     clock: u64,
     n_layers: usize,
@@ -13542,8 +13560,13 @@ pub struct PrefixStore {
 }
 impl PrefixStore {
     pub fn new(budget_bytes: usize, n_layers: usize, kv_dim: usize) -> Self {
-        Self { entries: vec![], budget_bytes, clock: 0, n_layers, kv_dim }
+        Self { entries: vec![], out: Default::default(), hits_total: 0, budget_bytes, clock: 0, n_layers, kv_dim }
     }
+    /// Cumulative successful `take`s — how often a prefix was served from cache rather than rebuilt.
+    /// The number a caller checks to prove reuse actually happened.
+    pub fn total_hits(&self) -> u64 { self.hits_total }
+    /// Number of prefixes currently checked out and not yet returned.
+    pub fn checked_out(&self) -> usize { self.out.len() }
     fn hot_bytes(&self, len: usize) -> usize { 2 * len * self.kv_dim * 4 * self.n_layers }
     fn warm_bytes(&self, len: usize) -> usize { 2 * self.n_layers * (len * self.kv_dim + len * 4) }
     fn entry_bytes(&self, e: &CacheEntry) -> usize {
@@ -13566,13 +13589,42 @@ impl PrefixStore {
             e.hits += 1; e.last = now; Some(&e.tier)
         } else { None }
     }
+    /// REMOVE a cached prefix and hand its `KvCache` to the caller, promoting warm→hot on the way
+    /// out. Returns `(len, cache)`.
+    ///
+    /// This exists because `get`'s borrow cannot serve a builder. `KvCache` wraps wgpu buffers and
+    /// is not `Clone`, so a hot hit can be neither copied nor moved out from behind `&Tier` — and a
+    /// caller like `run_fleet_trie_inner` must hold parent caches while inserting freshly-built
+    /// children, which conflicts with the `&mut self` that `insert` needs. Transferring ownership
+    /// in both directions removes the conflict entirely: nothing is borrowed across a mutation.
+    ///
+    /// A take counts as a hit. The entry's memory stops counting against the budget while it is
+    /// out, which is correct — the caller is holding it.
+    ///
+    /// WARM HITS ARE LOSSY. `promote_cache` reverses an int8 demotion, so a prefix served from the
+    /// warm tier is within int8 error of the f32 original, not equal to it. A caller that needs
+    /// bit-exactness must keep the budget large enough to avoid demotion.
+    pub fn take(&mut self, gpu: &Gpu, key: u64) -> Option<(usize, KvCache)> {
+        let i = self.entries.iter().position(|e| e.key == key)?;
+        let e = self.entries.remove(i);
+        self.out.insert(key, e.hits.saturating_add(1));
+        self.hits_total += 1;
+        let cache = match e.tier {
+            Tier::Hot(c) => c,
+            Tier::Warm(q) => gpu.promote_cache(&q, e.len, self.kv_dim),
+        };
+        Some((e.len, cache))
+    }
     /// Insert a freshly-built hot prefix cache, then enforce the budget.
     pub fn insert(&mut self, gpu: &Gpu, key: u64, len: usize, cache: KvCache) {
         self.clock += 1; let now = self.clock;
+        // If this key was checked out, restore the hit count it carried rather than starting over.
+        let restored = self.out.remove(&key);
         if let Some(e) = self.entries.iter_mut().find(|e| e.key == key) {
             e.tier = Tier::Hot(cache); e.len = len; e.last = now;
+            if let Some(h) = restored { e.hits = h; }
         } else {
-            self.entries.push(CacheEntry { key, len, tier: Tier::Hot(cache), hits: 0, last: now });
+            self.entries.push(CacheEntry { key, len, tier: Tier::Hot(cache), hits: restored.unwrap_or(0), last: now });
         }
         self.enforce(gpu);
     }
@@ -15633,6 +15685,33 @@ like a bad model rather than a wiring bug.");
         &self, m: &Model, requests: Vec<FleetRequest>, sampler: &SamplerParams,
         eos: Option<u32>, max_batch: usize, max_seq: usize, min_share: usize,
     ) -> Vec<(usize, Vec<u32>)> {
+        self.run_fleet_trie_inner(m, requests, sampler, eos, max_batch, max_seq, min_share, None)
+    }
+
+    /// `run_fleet_trie` with prefix caches that OUTLIVE the call.
+    ///
+    /// The trie already shares a prefix across the workers of ONE call, then drops every cache it
+    /// built. So a fleet that runs the same shared prefix again — the normal case when workers keep
+    /// returning to one file — re-prefills it from scratch. Passing a `PrefixStore` makes each trie
+    /// node a cache key: nodes are taken from the store when present and handed back when the run
+    /// finishes, with the store's two-tier eviction deciding what survives.
+    ///
+    /// Same results as `run_fleet_trie` while entries stay HOT. A warm (int8) hit is lossy by
+    /// construction — see `PrefixStore::take` — so a caller needing bit-exactness must size the
+    /// budget to avoid demotion.
+    pub fn run_fleet_trie_cached(
+        &self, m: &Model, requests: Vec<FleetRequest>, sampler: &SamplerParams,
+        eos: Option<u32>, max_batch: usize, max_seq: usize, min_share: usize,
+        store: &mut PrefixStore,
+    ) -> Vec<(usize, Vec<u32>)> {
+        self.run_fleet_trie_inner(m, requests, sampler, eos, max_batch, max_seq, min_share, Some(store))
+    }
+
+    fn run_fleet_trie_inner(
+        &self, m: &Model, requests: Vec<FleetRequest>, sampler: &SamplerParams,
+        eos: Option<u32>, max_batch: usize, max_seq: usize, min_share: usize,
+        mut store: Option<&mut PrefixStore>,
+    ) -> Vec<(usize, Vec<u32>)> {
         use std::collections::{HashMap, HashSet, VecDeque};
         if requests.is_empty() { return Vec::new(); }
         // build the trie (root = node 0, empty segment)
@@ -15678,9 +15757,19 @@ like a bad model rather than a wiring bug.");
         used.sort_by_key(|&n| nodes[n].cum);
         let used_set: HashSet<usize> = used.iter().copied().collect();
         let mut caches: HashMap<usize, KvCache> = HashMap::new();
+        let mut node_key: HashMap<usize, u64> = HashMap::new();
         for &node in &used {
             let cum = nodes[node].cum;
             let toks = requests[nodes[node].rep].tokens.clone();
+            let key = prefix_key(&toks[..cum]);
+            node_key.insert(node, key);
+            // Cache hit: take ownership of the whole node cache and skip building it. The length
+            // check guards a hash collision — a mismatch costs a rebuild, never wrong KV.
+            if let Some(st) = store.as_deref_mut() {
+                if let Some((len, c)) = st.take(self, key) {
+                    if len == cum { caches.insert(node, c); continue; }
+                }
+            }
             // nearest already-built cache ancestor
             let mut anc = nodes[node].parent; let mut pa = None;
             while anc != usize::MAX { if used_set.contains(&anc) { pa = Some(anc); break; } anc = nodes[anc].parent; }
@@ -15711,6 +15800,14 @@ like a bad model rather than a wiring bug.");
             out.append(&mut r);
         }
         out.sort_by_key(|r| r.0);
+        // Give the caches back. AFTER the run, not during: the run phase borrows `caches`, and
+        // `insert` needs `&mut store`. Each insert runs `enforce`, so the budget decides what
+        // survives to the next call.
+        if let Some(st) = store {
+            for (node, c) in caches {
+                if let Some(&k) = node_key.get(&node) { st.insert(self, k, nodes[node].cum, c); }
+            }
+        }
         out
     }
     pub fn session_q8_new(&self, m: &Model, max_seq: usize, seed: u64) -> SessionQ8 {
