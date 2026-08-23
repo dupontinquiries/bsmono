@@ -41,6 +41,58 @@ The dimensions are deliberately ragged (37×53×41, none a multiple of the
 16-wide tile), so this result covers the bounds handling in `a_at`/`b_at` and
 not just the aligned interior.
 
+## MEASURED — the selftest runs headlessly, and what that is worth
+
+`beatspace gpu-selftest --features gpu` was treated all session as needing the
+hardware. It does not. On llvmpipe, this sandbox's software adapter:
+
+```
+adapter: llvmpipe (LLVM 20.1.2, 256 bits) (Gl)
+gemm 37x53x41 on a 3x3 tile grid
+worst |gpu-cpu| = 0.000e0 at (0, 0)
+gemm PASS — all 1517 elements within 1e-4
+adam PASS — 4096 params, worst 0.000e0
+```
+
+So the acceptance test is runnable in CI and in a sandbox, which is worth
+having. But read the number, because the page above says an exactly-equal
+result "would be suspicious — it would mean the tile loop was not actually
+reordering anything", and here it is: `0.000e0`.
+
+**It is the ADAPTER, not the fixture.** Two explanations were possible — the
+inputs might sum exactly in any order, or llvmpipe might not be accumulating
+the way the kernel describes — and they call for opposite reactions. Settled in
+f32 arithmetic with no GPU involved, replaying both orders over the selftest's
+own inputs `((i*37 % 91) - 45)/45`:
+
+```
+cells compared      : 1517
+exactly equal       :  389
+worst |seq - tiled| : 2.861e-06
+```
+
+Reordering DOES change the result for these values, on 1128 of 1517 cells. A
+kernel genuinely accumulating in 16-wide tiles therefore CANNOT match a
+sequential reference bit for bit — so llvmpipe's `0.000e0` says it is not
+executing the tile structure the WGSL describes, presumably having flattened or
+re-associated it.
+
+Two consequences, and the first is the one that matters:
+
+* **A green selftest on llvmpipe does not validate the tiled GEMM.** It
+  validates the plumbing — dispatch, buffer layout, bounds handling in
+  `a_at`/`b_at`, the readback path — which is real and is most of what breaks.
+  It does not exercise the numerics the tile loop exists for. Do not read a
+  CI pass as covering that; the M2 run is still the only evidence there.
+* **It corroborates the M2 figure.** 1.669e-6 measured on hardware against
+  2.861e-6 predicted worst-case for pure reordering is the same order of
+  magnitude, which is what a genuinely tiled kernel accumulating in f32 should
+  produce. The hardware number was never a near miss and now has an independent
+  bound to sit against.
+
+The ragged dimensions still earn their place on any adapter: 37x53x41 against a
+16-wide tile exercises the bounds handling, and that part llvmpipe does check.
+
 ## MEASURED — the parameters this GEMM uses
 
 Validated by the run above, on `Apple M2 Ultra (G14D B1) [Vulkan]`:
