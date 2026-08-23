@@ -25,8 +25,9 @@
 use clawbound_rs::ancestor::{self, Ancestor};
 use clawbound_rs::battleground::{Battleground, CLAN_A};
 
-fn play(a: [Ancestor; 3], b: [Ancestor; 3], seed: u32) -> Option<u8> {
+fn play(a: [Ancestor; 3], b: [Ancestor; 3], seed: u32, wombo: bool) -> Option<u8> {
     let mut bg = Battleground::new_on(a, b, seed);
+    bg.wombo = wombo;
     let mut steps = 0u32;
     while bg.outcome.is_none() && steps < 30 * 60 * 13 {
         bg.step(1.0 / 30.0);
@@ -44,6 +45,9 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(13);
+    // arg 3: "nowombo" turns off AI crowd-control coordination, so the same
+    // drafts on the same land can be played both ways and compared
+    let wombo = std::env::args().nth(3).as_deref() != Some("nowombo");
     let pool = ancestor::ALL;
     let mut wins = vec![0u32; pool.len()];
     let mut games = vec![0u32; pool.len()];
@@ -72,7 +76,7 @@ fn main() {
             let side_b = [pool[picked[3]], pool[picked[4]], pool[picked[5]]];
             for swap in [false, true] {
                 let (x, y) = if swap { (side_b, side_a) } else { (side_a, side_b) };
-                let Some(o) = play(x, y, seed) else { continue };
+                let Some(o) = play(x, y, seed, wombo) else { continue };
                 total += 1;
                 if o != 2 {
                     fells += 1;
@@ -93,7 +97,7 @@ fn main() {
         eprintln!("roll {} of {rolls} done ({total} games)", roll + 1);
     }
 
-    eprintln!("\n{total} games over {rolls} terrain rolls");
+    eprintln!("\n{total} games over {rolls} terrain rolls (wombo {})", if wombo { "on" } else { "off" });
     eprintln!(
         "  clan A took {clan_a_wins} ({:.0}%) — the map claims symmetry, so this wants ~50%",
         clan_a_wins as f64 / total as f64 * 100.0

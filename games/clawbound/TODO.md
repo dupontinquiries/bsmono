@@ -242,10 +242,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 
 - [ ] Landform-carved heightfield (walls/crags as real terrain relief rather than placed
   slabs) would need a per-mode heightfield overlay in world — a bigger seam, deferred
-- [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes
-  the gather) — both controller-led report matches ran longest and lost their single
-  sample; consider auto_cast coordination (hold Earthshaker/Eclipse for a fresh
-  Undertow) before tuning numbers
+- [x] Crowd-control coordination in `auto_cast`: a controller saves its pull/root for a
+  crowd, an area ult holds a few seconds for a gather that is coming, and the pulled carry
+  a `pulled_t` mark so the follow-up can see the moment. Ults also now want a bigger crowd
+  than techniques (3 vs 2) — without that the gather kits burned The River Takes on any
+  two scouts. Behind `Battleground::wombo` so it can be ablated, not just believed.
+- [x] Ablation says the coordination alone was worth **nothing**: 168 games each way, same
+  drafts, same lands — clan A 48% off vs 49% on, every kit inside its own standard error
+  (Riptail 52% -> 49%). Recorded rather than quietly kept.
+- [x] The diagnosis was the real finding: ancestors were assigned `slot % LANES`, one per
+  trail, so **the map had a duo lane with nobody duoing** and the coordination had no
+  partner. Ancestors now lane like the country is shaped — seat 0 walks the river solo,
+  seats 1-2 climb the mountain together, the middle is the patrols' with a weighted wave
+  rotation. Roster spread went 37-65% -> **42-57%**, flatter than any kit tuning achieved.
+- [ ] Re-run the wombo ablation now that a duo pair actually exists — the null result was
+  measured in a world where the coordination could never trigger
 - [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
   camera follow; needs the `app` feature stack (winit/wgpu) compiled
 - [x] Player-pick draft UI in menu.rs — `Screen::Draft`, 6 pick slots (3 per
