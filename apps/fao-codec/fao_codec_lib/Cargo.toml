@@ -23,3 +23,8 @@ rustfft = "6.2"
 num-complex = "0.4"
 wgpu = { version = "0.19", optional = true }
 pollster = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# Offline WGSL validation so a shader error fails `cargo test` rather than
+# panicking on the first frame. Matched to this crate's own wgpu.
+naga = { version = "0.19", features = ["wgsl-in"] }

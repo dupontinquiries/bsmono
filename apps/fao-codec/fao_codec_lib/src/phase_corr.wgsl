@@ -333,9 +333,9 @@ fn peak_find(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicStore(&peak[1], i / N);
         // Also update second-place tracker — the loser of this exchange 
         // is the new second-best candidate.
-        let _ = atomicMax(&peak[3], prev_max_bits);
+        _ = atomicMax(&peak[3], prev_max_bits);
     } else {
         // We lost. Try to update second-place if our value beats it.
-        let _ = atomicMax(&peak[3], v_bits);
+        _ = atomicMax(&peak[3], v_bits);
     }
 }

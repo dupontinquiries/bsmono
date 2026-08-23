@@ -21,3 +21,8 @@ env_logger = { version = "0.11", optional = true }
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:env_logger"]
+
+[dev-dependencies]
+# Offline WGSL validation so a shader error fails `cargo test` rather than
+# panicking on the first frame. Matched to this crate's own wgpu.
+naga = { version = "0.19", features = ["wgsl-in"] }

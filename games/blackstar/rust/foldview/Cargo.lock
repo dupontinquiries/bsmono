@@ -585,6 +585,7 @@ dependencies = [
  "bytemuck",
  "env_logger",
  "model-verify",
+ "naga",
  "png",
  "pollster",
  "serde",

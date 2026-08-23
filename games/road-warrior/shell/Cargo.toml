@@ -11,3 +11,8 @@ zbus = { version = "3", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 bytemuck = { version = "1", features = ["derive"] }
 rand = "0.8"
+
+[dev-dependencies]
+# Offline WGSL validation so a shader error fails `cargo test` rather than
+# panicking on the first frame. Matched to this crate's own wgpu.
+naga = { version = "22", features = ["wgsl-in"] }

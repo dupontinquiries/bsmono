@@ -822,6 +822,7 @@ name = "fao-codec-lib"
 version = "1.0.0"
 dependencies = [
  "fao-codec-core",
+ "naga 0.19.2",
  "num-complex",
  "pollster",
  "rustfft",
