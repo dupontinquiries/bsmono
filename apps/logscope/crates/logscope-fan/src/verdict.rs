@@ -26,6 +26,10 @@ fn is_code_tag(tag: &str) -> bool {
 
 pub fn extract_code(reply: &str) -> String {
     let mut blocks = Vec::new();
+    // Fences whose tag says "not source". Kept separately rather than dropped:
+    // they are the wrong thing to CONCATENATE with source, and the right thing
+    // to fall back to when there is no source at all.
+    let mut other: Vec<String> = Vec::new();
     let mut rest = reply;
     while let Some(start) = rest.find("```") {
         let after = &rest[start + 3..];
@@ -52,11 +56,30 @@ pub fn extract_code(reply: &str) -> String {
             // SHOWING ITS OUTPUT. Measured, not hypothesised.
             if is_code_tag(tag) {
                 blocks.push(body[..end].to_string());
+            } else {
+                other.push(body[..end].to_string());
             }
             rest = &body[end + 3..];
         } else { break; }
     }
-    if blocks.is_empty() { reply.trim().to_string() } else { blocks.join("\n\n") }
+    // THREE TIERS, and the middle one exists because skipping non-source fences
+    // introduced a regression I had to go looking for.
+    //
+    // A worker asked to produce a manifest answers with one `toml` fence and
+    // nothing else. With only the source/prose split, that had no source
+    // fences and fell all the way through to the raw reply — handing the
+    // checker the prose AND the ``` markers, which is worse than the bug this
+    // function was just fixed for. `cmd` is caller-supplied, so a non-Rust
+    // checker is an ordinary case rather than a hypothetical.
+    if !blocks.is_empty() {
+        blocks.join("\n\n")
+    } else if !other.is_empty() {
+        // No source, but fenced content exists: it is what the worker meant to
+        // deliver, whatever its tag claims.
+        other.join("\n\n")
+    } else {
+        reply.trim().to_string()
+    }
 }
 
 /// Compile `code` with shell command `cmd`, returning Pass/Fail (None if the code is empty or the checker
@@ -142,6 +165,31 @@ a correct answer was graded as a compile failure: {code:?}");
             let code = extract_code(&reply);
             assert!(!code.contains("not source"), "`{tag}` block leaked into the code: {code:?}");
         }
+    }
+
+/// The regression the tag exclusion introduced, found by asking what a
+    /// worker producing a NON-Rust artifact would get.
+    #[test]
+    fn a_reply_whose_only_fence_is_non_source_yields_that_fence_not_the_prose() {
+        for tag in ["toml", "json", "yaml", "diff", "text"] {
+            let reply = format!("Here is the manifest:\n\n```{tag}\n[package]\nname = \"x\"\n```\n");
+            let code = extract_code(&reply);
+            assert!(code.contains("[package]"), "`{tag}`: content lost: {code:?}");
+            assert!(!code.contains("Here is the manifest"),
+                    "`{tag}`: the prose leaked into the checker: {code:?}");
+            assert!(!code.contains("```"),
+                    "`{tag}`: the fence markers leaked into the checker: {code:?}");
+        }
+    }
+
+    /// And source still wins when both are present — the whole point of the
+    /// split.
+    #[test]
+    fn source_wins_over_a_non_source_fence_in_the_same_reply() {
+        let reply = "```rust\nfn a() {}\n```\n```toml\n[package]\n```\n";
+        let code = extract_code(reply);
+        assert!(code.contains("fn a"));
+        assert!(!code.contains("[package]"), "the toml block must not be concatenated: {code:?}");
     }
 
     #[test]
