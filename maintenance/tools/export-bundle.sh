@@ -40,7 +40,17 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 echo "consolidating packs (REPO_SIZE.md step 1)…"
-git gc --quiet
+# STDIN CLOSED. `git gc` spawns `git repack`, which inherits stdin, and if the
+# caller left anything readable there repack consumes it as arguments and dies:
+#
+#   fatal: bad revision 'ls: cannot access .git/gc.log ...'
+#   fatal: failed to run repack
+#
+# The quoted text is the PREVIOUS command's output, which is what made it look
+# like repository corruption — `git fsck` was clean and `git repack -a -d -l`
+# alone succeeded every time. Reproduced and fixed by adding `< /dev/null`.
+# An export is the last thing that should fail for a reason outside itself.
+git gc --quiet < /dev/null
 
 # refs/notes/toolcalls is NOT included by --all. Omitting it is failure mode #3
 # in SKILL_session_capture.md: the receiving clone shows every observed_calls
