@@ -19,7 +19,13 @@ use crate::micsample::{Decision, Gate, Sampler};
 use crate::micsession::{Session, StopPolicy, Stopped};
 
 /// Capture until the policy says stop. Returns the session directory.
-pub fn listen(cfg: &Config, root: &std::path::Path, policy: StopPolicy) -> Result<std::path::PathBuf> {
+pub fn listen(
+    cfg: &Config,
+    root: &std::path::Path,
+    policy: StopPolicy,
+    gate: Gate,
+    dry_run: bool,
+) -> Result<std::path::PathBuf> {
     // Written against cpal 0.18, matching player.rs in this crate rather than
     // from memory: `default_input_device` returns Option not Result,
     // `sample_rate()` is a plain u32 (not a tuple struct), and a
@@ -53,6 +59,10 @@ pub fn listen(cfg: &Config, root: &std::path::Path, policy: StopPolicy) -> Resul
     }
     println!("[listen] crops are mel spectrograms, and mel is NOT anonymised: \
 this crate's Griffin-Lim can turn them back into audible sound.");
+    if dry_run {
+        println!("[listen] DRY RUN — nothing will be written. Tune with \
+--onset-mult / --refractory / --novelty, then run again without --dry-run.");
+    }
 
     // The audio thread must not allocate, block, or do FFTs, so it does the
     // least possible: interleaved input -> mono f32 -> channel. Everything else
@@ -73,7 +83,6 @@ convert with a virtual device, or add the arm here"),
     stream.play()?;
 
     let mel = crate::dsp::Mel::new(cfg);
-    let gate = Gate { time_frames: cfg.time_frames, budget: policy.budget, ..Gate::default() };
     let mut sampler = Sampler::new(gate, cfg.n_mels);
     let start = std::time::Instant::now();
     // Resampling is linear and per-block, matching audio_io::resample_linear —
@@ -84,7 +93,7 @@ convert with a virtual device, or add the arm here"),
     let reason = loop {
         let elapsed = start.elapsed().as_secs_f64();
         let asked = crate::train::stop_requested(cfg);
-        if let Some(r) = policy.should_stop(elapsed, session.written(), asked) {
+        if let Some(r) = policy.should_stop(elapsed, sampler.keeps, asked) {
             break r;
         }
         let Ok(block) = rx.recv_timeout(std::time::Duration::from_millis(250)) else { continue };
@@ -103,10 +112,18 @@ convert with a virtual device, or add the arm here"),
             for f in 0..t {
                 let col: Vec<f32> = (0..cfg.n_mels).map(|m| frames[m * t + f]).collect();
                 if sampler.push(&col) == Decision::Keep {
-                    match session.write_crop(&sampler.crop()) {
-                        Ok(_) => println!("[listen] kept crop {} ({:.0} s in)",
-                                          session.written(), start.elapsed().as_secs_f64()),
-                        Err(e) => eprintln!("[listen] could not write crop: {e}"),
+                    if dry_run {
+                        // Counted by the sampler either way; the session stays
+                        // empty so the stop policy's budget still applies to
+                        // what WOULD have been written.
+                        println!("[listen] would keep crop {} ({:.0} s in)",
+                                 sampler.keeps, start.elapsed().as_secs_f64());
+                    } else {
+                        match session.write_crop(&sampler.crop()) {
+                            Ok(_) => println!("[listen] kept crop {} ({:.0} s in)",
+                                              session.written(), start.elapsed().as_secs_f64()),
+                            Err(e) => eprintln!("[listen] could not write crop: {e}"),
+                        }
                     }
                 }
             }
@@ -120,10 +137,19 @@ convert with a virtual device, or add the arm here"),
         Stopped::Budget => "crop budget reached",
         Stopped::Asked => "STOP file",
     };
-    println!("[listen] stopped: {why}. {} crop(s) in {}",
-             session.written(), session.dir().display());
-    println!("[listen] train on it with: beatspace train --data-dir {}",
-             session.dir().display());
+    println!("[listen] stopped: {why}.");
+    // The tally, always — a session that kept plenty is as worth explaining as
+    // one that kept nothing, because the reject mix is how you tell a
+    // well-tuned gate from a lucky one.
+    println!("[listen] {}", sampler.rejected.advice(sampler.onsets, sampler.keeps));
+    if dry_run {
+        let _ = std::fs::remove_dir(session.dir()); // empty; leave no litter
+        println!("[listen] dry run — nothing written.");
+    } else {
+        println!("[listen] {} crop(s) in {}", session.written(), session.dir().display());
+        println!("[listen] train on it with: beatspace train --data-dir {}",
+                 session.dir().display());
+    }
     Ok(session.dir().to_path_buf())
 }
 

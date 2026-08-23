@@ -144,6 +144,54 @@ pub struct Sampler {
     kept: Vec<Vec<f32>>,
     pub keeps: usize,
     pub onsets: usize,
+    /// Why onsets were turned away, counted.
+    ///
+    /// Every `Gate` number was tuned against SYNTHETIC transients, so the first
+    /// real room is the first honest test of them — and the failure modes look
+    /// identical from outside. A session that keeps nothing is a broken
+    /// microphone, a threshold set too high, a refractory window swallowing
+    /// everything, or a novelty gate that decided the whole room sounds the
+    /// same. Those want opposite corrections, and the counts are what tell them
+    /// apart.
+    pub rejected: Rejects,
+}
+
+/// Rejection tally, one field per [`Reject`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Rejects {
+    pub too_soon: usize,
+    pub familiar: usize,
+    pub budget_spent: usize,
+    pub speech_like: usize,
+}
+
+impl Rejects {
+    pub fn total(&self) -> usize {
+        self.too_soon + self.familiar + self.budget_spent + self.speech_like
+    }
+
+    /// A line for the end of a session, written to be actionable rather than
+    /// merely accurate: each count is paired with the knob that moves it.
+    pub fn advice(&self, onsets: usize, keeps: usize) -> String {
+        let mut s = format!(
+            "onsets {onsets}, kept {keeps} — rejected: {} too-soon, {} familiar, \
+{} speech-like, {} over-budget",
+            self.too_soon, self.familiar, self.speech_like, self.budget_spent);
+        if onsets == 0 {
+            s.push_str("\n  nothing crossed the onset threshold: is the mic live, \
+and is --onset-mult too high for this room?");
+        } else if keeps == 0 && self.familiar > 0 {
+            s.push_str("\n  everything sounded familiar: lower --novelty, or the room \
+really does make one sound");
+        } else if keeps == 0 && self.too_soon == onsets {
+            s.push_str("\n  every onset landed inside the refractory window: \
+lower --refractory if these are separate events");
+        } else if self.speech_like > keeps {
+            s.push_str("\n  most events looked like speech and were dropped; \
+--allow-speech keeps them, and read what that means first");
+        }
+        s
+    }
 }
 
 impl Sampler {
@@ -160,6 +208,7 @@ impl Sampler {
             kept: Vec::new(),
             keeps: 0,
             onsets: 0,
+            rejected: Rejects::default(),
             gate,
         }
     }
@@ -198,17 +247,21 @@ impl Sampler {
         self.onsets += 1;
 
         if self.since_keep < self.gate.refractory {
+            self.rejected.too_soon += 1;
             return Decision::Rejected(Reject::TooSoon);
         }
         if self.keeps >= self.gate.budget {
+            self.rejected.budget_spent += 1;
             return Decision::Rejected(Reject::BudgetSpent);
         }
 
         let summary = self.summary();
         if self.gate.speechlike && looks_like_speech(&summary) {
+            self.rejected.speech_like += 1;
             return Decision::Rejected(Reject::SpeechLike);
         }
         if self.kept.iter().any(|k| summary_distance(k, &summary) < self.gate.novelty_min_dist) {
+            self.rejected.familiar += 1;
             return Decision::Rejected(Reject::Familiar);
         }
 
@@ -570,4 +623,70 @@ rejection has stopped working",
         assert!(s.keeps > 0 && s.keeps < 500,
                 "a day produced {} crops — expected a curated handful", s.keeps);
     }
+
+    /// The counters must distinguish the failure modes that look identical.
+    #[test]
+    fn rejections_are_attributed_to_the_right_gate() {
+        // A room with one sound in it, repeated. Onsets fire; novelty rejects.
+        let mut frames: Vec<Vec<f32>> = (0..400).map(|_| silence()).collect();
+        for _ in 0..40 {
+            for age in 0..10 { frames.push(hit(age, 0.3)); }
+            frames.extend((0..130).map(|_| silence()));
+        }
+        let (s, _) = run(Gate::default(), &frames);
+        assert!(s.onsets > 20, "the repeats should be heard: {}", s.onsets);
+        assert!(s.rejected.familiar > 10,
+                "repeats must be attributed to novelty, got {:?}", s.rejected);
+        assert_eq!(s.rejected.budget_spent, 0, "the budget was never near");
+    }
+
+    #[test]
+    fn a_clustered_event_is_attributed_to_the_refractory_window() {
+        let mut frames: Vec<Vec<f32>> = (0..400).map(|_| silence()).collect();
+        for burst in 0..5 {
+            for age in 0..6 { frames.push(hit(age, 0.1 * burst as f32)); }
+        }
+        frames.extend((0..200).map(|_| silence()));
+        let (s, _) = run(Gate::default(), &frames);
+        assert!(s.rejected.too_soon > 0,
+                "a burst must be attributed to refractory, got {:?}", s.rejected);
+    }
+
+    /// The advice is the point of the counters — a tally nobody can act on is
+    /// just a number.
+    #[test]
+    fn the_advice_names_the_knob_for_each_failure_mode() {
+        let silent = Rejects::default();
+        assert!(silent.advice(0, 0).contains("--onset-mult"),
+                "a session that heard nothing must question the threshold");
+
+        let familiar = Rejects { familiar: 50, ..Default::default() };
+        assert!(familiar.advice(50, 0).contains("--novelty"),
+                "everything-familiar must point at the novelty knob");
+
+        let soon = Rejects { too_soon: 30, ..Default::default() };
+        assert!(soon.advice(30, 0).contains("--refractory"),
+                "all-too-soon must point at the refractory knob");
+
+        let speech = Rejects { speech_like: 20, ..Default::default() };
+        assert!(speech.advice(25, 1).contains("--allow-speech"),
+                "mostly-speech must name the flag AND warn about it");
+    }
+
+    #[test]
+    fn a_healthy_session_gets_a_tally_without_a_lecture() {
+        let r = Rejects { familiar: 3, too_soon: 2, ..Default::default() };
+        let a = r.advice(40, 30);
+        assert!(a.contains("kept 30"));
+        // No diagnosis when nothing is wrong: advice on a working session is
+        // noise, and noise is what makes people stop reading it.
+        assert!(!a.contains("--"), "a healthy session should get no knob advice: {a}");
+    }
+
+    #[test]
+    fn the_total_counts_every_kind() {
+        let r = Rejects { too_soon: 1, familiar: 2, budget_spent: 3, speech_like: 4 };
+        assert_eq!(r.total(), 10);
+    }
+
 }

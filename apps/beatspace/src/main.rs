@@ -89,6 +89,38 @@ struct ListenArgs {
     /// Crop width in frames, must match what you will train with.
     #[arg(long)]
     time_frames: Option<usize>,
+
+    // ── tuning ──
+    //
+    // Every default was set against SYNTHETIC transients, so the first real
+    // room is the first honest test of them. These are flags rather than
+    // constants because tuning by rebuilding is tuning nobody does.
+    /// Onset fires when spectral flux exceeds this multiple of the recent
+    /// median. Higher hears less.
+    #[arg(long, default_value_t = 2.5)]
+    onset_mult: f32,
+    /// Frames to ignore after a keep. Default is one crop width, so kept crops
+    /// never overlap.
+    #[arg(long)]
+    refractory: Option<usize>,
+    /// How different a crop must be from what is already kept. Lower keeps
+    /// more near-duplicates.
+    #[arg(long, default_value_t = 0.08)]
+    novelty: f32,
+    /// Keep crops that look like voiced speech.
+    ///
+    /// Off by default. Read micsample's module docs before turning it on: the
+    /// crops are mel, mel is NOT anonymised, and this crate's Griffin-Lim can
+    /// turn them back into audible sound.
+    #[arg(long, default_value_t = false)]
+    allow_speech: bool,
+    /// Listen and report what WOULD be kept, writing nothing.
+    ///
+    /// The way to find this room's numbers: run it for a few minutes, read the
+    /// tally, adjust, repeat — without a directory of crops to clean up after
+    /// each attempt.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[cfg(feature = "gpu")]
@@ -344,7 +376,16 @@ proceeding, but a shape mismatch will now fail inside the loader",
                 max_seconds: if a.hours > 0.0 { Some(a.hours * 3600.0) } else { None },
                 budget: a.budget,
             };
-            miclisten::listen(&cfg, &a.out, policy)?;
+            let gate = micsample::Gate {
+                time_frames: cfg.time_frames,
+                threshold_mult: a.onset_mult,
+                refractory: a.refractory.unwrap_or(cfg.time_frames),
+                novelty_min_dist: a.novelty,
+                speechlike: !a.allow_speech,
+                budget: a.budget,
+                ..micsample::Gate::default()
+            };
+            miclisten::listen(&cfg, &a.out, policy, gate, a.dry_run)?;
         }
         #[cfg(feature = "gpu")]
         Cmd::Gpu(a) => {
