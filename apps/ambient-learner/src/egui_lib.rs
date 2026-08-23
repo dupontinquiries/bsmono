@@ -125,6 +125,54 @@ impl LiveState {
     pub fn shown_temperature(&self) -> f32 { self.shown }
     pub fn shown_confidence(&self) -> f32 { self.shown_conf }
 
+    /// Draw the headline reading: location, the big eased temperature, the
+    /// confidence tier, the day's band, and the recent series.
+    ///
+    /// This is the method `egui-frontend/main.rs` has been calling all along —
+    /// `self.live.ui(ui)`, with a comment beside it saying "LiveState above
+    /// draws the big reading; this draws the SENSOR panel". It did not exist,
+    /// so the binary did not compile:
+    ///
+    ///     error[E0599]: no method named `ui` found for struct `LiveState`
+    ///
+    /// Deliberately NOT delegating to `LiveView::ui`, the crate's other Live
+    /// implementation. That one eases through `ctx().animate_value_with_time`
+    /// and owns no display state, while this one owns `shown`/`shown_conf` and
+    /// is advanced by `tick(dt)` — calling it here would run two easings over
+    /// one value and show whichever finished last. `mod.rs` already records
+    /// that having two Live pages is an open question; this renders from the
+    /// state it has rather than pretending to answer it.
+    ///
+    /// The pure parts ARE shared: `confidence_tint` and `sparkline_ui` are the
+    /// same functions LiveView draws with, the latter extracted for this.
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let snap = &self.snapshot;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&snap.location).weak());
+        });
+        // The eased value, not `snapshot.temperature` — easing it and then
+        // drawing the raw reading is a mistake that looks like it works,
+        // because the two agree everywhere except during the animation.
+        ui.label(egui::RichText::new(crate::ui::egui::format_temp(self.shown)).size(72.0).strong());
+        let (tier, tint) = crate::ui::egui::confidence_tint(self.shown_conf);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{tier} confidence")).color(tint).small());
+            ui.label(egui::RichText::new(&snap.condition).weak().small());
+        });
+        ui.label(
+            egui::RichText::new(format!("band {:.1}° – {:.1}°", snap.min_temp, snap.max_temp))
+                .weak().small(),
+        );
+        ui.add_space(6.0);
+        crate::ui::egui::sparkline_ui(ui, &snap.series);
+        // Keep painting while anything is still moving. Without it the ease
+        // stops whenever the pointer does, which reads as a frozen window
+        // rather than a settled reading.
+        if self.animating() {
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// Is anything still moving? Used to keep repainting; without it the
     /// animation stops whenever the pointer does, which looks like a freeze.
     pub fn animating(&self) -> bool {

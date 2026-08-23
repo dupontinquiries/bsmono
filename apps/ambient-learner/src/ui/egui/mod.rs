@@ -228,6 +228,21 @@ impl LiveView {
 
     /// A minimal sparkline of the recent ambient series.
     fn sparkline(&self, ui: &mut egui::Ui, series: &[f32]) {
+        sparkline_ui(ui, series)
+    }
+}
+
+/// The reading sparkline, as a free function.
+///
+/// Extracted for the same reason `share_row_ui` above was: it takes no state
+/// from `LiveView` (it never touched `self`), and the OTHER Live page — the one
+/// `egui-frontend/main.rs` actually runs — needs it too. A private method here
+/// meant the running page either went without or grew a third copy.
+///
+/// Two Live implementations is already the problem this crate is carrying; the
+/// least it can do is not duplicate the parts that are pure.
+pub fn sparkline_ui(ui: &mut egui::Ui, series: &[f32]) {
+    {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(280.0), 44.0), egui::Sense::hover());
         ui.painter().rect_filled(rect, egui::CornerRadius::same(6), ui.visuals().extreme_bg_color);
         if series.len() < 2 {
