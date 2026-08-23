@@ -665,7 +665,6 @@ struct VoicetermApp {
     /// hidden: a rail that vanishes takes the tab list with it, and the tabs
     /// are how you get back. Vertical because it costs width once instead of
     /// height per row — on a phone the terminal wants every scanline.
-    rail_open: bool,
     /// Is the vertical tab column expanded?
     ///
     /// The Qt original could not do this — `vTabBar` is drag-resizable between
@@ -738,7 +737,10 @@ impl VoicetermApp {
             Command::NextTab => { self.workspace.apply(&WsCall::Command("next tab".into())); }
             Command::PrevTab => { self.workspace.apply(&WsCall::Command("previous tab".into())); }
             Command::ShowPalette => { self.palette_open = true; }
-            Command::ToggleRail => { self.rail_open = !self.rail_open; }
+            // Repointed from `rail_open` to `tabbar_open`: the palette entry
+            // ("Toggle sidebar") and the voice phrase ("hide the sidebar") keep
+            // working and now move the column that actually holds the tabs.
+            Command::ToggleRail => { self.tabbar_open = !self.tabbar_open; }
         }
     }
 
@@ -1731,45 +1733,17 @@ impl eframe::App for VoicetermApp {
         // from being stuck shut. min_touch_target is 44 on touch and 28 with a
         // pointer, which is the number this should always have been.
         //
-        // The open width scales with the surface rather than sitting at 132:
-        // on a narrow phone that is a third of the screen for a tab list, and
-        // on a desktop it is needlessly cramped.
-        let rail_w = if self.rail_open {
-            (adaptive.size.0 * 0.28).clamp(120.0, 220.0)
-        } else {
-            adaptive.min_touch_target
-        };
-        egui::SidePanel::left("rail").exact_width(rail_w).show(ctx, |ui| {
-            let c = self.colors;
-            if ui.small_button(if self.rail_open { "‹" } else { "›" })
-                .on_hover_text("Toggle sidebar")
-                .clicked()
-            {
-                self.rail_open = !self.rail_open;
-            }
-            ui.separator();
-            let tabs: Vec<(String, bool)> = self.workspace.tabs.iter().enumerate()
-                .map(|(i, t)| (t.name.clone(), i == self.workspace.active)).collect();
-            for (i, (name, active)) in tabs.iter().enumerate() {
-                // Collapsed, a tab is its first character: enough to count
-                // them and to see which is live, which is what the strip is
-                // for at that width.
-                let label = if self.rail_open { name.clone() }
-                            else { name.chars().next().unwrap_or('•').to_string() };
-                if uikit_egui::dock::list_row(ui, &label, *active, 26.0, &c).clicked() {
-                    self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
-                        format!("go to tab {}", i + 1)));
-                }
-            }
-            ui.separator();
-            if self.rail_open {
-                if ui.small_button("+ tab").clicked() {
-                    self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
-                        "new tab".into()));
-                }
-                if ui.small_button("⌘ commands").clicked() { self.palette_open = true; }
-            }
-        });
+        // `rail` REMOVED. It rendered the same `workspace.tabs` as the tab
+        // column above, in the same frame, with nothing switching between them
+        // — 48 lines whose only capability the column lacked was the chevron,
+        // and the column has that now. What the column has and rail did not:
+        // fences, pinning, close, drag, web panes, scroll-to.
+        //
+        // That duplication is a large part of why this surface read as less
+        // minimal than the Qt one: three left panels (sidebar, tabbar, rail)
+        // against `main.qml`'s single 168-point `vTabBar`, which hosts "work
+        // tabs (scrollable) + a default fence + system tabs".
+
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // SAFE AREA. Nothing in the fleet applied these until now — the
@@ -3313,7 +3287,6 @@ fn main() -> eframe::Result<()> {
                 summary_text: std::collections::HashMap::new(),
                 phonetics: Default::default(),
                 glow_active: false,
-                rail_open: true,
             // Open by default: a control the user has not met yet must not
             // start hidden, or the tabs look lost rather than collapsed.
             tabbar_open: true,
