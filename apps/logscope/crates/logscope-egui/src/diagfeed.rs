@@ -500,6 +500,63 @@ scales. Converting would double the bytes without adding precision",
     }
 
     /// A failure still outranks the degradation words it contains.
+
+    /// The guard actually serialises — proven by forcing the interleaving.
+    ///
+    /// The fix for the fleet failure was reasoned from the evidence (one test's
+    /// fixture appearing in another's assertion) rather than reproduced, because
+    /// this sandbox has ONE core: libtest's default pool is one thread, and even
+    /// `--test-threads=8` only time-slices, which does not produce the same
+    /// interleaving as eight cores. "I removed the mechanism" is weaker than "I
+    /// watched it fail and then pass", and this closes that gap.
+    ///
+    /// The trick is not to wait for a race but to CAUSE one. Each worker does
+    /// the sequence the real tests do — clear, record, read — with an explicit
+    /// `yield_now()` in the middle, which on a single core is precisely when the
+    /// other thread gets to run. Holding the guard makes that yield harmless
+    /// because the other worker is blocked on the lock; without it, the yield is
+    /// the corruption.
+    ///
+    /// Deterministic enough to be worth having, and it costs microseconds.
+    #[test]
+    fn the_guard_makes_interleaved_workers_see_only_their_own_records() {
+        use std::sync::{Arc, Barrier};
+
+        const WORKERS: usize = 4;
+        const ROUNDS: usize = 40;
+        let start = Arc::new(Barrier::new(WORKERS));
+        let mut handles = Vec::new();
+
+        for w in 0..WORKERS {
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                // Every worker's line is distinguishable, so a banner carrying
+                // someone else's text is unambiguous rather than a judgement
+                // call about severity ordering.
+                let mine = format!("worker: load failed: marker-{w}");
+                start.wait();
+                for _ in 0..ROUNDS {
+                    let _feed = crate::diagfeed::feed_guard();
+                    clear();
+                    // The window. On one core this hands the CPU to another
+                    // worker at the exact point that used to corrupt.
+                    std::thread::yield_now();
+                    record(&mine);
+                    std::thread::yield_now();
+                    let b = banner().expect("a recorded failure must produce a banner");
+                    assert!(
+                        b.contains(&format!("marker-{w}")),
+                        "worker {w} saw another worker's line: {b}"
+                    );
+                    clear();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("no worker should panic");
+        }
+    }
+
     #[test]
     fn failures_still_win_over_their_own_warning_words() {
         let l = "worker: load failed: blk.0.attn_qkv has 8192 rows but this model needs 5120";
