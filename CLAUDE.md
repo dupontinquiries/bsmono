@@ -132,11 +132,36 @@ measured a pre-rewrite clone.
 ```sh
 ./verify.sh                                # rustcheck/peek/drift over the tree
 python3 maintenance/tools/lock_check.py    # committed locks vs their manifests
+python3 maintenance/tools/orphan_check.py  # .rs files no `mod` declaration reaches
+python3 maintenance/tools/archive_check.py # maintenance/archive/ provenance headers
 ```
 
 `lock_check.py` exists because three stale lockfiles were found by tripping
 over them. A stale lock works perfectly online — cargo resolves the missing
 name and rewrites the file — and fails offline, on a clean clone, or in CI.
+
+`orphan_check.py` exists because a `.rs` file with no `mod` declaration is not
+compiled, so its tests never run and nothing in the build can contradict it.
+Nineteen were found this way, carrying 79 tests; two documents had drifted into
+disagreeing about whether one of them existed.
+
+## 7b. Removing a module: archive it, do not just delete it
+
+When a module is superseded, put it in `maintenance/archive/` with the
+five-field provenance header `archive_check.py` enforces — see
+[maintenance/archive/README.md](maintenance/archive/README.md). Git has the
+file either way; what git does not have is the REASON, at a path someone will
+grep. A deleted module is findable only by someone who already suspects it
+existed.
+
+Do **not** leave it undeclared in `src/` as a compromise. That is the worst of
+both: not compiled, not discoverable as archived, and still reading like the
+real implementation.
+
+`LAST-KNOWN-GOOD` is the field that matters and the easiest to write
+dishonestly. Record what was CONFIRMED, when, and by what — and keep "its tests
+passed" distinct from "it ran against real data", because the archive is
+exactly where that difference gets lost.
 
 ## 8. Commits
 

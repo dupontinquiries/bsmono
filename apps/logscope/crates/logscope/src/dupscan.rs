@@ -400,7 +400,11 @@ mod live_tests {
         //   `dequant_iq3_s` and `dequant_iq2_s` had DRIFTED, so iq3's fourteen
         //   tests were validating implementations the engine does not run.
         //
-        //   Deleted, but only after moving the coverage iq23 lacked. Most of
+        //   Removed from the crate — and ARCHIVED rather than dropped, at
+        //   maintenance/archive/gpu-gemm-iq3.rs with a provenance header, because
+        //   its bit-layout tests remain the clearest description of the IQ3_XXS
+        //   format in this repository even though its implementation is the older
+        //   answer. Removed only after moving the coverage iq23 lacked. Most of
         //   iq3's unique assertions turned out to be about the SHARED iqgrids
         //   tables rather than about either decoder — the 8-byte IQ2_XXS entry
         //   against IQ3_XXS's 4, the 128-entry shared sign table, the 1024-entry
