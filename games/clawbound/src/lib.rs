@@ -40,5 +40,6 @@ pub mod prowl;
 pub mod ring;
 pub mod sim;
 pub mod weather;
+pub mod wire;
 pub mod world;
 pub mod worldscript;

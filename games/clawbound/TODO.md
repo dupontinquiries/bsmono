@@ -614,9 +614,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   peer's claim for that tick is still in flight. Whichever half arrives second does the
   comparing now, and the desync test proves it by nudging one warrior half a length in one
   peer's world — which is exactly what a real desync looks like from the inside.
-- [ ] Transport: bind `lockstep::Packet` to `shared/netcode`'s multiplayer/session layer, and
-  agree the match setup by exchanging a `replay::Replay` header (it already carries draft,
-  seed and every doctrine switch — a lobby needs nothing else)
+- [x] Transport: `wire.rs` — a hand-written codec (an input is **8 bytes**, a digest check 13,
+  so a tick of two players costs 16 bytes of payload) plus `UdpLink`, a deliberately dumb
+  non-blocking UDP carrier. Movement travels as two i8 axes rather than f32: the sim
+  normalises the vector anyway, it is a quarter of the bytes, and two peers that agree on
+  the *bytes* agree on the input with no float parsing in between. Tested end to end — two
+  peers, two real loopback sockets, 240 ticks, same digest.
+- [x] No hard dependency on `shared/netcode`. That crate's job ends with two peers holding
+  each other's socket address, which is exactly what `UdpLink::connect` wants; keeping the
+  seam there means a LAN match between two handsets on the same wifi does not have to pay
+  for discovery it does not need. Match setup can still be agreed by exchanging a
+  `replay::Replay` header, which already carries draft, seed and every doctrine switch.
+- [ ] What a deployment needs on top, and where it belongs: resend-until-acked for the last
+  few input frames. A lost packet only *stalls* lockstep (a tick will not run without both
+  inputs), so this is a latency fix rather than a correctness one, and it is a transport
+  concern — it goes in `wire.rs`, not in the protocol.
 - [x] Both clans' leaders are drivable now (`set_input_for(side, ..)`, `driven(side)`), so
   lockstep applies both frames instead of carrying one it could not spend. A peer that drove
   only its own leader and left the other clan's to the AI would be running a different match
