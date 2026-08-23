@@ -201,17 +201,21 @@ All of these were written this session in `/home/claude/` and **will be lost
 when the sandbox resets**. Each is small; the question is whether it earns a
 place in `maintenance/tools/`.
 
-- **C9-3a — `cap.sh`: pin `CAPTURE_LOG` across shells.** `queued` · `verified`.
-  `session_capture.sh` defaults `CAPTURE_LOG` to `${TMPDIR}/session-capture-$$.jsonl`,
-  and `$$` is the sourcing shell's pid. An agent harness runs every command in
-  a **fresh shell**, so each invocation opens a new log, the post-commit mark's
-  same-log test never matches, and each commit gets only its own invocation's
-  commands. This is visible in the history that shipped: the note on `fbcfd6a7`
-  has exactly two lines. Pinning `CAPTURE_LOG` to one path fixes it and the
-  notes this session carry full command sequences.
-  This is failure mode #2 in `SKILL_session_capture.md` ("a new shell"), which
-  documents the symptom but not this specific interaction with the pid-derived
-  default. **Either fix the default or document the pin.**
+- **C9-3a — `cap.sh`: pin `CAPTURE_LOG` across shells.** `done` · `verified`
+  (c10, `bb55960f`). The default was fixed rather than the pin documented —
+  keyed by (user, repo cksum), so fresh shells in one repo share one log and
+  the hook computes the same fallback for commits from unsourced shells.
+  Reproducing the two-line-note failure exposed a SECOND defect the pin never
+  fixed: flush-on-next-command means a shell's final command is never
+  written, so a one-command-per-fresh-shell harness recorded **nothing** —
+  the pinned-log sessions survived only because their invocations ran many
+  commands and lost one per invocation. An EXIT-trap flush was tried and
+  abandoned on instrumented evidence (DEBUG firings inside the EXIT handler
+  see a frozen BASH_COMMAND; one marker, three writes); the landed mechanism
+  parks the pending command in a `$CAPTURE_LOG.pending.<pid>` sidecar and
+  sweeps dead shells' sidecars in at the next source or commit as
+  `exit:null`. `--selftest` simulates the harness end to end and fails on
+  three deliberately broken copies. Pinning still works and still wins.
 
 - **C9-3b — `export-bundle.sh`: the `c9-NNN-<summary>.bundle` convention.**
   `queued` · syntax-checked and slug-normaliser `verified`; **the export path
