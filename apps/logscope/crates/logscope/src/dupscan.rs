@@ -378,12 +378,97 @@ mod live_tests {
         // 303: +1 for the integration commit — VerifySpec::allowing / with_trust / userns_available
         // added one new collision key between them. Same verdict as the ten above: a spec builder
         // named for what it grants is not a reimplementation of anything here.
-        const CEILING: usize = 303;
+        // 303 -> 353, and the ratchet did its job. Triaged 2026-08-22, the first
+        // time this test could run at all: the logscope workspace would not build
+        // under cargo 1.75 (edition-2024 indexmap via wgpu-core 29), so nothing
+        // had executed here while 27 new .rs files landed across a dozen commits.
+        // A ceiling nobody can evaluate is not a ratchet.
+        //
+        // Triage was by module PAIR rather than by name: a module colliding with
+        // everything is shared vocabulary, while a PAIR colliding on several
+        // names is the reimplementation signal. Top pairs were probe/steer (7),
+        // iq23/iq3 (6), residency/ws_registry (6). probe/steer share zero public
+        // items — the 7 were private helpers with ordinary names. Most of the
+        // rest are the benign class the note above describes.
+        //
+        // ONE REAL HIT, recorded rather than fixed here because fixing it is a
+        // test migration, not a deletion:
+        //
+        //   iq3.rs is superseded by iq23.rs. Same six public items; iq23 is
+        //   "IQ3_XXS and IQ2_S" where iq3 is "IQ3_XXS". gguf.rs dispatches all
+        //   three formats to iq23 (types 18, 21, 22) and NOTHING calls iq3.
+        //   `dequant_iq3_xxs` is byte-identical between them, but
+        //   `dequant_iq3_s` and `dequant_iq2_s` have DRIFTED — so iq3's 14 tests
+        //   validate dead implementations that differ from the live ones, which
+        //   is worse than untested: it reads as coverage of the decoder that
+        //   actually runs.
+        //
+        //   Deleting iq3 loses 12 uniquely-named tests pinning real format
+        //   properties (the 0.5 scale multiplier vs IQ2_XXS's 0.25, the ten-bit
+        //   grid index, the position-varying ninth bit, the shared sign table).
+        //   iq23's 12 tests overlap but are not the same set. So: move the
+        //   coverage that iq23 lacks, THEN delete — see
+        //   `iq3_is_a_superseded_duplicate_of_iq23` below, which expires when
+        //   that happens.
+        const CEILING: usize = 353;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
 is what happened seven times this session.\n{}",
             d.len(), report(&d));
+    }
+
+
+    /// The one real reimplementation the 303 -> 353 triage found, pinned so it
+    /// cannot quietly become permanent.
+    ///
+    /// `gpu-gemm/src/iq3.rs` is superseded by `iq23.rs`: same six public items,
+    /// but iq23 covers IQ3_XXS *and* IQ2_S, `gguf.rs` dispatches all three
+    /// quant types to it, and nothing anywhere calls iq3.
+    ///
+    /// What makes it worth a test rather than a comment is the DRIFT.
+    /// `dequant_iq3_xxs` is byte-identical between the two, but
+    /// `dequant_iq3_s` and `dequant_iq2_s` are not — so iq3's fourteen tests
+    /// are validating implementations that differ from the ones the engine
+    /// runs. That is worse than dead code being untested: the test names read
+    /// as coverage of the live decoder.
+    ///
+    /// Not deleted here because deletion loses twelve uniquely-named tests
+    /// pinning real format properties, and iq23's twelve are a different set.
+    /// The order is: move the coverage iq23 lacks, then delete iq3. This test
+    /// fails the moment either happens and tells you to update the ceiling
+    /// note — the same expiry discipline archcfg's note_claims module uses.
+    ///
+    /// Structural on purpose: it reads the sources rather than importing the
+    /// modules, because logscope does not depend on gpu-gemm.
+    #[test]
+    fn iq3_is_a_superseded_duplicate_of_iq23() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let gg = match here.parent().map(|c| c.join("gpu-gemm/src")) {
+            Some(p) if p.is_dir() => p,
+            _ => return, // sibling crate absent; nothing to assert
+        };
+        let (iq3, iq23) = (gg.join("iq3.rs"), gg.join("iq23.rs"));
+        if !iq23.exists() {
+            return; // the survivor is gone; a different question entirely
+        }
+        if !iq3.exists() {
+            panic!("iq3.rs has been deleted — good. Remove this test and the iq3 paragraph from the CEILING note above, and drop the ceiling by however many names went with it.");
+        }
+
+        // Still superseded? If someone wires iq3 up, this stops being a
+        // duplicate and becomes a real fork to reconcile.
+        let mut callers = 0;
+        for e in std::fs::read_dir(&gg).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") { continue }
+            if p.file_name().and_then(|x| x.to_str()) == Some("iq3.rs") { continue }
+            if let Ok(t) = std::fs::read_to_string(&p) {
+                callers += t.matches("iq3::").count();
+            }
+        }
+        assert_eq!(callers, 0,
+            "iq3 now has {callers} caller(s). It was dead and drifted; if it is being used again that is a fork to reconcile against iq23, not a duplicate to delete.");
     }
 
     #[test]
