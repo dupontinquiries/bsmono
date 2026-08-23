@@ -6093,6 +6093,37 @@ wrong.
 
 1110 passing.
 
+THE SHIP HAS GEOMETRY NOW. `interior.rs` gave a ship you can WALK in and
+nothing to LOOK at: its SDF feeds collision, `world.sdf` is a physics query,
+and the renderer draws meshes. So the rooms have had positions, sizes, doors
+and fixtures all along and never a triangle among them.
+
+`hull_mesh` is one bevelled box per room and per OPEN corridor, at their real
+positions — 1,020 triangles for a 70 m hull, which is nothing. Deliberately
+the shell and not the dressing: enough to stand in and see where the doors
+are.
+
+SHUT CORRIDORS ARE OMITTED, and that matters twice. A sealed door should not
+have a tunnel drawn through it, and the mesh then AGREES WITH
+`reachable_from` about what is passable rather than being a second answer to
+the same question. Sealed, the hull drops from 1,020 triangles to 600, and a
+test asserts the direction.
+
+AND A STALE DOC, FOUND ON THE WAY. `roster.rs` opens by explaining that
+`CSDF_MAXM` is 126 models and that 222 chassis at five poses is 1,105 against
+that budget, which is why a selector exists. The constant is now 1,344 —
+tiling turned a depth-only stack into a grid — so THE WHOLE ROSTER FITS, at
+1,110 against 1,344.
+
+The code was never wrong: `SDF_BUDGET` is DERIVED from the constant and moved
+with it, which is precisely what its own comment predicted would matter. Only
+the prose rotted, and it rotted invisibly because a selector that never has to
+refuse looks identical to one that does. Corrected on top rather than
+rewritten — the reasoning is still why the selector exists and is no longer
+why it is needed — with an assertion that fails if the budget shrinks again.
+
+1113 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

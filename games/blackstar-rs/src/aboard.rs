@@ -147,6 +147,43 @@ impl Aboard {
     }
 }
 
+// -------------------------------------------------------------- shape ---
+
+/// A drawable mesh for the ship's interior.
+///
+/// **`interior.rs` gives you a ship you can walk in and nothing to look at.**
+/// Its SDF feeds collision, and `world.sdf` is a physics query — the renderer
+/// draws meshes. So the rooms have positions, sizes, doors and fixtures, and
+/// there has never been a triangle among them.
+///
+/// This is the missing half, and it is deliberately the SHELL rather than the
+/// dressing: one bevelled box per room, one per open corridor, at their real
+/// positions and sizes. Enough to stand in and see where the doors are.
+///
+/// Shut corridors are omitted, which matters twice: a sealed door should not
+/// have a tunnel drawn through it, and the mesh then agrees with
+/// `reachable_from` about what is passable — two answers to the same question
+/// that could otherwise disagree.
+pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
+    use crate::meshgen::{bake, cbox, merge, MeshData};
+    use glam::Quat;
+
+    let mut out = MeshData::new();
+    for c in &ship.cells {
+        let mut b = cbox(0.06);
+        bake(&mut b, c.half * 2.0, Quat::IDENTITY, c.centre);
+        merge(&mut out, &b);
+    }
+    for l in &ship.links {
+        // a shut door is hull, so there is no corridor to draw through it
+        let Some((_, h)) = l.door.void() else { continue };
+        let mut b = cbox(0.03);
+        bake(&mut b, l.half.min(h * 4.0) * 2.0, Quat::IDENTITY, l.centre);
+        merge(&mut out, &b);
+    }
+    out
+}
+
 // ------------------------------------------------------------- driver ---
 
 pub fn run(argv: &[String]) {
@@ -206,6 +243,18 @@ pub fn run(argv: &[String]) {
     dark.power_on();
     println!("    power restored: {} of {} reachable again.",
         dark.consoles_reachable().len(), STATIONS.len());
+
+    println!("\n  AND SOMETHING TO LOOK AT\n");
+    let lit = hull_mesh(&a.ship);
+    let mut sealed_ship = Aboard::new(hull);
+    sealed_ship.power_out();
+    let dark_mesh = hull_mesh(&sealed_ship.ship);
+    println!("    powered:  {:>6} verts, {:>6} tris", lit.verts.len(), lit.idx.len() / 3);
+    println!("    sealed:   {:>6} verts, {:>6} tris", dark_mesh.verts.len(), dark_mesh.idx.len() / 3);
+    println!("\n    the sealed hull is smaller because a shut door is hull — there is");
+    println!("    no corridor drawn through it, so the mesh and `reachable_from`");
+    println!("    agree about what is passable rather than being two answers to the");
+    println!("    same question.");
 
     println!("\n    `interior.rs` has modelled power-failure sealing since it landed.");
     println!("    Until something asked where you were, it could not stop you.");
@@ -306,6 +355,59 @@ mod tests {
         let dark = a.consoles_reachable().len();
         a.power_on();
         assert!(a.consoles_reachable().len() > dark, "power did not help");
+    }
+
+    #[test]
+    fn the_ship_has_a_mesh_now() {
+        // `interior.rs` gave a ship you can walk in and nothing to look at:
+        // its SDF feeds collision and the renderer draws meshes.
+        let a = Aboard::new(70.0);
+        let m = hull_mesh(&a.ship);
+        assert!(!m.verts.is_empty(), "the hull has no geometry");
+        assert_eq!(m.idx.len() % 3, 0, "indices are not triangles");
+        // one box per room at minimum, and boxes have 8+ verts
+        assert!(
+            m.verts.len() >= a.ship.cells.len() * 8,
+            "{} verts for {} rooms",
+            m.verts.len(),
+            a.ship.cells.len()
+        );
+        // every index addresses a real vertex
+        let n = m.verts.len() as u32;
+        assert!(m.idx.iter().all(|i| *i < n), "an index points past the end");
+    }
+
+    #[test]
+    fn a_shut_door_has_no_corridor_drawn_through_it() {
+        // the mesh and `reachable_from` are two answers to the same question
+        // and they have to agree: a sealed ship should not have tunnels
+        // through its sealed doors
+        let lit = Aboard::new(70.0);
+        let mut dark = Aboard::new(70.0);
+        dark.power_out();
+        let a = hull_mesh(&lit.ship);
+        let b = hull_mesh(&dark.ship);
+        assert!(
+            b.verts.len() < a.verts.len(),
+            "sealing the ship did not remove any corridor: {} vs {}",
+            b.verts.len(),
+            a.verts.len()
+        );
+        // the rooms are still there — it is a sealed ship, not an empty one
+        assert!(b.verts.len() >= dark.ship.cells.len() * 8);
+    }
+
+    #[test]
+    fn a_bigger_hull_makes_a_bigger_ship_not_more_rooms() {
+        let small = hull_mesh(&Aboard::new(30.0).ship);
+        let big = hull_mesh(&Aboard::new(200.0).ship);
+        // same room count, so the same geometry — the plan scales, it does
+        // not grow
+        assert_eq!(small.verts.len(), big.verts.len(), "the plan gained rooms");
+        let extent = |m: &crate::meshgen::MeshData| {
+            m.verts.iter().map(|v| v.pos[0].abs()).fold(0.0f32, f32::max)
+        };
+        assert!(extent(&big) > extent(&small) * 2.0, "a 200 m hull is not bigger");
     }
 
     #[test]

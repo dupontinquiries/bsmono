@@ -100,8 +100,13 @@ fixed, and moving between them is a position and a walkable check.
       1 of 7 consoles is reachable. `interior.rs` has modelled sealing since
       it landed and could not stop anybody, because nothing asked where you
       were.
-- [ ] A renderer for it. The rooms have positions, sizes and fixtures; nothing
-      draws them.
+- [x] **There is geometry now.** `aboard::hull_mesh` builds one bevelled box
+      per room and per OPEN corridor at their real positions — 1,020 triangles
+      for a 70 m hull, which is nothing. Shut corridors are omitted, so the
+      mesh and `reachable_from` agree about what is passable instead of being
+      two answers to the same question.
+- [ ] Handing that mesh to the renderer and standing in it. That is the last
+      step and the only one that needs a GPU to check.
 
 ### 3. Campaign missions you can play
 

@@ -2,7 +2,26 @@
 //!
 //! ## The constraint is real and cannot be raised
 //!
-//! `render::CSDF_MAXM` is 126 models, and its doc explains that this is not a
+//! **THE NUMBERS BELOW ARE STALE AND THE CODE IS NOT.** This doc says 126
+//! throughout; `CSDF_MAXM` is now 1344, because tiling the atlas turned a
+//! depth-only stack into a `TILES x TILES` grid. `SDF_BUDGET` is DERIVED from
+//! the constant and moved with it — which is exactly what its own comment
+//! predicted would matter, and is why the loader kept working while the prose
+//! rotted.
+//!
+//! What changed at 1344: **the whole roster fits.** 222 chassis at about five
+//! poses is 1110 against 1344, so the selector is no longer load-bearing for
+//! its original reason. It still earns its place — a `Pick` is how you load a
+//! faction rather than everything, and `fit` still refuses a half-baked
+//! chassis — but "the GPU cannot hold them all" stopped being true and nobody
+//! noticed, because a selector that never has to refuse looks identical to one
+//! that does.
+//!
+//! Left as history rather than rewritten, with the correction on top: the
+//! reasoning below is why the selector exists and it is no longer why it is
+//! needed.
+//!
+//! `render::CSDF_MAXM` was 126 models, and its doc explains that this is not a
 //! tuning knob: `CSDF_SLAB * CSDF_MAXM` is a texture depth against a 2048
 //! ceiling, and reaching 126 already meant cutting SLAB from 44 to 16. There is
 //! no room above it.
@@ -299,6 +318,18 @@ mod tests {
         // A copied constant that drifts is worse than an import, so it is
         // pinned here. If CSDF_MAXM moves, this fails and someone decides.
         assert_eq!(SDF_BUDGET as u32, crate::render::CSDF_MAXM);
+
+        // AND THE WHOLE ROSTER NOW FITS. Tiling took the budget from 126 to
+        // 1344; 222 chassis at about five poses is 1110. The selector is no
+        // longer needed for the reason it was built, which is worth an
+        // assertion because a selector that never has to refuse looks
+        // identical to one that does — and if the budget shrinks again this
+        // fails and says so.
+        let whole_roster = 222 * 5;
+        assert!(
+            whole_roster <= SDF_BUDGET,
+            "the roster no longer fits: {whole_roster} poses against {SDF_BUDGET}"
+        );
     }
 
     #[test]
