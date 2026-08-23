@@ -16,7 +16,8 @@
 #
 # usage: probe-bundle.sh <bundle> [repo]   (repo defaults to the enclosing one)
 # Exit codes: 0 measured, 1 usage/environment, 2 fetch failed (typically
-#             missing prerequisites — survey-bundle.sh names them).
+#             missing prerequisites — survey-bundle.sh names them),
+#             3 repack failed so nothing was measured (see the note below).
 set -euo pipefail
 
 BUNDLE="${1:?usage: probe-bundle.sh <bundle> [repo]}"
@@ -54,7 +55,7 @@ while read -r _sha ref; do
 done < <(git bundle list-heads "$BUNDLE")
 [ "${#refspecs[@]}" -gt 0 ] || { echo "bundle lists no fetchable refs" >&2; exit 2; }
 
-if ! git -C "$scratch" fetch -q --no-tags "$BUNDLE" "${refspecs[@]}" 2> "$scratchdir/fetch.err"; then
+if ! git -C "$scratch" fetch -q --no-tags "$BUNDLE" "${refspecs[@]}" 2> "$scratchdir/fetch.err" < /dev/null; then
   echo "fetch from bundle FAILED — usually missing prerequisites; survey-bundle.sh names them:" >&2
   sed 's/^/  /' "$scratchdir/fetch.err" >&2
   exit 2
@@ -65,7 +66,23 @@ if [ "$fetched" -eq 0 ]; then
   exit 2
 fi
 
-git -C "$scratch" repack -a -d -l -q
+# STDIN CLOSED, the same hazard export-bundle.sh documents on `git gc`.
+#
+# KNOWN FAILURE, unresolved: on git 2.43.0 in this sandbox, repacking a scratch
+# that received a LARGE amount of genuinely new content dies with
+#   fatal: bad revision 'pack<TAB><sha>'
+# from the `pack-objects` child (confirmed with GIT_TRACE), stdin closed or
+# not, with or without `-l`, `-d`, alternates, or bitmaps. It does NOT fire
+# when the bundle adds little or nothing, which is why this tool passed its
+# tests and its first real bundle and only broke on the second. The cost
+# measurement is the only casualty — survey-bundle.sh is unaffected, and
+# fetching the bundle for real does not go through this path.
+if ! git -C "$scratch" repack -a -d -l -q < /dev/null 2>"$scratchdir/repack.err"; then
+  echo "repack FAILED, so the incremental cost was NOT measured:" >&2
+  sed 's/^/  /' "$scratchdir/repack.err" >&2
+  echo "known on git 2.43.0 here for bundles with a lot of new content; see the comment in $0" >&2
+  exit 3
+fi
 
 cost=0
 for p in "$scratch"/objects/pack/*.pack; do
