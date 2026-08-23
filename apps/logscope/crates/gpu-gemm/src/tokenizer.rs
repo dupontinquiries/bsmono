@@ -413,7 +413,23 @@ the vocab size is cross-checked before it is accepted.".into()),
         for (i, tok) in tk.tokens.iter().enumerate() {
             if flagged.contains(&(i as u32)) { continue; }
             let s = String::from_utf8_lossy(tok);
+            // ChatML / Llama shape: <|...|>
             if s.len() >= 4 && s.starts_with("<|") && s.ends_with("|>") {
+                specials.push((s.into_owned(), i as u32));
+                continue;
+            }
+            // GEMMA shape: <start_of_turn>, no pipes. Gemma's turn markers were
+            // invisible to the scan above, so a Gemma vocab reported "24
+            // specials registered" with im_start/im_end/endoftext ALL None —
+            // the count came from token_type while every marker LOOKUP missed.
+            //
+            // A NAMED LIST, not a bare `<...>` match. A byte-level vocab
+            // contains plenty of `<div>`-shaped tokens, and promoting those to
+            // specials would break encoding of ordinary text — a much worse
+            // failure than the one being fixed.
+            if matches!(s.as_ref(),
+                "<start_of_turn>" | "<end_of_turn>" | "<bos>" | "<eos>" | "<pad>"
+                | "<start_of_image>" | "<end_of_image>" | "<unused0>") {
                 specials.push((s.into_owned(), i as u32));
             }
         }
@@ -422,11 +438,24 @@ the vocab size is cross-checked before it is accepted.".into()),
         // store them as literal "<|...|>" strings (so the <|...|> scan can't see them); if they're Some but
         // the prompt still shows "0 special tokens", the mismatch is in encode, not registration. Also dump
         // the raw stored strings at the known Qwen special ids to see what the vocab actually holds.
-        let show = |id: u32| tk.tokens.get(id as usize).map(|t| String::from_utf8_lossy(t).into_owned());
-        eprintln!("tokenizer: {} specials registered | im_start={:?} im_end={:?} endoftext={:?} eot_id={:?} | raw[151643..=151645]={:?},{:?},{:?}",
-            tk.specials.len(), tk.special_id("<|im_start|>"), tk.special_id("<|im_end|>"),
-            tk.special_id("<|endoftext|>"), tk.special_id("<|eot_id|>"),
-            show(151643), show(151644), show(151645));
+        // THIS MODEL'S markers, not a fixed id range.
+        //
+        // The old line dumped raw[151643..=151645] — Qwen's special ids —
+        // whatever the model was. On a Gemma vocab that printed
+        //
+        //     im_start=None im_end=None endoftext=None
+        //     raw[151643..=151645]=Some("ttet"),Some("▁男性用"),Some("▁()=>")
+        //
+        // which reads as a corrupt tokenizer and is just three ordinary tokens
+        // from an unrelated model's id space. A diagnostic that looks like
+        // damage when nothing is wrong costs more than one that says nothing.
+        let turn = turn_markers(&tk);
+        eprintln!("tokenizer: {} specials registered | turn markers: {} | eos={:?} bos={:?}",
+            tk.specials.len(),
+            if turn.is_empty() { "NONE FOUND — the chat template cannot be applied".into() }
+            else { turn.iter().map(|(n, i)| format!("{n}={i}")).collect::<Vec<_>>().join(" ") },
+            tk.special_id("<|endoftext|>").or_else(|| tk.special_id("<eos>")),
+            tk.special_id("<bos>"));
         Ok(tk)
     }
 }
@@ -554,6 +583,19 @@ mod borrowed_tokenizer {
     }
 }
 
+
+/// The turn markers this vocab actually has, across the families the engine
+/// loads. Empty means the chat template cannot be applied, which is worth
+/// saying out loud at load rather than discovering as malformed prompts.
+fn turn_markers(tk: &Tokenizer) -> Vec<(&'static str, u32)> {
+    ["<|im_start|>", "<|im_end|>",           // ChatML: Qwen, Yi
+     "<|start_header_id|>", "<|eot_id|>",    // Llama 3
+     "<start_of_turn>", "<end_of_turn>"]     // Gemma
+        .iter()
+        .filter_map(|n| tk.special_id(n).map(|i| (*n, i)))
+        .collect()
+}
+
 #[cfg(test)]
 mod sp_tests {
     use super::*;
@@ -618,5 +660,60 @@ mod sp_tests {
         assert_eq!(t.encode("a b"), vec![2, 6]);
         assert_eq!(t.decode(&[2, 6]), "a b");
         assert_eq!(t.special_id("<mask>"), Some(1), "token_type 3 registered the special");
+    }
+}
+
+#[cfg(test)]
+mod turn_marker_tests {
+    use super::*;
+
+    fn tok(specials: &[(&str, u32)]) -> Tokenizer {
+        let tokens: Vec<Vec<u8>> = (0..256u32).map(|b| vec![b as u8]).collect();
+        let mut t = Tokenizer::new_byte_level(tokens, Vec::new());
+        t.set_specials(specials.iter().map(|(s, id)| (s.to_string(), *id)).collect());
+        t
+    }
+
+    /// A Gemma vocab has turn markers; the old lookups could not see them.
+    ///
+    /// `<start_of_turn>` has no pipes, so the `<|...|>` fallback scan skipped it
+    /// and every marker lookup returned None. A real load reported "24 specials
+    /// registered | im_start=None im_end=None endoftext=None" — the count came
+    /// from token_type while nothing could be found by name.
+    #[test]
+    fn gemma_turn_markers_are_found() {
+        let t = tok(&[("<start_of_turn>", 105), ("<end_of_turn>", 106), ("<bos>", 2)]);
+        let m = turn_markers(&t);
+        assert_eq!(m.len(), 2, "both Gemma markers must be reported: {m:?}");
+        assert!(m.iter().any(|(n, i)| *n == "<start_of_turn>" && *i == 105));
+    }
+
+    #[test]
+    fn chatml_and_llama_markers_still_resolve() {
+        let q = tok(&[("<|im_start|>", 151644), ("<|im_end|>", 151645)]);
+        assert_eq!(turn_markers(&q).len(), 2, "ChatML must not regress");
+        let l = tok(&[("<|start_header_id|>", 128006), ("<|eot_id|>", 128009)]);
+        assert_eq!(turn_markers(&l).len(), 2, "Llama 3 must not regress");
+    }
+
+    /// The case the diagnostic exists to shout about.
+    #[test]
+    fn a_vocab_with_no_markers_reports_none_rather_than_a_wrong_id() {
+        let t = tok(&[("<pad>", 0)]);
+        assert!(turn_markers(&t).is_empty(),
+                "no markers means none — the old line printed three tokens from Qwen's id range \
+whatever the model was, which reads as corruption");
+    }
+
+    /// The named list must not become a bare `<...>` match.
+    ///
+    /// A byte-level vocab is full of `<div>`-shaped tokens, and promoting those
+    /// to specials would break the encoding of ordinary text — a worse failure
+    /// than the missing markers this fixes.
+    #[test]
+    fn html_shaped_tokens_are_not_turn_markers() {
+        let t = tok(&[("<div>", 50), ("<span>", 51), ("<start_of_turn>", 105)]);
+        let m = turn_markers(&t);
+        assert_eq!(m.len(), 1, "only the real marker: {m:?}");
     }
 }
