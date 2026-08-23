@@ -415,12 +415,17 @@ mod live_tests {
         //   drifted; it passes unchanged, which locates the drift outside that
         //   path. iq23: 12 tests -> 16.
         //
-        // 347, re-derived after the iq3 deletion rather than left at 353: a ceiling
-        // above the real count is headroom for the next duplicate to slip in unseen,
-        // which is the failure this test exists to prevent. Deleting iq3 removed six
-        // collision keys (IQ2_S_BLOCK, IQ3_S_BLOCK, IQ3_XXS_BLOCK, dequant_iq2_s,
-        // dequant_iq3_s, dequant_iq3_xxs).
-        const CEILING: usize = 347;
+        // 353, raised from 347 after the C9-8 logscope-fan modules
+        // (continuation, readmark, powerbudget, sessiontime) landed between
+        // the ceiling-set commit (0c599e55) and cc1bc237. They added 6 new
+        // collision keys — names like Step, Command, Source, decide, stalled
+        // that naturally overlap with existing modules. These are all
+        // name-sharing (two ideas independently choosing the same short name),
+        // not implementation duplication: each module's type carries different
+        // fields and different semantics. The test was not run in c9 (only
+        // crypto-kit tests were rerun), so the drift was invisible until c10
+        // ran the full suite.
+        const CEILING: usize = 353;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
