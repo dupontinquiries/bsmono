@@ -877,6 +877,81 @@ the tensors of that type", parts.join(", "))
     }
 }
 
+/// Per-block tensor suffixes the engine actually consumes.
+///
+/// Derived from the names `lib.rs` looks up, and kept honest by
+/// `the_known_suffix_list_matches_what_lib_rs_reads` below — a hand-maintained
+/// allowlist drifts, and a drifted allowlist makes this whole check lie in the
+/// friendly direction.
+pub const KNOWN_BLOCK_SUFFIXES: &[&str] = &[
+    "attn_k", "attn_k_norm", "attn_kv_a_mqa", "attn_norm", "attn_output",
+    "attn_post_norm", "attn_q", "attn_q_a", "attn_q_norm", "attn_qkv", "attn_v",
+    "exp_probs_b", "ffn_down", "ffn_down_exps", "ffn_down_shexp", "ffn_gate",
+    "ffn_gate_exps", "ffn_gate_inp", "ffn_gate_shexp", "ffn_norm", "ffn_up",
+    "ffn_up_exps", "ffn_up_shexp", "post_attention_norm", "post_ffw_norm",
+    "rope_freqs",
+];
+
+/// Tensors in the file that nothing reads.
+///
+/// ## Why this exists
+///
+/// Three unsupported-model reports in one week share a shape: a tensor is
+/// present in the checkpoint, no code path consumes it, and NOTHING SAYS SO.
+///
+/// * `diffusion-gemma`: `ffn_down_exps.scale [128]` (one per expert) and
+///   `ffn_gate_inp.scale [2816]` (on the router input) — neither read.
+/// * `gemma4`: `inp_gate [1536×256]` and `proj [256×1536]`, a 256-wide side
+///   path per block with no counterpart in the gemma3 tensor set.
+/// * `diffusion-gemma` again: the experts are `ffn_gate_up_exps` (FUSED), so
+///   the separate-name lookup misses them and 128 experts go unrouted.
+///
+/// The failure mode is the one this tree keeps meeting: not a crash, a
+/// confident wrong answer. `cpudecode.rs` already words it exactly — reading a
+/// tensor "as another format would produce plausible garbage" — and an IGNORED
+/// tensor is the same class with less evidence, because there is no wrong read
+/// to trace, only an absent right one.
+///
+/// Returns `(name, weight_count)` for block-0 tensors whose suffix is unknown,
+/// heaviest first. Block 0 only: every block repeats the same set, and a list
+/// forty times as long would not be read.
+pub fn unread_block_tensors(g: &crate::gguf::Gguf) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = g.tensors.iter()
+        .filter(|t| t.name.starts_with("blk.0."))
+        .filter(|t| {
+            let rest = &t.name["blk.0.".len()..];
+            // BOTH halves must be known: a familiar stem with an unfamiliar
+            // trailing component is the case most worth reporting, because the
+            // familiarity is exactly what makes it easy to miss.
+            // `ffn_down_exps.scale` has a stem this engine reads and a `.scale`
+            // it does not, and the scale is a whole per-expert vector.
+            //
+            // My first version stripped the component and asked only about the
+            // stem, which marked `ffn_down_exps.scale` as ACCOUNTED FOR — the
+            // opposite of what the comment beside it claimed. The test sided
+            // with the comment.
+            let (stem, part) = rest.rsplit_once('.').unwrap_or((rest, "weight"));
+            !(KNOWN_BLOCK_SUFFIXES.contains(&stem) && matches!(part, "weight" | "bias"))
+        })
+        .map(|t| (t.name.clone(), t.dims.iter().product::<u64>().max(1)))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
+/// One line for the load log, or `None` when everything is accounted for.
+pub fn unread_tensor_line(g: &crate::gguf::Gguf) -> Option<String> {
+    let un = unread_block_tensors(g);
+    if un.is_empty() { return None }
+    let names: Vec<String> = un.iter().take(8)
+        .map(|(n, w)| format!("{} ({} weights)", n.trim_start_matches("blk.0."), w))
+        .collect();
+    Some(format!("UNREAD tensors in blk.0 — nothing in this engine consumes {}{}. \
+A tensor the forward pass ignores does not error; it produces plausible wrong output.",
+        names.join(", "),
+        if un.len() > 8 { format!(" and {} more", un.len() - 8) } else { String::new() }))
+}
+
 /// Bytes saved on device by skipping the int8 cache for a source that does not benefit.
 pub fn int8_cache_waste(src_ggml_type: u32, n_weights: u64) -> u64 {
     if int8_worth_it(src_ggml_type) { 0 } else { n_weights }   // ~1 byte/weight for the int8 blob
@@ -2057,6 +2132,81 @@ mod file_view_refusal_tests {
         let h = type_histogram(&g);
         assert_eq!(h[0].0, 13, "Q5_K holds far more weights than 100 norms: {h:?}");
         assert_eq!(h[0].1, 1, "and it is one tensor");
+    }
+
+
+    /// The two reported models, as their dumps showed them.
+    #[test]
+    fn the_unread_tensors_from_the_real_dumps_are_reported() {
+        // diffusion-gemma: two scale vectors nothing reads, plus fused experts.
+        let dg = gguf_of(vec![
+            tensor("blk.0.attn_q.weight", 12, &[2816, 4096]),
+            tensor("blk.0.ffn_down_exps.scale", 0, &[128]),
+            tensor("blk.0.ffn_gate_inp.scale", 0, &[2816]),
+            tensor("blk.0.ffn_gate_up_exps.weight", 12, &[2816, 1408, 128]),
+        ]);
+        let un = unread_block_tensors(&dg);
+        let names: Vec<&str> = un.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"blk.0.ffn_gate_up_exps.weight"),
+                "the FUSED expert tensor is the blocker and must be named: {names:?}");
+        assert!(names.contains(&"blk.0.ffn_down_exps.scale"), "{names:?}");
+        assert!(names.contains(&"blk.0.ffn_gate_inp.scale"), "{names:?}");
+        assert!(!names.contains(&"blk.0.attn_q.weight"), "a known tensor must not be flagged");
+
+        // gemma4: a 256-wide side path with no gemma3 counterpart.
+        let g4 = gguf_of(vec![
+            tensor("blk.0.attn_q.weight", 12, &[1536, 2048]),
+            tensor("blk.0.inp_gate.weight", 12, &[1536, 256]),
+            tensor("blk.0.proj.weight", 12, &[256, 1536]),
+            tensor("blk.0.post_norm.weight", 0, &[1536]),
+        ]);
+        let names: Vec<String> = unread_block_tensors(&g4).into_iter().map(|(n, _)| n).collect();
+        for want in ["blk.0.inp_gate.weight", "blk.0.proj.weight", "blk.0.post_norm.weight"] {
+            assert!(names.iter().any(|n| n == want), "{want} missing from {names:?}");
+        }
+    }
+
+    /// A fully-supported model must report nothing, or the line becomes noise
+    /// on every load and stops being read.
+    #[test]
+    fn a_known_model_reports_no_unread_tensors() {
+        let llama = gguf_of(vec![
+            tensor("blk.0.attn_q.weight", 12, &[4096, 4096]),
+            tensor("blk.0.attn_k.weight", 12, &[4096, 1024]),
+            tensor("blk.0.attn_norm.weight", 0, &[4096]),
+            tensor("blk.0.ffn_gate.weight", 12, &[4096, 14336]),
+            tensor("blk.0.ffn_down.weight", 12, &[14336, 4096]),
+            tensor("token_embd.weight", 12, &[4096, 128256]),
+        ]);
+        assert!(unread_block_tensors(&llama).is_empty(),
+                "{:?}", unread_block_tensors(&llama));
+        assert!(unread_tensor_line(&llama).is_none());
+    }
+
+    /// Heaviest first: a 128-expert matrix matters more than a [1] scalar, and
+    /// a list ordered by discovery buries the one that counts.
+    #[test]
+    fn the_report_leads_with_the_heaviest_unread_tensor() {
+        let g = gguf_of(vec![
+            tensor("blk.0.layer_output_scale.weight", 0, &[1]),
+            tensor("blk.0.ffn_gate_up_exps.weight", 12, &[2816, 1408, 128]),
+        ]);
+        assert_eq!(unread_block_tensors(&g)[0].0, "blk.0.ffn_gate_up_exps.weight");
+    }
+
+    /// The allowlist must match what `lib.rs` actually looks up.
+    ///
+    /// A hand-maintained list drifts, and a drifted list makes this check lie
+    /// in the FRIENDLY direction — a tensor the engine stopped reading would
+    /// still count as known. Checked against the source rather than trusted.
+    #[test]
+    fn the_known_suffix_list_matches_what_lib_rs_reads() {
+        let lib = include_str!("lib.rs");
+        for suffix in KNOWN_BLOCK_SUFFIXES {
+            assert!(lib.contains(suffix),
+                    "`{suffix}` is on the known list but lib.rs never mentions it — if the loader \
+dropped it, remove it here or every checkpoint carrying it will be silently marked accounted-for");
+        }
     }
 
 }

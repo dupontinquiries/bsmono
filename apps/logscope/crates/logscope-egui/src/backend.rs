@@ -435,6 +435,17 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                     // question was which formats were in it, and the log could
                     // not answer.
                     crate::diag!("loader: {}", gpu_kernels::memplan::type_histogram_line(&g));
+                    // And what the forward pass will IGNORE. Three
+                    // unsupported-model reports in one week each turned on a
+                    // tensor present in the file that no code path reads —
+                    // diffusion-gemma's per-expert and router scales, gemma4's
+                    // inp_gate/proj side path, and its fused expert matrix that
+                    // the separate-name lookup misses entirely. None of them
+                    // errors; they produce plausible wrong output, which is
+                    // strictly harder to diagnose than a crash.
+                    if let Some(line) = gpu_kernels::memplan::unread_tensor_line(&g) {
+                        crate::diag!("loader: {line}");
+                    }
                     let src_type = g.tensor("blk.0.attn_q.weight").map(|t| t.ggml_type).unwrap_or(0);
                     let incoming_est = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
                     if !gpu_kernels::memplan::int8_worth_it(src_type) {
