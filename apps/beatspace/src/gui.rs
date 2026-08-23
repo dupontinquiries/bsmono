@@ -269,6 +269,15 @@ struct App {
     picker: uikit_egui::path_picker::PathPicker,
     picker_open: bool,
     train_batch: String,
+    /// Sampler duration in mel frames — the width of one training crop and the
+    /// length of one generated beat. Had no CLI flag until recently and no GUI
+    /// field at all, so it was reachable only by hand-editing config.json.
+    train_time_frames: String,
+    /// Continue from the checkpoint in ckpt_dir rather than starting over.
+    /// Defaults ON: the GUI's own stop button writes a checkpoint, so the
+    /// overwhelmingly common next action is to carry on from it, and starting
+    /// fresh by accident silently discards a training run.
+    train_resume: bool,
     latent: usize,
     shared: Arc<Mutex<Shared>>,
     z_a: Vec<f32>,
@@ -301,6 +310,8 @@ impl App {
             gpu: Default::default(),
             train_rx: None,
             train_epochs: "20000".into(),
+            train_time_frames: cfg.time_frames.to_string(),
+            train_resume: true,
             picker: Default::default(),
             picker_open: false,
             train_batch,
@@ -692,6 +703,21 @@ impl App {
             ui.add_enabled(!running,
                 egui::TextEdit::singleline(&mut self.train_batch).desired_width(70.0));
         });
+        ui.horizontal(|ui| {
+            ui.label("frames");
+            ui.add(egui::TextEdit::singleline(&mut self.train_time_frames).desired_width(70.0))
+                .on_hover_text(
+                    "Sampler duration, in mel frames: the width of one training crop and so the \
+length of one generated beat. 64 frames is about 0.74 s at the default hop and rate; 128 doubles \
+it. Must be a multiple of 16 — the trainer refuses other values up front rather than building a \
+model with a broken seed grid.\n\nChanging this changes the MODEL SHAPE, so it cannot be combined \
+with resume against an existing checkpoint.");
+            ui.checkbox(&mut self.train_resume, "resume")
+                .on_hover_text(
+                    "Continue from gen_latest in the checkpoint directory, at the epoch it stopped \
+at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's momentum does not \
+(candle keeps it private), so expect roughly a thousand steps of re-warming.");
+        });
 
         if !running {
             if ui.button("▶  start training").clicked() {
@@ -797,6 +823,8 @@ impl App {
     fn start_training(&mut self) {
         let epochs: u64 = self.train_epochs.trim().parse().unwrap_or(1000);
         let batch: usize = self.train_batch.trim().parse().unwrap_or(16);
+        let time_frames: usize = self.train_time_frames.trim().parse().unwrap_or(self.cfg.time_frames);
+        let resume = self.train_resume;
         let cfg = self.cfg.clone();
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         self.train_rx = Some(rx);
@@ -813,6 +841,13 @@ impl App {
                 .arg("--ckpt-dir").arg(&ckpt)
                 .arg("--epochs").arg(epochs.to_string())
                 .arg("--batch-size").arg(batch.to_string())
+                // Sampler duration and resume, which this launcher never
+                // passed. The trainer validates --time-frames before it
+                // allocates and refuses a resume whose shape differs from the
+                // checkpoint's, so a bad combination reports a named reason in
+                // the log pane rather than failing inside a tensor assignment.
+                .arg("--time-frames").arg(time_frames.to_string())
+                .args(if resume { &["--resume"][..] } else { &[][..] })
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn();
