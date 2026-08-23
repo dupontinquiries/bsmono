@@ -68,8 +68,8 @@ free.
 
 ## 3. Native dependencies block whole crates — use the feature gates
 
-Missing here: `libasound2-dev`, `libssl-dev`, `cmake`, Qt6, GTK4/libadwaita,
-any Vulkan ICD, `/dev/dri`. That means a build script fails and takes the whole
+Missing here: `libasound2-dev`, `libssl-dev`, `cmake`, `libudev-dev`, Qt6,
+GTK4/libadwaita, any Vulkan ICD, `/dev/dri`. That means a build script fails and takes the whole
 crate with it, including headless code that never touches the device.
 
 Known escapes, all default-on so ordinary builds are unaffected:
@@ -80,9 +80,17 @@ Known escapes, all default-on so ordinary builds are unaffected:
 | `games/blackstar-rs` | `--no-default-features` | cpal→alsa-sys |
 | `apps/studio` `studio-media` | `--no-default-features` | opus→libopus via cmake |
 | `system/snapclone` `snapclone-crypto` | `SNAPCLONE_SKIP_CBINDGEN=1` | see §4 |
+| `games/blackstar-rs` `gamepad` | already off by default | gilrs → libudev-sys |
 
 If you meet a new one, **add a default-on feature** rather than working around
 it in the shell. Three crates already do this; it is the house pattern.
+
+**And check the NON-default configurations before believing a crate is green.**
+`cargo ailite check` builds the default features only. `games/clawbound`'s
+`app` feature (winit/wgpu/egui) does compile in this sandbox — it was long
+recorded as blocked on rustc >= 1.76, which expired when the toolchain moved to
+1.96 — and it was BROKEN for a while because two merged menu commands had no
+`app.rs` arms, which no default-feature test could see (`7427ba3a4`).
 
 ## 4. Check `git status` after every build
 

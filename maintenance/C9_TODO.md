@@ -159,6 +159,16 @@ absorbing all of it.
   this is sampling, not a dropped commit — but nobody has reproduced their
   exact per-kit figures, and that is worth saying rather than rounding to
   "reproduces".
+  **AND THE MERGE BROKE A FEATURE NOBODY COULD SEE.** `--features app` stopped
+  compiling: the two incoming menu commands arrived with no `app.rs` arms, so
+  the match was non-exhaustive (E0004). The incoming line was pinned to rustc
+  1.75 where that feature cannot be built at all, and the merge verification
+  here ran the DEFAULT features, which exclude `app.rs` entirely — so neither
+  side could have caught it. Fixed in `7427ba3a4`; the whole winit/wgpu/egui
+  stack does build on 1.96, so the old "blocked on rustc >= 1.76" note is
+  expired. Generalised into CLAUDE.md §3: a green default build is not a green
+  crate. Checked the same class on blackstar-rs — `analog` is clean, `gamepad`
+  fails only on a missing `libudev-dev`, now listed in the gate table.
 
 ### New, from integrating
 
