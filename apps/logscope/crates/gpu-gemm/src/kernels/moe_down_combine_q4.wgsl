@@ -1,4 +1,3 @@
-
 struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> hmid: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -10,14 +9,14 @@ struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let tok=wg.z;
   if(col>=d.d){ return; }
-  var total=resid[col];   // match MOE_WSUM order: acc=resid then += weighted terms
+  var total=resid[tok*d.d+col];   // match MOE_WSUM order: acc=resid then += weighted terms
   for(var s=0u;s<d.slots;s=s+1u){
-    let expert=selw[s];
-    let w=bitcast<f32>(selw[d.slots+s]);
+    let expert=selw[tok*2u*d.slots+s];
+    let w=bitcast<f32>(selw[tok*2u*d.slots+d.slots+s]);
     let row=expert*d.d+col;
-    let wbase=row*(d.k/8u); let sbase=row*d.kb; let abase=s*d.k;
+    let wbase=row*(d.k/8u); let sbase=row*d.kb; let abase=(tok*d.slots+s)*d.k;
     var acc=0.0; var kk=tid;
     loop { if(kk>=d.k){break;}
       let scale=qs[sbase+(kk/32u)];
@@ -32,5 +31,5 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if(tid==0u){ total=total+w*red[0]; }
     workgroupBarrier();
   }
-  if(tid==0u){ o[col]=total; }
+  if(tid==0u){ o[tok*d.d+col]=total; }
 }

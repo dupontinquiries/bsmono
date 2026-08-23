@@ -1166,6 +1166,82 @@ the real implementation to whoever greps for it next."
         }
     }
 
+    /// The extracted `.wgsl` files must match the inline shaders that run.
+    ///
+    /// `src/kernels/` holds 90 shader files and `kernels.rs` maps each to a
+    /// `const` via `include_str!`. `kernels.rs` has no `mod` declaration, so
+    /// that mapping is not compiled — but the picture is NOT simply "all dead",
+    /// which is what makes the directory dangerous:
+    ///
+    ///   1 LIVE     `lib.rs` `include_str!`s `swiglu_matvec_q8_0_add.wgsl`
+    ///              directly. That file IS the shader the GPU runs.
+    ///   82 SHADOWED `lib.rs` carries an inline `r#"..."#` const of the same
+    ///              name. The inline one wins; the file is decoration.
+    ///   7 ORPHANED  reachable only through the undeclared `kernels.rs`.
+    ///
+    /// So one sibling in that directory is genuinely load-bearing, which makes
+    /// the other 82 read as load-bearing too — they are syntax-highlighted,
+    /// greppable, and sit exactly where a shader belongs. Thirteen had silently
+    /// diverged from the source that executes, `moe_topk.wgsl` by more than
+    /// half its length. Editing one of those does nothing at all.
+    ///
+    /// Rewriting them from the inline consts costs nothing (nothing compiles
+    /// them) and leaves the half-finished 2026-07-26 extraction in a state
+    /// where completing it is a mechanical swap rather than a 13-way
+    /// reconciliation. This test keeps them honest in the meantime.
+    ///
+    /// Deliberately does NOT check the orphaned seven: they have no inline
+    /// counterpart to compare against, and inventing one would be asserting a
+    /// relationship that does not exist.
+    #[test]
+    fn every_shadowed_shader_matches_the_inline_source_that_runs() {
+        let lib = include_str!("lib.rs");
+        let krs = include_str!("kernels.rs");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+
+        // file name -> const name, from kernels.rs's include_str! table.
+        let mut const_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for line in krs.lines() {
+            let (Some(c0), Some(f0)) = (line.find("pub const "), line.find("include_str!(\"kernels/"))
+                else { continue };
+            let cname = line[c0 + 10..].split(':').next().unwrap_or("").trim();
+            let rest = &line[f0 + 22..];
+            let Some(fname) = rest.split('"').next() else { continue };
+            if !cname.is_empty() && !fname.is_empty() { const_of.insert(fname, cname); }
+        }
+        assert!(const_of.len() > 50, "parsed only {} entries from kernels.rs", const_of.len());
+
+        let mut drifted = Vec::new();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("src/kernels") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("wgsl") { continue }
+            let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("").to_string();
+
+            // LIVE files are the source of truth; nothing to compare them to.
+            if lib.contains(&format!("include_str!(\"kernels/{fname}\")")) { continue }
+            let Some(cname) = const_of.get(fname.as_str()) else { continue }; // orphaned
+
+            let needle = format!("const {cname}: &str = r#\"");
+            let Some(a) = lib.find(&needle) else { continue };
+            let body = &lib[a + needle.len()..];
+            let Some(b) = body.find("\"#;") else { continue };
+
+            checked += 1;
+            let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+            if on_disk.trim() != body[..b].trim() { drifted.push(fname); }
+        }
+
+        assert!(checked > 50, "only compared {checked} shaders; the parse regressed");
+        drifted.sort();
+        assert!(
+            drifted.is_empty(),
+            "these extracted shaders no longer match the inline const lib.rs actually runs: \
+{drifted:?}\nEditing a file in src/kernels/ has no effect while `mod kernels` is undeclared — the \
+inline r#\"...\"# in lib.rs is what compiles. Change lib.rs, then re-sync the file."
+        );
+    }
+
     /// The mirror: notes must not describe as PENDING anything the engine already honours. Group
     /// routing was reported pending for 50 bundles after it landed.
     #[test]

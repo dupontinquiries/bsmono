@@ -1,10 +1,9 @@
-
 // `nswa`/`swaty` add sliding-window attention. Unlike decode — where a single query position gives one
 // contiguous range — every query ROW here has its own window, so the bound is computed per row from that
 // row's global position. It is still a range rather than a mask, because both windowing rules are
 // contiguous: the tile loop simply starts at the window instead of at 0. swaty: 0 none, 1 standard
 // (Gemma, last n positions), 2 chunked (Llama-4, current aligned chunk).
-struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,sl:u32,bcz:u32,bco:u32,_b2:u32,_b3:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
 @group(0)@binding(2) var<storage,read> vc: array<f32>;
@@ -13,8 +12,16 @@ struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
 var<workgroup> sc: array<f32,2048>;
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let row=wg.x;                                       // which (query row, head) this workgroup handles
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(local_invocation_id) lid:vec3<u32>){
+  // FLAT INDEX ACROSS X AND Y. One workgroup per (query row, head) means s*nh
+  // workgroups, and a 6905-token prefill on a 32-head model is 220,960 — past
+  // the 65535 per-dimension limit, which wgpu drops as a NON-FATAL validation
+  // error, leaving the attention output stale. Reading num_workgroups lets the
+  // caller spill the count into y; when it does not, nwg.x is the whole grid
+  // and this is arithmetically identical to the old `wg.x`.
+  let row=wg.x + wg.y*nwg.x;
+  if (row >= dd.s*dd.nh) { return; }                  // spilled grids overshoot
   let i=row/dd.nh; let hh=row%dd.nh; let tid=lid.x;
   let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
   let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;   // GQA: query head -> shared KV head

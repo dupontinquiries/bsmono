@@ -1,4 +1,3 @@
-
 struct D { n:u32,c:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> scales: array<f32>;
@@ -12,7 +11,10 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   var packed=0u;
   for(var b=0u;b<4u;b=b+1u){
     let qi=clamp(i32(round(x[row*dd.c + w*4u + b]*inv)), -127, 127);
-    packed=packed | ((u32(qi) & 0xffu) << (b*8u));
+    // insertBits: `<< (b*8u)` is a shift by a lane-varying amount and yields zero for every lane
+    // whose shift is non-zero on Honeykrisp. This is the int8 pack, so a wrong result here is wrong
+    // weights for every int8-resident model on that driver.
+    packed = insertBits(packed, u32(qi) & 0xffu, b * 8u, 8u);
   }
   q[p]=packed;
 }

@@ -1,4 +1,3 @@
-
 struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -23,15 +22,16 @@ fn dotq8(row:u32, tid:u32, k:u32, kb:u32, abase:u32) -> f32 {
 }
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let tok=wg.z/d._slot; let slot=wg.z%d._slot;
   if(col>=d.n){ return; }
-  let abase=select(0u, slot*d.k, d.xper==1u);
-  let expert=selw[slot];
+  let abase=select(tok*d.k, wg.z*d.k, d.xper==1u);
+  let expert=selw[tok*2u*d._slot+slot];
   let grow=expert*d.rstride+col;         // gate row: column j
   let urow=expert*d.rstride+d.n+col;     // up row:   column ff+j
   rg[tid]=dotq8(grow,tid,d.k,d.kb,abase);
   ru[tid]=dotq8(urow,tid,d.k,d.kb,abase);
   workgroupBarrier();
   for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
-  if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+  if(tid==0u){ let g=rg[0]; o[wg.z*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
 }

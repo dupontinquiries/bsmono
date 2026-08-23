@@ -1,10 +1,13 @@
-
 struct D { n:u32, grid_w:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;     // raw Q4_K bytes, viewed as words
 @group(0)@binding(1) var<storage,read_write> dst: array<f32>;
 @group(0)@binding(2) var<uniform> dims: D;                  // n = super-block count
 
-fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+// extractBits, NOT shift-and-mask: a shift by a lane-varying amount returns zero on
+// Honeykrisp for every lane whose shift is non-zero (--gate-bytes, extractBits CORRECT
+// where this form is WRONG). Four consecutive threads select four different bytes of one
+// word here, so three of every four got zero.
+fn byte_at(i: u32) -> u32 { return extractBits(src[i >> 2u], (i & 3u) * 8u, 8u); }
 
 // half -> f32 (subnormals and inf/nan handled the same way the CPU helper does)
 // Bit-for-bit twin of the CPU gguf::f16_to_f32: construct the f32 bit pattern and bitcast, rather than
@@ -66,6 +69,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let sm = scale_min(grp * 2u + half, sbase);
         let q = byte_at(qbase + grp * 32u + l);
         let nib = select(q & 0xFu, q >> 4u, half == 1u);
-        dst[blk * 256u + grp * 64u + half * 32u + l] = d * sm.x * f32(nib) - dmin * sm.y;
+        // THE SECOND SITE. The one below already binds these products, with a comment about FMA
+        // fusion — and this one was left as a single expression, so the compiler fused it here and
+        // not there. That is why 57 of 112 block scales came out an ULP from the CPU while the
+        // dequant itself was exact: two paths, one fixed.
+        //
+        // The rule is not "never fuse". Fusion is safe where the output is CONTINUOUS and unsafe
+        // where it feeds a DISCRETIZATION: an ULP changes nothing until the value crosses a
+        // quantization boundary, at which point it becomes a whole level. Q6K_DEQUANT outputs
+        // floats to be accumulated and fuses freely — faster AND more accurate, and bit-exact on
+        // hardware. This value feeds round(v / scale) in the re-quantizer, so it must not.
+        let ds = d * sm.x;
+        let dm = dmin * sm.y;
+        // Same explicit fma as the converter's wq, so the two GPU dequant paths cannot diverge —
+        // which is exactly how this bug hid: the gate tested this one and the converter used the
+        // other.
+        dst[blk * 256u + grp * 64u + half * 32u + l] = fma(ds, f32(nib), -dm);
     }
 }
