@@ -471,4 +471,49 @@ window for a fence storm"
         }
     }
 
+
+    /// The point of the whole exercise: a default window survives on Apple Vulkan.
+    ///
+    /// The fleet report was `requested window k=4 clamped to k=2 (AllocationCount
+    /// budget: soft cap 3072 objects, ~7535 live)` on Llama-3.3-8B, at 4.51 tok/s
+    /// with 52% of submits being readbacks — a k=2 window reinstates a readback
+    /// every other token, which the on-device sampler exists to avoid.
+    ///
+    /// A local split showed dims were 100% of live objects (dims 384 / pool 0
+    /// after 41 tokens) and the cache and ring were sized for Metal's 8192-object
+    /// budget: 4096 + 2048 against a 3072 cap. Both are now derived from the
+    /// backend's own budget.
+    ///
+    /// This asserts the consequence rather than the inputs. Sizing two constants
+    /// correctly is only worth doing if the window it frees is usable, and
+    /// "objects reclaimed" is not the same claim as "the clamp stops firing".
+    ///
+    /// NOT a promise about tok/s. It says the governor's arithmetic permits k=4;
+    /// whether the device then behaves is the hardware's answer.
+    #[test]
+    fn the_derived_dims_caps_leave_room_for_the_default_window() {
+        let b = Budget::for_backend(WgpuBackend::Vulkan, true, true); // Apple Vulkan
+        let dims = crate::dims_cap_for(b.soft_object_cap) + crate::dims_ring_cap_for(b.soft_object_cap);
+
+        // Live objects at steady state, as measured: dims dominate and the pool
+        // recycles to ~0. This is the number the governor actually sees.
+        let live = dims;
+        let k = b.safe_k(live);
+        assert!(
+            k >= 4,
+            "safe_k is {k} with {live} live dims objects against a {} cap — the default window \
+of 4 would still be clamped, so the resizing did not buy what it was for",
+            b.soft_object_cap
+        );
+
+        // And the old sizing must NOT have permitted it, or this test would pass
+        // for reasons unrelated to the change.
+        let old_dims = 4096 + 2048;
+        assert!(
+            b.safe_k(old_dims) < 4,
+            "the pre-change sizing ({old_dims} dims objects) already allowed k=4, so the clamp \
+in the fleet log had some other cause and this test is measuring nothing"
+        );
+    }
+
 }
