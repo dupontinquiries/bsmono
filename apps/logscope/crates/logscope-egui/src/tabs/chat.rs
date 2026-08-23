@@ -2436,7 +2436,15 @@ reply is framed differently from the turn that produced it.");
         let mut prev: Option<u64> = None;
         for m in &self.msgs {
             s.push_str(if m.role == Role::User { "## You" } else { "## Assistant" });
-            let gap = prev.map(|p| m.at.saturating_sub(p)).unwrap_or(0);
+            // BOTH ENDS must be real. A turn written before `MsgSave.at`
+            // existed loads with 0, and `m.at - 0` is the whole unix epoch —
+            // a part-migrated autosave would report "(473000 hours later)"
+            // between its last old turn and its first new one. That is the
+            // ordinary case for anyone who had a chat open when they updated.
+            let gap = match (prev, m.at) {
+                (Some(p), now) if p > 0 && now > 0 => now.saturating_sub(p),
+                _ => 0,
+            };
             if gap >= 60 {
                 s.push_str(&format!("  ({} later, {})",
                     logscope_fan::sessiontime::human(std::time::Duration::from_secs(gap)),
@@ -2445,7 +2453,7 @@ reply is framed differently from the turn that produced it.");
             s.push_str("\n\n");
             s.push_str(m.text());
             s.push_str("\n\n");
-            prev = Some(m.at);
+            prev = Some(m.at);   // 0 stays 0; the match above treats it as absent
         }
         s
     }
@@ -9338,4 +9346,39 @@ mod stamp_persistence_tests {
                 md.lines().take(2).collect::<Vec<_>>().join(" "));
         assert!(md.contains("1 hour later"), "the gap between turns must survive too: {md}");
     }
+
+    /// A part-migrated autosave must not claim a 54-year pause.
+    ///
+    /// Turns written before `MsgSave.at` existed load with 0. Followed by a
+    /// turn with a real stamp, `m.at - prev` is the whole unix epoch, and the
+    /// transcript would read "(473000 hours later, 2023-11-14 22:13 UTC)".
+    ///
+    /// This is the ordinary case for anyone who had a chat open when they
+    /// updated: the old turns have no time and the new ones do. A gap needs
+    /// BOTH ends to mean anything.
+    #[test]
+    fn a_gap_from_an_unstamped_turn_is_not_reported() {
+        let mut c = Chat::default();
+        let mut old = Msg::user("before the field existed".into()); old.at = 0;
+        let mut new = Msg::assistant();                            new.at = 1_700_000_000;
+        c.msgs.push(old); c.msgs.push(new);
+
+        let md = c.transcript();
+        assert!(!md.contains("later"),
+                "a gap measured from an unstamped turn is meaningless: {md}");
+        assert!(md.contains("Started unknown"),
+                "and the start of a part-migrated chat is genuinely unknown: {md}");
+    }
+
+    /// Two real stamps still report their gap — the guard must not silence
+    /// everything.
+    #[test]
+    fn a_gap_between_two_stamped_turns_is_still_reported() {
+        let mut c = Chat::default();
+        let mut a = Msg::user("q".into());  a.at = 1_700_000_000;
+        let mut b = Msg::assistant();       b.at = 1_700_003_600;
+        c.msgs.push(a); c.msgs.push(b);
+        assert!(c.transcript().contains("1 hour later"));
+    }
+
 }
