@@ -807,6 +807,64 @@ produce fluent, WRONG output rather than a crash");
             "the refused cache was taken and never accounted for — the store leaks its budget");
     }
 
+    /// The WARM path through `take` — the one branch of the store nothing had ever executed.
+    ///
+    /// Every other prefix-store test sizes the budget to keep entries hot, deliberately, because
+    /// they assert bit-equality and an int8 round trip cannot deliver it. That left
+    /// `Tier::Warm(q) => gpu.promote_cache(..)` inside `take` as live code with no coverage: a
+    /// panic, a wrong length, or a promotion that never happened would all have gone unnoticed.
+    /// Here the budget is set BETWEEN the hot and warm footprints of the single shared node, so
+    /// enforce must demote it and the next run must promote it back.
+    ///
+    /// WHAT IS NOT ASSERTED, and why. Not token equality against `run_fleet_trie`. Promotion is
+    /// lossy by construction, so equality is not something the design promises — asserting it would
+    /// pass here only because this fixture's argmax is insensitive, and would fire as a flake the
+    /// moment a sharper model or a longer prefix made the loss visible. The claim under test is
+    /// narrower and actually guaranteed: the entry really does demote, the warm branch really is
+    /// taken, and a run served from it completes and answers every request it was given.
+    #[test]
+    fn a_demoted_prefix_is_promoted_back_when_it_is_next_needed() {
+        let path = "/tmp/tiny-qwen3.gguf";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("SKIPPED: {path} absent — sh tools/tiny-variants/gen-all.sh");
+            return;
+        };
+        let gpu = crate::Gpu::new();
+        let Ok(m) = gpu.load_gguf_opt(&bytes, false) else { panic!("qwen3 fixture no longer loads") };
+        let sp = crate::SamplerParams::default();
+        let shared: Vec<u32> = vec![3, 1, 4, 1, 5];
+        let reqs = || vec![
+            crate::FleetRequest { id: 0, tokens: vec![3u32, 1, 4, 1, 5, 9], max_new: 3 },
+            crate::FleetRequest { id: 1, tokens: vec![3u32, 1, 4, 1, 5, 2], max_new: 3 },
+        ];
+
+        // Mirrors PrefixStore's own accounting: hot is f32 K+V per layer, warm is int8 plus a
+        // per-row scale. Sitting between them is what forces exactly one demotion and no eviction.
+        let (nl, kv, len) = (m.n_layers, m.kv_dim(), shared.len());
+        let hot = 2 * len * kv * 4 * nl;
+        let warm = 2 * nl * (len * kv + len * 4);
+        assert!(warm < hot, "the warm tier is not smaller than the hot one ({warm} vs {hot}) — \
+this test's budget cannot separate them and proves nothing");
+        let mut store = crate::PrefixStore::new((hot + warm) / 2, nl, kv);
+
+        let _ = gpu.run_fleet_trie_cached(&m, reqs(), &sp, None, 2, 32, 2, &mut store);
+        let key = crate::prefix_key(&shared);
+        assert!(matches!(store.tier_of(key), Some(crate::Tier::Warm(_))),
+            "the shared node did not demote under a budget below its hot footprint, so the warm \
+branch below is not being exercised and this test is vacuous");
+
+        let got = gpu.run_fleet_trie_cached(&m, reqs(), &sp, None, 2, 32, 2, &mut store);
+        assert_eq!(store.total_hits(), 1, "the demoted entry was not taken on the second run");
+        assert_eq!(store.checked_out(), 0, "a promoted cache was never handed back");
+        let mut ids: Vec<usize> = got.iter().map(|r| r.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1],
+            "a run served from a promoted int8 prefix dropped a request: {ids:?}");
+        for (id, toks) in &got {
+            assert!(!toks.is_empty(), "request {id} generated nothing from a promoted prefix");
+        }
+    }
+
     #[test]
     fn an_mla_checkpoint_reaches_the_loader_and_stops_where_the_notes_say() {
         let path = "/tmp/tiny-glmdsa.gguf";
