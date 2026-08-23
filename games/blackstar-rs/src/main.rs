@@ -688,6 +688,9 @@ struct Game {
     gpu: render::Gpu,
     /// the ship interior, and the mesh slot its hull was uploaded to
     aboard: aboard::Aboard,
+    /// the room the player was in last frame, so entering one is an EVENT
+    /// rather than a state the HUD reprints sixty times a second
+    last_room: Option<&'static str>,
     world: World,
     car: Car,
     ball: Ball,
@@ -1819,6 +1822,7 @@ fn main() {
         bot_categories: bot_categories_loaded,
         gpu,
         aboard: aboard::Aboard::new(70.0),
+        last_room: None,
         world,
         car,
         ball,
@@ -3826,15 +3830,27 @@ impl Game {
         // to the console. Everything else is swallowed: a player at a
         // console is AT the console.
         if self.mode == Mode::Play {
+            // Computed BEFORE the deck is borrowed, for the same reason the
+            // Enter arm resolves its order outside the borrow: acting on the
+            // deck needs the shell, and the shell is what is borrowed.
+            let reachable = self.consoles_reachable_now();
             if let Some(d) = self.deck.as_mut() {
                 match &key {
                     Key::Named(NamedKey::Escape) => {
                         d.input(menu::Input::Back);
                     }
                     Key::Named(NamedKey::Tab) => {
-                        let all = stations::STATIONS;
-                        let at = all.iter().position(|s| *s == d.station).unwrap_or(0);
-                        d.walk_to(all[(at + 1) % all.len()]);
+                        // WALK TO THE NEXT REACHABLE CONSOLE, not the next in
+                        // the array. Tab used to cycle all seven regardless of
+                        // sealed doors, which made `depower` cosmetic: the
+                        // whole point of a door that shuts is that it stops
+                        // you, and a menu that ignores it is a menu.
+                        let all = &reachable;
+                        if !all.is_empty() {
+                            let at =
+                                all.iter().position(|s| *s == d.station).unwrap_or(0);
+                            d.walk_to(all[(at + 1) % all.len()]);
+                        }
                     }
                     Key::Named(NamedKey::ArrowUp) => {
                         d.input(menu::Input::Move(-1));
@@ -3867,10 +3883,24 @@ impl Game {
                 return;
             }
             if ch.eq_ignore_ascii_case("v") {
-                // walk below: the armory is the first console aft
-                match deck::Deck::open(stations::Station::Armory, ship::Phase::Cruise, nightfall::week_now()) {
-                    Ok(d) => self.deck = Some(d),
-                    Err(e) => self.toastf(e),
+                // WHICHEVER CONSOLE YOU ARE STANDING IN. This opened the
+                // Armory unconditionally, because there was no way to ask
+                // where the player was — `Station::cell()` named a room and
+                // nothing could tell you which room you were in.
+                //
+                // Now the ship is parked and solid, so the car's position is
+                // a room, and a room is a console. Outside the ship there is
+                // no console to open, and saying so is better than opening an
+                // arbitrary one: a hub you can reach from anywhere is a menu.
+                let here = self.console_underfoot();
+                match here {
+                    Some(st) => {
+                        match deck::Deck::open(st, ship::Phase::Cruise, nightfall::week_now()) {
+                            Ok(d) => self.deck = Some(d),
+                            Err(e) => self.toastf(e),
+                        }
+                    }
+                    None => self.toastf("no console here — find a room aboard"),
                 }
                 return;
             }
@@ -5493,6 +5523,7 @@ impl Game {
             }
         }
         self.tick_lesson(dt);
+        self.tick_aboard();
         self.tick_trial(dt);
         if ball_air && self.air_link > 0.0 {
             self.air_t += dt;
@@ -5906,6 +5937,72 @@ impl Game {
 
         v.truncate(render::MAX_RT_SHAPES);
         (v, RtIds { ball: ball_id, car: car_id, decor0, remote0, static_n })
+    }
+
+    /// The console in the room the player is standing in, if any.
+    ///
+    /// The join `aboard.rs` was built for: the world knows where the ship is
+    /// parked, `interior::room_at` turns a position into a room, and
+    /// `Station::cell()` has named each console's room since the stations
+    /// landed.
+    /// Consoles the player could walk to from where they are, through doors
+    /// that open.
+    ///
+    /// Falls back to every station when the player is not aboard — being
+    /// outside the ship should not silently empty the console list, and the
+    /// deck is reachable from the surface today.
+    fn consoles_reachable_now(&self) -> Vec<stations::Station> {
+        let Some((origin, ship)) = self.world.parked.as_ref() else {
+            return stations::STATIONS.to_vec();
+        };
+        let Some(room) = ship.room_at(self.car.pos - *origin) else {
+            return stations::STATIONS.to_vec();
+        };
+        let open = ship.reachable_from(room.id);
+        let v: Vec<stations::Station> =
+            stations::STATIONS.into_iter().filter(|s| open.contains(&s.cell())).collect();
+        if v.is_empty() {
+            stations::STATIONS.to_vec()
+        } else {
+            v
+        }
+    }
+
+    /// Notice when the player walks into or out of a room.
+    ///
+    /// An EVENT, not a state: the room is a fact every frame, and a HUD line
+    /// that reprints it sixty times a second is noise. Only the transition is
+    /// worth saying, and the useful thing to say is what you can do here.
+    fn tick_aboard(&mut self) {
+        let now = self
+            .world
+            .parked
+            .as_ref()
+            .and_then(|(o, ship)| ship.room_at(self.car.pos - *o))
+            .map(|c| c.id);
+        if now == self.last_room {
+            return;
+        }
+        self.last_room = now;
+        let Some(id) = now else { return };
+        let name = self
+            .world
+            .parked
+            .as_ref()
+            .and_then(|(_, s)| s.cell(id))
+            .map(|c| c.name)
+            .unwrap_or(id);
+        match stations::STATIONS.into_iter().find(|s| s.cell() == id) {
+            Some(st) => self.toastf(&format!("{} — press V for {}", name, st.title())),
+            None => self.toastf(name),
+        }
+    }
+
+    fn console_underfoot(&self) -> Option<stations::Station> {
+        let (origin, ship) = self.world.parked.as_ref()?;
+        let local = self.car.pos - *origin;
+        let room = ship.room_at(local)?;
+        stations::STATIONS.into_iter().find(|s| s.cell() == room.id)
     }
 
     fn build_scene(&self, ids: &RtIds, rc: (Vec3, Quat), rb: (Vec3, Quat), planes: &[[f32; 4]; 6]) -> Vec<ObjDraw> {

@@ -6211,6 +6211,33 @@ through a wall that is drawn beside you.
 
 1119 passing.
 
+FOUR MORE JOINS, AND EACH ONE EXISTED ON BOTH SIDES ALREADY.
+
+`V` OPENED THE ARMORY UNCONDITIONALLY. Not a placeholder — there was no way to
+ask where the player was, so any console was as good as another. Now the ship
+is parked and solid, `interior::room_at` turns a position into a room, and
+`Station::cell()` has named each console's room since the stations landed.
+Outside the ship it says "no console here" rather than opening one: a hub you
+can reach from anywhere is a menu.
+
+TAB CYCLED ALL SEVEN STATIONS regardless of sealed doors, which made `depower`
+cosmetic — the whole point of a door that shuts is that it stops you. It walks
+the reachable set now, falling back to all of them when the player is not
+aboard, because being outside should not silently empty the list.
+
+ENTERING A ROOM IS AN EVENT, not a state. The room is a fact every frame and a
+HUD line that reprints it sixty times a second is noise; only the transition
+is worth saying, and what is worth saying is what you can DO there — "TRADE
+DECK — press V for THE CHARTROOM".
+
+AND THE BORROW CHECKER CAUGHT ME REPEATING A MISTAKE THE FILE ALREADY
+DOCUMENTS. The Enter arm has a comment explaining that it resolves its order
+OUTSIDE the deck's borrow, because acting on the deck needs the shell. I put
+the reachable-console lookup inside the same borrow. Hoisted, with a note
+pointing at the neighbour that already said so.
+
+1119 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

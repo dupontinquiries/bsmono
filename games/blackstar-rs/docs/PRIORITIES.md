@@ -112,6 +112,14 @@ fixed, and moving between them is a position and a walkable check.
       terrain; that the rooms read as rooms rather than one block. If it is
       invisible, the mesh slot or the draw is wrong; if it is a grey lump, the
       lighting params `[0.35, 0.0, 0.25, 0.0]` are the dial.
+- [x] **`V` opens the console you are standing in.** It opened the Armory
+      unconditionally before, because nothing could say where you were.
+      Outside the ship it says so rather than opening an arbitrary one — a hub
+      you can reach from anywhere is a menu.
+- [x] **Tab walks reachable consoles only.** It cycled all seven regardless of
+      sealed doors, which made `depower` cosmetic.
+- [x] **Entering a room says what you can do there** — a toast on the
+      transition, not a HUD line reprinted sixty times a second.
 - [x] **It is solid.** `World::park` folds the interior's SDF into the world
       query, broad-phased on the hull box. Drive at it and you should stop;
       drive through a doorway and you should be inside. Both the draw and the
