@@ -527,6 +527,39 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   clamps rather than panics, and the player's claw is the *same blow* an ancestor throws —
   target riders, on-hit effects (Hush of Snows fires from a human's paw) and kill credit,
   which it previously skipped.
+## Graphics: camera, ability guides, casting
+
+- [x] The camera came in: the `battle` render mode was framed two hundred units out on the
+  whole territory, which is a map screenshot rather than a game. It now follows the player's
+  warrior at ~30 units, and `castguide::camera_dist` gives the app and the menu one shared
+  answer for what each zoom step means (0 closest 20m .. 4 widest 34m, default 24 — nearer
+  than the 34 capture mode used).
+- [x] Zooming in broke the ground markers, which is the part worth recording: the contention
+  ground, the Heal Tree auras, the Skyrock and the camp pads were **filled translucent
+  discs**, fine as gentle washes at two hundred units and opaque slabs across the whole
+  frame at thirty. They are **rings** now — an outline says "this far" and still shows the
+  ground it describes.
+- [x] `castguide.rs`: placeholder ability guides, headless. Every kit's verb already implies
+  a shape — a ring around you (Aoe/Fear/Shield/Heal), a placed disc (Zone/Rain), a travel
+  line (Dash), a wedge (Root/Pull), a reticle (Strike/Execute) — and the aim is clamped into
+  range, because a guide that shows a reach the ability does not have is a guide that lies.
+  Cooling abilities are greyed rather than hidden: a range you cannot see is a range you
+  cannot learn.
+- [x] Tooltips assembled in one place (`castguide::tooltip`) so two screens cannot describe
+  the same ability differently: name, what it does, then "range 13 · 2.2x claw · 1.8s ·
+  cooldown 58s" — power in *claws*, the unit a player can feel. The ultimate's tooltip
+  carries the kit's passive, where there is room for it.
+- [x] Casting options: Quick (press to cast), Normal (press, aim, press, with a cancel that
+  spends no cooldown, and a different slot re-aims rather than firing both), Instant (quick
+  and no guide). Guides toggle **independently** of cast mode, because wanting a reticle and
+  wanting to press once are two different preferences.
+- [x] Menu rows for all three (`Ability guides`, `Casting`, `Camera`), with Back now found at
+  the end of the list rather than hard-coded to row 6.
+- [ ] App-side: the guides need drawing from `battleview` + `castguide` in `render_battle`,
+  and the tooltip wants an egui panel. Same rustc >= 1.76 blocker; the shapes, the words and
+  the state machine are done and tested, and the `battle` render mode is a working reference
+  implementation of exactly this drawing.
+
 ## Quick play and the 5v5 select page
 
 - [x] The battleground fields **up to five a side** (`Battleground::new_roster`, `MAX_CLAN`),

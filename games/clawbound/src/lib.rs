@@ -23,6 +23,7 @@ pub mod ancestor;
 pub mod battleground;
 pub mod battleview;
 pub mod capture;
+pub mod castguide;
 pub mod ecology;
 pub mod hunter;
 pub mod iqm;

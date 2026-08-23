@@ -55,6 +55,12 @@ impl Keybinds {
 
 #[derive(Clone)]
 pub struct Settings {
+    /// Ability guides on the ground: the ring, the disc, the dash line.
+    pub show_guides: bool,
+    /// How a press becomes a cast — see [`crate::castguide::CastMode`].
+    pub cast_mode: crate::castguide::CastMode,
+    /// Camera distance, 0 (close) to 4 (the whole lane).
+    pub camera_zoom: u8,
     pub show_cone: bool,   // debug: draw the AI vision cone
     pub master_volume: f32,
     pub difficulty: u8,    // 0 easy .. 2 hard — scales hunter speed, suspicion, and flush radius
@@ -64,7 +70,15 @@ pub struct Settings {
     pub keybinds: Keybinds,
 }
 impl Default for Settings {
-    fn default() -> Self { Settings { show_cone: false, master_volume: 0.7, difficulty: 1, hires: false, clan_abilities: false, prowl_fixed_wind: false, keybinds: Keybinds::default() } }
+    fn default() -> Self {
+        Settings {
+            show_guides: true,
+            cast_mode: crate::castguide::CastMode::Quick,
+            camera_zoom: 1,
+            show_cone: false, master_volume: 0.7, difficulty: 1, hires: false,
+            clan_abilities: false, prowl_fixed_wind: false, keybinds: Keybinds::default(),
+        }
+    }
 }
 
 /// Map the difficulty setting (0 easy .. 2 hard) to a hunter-aggression multiplier.
@@ -193,6 +207,13 @@ impl Menu {
                 v
             }
             Screen::Settings => vec![
+                format!("Ability guides: {}", if self.settings.show_guides { "On" } else { "Off" }),
+                format!("Casting: {}", self.settings.cast_mode.name()),
+                format!(
+                    "Camera: {} ({:.0}m)",
+                    ["Closest", "Close", "Middle", "Wide", "Widest"][self.settings.camera_zoom.min(4) as usize],
+                    crate::castguide::camera_dist(self.settings.camera_zoom)
+                ),
                 format!("Show vision cone: {}", if self.settings.show_cone { "On" } else { "Off" }),
                 format!("Master volume: {:.0}%", self.settings.master_volume * 100.0),
                 format!("Difficulty: {}", ["Easy", "Normal", "Hard"][self.settings.difficulty as usize]),
@@ -276,15 +297,29 @@ impl Menu {
             (Screen::Play, 2) => self.next_class(dir),
             (Screen::Play, 3) => self.sel_clan = (self.sel_clan as i32 + dir).rem_euclid(crate::clan::CLAN_COUNT as i32) as u8,
             (Screen::Draft, i) if i < 6 => self.next_draft_pick(i, dir),
-            (Screen::Settings, 0) => self.settings.show_cone = !self.settings.show_cone,
-            (Screen::Settings, 1) => self.settings.master_volume = (self.settings.master_volume + dir as f32 * 0.1).clamp(0.0, 1.0),
+            (Screen::Settings, 0) => self.settings.show_guides = !self.settings.show_guides,
+            (Screen::Settings, 1) => {
+                // one row, cycled either way, because three modes do not deserve
+                // three rows and a player flicking left should not have to wrap
+                self.settings.cast_mode = if dir >= 0 {
+                    self.settings.cast_mode.next()
+                } else {
+                    self.settings.cast_mode.next().next()
+                };
+            }
             (Screen::Settings, 2) => {
+                let z = self.settings.camera_zoom as i32 + dir;
+                self.settings.camera_zoom = z.clamp(0, 4) as u8;
+            }
+            (Screen::Settings, 3) => self.settings.show_cone = !self.settings.show_cone,
+            (Screen::Settings, 4) => self.settings.master_volume = (self.settings.master_volume + dir as f32 * 0.1).clamp(0.0, 1.0),
+            (Screen::Settings, 5) => {
                 let d = self.settings.difficulty as i32 + dir;
                 self.settings.difficulty = d.clamp(0, 2) as u8;
             }
-            (Screen::Settings, 3) => self.settings.hires = !self.settings.hires,
-            (Screen::Settings, 4) => self.settings.clan_abilities = !self.settings.clan_abilities,
-            (Screen::Settings, 5) => self.settings.prowl_fixed_wind = !self.settings.prowl_fixed_wind,
+            (Screen::Settings, 6) => self.settings.hires = !self.settings.hires,
+            (Screen::Settings, 7) => self.settings.clan_abilities = !self.settings.clan_abilities,
+            (Screen::Settings, 8) => self.settings.prowl_fixed_wind = !self.settings.prowl_fixed_wind,
             _ => {}
         }
     }
@@ -326,7 +361,11 @@ impl Menu {
                 7 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::None,   // rows 0..5 are adjusted with left/right
             },
-            Screen::Settings => { if self.cursor == 6 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
+            Screen::Settings => {
+                let back = self.items().len() - 1;
+                if self.cursor == back { self.screen = Screen::Title; self.cursor = 0; }
+                MenuCmd::None
+            }
             Screen::Keybinds => {
                 let n = self.settings.keybinds.keys.len();
                 if self.cursor == n { self.screen = Screen::Title; self.cursor = 0; }
@@ -352,6 +391,42 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_new_graphics_rows_adjust_and_back_still_backs_out() {
+        use crate::castguide::CastMode;
+        let mut m = Menu::new();
+        m.screen = Screen::Settings;
+        // guides toggle
+        m.cursor = 0;
+        assert!(m.settings.show_guides);
+        m.adjust(1);
+        assert!(!m.settings.show_guides);
+        // casting cycles both ways from one row
+        m.cursor = 1;
+        assert_eq!(m.settings.cast_mode, CastMode::Quick);
+        m.adjust(1);
+        assert_eq!(m.settings.cast_mode, CastMode::Normal);
+        m.adjust(-1);
+        assert_eq!(m.settings.cast_mode, CastMode::Quick);
+        // camera clamps rather than wrapping — nobody wants closest after widest
+        m.cursor = 2;
+        for _ in 0..9 { m.adjust(1); }
+        assert_eq!(m.settings.camera_zoom, 4);
+        for _ in 0..9 { m.adjust(-1); }
+        assert_eq!(m.settings.camera_zoom, 0);
+        // the rows that were already there still work, three lower
+        m.cursor = 3;
+        m.adjust(1);
+        assert!(m.settings.show_cone);
+        m.cursor = 6;
+        m.adjust(1);
+        assert!(m.settings.hires);
+        // and Back is wherever the list ends, not a hard-coded 6
+        m.cursor = m.items().len() - 1;
+        m.activate();
+        assert_eq!(m.screen, Screen::Title);
+    }
 
     #[test]
     fn quick_play_is_the_first_thing_on_the_title_screen() {
@@ -471,13 +546,15 @@ mod tests {
 
     #[test]
     fn settings_toggle_cone_and_volume() {
+        // rows moved down by three when guides, casting and camera went in at
+        // the top; the behaviour they assert has not changed
         let mut m = Menu::new();
         m.screen = Screen::Settings;
-        m.cursor = 0; let before = m.settings.show_cone; m.adjust(1);
+        m.cursor = 3; let before = m.settings.show_cone; m.adjust(1);
         assert_ne!(before, m.settings.show_cone);
-        m.cursor = 1; m.adjust(-1); m.adjust(-1);
+        m.cursor = 4; m.adjust(-1); m.adjust(-1);
         assert!(m.settings.master_volume < 0.71);
-        m.cursor = 3; let g0 = m.settings.hires; m.adjust(1);
+        m.cursor = 6; let g0 = m.settings.hires; m.adjust(1);
         assert_ne!(g0, m.settings.hires, "the Graphics setting should toggle");
     }
 
