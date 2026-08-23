@@ -715,11 +715,27 @@ mod tests {
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
-        let loader_wires_it = code.contains("Split::derive") || code.contains("ffn_gate_up_exps");
-        assert!(!loader_wires_it,
-                "lib.rs now reaches expsplit or names the fused tensor: if the loader really \
-routes 128 experts through it, DELETE this test and the 'CONTRADICTED' paragraph in the module \
-docs, which both still claim it does not");
+        // TWO FACTS, tracked apart, because they moved apart.
+        //
+        // The loader now RECOGNISES the fused name — it refuses a checkpoint
+        // that has `ffn_gate_up_exps` and no `ffn_gate_exps`, rather than
+        // silently reading the block as dense and dropping the experts. That is
+        // progress and this test must not treat it as the finish.
+        //
+        // What still does not happen is ROUTING: nothing calls
+        // `expsplit::Split::derive` to place the two views. Folding both into
+        // one boolean is what made this fail three commits running for three
+        // different reasons, each of them a step forward.
+        let recognises = code.contains("ffn_gate_up_exps");
+        let routes = code.contains("Split::derive");
+        assert!(recognises,
+                "the loader no longer mentions ffn_gate_up_exps — a checkpoint with fused experts \
+would go back to reading as DENSE and dropping them silently, which is the regression this \
+refusal exists to prevent");
+        assert!(!routes,
+                "lib.rs now calls Split::derive: if the loader really routes experts through the \
+fused tensor, DELETE this test and the 'CONTRADICTED' paragraph in the module docs, which both \
+still say it does not");
     }
 
     /// The scale tensors the plan does not account for.

@@ -118,6 +118,21 @@ coherent garbage instead of an error", ff * 2));
     pub fn half_dims(&self) -> [u64; 3] { [self.d, self.ff, self.n_expert] }
 }
 
+/// Does this checkpoint fuse its experts in a way the loader would misread?
+///
+/// True when some block has `ffn_gate_up_exps` and NO block has
+/// `ffn_gate_exps`. That combination is the dangerous one: MoE detection keys
+/// on the separate name, so the file loads as DENSE with its experts and its
+/// router silently dropped — wrong output rather than a failed load.
+///
+/// A predicate rather than an inline check in the loader because the loader
+/// needs a whole GGUF to reach and this needs a tensor list, and the difference
+/// is whether the rule can be tested at all.
+pub fn fused_without_separate(g: &crate::gguf::Gguf, n_blocks: u32) -> bool {
+    let has = |n: &str| (0..n_blocks).any(|b| g.tensor(&format!("blk.{b}.{n}.weight")).is_some());
+    has("ffn_gate_up_exps") && !has("ffn_gate_exps")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,4 +198,53 @@ mod tests {
         }
         assert_ne!(s.gate_off, s.up_off, "the halves must not alias whichever way round they are");
     }
+
+    fn gguf_of(names: &[&str]) -> crate::gguf::Gguf {
+        crate::gguf::Gguf {
+            version: 3, metadata: Default::default(), data_offset: 0,
+            tensors: names.iter().map(|n| crate::gguf::TensorInfo {
+                name: (*n).into(), dims: vec![8, 8, 4], ggml_type: 12, offset: 0 }).collect(),
+        }
+    }
+
+    /// The diffusion-gemma case: fused present, separate absent.
+    #[test]
+    fn a_fused_only_checkpoint_is_flagged() {
+        let g = gguf_of(&["blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_down_exps.weight"]);
+        assert!(fused_without_separate(&g, 4),
+                "this loads as DENSE and drops every expert without an error");
+    }
+
+    /// An ordinary MoE must not be flagged, or the refusal blocks working models.
+    #[test]
+    fn a_separate_expert_checkpoint_is_not_flagged() {
+        let g = gguf_of(&["blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                          "blk.0.ffn_down_exps.weight"]);
+        assert!(!fused_without_separate(&g, 4));
+    }
+
+    /// A dense model has neither and must load.
+    #[test]
+    fn a_dense_checkpoint_is_not_flagged() {
+        let g = gguf_of(&["blk.0.ffn_gate.weight", "blk.0.ffn_up.weight"]);
+        assert!(!fused_without_separate(&g, 4));
+    }
+
+    /// If BOTH are present the separate ones win and there is nothing to refuse
+    /// — a converter emitting both is redundant, not broken.
+    #[test]
+    fn both_present_is_not_flagged() {
+        let g = gguf_of(&["blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_gate_exps.weight"]);
+        assert!(!fused_without_separate(&g, 4));
+    }
+
+    /// Fused experts on a LATER block only. Layer 0 dense and 1+ MoE is a real
+    /// layout (lib.rs has a comment about exactly that), so scanning only
+    /// block 0 would miss it.
+    #[test]
+    fn fusion_on_a_later_block_is_still_found() {
+        let g = gguf_of(&["blk.0.ffn_gate.weight", "blk.3.ffn_gate_up_exps.weight"]);
+        assert!(fused_without_separate(&g, 8), "the scan must cover every block, not just 0");
+    }
+
 }

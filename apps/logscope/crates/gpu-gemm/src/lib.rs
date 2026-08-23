@@ -10401,8 +10401,28 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                 } else { 0 }
             }
         };
-        let is_moe = acfg.moe && n_expert > 0 && expert_ff > 0
-            && (0..g.get_u32(&format!("{pfx}.block_count")).unwrap_or(0)).any(|b| g.tensor(&format!("blk.{b}.ffn_gate_exps.weight")).is_some());
+        let n_blocks = g.get_u32(&format!("{pfx}.block_count")).unwrap_or(0);
+        let has_separate_experts = (0..n_blocks)
+            .any(|b| g.tensor(&format!("blk.{b}.ffn_gate_exps.weight")).is_some());
+        // FUSED EXPERTS: refuse rather than quietly become dense.
+        //
+        // `is_moe` keys on `ffn_gate_exps`. A checkpoint that fuses gate and up
+        // into `ffn_gate_up_exps` — diffusion-gemma does, `[d, 2*ff, n_expert]`
+        // — has no tensor by that name, so this evaluated FALSE and the model
+        // loaded as a DENSE one with its experts and its router silently
+        // dropped. On an unsupported architecture that is masked by the arch
+        // refusal; on a supported one it would load, run, and be wrong, which
+        // is the failure this tree keeps paying for.
+        //
+        // `expsplit::Split::derive` has the arithmetic to unpack it, checked
+        // against `ffn_down_exps`. Until the residency path can place two views
+        // over one buffer, saying so is better than proceeding: a refusal costs
+        // a load, a silent dense read costs a debugging session.
+        if crate::expsplit::fused_without_separate(g, n_blocks) {
+            return Err(format!(
+                "this checkpoint fuses the MoE experts: it has blk.*.ffn_gate_up_exps.weight and no ffn_gate_exps.weight. The loader detects MoE by the separate name, so it would read every block as DENSE and drop {n_expert} experts and the router without an error — wrong output rather than a failed load. gpu_kernels::expsplit derives the gate/up offsets from the fused shape (verified against ffn_down_exps) but nothing places the two views yet."));
+        }
+        let is_moe = acfg.moe && n_expert > 0 && expert_ff > 0 && has_separate_experts;
         let h = match g.get_u32(&format!("{pfx}.feed_forward_length")) {
             Some(v) => v as usize,
             None if is_moe => expert_ff, // MoE GGUFs may omit the dense FFN width entirely
