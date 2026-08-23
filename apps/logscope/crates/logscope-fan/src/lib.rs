@@ -59,6 +59,9 @@
 // Should the run carry on when the model stops talking? Cheap rules first, a
 // small-model call only when they genuinely cannot tell.
 #[allow(dead_code)] pub mod continuation;
+// How far the operator has gone past each node: what lets the graph badge an
+// unanswered question instead of the run having to stop for it.
+#[allow(dead_code)] pub mod readmark;
 #[allow(dead_code)] pub mod reply;
 #[allow(dead_code)] pub mod capability;
 #[allow(dead_code)] pub mod liaison_fan;

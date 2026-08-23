@@ -92,6 +92,18 @@ pub struct Facts<'a> {
     pub auto_turns: usize,
     /// Ceiling on those. Beyond it, stop regardless.
     pub max_auto_turns: usize,
+    /// Will an unanswered question stay VISIBLE if the run carries on?
+    ///
+    /// True when the caller is going to badge it — `readmark::open_questions`
+    /// over the graph's nodes. The original rule stopped dead on any question
+    /// because continuing "buries it above the next wall of output", and that
+    /// reasoning assumes a linear transcript. With a tree graph the question
+    /// does not have to be buried: it can be marked and stay findable.
+    ///
+    /// So the stop is conditional rather than absolute. False — no marking —
+    /// keeps the old behaviour, which is correct for any caller that cannot
+    /// show it.
+    pub questions_are_flagged: bool,
 }
 
 /// The cheap decision.
@@ -105,11 +117,6 @@ pub fn decide(f: Facts<'_>) -> Verdict {
     // prompt produces another empty reply and burns the remaining time.
     if reply.is_empty() {
         return Verdict::Decided(Command::StopAndWait, "the model produced nothing");
-    }
-    // A question belongs to the operator. Continuing answers it on their
-    // behalf and buries it above the next wall of output.
-    if ends_with_question(reply) {
-        return Verdict::Decided(Command::StopAndWait, "the model asked a question");
     }
     // A budget exists so that something eventually stops.
     if f.auto_turns >= f.max_auto_turns {
@@ -125,6 +132,31 @@ pub fn decide(f: Facts<'_>) -> Verdict {
             return Verdict::Decided(Command::StopAndWait, "under a minute left");
         }
         Some(_) => {}
+    }
+
+    // AFTER the time and budget stops, deliberately. A flagged question turns
+    // into a CHECK, which is a continuation — so placing it above them let a
+    // spent work limit continue anyway. Caught by
+    // `flagging_does_not_defeat_the_other_stop_conditions`; a badge makes a
+    // question survivable, not the clock.
+    //
+    // A question belongs to the operator — but "buried" is a property of a
+    // linear transcript, not of a graph that can badge the node.
+    //
+    // Unflagged, this is still a hard stop: an unanswered question scrolling
+    // away with nothing to mark it is the case the rule was written for.
+    //
+    // Flagged, it becomes a CHECK rather than a stop. The run continues, the
+    // node carries its badge, and the next step verifies rather than building
+    // further on an answer the operator never gave — carrying on with more
+    // construction would compound whatever the question was uncertain about.
+    if ends_with_question(reply) {
+        return if f.questions_are_flagged {
+            Verdict::Decided(Command::KeepGoingCheck,
+                "a question was asked and is flagged in the graph — verifying rather than building on it")
+        } else {
+            Verdict::Decided(Command::StopAndWait, "the model asked a question")
+        };
     }
 
     // ── things that continue ──
@@ -205,7 +237,8 @@ mod tests {
     use super::*;
 
     fn facts(reply: &str, remaining: Option<u64>, auto: usize) -> Facts<'_> {
-        Facts { reply, remaining_s: remaining, auto_turns: auto, max_auto_turns: 8 }
+        Facts { reply, remaining_s: remaining, auto_turns: auto, max_auto_turns: 8,
+                questions_are_flagged: false }
     }
 
     fn cmd(v: Verdict) -> Option<Command> {
@@ -298,4 +331,46 @@ mod tests {
             }
         }
     }
+
+    /// With the graph badging it, a question no longer has to stop the run.
+    ///
+    /// The original rule assumed a linear transcript where an unanswered
+    /// question scrolls away and is lost. A tree graph can mark the node, so
+    /// the reason for stopping does not apply.
+    #[test]
+    fn a_flagged_question_continues_as_a_check() {
+        let f = Facts { questions_are_flagged: true, ..facts("Which backend?", Some(3000), 0) };
+        assert_eq!(cmd(decide(f)), Some(Command::KeepGoingCheck),
+                   "flagged, the question stays findable and the run can verify instead of stopping");
+    }
+
+    /// And VERIFY rather than build — the distinction that makes continuing safe.
+    #[test]
+    fn a_flagged_question_does_not_continue_with_more_construction() {
+        let f = Facts { questions_are_flagged: true, ..facts("Shall I use wgpu?", Some(3000), 0) };
+        let got = cmd(decide(f));
+        assert_ne!(got, Some(Command::KeepGoingLinear),
+                   "building further compounds whatever the question was uncertain about");
+        assert_ne!(got, Some(Command::KeepGoingFan));
+    }
+
+    /// Without marking, the old hard stop stands.
+    #[test]
+    fn an_unflagged_question_still_stops() {
+        let f = Facts { questions_are_flagged: false, ..facts("Which backend?", Some(3000), 0) };
+        assert_eq!(cmd(decide(f)), Some(Command::StopAndWait));
+    }
+
+    /// Flagging does not override the other stops. A spent limit or an empty
+    /// reply is not made safe by a badge.
+    #[test]
+    fn flagging_does_not_defeat_the_other_stop_conditions() {
+        for (reply, rem, auto) in [("", Some(3000), 0), ("Which?", Some(0), 0),
+                                   ("Which?", Some(3000), 8)] {
+            let f = Facts { questions_are_flagged: true, ..facts(reply, rem, auto) };
+            assert_eq!(cmd(decide(f)), Some(Command::StopAndWait),
+                       "reply={reply:?} remaining={rem:?} auto={auto}");
+        }
+    }
+
 }
