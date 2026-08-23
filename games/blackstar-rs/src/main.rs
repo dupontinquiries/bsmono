@@ -2,11 +2,16 @@
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
 mod anim;
+mod approach;
 mod actuator;
+mod aboard;
 mod airlock;
+mod amalgam;
 mod analog;
 mod ballistics;
+mod bench;
 mod bigbody;
+mod board;
 mod botpack;
 mod bots;
 mod roster;
@@ -14,6 +19,7 @@ mod sections;
 mod camera;
 mod chassis_traits;
 mod chord;
+mod cling;
 mod clinch;
 mod combine;
 mod config;
@@ -29,22 +35,37 @@ mod fx;
 mod gamepad;
 mod gyro;
 mod content;
+mod crawler;
+mod cybertronian;
+mod curriculum;
 mod corruption;
 mod cyber;
 mod custom;
 mod partcars;
 mod partdata;
+mod palevector;
+mod parity;
 mod patrol;
+mod perception;
 mod trials;
+mod trainwatch;
+mod tuner;
+mod tuning;
 mod replay;
 mod academy;
 mod stream;
+mod hazard;
+mod hive;
 mod hud;
 mod hotbar;
 mod hydro;
 mod idle;
 mod input;
-mod intel;
+mod archive;
+mod assembler;
+mod archsim;
+mod orbits;
+mod provenance;
 mod joints;
 mod lift;
 mod loadout;
@@ -55,23 +76,30 @@ mod meshgen;
 mod model;
 mod net;
 mod physics;
+mod powers;
 mod platform;
 mod posture;
 mod procars;
 mod procgen;
 mod pulse;
 mod compact;
+mod brain;
 mod campaign;
+mod census;
 mod campsim;
 mod chi;
+mod codex;
 mod clones;
 mod exoworlds;
 mod deck;
+mod depth;
 mod gear;
 mod gearsim;
 mod menufx;
+mod mapsim;
 mod menusim;
 mod stations;
+mod stealth;
 mod vault;
 mod energon;
 mod finale;
@@ -80,6 +108,9 @@ mod orient;
 mod partdetect;
 mod loadbearing;
 mod grime;
+mod gravity;
+mod groundside;
+mod guidance;
 mod orientsim;
 mod partsim;
 mod skirmish;
@@ -91,21 +122,27 @@ mod raidrun;
 mod raidsim;
 mod relay;
 mod render;
+mod rescale;
+mod rip;
 mod style;
 mod subsea;
 mod sun;
 mod survival;
 mod save;
+mod scale;
 mod ship;
 mod sim;
 mod sound;
+mod space;
 mod terrain;
 mod touch;
+mod tradecraft;
 mod ui;
 mod weapons;
 mod xform;
 mod voyage;
 mod watch;
+mod voxel;
 mod world;
 
 use std::collections::{HashMap, HashSet};
@@ -179,6 +216,7 @@ enum Row {
 fn nav_here(menu: u8) -> usize {
     match menu {
         5 => 4,       // VIDEO
+        8 => 1,       // STORY lives under SETUP
         3 | 4 | 7 => 1, // CAR SETUP / FLIPS / MOTION live under SETUP
         _ => 1,
     }
@@ -237,6 +275,7 @@ pub fn sphere_visible(planes: &[[f32; 4]; 6], c: Vec3, r: f32) -> bool {
 
 fn menu_title(menu: u8) -> &'static str {
     match menu {
+        8 => "STORY",
         7 => "MOTION / GYRO",
         6 => "GAME MODES",
         1 => "CAMERA",
@@ -352,6 +391,22 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("EVERY BOT IS IN BALLCHASE MODE. GOOD LUCK.", Header),
             ("BACK", Back),
         ],
+        8 => vec![
+            // THE DIALS THE FICTION EXPOSES. `--tune` has carried these since
+            // they landed and the menu never did, so a knob documented as
+            // "a main-menu dial for how much history the game hands you
+            // already believing" was reachable only by hand-editing a save.
+            // Describing something as a menu setting does not put it in a menu.
+            ("WHAT YOU ALREADY BELIEVE", Header),
+            ("MYSTERY ANCHOR", Slider { get: |c| c.story.anchor, set: |c, v| c.story.anchor = v, min: 0.0, max: 1.0, step: 0.05, def: 0.45, fmt: 0 }),
+            ("CAMPAIGN (0 PRESENT / 1 ARCHIVE)", Slider { get: |c| c.story.era, set: |c, v| c.story.era = v, min: 0.0, max: 1.0, step: 1.0, def: 0.0, fmt: 1 }),
+            ("HOW THE MAP FIRMS UP", Header),
+            ("SOURCES FOR 'POSSIBLE'", Slider { get: |c| c.story.possible_at, set: |c, v| c.story.possible_at = v, min: 1.0, max: 8.0, step: 1.0, def: 2.0, fmt: 1 }),
+            ("SOURCES FOR 'HIGH CONFIDENCE'", Slider { get: |c| c.story.high_at, set: |c, v| c.story.high_at = v, min: 2.0, max: 12.0, step: 1.0, def: 3.0, fmt: 1 }),
+            ("WHAT YOU CAN CARRY", Header),
+            ("CASE CAPACITY", Slider { get: |c| c.story.case_cap, set: |c, v| c.story.case_cap = v, min: 1.0, max: 24.0, step: 1.0, def: 6.0, fmt: 1 }),
+            ("BACK", Back),
+        ],
         7 => vec![
             ("MOTION CONTROL", Header),
             ("GYRO DRIVE", Toggle { get: |c| c.gyro.on, set: |c, v| c.gyro.on = v }),
@@ -376,6 +431,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("CAR SETUP", Link(3)),
             ("FLIPS", Link(4)),
             ("VIDEO", Link(5)),
+            ("STORY", Link(8)),
             ("BACK", Back),
         ],
     }
@@ -482,8 +538,6 @@ fn parse_args() -> Opts {
             "--mute" => o.mute = true,
             "--mobile" => o.mobile = true,
             "--desktop-ui" => o.desktop_ui = true,
-            "--mobile" => o.mobile = true,
-            "--desktop-ui" => o.desktop_ui = true,
             "--dvorak" => o.dvorak = true,
             "--name" => o.name = args.next(),
             "--host" => o.host = true,
@@ -501,6 +555,51 @@ fn parse_args() -> Opts {
                 println!("  --host         announce a session on the fleet store at launch");
                 println!("  --join FRIEND  resolve FRIEND's session and dial in at launch");
                 println!("  --mute         run silent (doesn't change saved volume)");
+                println!();
+                // A dozen headless drivers had accumulated and `--help` named
+                // none of them, so the only way to find one was to read
+                // main.rs. A tool nobody can discover is a tool nobody runs.
+                println!("HEADLESS DRIVERS — no window, no GPU; each takes its own subcommand");
+                println!("  --sim <what>   physics/AI sims: all, flip, land, shot, perf, ... (see DESIGN.md)");
+                println!("  --campaign     the fifteen missions: slides, waves, objectives, progression");
+                println!("  --raid         the raid loop: generator, foothold, encounters, loot");
+                println!("  --arch <cmd>   the archaeological map: map, site, find, carry, relay,");
+                println!("                 city, read, why, anchor, orbit, audit, emit-c");
+                println!("  --terrain <c>  worlds and ground: grounds, profile, dunes, jump, drop, audit");
+                println!("  --raidrun <id> a raid at 120 Hz: the event stream a renderer consumes");
+                println!("  --finale       the red dwarf strike, and the three ways it refuses");
+                println!("  --powers       the human interface: what each power costs its host");
+                println!("  --keys         the live control scheme, overlaps and all");
+                println!("  --brain [what]  squad commanders: doctrines, the LLM seam, the wire");
+                println!("  --parity       invariants living at more than one call site");
+                println!("  --aboard [len] walk the ship: rooms, consoles, sealed doors");
+                println!("  --rescale      what a real-sized robot costs, per constant");
+                println!("  --guidance     the ball-chaser as a missile: pursuit vs PN");
+                println!("  --assemble     part families, and the pairing score");
+                println!("  --trainwatch   GAN training diagnostics: collapse and coverage");
+                println!("  --bench [code] roll, keep and share authored frames");
+                println!("  --voxel        critics for a voxel GAN: skeleton and part matching");
+                println!("  --gravity      the well formula, checked against real physics");
+                println!("  --frames       cybertronian frames, designed from the planet");
+                println!("  --space        kuiper as space: angular LOD, gravity, depth, the floor");
+                println!("  --roster       the bot census, and what the distribution implies");
+                println!("  --rip          finishers: the style of the kill is who you are");
+                println!("  --crawler      the ambush from above: climb, perch, pounce");
+                println!("  --board        human scale, Aiden's skateboard, and the scale gap");
+                println!("  --stealth      sight vs spark resonance, and assassination");
+                println!("  --grip         clinging: walls, undersides, bulk and ice");
+                println!("  --amalgam      the gate-warden hunt: forge, hide, banish");
+                println!("  --pale         the relic-keeper: testimony that is never evidence");
+                println!("  --codex [entry] the 54-entry codex, annotated where evidence differs");
+                println!("  --hazard       delayed consequences: the warp wave, spearcons");
+                println!("  --combine      gestalts: which squads merge, and the fitness grid");
+                println!("  --tune [group] every judgment call; `--tune guesses` for the unverified ones");
+                println!("  --intel        Blackstar's Array logs, once his flagship falls");
+                println!("  --menu         the station consoles, previewed as text frames");
+                println!("  --gear         the bearer's sheet, the ship's vault, the clone gallery");
+                println!("  --fold         audit a transformation: self-intersection, collapse, pops");
+                println!("  --orient       diagnose or fix a bot pose's orientation");
+                println!("  --parts        classify a bot pose's prims (leg/wheel/thruster/wing/body)");
                 std::process::exit(0);
             }
             other => eprintln!("unknown arg {other:?} (try --help)"),
@@ -589,6 +688,14 @@ struct Game {
     /// morph is rebuilt every time the active car changes.
     bot_categories: std::collections::HashMap<String, String>,
     gpu: render::Gpu,
+    /// the ship interior, and the mesh slot its hull was uploaded to
+    aboard: aboard::Aboard,
+    /// the room the player was in last frame, so entering one is an EVENT
+    /// rather than a state the HUD reprints sixty times a second
+    last_room: Option<&'static str>,
+    /// which doorways were carved last frame, so the hull is re-uploaded when
+    /// a door moves and not every frame
+    door_mask: u32,
     world: World,
     car: Car,
     ball: Ball,
@@ -1029,18 +1136,155 @@ fn main() {
         return;
     }
     if argv.iter().any(|a| a == "--intel") {
-        // Blackstar's own Array logs, unlocked once his flagship falls
+        // Blackstar's own Array logs. They live in the archaeology tables
+        // now (see archive.rs); this flag stays as the shortcut it always
+        // was -- read the three readings together, the way he first did.
         let (sv, _, _) = save::load();
         let camp = campaign::CampaignLog::from_line(&sv.missions);
-        match intel::read(&camp) {
-            Some(frags) => {
-                println!("THE ARRAY LOGS -- recovered aboard Blackstar's own ship\n");
-                for f in frags {
-                    println!("[act {}] {}\n    {}\n", f.act, f.timestamp, f.text);
-                }
+        let dig = provenance::Dig::from_line(&sv.finds, archive::FINDINGS);
+        let logs: Vec<_> = archive::FINDINGS
+            .iter()
+            .filter(|f| f.gate == Some(archive::ARRAY_LOG_GATE))
+            .collect();
+        if !camp.is_cleared(archive::ARRAY_LOG_GATE) {
+            println!("nothing here yet -- these are Blackstar's own logs; board his ship first");
+        } else {
+            println!("THE ARRAY LOGS -- recovered aboard Blackstar's own ship\n");
+            for f in &logs {
+                let mark = if dig.has(f.id) { "*" } else { " " };
+                println!("{mark} [{}]\n    {}\n", f.id, f.blurb);
             }
-            None => println!("nothing here yet -- these are Blackstar's own logs; board his ship first"),
+            println!("(* already in the dig -- `--arch find <id>` to record the rest)");
         }
+        return;
+    }
+    if argv.iter().any(|a| a == "--brain") {
+        brain::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--parity") {
+        parity::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--aboard") {
+        aboard::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--rescale") {
+        rescale::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--guidance") {
+        guidance::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--assemble") {
+        assembler::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--trainwatch") {
+        trainwatch::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--bench") {
+        bench::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--voxel") {
+        voxel::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--gravity") {
+        gravity::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--frames") {
+        cybertronian::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--space") {
+        space::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--roster") {
+        census::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--rip") {
+        rip::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--crawler") {
+        crawler::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--board") {
+        board::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--stealth") {
+        stealth::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--grip") {
+        cling::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--amalgam") {
+        amalgam::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--pale") {
+        palevector::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--codex") {
+        codex::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--hazard") {
+        // delayed consequences: the warp wave and the lieutenants' spears
+        hazard::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--combine") {
+        // gestalts: who merges with whom, and how big the result is
+        combine::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--raidrun") {
+        // the raid renderer's contract, stepped at 120 Hz
+        raidrun::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--finale") {
+        // Billy holds the star short; Photon Man aims it
+        finale::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--powers") {
+        // the human interface, and what each of them has left
+        powers::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--keys") {
+        // overlapping binds, and keys the shell steals before the table sees them
+        input::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--tune") {
+        // every judgment call, guesses first
+        tuning::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--terrain") {
+        // route rows -> terrain::Ground, and the generator run headless
+        mapsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--arch") {
+        // the archaeological map: strata, findings, the Asteri arithmetic
+        archsim::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--campaign") {
@@ -1148,8 +1392,14 @@ fn main() {
     let t0 = Instant::now();
     let octane = model::load(&dir.join("octane"), &mut gpu, 1.28);
     let fennec = model::load(&dir.join("fennec"), &mut gpu, 1.28);
-    let dominus = model::load(&dir.join("dominus"), &mut gpu, 1.32);
-    let decor_model = model::load(&dir.join("dominus_red"), &mut gpu, 1.32);
+    // WAS `dominus` / `dominus_red`, which are Rocket League rips. Gone: 11 MB
+    // of glTF for a game that has its own 1,012-model catalogue, and a
+    // licence question nobody wants. The slot order here is INDEX-ADDRESSED
+    // (see `cars.models` below and `cfg car`), so they are substituted rather
+    // than removed — deleting an entry silently renumbers every car after it
+    // and every saved loadout with them.
+    let dominus = procars::vipera(&mut gpu);
+    let decor_model = procars::vipera(&mut gpu);
     let ball_model = model::load(&dir.join("ball"), &mut gpu, 2.0); // radius 1
     println!("models loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
@@ -1242,8 +1492,9 @@ fn main() {
     let assael = model::load(&cars_dir.join("assael"), &mut gpu, 1.34);
     let guardian = model::load(&cars_dir.join("guardian"), &mut gpu, 1.30); // orientation is detected now
     let orion = model::load(&cars_dir.join("orion"), &mut gpu, 1.32);
-    let vulcan = model::load(&cars_dir.join("vulcan"), &mut gpu, 1.30);
-    let xdevil = model::load(&cars_dir.join("xdevil"), &mut gpu, 1.32);
+    // likewise
+    let vulcan = procars::aegis(&mut gpu);
+    let xdevil = procars::axion(&mut gpu);
     let mut cars = CarModels {
         models: vec![
             octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark,
@@ -1579,6 +1830,12 @@ fn main() {
     let mut game = Game {
         bot_categories: bot_categories_loaded,
         gpu,
+        // Sized off the body that flies it, not a number in metres. See
+        // `aboard::HULL_HEIGHTS` — a 70 m hull was 184 body-heights for the
+        // 0.38 m body this engine actually uses.
+        aboard: aboard::Aboard::for_body(physics::Car::new().half_h * 2.0),
+        last_room: None,
+        door_mask: 0,
         world,
         car,
         ball,
@@ -1686,6 +1943,35 @@ fn main() {
         air_t: 0.0,
         air_link: 0.0,
     };
+
+    // Upload the ship's hull once. `Aboard::upload_hull` needs `&mut Gpu`, so
+    // it happens here rather than in the struct literal — Game owns the gpu.
+    {
+        let mut ab = std::mem::replace(&mut game.aboard, aboard::Aboard::new(1.0));
+        ab.upload_hull(&mut game.gpu);
+        game.aboard = ab;
+        // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
+        // one object is how a hull you can see and a hull you can hit end up
+        // in different places, so both read `ground_lift` — and this is the
+        // same call `load_map` makes, so there is ONE place that parks rather
+        // than a launch path and a map path that can drift.
+        game.repark();
+        // A ONE-LINE PROOF THE WIRING RAN. Reported at startup because
+        // "the game runs exactly as it did before" and reading the code
+        // could not distinguish a change that does not execute from a change
+        // that does nothing visible.
+        if let Some((o, ship)) = game.world.parked.as_ref() {
+            eprintln!(
+                "[ship] hull {:.1} m, {} rooms, slot {:?}, parked at {:.1},{:.1},{:.1}",
+                ship.hull_half.x * 2.0,
+                ship.cells.len(),
+                game.aboard.hull_slot,
+                o.x, o.y, o.z
+            );
+        } else {
+            eprintln!("[ship] NOT PARKED");
+        }
+    }
 
     // ---- launch-time multiplayer: bsgames handoff first, then CLI ---------
     if game.save.name.is_empty() && (opts.host || opts.join.is_some()) {
@@ -1911,6 +2197,28 @@ fn main() {
 /// glTF strip, so the engine uses one duration for every bot until it does.
 const XFORM_DUR: f32 = 0.9;
 
+/// Which model's dimensions describe the body as it is CURRENTLY POSED.
+///
+/// Not always the displayed one. A smooth fold keeps `cars.active` pinned to
+/// the strip's first entry — the vehicle — and rewrites that model's meshes
+/// into the robot shape each frame. The geometry on screen is a robot; the
+/// `Model` whose `half_h` and `ride_h` would be read is a car.
+///
+/// While the fold is running that does not matter, because `advance_xform`
+/// overwrites the dimensions from `Morph::bounds_at` every frame. It matters
+/// the moment anything ELSE re-derives them — a garage switch, a car hotkey,
+/// a reload — because `apply_car_dims` then seats a robot using the car's
+/// numbers. For `analog` that is a `ride_h` of 0.239 against feet at 0.400:
+/// sixteen centimetres underground, which is an order of magnitude more than
+/// the 2.25 cm the half_h/ride_h guard bug could account for.
+fn dims_model(displayed: usize, strip: Option<&[usize]>, robot: bool) -> usize {
+    match strip {
+        // only remap the strip's own base, and only while standing up
+        Some(s) if robot && !s.is_empty() && displayed == s[0] => *s.last().unwrap(),
+        _ => displayed,
+    }
+}
+
 fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.half_len = m.half_len * size;
     car.half_h = (m.half_h * size).max(0.10);
@@ -1968,6 +2276,14 @@ impl Game {
         self.car.reset(&self.world);
         apply_car_dims(&mut self.car, &self.cars.models[dims_i], self.cfg.car.size);
         self.ball.reset_in_front(&self.car);
+        // THE SHIP SURVIVES A MAP CHANGE. `World::generate` builds a fresh
+        // world with `parked: None`, so loading a map silently unparked the
+        // hull — it would still DRAW, because the mesh slot lives on the gpu,
+        // and stop being solid. A hull you can see and walk through is worse
+        // than one that is not there, because it reads as collision being
+        // broken rather than as the ship being gone.
+        self.repark();
+
         self.fx = fx::Fx::new(seed);
         self.bots.clear();
         self.game_mode = 0;
@@ -2151,7 +2467,14 @@ impl Game {
     fn switch_car(&mut self, i: usize) {
         if i < self.cars.models.len() {
             self.cars.active = i;
-            apply_car_dims(&mut self.car, &self.cars.models[i], self.cfg.car.size);
+            // dimensions come from the pose, not from the model being drawn
+            let strip = self
+                .cars
+                .xform
+                .get(&i)
+                .map(|&(cid, _)| self.cars.chassis[cid].strip.clone());
+            let d = dims_model(i, strip.as_deref(), self.xf.is_robot());
+            apply_car_dims(&mut self.car, &self.cars.models[d], self.cfg.car.size);
             // Flight is a property of the CHASSIS, not of the pose, so it is
             // read from the registry rather than from the model. A jet stays
             // a jet through every frame of its fold.
@@ -2201,11 +2524,22 @@ impl Game {
     fn set_car_model(&mut self, m: usize) {
         self.switch_car(m);
         let d = self.world.sdf(self.car.pos);
-        if d < self.car.half_h {
-            // Seat on the LOWEST POINT, not the half-height -- Car::seat_h,
-            // the same helper physics.rs's ground-contact/suspension code
-            // now uses too, rather than each duplicating the fallback.
-            let drop = self.car.seat_h();
+        // THE GUARD HAS TO USE THE SAME NUMBER AS THE CORRECTION.
+        //
+        // This read `d < self.car.half_h` while correcting by `drop`, so a
+        // body sunk by anything between the two — which for a standing robot
+        // is a wide band, `half_h` 0.9 against a `ride_h` of 1.5 — was seen
+        // as not sunk at all and never lifted. That is a PARTIAL burial that
+        // corrects itself the moment the body is deep enough to trip the
+        // smaller threshold, which is why it reads as the bot sinking rather
+        // than as it spawning wrong.
+        let drop = self.car.stand_h();
+        if d < drop {
+            // Seat on the LOWEST POINT, not the half-height. They differ the
+            // moment the body stops being centred on its bounding box, which is
+            // exactly what standing up does — feet hang below centre while the
+            // mass sits high. Falls back to half_h when ride_h is unset so a
+            // model that never folds is unaffected.
             self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
     }
@@ -2318,8 +2652,26 @@ impl Game {
 
     /// Step the running fold    /// Step the running fold, swapping the body when the strip index changes.
     fn advance_xform(&mut self, dt: f32) {
+        // THE FOLD MUST RENDER ITS LAST FRAME.
+        //
+        // `Xform::update` flips `state` to Idle on the SAME call that `t`
+        // reaches 1.0 or 0.0, so gating on `state == Transforming` after
+        // calling it means the endpoint pose is never written: the final
+        // mesh write is the previous frame's, short of the target by
+        // however much of the blend one frame covers.
+        //
+        // That is both reported bugs at once. Folding to vehicle leaves
+        // limbs a few percent out of their sockets — parts visibly outside
+        // the car — and folding to robot leaves `half_h`/`ride_h` at the
+        // second-to-last frame's values, so the body is seated against a
+        // hitbox that never finished growing.
+        //
+        // Run the body once more on the frame the fold ends. `t` is already
+        // clamped to the endpoint by then, so this is the exact final pose
+        // and not an extrapolation.
+        let was_folding = self.xf.state == xform::State::Transforming;
         self.xf.update(dt);
-        if self.xf.state != xform::State::Transforming {
+        if self.xf.state != xform::State::Transforming && !was_folding {
             return;
         }
         let t = self.xf.eased();
@@ -2397,11 +2749,22 @@ impl Game {
         }
         // lift clear as the body grows, or a standing robot ends up buried
         let d = self.world.sdf(self.car.pos);
-        if d < self.car.half_h {
-            // Seat on the LOWEST POINT, not the half-height -- Car::seat_h,
-            // the same helper physics.rs's ground-contact/suspension code
-            // now uses too, rather than each duplicating the fallback.
-            let drop = self.car.seat_h();
+        // THE GUARD HAS TO USE THE SAME NUMBER AS THE CORRECTION.
+        //
+        // This read `d < self.car.half_h` while correcting by `drop`, so a
+        // body sunk by anything between the two — which for a standing robot
+        // is a wide band, `half_h` 0.9 against a `ride_h` of 1.5 — was seen
+        // as not sunk at all and never lifted. That is a PARTIAL burial that
+        // corrects itself the moment the body is deep enough to trip the
+        // smaller threshold, which is why it reads as the bot sinking rather
+        // than as it spawning wrong.
+        let drop = self.car.stand_h();
+        if d < drop {
+            // Seat on the LOWEST POINT, not the half-height. They differ the
+            // moment the body stops being centred on its bounding box, which is
+            // exactly what standing up does — feet hang below centre while the
+            // mass sits high. Falls back to half_h when ride_h is unset so a
+            // model that never folds is unaffected.
             self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
         if self.xf.state == xform::State::Idle {
@@ -3504,15 +3867,27 @@ impl Game {
         // to the console. Everything else is swallowed: a player at a
         // console is AT the console.
         if self.mode == Mode::Play {
+            // Computed BEFORE the deck is borrowed, for the same reason the
+            // Enter arm resolves its order outside the borrow: acting on the
+            // deck needs the shell, and the shell is what is borrowed.
+            let reachable = self.consoles_reachable_now();
             if let Some(d) = self.deck.as_mut() {
                 match &key {
                     Key::Named(NamedKey::Escape) => {
                         d.input(menu::Input::Back);
                     }
                     Key::Named(NamedKey::Tab) => {
-                        let all = stations::STATIONS;
-                        let at = all.iter().position(|s| *s == d.station).unwrap_or(0);
-                        d.walk_to(all[(at + 1) % all.len()]);
+                        // WALK TO THE NEXT REACHABLE CONSOLE, not the next in
+                        // the array. Tab used to cycle all seven regardless of
+                        // sealed doors, which made `depower` cosmetic: the
+                        // whole point of a door that shuts is that it stops
+                        // you, and a menu that ignores it is a menu.
+                        let all = &reachable;
+                        if !all.is_empty() {
+                            let at =
+                                all.iter().position(|s| *s == d.station).unwrap_or(0);
+                            d.walk_to(all[(at + 1) % all.len()]);
+                        }
                     }
                     Key::Named(NamedKey::ArrowUp) => {
                         d.input(menu::Input::Move(-1));
@@ -3521,8 +3896,32 @@ impl Game {
                         d.input(menu::Input::Move(1));
                     }
                     Key::Named(NamedKey::Enter) => {
+                        // resolve the order OUTSIDE the deck's borrow: acting
+                        // on it needs the shell, and rebuilding the console
+                        // needs to replace the very thing being borrowed
                         if let Some(order) = d.input(menu::Input::Activate) {
-                            self.toastf(&format!("{order:?} — fly it from the terminal sims for now"));
+                            // DEPART IS THE SHELL'S: it loads a map, which
+                            // needs the gpu and a fresh World. Intercepted
+                            // before `run_order`, whose `order_target` would
+                            // return None and silently do nothing.
+                            if let stations::Order::Depart { dest, line } = &order {
+                                let (dest, line) = (*dest, line.clone());
+                                self.depart_to(dest, &line);
+                                return;
+                            }
+                            let st = d.station;
+                            let (line, changed) = stations::run_order(&order);
+                            if changed {
+                                // the save moved under the console, so the
+                                // console has to be rebuilt from it — a Deck
+                                // loads its Shipboard once, at open.
+                                if let Ok(nd) =
+                                    deck::Deck::open(st, ship::Phase::Cruise, nightfall::week_now())
+                                {
+                                    self.deck = Some(nd);
+                                }
+                            }
+                            self.toastf(&line);
                         }
                     }
                     _ => {}
@@ -3530,10 +3929,24 @@ impl Game {
                 return;
             }
             if ch.eq_ignore_ascii_case("v") {
-                // walk below: the armory is the first console aft
-                match deck::Deck::open(stations::Station::Armory, ship::Phase::Cruise, nightfall::week_now()) {
-                    Ok(d) => self.deck = Some(d),
-                    Err(e) => self.toastf(e),
+                // WHICHEVER CONSOLE YOU ARE STANDING IN. This opened the
+                // Armory unconditionally, because there was no way to ask
+                // where the player was — `Station::cell()` named a room and
+                // nothing could tell you which room you were in.
+                //
+                // Now the ship is parked and solid, so the car's position is
+                // a room, and a room is a console. Outside the ship there is
+                // no console to open, and saying so is better than opening an
+                // arbitrary one: a hub you can reach from anywhere is a menu.
+                let here = self.console_underfoot();
+                match here {
+                    Some(st) => {
+                        match deck::Deck::open(st, ship::Phase::Cruise, nightfall::week_now()) {
+                            Ok(d) => self.deck = Some(d),
+                            Err(e) => self.toastf(e),
+                        }
+                    }
+                    None => self.toastf("no console here — find a room aboard"),
                 }
                 return;
             }
@@ -5156,6 +5569,7 @@ impl Game {
             }
         }
         self.tick_lesson(dt);
+        self.tick_aboard();
         self.tick_trial(dt);
         if ball_air && self.air_link > 0.0 {
             self.air_t += dt;
@@ -5571,6 +5985,165 @@ impl Game {
         (v, RtIds { ball: ball_id, car: car_id, decor0, remote0, static_n })
     }
 
+    /// The console in the room the player is standing in, if any.
+    ///
+    /// The join `aboard.rs` was built for: the world knows where the ship is
+    /// parked, `interior::room_at` turns a position into a room, and
+    /// `Station::cell()` has named each console's room since the stations
+    /// landed.
+    /// Consoles the player could walk to from where they are, through doors
+    /// that open.
+    ///
+    /// Falls back to every station when the player is not aboard — being
+    /// outside the ship should not silently empty the console list, and the
+    /// deck is reachable from the surface today.
+    fn consoles_reachable_now(&self) -> Vec<stations::Station> {
+        let Some((origin, ship)) = self.world.parked.as_ref() else {
+            return stations::STATIONS.to_vec();
+        };
+        let Some(room) = ship.room_at(self.car.pos - *origin) else {
+            return stations::STATIONS.to_vec();
+        };
+        let open = ship.reachable_from(room.id);
+        let v: Vec<stations::Station> =
+            stations::STATIONS.into_iter().filter(|s| open.contains(&s.cell())).collect();
+        if v.is_empty() {
+            stations::STATIONS.to_vec()
+        } else {
+            v
+        }
+    }
+
+    /// Notice when the player walks into or out of a room.
+    ///
+    /// An EVENT, not a state: the room is a fact every frame, and a HUD line
+    /// that reprints it sixty times a second is noise. Only the transition is
+    /// worth saying, and the useful thing to say is what you can do here.
+    /// Put the ship back in the world, wherever the world came from.
+    ///
+    /// The single place that parks. `World::generate` returns
+    /// `parked: None`, so every path that builds a world has to call this or
+    /// the hull keeps drawing and stops being solid.
+    /// Fly the ship somewhere and load what is there.
+    ///
+    /// The starmap could plot a course and the world never changed, so
+    /// "arriving" was a line of text. This is the rest of it: pick the style
+    /// that matches the destination's physics, load it, and close the console
+    /// — you are not at the chartroom any more, you are on Mars.
+    fn depart_to(&mut self, dest: &'static str, line: &str) {
+        let Some(d) = patrol::ROUTE.iter().find(|x| x.id == dest) else {
+            self.toastf("no such destination");
+            return;
+        };
+        let style = mapsim::style_for(d);
+        // a fresh seed per arrival, derived from the destination so the same
+        // world is the same place twice
+        let seed = d.id.bytes().fold(0x9E37u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+        self.load_map(style, seed);
+        // the console belongs to the ship you just left
+        self.deck = None;
+        self.toastf(line);
+    }
+
+    fn repark(&mut self) {
+        let at = Vec3::new(0.0, aboard::ground_lift(&self.aboard.ship), 0.0);
+        self.world.park(at, self.aboard.ship.clone());
+        self.last_room = None;
+        self.cam.indoors = None;
+    }
+
+    fn tick_aboard(&mut self) {
+        // THE DOORS HAVE NEVER MOVED. `step_doors` exists, `Door::update`
+        // animates travel, `passable()` reads it — and nothing ticked the
+        // clock, so every door in the game has been frozen at whatever state
+        // it was generated in. The ship being scenery is why nobody noticed.
+        let dt = 1.0 / 60.0;
+        let at = self.car.pos;
+        let mut doors_now = 0u32;
+        if let Some((origin, ship)) = self.world.parked.as_mut() {
+            // doors notice you before they move, so the sense comes first
+            ship.sense_doors(at - *origin);
+            ship.step_doors(dt);
+            for (i, l) in ship.links.iter().enumerate().take(32) {
+                // `passable()`, matching what `hull_mesh` now draws on. This
+                // read `void()` — so the mask flipped at travel 0.01 while
+                // the mesh changes at 0.75, and the hull was re-uploaded on
+                // frames where nothing about it had changed. Harmless and
+                // wasteful, and it is the same two-answers-to-one-question
+                // mistake `--parity` exists to find. The scan caught this one
+                // in my own code, written an hour after I wrote the scan.
+                if l.door.passable() {
+                    doors_now |= 1 << i;
+                }
+            }
+        }
+        // RE-UPLOAD WHEN THE DOORWAYS CHANGE, and only then. `hull_mesh`
+        // omits shut corridors, so a door opening changes the geometry — and
+        // a mesh uploaded once at launch would show walls where the collision
+        // has a corridor. A bitmask of which doorways are carved is the
+        // cheapest thing that notices.
+        if doors_now != self.door_mask {
+            self.door_mask = doors_now;
+            if let (Some(slot), Some((_, ship))) =
+                (self.aboard.hull_slot, self.world.parked.as_ref())
+            {
+                let m = aboard::hull_mesh(ship);
+                self.gpu.replace_mesh(slot, &m);
+            }
+        }
+
+        // and the camera: pull the boom in while the player is inside, or it
+        // sits outside the hull looking at the back of a wall
+        let inside = self
+            .world
+            .parked
+            .as_ref()
+            .map(|(o, ship)| (*o, ship.room_at(self.car.pos - *o).is_some()))
+            .unwrap_or((Vec3::ZERO, false));
+        if inside.1 {
+            if self.cam.indoors.is_none() {
+                if let Some((origin, ship)) = self.world.parked.as_ref() {
+                    let o = *origin;
+                    let probe = ship.clone();
+                    self.cam.indoors =
+                        Some(Box::new(move |p: Vec3| probe.walkable(p - o)));
+                }
+            }
+        } else if self.cam.indoors.is_some() {
+            self.cam.indoors = None;
+        }
+
+        let now = self
+            .world
+            .parked
+            .as_ref()
+            .and_then(|(o, ship)| ship.room_at(self.car.pos - *o))
+            .map(|c| c.id);
+        if now == self.last_room {
+            return;
+        }
+        self.last_room = now;
+        let Some(id) = now else { return };
+        let name = self
+            .world
+            .parked
+            .as_ref()
+            .and_then(|(_, s)| s.cell(id))
+            .map(|c| c.name)
+            .unwrap_or(id);
+        match stations::STATIONS.into_iter().find(|s| s.cell() == id) {
+            Some(st) => self.toastf(&format!("{} — press V for {}", name, st.title())),
+            None => self.toastf(name),
+        }
+    }
+
+    fn console_underfoot(&self) -> Option<stations::Station> {
+        let (origin, ship) = self.world.parked.as_ref()?;
+        let local = self.car.pos - *origin;
+        let room = ship.room_at(local)?;
+        stations::STATIONS.into_iter().find(|s| s.cell() == room.id)
+    }
+
     fn build_scene(&self, ids: &RtIds, rc: (Vec3, Quat), rb: (Vec3, Quat), planes: &[[f32; 4]; 6]) -> Vec<ObjDraw> {
         let mut objs: Vec<ObjDraw> = Vec::with_capacity(self.world.shapes.len() + 1024);
 
@@ -5603,6 +6176,32 @@ impl Game {
                 Mat4::IDENTITY,
                 self.style().grass,
                 [1.0, 0.0, 0.04, 0.0],
+            );
+        }
+
+        // THE SHIP. Parked at the origin, lifted clear of the deck so it sits
+        // on the ground rather than half-buried. One draw, ~1000 triangles.
+        //
+        // Same shape as the terrain chunks above: a mesh slot, an identity-ish
+        // transform, a colour. Placed here rather than behind a mode because
+        // the fastest way to find out whether it looks right is to be able to
+        // drive up to it.
+        // THE PARKED SHIP IS THE ONE THAT MOVES. `aboard.ship` is the
+        // template it was cloned from and its doors never animate, so drawing
+        // from it would show a hull that disagrees with the one you collide
+        // with — the exact "see it here, hit it there" failure the lift
+        // shares a function to avoid.
+        if let (Some(slot), Some((origin, _))) =
+            (self.aboard.hull_slot, self.world.parked.as_ref())
+        {
+            let lift = Mat4::from_translation(*origin);
+            push(
+                &mut objs,
+                slot,
+                None,
+                lift,
+                [0.62, 0.66, 0.72, 1.0],
+                [0.35, 0.0, 0.25, 0.0],
             );
         }
 
@@ -6178,6 +6777,120 @@ impl Game {
                     * Mat4::from_scale(Vec3::new(side * wheel_r * 1.02, wheel_r * 1.02, wheel_r * 1.02));
                 push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dims_tests {
+    use super::dims_model;
+
+    const STRIP: [usize; 5] = [10, 11, 12, 13, 14]; // f00 vehicle .. f04 robot
+
+    #[test]
+    fn a_folded_body_is_measured_by_the_pose_it_is_in() {
+        // A smooth fold pins the displayed model to the strip's BASE and
+        // rewrites its meshes, so anything re-deriving dimensions read a
+        // car's numbers for a robot's body — `ride_h` 0.239 against feet at
+        // 0.400 on `analog`, sixteen centimetres of sink.
+        assert_eq!(dims_model(10, Some(&STRIP), true), 14, "robot should measure as f04");
+        assert_eq!(dims_model(10, Some(&STRIP), false), 10, "vehicle measures as itself");
+    }
+
+    #[test]
+    fn nothing_else_is_remapped() {
+        assert_eq!(dims_model(12, Some(&STRIP), true), 12, "a mid-strip pose is itself");
+        assert_eq!(dims_model(14, Some(&STRIP), true), 14, "the end pose is itself");
+        // a chassis with no fold is never touched, in either mode
+        assert_eq!(dims_model(7, None, true), 7);
+        assert_eq!(dims_model(7, None, false), 7);
+        // and an empty strip cannot panic on `last()`
+        assert_eq!(dims_model(0, Some(&[]), true), 0);
+    }
+}
+
+#[cfg(test)]
+mod tweak_reach_tests {
+    use super::*;
+
+    /// Every menu the settings tree can reach from the root, followed.
+    fn reachable_menus() -> Vec<u8> {
+        let mut seen = vec![0u8];
+        let mut i = 0;
+        while i < seen.len() {
+            let m = seen[i];
+            for (_, row) in tweak_rows(m) {
+                if let Row::Link(t) = row {
+                    if !seen.contains(&t) {
+                        seen.push(t);
+                    }
+                }
+            }
+            i += 1;
+        }
+        seen
+    }
+
+    /// THE GAP THIS CLOSES. `--tune` listed `story_anchor` as a knob and its
+    /// own documentation called it "a main-menu dial", and it was in no menu
+    /// at all — reachable only by hand-editing a save. Describing something
+    /// as a setting does not put it in the settings.
+    ///
+    /// So: every knob the tuning ledger presents as a `cfg` setting must be
+    /// movable from the menu tree. The ledger and the UI are two tables about
+    /// the same thing, and nothing joined them.
+    #[test]
+    fn every_tuning_knob_is_reachable_in_a_menu() {
+        let base = Config::default();
+        for knob in tuning::KNOBS {
+            // does any row in any reachable menu move this knob's value?
+            let moves_it = reachable_menus().into_iter().any(|m| {
+                tweak_rows(m).into_iter().any(|(_, row)| match row {
+                    Row::Slider { get, set, min, max, .. } => {
+                        let mut c = Config::default();
+                        // drive the slider to both ends and see if the knob follows
+                        for v in [min, max] {
+                            set(&mut c, v);
+                            if ((knob.read)(&c) - (knob.read)(&base)).abs() > 1e-6 {
+                                return true;
+                            }
+                        }
+                        let _ = get;
+                        false
+                    }
+                    Row::Toggle { set, .. } => {
+                        let mut c = Config::default();
+                        for v in [true, false] {
+                            set(&mut c, v);
+                            if ((knob.read)(&c) - (knob.read)(&base)).abs() > 1e-6 {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                })
+            });
+            assert!(
+                moves_it,
+                "'{}' is in the tuning ledger and no menu row can move it — \
+                 it is a setting only in the sense that the save file has a line for it",
+                knob.id
+            );
+        }
+    }
+
+    #[test]
+    fn no_settings_menu_is_orphaned() {
+        // a menu nothing links to is a page nobody can open; the STORY menu
+        // was one keystroke from being exactly that
+        let reach = reachable_menus();
+        for m in 1u8..=8 {
+            assert!(
+                reach.contains(&m),
+                "settings menu {m} ({}) cannot be reached from the root",
+                menu_title(m)
+            );
         }
     }
 }

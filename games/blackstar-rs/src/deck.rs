@@ -38,13 +38,27 @@ pub struct Deck {
     walking_to: Option<Station>,
 }
 
+/// Size a console's scroll window to the panel that draws it.
+///
+/// `Menu::new` defaults `view` to 12 and nothing reconciled that with the
+/// console's own geometry, which holds twenty rows (`hud::deck_rows`). So
+/// every station scrolled eight rows early, and the wardeck's twenty rows
+/// scrolled when they would have fitted exactly.
+///
+/// It is normalised UI space, so this is a geometry question rather than a
+/// screen question — the same number on every display.
+pub fn fitted(mut m: crate::menu::Menu) -> crate::menu::Menu {
+    m.view = crate::hud::deck_rows();
+    m
+}
+
 impl Deck {
     /// Stand at a console. Refuses like the ship does if the phase says
     /// the walk is impossible.
     pub fn open(station: Station, phase: Phase, week: u64) -> Result<Deck, &'static str> {
         station.available(phase)?;
         let sb = Shipboard::load();
-        let menu = build(station, &sb, week);
+        let menu = fitted(build(station, &sb, week));
         let rows = menu.rows.len();
         let sel = menu.sel();
         let mut host = Host::new();
@@ -87,6 +101,10 @@ impl Deck {
                 self.feedback = Some(format!("REFUSED: {msg}"));
                 None
             }
+            // Depart goes UP to the shell: loading a map needs the gpu and a
+            // fresh World, neither of which a console has. Same reason
+            // `Sortie` passes through.
+            Some(Order::Depart { .. }) => order,
             Some(Order::Goto(st)) => {
                 self.walk_to(*st);
                 None
@@ -111,7 +129,7 @@ impl Deck {
     /// furniture did not.
     fn rebuild_in_place(&mut self) {
         let held = self.host.top().and_then(|m| m.selected()).map(|r| r.id);
-        let menu = build(self.station, &self.sb, self.week);
+        let menu = fitted(build(self.station, &self.sb, self.week));
         let rows = menu.rows.len();
         let sel = held
             .and_then(|id| menu.rows.iter().position(|r| r.id == id && !id.is_empty()))
@@ -137,7 +155,7 @@ impl Deck {
                     if let Some(st) = self.walking_to.take() {
                         self.station = st;
                         self.feedback = None;
-                        let menu = build(st, &self.sb, self.week);
+                        let menu = fitted(build(st, &self.sb, self.week));
                         let rows = menu.rows.len();
                         let sel = menu.sel();
                         let mut host = Host::new();
@@ -257,5 +275,51 @@ mod tests {
         assert!(Deck::open(Station::Armory, Phase::Folding, 0).is_err());
         assert!(Deck::open(Station::Bridge, Phase::Docked, 0).is_err());
         assert!(Deck::open(Station::Bridge, Phase::Plotting, 0).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn the_scroll_window_matches_the_panel_that_draws_it() {
+        // `Menu::new` defaults to 12 and the console holds twenty. Nothing
+        // reconciled them, so every station scrolled eight rows early.
+        let panel = crate::hud::deck_rows();
+        assert!(panel > 12, "the panel holds {panel}; the old default was 12");
+        let m = fitted(crate::menu::Menu::new("t", vec![]));
+        assert_eq!(m.view, panel);
+    }
+
+    #[test]
+    fn the_wardeck_stops_scrolling_when_it_no_longer_needs_to() {
+        // twenty wardens plus a heading is the longest station that could
+        // plausibly fit; the medbay is longer and still scrolls, correctly
+        let sb = Shipboard::load();
+        let panel = crate::hud::deck_rows();
+        for st in [Station::Wardeck, Station::Medbay] {
+            let m = fitted(build(st, &sb, 3));
+            let needs_scroll = m.rows.len() > m.view;
+            assert_eq!(
+                needs_scroll,
+                m.rows.len() > panel,
+                "{} scrolls on the wrong side of the panel's {panel} rows ({} rows)",
+                st.id(),
+                m.rows.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_geometry_is_resolution_independent() {
+        // normalised UI space: the row count is a property of the layout, not
+        // of the display, which is why this is answerable without one
+        assert_eq!(
+            crate::hud::deck_rows(),
+            crate::hud::vis_rows(crate::hud::DECK_ROW_H, crate::hud::DECK_TOP, crate::hud::TW_BOTTOM)
+        );
+        // and the floor in vis_rows keeps a pathological layout usable
+        assert!(crate::hud::vis_rows(9.0, 0.1, -0.1) >= 3);
     }
 }

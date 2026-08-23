@@ -109,6 +109,13 @@ pub struct Link {
     pub door: Door,
 }
 
+/// Cloneable so the camera can hold a probe.
+///
+/// `camera.rs` takes a closure asking "is this point open volume", and a
+/// closure cannot borrow the world it is stored next to. Cloning is cheap
+/// here — eight cells and nine links — and far cheaper than teaching the
+/// camera about ships or wrapping the world in a refcount.
+#[derive(Clone)]
 pub struct Interior {
     pub cells: Vec<Cell>,
     pub links: Vec<Link>,
@@ -310,6 +317,28 @@ impl Interior {
         self.lock.outer.depower();
     }
 
+    /// Open the doors somebody is walking at, and shut the rest.
+    ///
+    /// The ship has only ever been all-open (`unseal`) or all-shut
+    /// (`depower`), so a doorway has never been a MOMENT — you either had a
+    /// corridor or a wall, and never a door that noticed you. This is the
+    /// difference between a floor plan and a place.
+    ///
+    /// Radius is in hull terms rather than metres, so it survives the ship
+    /// being sized for a different occupant — the same reason
+    /// `aboard::HULL_HEIGHTS` exists.
+    pub fn sense_doors(&mut self, who: Vec3) {
+        let reach = self.hull_half.max_element() * 0.22;
+        for l in self.links.iter_mut() {
+            let near = who.distance(l.centre) < reach;
+            if near {
+                l.door.open();
+            } else {
+                l.door.close();
+            }
+        }
+    }
+
     pub fn step_doors(&mut self, dt: f32) {
         for l in self.links.iter_mut() {
             l.door.update(dt);
@@ -340,6 +369,37 @@ impl Interior {
             Vec3::new(0.0, 0.0, -DRIVE_HALF_W * 0.9),
         ];
         probes.iter().all(|o| self.walkable(p + *o))
+    }
+
+    /// Which room a point is in, if any.
+    ///
+    /// The lookup that was missing, and the reason `main.rs` referenced this
+    /// module zero times: a complete walkable ship with no way to ask "where
+    /// am I" cannot drive a console, so the eight rooms and their fixtures
+    /// stayed a diagram.
+    ///
+    /// Corridors deliberately return `None`. Standing in a doorway is between
+    /// rooms, not in both, and a console that opens while you are halfway
+    /// through a door is worse than one that waits.
+    pub fn room_at(&self, p: Vec3) -> Option<&Cell> {
+        self.cells.iter().find(|c| {
+            let d = (p - c.centre).abs();
+            d.x <= c.half.x && d.y <= c.half.y + 1.0 && d.z <= c.half.z
+        })
+    }
+
+    /// The nearest room's id, whether or not you are inside it. For a
+    /// waypoint marker rather than for opening anything.
+    pub fn nearest_room(&self, p: Vec3) -> Option<&Cell> {
+        self.cells.iter().min_by(|a, b| {
+            a.centre.distance(p).partial_cmp(&b.centre.distance(p)).unwrap()
+        })
+    }
+
+    /// Somewhere to stand in a room — its centre, on the deck.
+    pub fn stand_in(&self, id: &str) -> Option<Vec3> {
+        let c = self.cell(id)?;
+        Some(Vec3::new(c.centre.x, self.deck_y, c.centre.z))
     }
 
     pub fn cell(&self, id: &str) -> Option<&Cell> {
@@ -382,13 +442,31 @@ impl Interior {
 
     /// Walk the door graph from a room; used to prove the carve did not
     /// separate anything the plan says is connected.
+    /// Which rooms the PLAN connects, ignoring whether the doors are open.
+    /// The ship's topology, which does not change when the power does.
+    pub fn linked_from(&self, start: &str) -> Vec<&'static str> {
+        self.flood(start, |_| true)
+    }
+
+    /// Which rooms you can actually walk to right now.
+    ///
+    /// This used to be `linked_from` under this name: it walked every link in
+    /// the plan whether or not the door was passable, so a depowered ship —
+    /// hatches shut, which `depower` explicitly does — still reported the
+    /// whole interior as reachable. Anything asking "can the crew get there"
+    /// got the answer "yes, always", which is the one answer a failure mode
+    /// exists to contradict.
     pub fn reachable_from(&self, start: &str) -> Vec<&'static str> {
+        self.flood(start, |l: &Link| l.door.passable())
+    }
+
+    fn flood(&self, start: &str, open: impl Fn(&Link) -> bool) -> Vec<&'static str> {
         let Some(s) = self.cells.iter().position(|c| c.id == start) else { return Vec::new() };
         let mut seen = vec![s];
         let mut i = 0;
         while i < seen.len() {
             let cur = seen[i];
-            for l in &self.links {
+            for l in self.links.iter().filter(|l| open(l)) {
                 let other = if l.a == cur {
                     Some(l.b)
                 } else if l.b == cur {
@@ -413,6 +491,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn losing_power_actually_strands_you() {
+        // the behaviour the old reachability could not express: `depower`
+        // shuts the hatches, and a shut hatch is not a route. This returned
+        // "everything is reachable" on a dead ship before the door check.
+        let mut i = Interior::generate(110.0);
+        i.unseal();
+        let before = i.reachable_from("bridge").len();
+        assert_eq!(before, HUB.len());
+
+        i.depower();
+        i.step_doors(5.0);
+        let after = i.reachable_from("bridge").len();
+        assert!(after < before, "a depowered ship is still fully walkable ({after} rooms)");
+        // the topology is unchanged; it is the doors that moved
+        assert_eq!(i.linked_from("bridge").len(), HUB.len());
+    }
+
+    #[test]
     fn the_plan_survives_being_built() {
         let i = Interior::generate(110.0);
         assert_eq!(i.cells.len(), HUB.len());
@@ -420,7 +516,12 @@ mod tests {
         let doors: usize = HUB.iter().map(|r| r.exits.len()).sum();
         assert_eq!(i.links.len(), doors / 2, "doors and corridors disagree");
         // and nothing was separated by the carve
-        assert_eq!(i.reachable_from("bridge").len(), HUB.len());
+        // topology: the plan connects all eight rooms, doors or no doors
+        assert_eq!(i.linked_from("bridge").len(), HUB.len());
+        // and once the ship is at rest with its doors open, so does the walk
+        let mut open = Interior::generate(110.0);
+        open.unseal();
+        assert_eq!(open.reachable_from("bridge").len(), HUB.len());
     }
 
     #[test]

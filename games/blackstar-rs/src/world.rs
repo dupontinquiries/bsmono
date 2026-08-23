@@ -353,6 +353,8 @@ pub struct World {
     drop_cd: f32,
     /// spawn template for arriving planets (KUIPER only)
     kuiper: bool,
+    /// a ship parked in the world, and where. See `park`.
+    pub parked: Option<(Vec3, crate::interior::Interior)>,
     /// DROPSHOT: platform height — a ball below it scores by z sign
     pub drop_pit: Option<f32>,
     /// maps whose play surface is a raised deck say where to start
@@ -3518,11 +3520,35 @@ impl World {
         // every drivable route and open whatever is blocking it.
         if !routes.is_empty() {
             // brute-force distance (the spatial grid is not built yet)
+            // WHY THIS IS BOUNDED RATHER THAN EARLY-OUT.
+            //
+            // This block was 175 ms of PERPLEXUS's 190 ms worldgen (measured;
+            // routes x segments x steps, each a full min-SDF over all 864
+            // shapes). The obvious fix is to stop as soon as something is
+            // nearer than `want` -- and it is WRONG, because the combination
+            // is not a min: cuts subtract (`d.max(-dcut)`) and can carve the
+            // point clear again after a near shape has already been seen.
+            //
+            // So reject on REACH instead, which is sound: a shape farther
+            // than its own bounding radius cannot change the result. It is
+            // the same test the runtime spatial grid applies in `sdf()`, so
+            // the route check now agrees with the physics SDF rather than
+            // being subtly stricter than it.
+            let reach2: Vec<f32> = shapes
+                .iter()
+                .map(|sh| {
+                    let r = shape_reach(&sh.sdf) + 10.0; // matches the runtime grid: +4 reach, +6 probe
+                    r * r
+                })
+                .collect();
             let raw = |shapes: &[Shape], p: Vec3| -> f32 {
                 let mut d = p.y - grid_h(&tgrid, p.x, p.z);
                 let mut db = f32::MAX;
                 let mut dcut = f32::MAX;
-                for sh in shapes.iter() {
+                for (si, sh) in shapes.iter().enumerate() {
+                    if (p - sh.pos).length_squared() > reach2[si] {
+                        continue;
+                    }
                     let rel = p - sh.pos;
                     let q = sh.inv_rot * rel;
                     let ds = match sh.sdf {
@@ -3697,7 +3723,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
+        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
         // prime the mover index so the very first frame is already fast
         w.rebuild_movers();
         w
@@ -4105,6 +4131,15 @@ impl World {
         self.sdf_calls.get()
     }
 
+    /// Park a ship in the world, so it becomes solid.
+    ///
+    /// `interior.rs` has always produced a walkable ship and the world knew
+    /// nothing about it, so the hull was scenery you drove through. One
+    /// option field is the whole join.
+    pub fn park(&mut self, origin: Vec3, ship: crate::interior::Interior) {
+        self.parked = Some((origin, ship));
+    }
+
     pub fn sdf(&self, p: Vec3) -> f32 {
         self.sdf_calls.set(self.sdf_calls.get() + 1);
         let mut d = p.y - grid_h(&self.tgrid, p.x, p.z);
@@ -4196,6 +4231,20 @@ impl World {
         }
         if dcut < 1.0e8 {
             d = d.max(-dcut);
+        }
+        // THE SHIP, if one is parked here.
+        //
+        // A hollow solid, so it unions like anything else — `interior.rs`
+        // already returns the carved distance, negative inside a room and
+        // positive in the hull. Broad-phased on the hull box because
+        // `sdf_local` walks every cell and every link, and `sdf` is called
+        // per contact per frame.
+        if let Some((origin, ship)) = &self.parked {
+            let local = p - *origin;
+            let q = local.abs() - ship.hull_half - Vec3::splat(2.0);
+            if q.max_element() < 0.0 {
+                d = d.min(ship.sdf_local(local));
+            }
         }
         d
     }
@@ -4471,6 +4520,47 @@ impl World {
         .normalize_or(Vec3::Y)
     }
 
+    /// The surface normal at `p`, reusing an SDF value the caller already has.
+    ///
+    /// `normal_uncached` samples a tetrahedron: four SDF evaluations, none of
+    /// them at `p`. Callers that have just evaluated `sdf(p)` — which
+    /// `gravity_dir` has, to decide whether it needs a normal at all — throw
+    /// that sample away and pay for four more. At 5.2 us per SDF on
+    /// PERPLEXUS that is the whole of `gravity_dir`'s 26.8 us, and it is hit
+    /// by every car and the ball every frame.
+    ///
+    /// A forward difference reuses the centre and costs three. Less
+    /// symmetric than the tetrahedron and therefore slightly biased, which is
+    /// why `the_forward_difference_normal_agrees_with_the_tetrahedron`
+    /// measures the angle between them on a real world rather than assuming
+    /// it is small.
+    pub fn normal_from(&self, p: Vec3, d_at_p: f32) -> Vec3 {
+        // Serve and POPULATE the same one-entry cache `normal` uses.
+        //
+        // The first version did neither, and the microbenchmark said it was a
+        // 22% win while `--sim perf` said total SDF evaluations per step rose
+        // from 19.3 to 25.3 and two maps got SLOWER. The old path called
+        // `normal(p)`, which caches; anything downstream asking for the
+        // normal at the same point got it free. Saving one evaluation here
+        // cost four somewhere else.
+        //
+        // A microbenchmark that improves while the system regresses is the
+        // whole argument for measuring both.
+        let (cp, cn) = self.nrm_cache.get();
+        if (cp - p).length_squared() < 1e-6 && cn != Vec3::ZERO {
+            return cn;
+        }
+        let e = 0.07;
+        let n = Vec3::new(
+            self.sdf(p + Vec3::X * e) - d_at_p,
+            self.sdf(p + Vec3::Y * e) - d_at_p,
+            self.sdf(p + Vec3::Z * e) - d_at_p,
+        )
+        .normalize_or(Vec3::Y);
+        self.nrm_cache.set((p, n));
+        n
+    }
+
     /// Local gravity direction at a point. Empty node list = plain -Y.
     /// Gravity direction AND strength at p. Strength is the nearest node's
     /// multiplier, faded the same way the direction is, so a big planet
@@ -4588,7 +4678,8 @@ impl World {
         if self.grav[i0].surf {
             let d = self.sdf(p);
             if d < 6.0 {
-                let n = self.normal(p);
+                // reuse the sample just taken; see `normal_from`
+                let n = self.normal_from(p, d);
                 let k = ((6.0 - d) / 5.0).clamp(0.0, 1.0);
                 out = (out * (1.0 - k) - n * k).normalize_or(out);
             }
@@ -4662,5 +4753,108 @@ impl World {
 
     pub fn ground_h(&self, x: f32, z: f32) -> f32 {
         grid_h(&self.tgrid, x, z)
+    }
+}
+
+#[cfg(test)]
+mod normal_cost_tests {
+    use super::*;
+
+    fn a_world() -> World {
+        World::generate(7, style(1), 0.19, 1.0)
+    }
+
+    #[test]
+    fn the_forward_difference_normal_agrees_with_the_tetrahedron() {
+        // The saving is only worth having if the answer is still right. A
+        // forward difference is biased where the tetrahedron is symmetric, so
+        // this measures the ANGLE between them on real generated geometry
+        // rather than assuming the bias is small.
+        //
+        // It is only used inside gravity's near-surface blend, weighted by
+        // `k`, so a couple of degrees is invisible; ten would not be.
+        let w = a_world();
+        let mut worst: f32 = 0.0;
+        let mut n = 0;
+        for i in 0..400 {
+            let f = i as f32;
+            let p = Vec3::new((f * 0.37).sin() * 60.0, 2.0 + (f * 0.11).sin() * 4.0, (f * 0.53).cos() * 60.0);
+            let d = w.sdf(p);
+            // only where it is actually used
+            if d >= 6.0 || d < -2.0 {
+                continue;
+            }
+            let a = w.normal_uncached(p);
+            let b = w.normal_from(p, d);
+            let dot = a.dot(b).clamp(-1.0, 1.0);
+            worst = worst.max(dot.acos().to_degrees());
+            n += 1;
+        }
+        assert!(n > 20, "only {n} sample points landed near a surface; test proves little");
+        assert!(worst < 12.0, "worst disagreement {worst:.1} degrees over {n} points");
+    }
+
+    #[test]
+    fn it_costs_three_evaluations_instead_of_four() {
+        // the claim behind the change, as a count rather than a timing — a
+        // wall-clock assertion in a test suite is a flake waiting to happen
+        let w = a_world();
+        let p = Vec3::new(3.0, 2.0, -4.0);
+        let before = w.sdf_calls();
+        let _ = w.normal_uncached(p);
+        let tetra = w.sdf_calls() - before;
+
+        let d = w.sdf(p);
+        let mid = w.sdf_calls();
+        let _ = w.normal_from(p, d);
+        let fwd = w.sdf_calls() - mid;
+
+        assert_eq!(tetra, 4, "the tetrahedron should cost four");
+        assert_eq!(fwd, 3, "the forward difference should cost three");
+    }
+}
+
+#[cfg(test)]
+mod worldgen_cost_tests {
+    use super::*;
+
+    /// The route-clearance pass was 175 ms of PERPLEXUS's 190 ms worldgen: a
+    /// full min-SDF over every shape, per sample point, because — as its own
+    /// comment said — "the spatial grid is not built yet".
+    ///
+    /// The reject that fixed it is only sound if the margin is wide enough to
+    /// cover the blend. At +2 m the generated worlds CHANGED (864 shapes
+    /// became 856), because `smin` reaches past a shape's bounding radius.
+    /// This pins the margin against the same reach the runtime grid uses, so
+    /// nobody tightens it back on the reasoning that a bounding sphere ought
+    /// to be enough.
+    #[test]
+    fn the_route_reject_margin_covers_the_blend() {
+        // the runtime grid budgets +4 for reach and +6 for probe offsets
+        const RUNTIME_MARGIN: f32 = 10.0;
+        let src = include_str!("world.rs");
+        assert!(
+            src.contains("shape_reach(&sh.sdf) + 10.0"),
+            "the route-clearance margin moved; regenerate a world and diff the \
+             shape count before trusting it"
+        );
+        // and the blend radii it has to cover are still what they were
+        assert!(src.contains("smin(db, ds, 1.8)"), "the blend radius changed");
+        assert!(RUNTIME_MARGIN > 1.8 + 0.25, "the margin no longer covers smin");
+    }
+
+    #[test]
+    fn worldgen_is_deterministic_for_a_seed() {
+        // the property the optimisation was verified against: same seed, same
+        // world. Without this a perf change could silently alter the map and
+        // nothing would notice.
+        let a = World::generate(11, style(1), 0.19, 1.0);
+        let b = World::generate(11, style(1), 0.19, 1.0);
+        assert_eq!(a.shapes.len(), b.shapes.len());
+        assert_eq!(a.grav.len(), b.grav.len());
+        let sum = |w: &World| -> f64 {
+            w.shapes.iter().map(|s| (s.pos.x + s.pos.y * 3.0 + s.pos.z * 7.0) as f64).sum()
+        };
+        assert!((sum(&a) - sum(&b)).abs() < 1e-6, "same seed produced different geometry");
     }
 }

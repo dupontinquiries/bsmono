@@ -226,6 +226,11 @@ pub struct Gust {
 }
 
 /// Two doors and the volume between them.
+///
+/// `Clone` because `interior::Interior` is cloneable — the camera holds a
+/// probe closure and a closure cannot borrow the world it lives beside. Every
+/// field here is plain `Copy` data, so the derive costs nothing.
+#[derive(Clone)]
 pub struct Airlock {
     pub inner: Door,
     pub outer: Door,

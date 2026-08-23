@@ -218,6 +218,17 @@ impl MissionRun {
     }
 
     /// Nightfall dress: an element burn and, some weeks, no field repair.
+    /// Arrive weakened. `loss` is 0..1 off the engagement's power.
+    ///
+    /// A method rather than a public field, because `power` is resolved once
+    /// against the mission's recommended energon and the invariant is that
+    /// nothing moves it afterwards except a NAMED cost — a landing, a burn.
+    /// Opening the field would make that invariant a convention.
+    pub fn arrived_badly(mut self, loss: f32) -> MissionRun {
+        self.power *= (1.0 - loss).clamp(0.05, 1.0);
+        self
+    }
+
     pub fn with_modifiers(mut self, burn: Option<Element>, exposure: bool) -> MissionRun {
         self.burn = burn;
         self.exposure = exposure;
@@ -707,5 +718,87 @@ mod tests {
         let mut gap = CampaignLog::default();
         gap.record(MISSIONS[2].id);
         assert_eq!(gap.next().unwrap().id, MISSIONS[0].id);
+    }
+}
+
+#[cfg(test)]
+mod contract_shape_tests {
+    use super::*;
+
+    /// Step a mission to its outcome and report what the shell would see.
+    fn drive(m: &'static Mission) -> (usize, usize, Option<bool>) {
+        let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
+        let mut run = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40);
+        let dt = 1.0 / 120.0;
+        let (mut worst, mut total) = (0usize, 0usize);
+        for _ in 0..120_000 {
+            let evs = run.step(dt);
+            worst = worst.max(evs.len());
+            total += evs.len();
+            if evs.iter().any(|e| matches!(e, CampEvent::Won | CampEvent::Lost)) {
+                break;
+            }
+        }
+        (worst, total, run.outcome())
+    }
+
+    /// The campaign's half of the same question `raidrun` answers: what does
+    /// the shell have to absorb per tick, and does every mission terminate?
+    ///
+    /// `MissionRun` has had `step` since it landed and everything called
+    /// `resolve`, which loops it at 0.1 s and throws the events away. So the
+    /// per-tick stream — the thing a renderer consumes — had never been
+    /// looked at, only summed.
+    #[test]
+    fn every_mission_terminates_and_no_tick_floods_the_shell() {
+        let mut worst_overall = 0;
+        for m in MISSIONS {
+            let (worst, total, outcome) = drive(m);
+            assert!(outcome.is_some(), "{} never reached an outcome in 1000 s", m.id);
+            assert!(total > 0, "{} produced no events", m.id);
+            worst_overall = worst_overall.max(worst);
+        }
+        // the real figure, found by tightening until it failed, so a
+        // regression reads as a changed number rather than as spare headroom
+        assert!(
+            worst_overall <= 4,
+            "worst campaign tick is now {worst_overall}; it was 3 (raids peak at 4)"
+        );
+        assert!(worst_overall > 1, "the drive is too tame to prove anything");
+    }
+
+    /// A renderer draws a wave; it needs the wave stream to be sane.
+    #[test]
+    fn waves_start_before_they_clear_and_never_skip() {
+        for m in MISSIONS {
+            let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
+            let mut run = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40);
+            let (mut started, mut cleared) = (Vec::new(), Vec::new());
+            for _ in 0..120_000 {
+                let evs = run.step(1.0 / 120.0);
+                for e in &evs {
+                    match e {
+                        CampEvent::WaveStart { wave, .. } => started.push(*wave),
+                        CampEvent::WaveCleared { wave } => cleared.push(*wave),
+                        _ => {}
+                    }
+                }
+                if run.outcome().is_some() {
+                    break;
+                }
+            }
+            // ONE-BASED, deliberately: both emit sites push `wave_i + 1` so
+            // the event reads "wave 1 of 3" to a player rather than "wave 0".
+            // I assumed zero-based and the test failed — my assumption, not
+            // the sim's bug, and the convention is worth asserting rather
+            // than silently shifting an index past.
+            for (i, w) in started.iter().enumerate() {
+                assert_eq!(*w, i + 1, "{} started wave {w} at position {i}", m.id);
+            }
+            assert_eq!(started.first(), Some(&1), "{} does not number waves from one", m.id);
+            for w in &cleared {
+                assert!(started.contains(w), "{} cleared wave {w} it never started", m.id);
+            }
+        }
     }
 }

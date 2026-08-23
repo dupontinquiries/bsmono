@@ -108,6 +108,30 @@ pub struct FlipCfg {
                                 // powerslide-doubles-as-air-roll scheme)
 }
 
+/// Narrative framing. See `archive::RECEIVED` — how much of the history the
+/// game hands the player already believing.
+pub struct StoryCfg {
+    /// MYSTERY ANCHOR, 0 = nothing is known, 1 = the whole received account
+    /// is on the table (including the parts of it that are false).
+    pub anchor: f32,
+    /// How much evidence fits in the case before you must relay (tradecraft).
+    pub case_cap: f32,
+    /// Independent sources needed for POSSIBLE and for HIGH-CONFIDENCE
+    /// (provenance::Ladder). Floats because the whole config table is floats.
+    pub possible_at: f32,
+    pub high_at: f32,
+    /// WHICH CAMPAIGN IS BEING PLAYED. 0 = the Blackstar present, 1 = the
+    /// Black Archive era (see groundside::Era).
+    ///
+    /// It has to exist somewhere, and it turned out not to: `--arch find`
+    /// (scan it onto the map) and `--arch carry` (into the case, relay it
+    /// later) are the two campaigns' mutually exclusive discovery verbs, and
+    /// both worked at once because nothing recorded which campaign was
+    /// running. A dial rather than a story flag, because switching between
+    /// them is exactly what testing both needs.
+    pub era: f32,
+}
+
 pub struct TouchCfg {
     pub enabled: bool,
     pub scale: f32, // on-screen control size multiplier
@@ -145,6 +169,7 @@ pub struct Config {
     pub video: VideoCfg,
     pub preset: usize, // last mutator preset picked (display only)
     pub touch: TouchCfg,
+    pub story: StoryCfg,
 }
 
 impl Default for Config {
@@ -158,6 +183,12 @@ impl Default for Config {
             flip: FlipCfg { spin: 1.0, strength: 1.0, resets: true, strict: true, unlimited: false, cancel: true, land_assist: 0.0, air_roll_default: false },
             video: VideoCfg { render_scale: 1.0, rays: true, quality: 1.0, filmic: true, exposure: 1.0, vignette: 0.32, grain: 0.12, letterbox: false, bloom: 0.7, ray_dist: 1.0, vsync: true, screen_door: 0.05, tier: 0 },
             touch: TouchCfg { enabled: false, scale: 1.0, tap_to_move: true },
+            // 0.45 -- you know what you lived through and nothing past it.
+            // Treating the campaign's own events as undiscovered is a lie
+            // about the player; treating the deep strata as known throws the
+            // game away. The midpoint is the only defensible default, and it
+            // is a default rather than a decision: the dial is the answer.
+            story: StoryCfg { anchor: 0.45, case_cap: crate::tradecraft::CASE_CAP as f32, possible_at: 2.0, high_at: 3.0, era: 0.0 },
             preset: 0,
         }
     }
@@ -198,6 +229,11 @@ impl Config {
         w("cam_shake", self.cam.shake);
         w("cam_grav", self.cam.grav_follow);
         w("cam_stiff", self.cam.stiffness);
+        w("story_anchor", self.story.anchor);
+        w("case_cap", self.story.case_cap);
+        w("arch_possible_at", self.story.possible_at);
+        w("arch_high_at", self.story.high_at);
+        w("story_era", self.story.era);
         w("gravity", self.arena.gravity);
         w("arena_bounce", self.arena.bounce);
         w("arena_friction", self.arena.friction);
@@ -268,6 +304,11 @@ impl Config {
             "arena_bounce" => self.arena.bounce = v.clamp(0.2, 2.0),
             "arena_friction" => self.arena.friction = v.clamp(0.1, 2.5),
             "arena_scale" => self.arena.scale = v.clamp(0.55, 1.6),
+            "story_anchor" => self.story.anchor = v.clamp(0.0, 1.0),
+            "case_cap" => self.story.case_cap = v.clamp(1.0, 24.0),
+            "arch_possible_at" => self.story.possible_at = v.clamp(1.0, 8.0),
+            "arch_high_at" => self.story.high_at = v.clamp(2.0, 12.0),
+            "story_era" => self.story.era = v.clamp(0.0, 1.0),
             "ball_size" => self.ball.size = v.clamp(0.35, 3.0),
             "ball_bounce" => self.ball.bounce = v.clamp(0.2, 2.0),
             "ball_friction" => self.ball.friction = v.clamp(0.0, 2.5),
@@ -318,5 +359,132 @@ impl Config {
             "preset" => self.preset = (v as usize) % PRESETS.len(),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+
+    /// Every `cfg` key the parser accepts, read out of this file's own source.
+    fn keys() -> Vec<String> {
+        let src = include_str!("config.rs");
+        let load = src
+            .split("pub fn load_line")
+            .nth(1)
+            .and_then(|s| s.split("pub fn save_lines").next())
+            .expect("load_line");
+        let mut out = Vec::new();
+        for line in load.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix('"') else { continue };
+            let Some((k, tail)) = rest.split_once('"') else { continue };
+            if tail.trim_start().starts_with("=>") {
+                out.push(k.to_string());
+            }
+        }
+        out
+    }
+
+    fn lines_of(c: &Config) -> Vec<String> {
+        let mut s = String::new();
+        c.save_lines(&mut s);
+        s.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_key_sets_agree_in_both_directions() {
+        // a key the parser accepts but nothing writes is a setting that
+        // silently resets; a key written but not parsed is one that silently
+        // will not load. Both are invisible until somebody edits a save.
+        let src = include_str!("config.rs");
+        let save = src.split("pub fn save_lines").nth(1).expect("save_lines");
+        for k in keys() {
+            assert!(
+                save.contains(&format!("w(\"{k}\"")),
+                "cfg key '{k}' can be loaded and is never saved"
+            );
+        }
+        let written: Vec<&str> = save
+            .split("w(\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .collect();
+        let known = keys();
+        for w in &written {
+            assert!(
+                known.iter().any(|k| k == w),
+                "cfg key '{w}' is saved and can never be loaded back"
+            );
+        }
+        assert!(known.len() > 50, "only found {} keys; the parser broke", known.len());
+    }
+
+    /// The bug set-equality cannot see: a key saved from the WRONG FIELD.
+    /// `w("cam_dist", self.cam.height)` passes every structural check and
+    /// quietly swaps two settings the first time somebody saves.
+    ///
+    /// Perturb exactly one key, render, and diff against the unperturbed
+    /// render. The only line that may differ is that key's own.
+    #[test]
+    fn setting_one_key_moves_only_that_key() {
+        let base = lines_of(&Config::default());
+        for k in keys() {
+            // probe from several directions: every key clamps to its own
+            // range, so a single probe is a silent no-op on bounded ones
+            let mut moved = None;
+            for probe in ["0", "1", "0.5", "2", "-1", "7", "0.123"] {
+                let mut c = Config::default();
+                c.load_line(&k, probe);
+                let now = lines_of(&c);
+                let diff: Vec<usize> =
+                    (0..base.len()).filter(|&i| base[i] != now[i]).collect();
+                if !diff.is_empty() {
+                    moved = Some((diff, now));
+                    break;
+                }
+            }
+            let Some((diff, now)) = moved else {
+                // Two causes, and the message has to name both because the
+                // symptom is identical: either load_line ignores the key, or
+                // save_lines writes it from the WRONG FIELD (in which case
+                // some other key's line is the one that moves, and that key
+                // will fail below with "moved 2 lines").
+                panic!(
+                    "cfg key '{k}' never changes its own line. either load_line drops it, \
+                     or save_lines writes w(\"{k}\", ..) from another field"
+                );
+            };
+            assert_eq!(
+                diff.len(),
+                1,
+                "cfg key '{k}' moved {} lines: {:?}",
+                diff.len(),
+                diff.iter().map(|&i| (&base[i], &now[i])).collect::<Vec<_>>()
+            );
+            assert!(
+                now[diff[0]].starts_with(&format!("cfg {k} ")),
+                "cfg key '{k}' wrote to line {:?} instead of its own",
+                now[diff[0]]
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_config_survives_a_render_and_a_parse() {
+        // the whole table at once, through the real save path
+        let mut c = Config::default();
+        for (i, k) in keys().iter().enumerate() {
+            // spread values so two keys cannot coincidentally agree
+            c.load_line(k, &format!("{}", (i % 3) as f32 * 0.5));
+        }
+        let before = lines_of(&c);
+        let text = crate::save::render(
+            &crate::save::Save::default(),
+            &crate::input::Bindings::default_scheme(),
+            &c,
+        );
+        let (_, _, back) = crate::save::parse(&text);
+        assert_eq!(lines_of(&back), before, "the config did not survive the save file");
     }
 }

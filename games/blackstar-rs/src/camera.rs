@@ -114,6 +114,13 @@ pub struct Camera {
     /// rather than a camera of its own, so ball cam, the gravity-aware up
     /// and the terrain clamp all keep working underneath it.
     pub look_yaw: f32,
+    /// Set while the player is inside a ship: "is this point open volume".
+    ///
+    /// A closure rather than a reference to the interior, so `camera.rs` does
+    /// not learn about ships — it needs to know whether a point is clear, and
+    /// nothing else. The terrain clamp already works this way in spirit.
+    #[allow(clippy::type_complexity)]
+    pub indoors: Option<Box<dyn Fn(Vec3) -> bool>>,
     pub look_pitch: f32,
     /// AUTOTARGET. Ball cam is a point-of-interest camera that happens to
     /// have been given the ball; hand it something else and the same rig
@@ -143,6 +150,7 @@ impl Camera {
             shake: 0.0,
             shake_t: 0.0,
             look_yaw: 0.0,
+            indoors: None,
             look_pitch: 0.0,
             poi: None,
             nose_cam: false,
@@ -360,6 +368,26 @@ impl Camera {
         let want_look = aim + self.up * (0.35 - tilt);
         self.look += (want_look - self.look) * (1.0 - (-14.0 * cfg.stiffness * dt).exp());
 
+        // INDOORS THE BOOM HAS TO COME IN. A 4.9 m chase distance is fine on
+        // a field and wrong in a corridor: the eye ends up outside the hull
+        // looking at the back of a wall, which reads as the ship vanishing.
+        //
+        // Pulled toward the subject until the eye is in open volume. Done
+        // here, after the boom and before the shake, because it is a
+        // correction to a position rather than an input to one — and the
+        // shake should still be able to nudge it.
+        if let Some(clear) = &self.indoors {
+            let mut t = 1.0;
+            for _ in 0..8 {
+                let p = self.look + (self.pos - self.look) * t;
+                if clear(p) {
+                    break;
+                }
+                t *= 0.7;
+            }
+            self.pos = self.look + (self.pos - self.look) * t;
+        }
+
         self.shake_t += dt;
         self.shake = (self.shake - dt * 2.2).max(0.0);
         if self.shake > 0.001 && cfg.shake > 0.001 {
@@ -369,12 +397,29 @@ impl Camera {
         }
     }
 
+    /// Far plane, unchanged. Kept as a named constant so `depth.rs`'s
+    /// analysis and the renderer cannot drift apart silently.
+    pub const FAR_M: f32 = 2600.0;
+
     pub fn view_proj(&self, cfg: &CamCfg, aspect: f32) -> (Mat4, Mat4) {
         // guard against a degenerate basis when look-dir ~ up
         let fwd = (self.look - self.pos).normalize_or(Vec3::NEG_Z);
         let up = if fwd.dot(self.up).abs() > 0.985 { fwd.cross(Vec3::X).normalize_or(Vec3::Y) } else { self.up };
         let view = Mat4::look_at_rh(self.pos, self.look, up);
-        let proj = Mat4::perspective_rh(cfg.fov_deg.to_radians(), aspect, 0.08, 2600.0);
+        // THE NEAR PLANE FOLLOWS THE SHOT. It was a fixed 0.08 m, which is
+        // right for a body 38 cm tall and wrong by two orders of magnitude
+        // for a camera hundreds of metres from a skyscraper: the perspective
+        // divide spends most of the depth buffer between eight centimetres
+        // and a metre, and in that shot nothing is there. `--terrain depth`
+        // has the measurements; at the tower pullback this alone takes
+        // standard-Z resolution from 94 mm to 0.7 mm.
+        //
+        // At the distances this game currently uses it barely moves (4.9 m
+        // back gives 0.098 m against the old 0.08), and there is nothing
+        // within ten centimetres of a chase camera. Tested in `scale.rs`.
+        let shot = (self.look - self.pos).length();
+        let near = crate::scale::near_for(shot);
+        let proj = Mat4::perspective_rh(cfg.fov_deg.to_radians(), aspect, near, Self::FAR_M);
         let vp = proj * view;
         (vp, vp.inverse())
     }
@@ -440,5 +485,70 @@ mod tests {
         for m in [CamMode::Ball, CamMode::Chase, CamMode::First, CamMode::Gunner] {
             assert!(!m.label().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod near_plane_tests {
+    use super::*;
+
+    /// Read the near plane back out of a glam `perspective_rh` matrix.
+    /// For the wgpu [0,1] mapping, `m22 = f/(n-f)` and `m32 = n*f/(n-f)`,
+    /// so `n = m32/m22`.
+    fn near_of(proj: Mat4) -> f32 {
+        let c = proj.to_cols_array();
+        c[14] / c[10]
+    }
+
+    fn cam_at(distance: f32) -> Camera {
+        let mut c = Camera::new();
+        c.pos = Vec3::new(0.0, 0.0, distance);
+        c.look = Vec3::ZERO;
+        c.up = Vec3::Y;
+        c
+    }
+
+    #[test]
+    fn the_projection_actually_uses_the_shot_distance() {
+        // end-to-end: the analysis in scale.rs is only worth anything if the
+        // matrix the renderer builds carries it, and that is the step this
+        // project keeps skipping.
+        let cfg = CamCfg {
+            fov_deg: 86.0,
+            dist: 4.9,
+            height: 1.21,
+            angle_deg: 20.0,
+            stiffness: 1.0,
+            shake: 0.0,
+            grav_follow: 1.0,
+            plat_bend: 0.55,
+        };
+        for d in [4.9f32, 16.0, 50.0, 343.0] {
+            let cam = cam_at(d);
+            let (vp, _) = cam.view_proj(&cfg, 16.0 / 9.0);
+            // RECOVER THE PROJECTION FROM WHAT THE CAMERA ACTUALLY RETURNED.
+            // The first version of this rebuilt the matrix itself and
+            // compared that, which asserts only that perspective_rh is
+            // perspective_rh — a tautology dressed as an integration test.
+            // `view_proj` returns proj*view, so undo the view.
+            let view = Mat4::look_at_rh(cam.pos, cam.look, cam.up);
+            let proj = vp * view.inverse();
+            let got = near_of(proj);
+            let want = crate::scale::near_for(d);
+            assert!(
+                (got - want).abs() < want * 0.02,
+                "at {d} m the camera's own matrix has near {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gameplay_shot_barely_moves_and_the_tower_shot_moves_a_lot() {
+        let close = crate::scale::near_for(4.9);
+        let far = crate::scale::near_for(343.0);
+        assert!((close - 0.08).abs() < 0.03, "gameplay near plane {close}");
+        assert!(far > 5.0, "tower near plane {far}");
+        // the ratio is the whole point: one number cannot serve both
+        assert!(far / close > 50.0);
     }
 }

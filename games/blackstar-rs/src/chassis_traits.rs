@@ -107,21 +107,32 @@ impl Traits {
     /// exists: "70% tank, 30% hoverer" is a sentence about a real chassis.
     pub fn blend(self, other: Traits, w: f32) -> Traits {
         let w = w.clamp(0.0, 1.0);
-        // `a * (1.0 - w) + b * w` rather than `a + (b - a) * w`. Both are the
-        // same lerp algebraically, but only this form recovers the endpoints
-        // exactly in floating point: multiplying by an exact 0.0 or 1.0
-        // introduces no rounding, while `a + (b - a) * w` computes a
-        // subtraction and an addition, each rounding once, and the two
-        // roundings do not generally cancel back to exactly `b` at w == 1.
+        // Endpoint-exact lerp. `a + (b - a) * w` is monotonic but NOT exact at
+        // w = 1: it computes a subtraction and an addition, each rounding once,
+        // and the two roundings do not generally cancel back to exactly `b`.
+        // Observed on real data: tank.traction (0.95) blended toward
+        // hoverer.traction (0.20) at w == 1 came out 0.19999999, so a fully
+        // blended chassis was not equal to the thing it blended into. That
+        // matters wherever a blend is compared, keyed, or thresholded —
+        // `flies()` is a threshold on lift, and a chassis one ulp under the
+        // line does not fly. Not a tolerance problem, and loosening the assert
+        // would have hidden it; `blending_is_clamped_at_both_ends` is the test.
         //
-        // Found independently on both sides of the c8/c9 split, which is why
-        // this comment carries both halves of the evidence. Observed on real
-        // data: tank.traction (0.95) blended toward hoverer.traction (0.20) at
-        // w == 1 came out 0.19999999, not 0.2. The test that catches it is
-        // `blending_is_clamped_at_both_ends`, whose exact equality against
-        // `other` the old formula broke. Not a tolerance problem — a formula
-        // problem, and loosening the assert would have hidden it.
-        let m = |a: f32, b: f32| a * (1.0 - w) + b * w;
+        // FOUND INDEPENDENTLY ON BOTH SIDES of the c8/c9 split, and the two
+        // fixes were not equally good — worth recording, because the merge had
+        // to choose. `a*(1-w) + b*w` is endpoint-exact but can be
+        // NON-MONOTONIC in the interior; the difference form is monotonic but
+        // not endpoint-exact. Handling the endpoints explicitly is the only
+        // form with both properties, so that is what survived the merge.
+        let m = |a: f32, b: f32| {
+            if w <= 0.0 {
+                a
+            } else if w >= 1.0 {
+                b
+            } else {
+                a + (b - a) * w
+            }
+        };
         Traits {
             traction: m(self.traction, other.traction),
             lift: m(self.lift, other.lift),
@@ -263,6 +274,37 @@ mod tests {
         let h = Traits::from_category("hoverer");
         assert_eq!(t.blend(h, -1.0), t);
         assert_eq!(t.blend(h, 2.0), h);
+        // exactly at the ends, not merely near them
+        assert_eq!(t.blend(h, 0.0), t);
+        assert_eq!(t.blend(h, 1.0), h);
+    }
+
+    #[test]
+    fn a_full_blend_flies_exactly_as_the_thing_it_blended_into() {
+        // the reason endpoint exactness is not pedantry: `flies()` is a
+        // threshold on lift, so a chassis one ulp under the line silently
+        // stops flying
+        for a in ["tank", "hoverer", "flyer", "boat", "spaceship"] {
+            for b in ["tank", "hoverer", "flyer", "boat", "spaceship"] {
+                let (x, y) = (Traits::from_category(a), Traits::from_category(b));
+                assert_eq!(x.blend(y, 1.0), y, "{a} fully blended into {b} is not {b}");
+                assert_eq!(x.blend(y, 1.0).flies(), y.flies(), "{a}->{b} changed flight");
+            }
+        }
+    }
+
+    #[test]
+    fn blending_stays_monotonic_in_the_interior() {
+        // the property the difference form was chosen for; taking the
+        // endpoints explicitly must not have cost it
+        let t = Traits::from_category("tank");
+        let h = Traits::from_category("hoverer");
+        let mut prev = t.hover;
+        for i in 0..=20 {
+            let v = t.blend(h, i as f32 / 20.0).hover;
+            assert!(v >= prev - 1e-6, "hover went backwards at w={}", i as f32 / 20.0);
+            prev = v;
+        }
     }
 
     #[test]

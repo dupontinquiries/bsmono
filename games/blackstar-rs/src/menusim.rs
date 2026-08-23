@@ -3,6 +3,19 @@
 //!     skydribble --menu                      walk the stations (list)
 //!     skydribble --menu armory               open one console, watch it deploy
 //!     skydribble --menu armory --tape d,d,a  then play an input tape
+//!
+//! ## The tape wraps, and I blamed it twice for that
+//!
+//! `d` down, `u` up, `a` activate. Selection WRAPS at the ends, and a console
+//! with two selectable rows therefore returns to the first on the second `d`.
+//! I ran `d,d,a` on the bridge expecting the sortie, got the nightfall row it
+//! had wrapped back to, and concluded the harness could not reach arbitrary
+//! rows — twice, in two different sessions, working around it both times.
+//!
+//! It reaches them fine. `d,a` is the sortie. Counting the SELECTABLE rows —
+//! headings, gaps and disabled rows are skipped — is the whole trick, and
+//! `--menu <station>` with no tape prints them in order so the count is
+//! there to read.
 //!     skydribble --menu motion               the fx kit's dials, demonstrated
 //!
 //! Every animation in `menufx.rs` is a pure function of time, which
@@ -20,7 +33,7 @@ use crate::menu::{Event, Host, Input};
 use crate::menufx::{DeployStyle, Hold, Motion, Pending, Stage, HOLD_SEC};
 use crate::nightfall;
 use crate::ship::Phase;
-use crate::stations::{apply, build, Order, Shipboard, Station, STATIONS};
+use crate::stations::{apply, build, run_order, Order, Shipboard, Station, STATIONS};
 
 pub fn run(argv: &[String]) {
     let i = argv.iter().position(|a| a == "--menu").unwrap();
@@ -46,7 +59,7 @@ fn walk() {
     println!("THE SHIP'S STATIONS -- `--menu <id>` to stand at one.\n");
     for st in STATIONS {
         let ok = st.available(Phase::Cruise).is_ok();
-        println!("  {:8} {}  {}", st.id(), st.title(), if ok { "" } else { "(dark)" });
+        println!("  {:10} {}  {}", st.id(), st.title(), if ok { "" } else { "(dark)" });
         println!("           {}", st.room());
         let s = st.style();
         println!(
@@ -63,7 +76,10 @@ fn walk() {
 fn console(st: Station, tape: &str) {
     let mut sb = Shipboard::load();
     let week = nightfall::week_now();
-    let menu = build(st, &sb, week);
+    // through the same sizing the Deck applies, or this driver reports on a
+    // scroll window the game does not use — which it did, showing twelve
+    // rows of a panel that holds twenty
+    let menu = crate::deck::fitted(build(st, &sb, week));
     let rows = menu.rows.len();
     let mut host = Host::new();
     host.open(menu);
@@ -115,7 +131,7 @@ fn console(st: Station, tape: &str) {
                     narrate(st, &ev, &mut sb, week);
                     // state changed: rebuild the console in place
                     if matches!(ev, Event::Pressed(_)) {
-                        let m = build(st, &sb, week);
+                        let m = crate::deck::fitted(build(st, &sb, week));
                         let n = m.rows.len();
                         host = Host::new();
                         host.open(m);
@@ -184,8 +200,33 @@ fn narrate(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) {
     match apply(st, ev, sb, week) {
         Some(Order::Did(m)) => println!("  > {m}"),
         Some(Order::Refused(m)) => println!("  > REFUSED: {m}"),
-        Some(Order::Sortie(id)) => println!("  > SORTIE PLOTTED: {id} (the shell flies this; `--campaign {id}` runs it)"),
-        Some(Order::Nightfall(w)) => println!("  > NIGHTFALL, week {w} (the shell flies this; `--campaign nightfall` runs it)"),
+        // Run it, rather than print a second copy of the shell's disclaimer.
+        // These two arms used to say "the shell flies this" — which meant the
+        // one path with no headless driver was the one the shell had just
+        // learned to execute, so nothing could exercise it. Same function the
+        // winit handler calls; if it breaks, it breaks here first.
+        // Depart cannot run here — `load_map` needs a gpu — so the harness
+        // reports what the shell WOULD do, including which map style the
+        // destination resolves to. That is the checkable half, and the note
+        // above about untested shell paths is why it is not left silent.
+        Some(Order::Depart { dest, line }) => {
+            println!("  > {line}");
+            match crate::patrol::ROUTE.iter().find(|d| d.id == dest) {
+                Some(d) => println!(
+                    "  > (the shell would load style {} — {})",
+                    crate::mapsim::style_for(d),
+                    crate::world::style(crate::mapsim::style_for(d)).name
+                ),
+                None => println!("  > (no such destination)"),
+            }
+        }
+        Some(o @ (Order::Sortie(_) | Order::Nightfall(_))) => {
+            let (line, changed) = run_order(&o);
+            println!("  > {line}");
+            if changed {
+                println!("  > (the save moved; reopen the console to see it)");
+            }
+        }
         Some(Order::Goto(s)) => println!("  > walking to {}", s.id()),
         None => match ev {
             Event::Open(id) => println!("  > opens {id}"),
@@ -225,7 +266,7 @@ fn frame(host: &Host, motion: &Motion, hold: Option<&Hold>) -> String {
         let unfold_mark = if pose.unfold < 0.95 { "=" } else { " " };
         out.push_str(&format!(
             "{bar}{indent}{ink}{unfold_mark}{} {}\n",
-            truncate(&label, 46),
+            truncate(&label, LABEL_W),
             value
         ));
         if let (Some(h), true) = (hold, i as i64 == cursor_row) {
@@ -248,6 +289,14 @@ fn ramp(a: f32) -> &'static str {
         _ => "",
     }
 }
+
+/// The console's usable label width, in characters.
+///
+/// Was a bare `46` at the one call site. Named because it is a real
+/// constraint that station authors have to respect and could not see: the
+/// Bridge shipped "— teaches tra~" and "the open ~" because nothing told
+/// anyone the budget existed. `stations::tests` asserts every row fits.
+pub const LABEL_W: usize = 46;
 
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {

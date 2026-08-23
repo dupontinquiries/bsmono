@@ -22,6 +22,7 @@
 //! Which is correct depends on the sky, and that is the point. A clear world
 //! makes the LZ obviously right. An incoming front makes it suicide.
 
+use crate::approach;
 use crate::survival::{axis_for, Body, Bunker, ShelterKind, Weather};
 
 /// How a team takes its first ground.
@@ -102,67 +103,63 @@ pub fn assess(body: Body, site: &Site, w: Weather, window_s: f32, speed_ms: f32)
     if !reachable {
         return Plan { site: *site, viable: false, margin_s: spare, note: "cannot reach it in the window" };
     }
-    // THE FIGHT COUNTS AGAINST THE CLOCK ONLY WHERE IT HAPPENS IN THE OPEN.
-    // An LZ is exposed from first boot until the ship is down; a fortress is
-    // exposed on the approach and sheltered from the moment you are inside.
-    let exposed_fight = if site.approach.exposed_during_take() { site.take_s } else { site.take_s * 0.25 };
-    let after = spare - exposed_fight;
-    if after < 0.0 {
-        return Plan {
-            site: *site,
-            viable: false,
-            margin_s: after,
-            note: "the fight outlasts the window — caught in the open",
-        };
-    }
-    // and once taken, does the place actually stop THIS weather?
+    // The arithmetic from here is not Cybertronian and is shared with the
+    // detective campaign, which asks the same question with a rival society
+    // for weather and a parked car for a grounded ship. See `approach.rs`;
+    // what stays HERE is the domain — reaching it, and whether this shelter
+    // stops THIS weather, neither of which that module can know.
     let stops = axis_for(w, &site.approach.shelter().protection());
-    if stops < 0.5 && window_s.is_finite() {
-        return Plan {
-            site: *site,
-            viable: false,
-            margin_s: after,
-            note: "taken in time, and it does not stop this weather",
-        };
+    let opening = approach::Opening {
+        reach_spare_s: spare,
+        take_s: site.take_s,
+        exposed_during_take: site.approach.exposed_during_take(),
+        shelters_after: stops >= 0.5,
+        lingering_cost: site.approach.pins_the_ship(),
+        effort: site.take_s + site.garrison * 120.0,
+        // weather does not care who sees you
+        seen_cost: 0.0,
+    };
+    let v = approach::assess(&opening, window_s);
+    Plan {
+        site: *site,
+        viable: v.viable(),
+        margin_s: v.margin_s(),
+        note: match v {
+            approach::Verdict::CaughtInTheOpen { .. } => "the fight outlasts the window — caught in the open",
+            approach::Verdict::NoShelter { .. } => "taken in time, and it does not stop this weather",
+            _ => v.note(),
+        },
     }
-    Plan { site: *site, viable: true, margin_s: after, note: "" }
+}
+
+/// The same site, as the shared decision core sees it.
+fn opening_of(body: Body, site: &Site, w: Weather, window_s: f32, speed_ms: f32) -> approach::Opening {
+    let (_, spare) = crate::survival::can_reach(body, &site.at, window_s, speed_ms);
+    approach::Opening {
+        reach_spare_s: spare,
+        take_s: site.take_s,
+        exposed_during_take: site.approach.exposed_during_take(),
+        shelters_after: axis_for(w, &site.approach.shelter().protection()) >= 0.5,
+        lingering_cost: site.approach.pins_the_ship(),
+        effort: site.take_s + site.garrison * 120.0,
+        seen_cost: 0.0,
+    }
 }
 
 /// Pick the opening. Prefers a viable site, and among viable ones the one
 /// that leaves the ship free — because a pinned ship is a cost that lasts
 /// the whole raid rather than the first phase.
 pub fn choose<'a>(body: Body, sites: &'a [Site], w: Weather, window_s: f32, speed_ms: f32) -> Option<Plan> {
-    let plans: Vec<Plan> = sites.iter().map(|s| assess(body, s, w, window_s, speed_ms)).collect();
-    let viable: Vec<&Plan> = plans.iter().filter(|p| p.viable).collect();
-    if viable.is_empty() {
-        return None;
-    }
     // THE SKY DECIDES, which is the whole design and which my first sort got
     // wrong: it ranked "does not pin the ship" above everything, so a
-    // fortress always won and the LZ was never worth having.
-    //
-    // Under pressure, take the most margin — a clock you can beat is the
-    // only thing that matters. With no pressure, take the CHEAPEST fight,
-    // because nobody garrisons empty rock and a fortress you did not need to
-    // storm is a hundred casualties for a roof. Ship-pinning breaks ties in
-    // both, since it is a real cost that just is not the deciding one.
-    let pressured = window_s.is_finite();
-    let best = viable
-        .iter()
-        .max_by(|a, b| {
-            let key = |p: &Plan| {
-                let cost = p.site.take_s + p.site.garrison * 120.0;
-                let free_ship = if p.site.approach.pins_the_ship() { 0.0 } else { 1.0 };
-                if pressured {
-                    (p.margin_s, free_ship)
-                } else {
-                    (-cost, free_ship)
-                }
-            };
-            key(a).partial_cmp(&key(b)).unwrap()
-        })
-        .unwrap();
-    Some(**best)
+    // fortress always won and the LZ was never worth having. That ranking —
+    // margin under pressure, cheapness without it, lingering cost as a
+    // tie-break only — is the part shared with the detective campaign and now
+    // lives in `approach::choose`.
+    let openings: Vec<approach::Opening> =
+        sites.iter().map(|s| opening_of(body, s, w, window_s, speed_ms)).collect();
+    let i = approach::choose(&openings, window_s)?;
+    Some(assess(body, &sites[i], w, window_s, speed_ms))
 }
 
 #[cfg(test)]

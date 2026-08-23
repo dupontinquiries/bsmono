@@ -490,3 +490,233 @@ impl Bindings {
         *self.slot(a) = v;
     }
 }
+
+// ------------------------------------------------------------ conflicts ---
+
+/// Two actions bound to the same input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Clash {
+    pub bind: Bind,
+    pub actions: Vec<Action>,
+}
+
+/// Every input that more than one action listens for.
+///
+/// There was no conflict check of any kind: `slot()` hands out a `Vec<Bind>`
+/// per action and nothing ever looked across actions, so a rebind could
+/// silently shadow another and the only way to find out was to press the key
+/// and watch two things happen.
+///
+/// Binds are compared after `norm_key`, because that is what the dispatcher
+/// compares. Without it 'E' and 'e' look like different keys here and the
+/// same key at runtime, which would make this report clean and wrong.
+pub fn clashes(b: &Bindings) -> Vec<Clash> {
+    let mut seen: Vec<(Bind, Vec<Action>)> = Vec::new();
+    for (a, binds) in &b.map {
+        for bind in binds {
+            let key = match bind {
+                Bind::Key(k) => Bind::Key(norm_key(k)),
+                other => other.clone(),
+            };
+            match seen.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, acts)) => {
+                    if !acts.contains(a) {
+                        acts.push(*a);
+                    }
+                }
+                None => seen.push((key, vec![*a])),
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, acts)| acts.len() > 1)
+        .map(|(bind, actions)| Clash { bind, actions })
+        .collect()
+}
+
+/// Keys the shell consumes before the action table ever sees them.
+///
+/// The hotbar takes 1-9 in `main.rs` directly and the deck takes these while
+/// a console is on stage; `F11` is fullscreen. Binding an action to one of
+/// them is an overlap the clash detector cannot see, because only one side
+/// of it is in the table.
+pub const RESERVED_NAMED: &[NamedKey] = &[
+    NamedKey::Escape,
+    NamedKey::Tab,
+    NamedKey::Enter,
+    NamedKey::ArrowUp,
+    NamedKey::ArrowDown,
+    NamedKey::ArrowLeft,
+    NamedKey::ArrowRight,
+    NamedKey::F11,
+    NamedKey::Backspace,
+    NamedKey::Delete,
+];
+
+/// Is this bind one the shell will also act on?
+pub fn reserved(b: &Bind) -> Option<&'static str> {
+    match b {
+        Bind::Key(Key::Character(c))
+            if c.chars().next().map_or(false, |c| c.is_ascii_digit()) =>
+        {
+            Some("the hotbar takes 1-9 directly")
+        }
+        Bind::Key(Key::Named(n)) if RESERVED_NAMED.contains(n) => {
+            Some("the shell/deck handles this key itself")
+        }
+        _ => None,
+    }
+}
+
+/// Actions with nothing bound at all.
+pub fn unbound(b: &Bindings) -> Vec<Action> {
+    b.map.iter().filter(|(_, v)| v.is_empty()).map(|(a, _)| *a).collect()
+}
+
+#[cfg(test)]
+mod clash_tests {
+    use super::*;
+
+    /// Print the shipped scheme's conflicts, so the report is the test's
+    /// failure message rather than something to go and run separately.
+    fn report(b: &Bindings) -> String {
+        clashes(b)
+            .iter()
+            .map(|c| {
+                let who: Vec<String> = c.actions.iter().map(|a| format!("{a:?}")).collect();
+                format!("{:?} <- {}", c.bind, who.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    }
+
+    #[test]
+    fn the_detector_sees_a_conflict_it_is_given() {
+        // guard the guard: a detector that reports nothing is indistinguishable
+        // from a clean scheme
+        let mut b = Bindings::default_scheme();
+        let k = ch("z");
+        *b.slot(Action::Forward) = vec![k.clone()];
+        *b.slot(Action::Reverse) = vec![k];
+        let c = clashes(&b);
+        assert!(
+            c.iter().any(|c| c.actions.contains(&Action::Forward)
+                && c.actions.contains(&Action::Reverse)),
+            "the detector missed a deliberate clash: {c:?}"
+        );
+    }
+
+    #[test]
+    fn case_does_not_hide_a_clash() {
+        // 'E' and 'e' are the same key to the dispatcher, so they must be the
+        // same key here or the report is clean and wrong
+        let mut b = Bindings::default_scheme();
+        *b.slot(Action::Forward) = vec![Bind::Key(Key::Character("E".into()))];
+        *b.slot(Action::Reverse) = vec![Bind::Key(Key::Character("e".into()))];
+        assert!(!clashes(&b).is_empty(), "case folding is not being applied");
+    }
+
+    #[test]
+    fn nothing_is_bound_to_a_key_the_shell_handles_itself() {
+        // The clash detector only sees the bindings TABLE. Some keys never
+        // reach it: the hotbar takes 1-9 directly, the deck takes Escape,
+        // Tab, Enter and the arrows, and F11 is fullscreen. An action bound
+        // to one of those fires alongside the hardcoded behaviour, which is
+        // an overlap no amount of looking at the table would reveal.
+        for (a, binds) in &Bindings::default_scheme().map {
+            for b in binds {
+                match b {
+                    Bind::Key(Key::Character(c)) => assert!(
+                        !c.chars().next().map_or(false, |c| c.is_ascii_digit()),
+                        "{a:?} is bound to {c:?}, which the hotbar takes directly"
+                    ),
+                    Bind::Key(Key::Named(n)) => assert!(
+                        !RESERVED_NAMED.contains(n),
+                        "{a:?} is bound to {n:?}, which the shell handles itself"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_shipped_scheme_has_no_overlapping_binds() {
+        let b = Bindings::default_scheme();
+        let c = clashes(&b);
+        assert!(c.is_empty(), "the default scheme double-binds:\n  {}", report(&b));
+    }
+
+    #[test]
+    fn the_classic_scheme_has_no_overlapping_binds() {
+        let b = Bindings::classic();
+        let c = clashes(&b);
+        assert!(c.is_empty(), "the classic scheme double-binds:\n  {}", report(&b));
+    }
+}
+
+// --------------------------------------------------------------- driver ---
+
+/// `--keys` — the live control scheme, and everything wrong with it.
+///
+/// Reads the bindings out of the SAVE, not the defaults, because the defaults
+/// are clean and a player's overlaps are in their own file. There was no way
+/// to see this short of pressing every key and watching what happened twice.
+pub fn run(argv: &[String]) {
+    let i = argv.iter().position(|a| a == "--keys").unwrap_or(0);
+    let want_defaults = argv.get(i + 1).map(String::as_str) == Some("defaults");
+    let (_, binds, _) = crate::save::load();
+    let b = if want_defaults { Bindings::default_scheme() } else { binds };
+
+    println!(
+        "CONTROL SCHEME — {}\n",
+        if want_defaults { "shipped defaults" } else { "from your save" }
+    );
+
+    let cl = clashes(&b);
+    if cl.is_empty() {
+        println!("  no two actions share an input.");
+    } else {
+        println!("  {} OVERLAP(S):", cl.len());
+        for c in &cl {
+            let who: Vec<String> = c.actions.iter().map(|a| format!("{a:?}")).collect();
+            println!("    {:<22} {}", bind_name(&c.bind), who.join(" + "));
+        }
+    }
+
+    // the other half: keys the shell eats before the table sees them
+    let mut stolen = Vec::new();
+    for (a, list) in &b.map {
+        for bind in list {
+            if let Some(why) = reserved(bind) {
+                stolen.push((*a, bind.clone(), why));
+            }
+        }
+    }
+    if !stolen.is_empty() {
+        println!("\n  {} BOUND TO A KEY THE SHELL ALSO USES:", stolen.len());
+        for (a, bind, why) in &stolen {
+            println!("    {:<22} {a:?}  ({why})", bind_name(bind));
+        }
+        println!("    these fire TWICE — once as the action, once as the shell's own");
+        println!("    behaviour — and no amount of reading the bindings table shows it.");
+    }
+
+    let un = unbound(&b);
+    if !un.is_empty() {
+        let names: Vec<String> = un.iter().map(|a| format!("{a:?}")).collect();
+        println!("\n  {} unbound: {}", un.len(), names.join(", "));
+        println!("    (RollL is deliberately unbound; the rest are worth a look)");
+    }
+    println!("\n  --keys defaults  to compare against the shipped scheme");
+}
+
+fn bind_name(b: &Bind) -> String {
+    match b {
+        Bind::Key(Key::Character(c)) => format!("'{c}'"),
+        Bind::Key(Key::Named(n)) => format!("{n:?}"),
+        Bind::Key(k) => format!("{k:?}"),
+        Bind::Mouse(m) => format!("mouse {m:?}"),
+        Bind::Pad(p) => format!("pad {}", crate::gamepad::pad_button_name(*p)),
+    }
+}

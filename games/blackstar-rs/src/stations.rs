@@ -38,6 +38,9 @@ use crate::raidlog::RaidLog;
 use crate::save;
 use crate::ship::Phase;
 use crate::vault::Vault;
+use crate::archive;
+use crate::curriculum;
+use crate::provenance::{assay_with, Bearing, Dig, Ladder, Medium};
 use crate::hotbar::Hotbar;
 use crate::watch::{self, Watch, NATIVE, PHOTON};
 
@@ -54,10 +57,35 @@ pub enum Station {
     Medbay,
     /// the warden ladder and the seal
     Wardeck,
+    /// THE STARMAP — the destination list, and the first place the campaign
+    /// stack is reachable from inside the game.
+    ///
+    /// `docs/PRIORITIES.md` counted the problem: `patrol` has zero references
+    /// in `main.rs`, so the twenty destinations exist, are tested, and cannot
+    /// be looked at while playing. This is the smallest honest fix — the
+    /// airlock is where you leave from, and it was the one hub room with no
+    /// console on it.
+    Starmap,
+    /// THE CHARTROOM -- the archaeological map, and the only place the
+    /// carried-back artifacts get looked at properly.
+    ///
+    /// This is the ship end of the split the archaeology layer is built
+    /// around: `Medium::Artifact` evidence comes home to this table, while
+    /// terminals and cut walls are read where they stand. The Destiny move
+    /// is that the Tower is where you make sense of what you brought back,
+    /// not where you find it.
+    Chartroom,
 }
 
-pub const STATIONS: [Station; 5] =
-    [Station::Bridge, Station::Armory, Station::Hold, Station::Medbay, Station::Wardeck];
+pub const STATIONS: [Station; 7] = [
+    Station::Bridge,
+    Station::Armory,
+    Station::Hold,
+    Station::Medbay,
+    Station::Wardeck,
+    Station::Chartroom,
+    Station::Starmap,
+];
 
 impl Station {
     pub fn id(self) -> &'static str {
@@ -67,6 +95,8 @@ impl Station {
             Station::Hold => "hold",
             Station::Medbay => "medbay",
             Station::Wardeck => "wardeck",
+            Station::Starmap => "starmap",
+            Station::Chartroom => "chartroom",
         }
     }
     pub fn title(self) -> &'static str {
@@ -76,6 +106,8 @@ impl Station {
             Station::Hold => "THE HOLD",
             Station::Medbay => "THE MEDBAY",
             Station::Wardeck => "THE WARDECK",
+            Station::Starmap => "THE STARMAP",
+            Station::Chartroom => "THE CHARTROOM",
         }
     }
     /// One line of place, drawn under the title — the room, not the UI.
@@ -86,6 +118,8 @@ impl Station {
             Station::Hold => "cargo lattice amidships, one chest bolted to the deck",
             Station::Medbay => "seven vats along the hull, one of them yours",
             Station::Wardeck => "the seal chart, nineteen names, some of them crossed",
+            Station::Starmap => "the airlock plot: twenty places, and what each one will do to you",
+            Station::Chartroom => "a long table under a hard lamp, and everything you carried home on it",
         }
     }
     /// How the room's console deploys. The character lives HERE, once.
@@ -96,8 +130,37 @@ impl Station {
             Station::Hold => DeployStyle::stack(),
             Station::Medbay => DeployStyle::glide(),
             Station::Wardeck => DeployStyle::glide(),
+            // the plot unrolls: a chart is a thing you spread out
+            Station::Starmap => DeployStyle::sweep(),
+            Station::Chartroom => DeployStyle::sweep(),
         }
     }
+    /// Which HUB room this console is IN.
+    ///
+    /// `room()` above is prose; this is an address. The two were unrelated
+    /// until now: `interior.rs` has generated a real floor plan from
+    /// `content::HUB` since it landed — eight rooms with positions, doors and
+    /// reachability — and had no caller, while this module claimed in its own
+    /// doc comment that "menus obey the hull" and enforced that with a phase
+    /// check alone. A console you can open while standing on the other side of
+    /// a sealed door is not obeying anything.
+    ///
+    /// Stations are placed by what the room IS, not by convenience: the
+    /// armoury is the upgrade bay because that is where the chassis rigs and
+    /// part racks are, and the hold is the hangar because that is the room
+    /// with a deck to bolt a chest to.
+    pub fn cell(self) -> &'static str {
+        match self {
+            Station::Bridge => "bridge",
+            Station::Armory => "upgrade_bay",
+            Station::Hold => "hangar",
+            Station::Medbay => "quarters",
+            Station::Wardeck => "corridor_aft",
+            Station::Starmap => "airlock",
+            Station::Chartroom => "market",
+        }
+    }
+
     /// The room's light, for panel chrome: r, g, b.
     pub fn accent(self) -> [f32; 3] {
         match self {
@@ -106,6 +169,8 @@ impl Station {
             Station::Hold => [0.55, 0.80, 0.40],    // cargo strip-lights
             Station::Medbay => [0.45, 0.90, 0.95],  // vat glow, ice-cold
             Station::Wardeck => [0.85, 0.30, 0.30], // the seal, unhappy
+            Station::Starmap => [0.55, 0.62, 0.90], // airlock blue, cold outside
+            Station::Chartroom => [0.88, 0.82, 0.62], // one hard lamp, paper-warm
         }
     }
     /// Whether the walk to this console is possible right now. Stations
@@ -113,6 +178,10 @@ impl Station {
     pub fn available(self, phase: Phase) -> Result<(), &'static str> {
         if !phase.interior() {
             return Err("the interior is not walkable right now");
+        }
+        // and the room has to be somewhere you can actually get to
+        if !crate::content::HUB.iter().any(|r| r.id == self.cell()) {
+            return Err("that room is not on the ship's plan");
         }
         match self {
             Station::Bridge => {
@@ -138,18 +207,27 @@ pub struct Shipboard {
     pub vault: Vault,
     pub watch: Watch,
     pub hotbar: Hotbar,
+    /// what has been dug up (see provenance.rs)
+    pub dig: Dig,
+    /// the mystery anchor, 0..1 (see archive::RECEIVED)
+    pub anchor: f32,
+    /// how fast the map firms up (see provenance::Ladder, cfg arch_*)
+    pub ladder: Ladder,
 }
 
 impl Shipboard {
     pub fn load() -> Shipboard {
-        let (sv, _, _) = save::load();
+        let (sv, _, cfg) = save::load();
         Shipboard {
+            anchor: cfg.story.anchor,
+            ladder: Ladder::from_cfg(&cfg),
             camp: CampaignLog::from_line(&sv.missions),
             raids: RaidLog::from_line(&sv.wardens),
             nf: NightfallLog::from_line(&sv.nightfalls),
             chi: Chi::from_line(&sv.chi),
             gear: Gear::from_save(&sv.armed, &sv.worn, &sv.bag),
             vault: Vault::from_line(&sv.vault),
+            dig: Dig::from_line(&sv.finds, archive::FINDINGS),
             watch: Watch::from_line(&sv.watch),
             hotbar: Hotbar::from_line(&sv.hotbar),
         }
@@ -167,6 +245,10 @@ impl Shipboard {
         sv.vault = self.vault.line();
         sv.watch = self.watch.line();
         sv.hotbar = self.hotbar.line();
+        // the dig was loaded into Shipboard and never written back, so
+        // anything recovered at a console vanished on the next load. Silent,
+        // because nothing at a console could recover anything yet.
+        sv.finds = self.dig.line();
         save::store(&sv, &b, &cfg);
     }
     pub fn energon(&self) -> u32 {
@@ -189,15 +271,274 @@ pub enum Order {
     Did(String),
     /// a refusal, printed where the player is looking
     Refused(String),
+    /// FLY THERE. The console cannot load a map — that needs the shell, the
+    /// gpu and a fresh `World` — so it names the destination and the shell
+    /// does it, the same way `Sortie` names a mission rather than running it.
+    ///
+    /// The line is the arrival report, already computed, so the shell does not
+    /// have to fly the drop a second time to know what to say.
+    Depart { dest: &'static str, line: String },
+}
+
+/// Evidence recoverable but not yet recorded: sited where a mission has been
+/// cleared, gate open, and not already in the dig.
+///
+/// The site gate is the whole design. Without it the Chartroom would be a
+/// button that hands over the entire history, and the archaeology layer would
+/// be an inventory screen.
+fn unexamined(sb: &Shipboard) -> Vec<&'static crate::provenance::Finding> {
+    archive::FINDINGS
+        .iter()
+        .filter(|f| !sb.dig.has(f.id))
+        .filter(|f| f.gate.map(|g| archive::gate_open(g, &sb.camp, &sb.raids)).unwrap_or(true))
+        .filter(|f| {
+            // BY PLACE where there is one, by destination otherwise.
+            //
+            // This was destination-only, so clearing any Earth mission opened
+            // all seventeen Earth findings at once — an observatory and a
+            // museum the mission never went near. "You can only examine
+            // evidence from somewhere you have actually been" was the stated
+            // rule and "been to Earth" is not the same as "been everywhere on
+            // Earth". `groundside::Place::reached_by` is the join that makes
+            // the finer answer available.
+            match crate::groundside::place_of(f.id) {
+                Some(p) => crate::groundside::visited(p, &sb.camp),
+                None => MISSIONS.iter().any(|m| m.dest == f.site && sb.camp.is_cleared(m.id)),
+            }
+        })
+        .collect()
+}
+
+/// What happened on the way in.
+pub struct Arrival {
+    /// a phrase for the report line
+    pub line: String,
+    /// how much the landing cost the squad, 0..1 off their effective strength
+    pub penalty: f32,
+}
+
+/// Fly a mission's descent before it resolves.
+///
+/// The join the campaign has never had: a mission names a `dest`, `patrol`
+/// knows that world's gravity and surface, and `drop.rs` flies the fall. A
+/// scattered landing is the first thing in this game where arriving badly
+/// costs you at the far end rather than being scenery.
+pub fn arrive_at(dest: &str) -> Arrival {
+    let Some(d) = crate::patrol::ROUTE.iter().find(|d| d.id == dest) else {
+        return Arrival { line: String::new(), penalty: 0.0 };
+    };
+    if is_dock(d) {
+        return Arrival { line: "docked —".into(), penalty: 0.0 };
+    }
+    let g = crate::mapsim::ground_for(d);
+    let l = fly_the_drop(d, &g);
+    // a clean drop is free; a scattered one hurts, capped so a bad landing is
+    // a setback rather than a loss before the fight starts
+    let penalty = ((l.miss_distance - 20.0) / 300.0).clamp(0.0, 0.35);
+    let line = if l.miss_distance < 20.0 {
+        format!("clean drop on {} —", d.name)
+    } else if penalty < 0.2 {
+        format!("loose drop on {} ({:.0} m) —", d.name, l.miss_distance)
+    } else {
+        format!("SCATTERED on {} ({:.0} m) —", d.name, l.miss_distance)
+    };
+    Arrival { line, penalty }
+}
+
+/// Fly the descent for a destination, in simulation.
+///
+/// The first time `patrol`, `mapsim` and `drop` run in sequence rather than
+/// in three separate headless drivers. Gravity comes from the destination,
+/// the ground from `ground_for`, and the fall from `drop.rs` — so a low-g
+/// world really does give you longer to correct, and a heavy one really does
+/// hurt on arrival.
+///
+/// Deterministic: the same destination flies the same way every time, because
+/// a console that reports a different outcome each press is telling you about
+/// its RNG rather than about the world.
+/// You do not land on deep space; you dock with something in it.
+///
+/// Three of the eighteen destinations have gravity at or near zero —
+/// `outer_rim` and `shield_edge` are `Terrain::DeepSpace`, `carrion` is an
+/// asteroid field at 0.02g. A drop needs something to fall toward, and
+/// forcing one produces a descent that never terminates: my first version
+/// looped ninety seconds and reported an infinite miss distance, which a test
+/// caught as "outer_rim never landed at all".
+///
+/// That is correct DATA and a wrong assumption on my part, not a bug in the
+/// route table.
+pub const DOCK_BELOW_G: f32 = 0.05;
+
+pub fn is_dock(d: &crate::patrol::Destination) -> bool {
+    d.gravity < DOCK_BELOW_G
+}
+
+fn fly_the_drop(
+    d: &'static crate::patrol::Destination,
+    g: &crate::terrain::Ground,
+) -> crate::drop::Landing {
+    use crate::drop::{Drop, Mode};
+    use glam::Vec3;
+    let mut dr = Drop::new(Vec3::ZERO, d.hostiles != crate::patrol::Faction::None);
+    dr.jump(Vec3::new(0.0, 600.0, 0.0), Vec3::new(18.0, 0.0, 0.0));
+    // a competent drop: fold to the fall gait at a sensible altitude and
+    // steer back toward the mark
+    let dt = 1.0 / 60.0;
+    for step in 0..(60 * 90) {
+        let alt = dr.pos.y;
+        if alt < 120.0 && dr.mode == Mode::Vehicle {
+            dr.transform(alt);
+        }
+        // steer at the landing zone, hardest early when there is time
+        let to = (dr.lz - dr.pos) * Vec3::new(1.0, 0.0, 1.0);
+        let steer = to.normalize_or_zero();
+        if let Some(l) = dr.update(dt, steer, g.g, 0.0) {
+            return l;
+        }
+        let _ = step;
+    }
+    crate::drop::Landing {
+        impact_speed: 0.0,
+        self_dmg: 0.0,
+        shock: 0.0,
+        shock_radius: 0.0,
+        miss_distance: f32::INFINITY,
+        aa_taken: 0.0,
+        hero: false,
+    }
+}
+
+/// Is there a route to this destination yet?
+///
+/// Uses the same gate vocabulary `archive::gate_open` does — a bare id is a
+/// mission, `warden:<id>` a raid clear — so the starmap and the archaeology
+/// map cannot disagree about where you have been.
+fn gate_open_for(dest: &str, sb: &Shipboard) -> bool {
+    // the first two are always open; the rest follow the missions that reach
+    // them, which is what `content::MISSIONS` already encodes
+    if matches!(dest, "earth" | "outer_rim") {
+        return true;
+    }
+    crate::content::MISSIONS
+        .iter()
+        .filter(|m| m.dest == dest)
+        .any(|m| sb.camp.is_cleared(m.id))
 }
 
 /// Build a station's console from the state.
 pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
     let mut rows: Vec<Row> = Vec::new();
     match st {
+        Station::Starmap => {
+            use crate::patrol::ROUTE;
+            // THE FIRST TIME `patrol` IS READABLE FROM INSIDE THE GAME.
+            // Twenty destinations with real gravity, terrain and weather,
+            // tested for years under `--terrain`, and until now invisible
+            // while playing.
+            let reachable = ROUTE.iter().filter(|d| gate_open_for(d.id, sb)).count();
+            rows.push(Row::heading(&format!(
+                "{reachable} of {} plotted",
+                ROUTE.len()
+            )));
+            rows.push(Row::gap());
+            for d in ROUTE.iter() {
+                let open = gate_open_for(d.id, sb);
+                let g = crate::mapsim::ground_for(d);
+                let label = format!(
+                    "{:<14} {:>4.2}g {:?}",
+                    d.name.chars().take(14).collect::<String>(),
+                    d.gravity,
+                    g.material
+                );
+                if open {
+                    rows.push(
+                        Row::action(d.id, &label).hint(leak(format!(
+                            "{:?} under a {:?} sky, {}, {:?} held",
+                            d.terrain,
+                            d.sky,
+                            if d.weather { "weather" } else { "no air movement" },
+                            d.hostiles
+                        ))),
+                    );
+                } else {
+                    // greyed rather than hidden: the menu's own note says "why can't
+                    // I press this" beats a row that is not there, and a
+                    // starmap with holes in it is a worse map
+                    rows.push(
+                        Row::action(d.id, &format!("{label}   — no route yet")).disabled(),
+                    );
+                }
+            }
+            rows.push(Row::gap());
+            rows.push(Row::heading("plotting is not flying — see PRIORITIES.md"));
+        }
+        Station::Chartroom => {
+            let a = assay_with(
+                archive::CLAIMS,
+                archive::FINDINGS,
+                sb.dig.ids(),
+                &archive::priors(sb.anchor),
+            );
+            let ladder = sb.ladder;
+            let mut nodes: Vec<_> =
+                archive::CLAIMS.iter().filter(|c| a[c.id].standing_with(ladder).drawn()).collect();
+            // artifacts come HOME; terminals and cut walls were read where
+            // they stood and never reach this table
+            let shelved = archive::FINDINGS
+                .iter()
+                .filter(|f| sb.dig.has(f.id) && f.medium == Medium::Artifact)
+                .count();
+            let crated = unexamined(sb);
+            rows.push(Row::heading(&format!(
+                "{} home / {} nodes / anchor {}",
+                shelved,
+                nodes.len(),
+                archive::anchor_name(sb.anchor)
+            )));
+            // The one thing this table DOES rather than shows. You can only
+            // go through evidence from somewhere you have actually been, so
+            // the gate is a cleared mission at that site: "everything you
+            // carried home" is the room's own description of itself.
+            if !crated.is_empty() {
+                rows.push(Row::gap());
+                rows.push(Row::heading(&format!("UNEXAMINED ({})", crated.len())));
+                for f in &crated {
+                    rows.push(
+                        Row::action(f.id, &format!("{} ({})", f.id, f.site))
+                            .hint(leak(format!("{:?} — recovered at {}", f.medium, f.site))),
+                    );
+                }
+            }
+            if nodes.is_empty() {
+                rows.push(Row::heading(
+                    "the table is bare. the map is built out of what you carry home.",
+                ));
+            }
+            nodes.sort_by_key(|c| (std::cmp::Reverse(a[c.id].standing_with(ladder)), c.layer, c.id));
+            for c in nodes {
+                let asy = &a[c.id];
+                // Lead with the claim. The first version put the STANDING
+                // first and left the id out of the label entirely, so the
+                // console showed three rows reading "L2 UNKNOWN TECHNOLOGICAL
+                // RELATION — 1 for / 0 against" and nothing else: identical,
+                // and truncated at the console's width besides. Found by
+                // driving `--menu chartroom`, not by a test.
+                rows.push(Row::action(
+                    c.id,
+                    &format!(
+                        "L{} {:<26} {} {}/{}",
+                        c.layer,
+                        c.id,
+                        asy.standing_with(ladder).short(),
+                        asy.support(),
+                        asy.opposition()
+                    ),
+                ));
+            }
+        }
         Station::Bridge => {
             rows.push(Row::heading(&format!(
-                "ENERGON {}   ({} missions, {} wardens, {} nightfalls)",
+                "ENERGON {}  ({}m {}w {}n)",
                 sb.energon(),
                 sb.camp.done(),
                 sb.raids.shards(),
@@ -205,10 +546,10 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
             )));
             let card = nightfall::card(week);
             let nf_label = format!(
-                "NIGHTFALL — {} under a {} burn{}",
+                "NIGHTFALL {} / {}{}",
                 card.mission.id,
                 card.burn.name(),
-                if card.exposure { ", exposure" } else { "" }
+                if card.exposure { " / exposed" } else { "" }
             );
             if sb.nf.cleared(week) {
                 rows.push(Row::action("nf", &nf_label).hint("banked this week; it returns at the reset").disabled());
@@ -221,13 +562,32 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                 Some(m) => {
                     let rec = energon::rec_energon(m);
                     let have = sb.energon();
-                    let label = format!("{}  (film {}, rec {rec})", m.id, m.film);
+                    // A campaign built on introducing one mechanic per mission
+                    // should SAY so on the row that offers it -- that is the
+                    // whole shape of the thing (see curriculum.rs), and a
+                    // sortie list that hides it is a list of names.
+                    let teaches = curriculum::taught_by(m.id);
+                    // terse: the console gives ~46 characters and the tail is
+                    // the informative part, so the first version lost exactly
+                    // the words worth reading ("— teaches tra~")
+                    let label = match teaches.first() {
+                        Some(k) => format!("{} (f{}, rec {rec}) +{}", m.id, m.film, k.id),
+                        None => format!("{} (f{}, rec {rec})", m.id, m.film),
+                    };
                     let r = Row::action(m.id, &label);
                     rows.push(if have < rec {
                         r.hint("LOW ENERGON: this will hurt")
+                    } else if let Some(k) = teaches.first() {
+                        r.hint(leak(format!("{}  |  {}", m.beat, k.note)))
                     } else {
                         r.hint(m.beat)
                     });
+                    // what the player can already do, so the funnel is visible
+                    let known = curriculum::known_after(m).len();
+                    rows.push(Row::heading(&format!(
+                        "KIT {known}/{} — nothing is taken away",
+                        curriculum::CURRICULUM.len()
+                    )));
                 }
                 None => rows.push(Row::heading("the campaign is finished; the wardens hold the rest")),
             }
@@ -286,7 +646,11 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
             rows.push(Row::action("sort", "TIDY THE CHEST").hint("weapons first, then armor, alphabetical"));
         }
         Station::Medbay => {
-            rows.push(Row::heading(&format!("THE BEARER — chi: {}", crate::chi::sheet(&sb.chi))));
+            // 46 total on the console, minus this prefix
+            rows.push(Row::heading(&format!(
+                "THE BEARER — chi: {}",
+                crate::chi::sheet_short(&sb.chi, 28)
+            )));
             rows.push(Row::gap());
             // THE WATCH — every native form is already the Morpher's
             // (`watch.rs`, against Clones.md: "he has mapped them"), so
@@ -389,6 +753,106 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
     let Event::Pressed(id) = ev else { return None };
     let id = *id;
     match st {
+        Station::Starmap => {
+            use crate::patrol::ROUTE;
+            let Some(d) = ROUTE.iter().find(|d| d.id == id) else { return None };
+            if !gate_open_for(d.id, sb) {
+                return Some(Order::Did(format!("{} — no route yet.", d.name)));
+            }
+            // AND NOW IT FLIES IT. The chain the campaign has always had in
+            // pieces and never in sequence:
+            //
+            //     patrol::Destination -> mapsim::ground_for -> drop::Drop
+            //
+            // Resolved in simulation, not rendered — which is the same
+            // boundary the missions already sit behind, and honest about it.
+            let g = crate::mapsim::ground_for(d);
+            if is_dock(d) {
+                return Some(Order::Did(format!(
+                    "{} — {:?} at {:.2}g. nothing to fall toward: you dock, you \
+                     do not land.",
+                    d.name, d.terrain, d.gravity
+                )));
+            }
+            let land = fly_the_drop(d, &g);
+            let verdict = if land.miss_distance < 40.0 {
+                format!("down at {:.0} m from the mark", land.miss_distance)
+            } else {
+                format!("SCATTERED — {:.0} m wide", land.miss_distance)
+            };
+            let line = format!(
+                "{} {:.2}g: {} at {:.0} m/s{}",
+                d.name,
+                d.gravity,
+                verdict,
+                land.impact_speed,
+                if land.hero { ", clean fold" } else { "" }
+            );
+            // and actually GO. Plotting a course that changes nothing is a
+            // line of text; the shell loads the map because the console
+            // cannot.
+            Some(Order::Depart { dest: d.id, line })
+        }
+        Station::Chartroom => {
+            // Going through what you brought back IS this room's job, so a
+            // press on an unexamined crate records it. A press on a NODE is
+            // still read-only: the map is derived from the evidence and is
+            // not somewhere you can write.
+            if let Some(f) = unexamined(sb).into_iter().find(|f| f.id == id) {
+                let before = assay_with(
+                    archive::CLAIMS,
+                    archive::FINDINGS,
+                    sb.dig.ids(),
+                    &archive::priors(sb.anchor),
+                );
+                sb.dig.record(f.id);
+                let after = assay_with(
+                    archive::CLAIMS,
+                    archive::FINDINGS,
+                    sb.dig.ids(),
+                    &archive::priors(sb.anchor),
+                );
+                sb.store();
+                let moved: Vec<&str> = archive::CLAIMS
+                    .iter()
+                    .filter(|c| {
+                        before[c.id].standing_with(sb.ladder)
+                            != after[c.id].standing_with(sb.ladder)
+                    })
+                    .map(|c| c.id)
+                    .collect();
+                return Some(Order::Did(if moved.is_empty() {
+                    format!("{} — logged. nothing on the map moves.", f.id)
+                } else {
+                    format!("{} — logged. {} moves.", f.id, moved.join(", "))
+                }));
+            }
+            // a reading surface for the map itself: pressing a node shows
+            // its citations.
+            let c = archive::claim(id)?;
+            let a = assay_with(
+                archive::CLAIMS,
+                archive::FINDINGS,
+                sb.dig.ids(),
+                &archive::priors(sb.anchor),
+            );
+            let asy = a.get(c.id)?;
+            let mut out = format!("{} — {}", asy.standing_with(sb.ladder).label(), c.text);
+            for f in archive::FINDINGS.iter().filter(|f| sb.dig.has(f.id)) {
+                for l in f.links.iter().filter(|l| l.claim == c.id) {
+                    let verb = match l.bearing {
+                        Bearing::Supports => "for",
+                        Bearing::Contradicts => "against",
+                        Bearing::Mentions => "names",
+                    };
+                    out.push_str(&format!("\n  {verb}: {} (via {})", f.id, f.source));
+                }
+            }
+            if asy.support() > 0 && asy.opposition() > 0 {
+                out.push_str("\n  these do not average. somebody is wrong, or lying.");
+            }
+            Some(Order::Did(out))
+        }
         Station::Bridge => {
             if id == "nf" {
                 return Some(Order::Nightfall(week));
@@ -475,11 +939,632 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
     }
 }
 
+/// Which mission an order means, and under what modifiers.
+///
+/// Split out from `run_order` because that one loads and stores the save,
+/// which makes it untestable in a suite that runs in one working directory.
+/// This half is a pure lookup and carries the whole of the mapping — an
+/// order naming a mission that does not exist is the failure worth catching,
+/// and it is catchable here.
+fn order_target(
+    order: &Order,
+) -> Option<(&'static crate::content::Mission, Option<crate::nightfall::Nightfall>)> {
+    let (id, card) = match order {
+        Order::Sortie(id) => (*id, None),
+        Order::Nightfall(week) => {
+            let c = crate::nightfall::card(*week);
+            (c.mission.id, Some(c))
+        }
+        // Did / Refused / Goto never reach the shell: `deck::on_event`
+        // consumes them itself. Depart DOES reach the shell and is handled
+        // before this — it loads a map, which needs the gpu. Reaching here
+        // with one means the shell forgot to intercept it, and returning
+        // None is the right answer: better a departure that does nothing
+        // than a mission run for a destination.
+        _ => return None,
+    };
+    let m = crate::content::MISSIONS.iter().find(|m| m.id == id)?;
+    Some((m, card))
+}
+
+/// Execute a station order, and say what happened.
+///
+/// These were built and thrown away: `deck` handles `Did`, `Refused` and
+/// `Goto` itself, and the two that escaped — a sortie and the week's
+/// nightfall — were toasted with "fly it from the terminal sims for now".
+/// The console offered a mission and pressing it did nothing, which is the
+/// wiring debt `docs/PLAN.md` describes, in one line of the shell.
+///
+/// **What this does NOT claim.** The mission is RESOLVED by
+/// `campaign::MissionRun` — the same deterministic resolver `--campaign`
+/// runs — not played. That is a real outcome that persists, and it is not an
+/// action mission; the toast says so rather than letting a resolved clear
+/// look like a flown one. Flying them is the renderer's job and is still
+/// ahead.
+///
+/// Returns the line to show and whether the save changed.
+///
+/// The DECISION half lives in `order_target` so it can be tested without
+/// touching the save file; this function is the effect.
+pub fn run_order(order: &Order) -> (String, bool) {
+    use crate::campaign::{CampaignLog, MissionRun, DEFAULT_DOCTRINE, DEFAULT_SQUAD};
+    let (sv, binds, cfg) = crate::save::load();
+    let mut camp = CampaignLog::from_line(&sv.missions);
+    let raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
+    let mut nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
+    let have = crate::energon::energon(&camp, &raids, nf.count());
+
+    let Some((m, card)) = order_target(order) else {
+        return (format!("{order:?}"), false);
+    };
+
+    // THE DROP COMES FIRST. A sortie used to go straight from the Bridge to a
+    // resolved result — "resolved, not flown" was the honest label and there
+    // was nothing to fly. There is now: the mission has a `dest`, `patrol` has
+    // its physics, and `drop.rs` flies the descent.
+    //
+    // A scattered landing costs you: the squad arrives spread and starts the
+    // engagement worse. That is the first thing in this game where getting
+    // somewhere badly has a consequence at the far end.
+    let arrival = arrive_at(m.dest);
+
+    let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
+    let mut run = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, have);
+    // SPEND THE PENALTY. `power` is the multiplier the whole engagement runs
+    // on, resolved once against the mission's recommended energon — which is
+    // exactly where arriving badly belongs. A cost that costs nothing is
+    // decoration, and this is the first consequence in the game for getting
+    // somewhere badly.
+    if arrival.penalty > 0.0 {
+        run = run.arrived_badly(arrival.penalty);
+    }
+    if let Some(c) = &card {
+        run = run.with_modifiers(Some(c.burn), c.exposure);
+    }
+    // cap the resolve so a Survive objective cannot hang the frame
+    let won = run.resolve(600.0);
+
+    if !won {
+        return (
+            format!("{} — {} lost. the squad did not hold", m.id, arrival.line),
+            false,
+        );
+    }
+    let mut sv = sv;
+    let fresh = camp.record(m.id);
+    sv.missions = camp.line();
+    if let Some(c) = &card {
+        nf.record(c.week);
+        sv.nightfalls = nf.line();
+    }
+    crate::save::store(&sv, &binds, &cfg);
+    let what = if card.is_some() { "nightfall" } else { "sortie" };
+    (
+        format!(
+            "{} — {} {what} CLEARED{}",
+            m.id,
+            arrival.line,
+            if fresh { "" } else { "; already on the board" }
+        ),
+        true,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::menu::{Host, Input};
     use crate::weapons::{Element, Verb};
+
+    #[test]
+    fn the_chartroom_is_bare_until_something_is_carried_home() {
+        let mut sb = board();
+        sb.anchor = 0.0; // FRESH: assume nothing
+        let m = build(Station::Chartroom, &sb, 0);
+        let text: String = m.rows.iter().map(|r| r.label.clone()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("bare"), "{text}");
+        let bare_rows = m.rows.len();
+
+        // two independent sources for one claim, and a node appears
+        sb.dig.record("bunker_alloy");
+        sb.dig.record("museum_specimen");
+        let m2 = build(Station::Chartroom, &sb, 0);
+        assert!(m2.rows.len() > bare_rows, "the table did not grow");
+        let text2: String =
+            m2.rows.iter().map(|r| r.label.clone()).collect::<Vec<_>>().join("\n");
+        assert!(text2.contains("possible"), "{text2}");
+        // both are carry-home artifacts, so both reach the lamp
+        assert!(text2.contains("2 home"), "{text2}");
+
+        // THE ROWS MUST BE TELLABLE APART. The first version of this console
+        // put the standing in the label and left the claim id out, so every
+        // node rendered as the same sentence. A test that only checked for
+        // the standing text passed happily through that.
+        let node_rows: Vec<&String> =
+            m2.rows.iter().filter(|r| archive::claim(r.id).is_some()).map(|r| &r.label).collect();
+        assert!(node_rows.len() >= 2, "expected several nodes, got {node_rows:?}");
+        for c in archive::CLAIMS {
+            if let Some(row) = m2.rows.iter().find(|r| r.id == c.id) {
+                assert!(
+                    row.label.contains(c.id),
+                    "row for {} does not name it: {:?}",
+                    c.id,
+                    row.label
+                );
+            }
+        }
+        let uniq: std::collections::BTreeSet<&String> = node_rows.iter().copied().collect();
+        assert_eq!(uniq.len(), node_rows.len(), "two node rows read identically");
+    }
+
+    #[test]
+    fn shipboard_writes_back_everything_it_loaded() {
+        // `finds` was loaded into Shipboard and left out of `store` — the
+        // exact bug `save::tests` now guards at its own layer. This is the
+        // same check one layer up: every line Shipboard OWNS must survive a
+        // store, or a console's work vanishes on the next load.
+        let src = include_str!("stations.rs");
+        let load_body = src
+            .split("pub fn load() -> Shipboard {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("Shipboard::load");
+        let store_body = src
+            .split("pub fn store(&self) {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("Shipboard::store");
+
+        // every `sv.<field>` load reads must have a matching store write
+        for line in load_body.lines() {
+            let Some(rest) = line.split("&sv.").nth(1) else { continue };
+            let field: String =
+                rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if field.is_empty() {
+                continue;
+            }
+            assert!(
+                store_body.contains(&format!("sv.{field} =")),
+                "Shipboard loads sv.{field} and never writes it back"
+            );
+        }
+    }
+
+    #[test]
+    fn the_campaign_runs_in_sequence() {
+        // PRIORITIES.md item 1 was "one mission end to end, badly". This is
+        // the whole board: each sortie flies to its own destination and the
+        // next one becomes available, which is the thing that had never been
+        // asked to happen in sequence.
+        //
+        // Verified by driving the log directly rather than the console, so it
+        // does not depend on menu navigation.
+        let mut camp = crate::campaign::CampaignLog::from_line("");
+        let mut flown = Vec::new();
+        for _ in 0..6 {
+            let Some(m) = camp.next() else { break };
+            let a = arrive_at(m.dest);
+            assert!(!a.line.is_empty(), "{} did not fly anywhere", m.id);
+            flown.push((m.id, m.dest));
+            camp.record(m.id);
+        }
+        assert!(flown.len() >= 5, "the board stalled after {}", flown.len());
+        // and they are not all the same place — the drop is reading the
+        // mission rather than a constant
+        let mut worlds: Vec<&str> = flown.iter().map(|(_, d)| *d).collect();
+        worlds.sort_unstable();
+        worlds.dedup();
+        assert!(worlds.len() >= 3, "five missions visited {worlds:?}");
+    }
+
+    #[test]
+    fn a_sortie_flies_to_its_destination_before_it_resolves() {
+        // "resolved, not flown" was the honest label when there was nothing
+        // to fly. The mission names a dest, patrol knows its physics, and
+        // drop.rs flies the fall — so the report says where it landed.
+        for m in crate::content::MISSIONS.iter().take(6) {
+            let a = arrive_at(m.dest);
+            assert!(
+                !a.line.is_empty(),
+                "{} goes to '{}' and the drop said nothing",
+                m.id,
+                m.dest
+            );
+            assert!((0.0..=0.35).contains(&a.penalty), "{}: {}", m.id, a.penalty);
+        }
+    }
+
+    #[test]
+    fn every_mission_goes_somewhere_the_route_knows() {
+        // a mission whose dest is not on the route silently skips the drop,
+        // which would look like the feature being off rather than the data
+        // being wrong
+        for m in crate::content::MISSIONS {
+            assert!(
+                crate::patrol::ROUTE.iter().any(|d| d.id == m.dest),
+                "{} goes to '{}', which is not a destination",
+                m.id,
+                m.dest
+            );
+        }
+    }
+
+    #[test]
+    fn arriving_badly_costs_the_engagement() {
+        // a cost that costs nothing is decoration. `power` is the multiplier
+        // the whole fight runs on and `arrived_badly` is the only named way
+        // to move it after it is resolved.
+        use crate::campaign::{MissionRun, DEFAULT_DOCTRINE, DEFAULT_SQUAD};
+        let m = &crate::content::MISSIONS[0];
+        let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
+        let clean = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40);
+        let rough = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40).arrived_badly(0.3);
+        // resolve both from the same start and the weakened one should not do
+        // better
+        let mut a = clean;
+        let mut b = rough;
+        let (wa, wb) = (a.resolve(600.0), b.resolve(600.0));
+        assert!(wa || !wb, "arriving scattered helped");
+        // and the loss is clamped so a bad landing is a setback, not a loss
+        let floored = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, 40).arrived_badly(5.0);
+        let mut f = floored;
+        let _ = f.resolve(600.0); // must not panic or hang
+    }
+
+    #[test]
+    fn every_destination_resolves_to_a_real_map_and_they_are_not_all_one() {
+        // The starmap loads a map now, so a destination that resolves to a
+        // style index off the end is a crash on arrival — and one that
+        // resolves them all to MEADOW is a starmap where every world looks
+        // the same, which is worse than no starmap.
+        use std::collections::BTreeSet;
+        let mut seen = BTreeSet::new();
+        for d in crate::patrol::ROUTE.iter() {
+            let i = crate::mapsim::style_for(d);
+            assert!(
+                i < crate::world::STYLE_COUNT,
+                "{} resolves to style {i} of {}",
+                d.id,
+                crate::world::STYLE_COUNT
+            );
+            seen.insert(i);
+        }
+        assert!(seen.len() >= 4, "eighteen destinations share {} maps", seen.len());
+    }
+
+    #[test]
+    fn docking_costs_nothing_because_there_is_no_drop() {
+        let a = arrive_at("outer_rim");
+        assert_eq!(a.penalty, 0.0);
+        assert!(a.line.contains("docked"), "{}", a.line);
+        // and an unknown destination is silent rather than free-with-a-line
+        let none = arrive_at("nowhere_at_all");
+        assert!(none.line.is_empty());
+        assert_eq!(none.penalty, 0.0);
+    }
+
+    #[test]
+    fn the_starmap_makes_patrol_reachable_from_inside_the_game() {
+        // `docs/PRIORITIES.md` counted zero references to `patrol` in
+        // `main.rs`. Stations ARE in the game loop, so this is the smallest
+        // honest fix — and a test that the destinations show up at all,
+        // because "it exists and is tested" was already true and was not
+        // enough.
+        let sb = board();
+        let m = build(Station::Starmap, &sb, 0);
+        let labels: Vec<&str> = m.rows.iter().map(|r| r.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("EARTH")),
+            "the starmap does not list Earth: {labels:?}"
+        );
+        assert!(
+            m.rows.len() >= crate::patrol::ROUTE.len(),
+            "only {} rows for {} destinations",
+            m.rows.len(),
+            crate::patrol::ROUTE.len()
+        );
+    }
+
+    #[test]
+    fn gravity_actually_changes_the_landing() {
+        // The chain is only worth having if the destination's physics reach
+        // the outcome. A low-gravity world should arrive slower; if every
+        // world lands identically then `ground_for` is decorative and the
+        // three modules are still three modules.
+        use crate::patrol::ROUTE;
+        let fly = |id: &str| {
+            let d = ROUTE.iter().find(|d| d.id == id).expect(id);
+            let g = crate::mapsim::ground_for(d);
+            (d.gravity, fly_the_drop(d, &g))
+        };
+        let (g_earth, earth) = fly("earth");
+        let (g_luna, luna) = fly("luna");
+        assert!(g_luna < g_earth * 0.5, "the fixture worlds are too alike");
+        assert!(
+            luna.impact_speed < earth.impact_speed,
+            "a sixth of a g arrived at {:.0} m/s against Earth's {:.0}",
+            luna.impact_speed,
+            earth.impact_speed
+        );
+        // and everywhere with a surface lands somewhere real
+        for d in ROUTE.iter().filter(|d| !is_dock(d)) {
+            let l = fly_the_drop(d, &crate::mapsim::ground_for(d));
+            assert!(l.miss_distance.is_finite(), "{} never landed at all", d.id);
+            assert!(l.impact_speed >= 0.0 && l.impact_speed < 400.0, "{}: {:?}", d.id, l);
+        }
+    }
+
+    #[test]
+    fn deep_space_is_a_dock_not_a_landing() {
+        // Three destinations have no gravity to fall toward. Forcing a drop
+        // there loops until the timeout and reports an infinite miss, which
+        // is how this was found — the route table is right and my assumption
+        // that every destination has a surface was not.
+        use crate::patrol::ROUTE;
+        let docks: Vec<&str> =
+            ROUTE.iter().filter(|d| is_dock(d)).map(|d| d.id).collect();
+        assert!(docks.len() >= 2, "expected deep-space destinations: {docks:?}");
+        assert!(docks.contains(&"outer_rim"));
+
+        let mut sb = board();
+        sb.camp.record("the_scavenger_king");
+        let out = apply(Station::Starmap, &Event::Pressed("outer_rim"), &mut sb, 0);
+        let Some(Order::Did(line)) = out else { panic!("no report") };
+        assert!(line.contains("dock"), "it tried to land on deep space: {line}");
+        assert!(!line.contains("m/s"), "it reported an impact speed: {line}");
+    }
+
+    #[test]
+    fn the_same_course_flies_the_same_way_twice() {
+        // a console reporting a different outcome each press is telling you
+        // about its RNG rather than about the world
+        let d = crate::patrol::ROUTE.iter().find(|d| d.id == "earth").unwrap();
+        let g = crate::mapsim::ground_for(d);
+        let a = fly_the_drop(d, &g);
+        let b = fly_the_drop(d, &g);
+        assert_eq!(a.impact_speed, b.impact_speed);
+        assert_eq!(a.miss_distance, b.miss_distance);
+    }
+
+    #[test]
+    fn unreachable_places_are_greyed_rather_than_hidden() {
+        // menu.rs's own note: "why can't I press this" is a better experience
+        // than a row that is not there, and a starmap with holes in it is a
+        // worse map
+        let sb = board();
+        let m = build(Station::Starmap, &sb, 0);
+        // count by ID rather than by a substring of the label — "g " also
+        // matches the "N of M plotted" heading, which is how this first read
+        // nineteen destinations out of eighteen
+        let ids: Vec<&str> = m.rows.iter().map(|r| r.id).filter(|i| !i.is_empty()).collect();
+        let shown = crate::patrol::ROUTE.iter().filter(|d| ids.contains(&d.id)).count();
+        let pressable = m.rows.iter().filter(|r| r.enabled).count();
+        assert_eq!(shown, crate::patrol::ROUTE.len(), "some destinations are hidden");
+        assert!(pressable < shown, "everywhere is reachable from a fresh save");
+        assert!(pressable >= 1, "nowhere is reachable at all");
+    }
+
+    #[test]
+    fn clearing_a_mission_opens_its_destination() {
+        let mut sb = board();
+        let before = build(Station::Starmap, &sb, 0)
+            .rows
+            .iter()
+            .filter(|r| r.enabled)
+            .count();
+        // pluto is gated behind the mission that reaches it
+        sb.camp.record("the_pluto_line");
+        let after = build(Station::Starmap, &sb, 0)
+            .rows
+            .iter()
+            .filter(|r| r.enabled)
+            .count();
+        assert!(after > before, "clearing a mission opened nothing: {before} -> {after}");
+    }
+
+    #[test]
+    fn the_starmap_flies_the_drop_and_reports_the_landing() {
+        // This test used to assert the console said "not wired yet", and it
+        // FAILED when the drop was connected — which is the assertion working.
+        // A claim about what a feature does not do has to be revisited when it
+        // starts doing it, and a test is the only thing that makes that
+        // happen on purpose rather than by somebody noticing.
+        // Now returns `Depart` rather than `Did`, because plotting a course
+        // that changes nothing is a line of text — the shell loads the map.
+        // This test asserted `Did` and failed when that landed, which is the
+        // assertion working: a claim about what a console RETURNS has to be
+        // revisited when the console starts doing more.
+        let mut sb = board();
+        let out = apply(Station::Starmap, &Event::Pressed("earth"), &mut sb, 0);
+        let Some(Order::Depart { dest, line }) = out else { panic!("no departure: {out:?}") };
+        assert_eq!(dest, "earth");
+        assert!(line.contains("EARTH"), "{line}");
+        assert!(line.contains("m/s"), "no impact speed: {line}");
+        assert!(
+            line.contains("from the mark") || line.contains("SCATTERED"),
+            "no landing verdict: {line}"
+        );
+
+        // and an unreachable one refuses rather than departing
+        let out = apply(Station::Starmap, &Event::Pressed("pluto"), &mut sb, 0);
+        let Some(Order::Did(line)) = out else { panic!("it departed for nowhere: {out:?}") };
+        assert!(line.contains("no route"), "{line}");
+    }
+
+    #[test]
+    fn you_can_only_examine_evidence_from_somewhere_you_have_been() {
+        // the gate that stops the Chartroom being a button that hands over
+        // the whole history
+        let mut sb = board();
+        assert!(unexamined(&sb).is_empty(), "a crew that has flown nothing has nothing to examine");
+
+        sb.camp.record("the_beach_opens"); // the beach, the ridge, the farmhouse
+        let crated = unexamined(&sb);
+        assert!(!crated.is_empty(), "clearing an earth mission should open something");
+        assert!(crated.iter().all(|f| f.site == "earth"), "evidence leaked from another world");
+
+        // AND NOT ALL OF EARTH. This assertion is the one that was missing:
+        // the gate was destination-level, so one mission opened all seventeen
+        // Earth findings including an observatory it never went near, and a
+        // test that only checked "something opened" could not see it.
+        use crate::groundside;
+        let all_earth = crate::archive::FINDINGS.iter().filter(|f| f.site == "earth").count();
+        assert!(
+            crated.len() < all_earth,
+            "one mission opened every one of the {all_earth} earth findings"
+        );
+        for f in &crated {
+            let p = groundside::place_of(f.id).expect("an earth finding has an address");
+            assert!(
+                p.reached_by.contains(&"the_beach_opens"),
+                "{} is at {}, which the beach mission does not reach",
+                f.id,
+                p.id
+            );
+        }
+        // and nothing gated stays visible
+        assert!(
+            crated.iter().all(|f| f.gate.is_none()),
+            "a sealed finding showed up before its gate opened"
+        );
+    }
+
+    #[test]
+    fn examining_a_crate_records_it_and_moves_the_map() {
+        let mut sb = board();
+        sb.camp.record("the_beach_opens");
+        let f = unexamined(&sb)[0];
+        let n = sb.dig.count();
+
+        let out = apply(Station::Chartroom, &Event::Pressed(f.id), &mut sb, 0);
+        let Some(Order::Did(line)) = out else { panic!("expected a report, got {out:?}") };
+        assert!(line.contains(f.id), "{line}");
+        assert_eq!(sb.dig.count(), n + 1, "the crate was not recorded");
+        assert!(sb.dig.has(f.id));
+        // and it is gone from the pile
+        assert!(!unexamined(&sb).iter().any(|x| x.id == f.id));
+    }
+
+    #[test]
+    fn pressing_a_chartroom_NODE_is_still_read_only() {
+        let mut sb = board();
+        sb.dig.record("directorate_record");
+        sb.dig.record("trench_excavation_scar");
+        let before = sb.dig.line();
+        let out = apply(Station::Chartroom, &Event::Pressed("facility_built_2003"), &mut sb, 0);
+        let Some(Order::Did(line)) = out else { panic!("expected a report, got {out:?}") };
+        assert!(line.contains("SOURCES DISAGREE"), "{line}");
+        // the map is DERIVED from the evidence; it is not somewhere you write
+        assert!(line.contains("for: directorate_record"), "{line}");
+        assert!(line.contains("against: trench_excavation_scar"), "{line}");
+        assert_eq!(sb.dig.line(), before, "the chartroom edited the dig");
+    }
+
+    #[test]
+    fn every_station_is_in_a_room_that_exists_and_can_be_walked_to() {
+        use crate::content::HUB;
+        use crate::interior::Interior;
+        // the floor plan is generated for a real hull; every console must be
+        // in a cell of it, and every cell must be reachable from the bridge —
+        // a station behind a door with no path is a menu nobody can open.
+        let mut plan = Interior::generate(90.0);
+        plan.unseal(); // the ship at rest, which is when consoles are used
+        let reachable = plan.reachable_from("bridge");
+        for st in STATIONS {
+            let c = st.cell();
+            assert!(HUB.iter().any(|r| r.id == c), "{} is in unknown room {c}", st.id());
+            assert!(plan.cell(c).is_some(), "{} is in a room the plan did not carve: {c}", st.id());
+            assert!(
+                reachable.contains(&c),
+                "{} sits in {c}, which cannot be reached from the bridge",
+                st.id()
+            );
+        }
+    }
+
+    #[test]
+    fn two_stations_do_not_share_a_console() {
+        // six consoles, six rooms. if two ever collide the room prose and the
+        // address disagree and one of them is decoration.
+        let mut cells: Vec<&str> = STATIONS.iter().map(|s| s.cell()).collect();
+        cells.sort_unstable();
+        let n = cells.len();
+        cells.dedup();
+        assert_eq!(cells.len(), n, "two stations share a room");
+    }
+
+    #[test]
+    fn the_bridge_offers_an_order_the_shell_can_actually_run() {
+        // the end-to-end contract, minus the I/O: the Bridge builds a row,
+        // `apply` turns pressing it into an Order, and `order_target`
+        // resolves that Order to a mission. Those are three tables that have
+        // to agree, and for a while they did not have to — the shell threw
+        // every order away, so a disagreement was invisible.
+        let sb = board();
+        let menu = build(Station::Bridge, &sb, 3);
+        let mut ran = 0;
+        for row in &menu.rows {
+            let Some(order) = apply(Station::Bridge, &Event::Pressed(row.id), &mut board(), 3)
+            else {
+                continue;
+            };
+            if matches!(order, Order::Sortie(_) | Order::Nightfall(_)) {
+                assert!(
+                    super::order_target(&order).is_some(),
+                    "the Bridge offers {:?}, which resolves to no mission",
+                    order
+                );
+                ran += 1;
+            }
+        }
+        assert!(ran >= 2, "the Bridge should offer at least a sortie and a nightfall, got {ran}");
+    }
+
+    #[test]
+    fn no_console_row_overflows_the_screen() {
+        // The console truncates at `menusim::LABEL_W` and the tail is always
+        // the informative part, so an overlong label loses exactly the words
+        // worth reading — the Bridge shipped "— teaches tra~" and the
+        // Chartroom's heading lost its anchor. Nothing told an author the
+        // budget existed; now something does.
+        use crate::menusim::LABEL_W;
+        // BOTH STATES. The first version of this used only `board()`, whose
+        // chi is populated — and `chi::sheet` returns a short summary when
+        // there is chi and a long sentence when there is none, so the medbay
+        // heading overflowed on a FRESH SAVE and this test never saw it.
+        // Testing the state that passes is not testing.
+        let mut dug = board();
+        for f in ["bunker_alloy", "museum_specimen", "directorate_record", "trench_excavation_scar"] {
+            dug.dig.record(f);
+        }
+        let mut fresh = board();
+        fresh.chi = Chi::default();
+        fresh.gear = Gear::default();
+
+        for (what, sb) in [("a played save", &dug), ("a fresh save", &fresh)] {
+            for st in STATIONS {
+                for row in build(st, sb, 3).rows {
+                    assert!(
+                        row.label.chars().count() <= LABEL_W,
+                        "{} row {:?} is {} chars on {what}, over the {LABEL_W} the console shows",
+                        st.id(),
+                        row.label,
+                        row.label.chars().count()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_chartroom_is_a_real_station_like_the_others() {
+        let st = Station::Chartroom;
+        assert!(STATIONS.contains(&st));
+        assert!(!st.id().is_empty() && !st.title().is_empty() && !st.room().is_empty());
+        // ids stay unique, or the console router picks the wrong room
+        let ids: std::collections::BTreeSet<_> = STATIONS.iter().map(|s| s.id()).collect();
+        assert_eq!(ids.len(), STATIONS.len());
+    }
 
     fn board() -> Shipboard {
         Shipboard {
@@ -491,6 +1576,9 @@ mod tests {
             vault: Vault::default(),
             watch: Watch::default(),
             hotbar: Hotbar::default(),
+            dig: Dig::default(),
+            anchor: 0.45,
+            ladder: Ladder::default(),
         }
     }
 
@@ -636,5 +1724,53 @@ mod tests {
         assert!(a.rows.iter().any(|r| r.id == "bag:0"));
         assert!(b.rows.iter().any(|r| r.id == "bag:0"));
         assert!(b.rows.iter().any(|r| r.id == "rail:kinetic"));
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use crate::content;
+    use crate::nightfall;
+
+    #[test]
+    fn a_sortie_order_names_a_real_mission() {
+        // the bug this guards: the Bridge builds rows from MISSIONS and the
+        // shell looks them up again by id. If those two ever disagree, the
+        // console offers a mission that silently does nothing — which is
+        // exactly the state this wiring replaced.
+        for m in content::MISSIONS {
+            let o = Order::Sortie(m.id);
+            let (got, card) = order_target(&o).expect("every mission id must resolve");
+            assert_eq!(got.id, m.id);
+            assert!(card.is_none(), "a plain sortie should carry no burn");
+        }
+    }
+
+    #[test]
+    fn a_nightfall_order_resolves_to_that_weeks_card() {
+        for week in [0u64, 1, 7, 52, 1000] {
+            let c = nightfall::card(week);
+            let (m, card) = order_target(&Order::Nightfall(week)).expect("card");
+            assert_eq!(m.id, c.mission.id);
+            let card = card.expect("a nightfall carries its modifiers");
+            assert_eq!(card.week, week);
+            assert_eq!(card.exposure, c.exposure);
+        }
+    }
+
+    #[test]
+    fn the_orders_the_deck_eats_do_not_reach_the_shell() {
+        // Did / Refused / Goto are handled inside deck::on_event. If one
+        // arrives here it means that contract moved, and treating it as a
+        // mission lookup would be wrong rather than merely useless.
+        assert!(order_target(&Order::Did("x".into())).is_none());
+        assert!(order_target(&Order::Refused("x".into())).is_none());
+        assert!(order_target(&Order::Goto(Station::Hold)).is_none());
+    }
+
+    #[test]
+    fn an_unknown_mission_id_is_refused_rather_than_panicking() {
+        assert!(order_target(&Order::Sortie("not_a_mission")).is_none());
     }
 }

@@ -174,7 +174,19 @@ pub const fn csdf_extent() -> (u32, u32, u32) {
 /// disagree. Until then this reports what the device could hold and the roster
 /// stays at CSDF_MAXM.
 pub fn sdf_capacity(device_max_3d: u32) -> u32 {
-    let by_device = device_max_3d / CSDF_SLAB;
+    // TILING. This function predates the atlas becoming a TILES x TILES grid
+    // and was never updated: it computed depth-only stacking, as if a model
+    // still advanced depth alone. Since tiling, `TILES^2` models share one
+    // depth slab, so it under-reported by a factor of sixteen.
+    //
+    // It went unnoticed because the `.max(CSDF_MAXM)` floor below swallowed
+    // the answer on every device — 4096 reported 256, the floor returned
+    // 1344, and the number was never wrong in a way anything could see. The
+    // doc note that this is "NOT YET USED TO SIZE THE TEXTURE" is why it was
+    // a stale number rather than a rendering bug, and also why nothing caught
+    // it: an unused answer is never checked against reality.
+    let slabs = device_max_3d / CSDF_SLAB;
+    let by_device = slabs.saturating_mul(CSDF_TILES * CSDF_TILES);
     // Never below the compile-time floor: shader constants and the staging
     // buffer are sized against CSDF_MAXM, and a device reporting less than
     // baseline would otherwise produce a roster the shader cannot index.
@@ -1343,29 +1355,60 @@ mod atlas_layout_tests {
 mod sdf_capacity_tests {
     use super::*;
 
+    /// How much depth a roster of `models` actually needs, given tiling.
+    /// The inverse of `sdf_capacity`, written out so the tests below check a
+    /// relationship rather than restating constants.
+    fn depth_for(models: u32) -> u32 {
+        models * CSDF_SLAB / (CSDF_TILES * CSDF_TILES)
+    }
+
     #[test]
-    fn the_baseline_device_gives_the_compile_time_count() {
-        // 2048 is WebGPU's guaranteed max_texture_dimension_3d, and 16*126 =
-        // 2016 is what fits under it. This is the case every device meets.
-        assert_eq!(sdf_capacity(2048), CSDF_MAXM);
+    fn the_baseline_device_holds_the_whole_shipped_library() {
+        // 2048 is WebGPU's guaranteed max_texture_dimension_3d. With TILES^2
+        // models per slab that is 2048 models, comfortably above CSDF_MAXM —
+        // which is the point of tiling: the library stopped being clipped.
+        assert_eq!(sdf_capacity(2048), 2048 / CSDF_SLAB * CSDF_TILES * CSDF_TILES);
+        assert!(sdf_capacity(2048) >= CSDF_MAXM, "baseline cannot hold the roster");
+        assert!(depth_for(CSDF_MAXM) <= 2048, "the shipped library does not fit the guarantee");
     }
 
     #[test]
     fn a_bigger_device_gets_a_bigger_roster() {
-        // The point of asking the adapter: a big enough device should
-        // get more than the floor. 4096/8192 used to demonstrate this
-        // (256, 512) back when CSDF_MAXM was 126 -- it moved to 1344
-        // ("the whole library loads"), and by_device.max(CSDF_MAXM)
-        // now clamps BOTH of those old device sizes to the same
-        // floor, so the test's own premise silently stopped holding.
-        // Sized off CSDF_MAXM itself now, comfortably past the floor
-        // in slab terms, so this can't go stale the same way again.
+        // The point of asking the adapter: 4096 is common on desktop. These
+        // were 256 and 512 — the pre-tiling numbers, sixteen times too small.
+        assert_eq!(sdf_capacity(4096), 4096);
+        assert_eq!(sdf_capacity(8192), 8192);
+        // and it is genuinely monotonic in the device limit
+        let mut prev = 0;
+        for d in [2048u32, 4096, 8192, 16384] {
+            let c = sdf_capacity(d);
+            assert!(c > prev, "capacity did not grow at {d}");
+            prev = c;
+        }
+
+        // AND THE SAME PROPERTY WITHOUT LITERALS, kept from the other side of
+        // the c8/c9 split. The concrete 4096/8192 assertions above are the
+        // clearer statement, but they are the second set of literals this test
+        // has had: the first pair (256, 512) was written when CSDF_MAXM was
+        // 126, and when the floor moved to 1344 both of those clamped to it,
+        // so the test still passed while no longer demonstrating anything.
+        // Sizing off CSDF_MAXM itself cannot go stale that way again.
         let small = (CSDF_MAXM + 200) * CSDF_SLAB;
         let big = (CSDF_MAXM + 400) * CSDF_SLAB;
         let cap_small = sdf_capacity(small);
         let cap_big = sdf_capacity(big);
         assert!(cap_small > CSDF_MAXM, "should exceed the floor once past it: {cap_small}");
         assert!(cap_big > cap_small, "a bigger device should get a bigger roster: {cap_big} vs {cap_small}");
+    }
+
+    #[test]
+    fn tiling_is_what_makes_the_library_fit() {
+        // the claim in CSDF_TILES' own doc comment: stacked on depth alone
+        // this roster needs ten times the 2048 limit. worth asserting, since
+        // it is the justification for the whole tiled layout.
+        let depth_untiled = CSDF_MAXM * CSDF_SLAB;
+        assert!(depth_untiled > 2048 * 8, "untiled depth is {depth_untiled}");
+        assert!(depth_for(CSDF_MAXM) <= 2048);
     }
 
     #[test]
@@ -1378,18 +1421,21 @@ mod sdf_capacity_tests {
     }
 
     #[test]
-    fn capacity_is_a_whole_number_of_slabs() {
+    fn a_reported_capacity_actually_fits_the_device() {
         // A partial slab is a model whose field is truncated mid-depth, which
         // reads as a silhouette with a slice missing rather than as an error.
-        // The bound is CSDF_MAXM * CSDF_SLAB, not a literal 2016 -- 2016 was
-        // 126 * CSDF_SLAB, the floor's OLD value before it moved to 1344.
-        // A device below the floor is EXPECTED to have capacity exceed its
-        // own reported limit (that's what the floor means, by design — see
-        // sdf_capacity's own doc comment), so this only tests devices at or
-        // above the floor in slab terms, where the property is meaningful.
-        let floor_bytes = CSDF_MAXM * CSDF_SLAB;
-        for d in [floor_bytes, floor_bytes + 1000, floor_bytes * 2, floor_bytes * 3, floor_bytes * 4] {
-            assert!(sdf_capacity(d) * CSDF_SLAB <= d.max(floor_bytes), "{d}");
+        // The old form of this test compared against a bare 2016 — the
+        // pre-tiling depth — and so could not have caught the tiling bug.
+        for d in [2048u32, 3000, 4096, 5000, 8192] {
+            let cap = sdf_capacity(d);
+            let needed = depth_for(cap);
+            // either it fits the device, or it is the floor, which is allowed
+            // to exceed a small device on purpose (see sdf_capacity)
+            assert!(
+                needed <= d || cap == CSDF_MAXM,
+                "device {d} was told it can hold {cap} models, which needs {needed} depth"
+            );
+            assert_eq!(cap % (CSDF_TILES * CSDF_TILES), 0, "{d} gave a partial tile row");
         }
     }
 }

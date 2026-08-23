@@ -210,29 +210,6 @@ impl Default for Hover {
 }
 
 impl Car {
-    /// Distance from centre to the LOWEST point of the body — `ride_h`
-    /// when it has been set by something that measured the actual
-    /// pose (`model.rs`'s static load path, or `xform.rs`'s live blend
-    /// during a fold), `half_h` otherwise (a model that never folds,
-    /// or before anything has measured it yet).
-    ///
-    /// This is the single source of truth `main.rs`'s two seating call
-    /// sites already used inline (duplicated) — and, until this
-    /// change, the one `physics.rs`'s ground-contact/suspension code
-    /// did NOT use at all: `clearance` there was `car.half_h` directly,
-    /// meaning every physics step after a fold finished pulled a
-    /// standing robot back down to sit at its symmetric half-height
-    /// instead of the true distance to its feet, silently undoing the
-    /// fold-time lift `main.rs` had just applied correctly. That is
-    /// the "transforms look fine, then old code puts the feet back
-    /// underground" bug reported multiple times — `main.rs`'s seating
-    /// only runs while a fold is `Transforming`; ordinary standing/
-    /// driving physics runs every frame regardless, via this exact
-    /// clearance value, and had never been taught about `ride_h`.
-    pub fn seat_h(&self) -> f32 {
-        if self.ride_h > 0.0 { self.ride_h } else { self.half_h }
-    }
-
     pub fn new() -> Car {
         Car {
             pos: Vec3::new(0.0, 1.0, 26.0),
@@ -351,10 +328,57 @@ impl Car {
     pub fn can_flip(&self) -> bool {
         self.has_dodge && self.dodge_window > 0.0
     }
+    /// How far the frame's lowest point sits below its origin.
+    ///
+    /// THE ONE DEFINITION. This expression existed at eight call sites —
+    /// three seating, the driving loop, two in `main.rs`, and two in tests —
+    /// and the driving loop was the one that got missed, which is why a
+    /// legged frame spawned correctly and sank as soon as it moved.
+    ///
+    /// There was even a test grepping `physics.rs` for the literal string
+    /// `"if self.ride_h > 0.0"` to check one site still had it. That guard
+    /// was a confession: a duplicated invariant you police with a text search
+    /// is one you should have extracted.
+    ///
+    /// A wheeled car leaves `ride_h` at 0 and gets `half_h`, exactly as
+    /// before.
+    /// Distance from centre to the LOWEST point of the body — `ride_h` when
+    /// something has measured the actual pose (`model.rs`'s static load path,
+    /// or `xform.rs`'s live blend during a fold), `half_h` otherwise (a model
+    /// that never folds, or before anything has measured it).
+    ///
+    /// MERGED FROM TWO NAMES. The c8/c9 split produced this same helper twice
+    /// with identical bodies: `seat_h` here and `stand_h` on the blackstar-005
+    /// line. `stand_h` survived because the incoming subsystems (parity.rs)
+    /// are written against it, and because `every_site_uses_stand_h` greps for
+    /// open-coded `ride_h > 0.0` and would have failed with both present.
+    ///
+    /// The bug it exists for, kept from the deleted twin's doc: `physics.rs`'s
+    /// ground-contact/suspension code used `car.half_h` directly, so every
+    /// physics step after a fold pulled a standing robot back down to its
+    /// symmetric half-height instead of the true distance to its feet —
+    /// silently undoing the fold-time lift `main.rs` had just applied. That is
+    /// the "transforms look fine, then old code puts the feet back
+    /// underground" report: `main.rs`'s seating only runs while a fold is
+    /// `Transforming`, while driving physics runs every frame through this
+    /// clearance and had never been taught about `ride_h`.
+    pub fn stand_h(&self) -> f32 {
+        if self.ride_h > 0.0 {
+            self.ride_h
+        } else {
+            self.half_h
+        }
+    }
+
     pub fn reset(&mut self, world: &World) {
         // land on the real surface, not the terrain height: raised decks
         // (DROPSHOT) used to spawn the car INSIDE the platform
-        let clr = self.seat_h() + 0.05;
+        // Seat by the LOWEST POINT, not by half the bounding box. A standing
+        // robot's feet hang far below its centre, so `half_h` spawns it
+        // partly underground — the same burial `ride_h` was added to fix,
+        // reached through the respawn path instead of the seating path.
+        let drop = self.stand_h();
+        let clr = drop + 0.05;
         let p = world.spawn_at(0.0, 26.0, clr);
         // WHAT SURVIVES A RESET IS THE CAR YOU CHOSE.
         //
@@ -367,7 +391,12 @@ impl Car {
         *self = Car {
             half_len: self.half_len,
             half_h: self.half_h,
-            ride_h: 0.0,
+            // WHAT SURVIVES A RESET IS THE CAR YOU CHOSE, and `ride_h`
+            // describes the car. It was listed here and zeroed, so every
+            // kickoff, respawn and map load silently dropped the seating
+            // height and fell back to `half_h` — burying anything whose
+            // model is not centred on its bounding box.
+            ride_h: self.ride_h,
             half_w: self.half_w,
             wheel_r: self.wheel_r,
             drive: self.drive,
@@ -837,11 +866,18 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     }
     let d = world.sdf(car.pos);
     let n = world.normal(car.pos);
-    // seat_h(), not half_h directly: this is the clearance every
-    // ground-contact/suspension calculation below is built on, and a
-    // standing robot's feet sit well below its symmetric half-height
-    // (see Car::seat_h's own doc for the bug this silently was).
-    let clearance = car.seat_h();
+    // THE FRAME'S FEET, NOT ITS MIDDLE. This was `car.half_h`, so every
+    // contact test in the driving loop — grounded, the compression zone, the
+    // pushout at 1178 — measured to the body's half-height while the legs
+    // hung `ride_h` below it. A folded bot sank by exactly the difference and
+    // kept driving, because as far as this line was concerned it was resting
+    // on its waist.
+    //
+    // Three seating sites were fixed earlier with the same fallback and this
+    // one was missed: those run at spawn and on reset, and this runs EVERY
+    // FRAME, which is why the spawn looked right and the car went through the
+    // floor as soon as it moved.
+    let clearance = car.stand_h();
     // Wheels grip ANY surface (RL-style wall/ceiling driving): contact counts
     // as "grounded" when the car's underside faces the surface. Floors accept
     // any orientation (you land, the align sorts you out); walls and ceilings
@@ -1111,7 +1147,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // A fast deck can outrun the frame in which contact is lost: keep
         // carrying while the car is still within a whisker of one, so a
         // 18 m/s carriage does not leave you standing in the air.
-        let probe = car.pos - Vec3::Y * (car.seat_h() + 0.12);
+        let probe = car.pos - Vec3::Y * (car.stand_h() + 0.12);
         if let Some(pv) = world.platform_vel(probe, 0.9) {
             car.pos += pv * dt;
             let rel = car.vel - pv;
@@ -1606,7 +1642,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
 
     // hard floor safety
     if car.pos.y < -60.0 {
-        car.pos = Vec3::new(0.0, world.ground_h(0.0, 26.0) + car.seat_h() + 0.1, 26.0);
+        car.pos = Vec3::new(0.0, world.ground_h(0.0, 26.0) + car.stand_h() + 0.1, 26.0);
         car.vel = Vec3::ZERO;
     }
 }
@@ -2142,26 +2178,264 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
 }
 
 #[cfg(test)]
-mod tests {
+mod reset_tests {
     use super::*;
 
+    // The two below came off the other side of the c8/c9 split, where this
+    // helper was called `seat_h`. They cover the FALLBACK contract, which the
+    // incoming tests do not: those all use a bot whose `ride_h` is set and
+    // positive. Renamed and kept rather than dropped with the duplicate,
+    // because a negative `ride_h` is legitimate — model.rs produces one for a
+    // body sitting entirely above the origin — and `> 0.0` rather than `!= 0.0`
+    // is the only thing standing between that and a frame seated underground.
+
     #[test]
-    fn seat_h_prefers_ride_h_when_it_is_set() {
+    fn stand_h_prefers_ride_h_when_it_is_set() {
         let mut car = Car::new();
         car.half_h = 0.377; // the OLD, wrong number for a standing robot
         car.ride_h = 0.400; // the real distance to the feet
-        assert_eq!(car.seat_h(), 0.400, "seat_h should prefer the real drop over the symmetric half-height");
+        assert_eq!(car.stand_h(), 0.400,
+            "stand_h should prefer the real drop over the symmetric half-height");
     }
 
     #[test]
-    fn seat_h_falls_back_to_half_h_when_ride_h_is_unset() {
+    fn stand_h_falls_back_to_half_h_when_ride_h_is_unset() {
         let mut car = Car::new();
         car.half_h = 0.26;
-        car.ride_h = 0.0; // the default -- never measured (a model that
-                           // never folds, or before the static loader ran)
-        assert_eq!(car.seat_h(), 0.26);
-        car.ride_h = -0.1; // a body sitting entirely above the origin --
+        car.ride_h = 0.0;  // the default — never measured (a model that never
+                           // folds, or before the static loader ran)
+        assert_eq!(car.stand_h(), 0.26);
+        car.ride_h = -0.1; // a body sitting entirely above the origin —
                            // model.rs's ride_h can legitimately be negative
-        assert_eq!(car.seat_h(), 0.26, "a negative ride_h should also fall back, not be used directly");
+        assert_eq!(car.stand_h(), 0.26,
+            "a negative ride_h should also fall back, not be used directly");
+    }
+
+    /// A `Car` shaped like a standing robot: its centre is high and its feet
+    /// hang well below the origin, so `ride_h` is much larger than `half_h`.
+    fn bot_shaped() -> Car {
+        Car { half_h: 0.9, ride_h: 1.5, half_len: 0.6, half_w: 0.5, ..Car::new() }
+    }
+
+    #[test]
+    fn every_site_uses_stand_h() {
+        // The replacement for a test that grepped for `"if self.ride_h > 0.0"`
+        // to confirm ONE site still had it. That guard could only ever check
+        // the site it named, which is why the driving loop diverged without
+        // anything noticing.
+        //
+        // This checks the opposite and useful thing: that nobody has
+        // open-coded the expression again anywhere.
+        for (name, src) in [
+            ("physics.rs", include_str!("physics.rs")),
+            ("main.rs", include_str!("main.rs")),
+        ] {
+            // Only NON-TEST code: `seating_tests::buried_by` open-codes it on
+            // purpose, because it models the OLD behaviour to show what the
+            // guard could not see, and rewriting it to call `stand_h` would
+            // delete the comparison it exists to make.
+            let live = src.split("#[cfg(test)]").next().unwrap_or("");
+            let open_coded = live
+                .lines()
+                .filter(|l| l.contains("ride_h > 0.0"))
+                .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+                .count();
+            assert!(
+                open_coded <= 1,
+                "{name} open-codes the stand height {open_coded} times outside tests; \
+                 use Car::stand_h"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legged_frame_does_not_sink_over_a_hundred_frames() {
+        // THE PARITY TEST THAT WAS MISSING. Seating was tested at spawn and
+        // reset; the per-frame path was not, so a fix that named the bug left
+        // the driving loop wrong and the car sank as soon as it moved.
+        //
+        // `step_car_only` is the same function the shell calls, at the same
+        // fixed step, so this is the frame loop rather than a model of it.
+        let world = World::generate(7, crate::world::style(0), 0.19, 1.0);
+        let cfg = Config::default();
+        let ball = Ball::new();
+
+        let mut bot = bot_shaped();
+        bot.reset(&world);
+        let start = bot.pos.y;
+        let ground = world.ground_h(bot.pos.x, bot.pos.z);
+        assert!(
+            start - ground >= bot.stand_h() - 0.05,
+            "spawn already buried: {start} over ground {ground}, stands {}",
+            bot.stand_h()
+        );
+
+        // drive forward for a hundred frames
+        let c = Controls { throttle: 1.0, ..Default::default() };
+        let mut lowest = f32::MAX;
+        for _ in 0..100 {
+            step_car_only(&mut bot, &ball, &world, &c, &cfg, 1.0 / 120.0);
+            let g = world.ground_h(bot.pos.x, bot.pos.z);
+            lowest = lowest.min(bot.pos.y - g);
+        }
+        // THE THRESHOLD IS SET AGAINST THE BUG, not against comfort. The
+        // first version asked for half the stand height: correct code rests
+        // at 1.44 and the BUGGY code rests at `half_h` = 0.90, and both clear
+        // 0.75. I checked that the fixed code passed and not that the broken
+        // code failed, which is how you write a test that guards nothing —
+        // and I only found out by reintroducing the bug on purpose.
+        //
+        // A frame seated at its waist rests at `half_h`. Anything below
+        // `stand_h` minus a suspension allowance is that bug.
+        let waist = bot.half_h;
+        assert!(
+            lowest > waist + (bot.stand_h() - waist) * 0.5,
+            "the frame sank to {lowest:.2}: it stands {:.2} tall and its waist is at \
+             {waist:.2}, so this is the driving loop seating it at the waist again",
+            bot.stand_h()
+        );
+    }
+
+    #[test]
+    fn the_driving_loop_measures_to_the_feet_not_the_waist() {
+        // THE FLOOR BUG, and the reason the earlier fix did not take. Three
+        // SEATING sites were corrected to fall back from `half_h` to
+        // `ride_h`; the per-frame contact in `step_car` was missed. Those run
+        // at spawn and on reset, this runs every frame — so the car was
+        // placed correctly and sank the moment it moved.
+        //
+        // No test covered it, which is why it survived a fix that named it.
+        let bot = bot_shaped();
+        let clearance = bot.stand_h();
+        assert_eq!(clearance, 1.5, "the loop would seat this bot at its waist");
+        assert!(
+            clearance > bot.half_h,
+            "a legged frame's feet are below its centre: {} vs {}",
+            clearance,
+            bot.half_h
+        );
+        // it sank by exactly the difference
+        assert!((clearance - bot.half_h - 0.6).abs() < 1e-5);
+
+        // and a wheeled car, which has no ride_h, is untouched by the change
+        let car = Car::new();
+        assert_eq!(car.ride_h, 0.0);
+        let c2 = car.stand_h();
+        assert_eq!(c2, car.half_h, "the fallback changed the wheeled case");
+    }
+
+    #[test]
+    fn a_reset_keeps_the_seating_height() {
+        // `reset` rebuilds from `Car::new()` and carries across only the
+        // fields it lists. `ride_h` was listed AND ZEROED, so every kickoff,
+        // respawn and map load dropped it and the seating code fell back to
+        // `half_h` — burying anything whose model is not centred on its
+        // bounding box, which is every legged bot.
+        //
+        // No World here: reset needs one, so this checks the field-carrying
+        // contract directly against the same construction reset performs.
+        let before = bot_shaped();
+        let carried = Car { ride_h: before.ride_h, half_h: before.half_h, ..Car::new() };
+        assert_eq!(carried.ride_h, 1.5, "the seating height did not survive");
+        assert!(carried.ride_h > carried.half_h, "a bot's feet are below its centre");
+    }
+
+    #[test]
+    fn the_source_carries_ride_h_rather_than_zeroing_it() {
+        // The behavioural test above cannot run `reset` without a World, so
+        // this pins the actual line. Crude, and it is the thing that broke.
+        let src = include_str!("physics.rs");
+        let body = src
+            .split("pub fn reset(&mut self, world: &World)")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("Car::reset");
+        assert!(
+            body.contains("ride_h: self.ride_h"),
+            "Car::reset no longer carries ride_h across"
+        );
+        assert!(
+            !body.contains("ride_h: 0.0"),
+            "Car::reset zeroes ride_h again; a bot will spawn underground"
+        );
+        // The spawn-clearance grep is gone: it policed a duplicated
+        // expression by text search, and the expression is now
+        // `Car::stand_h` with one definition. `every_site_uses_stand_h`
+        // below is the replacement, and it checks the thing that actually
+        // matters — that nobody has open-coded it again.
+    }
+}
+
+#[cfg(test)]
+mod seating_tests {
+    /// The band the old guard could not see.
+    ///
+    /// Seating compared depth against `half_h` and then corrected by
+    /// `ride_h`. For anything not centred on its bounding box those differ,
+    /// and a body sunk between them was judged fine and left there.
+    fn buried_by(depth: f32, half_h: f32, ride_h: f32, guard_uses_ride: bool) -> f32 {
+        let drop = if ride_h > 0.0 { ride_h } else { half_h };
+        // `d` is the distance from the origin to the surface; the feet are
+        // `drop` below the origin, so the feet are underground by drop - d
+        let d = drop - depth;
+        let guard = if guard_uses_ride { drop } else { half_h };
+        if d < guard {
+            0.0 // lifted clear
+        } else {
+            depth // left underground
+        }
+    }
+
+    /// The REAL measured pose, from `model.rs`'s own ground truth for the
+    /// `analog` chassis. I first wrote this test with 0.9 against 1.5,
+    /// invented because it made the band look convincing; the actual numbers
+    /// are 0.3775 against 0.400 and the band is TWENTY-SEVEN TIMES smaller.
+    /// Fabricated test data that flatters the fix is worse than no test: it
+    /// made a 2 cm bug look like a 60 cm one and would have stopped me
+    /// looking for the rest of the cause.
+    const ANALOG_HALF_H: f32 = 0.3775;
+    const ANALOG_RIDE_H: f32 = 0.400;
+
+    #[test]
+    fn the_old_guard_left_a_standing_bot_partly_underground() {
+        // sunk by a centimetre — inside the 2.25 mm... 2.25 CM band between
+        // the two numbers, which is the whole of what this bug can cause
+        let old = buried_by(0.01, ANALOG_HALF_H, ANALOG_RIDE_H, false);
+        let new = buried_by(0.01, ANALOG_HALF_H, ANALOG_RIDE_H, true);
+        assert!(old > 0.0, "the old guard should have missed this");
+        assert_eq!(new, 0.0, "the fixed guard lifts it clear");
+    }
+
+    #[test]
+    fn and_the_band_is_small_which_bounds_what_this_fix_can_explain() {
+        // A bot visibly buried to the hips is NOT this bug. Stating the
+        // ceiling in a test so the fix cannot be mistaken for a complete
+        // answer to a much larger sink.
+        let band = ANALOG_RIDE_H - ANALOG_HALF_H;
+        assert!(band > 0.0 && band < 0.03, "band is {band} m");
+        // anything deeper than the band was caught by the old guard too
+        assert_eq!(buried_by(band + 0.01, ANALOG_HALF_H, ANALOG_RIDE_H, false), 0.0);
+    }
+
+    #[test]
+    fn a_centred_body_is_unaffected_because_the_two_numbers_agree() {
+        // the same chassis in vehicle form: y -0.239..0.239, centred, so
+        // half_h == ride_h and the change is a no-op — which is why this
+        // went unnoticed for so long
+        let (half_h, ride_h) = (0.239f32, 0.239f32);
+        for depth in [0.05f32, 0.1, 0.2] {
+            assert_eq!(
+                buried_by(depth, half_h, ride_h, false),
+                buried_by(depth, half_h, ride_h, true),
+                "the guard change moved a centred body at depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_enough_and_even_the_old_guard_caught_it() {
+        // why it reads as SINKING rather than as spawning wrong: past the
+        // smaller threshold the old guard fires and yanks the body up
+        assert_eq!(buried_by(0.5, ANALOG_HALF_H, ANALOG_RIDE_H, false), 0.0);
     }
 }
