@@ -46,6 +46,10 @@
 // completely different thing — NAT reflexive-address learning, not the
 // coordinator's pattern-to-reaction spinal cord. The near-collision is a
 // plausible reason nobody noticed one of the two was missing.
+// The per-worker capability contract HiveMind_Strategy_Logscope.md makes
+// mandatory: Duty says where a worker may run and engmode::prompt_for says what
+// phase it is in, but nothing told a worker what it IS.
+#[allow(dead_code)] pub mod capability;
 #[allow(dead_code)] pub mod liaison_fan;
 #[allow(dead_code)] pub mod reflex;
 #[allow(dead_code)] pub mod pathfan;
