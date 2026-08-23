@@ -22,6 +22,55 @@
 //! module is the plan those gaps will be closed against, plus the CPU reference the gates will
 //! compare to.
 //!
+//! ## THE REAL CHECKPOINT, checked against this plan (2026-08-23)
+//!
+//! Everything above was written from the HF drop's weight census. A GGUF now
+//! exists — `google.diffusiongemma-26B-A4B-it.Q4_K_M.gguf`, 16028 MiB, 692
+//! tensors — and an operator's load attempt dumped `blk.0`. Most of the plan
+//! survives contact; three things do not, and one of them blocks the loader
+//! before any kernel is reached.
+//!
+//! CONFIRMED by the dump:
+//! - sliding geometry at layer 0 — `attn_q [2816×4096]`, `attn_k [2816×2048]`,
+//!   with `attn_q_norm`/`attn_k_norm` at `[256]`: d=2816, head_dim 256, 16 Q
+//!   heads, 8 KV heads, exactly as planned;
+//! - both output scalars exist and are `[1]` — `layer_output_scale` and
+//!   `enc_layer_output_scale` (`archfeat::LayerOutputScale`);
+//! - the twin-FFN norm set is real and is SEVEN per block, not five:
+//!   `attn_norm`, `post_attention_norm`, `ffn_norm`, `post_ffw_norm`,
+//!   `post_ffw_norm_1`, `post_ffw_norm_2`, `pre_ffw_norm_2`;
+//! - a dense FFN (`ffn_gate`/`ffn_up`/`ffn_down`) sits ALONGSIDE the experts,
+//!   which is `archfeat::SharedExpert` as expected.
+//!
+//! CONTRADICTED, and this is the one that stops the load:
+//! - **the experts are FUSED.** The file ships
+//!   `blk.0.ffn_gate_up_exps.weight [2816×1408×128]` — gate and up in one
+//!   tensor, 128 experts. This engine's MoE detection and fill both key on
+//!   SEPARATE `ffn_gate_exps` + `ffn_up_exps` (lib.rs:10401 decides a layer is
+//!   MoE by the presence of `ffn_gate_exps`), so a diffusion-gemma block reads
+//!   as DENSE and its 128 experts are never seen. Splitting a fused
+//!   `[d × ff × n_expert]` into two halves is the same operation
+//!   `qkvsplit` already does for fused QKV, and is the smallest change that
+//!   would let this file past the router.
+//!
+//! NOT IN THE PLAN AT ALL:
+//! - `ffn_down_exps.scale [128]` — one scalar per expert, and
+//!   `ffn_gate_inp.scale [2816]` — one per model dim on the ROUTER input. The
+//!   module doc above describes "the router operating on a weightless-rms of
+//!   attn_out times a learned scale vector", which is presumably this second
+//!   tensor; the per-expert down scale is unaccounted for. Neither is read by
+//!   anything today, and a silently ignored scale vector is precisely the kind
+//!   of omission that yields plausible-but-wrong output rather than an error.
+//! - the V projection is PRESENT at layer 0 (`attn_v [2816×2048] Q6_K`), so
+//!   the "V-from-K on layers without v_proj" path — transcribed from
+//!   gemma4.cpp — is not exercised by this block. Which layers lack it, if any,
+//!   the dump does not say; it covers `blk.0` only.
+//!
+//! MIXED QUANTS within one block, which the loader now reports at load
+//! (`memplan::type_histogram_line`): Q4_K for most projections, Q6_K for
+//! `attn_v`, Q8_0 for `ffn_down` and `ffn_down_exps`. Any per-model assumption
+//! about "the" source type is wrong for this file.
+//!
 //! ## What is genuinely new here vs the archs already wired
 //!
 //! - **Per-layer attention geometry.** Sliding layers: head_dim 256, 8 KV heads, rope θ=1e4,
@@ -633,4 +682,39 @@ mod tests {
         let e = layer_out_scale(Pass::Encode, 0.7, None).unwrap_err();
         assert!(e.contains("layer_output_scale_enc"), "the refusal names the missing tensor: {e}");
     }
+
+    /// The real GGUF ships FUSED experts; this engine reads separate ones.
+    ///
+    /// `blk.0.ffn_gate_up_exps.weight [2816×1408×128]` is gate and up in one
+    /// tensor. `lib.rs` decides a layer is MoE by the presence of
+    /// `ffn_gate_exps`, so a diffusion-gemma block reads as DENSE and its 128
+    /// experts are never routed to — before any kernel is involved.
+    ///
+    /// A source-level check because there is no checkpoint here to load. It
+    /// fails the moment someone teaches the loader the fused name, which is the
+    /// point: this test should DIE with the fix, not outlive it.
+    #[test]
+    fn the_loader_does_not_yet_know_the_fused_expert_tensor() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("ffn_gate_exps"),
+                "the separate-expert names are gone — if the loader was rewritten, re-derive this");
+        assert!(!lib.contains("ffn_gate_up_exps"),
+                "lib.rs now mentions ffn_gate_up_exps: if fused experts are handled, DELETE this \
+test and the 'CONTRADICTED' paragraph in the module docs, which both claim they are not");
+    }
+
+    /// The scale tensors the plan does not account for.
+    ///
+    /// `ffn_down_exps.scale [128]` and `ffn_gate_inp.scale [2816]` are in the
+    /// file and read by nothing. A silently ignored scale vector produces
+    /// plausible-but-wrong output rather than an error, which is the failure
+    /// mode this tree has hit twice this week.
+    #[test]
+    fn the_unaccounted_scale_tensors_are_still_unaccounted() {
+        let lib = include_str!("lib.rs");
+        assert!(!lib.contains("ffn_down_exps.scale"),
+                "if the per-expert down scale is now read, update the module docs — they say it is \
+unaccounted for");
+    }
+
 }
