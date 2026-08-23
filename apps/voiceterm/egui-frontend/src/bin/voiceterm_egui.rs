@@ -1614,10 +1614,21 @@ impl eframe::App for VoicetermApp {
                 self.tabbar_open = !self.tabbar_open;
             }
             if !self.tabbar_open {
-                // Collapsed: initials only, active highlighted. Enough to count
-                // the tabs and see which is live — the same reduction `rail`
-                // makes, and the reason a closed column is still useful rather
-                // than merely absent.
+                // COLLAPSED: BOTH LISTS, reduced to initials. A unified bar that
+                // drops half its contents when narrow is not unified — it is two
+                // bars with one of them hidden, which is the arrangement this
+                // column was merged to get rid of.
+                //
+                // Sessions stay for the same reason the tabs do: the point of a
+                // collapsed column is to say which thing is live at a glance,
+                // and "which session" is the question a terminal user asks more
+                // often than "which tab". Dropping it also stranded `+ New`,
+                // `Graph` and `Settings`, which is why `ToggleSettings` had to
+                // be added when this branch first went in.
+                //
+                // Separator between them, not a heading: at one touch target
+                // wide there is no room for a word, and two ungrouped columns of
+                // single letters read as one list.
                 ui.separator();
                 let tabs: Vec<(String, bool)> = self.workspace.tabs.iter().enumerate()
                     .map(|(i, t)| (t.name.clone(), i == self.workspace.active)).collect();
@@ -1625,6 +1636,20 @@ impl eframe::App for VoicetermApp {
                     let initial = name.chars().next().unwrap_or('\u{2022}').to_string();
                     if uikit_egui::dock::list_row(ui, &initial, *active, 26.0, &self.colors).clicked() {
                         self.workspace.active = i;
+                    }
+                }
+                let sessions: Vec<(String, bool)> = self.sidebar.sessions.iter().enumerate()
+                    .map(|(i, s)| (s.name.clone(), i == self.sidebar.active)).collect();
+                if !sessions.is_empty() {
+                    ui.separator();
+                    for (i, (name, active)) in sessions.iter().enumerate() {
+                        let initial = name.chars().next().unwrap_or('\u{2022}').to_string();
+                        if uikit_egui::dock::list_row(ui, &initial, *active, 26.0, &self.colors)
+                            .on_hover_text(name)
+                            .clicked()
+                        {
+                            self.sidebar.active = i;
+                        }
                     }
                 }
                 return;

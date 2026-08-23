@@ -535,4 +535,62 @@ so a collapse that frees little is worse than not having one");
         assert!((avail - 420.0).abs() < 1.0,
                 "no panel drawn, yet only {avail} of 420 points reached the panes");
     }
+
+    /// ONE left bar, and it stays one.
+    ///
+    /// The Qt original hosts "work tabs (scrollable) + a default fence + system
+    /// tabs" in a single `vTabBar`. This port had three left panels — `sidebar`
+    /// (160), `tabbar` (168) and `rail` — two of which rendered the same
+    /// `workspace.tabs`. `rail` was deleted and the session list moved inside
+    /// the tab column; this is what stops a fourth appearing.
+    ///
+    /// A SOURCE check, because the panels are built inside a 3000-line `update`
+    /// that cannot be driven headlessly without a model, a PTY and a workspace.
+    /// The layout tests above measure a panel; this one counts them.
+    #[test]
+    fn the_left_edge_is_a_single_panel() {
+        let src = include_str!("bin/voiceterm_egui.rs");
+        // Slice after the MATCH rather than after a hand-counted offset. My
+        // first version used `i + 22` and every id came back empty — the
+        // pattern is 23 bytes, and a magic number that is wrong by one produces
+        // a test that passes vacuously if the expectation is also empty.
+        const PAT: &str = "egui::SidePanel::left(\"";
+        let ids: Vec<&str> = src.match_indices(PAT)
+            .map(|(i, _)| {
+                let rest = &src[i + PAT.len()..];
+                &rest[..rest.find('"').unwrap_or(0)]
+            })
+            .collect();
+        // `tabbar` appears twice: the if/else that picks resizable-vs-exact
+        // builds it in both arms and shows it once.
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        let permanent: Vec<&str> = unique.iter().copied()
+            .filter(|id| *id != "blocks-drawer")   // a drawer behind its own toggle
+            .collect();
+        assert_eq!(
+            permanent, vec!["tabbar"],
+            "the left edge should be the tab column alone (plus the blocks drawer, which is a \
+toggle). Found {permanent:?} — if a panel was added, put its contents IN the column or give it a \
+toggle, because Qt does this with one bar and the port already carried three."
+        );
+    }
+
+    /// Collapsed, the column keeps both lists rather than dropping one.
+    ///
+    /// A unified bar that sheds half its contents when narrow is two bars with
+    /// one hidden — the arrangement the merge existed to remove. Sessions also
+    /// carry `+ New` / `Graph` / `Settings`, so dropping them strands controls
+    /// whose only other route is the command palette.
+    #[test]
+    fn the_collapsed_column_still_shows_sessions() {
+        let src = include_str!("bin/voiceterm_egui.rs");
+        let collapsed = src.split("if !self.tabbar_open {").nth(1)
+            .and_then(|s| s.split("return;").next())
+            .expect("the collapsed branch");
+        assert!(collapsed.contains("self.workspace.tabs"), "tabs must survive collapse");
+        assert!(collapsed.contains("self.sidebar.sessions"),
+                "sessions must survive collapse too — dropping them makes the bar unified only \
+while it is open");
+    }
+
 }
