@@ -179,15 +179,14 @@ impl LockstepPeer {
         }
         let mine = Self::frame_at(&self.local, self.tick).unwrap();
         let theirs = Self::frame_at(&self.remote, self.tick).unwrap();
-        // Each peer drives its OWN player through set_input; the other clan's
-        // ancestors are AI on both machines and take the enemy frame the same
-        // way, so both worlds see the same two decisions in the same order.
+        // Each peer applies BOTH frames — its own and the one that arrived —
+        // because both worlds must see the same two decisions in the same order.
+        // A peer that only drove its own leader and left the other clan's to the
+        // AI would be running a different match from the one across the link,
+        // which is the classic way a lockstep game desyncs on move one.
         let (a, b) = if self.side == 0 { (mine, theirs) } else { (theirs, mine) };
-        self.bg.set_input(a.mx, a.mz, a.claw, a.ability);
-        let _ = b; // clan B's player input lands through the same door once
-                   // battleground grows a second driven warrior; until then the
-                   // frame is carried, exchanged and compared, so the protocol
-                   // is already right when that day comes.
+        self.bg.set_input_for(0, a.mx, a.mz, a.claw, a.ability);
+        self.bg.set_input_for(1, b.mx, b.mz, b.claw, b.ability);
         self.bg.step(1.0 / 30.0);
         self.tick += 1;
 
@@ -321,6 +320,28 @@ mod tests {
             p.halted,
             q.halted
         );
+    }
+
+    #[test]
+    fn each_side_moves_its_own_leader_and_neither_moves_the_others() {
+        let (mut p, mut q) = pair();
+        let a0 = p.bg.warriors.iter().position(|w| w.team == 0 && w.is_player).unwrap();
+        let b0 = p.bg.warriors.iter().position(|w| w.team == 1 && w.is_player).unwrap();
+        let start_a = (p.bg.warriors[a0].x, p.bg.warriors[a0].z);
+        let start_b = (p.bg.warriors[b0].x, p.bg.warriors[b0].z);
+        for _ in 0..90 {
+            p.submit(Frame { mx: 1.0, mz: 0.0, claw: false, ability: None });
+            q.submit(Frame { mx: 0.0, mz: -1.0, claw: false, ability: None });
+            exchange(&mut p, &mut q, true);
+            p.step();
+            q.step();
+        }
+        // both worlds agree, and each leader went where its own player pushed
+        assert_eq!(p.bg.digest(), q.bg.digest());
+        assert!(p.bg.warriors[a0].x - start_a.0 > 2.0, "clan A's leader went east");
+        assert!(start_b.1 - p.bg.warriors[b0].z > 2.0, "clan B's leader went north");
+        // and the peer that is NOT clan B still shows clan B where clan B is
+        assert!((p.bg.warriors[b0].x - q.bg.warriors[b0].x).abs() < 1e-6);
     }
 
     #[test]

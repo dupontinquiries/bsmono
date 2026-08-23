@@ -617,9 +617,15 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [ ] Transport: bind `lockstep::Packet` to `shared/netcode`'s multiplayer/session layer, and
   agree the match setup by exchanging a `replay::Replay` header (it already carries draft,
   seed and every doctrine switch — a lobby needs nothing else)
-- [ ] Clan B's player frame is carried, exchanged and compared but not yet applied: the
-  battleground drives one warrior from `set_input`. Second driven warrior, then the protocol
-  is complete rather than merely correct
+- [x] Both clans' leaders are drivable now (`set_input_for(side, ..)`, `driven(side)`), so
+  lockstep applies both frames instead of carrying one it could not spend. A peer that drove
+  only its own leader and left the other clan's to the AI would be running a different match
+  from the one across the link — the classic move-one desync — so both peers apply both.
+  `set_input` still means clan A, and an undriven clan still thinks for itself (tested:
+  driving one side must not switch the other side's AI off).
+- [x] The recorded-match regression passed unchanged through that refactor, which is exactly
+  what the fixture is for: clan B's seat 0 became `is_player` but nobody drives it, so the
+  match must play identically — and it does, to the digest.
 
 ## Roadmap (multi-turn)
 -29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an

@@ -397,8 +397,11 @@ pub struct Battleground {
     /// question about what the mode is, so the switch exists and the default
     /// declines to answer it.
     pub spoils: bool,
-    player_driven: bool,   // becomes true on the first set_input; until then the player's warrior is AI-driven
-    input: Option<(f32, f32, bool, Option<usize>)>,   // move dir, claw, ability index
+    /// Which clans have a human at the paws, indexed by side. Set by the first
+    /// `set_input` for that side; until then that clan's seat 0 is AI-driven,
+    /// which is what lets every balance harness run a "player" slot without one.
+    player_driven: [bool; 2],
+    input: [Option<(f32, f32, bool, Option<usize>)>; 2],   // move dir, claw, ability index
 }
 
 impl Battleground {
@@ -623,7 +626,10 @@ impl Battleground {
                     mind: Mind::Trail, carry: Carry::Nothing,
                     shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
                     cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, prey_taken: 0, seat: slot as u32, still_t: 0.0, duty: Duty::Border,
-                    is_player: team == CLAN_A && slot == 0, seg: 0,
+                    // Both clans' seat 0 can be driven — clan A's by the local
+                    // player, clan B's by a human across a lockstep link. Until
+                    // somebody actually drives one it is an ordinary AI warrior.
+                    is_player: slot == 0, seg: 0,
                 });
             }
         }
@@ -637,13 +643,33 @@ impl Battleground {
             camps, medics, contention: (0.0, 0.0), contention_holder: None,
             skyrock: (-92.0, 92.0), skyrock_holder: None,
             time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], wave_n: [0; 2], tick: 0,
-            wombo: false, collapse_on_breach: false, spoils: false, player_driven: false, input: None,
+            wombo: false, collapse_on_breach: false, spoils: false,
+            player_driven: [false; 2], input: [None; 2],
         }
     }
 
+    /// Drive clan A's leader — the local player in a single-clan game.
     pub fn set_input(&mut self, mx: f32, mz: f32, claw: bool, ability: Option<usize>) {
-        self.player_driven = true;
-        self.input = Some((mx, mz, claw, ability));
+        self.set_input_for(CLAN_A, mx, mz, claw, ability);
+    }
+
+    /// Drive either clan's leader. The second side exists for
+    /// [`crate::lockstep`], which was already carrying and comparing clan B's
+    /// frame across the wire while the sim had nowhere to put it.
+    pub fn set_input_for(&mut self, side: u8, mx: f32, mz: f32, claw: bool, ability: Option<usize>) {
+        let s = (side as usize).min(1);
+        self.player_driven[s] = true;
+        self.input[s] = Some((mx, mz, claw, ability));
+    }
+
+    /// The warrior a given clan's human drives, if anyone is driving.
+    pub fn driven(&self, side: u8) -> Option<usize> {
+        if !self.player_driven[(side as usize).min(1)] {
+            return None;
+        }
+        self.warriors
+            .iter()
+            .position(|w| w.team == side && w.is_player && w.role == Role::Ancestor)
     }
 
     fn spawn_patrol(&mut self, team: u8, lane: usize, duty: Duty) {
@@ -1219,7 +1245,8 @@ impl Battleground {
                 // the field that never left the trail to farm. The mirror probe
                 // found it as a 0.6 m break at tick 34, and it is worth more than
                 // that over a match, since the economy is what wins them.
-                let hands_off = self.warriors[i].is_player && self.player_driven;
+                let hands_off =
+                    self.warriors[i].is_player && self.player_driven[team as usize];
                 if role == Role::Ancestor && !hands_off && carry == Carry::Nothing {
                     // One at a time. A lane held by nobody is a lane given away,
                     // so a warrior only peels off to hunt or gather if its
@@ -1305,7 +1332,9 @@ impl Battleground {
     /// heal when pressed, otherwise spend a technique.
     fn auto_cast(&mut self, i: usize) {
         let Some(a) = self.warriors[i].ancestor else { return };
-        if self.warriors[i].is_player && self.player_driven { return; }   // the player casts by input
+        if self.warriors[i].is_player && self.player_driven[self.warriors[i].team as usize] {
+            return; // the player casts by input
+        }
         let (team, x, z, frac) = { let w = &self.warriors[i]; (w.team, w.x, w.z, w.power_frac()) };
         let k = ancestor::kit(a);
         let in_ult_range = |bg: &Battleground| {
@@ -1479,32 +1508,38 @@ impl Battleground {
         self.skyrock_holder =
             if sa > sb { Some(CLAN_A) } else if sb > sa { Some(CLAN_B) } else { self.skyrock_holder };
 
-        // player input drives warrior 0 directly
-        if let Some((mx, mz, claw, ability)) = self.input.take() {
-            if self.warriors[0].alive() {
-                if (mx != 0.0 || mz != 0.0) && self.warriors[0].root_t <= 0.0 {
-                    let (nx, nz) = norm(mx, mz);
-                    let s = self.speed_of(0);
-                    let w = &mut self.warriors[0];
-                    w.x = (w.x + nx * s * dt).clamp(-ARENA, ARENA);
-                    w.z = (w.z + nz * s * dt).clamp(-ARENA, ARENA);
-                    w.heading = nz.atan2(nx);
-                }
-                if let Some(slot) = ability { self.cast(0, slot.min(2)); }
-                if claw {
-                    if let Some(t) = self.nearest_enemy(0, self.warriors[0].reach) {
-                        // the same blow an AI ancestor throws — target-dependent
-                        // riders, on-hit effects, and the kill credited. A player's
-                        // claw that quietly skipped Hush of Snows or The Saber
-                        // Finishes would make the kits play differently in a human's
-                        // paws than in the sim they were balanced in.
-                        let dmg = self.strike_of(0) * self.strike_vs(0, t) * dt;
-                        let alive_before = self.warriors[t].alive();
-                        self.hurt(t, dmg);
-                        self.on_hit(0, t);
-                        if alive_before && !self.warriors[t].alive() {
-                            self.warriors[0].kills += 1;
-                        }
+        // player input drives each clan's leader — one side in a solo game, both
+        // in a lockstep match
+        for side in [CLAN_A, CLAN_B] {
+            let Some((mx, mz, claw, ability)) = self.input[side as usize].take() else { continue };
+            let Some(i) = self.driven(side) else { continue };
+            if !self.warriors[i].alive() {
+                continue;
+            }
+            if (mx != 0.0 || mz != 0.0) && self.warriors[i].root_t <= 0.0 {
+                let (nx, nz) = norm(mx, mz);
+                let sp = self.speed_of(i);
+                let w = &mut self.warriors[i];
+                w.x = (w.x + nx * sp * dt).clamp(-ARENA, ARENA);
+                w.z = (w.z + nz * sp * dt).clamp(-ARENA, ARENA);
+                w.heading = nz.atan2(nx);
+            }
+            if let Some(slot) = ability {
+                self.cast(i, slot.min(2));
+            }
+            if claw {
+                if let Some(t) = self.nearest_enemy(i, self.warriors[i].reach) {
+                    // the same blow an AI ancestor throws — target-dependent
+                    // riders, on-hit effects, and the kill credited. A player's
+                    // claw that quietly skipped Hush of Snows or The Saber
+                    // Finishes would make the kits play differently in a human's
+                    // paws than in the sim they were balanced in.
+                    let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
+                    let alive_before = self.warriors[t].alive();
+                    self.hurt(t, dmg);
+                    self.on_hit(i, t);
+                    if alive_before && !self.warriors[t].alive() {
+                        self.warriors[i].kills += 1;
                     }
                 }
             }
@@ -1526,7 +1561,9 @@ impl Battleground {
         let ascending = self.tick % 2 == 0;
         for k in 0..n {
             let i = if ascending { k } else { n - 1 - k };
-            if !self.warriors[i].alive() || (self.warriors[i].is_player && self.player_driven) { continue; }
+            let driven = self.warriors[i].is_player
+                && self.player_driven[self.warriors[i].team as usize];
+            if !self.warriors[i].alive() || driven { continue; }
             self.think(i, dt);
         }
 
@@ -2646,7 +2683,7 @@ mod tests {
         let moved = bg.warriors[0].x - start.0;
         assert!(moved > 3.0, "the player's warrior should have walked east, got {moved}");
         assert!((bg.warriors[0].z - start.1).abs() < 0.01, "and not drifted north");
-        assert!(bg.player_driven, "the first input hands the seat over");
+        assert!(bg.player_driven[CLAN_A as usize], "the first input hands the seat over");
         // the AI must not be steering it any more: hold no input and it holds still
         let held = (bg.warriors[0].x, bg.warriors[0].z);
         for _ in 0..30 {
@@ -3185,6 +3222,50 @@ mod tests {
         // and it still saturates rather than running away
         bg.clans[CLAN_A as usize].pile = 1e6;
         assert!(bg.growth(CLAN_A) < 1.0 + GROWTH_CAP + 1e-4);
+    }
+
+    #[test]
+    fn both_clans_can_have_a_human_at_the_paws() {
+        // The lockstep protocol was already carrying clan B's frame across the
+        // wire while the sim had nowhere to put it. Now it does.
+        let mut bg = Battleground::new(Ancestor::Serval);
+        bg.patrol_t = [1e9; 2];
+        let (a, b) = (bg.driven(CLAN_A), bg.driven(CLAN_B));
+        assert_eq!((a, b), (None, None), "nobody is driving until somebody drives");
+        // move each clan's leader in a different direction and watch both go
+        let ai = bg.warriors.iter().position(|w| w.team == CLAN_A && w.is_player).unwrap();
+        let bi = bg.warriors.iter().position(|w| w.team == CLAN_B && w.is_player).unwrap();
+        let (ax, az) = (bg.warriors[ai].x, bg.warriors[ai].z);
+        let (bx, bz) = (bg.warriors[bi].x, bg.warriors[bi].z);
+        for _ in 0..30 {
+            bg.set_input_for(CLAN_A, 1.0, 0.0, false, None);
+            bg.set_input_for(CLAN_B, 0.0, -1.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert_eq!(bg.driven(CLAN_A), Some(ai));
+        assert_eq!(bg.driven(CLAN_B), Some(bi));
+        assert!(bg.warriors[ai].x - ax > 3.0, "clan A's leader walked east");
+        assert!((bg.warriors[ai].z - az).abs() < 0.01);
+        assert!(bz - bg.warriors[bi].z > 3.0, "clan B's leader walked north");
+        assert!((bg.warriors[bi].x - bx).abs() < 0.01);
+    }
+
+    #[test]
+    fn an_undriven_clan_still_thinks_for_itself() {
+        // Driving one side must not switch the other side's AI off — the common
+        // case is one human against a clan of ancestors.
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        let bi = bg.warriors.iter().position(|w| w.team == CLAN_B && w.is_player).unwrap();
+        let before = (bg.warriors[bi].x, bg.warriors[bi].z);
+        for _ in 0..60 {
+            bg.set_input(0.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert!(
+            dist(bg.warriors[bi].x, bg.warriors[bi].z, before.0, before.1) > 1.0,
+            "clan B's leader should have got on with its patrol"
+        );
     }
 
     #[test]
