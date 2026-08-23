@@ -59,15 +59,43 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
     let mut g = Generator::new(cfg, &dev)?;
     let mut d = Discriminator::new(cfg, &dev)?;
 
+    let mut start_epoch = 0usize;
     if resume {
         let gp = cfg.ckpt_dir.join("gen_latest.safetensors");
         let dp = cfg.ckpt_dir.join("disc_latest.safetensors");
         if gp.exists() && dp.exists() {
             load_generator(&mut g, &gp, &dev)?;
             load_discriminator(&mut d, &dp, &dev)?;
-            println!("[train] resumed from {gp:?}");
+            match read_resume_epoch(cfg) {
+                Some(e) => {
+                    start_epoch = e;
+                    println!("[train] resumed from {gp:?} at epoch {e}");
+                }
+                None => println!(
+                    "[train] resumed from {gp:?}, but {} is missing or unreadable — \
+the epoch counter restarts at 0. Weights are fine; only the numbering is lost.",
+                    resume_state_path(cfg).display()),
+            }
+            // WHAT A RESUME DOES NOT RESTORE, said out loud because the run
+            // will look slightly worse for a few hundred steps and the operator
+            // should know why rather than suspecting the checkpoint.
+            //
+            // Adam's first and second moment estimates are gone. candle's
+            // `AdamW` keeps them in private fields with no accessor
+            // (candle-nn/src/optim.rs: `first_moment` / `second_moment` on a
+            // private per-var struct; only `params()`/`set_params()` are
+            // public), so there is nothing to serialise without forking candle.
+            //
+            // The cost is bounded and worth stating precisely: beta2 = 0.999
+            // gives the second moment a memory of roughly 1/(1-beta2) = 1000
+            // steps, so the optimiser is re-warmed within about that many —
+            // under a fifth of one epoch at the default 64 steps. It is a
+            // transient, not a reset.
+            println!("[train] NOTE: optimizer state is NOT restored (candle's AdamW keeps its \
+moments private). Expect ~1000 steps of re-warming; the weights themselves are exact.");
         } else {
-            println!("[train] --resume set but no latest checkpoint; starting fresh");
+            println!("[train] --resume set but no latest checkpoint in {}; starting fresh",
+                     cfg.ckpt_dir.display());
         }
     }
 
@@ -98,7 +126,16 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
     let fake_target = zeros.clone();
     let gen_target = ones.clone();
 
-    for epoch in 0..cfg.epochs {
+    // FROM start_epoch, not 0: `cfg.epochs` is the target the operator asked to
+    // reach, not a count of additional epochs. Resuming a 20000-epoch run at
+    // 4000 should do 16000 more, and `--epochs 4000` on a run already at 4000
+    // should do nothing and say so.
+    if start_epoch >= cfg.epochs {
+        println!("[train] already at epoch {start_epoch} of a {}-epoch target — nothing to do. \
+Raise --epochs to continue.", cfg.epochs);
+        return Ok(());
+    }
+    for epoch in start_epoch..cfg.epochs {
         let mut d_running = 0f32;
         let mut g_running = 0f32;
 
@@ -245,8 +282,45 @@ fn checkpoint(g: &Generator, d: &Discriminator, cfg: &Config, epoch: usize) -> R
     // rolling "latest" so the GUI can always find the newest weights
     save_generator(g, &dir.join("gen_latest.safetensors"))?;
     save_discriminator(d, &dir.join("disc_latest.safetensors"))?;
+    // WHICH EPOCH THOSE WEIGHTS ARE. Without it `--resume` reloaded the weights
+    // and restarted the counter at zero, so gen_000000 was overwritten on every
+    // resume, `ckpt_every` re-triggered from the beginning, and the log claimed
+    // epoch 3 of a run that had already done 4000.
+    write_resume_state(cfg, epoch)?;
     println!("[train] checkpoint @ epoch {epoch} -> {gp:?}");
     Ok(())
+}
+
+/// Where the epoch counter lives between runs.
+///
+/// A sidecar rather than a safetensors field: it is one integer, it must be
+/// readable without loading 4 GB of weights (the GUI wants it, and so does a
+/// person with `cat`), and a corrupt or absent one has to degrade to "start
+/// from zero" rather than making the checkpoint unloadable.
+pub fn resume_state_path(cfg: &Config) -> std::path::PathBuf {
+    cfg.ckpt_dir.join("resume.json")
+}
+
+fn write_resume_state(cfg: &Config, epoch: usize) -> Result<()> {
+    let body = format!(
+        "{{\n  \"epoch\": {epoch},\n  \"time_frames\": {},\n  \"n_mels\": {},\n  \"latent\": {}\n}}\n",
+        cfg.time_frames, cfg.n_mels, cfg.latent);
+    fs::write(resume_state_path(cfg), body)
+        .with_context(|| format!("writing {}", resume_state_path(cfg).display()))
+}
+
+/// The epoch a `--resume` should continue FROM, or 0.
+///
+/// Deliberately tolerant: a missing, unreadable or unparsable file means start
+/// at zero and say so. The alternative — refusing to train because a
+/// bookkeeping sidecar is malformed — turns a cosmetic problem into a stopped
+/// run, and the weights are still perfectly loadable.
+pub fn read_resume_epoch(cfg: &Config) -> Option<usize> {
+    let raw = fs::read_to_string(resume_state_path(cfg)).ok()?;
+    let after = raw.split(r#""epoch""#).nth(1)?;
+    let digits: String = after.trim_start_matches([':', ' '])
+        .chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 
@@ -345,5 +419,80 @@ impl Drop for StayAwake {
             // of the parent — which for the GUI is the whole session.
             let _ = c.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_state {
+    use super::*;
+    use crate::config::Config;
+
+    fn tmp(name: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("beatspace-resume-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Config { ckpt_dir: dir, ..Config::default() }
+    }
+
+    #[test]
+    fn an_epoch_written_is_an_epoch_read() {
+        let cfg = tmp("roundtrip");
+        write_resume_state(&cfg, 4137).unwrap();
+        assert_eq!(read_resume_epoch(&cfg), Some(4137));
+        fs::remove_dir_all(&cfg.ckpt_dir).ok();
+    }
+
+    #[test]
+    fn epoch_zero_round_trips_as_zero_not_as_absent() {
+        // The distinction matters: Some(0) means "checkpointed at the very
+        // start", None means "no record". Conflating them would make a fresh
+        // checkpoint look like a missing one.
+        let cfg = tmp("zero");
+        write_resume_state(&cfg, 0).unwrap();
+        assert_eq!(read_resume_epoch(&cfg), Some(0));
+        fs::remove_dir_all(&cfg.ckpt_dir).ok();
+    }
+
+    #[test]
+    fn a_missing_file_is_none_rather_than_an_error() {
+        let cfg = tmp("missing");
+        assert_eq!(read_resume_epoch(&cfg), None);
+        fs::remove_dir_all(&cfg.ckpt_dir).ok();
+    }
+
+    #[test]
+    fn garbage_degrades_to_none_instead_of_stopping_the_run() {
+        // A malformed bookkeeping sidecar must not be able to prevent training.
+        // The weights are still loadable; only the numbering is lost.
+        let cfg = tmp("garbage");
+        for body in ["", "{", "not json at all", r#"{"epoch": }"#, r#"{"epochs": 12}"#] {
+            fs::write(resume_state_path(&cfg), body).unwrap();
+            assert_eq!(read_resume_epoch(&cfg), None, "body {body:?} should not parse");
+        }
+        fs::remove_dir_all(&cfg.ckpt_dir).ok();
+    }
+
+    #[test]
+    fn the_record_carries_the_shape_so_a_reader_can_see_it_without_the_weights() {
+        // The point of a sidecar over a safetensors field: readable with `cat`,
+        // and by the GUI, without loading gigabytes.
+        let cfg = Config { time_frames: 128, n_mels: 64, latent: 32, ..tmp("shape") };
+        write_resume_state(&cfg, 7).unwrap();
+        let raw = fs::read_to_string(resume_state_path(&cfg)).unwrap();
+        for needle in ["\"epoch\": 7", "\"time_frames\": 128", "\"n_mels\": 64", "\"latent\": 32"] {
+            assert!(raw.contains(needle), "record is missing {needle}:\n{raw}");
+        }
+        fs::remove_dir_all(&cfg.ckpt_dir).ok();
+    }
+
+    #[test]
+    fn a_later_write_replaces_the_earlier_epoch() {
+        // checkpoint() calls this every time; a stale value would send a resume
+        // backwards and silently redo work.
+        let cfg = tmp("overwrite");
+        write_resume_state(&cfg, 10).unwrap();
+        write_resume_state(&cfg, 200).unwrap();
+        assert_eq!(read_resume_epoch(&cfg), Some(200));
+        fs::remove_dir_all(&cfg.ckpt_dir).ok();
     }
 }
