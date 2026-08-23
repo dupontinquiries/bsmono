@@ -101,6 +101,10 @@ impl Deck {
                 self.feedback = Some(format!("REFUSED: {msg}"));
                 None
             }
+            // Depart goes UP to the shell: loading a map needs the gpu and a
+            // fresh World, neither of which a console has. Same reason
+            // `Sortie` passes through.
+            Some(Order::Depart { .. }) => order,
             Some(Order::Goto(st)) => {
                 self.walk_to(*st);
                 None

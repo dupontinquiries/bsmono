@@ -6295,6 +6295,44 @@ lander is a cramped carrier, not a smaller one.
 
 1123 passing.
 
+THE STARMAP TAKES YOU THERE NOW. Plotting a course that changes nothing is a
+line of text; pressing a destination loads the map for it and closes the
+console, because you are not at the chartroom any more.
+
+`Order::Depart` carries the destination and the arrival report the console
+already computed, so the shell does not fly the drop a second time to know
+what to say. It goes UP to the shell for the same reason `Sortie` does —
+loading a map needs the gpu and a fresh `World`, neither of which a console
+has.
+
+STYLES ARE MATCHED ON PHYSICS, NOT ON NAME. None of skydribble's eighteen is
+Mars, so this is a stopgap with its name on it — but a style picked for its
+fog colour would have to be re-picked the moment the styles change, and one
+picked for gravity and surface material will still be roughly right. Ice
+worlds get AURORA, worked metal gets FOUNDRY, low-gravity dust gets
+PLANETARIUM. A test asserts every destination resolves inside the table and
+that they do not all collapse to one — eighteen worlds sharing one map is
+worse than no starmap.
+
+DOORS NOTICE YOU. The ship has only ever been all-open or all-shut, so a
+doorway was never a MOMENT — you had a corridor or a wall, never a door that
+saw you coming. The radius is in hull terms rather than metres, for the same
+reason `HULL_HEIGHTS` exists.
+
+AND THAT EXPOSED TWO COPIES OF THE SHIP. Doors animate on `world.parked` and
+the hull mesh was built from `aboard.ship`, its template — so the drawn hull
+would have disagreed with the one you collide with, which is exactly the "see
+it here, hit it there" failure the lift shares a function to avoid. The parked
+ship is the truth; the mesh is rebuilt from it, and only when the set of
+carved doorways changes.
+
+THE COMPILER NAMED BOTH PLACES A NEW ORDER HAD TO BE ANSWERED, and `menusim`'s
+own comment named the risk: "the one path with no headless driver was the one
+the shell had just learned to execute". So Depart reports what the shell WOULD
+load rather than being left silent.
+
+1124 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

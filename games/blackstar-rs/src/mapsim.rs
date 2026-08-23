@@ -122,6 +122,39 @@ pub fn has_ground(d: &Destination) -> bool {
     matches!(d.terrain, Terrain::Surface | Terrain::Procedural)
 }
 
+/// Which of the eighteen map styles to load for a destination.
+///
+/// The starmap could fly a course and the world never changed, which made
+/// "arriving" a line of text. This is the join, and it is a stopgap with its
+/// name on it: the styles are skydribble's — MEADOW, CATHEDRAL, FOUNDRY — and
+/// none of them is Mars. `docs/UNWIRING.md` is the plan for replacing them
+/// with generated worlds.
+///
+/// Until then, matched on PHYSICS rather than on name, because a style picked
+/// for its fog colour would have to be re-picked the moment the styles change
+/// and a style picked for its gravity and surface will still be roughly right.
+pub fn style_for(d: &Destination) -> usize {
+    use crate::terrain::Material;
+    let g = ground_for(d);
+    match (material_of(d), d.gravity) {
+        // ice worlds: the cold, bright ones
+        (Material::Ice | Material::SoftIce, _) => 19, // AURORA
+        // worked metal: a foundry is the only built surface in the set
+        (Material::Metal, _) => 6, // FOUNDRY
+        // heavy rock under a real sky
+        (Material::Basalt, gr) if gr > 0.6 => 11, // CAVERN
+        (Material::Basalt, _) => 14,              // VAULT
+        // low-gravity dust
+        (Material::Regolith, gr) if gr < 0.3 => 12, // PLANETARIUM
+        (Material::Regolith, _) => 7,               // ZEN GARDEN
+        // sandstone and everything else: somewhere you can breathe
+        _ => {
+            let _ = g;
+            0 // MEADOW
+        }
+    }
+}
+
 // ----------------------------------------------------- generated worlds ---
 //
 // The other half of the map pipeline, and the other dead module.

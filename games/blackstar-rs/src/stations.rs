@@ -271,6 +271,13 @@ pub enum Order {
     Did(String),
     /// a refusal, printed where the player is looking
     Refused(String),
+    /// FLY THERE. The console cannot load a map — that needs the shell, the
+    /// gpu and a fresh `World` — so it names the destination and the shell
+    /// does it, the same way `Sortie` names a mission rather than running it.
+    ///
+    /// The line is the arrival report, already computed, so the shell does not
+    /// have to fly the drop a second time to know what to say.
+    Depart { dest: &'static str, line: String },
 }
 
 /// Evidence recoverable but not yet recorded: sited where a mission has been
@@ -773,14 +780,18 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
             } else {
                 format!("SCATTERED — {:.0} m wide", land.miss_distance)
             };
-            Some(Order::Did(format!(
+            let line = format!(
                 "{} {:.2}g: {} at {:.0} m/s{}",
                 d.name,
                 d.gravity,
                 verdict,
                 land.impact_speed,
                 if land.hero { ", clean fold" } else { "" }
-            )))
+            );
+            // and actually GO. Plotting a course that changes nothing is a
+            // line of text; the shell loads the map because the console
+            // cannot.
+            Some(Order::Depart { dest: d.id, line })
         }
         Station::Chartroom => {
             // Going through what you brought back IS this room's job, so a
@@ -945,7 +956,11 @@ fn order_target(
             (c.mission.id, Some(c))
         }
         // Did / Refused / Goto never reach the shell: `deck::on_event`
-        // consumes them itself. Reaching here means that changed.
+        // consumes them itself. Depart DOES reach the shell and is handled
+        // before this — it loads a map, which needs the gpu. Reaching here
+        // with one means the shell forgot to intercept it, and returning
+        // None is the right answer: better a departure that does nothing
+        // than a mission run for a destination.
         _ => return None,
     };
     let m = crate::content::MISSIONS.iter().find(|m| m.id == id)?;
@@ -1197,6 +1212,27 @@ mod tests {
     }
 
     #[test]
+    fn every_destination_resolves_to_a_real_map_and_they_are_not_all_one() {
+        // The starmap loads a map now, so a destination that resolves to a
+        // style index off the end is a crash on arrival — and one that
+        // resolves them all to MEADOW is a starmap where every world looks
+        // the same, which is worse than no starmap.
+        use std::collections::BTreeSet;
+        let mut seen = BTreeSet::new();
+        for d in crate::patrol::ROUTE.iter() {
+            let i = crate::mapsim::style_for(d);
+            assert!(
+                i < crate::world::STYLE_COUNT,
+                "{} resolves to style {i} of {}",
+                d.id,
+                crate::world::STYLE_COUNT
+            );
+            seen.insert(i);
+        }
+        assert!(seen.len() >= 4, "eighteen destinations share {} maps", seen.len());
+    }
+
+    #[test]
     fn docking_costs_nothing_because_there_is_no_drop() {
         let a = arrive_at("outer_rim");
         assert_eq!(a.penalty, 0.0);
@@ -1333,9 +1369,15 @@ mod tests {
         // A claim about what a feature does not do has to be revisited when it
         // starts doing it, and a test is the only thing that makes that
         // happen on purpose rather than by somebody noticing.
+        // Now returns `Depart` rather than `Did`, because plotting a course
+        // that changes nothing is a line of text — the shell loads the map.
+        // This test asserted `Did` and failed when that landed, which is the
+        // assertion working: a claim about what a console RETURNS has to be
+        // revisited when the console starts doing more.
         let mut sb = board();
         let out = apply(Station::Starmap, &Event::Pressed("earth"), &mut sb, 0);
-        let Some(Order::Did(line)) = out else { panic!("no report: {out:?}") };
+        let Some(Order::Depart { dest, line }) = out else { panic!("no departure: {out:?}") };
+        assert_eq!(dest, "earth");
         assert!(line.contains("EARTH"), "{line}");
         assert!(line.contains("m/s"), "no impact speed: {line}");
         assert!(
@@ -1343,9 +1385,9 @@ mod tests {
             "no landing verdict: {line}"
         );
 
-        // and an unreachable one refuses rather than pretending
+        // and an unreachable one refuses rather than departing
         let out = apply(Station::Starmap, &Event::Pressed("pluto"), &mut sb, 0);
-        let Some(Order::Did(line)) = out else { panic!("no report") };
+        let Some(Order::Did(line)) = out else { panic!("it departed for nowhere: {out:?}") };
         assert!(line.contains("no route"), "{line}");
     }
 

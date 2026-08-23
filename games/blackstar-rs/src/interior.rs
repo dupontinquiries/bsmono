@@ -317,6 +317,28 @@ impl Interior {
         self.lock.outer.depower();
     }
 
+    /// Open the doors somebody is walking at, and shut the rest.
+    ///
+    /// The ship has only ever been all-open (`unseal`) or all-shut
+    /// (`depower`), so a doorway has never been a MOMENT — you either had a
+    /// corridor or a wall, and never a door that noticed you. This is the
+    /// difference between a floor plan and a place.
+    ///
+    /// Radius is in hull terms rather than metres, so it survives the ship
+    /// being sized for a different occupant — the same reason
+    /// `aboard::HULL_HEIGHTS` exists.
+    pub fn sense_doors(&mut self, who: Vec3) {
+        let reach = self.hull_half.max_element() * 0.22;
+        for l in self.links.iter_mut() {
+            let near = who.distance(l.centre) < reach;
+            if near {
+                l.door.open();
+            } else {
+                l.door.close();
+            }
+        }
+    }
+
     pub fn step_doors(&mut self, dt: f32) {
         for l in self.links.iter_mut() {
             l.door.update(dt);

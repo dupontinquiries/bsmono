@@ -691,6 +691,9 @@ struct Game {
     /// the room the player was in last frame, so entering one is an EVENT
     /// rather than a state the HUD reprints sixty times a second
     last_room: Option<&'static str>,
+    /// which doorways were carved last frame, so the hull is re-uploaded when
+    /// a door moves and not every frame
+    door_mask: u32,
     world: World,
     car: Car,
     ball: Ball,
@@ -1826,6 +1829,7 @@ fn main() {
         // 0.38 m body this engine actually uses.
         aboard: aboard::Aboard::for_body(physics::Car::new().half_h * 2.0),
         last_room: None,
+        door_mask: 0,
         world,
         car,
         ball,
@@ -3875,6 +3879,15 @@ impl Game {
                         // on it needs the shell, and rebuilding the console
                         // needs to replace the very thing being borrowed
                         if let Some(order) = d.input(menu::Input::Activate) {
+                            // DEPART IS THE SHELL'S: it loads a map, which
+                            // needs the gpu and a fresh World. Intercepted
+                            // before `run_order`, whose `order_target` would
+                            // return None and silently do nothing.
+                            if let stations::Order::Depart { dest, line } = &order {
+                                let (dest, line) = (*dest, line.clone());
+                                self.depart_to(dest, &line);
+                                return;
+                            }
                             let st = d.station;
                             let (line, changed) = stations::run_order(&order);
                             if changed {
@@ -5990,6 +6003,27 @@ impl Game {
     /// The single place that parks. `World::generate` returns
     /// `parked: None`, so every path that builds a world has to call this or
     /// the hull keeps drawing and stops being solid.
+    /// Fly the ship somewhere and load what is there.
+    ///
+    /// The starmap could plot a course and the world never changed, so
+    /// "arriving" was a line of text. This is the rest of it: pick the style
+    /// that matches the destination's physics, load it, and close the console
+    /// — you are not at the chartroom any more, you are on Mars.
+    fn depart_to(&mut self, dest: &'static str, line: &str) {
+        let Some(d) = patrol::ROUTE.iter().find(|x| x.id == dest) else {
+            self.toastf("no such destination");
+            return;
+        };
+        let style = mapsim::style_for(d);
+        // a fresh seed per arrival, derived from the destination so the same
+        // world is the same place twice
+        let seed = d.id.bytes().fold(0x9E37u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+        self.load_map(style, seed);
+        // the console belongs to the ship you just left
+        self.deck = None;
+        self.toastf(line);
+    }
+
     fn repark(&mut self) {
         let at = Vec3::new(0.0, aboard::ground_lift(&self.aboard.ship), 0.0);
         self.world.park(at, self.aboard.ship.clone());
@@ -6003,8 +6037,31 @@ impl Game {
         // clock, so every door in the game has been frozen at whatever state
         // it was generated in. The ship being scenery is why nobody noticed.
         let dt = 1.0 / 60.0;
-        if let Some((_, ship)) = self.world.parked.as_mut() {
+        let at = self.car.pos;
+        let mut doors_now = 0u32;
+        if let Some((origin, ship)) = self.world.parked.as_mut() {
+            // doors notice you before they move, so the sense comes first
+            ship.sense_doors(at - *origin);
             ship.step_doors(dt);
+            for (i, l) in ship.links.iter().enumerate().take(32) {
+                if l.door.void().is_some() {
+                    doors_now |= 1 << i;
+                }
+            }
+        }
+        // RE-UPLOAD WHEN THE DOORWAYS CHANGE, and only then. `hull_mesh`
+        // omits shut corridors, so a door opening changes the geometry — and
+        // a mesh uploaded once at launch would show walls where the collision
+        // has a corridor. A bitmask of which doorways are carved is the
+        // cheapest thing that notices.
+        if doors_now != self.door_mask {
+            self.door_mask = doors_now;
+            if let (Some(slot), Some((_, ship))) =
+                (self.aboard.hull_slot, self.world.parked.as_ref())
+            {
+                let m = aboard::hull_mesh(ship);
+                self.gpu.replace_mesh(slot, &m);
+            }
         }
 
         // and the camera: pull the boom in while the player is inside, or it
@@ -6101,12 +6158,15 @@ impl Game {
         // transform, a colour. Placed here rather than behind a mode because
         // the fastest way to find out whether it looks right is to be able to
         // drive up to it.
-        if let Some(slot) = self.aboard.hull_slot {
-            let lift = Mat4::from_translation(Vec3::new(
-                0.0,
-                aboard::ground_lift(&self.aboard.ship),
-                0.0,
-            ));
+        // THE PARKED SHIP IS THE ONE THAT MOVES. `aboard.ship` is the
+        // template it was cloned from and its doors never animate, so drawing
+        // from it would show a hull that disagrees with the one you collide
+        // with — the exact "see it here, hit it there" failure the lift
+        // shares a function to avoid.
+        if let (Some(slot), Some((origin, _))) =
+            (self.aboard.hull_slot, self.world.parked.as_ref())
+        {
+            let lift = Mat4::from_translation(*origin);
             push(
                 &mut objs,
                 slot,

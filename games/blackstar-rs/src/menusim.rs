@@ -205,6 +205,21 @@ fn narrate(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) {
         // one path with no headless driver was the one the shell had just
         // learned to execute, so nothing could exercise it. Same function the
         // winit handler calls; if it breaks, it breaks here first.
+        // Depart cannot run here — `load_map` needs a gpu — so the harness
+        // reports what the shell WOULD do, including which map style the
+        // destination resolves to. That is the checkable half, and the note
+        // above about untested shell paths is why it is not left silent.
+        Some(Order::Depart { dest, line }) => {
+            println!("  > {line}");
+            match crate::patrol::ROUTE.iter().find(|d| d.id == dest) {
+                Some(d) => println!(
+                    "  > (the shell would load style {} — {})",
+                    crate::mapsim::style_for(d),
+                    crate::world::style(crate::mapsim::style_for(d)).name
+                ),
+                None => println!("  > (no such destination)"),
+            }
+        }
         Some(o @ (Order::Sortie(_) | Order::Nightfall(_))) => {
             let (line, changed) = run_order(&o);
             println!("  > {line}");
