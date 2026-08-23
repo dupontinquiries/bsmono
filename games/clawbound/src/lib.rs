@@ -28,6 +28,7 @@ pub mod hunter;
 pub mod iqm;
 pub mod assetpack;
 pub mod draft;
+pub mod lobby;
 pub mod lockstep;
 pub mod replay;
 pub mod junglemap;

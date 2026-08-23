@@ -66,9 +66,9 @@ pub const SOLO_LANE: usize = 2;
 /// worth nothing on an empty trail, and a veil is worth less with a packmate
 /// blundering alongside. Ties break on pool order, so the choice is
 /// deterministic and identical for both clans.
-pub fn solo_seat(picks: [Ancestor; 3]) -> usize {
+pub fn solo_seat(picks: &[Ancestor]) -> usize {
     let mut best = 0usize;
-    for s in 1..3 {
+    for s in 1..picks.len() {
         let (a, b) = (ancestor::sociability(picks[s]), ancestor::sociability(picks[best]));
         if a < b { best = s; }
     }
@@ -88,12 +88,42 @@ pub enum LanePolicy {
 }
 
 /// Seat -> trail, given who else the clan fielded and how the clan decides.
-pub fn lane_for(seat: usize, picks: [Ancestor; 3], policy: LanePolicy) -> usize {
+///
+/// A clan of three is the old shape: one down the river, two up the mountain.
+/// A clan of **five** is the conquest shape the map was actually built for —
+/// solo on the river, two together on the mountain, one holding the middle the
+/// patrols walk, and a fifth with no lane at all, who starts in the jungle and
+/// goes where the fight is. That fifth seat is the reason the middle stopped
+/// being nobody's: with five there is somebody to hold it.
+pub fn lane_for(seat: usize, picks: &[Ancestor], policy: LanePolicy) -> usize {
     let solo = match policy {
         LanePolicy::Seat => 0,
-        LanePolicy::Kit => solo_seat(picks),
+        LanePolicy::Kit => solo_seat(&picks),
     };
-    if seat == solo { SOLO_LANE } else { DUO_LANE }
+    if seat == solo {
+        return SOLO_LANE;
+    }
+    if picks.len() < 4 {
+        return DUO_LANE;
+    }
+    // the seats that are not the river-walker, in order, take: mid, duo, duo,
+    // then the roamer — who is given mid as a starting trail and leaves it
+    let rest: Vec<usize> = (0..picks.len()).filter(|&s| s != solo).collect();
+    match rest.iter().position(|&s| s == seat).unwrap_or(0) {
+        0 => MID_LANE,
+        1 | 2 => DUO_LANE,
+        _ => MID_LANE,
+    }
+}
+
+/// Does this clan field a roamer — a warrior with no lane of its own, free to
+/// join whichever fight is worth joining? Only a full five does.
+pub fn roamer_seat(picks: &[Ancestor]) -> Option<usize> {
+    if picks.len() < 5 {
+        return None;
+    }
+    let solo = solo_seat(&picks);
+    (0..picks.len()).filter(|&s| s != solo).nth(3)
 }
 
 // structures
@@ -112,6 +142,9 @@ const ROOT_GUARD: f32 = 0.55;        // Great Tree damage reduction while any He
 // patrols — fewer, stronger, and they retreat
 const PATROL_INTERVAL: f32 = 26.0;
 const PATROL_SIZE: usize = 2;
+/// The most warriors a clan may field. Five is the conquest shape: a river
+/// solo, a mountain duo, a middle, and a roamer.
+pub const MAX_CLAN: usize = 5;
 const PATROL_HP: f32 = 130.0;
 const PATROL_ATK: f32 = 8.0;
 const PATROL_SPEED: f32 = 6.4;
@@ -528,6 +561,18 @@ impl Battleground {
         Battleground::new_on(picks_a, picks_b, 0)
     }
 
+    /// A match between clans of any size from one to [`MAX_CLAN`]. The
+    /// three-a-side constructors above are this with a fixed roster; five a
+    /// side is what the lobby drafts and what the map's lanes were shaped for.
+    pub fn new_roster(
+        picks_a: &[Ancestor],
+        picks_b: &[Ancestor],
+        seed: u32,
+        policy: LanePolicy,
+    ) -> Battleground {
+        Battleground::build(picks_a, picks_b, seed, policy)
+    }
+
     /// A drafted match on a re-rolled land. `seed` salts the terrain noise (see
     /// [`world::set_terrain_seed`]) — the same camps, trails, river course and
     /// jungle layout, over different country. This is what lets a balance run
@@ -542,6 +587,15 @@ impl Battleground {
     pub fn new_with(
         picks_a: [Ancestor; 3],
         picks_b: [Ancestor; 3],
+        seed: u32,
+        policy: LanePolicy,
+    ) -> Battleground {
+        Battleground::build(&picks_a, &picks_b, seed, policy)
+    }
+
+    fn build(
+        picks_a: &[Ancestor],
+        picks_b: &[Ancestor],
         seed: u32,
         policy: LanePolicy,
     ) -> Battleground {
@@ -605,20 +659,20 @@ impl Battleground {
             .map(|(x, z)| HerbPatch { x, z, regrow_t: 0.0 })
             .collect();
 
-        // Rosters: the drafted three a side; the player leads clan A.
+        // Rosters: whatever each clan drafted, up to five; the player leads clan A.
         let mut warriors = Vec::new();
         for team in 0..2u8 {
-            for slot in 0..3usize {
-                let a = if team == CLAN_A { picks_a[slot] } else { picks_b[slot] };
+            let side: &[Ancestor] = if team == CLAN_A { picks_a } else { picks_b };
+            for slot in 0..side.len().min(MAX_CLAN) {
+                let a = side[slot];
                 let k = ancestor::kit(a);
                 let (cx, cz) = camps[team as usize];
                 // Spawn offsets are REFLECTED for clan B, not copied. The mirror
                 // probe caught this at tick zero: both clans fanning out along
                 // +x put clan B's line across its own camp instead of along it,
                 // a 2.8 m break in the mirror before a single step was taken.
-                let d = slot as f32 * 2.0 - 2.0;
+                let d = slot as f32 * 2.0 - (side.len().min(MAX_CLAN) as f32 - 1.0);
                 let (sx, sz) = if team == CLAN_A { (cx + d, cz) } else { (cx, cz - d) };
-                let side = if team == CLAN_A { picks_a } else { picks_b };
                 warriors.push(Warrior {
                     team, role: Role::Ancestor, ancestor: Some(a), lane: lane_for(slot, side, policy),
                     x: sx, z: sz, heading: 0.0,
@@ -2578,12 +2632,12 @@ mod tests {
         // Doctrine, asserted: whoever's kit is worth least beside a packmate
         // walks the solo lane, whatever seat they were drafted into.
         let picks = [Ancestor::Lion, Ancestor::Panther, Ancestor::Leopard];
-        assert_eq!(solo_seat(picks), 1, "the shadow-walker walks alone");
+        assert_eq!(solo_seat(&picks), 1, "the shadow-walker walks alone");
         // and the old doctrine is still reachable, because it is the baseline
         // every balance number before this was measured against
-        assert_eq!(lane_for(0, picks, LanePolicy::Seat), SOLO_LANE);
-        assert_eq!(lane_for(1, picks, LanePolicy::Seat), DUO_LANE);
-        assert_eq!(lane_for(1, picks, LanePolicy::Kit), SOLO_LANE);
+        assert_eq!(lane_for(0, &picks, LanePolicy::Seat), SOLO_LANE);
+        assert_eq!(lane_for(1, &picks, LanePolicy::Seat), DUO_LANE);
+        assert_eq!(lane_for(1, &picks, LanePolicy::Kit), SOLO_LANE);
         let bg = Battleground::new_draft(picks, picks);
         for team in [CLAN_A, CLAN_B] {
             let lane_of = |a: Ancestor| {
@@ -3266,6 +3320,57 @@ mod tests {
             dist(bg.warriors[bi].x, bg.warriors[bi].z, before.0, before.1) > 1.0,
             "clan B's leader should have got on with its patrol"
         );
+    }
+
+    #[test]
+    fn a_clan_of_five_takes_the_conquest_shape() {
+        use crate::ancestor::ALL;
+        let five: Vec<Ancestor> = ALL[..5].to_vec();
+        let bg = Battleground::new_roster(&five, &five, 0, LanePolicy::Kit);
+        for team in [CLAN_A, CLAN_B] {
+            let lanes: Vec<usize> = bg
+                .warriors
+                .iter()
+                .filter(|w| w.team == team && w.role == Role::Ancestor)
+                .map(|w| w.lane)
+                .collect();
+            assert_eq!(lanes.len(), 5, "five a side");
+            assert_eq!(lanes.iter().filter(|&&l| l == SOLO_LANE).count(), 1, "one on the river");
+            assert_eq!(lanes.iter().filter(|&&l| l == DUO_LANE).count(), 2, "two on the mountain");
+            assert_eq!(
+                lanes.iter().filter(|&&l| l == MID_LANE).count(),
+                2,
+                "the middle and the roamer — with five there is finally somebody to hold it"
+            );
+        }
+        assert!(roamer_seat(&five).is_some(), "a full five fields a roamer");
+        assert!(roamer_seat(&five[..3]).is_none(), "three does not");
+        // and a five-a-side match still resolves, which is the real question:
+        // every rule in here was tuned against three
+        let mut bg = Battleground::new_roster(&five, &ALL[5..10].to_vec(), 1, LanePolicy::Kit);
+        let mut steps = 0;
+        while bg.outcome.is_none() && steps < 30 * 60 * 13 {
+            bg.step(1.0 / 30.0);
+            steps += 1;
+        }
+        assert!(bg.outcome.is_some(), "a 5v5 must end");
+    }
+
+    #[test]
+    fn a_short_roster_still_fields_a_clan() {
+        // The lobby fills empty seats with bots, but nothing should explode if a
+        // caller hands over two, or one.
+        for n in 1..=5usize {
+            let r: Vec<Ancestor> = crate::ancestor::ALL[..n].to_vec();
+            let mut bg = Battleground::new_roster(&r, &r, 0, LanePolicy::Kit);
+            assert_eq!(
+                bg.warriors.iter().filter(|w| w.team == CLAN_A && w.role == Role::Ancestor).count(),
+                n
+            );
+            for _ in 0..30 * 10 {
+                bg.step(1.0 / 30.0);
+            }
+        }
     }
 
     #[test]

@@ -108,6 +108,9 @@ pub enum MenuCmd {
     /// command rather than a `StartMode` because the battleground takes an
     /// ancestor and nothing else — no hunter, no class, no clan.
     StartBattleground(Ancestor),
+    /// Open the 5v5 ancestor-select page ([`crate::lobby`]) — the one-press
+    /// route into a match, with the clock doing the deciding.
+    QuickPlay,
     /// The clan-war draft is confirmed: three picks per side, straight into
     /// `battleground::new_draft`. A distinct variant from `StartMode` rather
     /// than shoehorning ancestor picks through `Class`/`Kind` — Battleground
@@ -155,7 +158,12 @@ impl Menu {
     /// Menu item labels for the current screen (top-to-bottom).
     pub fn items(&self) -> Vec<String> {
         match self.screen {
-            Screen::Title => vec!["Single Player".into(), "Battleground of the Ancestors".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
+            // Quick Play sits at the top because it is the button most players
+            // want: one press, five a side, a clock, a match. Everything below
+            // it is for the player who wants to choose the shape of the evening.
+            // The Battleground row below it is this side's full six-pick draft;
+            // the two are different journeys into the same mode.
+            Screen::Title => vec!["Quick Play (5v5)".into(), "Single Player".into(), "Battleground of the Ancestors".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
             Screen::Play if self.sel_game.picks_ancestor() => {
                 let a = self.ancestor();
                 let k = crate::ancestor::kit(a);
@@ -285,12 +293,13 @@ impl Menu {
     pub fn activate(&mut self) -> MenuCmd {
         match self.screen {
             Screen::Title => match self.cursor {
-                0 => { self.screen = Screen::Play; self.cursor = 0; MenuCmd::None }
-                1 => { self.screen = Screen::Draft; self.cursor = 0; MenuCmd::None }
-                2 => MenuCmd::Multiplayer,
-                3 => { self.open = false; MenuCmd::StartTutorial }
-                4 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
-                5 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
+                0 => { self.open = false; MenuCmd::QuickPlay }
+                1 => { self.screen = Screen::Play; self.cursor = 0; MenuCmd::None }
+                2 => { self.screen = Screen::Draft; self.cursor = 0; MenuCmd::None }
+                3 => MenuCmd::Multiplayer,
+                4 => { self.open = false; MenuCmd::StartTutorial }
+                5 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
+                6 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::Quit,
             },
             Screen::Play => match self.cursor {
@@ -343,6 +352,28 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quick_play_is_the_first_thing_on_the_title_screen() {
+        let mut m = Menu::new();
+        assert_eq!(m.items()[0], "Quick Play (5v5)");
+        assert_eq!(m.activate(), MenuCmd::QuickPlay);
+        assert!(!m.open, "and it leaves the menu for the select page");
+        // the rows below it still go where they went
+        let mut m = Menu::new();
+        m.cursor = 1;
+        assert_eq!(m.activate(), MenuCmd::None);
+        assert_eq!(m.screen, Screen::Play);
+        let mut m = Menu::new();
+        m.cursor = 2;
+        assert_eq!(m.activate(), MenuCmd::Multiplayer);
+        let mut m = Menu::new();
+        m.cursor = 3;
+        assert_eq!(m.activate(), MenuCmd::StartTutorial);
+        let mut m = Menu::new();
+        m.cursor = 6;
+        assert_eq!(m.activate(), MenuCmd::Quit);
+    }
 
     #[test]
     fn the_battleground_is_reachable_and_starts_with_an_ancestor() {
@@ -404,7 +435,7 @@ mod tests {
     #[test]
     fn tutorial_entry_launches_from_the_title_screen() {
         let mut m = Menu::new();
-        m.cursor = 3;   // Tutorial row (0=Single, 1=Battleground, 2=Multiplayer, 3=Tutorial)
+        m.cursor = 4;   // Tutorial row (0=QuickPlay, 1=Single, 2=Battleground, 3=Multiplayer, 4=Tutorial)
         assert_eq!(m.activate(), MenuCmd::StartTutorial);
         assert!(!m.open, "starting the tutorial should close the menu");
     }
@@ -412,6 +443,7 @@ mod tests {
     #[test]
     fn single_player_flow_starts_a_match() {
         let mut m = Menu::new();
+        m.cursor = 1;                                  // Single Player, under Quick Play
         assert_eq!(m.activate(), MenuCmd::None);      // Title → Play screen
         assert_eq!(m.screen, Screen::Play);
         m.cursor = 1; m.adjust(1);                     // change hunter
@@ -423,6 +455,7 @@ mod tests {
     #[test]
     fn play_screen_selects_game_and_class() {
         let mut m = Menu::new();
+        m.cursor = 1;
         m.activate();                                  // Title → Play
         assert_eq!(m.sel_game, GameMode::Rendezvous);
         m.cursor = 0; m.adjust(1); assert_eq!(m.sel_game, GameMode::Survive);
@@ -479,7 +512,7 @@ mod tests {
     #[test]
     fn battleground_entry_opens_the_draft_screen() {
         let mut m = Menu::new();
-        m.cursor = 1;   // Battleground row
+        m.cursor = 2;   // Battleground row, one lower since Quick Play took the top
         assert_eq!(m.activate(), MenuCmd::None);
         assert_eq!(m.screen, Screen::Draft);
     }

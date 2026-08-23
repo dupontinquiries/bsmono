@@ -527,6 +527,29 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   clamps rather than panics, and the player's claw is the *same blow* an ancestor throws —
   target riders, on-hit effects (Hush of Snows fires from a human's paw) and kill credit,
   which it previously skipped.
+## Quick play and the 5v5 select page
+
+- [x] The battleground fields **up to five a side** (`Battleground::new_roster`, `MAX_CLAN`),
+  and five is where the map's lanes finally make sense: a river solo, a mountain duo, a
+  middle that is somebody's rather than nobody's, and a **roamer** with no lane at all.
+  Rosters of one to five all build and run; the three-a-side constructors are thin wrappers,
+  so every existing test and balance number still means what it meant.
+- [x] `lobby.rs` — quick play and the select page, headless like `draft` and `battleview`.
+  One `LobbyInput` set for three sets of hands, with a test that a **controller** (walk the
+  grid, wrapping so a stick never finds a wall), a **keyboard** (type "still", land on
+  Stillsmoke) and a **thumb** (tap a grid cell, layout supplied by `Lobby::grid` so the
+  hit-test cannot disagree with the render) all reach the same cat and lock it.
+- [x] The clock decides: 30s to pick, bots choosing with rising urgency so the column
+  resolves before the buzzer rather than on it, anyone unlocked auto-picked from what they
+  were hovering, then a 5s ready beat and launch. Everyone locking early skips the rest of
+  the clock; nobody locking still starts a legal match.
+- [x] `MenuCmd::QuickPlay` is the first row of the title screen — one press to a match — and
+  the rows beneath it are asserted to still go where they went.
+- [x] `examples/lobby_demo.rs` runs the page and the match it produces end to end.
+- [ ] The app-side page itself (portraits, clan columns, the countdown ring, thumb targets
+  sized for a phone) — same blocker as the render work below: it needs the `app` feature and
+  rustc >= 1.76. The state machine it drives is done and tested, so this is layout.
+
 ## The battleground in the app: what is done, what is left
 
 The mode is simulated, balanced, playable in a terminal and recorded/replayed —
