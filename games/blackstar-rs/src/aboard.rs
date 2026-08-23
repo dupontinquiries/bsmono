@@ -41,6 +41,12 @@ use glam::Vec3;
 pub struct Aboard {
     pub ship: Interior,
     pub pos: Vec3,
+    /// the renderer slot the hull mesh was uploaded to, once it has been
+    ///
+    /// `None` until something asks. Uploading a mesh needs a GPU and this
+    /// module is used headlessly by tests and drivers, so the geometry is
+    /// built on demand rather than at construction.
+    pub hull_slot: Option<usize>,
     /// the room last occupied — corridors keep the previous one, so a console
     /// does not blink off while you walk through a doorway
     pub room: &'static str,
@@ -66,7 +72,7 @@ impl Aboard {
             ship.step_doors(1.0 / 60.0);
         }
         let pos = ship.stand_in("bridge").unwrap_or(Vec3::ZERO);
-        Aboard { ship, pos, room: "bridge" }
+        Aboard { ship, pos, room: "bridge", hull_slot: None }
     }
 
     /// Try to move. Refused if the destination is not walkable — a sealed
@@ -182,6 +188,40 @@ pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
         merge(&mut out, &b);
     }
     out
+}
+
+impl Aboard {
+    /// Upload the hull and remember where it went.
+    ///
+    /// **Nothing calls this yet, and that is the honest state.** It is the
+    /// last step before the ship is on screen, and it is the only one in this
+    /// module that cannot be checked here — `add_mesh` builds GPU buffers and
+    /// this environment has no GPU. The path type-checks (`wgpu` is not
+    /// feature-gated, so `render.rs` is in the build the tests run against),
+    /// which is as far as verification goes without a device.
+    ///
+    /// I am not inventing a caller to silence the warning. The remaining work
+    /// is: call this once on boarding, and `push` the slot with
+    /// `Mat4::IDENTITY` in the draw loop the way the terrain chunks do. Two
+    /// lines, and both of them want eyes on the result.
+    ///
+    /// Re-uploads when the doors have moved, because a sealed corridor is not
+    /// drawn and the mesh has to agree with what you can walk through. Cheap:
+    /// a thousand triangles.
+    pub fn upload_hull(&mut self, gpu: &mut crate::render::Gpu) -> usize {
+        let m = hull_mesh(&self.ship);
+        match self.hull_slot {
+            Some(i) => {
+                gpu.replace_mesh(i, &m);
+                i
+            }
+            None => {
+                let i = gpu.add_mesh(&m);
+                self.hull_slot = Some(i);
+                i
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------- driver ---
@@ -395,6 +435,19 @@ mod tests {
         );
         // the rooms are still there — it is a sealed ship, not an empty one
         assert!(b.verts.len() >= dark.ship.cells.len() * 8);
+    }
+
+    #[test]
+    fn the_hull_slot_starts_empty_and_is_remembered() {
+        // the upload itself needs a GPU; the bookkeeping around it does not,
+        // and getting that wrong would mean re-uploading a thousand triangles
+        // every frame
+        let mut a = Aboard::new(70.0);
+        assert!(a.hull_slot.is_none(), "a fresh ship claims to be uploaded");
+        a.hull_slot = Some(42);
+        // walking must not lose it — the mesh outlives the position
+        a.go("market");
+        assert_eq!(a.hull_slot, Some(42), "walking dropped the hull slot");
     }
 
     #[test]

@@ -105,8 +105,15 @@ fixed, and moving between them is a position and a walkable check.
       for a 70 m hull, which is nothing. Shut corridors are omitted, so the
       mesh and `reachable_from` agree about what is passable instead of being
       two answers to the same question.
-- [ ] Handing that mesh to the renderer and standing in it. That is the last
-      step and the only one that needs a GPU to check.
+- [~] **The upload path exists and nothing calls it.** `Aboard::upload_hull`
+      registers the mesh with `Gpu::add_mesh` and remembers the slot,
+      re-uploading when the doors move. It type-checks — `wgpu` is not
+      feature-gated, so `render.rs` is in the build the tests run against —
+      and that is as far as verification goes without a device.
+      **Remaining: two lines.** Call it once on boarding, and `push` the slot
+      with `Mat4::IDENTITY` in the draw loop the way the terrain chunks do
+      (`main.rs`, the `M_TERRAIN_0 + ci` block). Both want eyes on the result,
+      which is why I stopped here rather than writing them blind.
 
 ### 3. Campaign missions you can play
 

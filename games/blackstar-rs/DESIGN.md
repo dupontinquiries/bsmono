@@ -6124,6 +6124,28 @@ why it is needed — with an assertion that fails if the budget shrinks again.
 
 1113 passing.
 
+THE UPLOAD PATH, AND WHERE I STOPPED. `Aboard::upload_hull` registers the
+ship mesh with `Gpu::add_mesh` and keeps the slot, re-uploading when the doors
+move because a sealed corridor is not drawn and the geometry has to agree with
+what you can walk through.
+
+It type-checks, and that is worth stating precisely rather than hoping:
+`wgpu` is NOT feature-gated in this crate, so `render.rs` is compiled by the
+same `--no-default-features` build the tests run against. The path is real
+code the compiler has seen; what it has never done is run on a device.
+
+NOTHING CALLS IT, and I left the warning rather than inventing a caller. The
+remaining work is two lines — call it once on boarding, and `push` the slot
+with `Mat4::IDENTITY` in the draw loop the way the terrain chunks already do.
+Both want eyes on the result. Writing them blind would turn "not yet drawn"
+into "drawn, possibly wrong, and nobody can tell", which is worse.
+
+What IS checked here is the bookkeeping around it: the slot starts empty and
+survives walking, because getting that wrong means re-uploading a thousand
+triangles every frame and it needs no GPU to catch.
+
+1114 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
