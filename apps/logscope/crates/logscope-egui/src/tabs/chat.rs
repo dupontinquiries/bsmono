@@ -5852,6 +5852,49 @@ them to", patches.len());
     fn run_command(&mut self, cmd: crate::vimmode::Command, ui: &egui::Ui) {
         use crate::vimmode::Command;
         match cmd {
+            // The `:irc` family. Parsed by logscope-fan's vimmode and dispatched by
+            // logscope-fan's cmdpalette; this SHELL has not been wired to the consent
+            // gate yet, so each arm says so by name rather than doing nothing.
+            //
+            // Silence would be the wrong failure here specifically. The whole point of
+            // `irc-kit`'s design is that adding a channel log costs two deliberate steps
+            // — `:irc <net>/<chan>` prints the consent text and arms a pending ask,
+            // `:ircy <chan>` confirms by typing the channel name back — precisely so
+            // muscle memory cannot grant access to other people's writing. A command
+            // that appears to be accepted and quietly grants nothing teaches the
+            // operator that the gate is noise, which is the one lesson it must not
+            // teach. So: name the command, name what is missing.
+            Command::IrcStatus => {
+                self.note = ":irc — channel-log sources are not wired into this shell yet \
+(shared/irc-kit has the log index and the consent gate; logscope-fan's ircsrc.rs is the seam)".into();
+            }
+            Command::IrcAsk(chan) => {
+                self.note = format!(
+                    ":irc {chan} — not wired into this shell yet, so NOTHING has been granted. \
+When it is, this prints the consent text and arms an ask that `:ircy {chan}` confirms.");
+            }
+            Command::IrcConfirm(chan) => {
+                self.note = format!(
+                    ":ircy {chan} — there is no pending ask to confirm; the `:irc` family is not \
+wired into this shell yet.");
+            }
+            Command::IrcRevoke(chan) => {
+                // Revocation reads as safe to no-op and is not: an operator who believes
+                // a grant was withdrawn will act on that belief.
+                self.note = format!(
+                    ":ircx {chan} — nothing to withdraw. Channel-log sources are not wired into \
+this shell, so no grant exists here to revoke.");
+            }
+
+            Command::IrcFind(q) => {
+                // Search is the reach the grant gates, so an unwired search must not
+                // read as "no results" — that is indistinguishable from a granted log
+                // containing nothing.
+                self.note = format!(
+                    ":ircf {q} — channel-log search is not wired into this shell yet. This is NOT \
+an empty result set: nothing was searched.");
+            }
+
             Command::Branch => { if let Some(f) = self.walk_focus { self.branch_from = Some(f); } }
             Command::Attach(p) => self.attach_path(&p, ui),
             Command::Image(prompt) => self.start_image(&prompt),

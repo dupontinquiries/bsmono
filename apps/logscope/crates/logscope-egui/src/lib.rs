@@ -154,6 +154,19 @@ pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan
 #[allow(dead_code)] pub mod convograph; // pure (no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
 #[allow(dead_code)] pub mod spatial; // pure math (no egui) + imported by lean modules → not gui-gated
+
+// Four modules that sat in src/ with no `mod` line — never compiled, 22 tests
+// that had never run. Found by maintenance/tools/orphan_check.py; each checked
+// against the iq3 case first (a superseded duplicate, where declaring builds a
+// second copy of working code). None is that: no public item of any of them is
+// defined elsewhere in this crate except `gen_profile::detect`, which shares
+// only a name with `mount::detect`.
+//
+// Gated by what each actually imports, following the convention above.
+#[allow(dead_code)] pub mod components;   // std only
+#[allow(dead_code)] pub mod gen_profile;  // std only
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod hud_pack;   // eframe::egui geometry
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod touch_nav;  // touchkit + crate::spatial
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod mesh3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
