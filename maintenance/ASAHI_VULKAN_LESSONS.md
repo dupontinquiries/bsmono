@@ -224,11 +224,53 @@ self-documenting on a machine that will only ever build for itself; both
 `apple-m1` and `cortex-a53` are valid `target-cpu` values, so the same mechanism
 expresses "this is a PinePhone" correctly too.
 
-The durable fix is upstream in candle: `gemm-f16` should be behind a feature, or
-its aarch64 path should be runtime-dispatched the way `gpu-gemm` gates its
-subgroup kernel. Until then this is a per-machine setting, and the reason it is
-written down here rather than fixed in-tree is that fixing it in-tree would be
-wrong.
+### Why the tidy in-tree fix does not exist, tested rather than assumed
+
+`f16` IS an optional feature of `gemm` — default-on, but optional:
+
+```toml
+[features]
+default = ["std", "rayon", "f16"]
+f16 = ["gemm-f16", ...]
+```
+
+So the obvious move is to turn it off from above, since beatspace uses no f16
+anywhere in its own code. It does not work, and the reason is worth knowing
+before someone spends an afternoon on it. candle-core declares:
+
+```toml
+gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
+```
+
+with defaults ON, and **Cargo features are additive** — `default-features =
+false` on one dependent cannot cancel another dependent that takes the
+defaults. Verified in a scratch crate that asks for exactly that:
+
+```
+$ cargo tree -i gemm-f16
+gemm-f16 v0.19.0
+└── gemm v0.19.0
+    ├── candle-core v0.11.0
+    │   └── f16try v0.0.0
+    └── f16try v0.0.0        <- our default-features=false request
+```
+
+`gemm-f16` is still there. There is no combination of features a downstream
+crate can set that removes it.
+
+That leaves three real options, none of them a one-liner:
+
+1. **Per-machine flag** (above). What this fleet should do today.
+2. **`[patch.crates-io]` onto a candle-core fork** that sets
+   `default-features = false` on gemm. Vendors a dependency to change one line
+   of its manifest, and then owns the fork.
+3. **Upstream**: candle-core should not force `gemm/f16` on consumers that
+   never use half precision. That is the fix that helps everyone building
+   candle for a baseline aarch64 target, which is every PinePhone, every
+   Raspberry Pi and every default CI runner.
+
+The reason this is written down instead of fixed in-tree is not that the fix is
+hard — it is that the two available in-tree fixes are worse than the setting.
 
 **UNVERIFIED BY COMPILATION.** This sandbox is x86_64 with no aarch64 std
 installed and no rustup to add one, so none of the above was built. What WAS
