@@ -221,16 +221,23 @@ place in `maintenance/tools/`.
   which `--all` does **not** include; refuses a dirty tree and fails hard over
   500 MiB.
 
-- **C9-3c — Bundle survey + incremental-cost probe.** `queued` (promoted from
-  `idea`) · `verified` on three bundles.
-  Two scripts. The survey answers "self-contained or incremental, and do I have
-  the prerequisite" without fetching. The probe answers "what would this
-  actually cost", via an alternates-backed scratch repo and
-  `git repack -a -d -l`. The probe is the one that earned its keep: it turned
-  a 369 MiB bundle into a measured 888 KiB and stopped two large ones from
-  silently undoing the history rewrite. Both belong in `maintenance/tools/`
-  next to `zips_to_history.sh` — `lock_check.py` landed there this session and
-  these are the same kind of thing, so there is now a precedent and no excuse.
+- **C9-3c — Bundle survey + incremental-cost probe.** `done` · `verified`
+  (c10). The c9 scripts were lost with the sandbox; rewritten as
+  `maintenance/tools/survey-bundle.sh` and `probe-bundle.sh`.
+  The survey answers "self-contained or incremental, and do I have the
+  prerequisite" by parsing the bundle header up to the first empty line —
+  nothing fetched — and calls out a missing `refs/notes/toolcalls`
+  explicitly (failure mode #3). The probe answers "what would this actually
+  cost" via the alternates-backed scratch + `git repack -a -d -l`, as in c9.
+  Verified both directions: applyable/NOT-applyable on a crafted incremental
+  pair; probe of the c9-005 bundle (369 MiB) against a clone made from it
+  measures **0 bytes** in 0.3 s — fetch negotiation sees every tip already
+  present and skips the transfer, so the speed is the mechanism, not a skip.
+  One trap found by testing the failure path: a bundle recording only `HEAD`
+  matches nothing under a `+refs/*:refs/*` refspec, and the fetch SUCCEEDS
+  having fetched zero refs — the first probe draft printed a lying "0 bytes"
+  for a bundle it never measured. Refspecs are now built from
+  `git bundle list-heads`, and a success that lands no refs is refused.
 
 - **C9-3d — `build/build.sh --run` cannot build anything on an x86_64 host.**
   `queued` · `verified`.
