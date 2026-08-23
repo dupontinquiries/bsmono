@@ -53,6 +53,9 @@
 // three different strategies and three of them had bugs; this is the primitive
 // they should have been policies over. Honours the CommonMark run-length rule
 // (a 4-tick block contains 3-tick blocks), which all four sites get wrong.
+// The clock the conversation never had: an operator asked to "keep working for
+// the next hour" and no turn carried a timestamp, so the phrase was unreadable.
+#[allow(dead_code)] pub mod sessiontime;
 #[allow(dead_code)] pub mod reply;
 #[allow(dead_code)] pub mod capability;
 #[allow(dead_code)] pub mod liaison_fan;

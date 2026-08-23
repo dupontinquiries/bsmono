@@ -358,10 +358,46 @@ fn glass_frame() -> egui::Frame {
 /// from before this was recorded — see convoprov, which skips unknown provenance rather than
 /// assuming it matches the neighbours, because that is exactly what an older conversation looks
 /// like and guessing there would label it with whatever happens to be loaded now.
-struct Msg { role: Role, variants: Vec<String>, cur: usize, born: std::time::Instant, editing: bool, edit_buf: String, think_open: bool, parent: Option<usize>, model: Option<String> }
+/// `born` is an `Instant` — monotonic, so it can measure "3s ago" and can
+/// NEITHER produce a wall-clock time nor survive a save. `at` is the wall clock,
+/// in unix seconds, and it is why the exported transcript can say when anything
+/// happened. A session reopened tomorrow used to look identical to one from a
+/// minute ago.
+struct Msg { role: Role, variants: Vec<String>, cur: usize, born: std::time::Instant, at: u64, editing: bool, edit_buf: String, think_open: bool, parent: Option<usize>, model: Option<String> }
+
+/// `YYYY-MM-DD HH:MM UTC` from unix seconds, without pulling a date crate into
+/// a frontend that has none.
+///
+/// UTC rather than local: a transcript is a file that gets read on another
+/// machine, and a bare local time with no offset is the one format that cannot
+/// be corrected later.
+fn stamp_utc(secs: u64) -> String {
+    if secs == 0 { return "unknown".into() }
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm), integer-only.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", tod / 3600, (tod % 3600) / 60)
+}
+
+/// Wall-clock seconds. Falls back to 0 rather than panicking: a clock before
+/// the epoch is a broken machine, not a reason to lose the message.
+fn wall_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0)
+}
 impl Msg {
-    fn user(text: String) -> Self { Self { role: Role::User, variants: vec![text], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
-    fn assistant() -> Self { Self { role: Role::Assistant, variants: vec![String::new()], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
+    fn user(text: String) -> Self { Self { role: Role::User, variants: vec![text], cur: 0, born: Instant::now(), at: wall_now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
+    fn assistant() -> Self { Self { role: Role::Assistant, variants: vec![String::new()], cur: 0, born: Instant::now(), at: wall_now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
     fn text(&self) -> &str { &self.variants[self.cur] }
     /// All variants, for an export that must not drop regenerations.
     fn all_variants(&self) -> &[String] { &self.variants }
@@ -605,7 +641,7 @@ fn msg_to_save(m: &Msg) -> MsgSave { MsgSave { role: if m.role == Role::User { 0
 fn save_to_msg(s: &MsgSave) -> Msg {
     let variants = if s.variants.is_empty() { vec![String::new()] } else { s.variants.clone() };
     let cur = s.cur.min(variants.len() - 1);
-    Msg { role: if s.role == 0 { Role::User } else { Role::Assistant }, variants, cur, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None , model: None }
+    Msg { role: if s.role == 0 { Role::User } else { Role::Assistant }, variants, cur, born: Instant::now(), at: wall_now(), editing: false, edit_buf: String::new(), think_open: true, parent: None , model: None }
 }
 fn now_unix() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 
@@ -2301,10 +2337,35 @@ reply is framed differently from the turn that produced it.");
     /// The conversation as portable Markdown (You / Assistant sections).
     fn transcript(&self) -> String {
         let mut s = String::from("# logscope chat\n\n");
+        // WHEN, and HOW LONG SINCE THE LAST TURN.
+        //
+        // The export carried no time at all, so a conversation reopened a week
+        // later read exactly like one from a minute ago — and an operator who
+        // typed "keep working for the next hour" left no trace of when the hour
+        // started. Both halves matter and the second more: absolute stamps tell
+        // you when, gaps tell you what happened between turns, and a
+        // twenty-minute gap before a one-line reply is the shape of a model
+        // that stalled.
+        //
+        // Gaps only when they are worth a reader's attention. A stamp on every
+        // turn of a fast exchange is noise, and noise in a header is what makes
+        // people stop reading headers.
+        if let Some(first) = self.msgs.first() {
+            s.push_str(&format!("Started {}\n\n", stamp_utc(first.at)));
+        }
+        let mut prev: Option<u64> = None;
         for m in &self.msgs {
-            s.push_str(if m.role == Role::User { "## You\n\n" } else { "## Assistant\n\n" });
+            s.push_str(if m.role == Role::User { "## You" } else { "## Assistant" });
+            let gap = prev.map(|p| m.at.saturating_sub(p)).unwrap_or(0);
+            if gap >= 60 {
+                s.push_str(&format!("  ({} later, {})",
+                    logscope_fan::sessiontime::human(std::time::Duration::from_secs(gap)),
+                    stamp_utc(m.at)));
+            }
+            s.push_str("\n\n");
             s.push_str(m.text());
             s.push_str("\n\n");
+            prev = Some(m.at);
         }
         s
     }
@@ -8869,7 +8930,7 @@ mod tests {
         let msgs = vec![
             Msg::user("why is the disk full?".into()),
             Msg { role: Role::Assistant, variants: vec!["first try".into(), "better answer with ```code```".into()], cur: 1,
-                  born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None },
+                  born: Instant::now(), at: wall_now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None },
         ];
         let save = ChatSave {
             msgs: msgs.iter().map(msg_to_save).collect(),
@@ -9029,5 +9090,35 @@ mod long_horizon_prompt_tests {
         let long = "x".repeat(200);
         let out = summarize_progress(&long).unwrap();
         assert!(out.chars().count() <= 65 && out.ends_with('…'), "got {} chars", out.chars().count());
+    }
+}
+
+#[cfg(test)]
+mod time_stamp_tests {
+    use super::stamp_utc;
+
+    /// The civil-from-days arithmetic, against dates computed independently.
+    ///
+    /// Hand-rolled date maths is exactly the kind of thing that looks right and
+    /// is off by one for four months of the year, so these are real epoch
+    /// values rather than round numbers.
+    #[test]
+    fn known_epochs_render_correctly() {
+        assert_eq!(stamp_utc(0), "unknown", "0 is the fallback, not 1970");
+        assert_eq!(stamp_utc(1), "1970-01-01 00:00 UTC");
+        assert_eq!(stamp_utc(946_684_800), "2000-01-01 00:00 UTC");
+        // A leap day, which is where this algorithm earns its keep.
+        assert_eq!(stamp_utc(1_709_164_800), "2024-02-29 00:00 UTC");
+        // The day after, so an off-by-one in the leap branch cannot hide.
+        assert_eq!(stamp_utc(1_709_251_200), "2024-03-01 00:00 UTC");
+        // A time of day, not just midnight.
+        assert_eq!(stamp_utc(1_700_000_000), "2023-11-14 22:13 UTC");
+    }
+
+    #[test]
+    fn december_and_january_land_in_the_right_year() {
+        // The month shift (March-based) is where a year boundary goes wrong.
+        assert_eq!(stamp_utc(1_703_980_800), "2023-12-31 00:00 UTC");
+        assert_eq!(stamp_utc(1_704_067_200), "2024-01-01 00:00 UTC");
     }
 }
