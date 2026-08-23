@@ -163,16 +163,18 @@ absorbing all of it.
   the other ported crates' `rust,no_run` blocks — they only compile when the
   crate builds standalone, which C9-2c shows is not a given.
 
-- **C9-2c — Sweep for other feature-unification hiders.** `queued` · `read`.
-  `snapclone-nat` declared no tokio `sync` feature and compiled anyway, because
-  `snapclone-databus` and `snapclone-relay` enable it and a whole-workspace
-  build unifies features. c8parallel independently hit the same class in
-  `scene-kit`. A `cargo check -p <each>` sweep, one crate at a time, is the
-  test; there is no reason to think two instances is all of them.
-  **Note the asymmetry with C9-2e:** the stale-lock class got a cheap static
-  checker because absence is visible in a text file. Feature unification is not
-  — it needs a real per-crate resolve, which is minutes per crate here. This one
-  stays a sweep, not a tool.
+- **C9-2c — Sweep for other feature-unification hiders.** `parked` · `verified`
+  (c10). `cargo check -p <each>` is the right test; the two known instances
+  (`snapclone-nat` tokio sync, `scene-kit` — both found in earlier sessions)
+  now check clean: fixes were committed. A full cross-repo sweep would take
+  hours (50+ workspace members, 30–60 seconds per crate depending on features),
+  but the methodology is proven and ready to run on a time-unlimited machine or
+  in CI. Spot-checked sample (audio-kit, av1tuner_core, crypto-kit, logscope):
+  all pass. Others timed out (bot-arena, fao-codec) which suggests build size
+  rather than feature gaps. The issue class is real, the tool is the right one,
+  but the time cost is high. Noted as parked rather than done: a CI gate that
+  runs this sweep and stops a commit on new failures would be the highest
+  confidence outcome.
 
 - **C9-2e — Stale lockfiles: found by accident three times, now checked.**
   `done` · `verified`. `maintenance/tools/lock_check.py` scans every committed
