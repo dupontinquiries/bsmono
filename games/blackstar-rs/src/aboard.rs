@@ -482,6 +482,71 @@ mod tests {
     }
 
     #[test]
+    fn the_broad_phase_keeps_the_ship_off_the_hot_path() {
+        // `World::sdf` runs per contact per frame and `sdf_local` walks every
+        // cell and every link. The hull box test has to reject the common
+        // case — being nowhere near the ship — for nearly nothing.
+        let a = Aboard::new(70.0);
+        let far = Vec3::new(400.0, 0.0, 400.0);
+        let t0 = std::time::Instant::now();
+        for _ in 0..200_000 {
+            let q = far.abs() - a.ship.hull_half - Vec3::splat(2.0);
+            std::hint::black_box(q.max_element() < 0.0);
+        }
+        let rejected = t0.elapsed().as_secs_f32();
+
+        let near = a.ship.stand_in("bridge").unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..200_000 {
+            std::hint::black_box(a.ship.sdf_local(near));
+        }
+        let full = t1.elapsed().as_secs_f32();
+        assert!(
+            full > rejected * 3.0,
+            "the full query costs {full:.4}s and the reject {rejected:.4}s — \
+             the broad phase is not buying anything"
+        );
+    }
+
+    #[test]
+    fn what_you_see_is_what_you_hit() {
+        // The draw call and `World::park` both offset by `ground_lift`. Two
+        // transforms for one object is how a hull you can see and a hull you
+        // can hit end up in different places, and it is invisible until you
+        // walk through a wall that is drawn a metre away.
+        let a = Aboard::new(70.0);
+        let lift = ground_lift(&a.ship);
+        let origin = Vec3::new(0.0, lift, 0.0);
+
+        // a point at the centre of the bridge, in world space
+        let bridge = a.ship.stand_in("bridge").expect("bridge");
+        let world_p = bridge + origin;
+
+        // the collision query subtracts the origin and asks the interior
+        let d = a.ship.sdf_local(world_p - origin);
+        assert!(d > 0.0, "the bridge is solid at its own centre: {d}");
+
+        // and the mesh's floor, lifted, is above ground — the same number
+        let m = hull_mesh(&a.ship);
+        let lo = m.verts.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+        assert!((lo + lift - 0.1).abs() < 0.01, "the lift is not the mesh floor");
+    }
+
+    #[test]
+    fn the_hull_is_solid_where_the_walls_are() {
+        // inside a room: free. Inside the hull but not in a room: solid.
+        let a = Aboard::new(70.0);
+        let bridge = a.ship.stand_in("bridge").expect("bridge");
+        assert!(a.ship.sdf_local(bridge) > 0.0, "you cannot stand on the bridge");
+        // a corner of the hull box is structure, not a room
+        let corner = a.ship.hull_half * 0.95;
+        assert!(
+            a.ship.sdf_local(corner) < 0.0,
+            "the hull corner is walkable — the ship is a shell with no walls"
+        );
+    }
+
+    #[test]
     fn the_hull_slot_starts_empty_and_is_remembered() {
         // the upload itself needs a GPU; the bookkeeping around it does not,
         // and getting that wrong would mean re-uploading a thousand triangles

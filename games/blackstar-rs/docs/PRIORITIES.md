@@ -112,6 +112,12 @@ fixed, and moving between them is a position and a walkable check.
       terrain; that the rooms read as rooms rather than one block. If it is
       invisible, the mesh slot or the draw is wrong; if it is a grey lump, the
       lighting params `[0.35, 0.0, 0.25, 0.0]` are the dial.
+- [x] **It is solid.** `World::park` folds the interior's SDF into the world
+      query, broad-phased on the hull box. Drive at it and you should stop;
+      drive through a doorway and you should be inside. Both the draw and the
+      collision read `ground_lift`, so what you see is what you hit — there is
+      a test, because two transforms for one object is exactly how those end
+      up a metre apart.
 - [~] (was) The upload path exists and nothing calls it. `Aboard::upload_hull`
       registers the mesh with `Gpu::add_mesh` and remembers the slot,
       re-uploading when the doors move. It type-checks — `wgpu` is not

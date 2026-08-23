@@ -353,6 +353,8 @@ pub struct World {
     drop_cd: f32,
     /// spawn template for arriving planets (KUIPER only)
     kuiper: bool,
+    /// a ship parked in the world, and where. See `park`.
+    pub parked: Option<(Vec3, crate::interior::Interior)>,
     /// DROPSHOT: platform height — a ball below it scores by z sign
     pub drop_pit: Option<f32>,
     /// maps whose play surface is a raised deck say where to start
@@ -3721,7 +3723,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
+        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
         // prime the mover index so the very first frame is already fast
         w.rebuild_movers();
         w
@@ -4129,6 +4131,15 @@ impl World {
         self.sdf_calls.get()
     }
 
+    /// Park a ship in the world, so it becomes solid.
+    ///
+    /// `interior.rs` has always produced a walkable ship and the world knew
+    /// nothing about it, so the hull was scenery you drove through. One
+    /// option field is the whole join.
+    pub fn park(&mut self, origin: Vec3, ship: crate::interior::Interior) {
+        self.parked = Some((origin, ship));
+    }
+
     pub fn sdf(&self, p: Vec3) -> f32 {
         self.sdf_calls.set(self.sdf_calls.get() + 1);
         let mut d = p.y - grid_h(&self.tgrid, p.x, p.z);
@@ -4220,6 +4231,20 @@ impl World {
         }
         if dcut < 1.0e8 {
             d = d.max(-dcut);
+        }
+        // THE SHIP, if one is parked here.
+        //
+        // A hollow solid, so it unions like anything else — `interior.rs`
+        // already returns the carved distance, negative inside a room and
+        // positive in the hull. Broad-phased on the hull box because
+        // `sdf_local` walks every cell and every link, and `sdf` is called
+        // per contact per frame.
+        if let Some((origin, ship)) = &self.parked {
+            let local = p - *origin;
+            let q = local.abs() - ship.hull_half - Vec3::splat(2.0);
+            if q.max_element() < 0.0 {
+                d = d.min(ship.sdf_local(local));
+            }
         }
         d
     }

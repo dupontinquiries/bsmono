@@ -1932,6 +1932,11 @@ fn main() {
     {
         let mut ab = std::mem::replace(&mut game.aboard, aboard::Aboard::new(1.0));
         ab.upload_hull(&mut game.gpu);
+        // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
+        // one object is how a hull you can see and a hull you can hit end up
+        // in different places, so both read `ground_lift`.
+        let at = Vec3::new(0.0, aboard::ground_lift(&ab.ship), 0.0);
+        game.world.park(at, aboard::Aboard::new(70.0).ship);
         game.aboard = ab;
     }
 

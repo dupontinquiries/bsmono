@@ -6193,6 +6193,24 @@ lands — and the computation is three lines.
 
 1116 passing.
 
+THE SHIP IS SOLID. `World::park` folds the interior's SDF into the world
+query — one `Option` field and five lines at the end of `World::sdf`. The hull
+has been walkable since `interior.rs` landed and the world knew nothing about
+it, so you drove through scenery.
+
+BROAD-PHASED ON THE HULL BOX, because `sdf` runs per contact per frame and
+`sdf_local` walks every cell and every link. A test asserts the reject path is
+at least three times cheaper than the full query, so the common case — being
+nowhere near the ship — costs almost nothing.
+
+AND BOTH TRANSFORMS READ `ground_lift`. The draw call and the park use the
+same function, with a test that the mesh floor and the collision origin agree.
+Two transforms for one object is exactly how a hull you can SEE and a hull you
+can HIT end up a metre apart, and that failure is invisible until you walk
+through a wall that is drawn beside you.
+
+1119 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
