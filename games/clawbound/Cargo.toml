@@ -34,3 +34,9 @@ web = ["app", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_error
 
 [profile.dev]
 opt-level = 1
+
+[dev-dependencies]
+# WGSL validation at test time: cargo check does not compile shaders, so a
+# malformed one otherwise waits for the first frame that dispatches it.
+# Pinned to the version wgpu 22 already resolves, so it adds no new build.
+naga = { version = "22", features = ["wgsl-in"] }
