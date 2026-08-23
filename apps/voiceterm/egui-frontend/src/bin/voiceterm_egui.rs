@@ -666,6 +666,14 @@ struct VoicetermApp {
     /// are how you get back. Vertical because it costs width once instead of
     /// height per row — on a phone the terminal wants every scanline.
     rail_open: bool,
+    /// Is the vertical tab column expanded?
+    ///
+    /// The Qt original could not do this — `vTabBar` is drag-resizable between
+    /// 110 and 340 and has no closed state, so on a phone it always costs at
+    /// least 110 points of width. This is an improvement on the port's source
+    /// rather than a fidelity fix, and worth saying plainly because everything
+    /// else in this file is measured against the QML.
+    tabbar_open: bool,
     /// Swipe-to-switch-tab, from the kit rather than hand-rolled.
     ///
     /// The rail keeps the screen space; this is how you move between tabs
@@ -1581,11 +1589,47 @@ impl eframe::App for VoicetermApp {
         //    `tabbar` (120) for 280px against Qt's 168. Merging them is the
         //    real fidelity fix and is not this change; gating and sizing are.
         if show_chrome {
-        egui::SidePanel::left("tabbar")
-            .resizable(true)
-            .default_width(168.0)          // main.qml:4015 termSidebarWidth
-            .width_range(110.0..=340.0)    // main.qml:4685 drag clamp
-            .show(ctx, |ui| {
+        // COLLAPSED, the column is one touch target wide — the same closed
+        // width `rail` uses, so the two behave alike rather than each having
+        // its own idea of "narrow".
+        //
+        // Resizable only when open: a drag handle on a chevron-width strip is a
+        // target the user hits by accident while reaching for the chevron.
+        let tabbar_panel = if self.tabbar_open {
+            egui::SidePanel::left("tabbar")
+                .resizable(true)
+                .default_width(168.0)          // main.qml:4015 termSidebarWidth
+                .width_range(110.0..=340.0)    // main.qml:4685 drag clamp
+        } else {
+            egui::SidePanel::left("tabbar")
+                .resizable(false)
+                .exact_width(adaptive.min_touch_target)
+        };
+        tabbar_panel.show(ctx, |ui| {
+            // The chevron points the way the panel will move, which is the
+            // convention `rail` already set two panels over.
+            if ui.small_button(if self.tabbar_open { "‹" } else { "›" })
+                .on_hover_text(if self.tabbar_open { "Collapse tabs" } else { "Expand tabs" })
+                .clicked()
+            {
+                self.tabbar_open = !self.tabbar_open;
+            }
+            if !self.tabbar_open {
+                // Collapsed: initials only, active highlighted. Enough to count
+                // the tabs and see which is live — the same reduction `rail`
+                // makes, and the reason a closed column is still useful rather
+                // than merely absent.
+                ui.separator();
+                let tabs: Vec<(String, bool)> = self.workspace.tabs.iter().enumerate()
+                    .map(|(i, t)| (t.name.clone(), i == self.workspace.active)).collect();
+                for (i, (name, active)) in tabs.iter().enumerate() {
+                    let initial = name.chars().next().unwrap_or('\u{2022}').to_string();
+                    if uikit_egui::dock::list_row(ui, &initial, *active, 26.0, &self.colors).clicked() {
+                        self.workspace.active = i;
+                    }
+                }
+                return;
+            }
             ui.add_space(4.0);
             let mut apply: Vec<voiceterm_egui::gesture_menus::WsCall> = Vec::new();
             const ROW_PITCH: f32 = 33.0; // QML v0.1.803: 30px row + 3px spacing
@@ -3270,6 +3314,9 @@ fn main() -> eframe::Result<()> {
                 phonetics: Default::default(),
                 glow_active: false,
                 rail_open: true,
+            // Open by default: a control the user has not met yet must not
+            // start hidden, or the tabs look lost rather than collapsed.
+            tabbar_open: true,
                 // One page = one tab. 320 px matches the snapclone convention
                 // the layer was written against, so the detent lands where a
                 // thumb expects it on every app in the fleet.
