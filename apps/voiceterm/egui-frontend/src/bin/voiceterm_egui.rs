@@ -1646,9 +1646,15 @@ impl eframe::App for VoicetermApp {
                     if resp.clicked() {
                         self.workspace.active = i;
                     }
-                    // hold-to-open the per-tab menu on the same row host (0.35 s, QML hold
+                    // hold-to-open the per-tab menu on the same row host. 0.38 s, not
+                    // 0.35: `main.qml:4494` is `Timer { id: _holdTimer; interval: 380 }`,
+                    // and its comment explains why it is a MANUAL timer rather than
+                    // Qt's `onPressAndHold` — "cancelled when a touch point drifts past
+                    // the drag threshold, so on a touchscreen a finger-hold almost never
+                    // fired the menu". A port that shortens it re-introduces a race the
+                    // original lengthened the interval to avoid. (QML hold
                     // feel); the held tab's name rides in the title band
-                    let menu = tab_slide_menu(("vt-tab-menu", i), &tab.name).hold(0.35);
+                    let menu = tab_slide_menu(("vt-tab-menu", i), &tab.name).hold(0.38);
                     if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, variant) =
                         menu.show_stored(ui, egui::Id::new(("vt-tab-menu", i)), &resp, &tab_menu())
                     {
