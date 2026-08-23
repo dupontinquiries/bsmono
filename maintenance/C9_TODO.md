@@ -379,8 +379,24 @@ relevant half for this stack than the Python side.
   inner with `store: Option<&mut PrefixStore>` so the validated path is the
   same code with `None`. 1219 tests pass on llvmpipe. Still open: the
   collision length guard is reasoned-correct but not test-enforced (this
-  fixture's argmax does not move on garbage KV — needs M2), warm-tier hits are
-  untested because every test keeps the budget hot, and (3) is untouched.
+  fixture's argmax does not move on garbage KV — needs M2), and (3) is
+  untouched.
+
+  Warm-tier hits are now covered (`05cbc785`): a budget set between the hot and
+  warm footprints forces one demotion, and the next run must promote it back.
+  That test deliberately does NOT assert token equality — promotion is lossy, so
+  equality holds here only because this fixture's argmax is insensitive and
+  would flake on a sharper model. It asserts what the design does guarantee:
+  the entry demotes, the warm branch of `take` runs, and every request is
+  answered. Both halves fail on broken copies.
+
+  **A finding that changes how green this suite should be read:** 28 gpu-gemm
+  test sites are fixture-gated and pass SILENTLY when the fixture is absent —
+  the same class C9-4c flagged. Running `sh tools/tiny-variants/gen-all.sh`
+  first takes the suite from 9 s to 23 s at the same pass count, which is the
+  measure of how much was not executing. Any session reporting a gpu-gemm pass
+  count without generating fixtures first is reporting a partly hollow number;
+  this one did, in its first pass, before catching it.
 
   **The seam that fits, as originally designed:** give `PrefixStore` a
   `take(&mut self, gpu, key) -> Option<(usize, KvCache)>` that REMOVES the
