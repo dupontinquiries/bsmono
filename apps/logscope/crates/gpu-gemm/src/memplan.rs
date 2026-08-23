@@ -883,6 +883,17 @@ the tensors of that type", parts.join(", "))
 /// `the_known_suffix_list_matches_what_lib_rs_reads` below — a hand-maintained
 /// allowlist drifts, and a drifted allowlist makes this whole check lie in the
 /// friendly direction.
+/// Top-level (non-`blk.N.`) tensor stems the engine consumes.
+///
+/// The block list below covers per-layer tensors and the census originally
+/// stopped there — so a checkpoint carrying an unread tensor OUTSIDE any block
+/// was reported as fully accounted for. That is the same silent-omission class
+/// the census exists to catch, in the one place it was not looking, and it took
+/// noticing that `blk.0.` was the only prefix filtered.
+pub const KNOWN_TOP_LEVEL: &[&str] = &[
+    "output", "output_norm", "rope_freqs", "token_embd",
+];
+
 pub const KNOWN_BLOCK_SUFFIXES: &[&str] = &[
     "attn_k", "attn_k_norm", "attn_kv_a_mqa", "attn_norm", "attn_output",
     "attn_post_norm", "attn_q", "attn_q_a", "attn_q_norm", "attn_qkv", "attn_v",
@@ -916,9 +927,19 @@ pub const KNOWN_BLOCK_SUFFIXES: &[&str] = &[
 /// heaviest first. Block 0 only: every block repeats the same set, and a list
 /// forty times as long would not be read.
 pub fn unread_block_tensors(g: &crate::gguf::Gguf) -> Vec<(String, u64)> {
+    let known = |name: &str, allow: &[&str]| {
+        let (stem, part) = name.rsplit_once('.').unwrap_or((name, "weight"));
+        allow.contains(&stem) && matches!(part, "weight" | "bias")
+    };
     let mut out: Vec<(String, u64)> = g.tensors.iter()
-        .filter(|t| t.name.starts_with("blk.0."))
+        // Block 0 AND everything outside a block. Later blocks repeat block 0's
+        // set, so listing them would multiply the report by the layer count
+        // without adding a fact.
+        .filter(|t| t.name.starts_with("blk.0.") || !t.name.starts_with("blk."))
         .filter(|t| {
+            if !t.name.starts_with("blk.") {
+                return !known(&t.name, KNOWN_TOP_LEVEL);
+            }
             let rest = &t.name["blk.0.".len()..];
             // BOTH halves must be known: a familiar stem with an unfamiliar
             // trailing component is the case most worth reporting, because the
@@ -930,8 +951,7 @@ pub fn unread_block_tensors(g: &crate::gguf::Gguf) -> Vec<(String, u64)> {
             // stem, which marked `ffn_down_exps.scale` as ACCOUNTED FOR — the
             // opposite of what the comment beside it claimed. The test sided
             // with the comment.
-            let (stem, part) = rest.rsplit_once('.').unwrap_or((rest, "weight"));
-            !(KNOWN_BLOCK_SUFFIXES.contains(&stem) && matches!(part, "weight" | "bias"))
+            !known(rest, KNOWN_BLOCK_SUFFIXES)
         })
         .map(|t| (t.name.clone(), t.dims.iter().product::<u64>().max(1)))
         .collect();
@@ -946,7 +966,7 @@ pub fn unread_tensor_line(g: &crate::gguf::Gguf) -> Option<String> {
     let names: Vec<String> = un.iter().take(8)
         .map(|(n, w)| format!("{} ({} weights)", n.trim_start_matches("blk.0."), w))
         .collect();
-    Some(format!("UNREAD tensors in blk.0 — nothing in this engine consumes {}{}. \
+    Some(format!("UNREAD tensors (blk.0 and top level) — nothing in this engine consumes {}{}. \
 A tensor the forward pass ignores does not error; it produces plausible wrong output.",
         names.join(", "),
         if un.len() > 8 { format!(" and {} more", un.len() - 8) } else { String::new() }))
@@ -2207,6 +2227,50 @@ mod file_view_refusal_tests {
                     "`{suffix}` is on the known list but lib.rs never mentions it — if the loader \
 dropped it, remove it here or every checkpoint carrying it will be silently marked accounted-for");
         }
+    }
+
+
+    /// Top-level tensors were skipped entirely by the first version.
+    ///
+    /// The filter kept only `blk.0.` names, so anything outside a block —
+    /// where a per-model scale or an auxiliary head would sit — was reported as
+    /// accounted for by never being examined. Silently omitting from a report
+    /// about silent omissions.
+    #[test]
+    fn an_unread_top_level_tensor_is_reported() {
+        let g = gguf_of(vec![
+            tensor("token_embd.weight", 12, &[4096, 128256]),
+            tensor("output_norm.weight", 0, &[4096]),
+            tensor("per_layer_model_proj.weight", 12, &[4096, 256]),
+            tensor("altup_proj.weight", 12, &[4096, 4096]),
+        ]);
+        let names: Vec<String> = unread_block_tensors(&g).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"per_layer_model_proj.weight".to_string()), "{names:?}");
+        assert!(names.contains(&"altup_proj.weight".to_string()), "{names:?}");
+        assert!(!names.contains(&"token_embd.weight".to_string()),
+                "the four known top-level tensors must not be flagged: {names:?}");
+        assert_eq!(names.len(), 2);
+    }
+
+    /// Later blocks repeat block 0's set; reporting them would multiply the
+    /// line by the layer count without adding a fact.
+    #[test]
+    fn later_blocks_are_not_listed_again() {
+        let g = gguf_of(vec![
+            tensor("blk.0.mystery.weight", 12, &[8, 8]),
+            tensor("blk.1.mystery.weight", 12, &[8, 8]),
+            tensor("blk.39.mystery.weight", 12, &[8, 8]),
+        ]);
+        assert_eq!(unread_block_tensors(&g).len(), 1, "one line per distinct tensor, not per layer");
+    }
+
+    /// A `.scale` on a known TOP-LEVEL stem is unread, exactly as it is on a
+    /// block stem — the rule must not differ between the two paths.
+    #[test]
+    fn an_unknown_component_on_a_known_top_level_stem_is_reported() {
+        let g = gguf_of(vec![tensor("output.scale", 0, &[128])]);
+        let names: Vec<String> = unread_block_tensors(&g).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["output.scale".to_string()]);
     }
 
 }
