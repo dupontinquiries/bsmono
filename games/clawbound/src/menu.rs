@@ -434,19 +434,27 @@ mod tests {
         assert_eq!(m.items()[0], "Quick Play (5v5)");
         assert_eq!(m.activate(), MenuCmd::QuickPlay);
         assert!(!m.open, "and it leaves the menu for the select page");
-        // the rows below it still go where they went
+        // The rows below it still go where they went — but there is one more of
+        // them than the series assumed: this side's six-pick draft row sits at 2,
+        // so everything after it shifts down by one. Both routes into the mode
+        // are asserted here on purpose, since a renumbering is exactly how one
+        // of them would quietly stop being reachable.
         let mut m = Menu::new();
         m.cursor = 1;
         assert_eq!(m.activate(), MenuCmd::None);
         assert_eq!(m.screen, Screen::Play);
         let mut m = Menu::new();
         m.cursor = 2;
-        assert_eq!(m.activate(), MenuCmd::Multiplayer);
+        assert_eq!(m.activate(), MenuCmd::None);
+        assert_eq!(m.screen, Screen::Draft, "the Battleground draft row must still open the draft");
         let mut m = Menu::new();
         m.cursor = 3;
+        assert_eq!(m.activate(), MenuCmd::Multiplayer);
+        let mut m = Menu::new();
+        m.cursor = 4;
         assert_eq!(m.activate(), MenuCmd::StartTutorial);
         let mut m = Menu::new();
-        m.cursor = 6;
+        m.cursor = 7;
         assert_eq!(m.activate(), MenuCmd::Quit);
     }
 
