@@ -605,3 +605,291 @@ mod tests {
         assert_eq!(run.phase, 3);
     }
 }
+
+// --------------------------------------------------------------- driver ---
+
+/// `--raidrun <boss>` — a raid at 120 Hz, as the renderer will have to see it.
+///
+/// This module is the contract the raid renderer must satisfy: it is handed
+/// unit positions and a clock, and hands back EVENTS and BEACONS. It never
+/// moves anything. `skirmish.rs` calls it "the contract for the raid
+/// renderer" in its own doc — and it had one reference in the whole tree, so
+/// nothing had ever run the contract to see what it actually emits.
+///
+/// The point of printing the stream is that the renderer's job is defined by
+/// it. Every `Slam` is a body being thrown at the deck; every `Grapple` is an
+/// impulse the shell applies and the camera has to follow. A list of the
+/// events a real raid produces, in order, with timings, is the closest thing
+/// to a specification for that work that can exist before there is a window.
+pub fn run(argv: &[String]) {
+    let i = argv.iter().position(|a| a == "--raidrun").unwrap_or(0);
+    let want = argv.get(i + 1).map(String::as_str).unwrap_or("mantis");
+    let Some(boss) = crate::raidcon::BOSSES.iter().find(|b| b.id == want) else {
+        println!("no warden '{want}'. `--raid` lists them.");
+        return;
+    };
+    let plan = crate::raidgen::plan_for(boss, 3, 7);
+    println!("{} — {:?}, {} phases, stepped at 120 Hz\n", boss.name, boss.mech, plan.phases.len());
+
+    // A squad that flies, so grounding fields have something to bite. Who
+    // moves these is the shell's business; here they just exist and drift in.
+    // start them on top of the first objective, so a GROUND field has
+    // something to bite immediately rather than after a minute of drift
+    let start = plan.phases[0].enc.first().map(|e| (e.x, e.z)).unwrap_or((0.0, 0.0));
+    let mut units: Vec<Unit> = (0..4)
+        .map(|k| Unit { pos: [start.0 + k as f32 * 4.0 - 6.0, FLY_Y + 4.0, start.1] })
+        .collect();
+
+    let mut run = RaidRun::new(&plan);
+    let dt = 1.0 / 120.0;
+    let mut phase_no = 1;
+    loop {
+        let spec_len = plan.phases[run.phase].enc.len();
+        println!("-- phase {phase_no}: {spec_len} encounter(s)");
+        {
+            let pr = run.start_phase(600.0, false);
+            let mut t = 0.0f32;
+            let mut seen: Vec<String> = Vec::new();
+            let mut ticks = 0;
+            while t < 600.0 {
+                let evs = pr.step(dt, &units);
+                for e in &evs {
+                    let line = format!("{:>7.2}s  {}", t, describe(e));
+                    // collapse the repeaters: a chip every accumulator period
+                    // for a minute is one fact, not two hundred
+                    let key = describe_kind(e);
+                    if seen.iter().filter(|s| **s == key).count() < 2 {
+                        println!("   {line}");
+                    } else if seen.iter().filter(|s| **s == key).count() == 2 {
+                        println!("   {:>7.2}s  ... {key} repeating", t);
+                    }
+                    seen.push(key);
+                }
+                // apply what the sim asked for, which is the shell's half
+                for e in &evs {
+                    match e {
+                        Event::Slam { unit, vy } => units[*unit].pos[1] += vy * dt,
+                        Event::Grapple { unit, vel } => {
+                            for a in 0..3 {
+                                units[*unit].pos[a] += vel[a] * dt;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if evs.iter().any(|e| matches!(e, Event::PhaseCleared | Event::WindowClosed)) {
+                    break;
+                }
+                // THE SHELL'S OTHER HALF: the contract exposes two inputs as
+                // well as the event stream. A player presses grapple; a
+                // champion dies to whatever the combat layer decides. Drive
+                // both, or the driver only tests the half that ticks itself.
+                if ticks == 240 {
+                    if let Some(e) = pr.request_grapple(0, &units) {
+                        println!("   {:>7.2}s  {}  (player pressed grapple)", t, describe(&e));
+                    }
+                }
+                if ticks == 600 {
+                    pr.champion_fell();
+                }
+                // AND THE THIRD INPUT: kills. A quota encounter clears on
+                // `credit_kill`, never on its own — the contract does not
+                // decide who dies any more than it decides who moves. My
+                // first run of this driver called neither and sat for 72,000
+                // ticks emitting two events, which read like a broken sim and
+                // was a harness feeding it nothing.
+                if ticks % 600 == 0 {
+                    for (i, b) in pr.beacons().iter().enumerate() {
+                        if !b.done && !b.anchor {
+                            pr.credit_kill(i);
+                            break;
+                        }
+                    }
+                }
+                // drift toward the objectives so the phase can actually end
+                if let Some(b) = pr.beacons().iter().find(|b| !b.done) {
+                    for u in units.iter_mut() {
+                        for a in [0usize, 2] {
+                            u.pos[a] += (b.pos[a] - u.pos[a]).clamp(-8.0 * dt, 8.0 * dt);
+                        }
+                    }
+                }
+                t += dt;
+                ticks += 1;
+            }
+            let counts = tally(&seen);
+            println!("   {ticks} ticks, {:.1}s: {counts}\n", t);
+        }
+        // `advance` returns OVER, not "ok to continue". I read it as the
+        // latter and the driver stopped after phase one — the same shape of
+        // error as reading a `Result` backwards, and worth the comment
+        // because the name reads either way at the call site.
+        if run.advance() {
+            break;
+        }
+        phase_no += 1;
+    }
+    println!("the sim never moved a unit. every Slam and Grapple above is a");
+    println!("velocity the shell applies and the camera has to follow — which is");
+    println!("the renderer's half of this contract, stated as a list.");
+}
+
+fn describe(e: &Event) -> String {
+    match e {
+        Event::Slam { unit, vy } => format!("SLAM      unit {unit}, vy {vy:+.1}"),
+        Event::Chip { unit, dmg } => format!("CHIP      unit {unit}, {dmg:.1}"),
+        Event::Grapple { unit, vel } => {
+            format!("GRAPPLE   unit {unit}, vel [{:.0} {:.0} {:.0}]", vel[0], vel[1], vel[2])
+        }
+        Event::NodeClaimed { enc } => format!("NODE      encounter {enc} claimed"),
+        Event::SyncHeld { enc, occ } => format!("SYNC      encounter {enc}, {occ} on the plates"),
+        Event::Secured { enc } => format!("SECURED   encounter {enc}"),
+        Event::AnchorDown { enc } => format!("ANCHOR    encounter {enc} — champion down"),
+        Event::PhaseCleared => "PHASE CLEARED".into(),
+        Event::WindowClosed => "WINDOW CLOSED — the weather beat them".into(),
+    }
+}
+
+fn describe_kind(e: &Event) -> String {
+    match e {
+        Event::Slam { .. } => "SLAM",
+        Event::Chip { .. } => "CHIP",
+        Event::Grapple { .. } => "GRAPPLE",
+        Event::NodeClaimed { .. } => "NODE",
+        Event::SyncHeld { .. } => "SYNC",
+        Event::Secured { .. } => "SECURED",
+        Event::AnchorDown { .. } => "ANCHOR",
+        Event::PhaseCleared => "PHASE CLEARED",
+        Event::WindowClosed => "WINDOW CLOSED",
+    }
+    .into()
+}
+
+fn tally(seen: &[String]) -> String {
+    let mut kinds: Vec<&String> = seen.iter().collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+        .iter()
+        .map(|k| format!("{} x{}", k, seen.iter().filter(|s| s.as_str() == k.as_str()).count()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod contract_shape_tests {
+    use super::*;
+    use crate::raidcon::BOSSES;
+    use crate::raidgen::plan_for;
+
+    /// Step a whole raid, feeding the three shell inputs, and report the
+    /// worst tick and the beacon behaviour.
+    fn drive(boss: &'static crate::raidcon::Boss) -> (usize, usize, bool) {
+        let plan = plan_for(boss, 3, 7);
+        let start = plan.phases[0].enc.first().map(|e| (e.x, e.z)).unwrap_or((0.0, 0.0));
+        let mut units: Vec<Unit> = (0..4)
+            .map(|k| Unit { pos: [start.0 + k as f32 * 4.0 - 6.0, FLY_Y + 4.0, start.1] })
+            .collect();
+        let mut run = RaidRun::new(&plan);
+        let dt = 1.0 / 120.0;
+        let (mut worst, mut total) = (0usize, 0usize);
+        let mut beacons_stable = true;
+        loop {
+            let pr = run.start_phase(600.0, false);
+            let mut n_beacons: Option<usize> = None;
+            for ticks in 0..72_000u32 {
+                let evs = pr.step(dt, &units);
+                worst = worst.max(evs.len());
+                total += evs.len();
+                for e in &evs {
+                    match e {
+                        Event::Slam { unit, vy } => units[*unit].pos[1] += vy * dt,
+                        Event::Grapple { unit, vel } => {
+                            for a in 0..3 {
+                                units[*unit].pos[a] += vel[a] * dt;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // beacon COUNT and ORDER must not churn: a renderer keys its
+                // draw objects off the index
+                let b = pr.beacons();
+                match n_beacons {
+                    None => n_beacons = Some(b.len()),
+                    Some(n) => {
+                        if n != b.len() {
+                            beacons_stable = false;
+                        }
+                    }
+                }
+                if ticks == 600 {
+                    pr.champion_fell();
+                }
+                if ticks % 600 == 0 {
+                    for (i, bc) in pr.beacons().iter().enumerate() {
+                        if !bc.done && !bc.anchor {
+                            pr.credit_kill(i);
+                            break;
+                        }
+                    }
+                }
+                if evs.iter().any(|e| matches!(e, Event::PhaseCleared | Event::WindowClosed)) {
+                    break;
+                }
+            }
+            if run.advance() {
+                break;
+            }
+        }
+        (worst, total, beacons_stable)
+    }
+
+    /// WHAT THE SHELL HAS TO BUDGET FOR. The renderer consumes this stream
+    /// every tick; if a single tick can emit hundreds of events, that is an
+    /// allocation and a draw-call spike, and it is better known now than
+    /// discovered at 120 Hz with a window open.
+    #[test]
+    fn no_tick_emits_more_events_than_a_frame_can_absorb() {
+        let mut worst_overall = 0;
+        for b in BOSSES {
+            let (worst, total, _) = drive(b);
+            assert!(total > 0, "{} produced no events at all", b.id);
+            assert!(
+                worst <= 16,
+                "{} emits {worst} events in one tick; the shell has to handle \
+                 that inside a frame",
+                b.id
+            );
+            worst_overall = worst_overall.max(worst);
+        }
+        assert!(worst_overall > 1, "nothing ever emits more than one event; the drive is too tame");
+        // the number itself, so a regression shows as a changed figure rather
+        // than as a bound that silently had room
+        assert!(
+            worst_overall <= 8,
+            "the worst tick across all nineteen is now {worst_overall}; it was 4"
+        );
+    }
+
+    /// A renderer keys beacon draw objects off the index. If the list length
+    /// changes mid-phase it has to rebuild, and if the ORDER changes it draws
+    /// the wrong marker at the wrong place.
+    #[test]
+    fn the_beacon_list_is_stable_within_a_phase() {
+        for b in BOSSES {
+            let (_, _, stable) = drive(b);
+            assert!(stable, "{}'s beacon list changes length mid-phase", b.id);
+        }
+    }
+
+    #[test]
+    fn every_warden_can_actually_be_finished() {
+        // the contract has to be completable for all nineteen, or a renderer
+        // built against it will meet one that cannot end
+        for b in BOSSES {
+            let (_, total, _) = drive(b);
+            assert!(total >= 3, "{} only ever emitted {total} events", b.id);
+        }
+    }
+}

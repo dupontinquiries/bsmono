@@ -3228,6 +3228,2688 @@ That count is now reported by `--sim perf` as a stable measure of physics
 cost, which is a better instrument than the timings for exactly the reason
 this session demonstrates.
 
+## v1.99.0 — the history under the game, and a doc that cannot rot
+
+THE STORY GAINED A HUMAN PREHISTORY — twenty films of secret societies on
+Earth — and the question was how to put it in a game that is about
+Transformers. Not as a lore menu. The universe becomes ARCHAEOLOGY: the
+player finds objects, objects bear on historical claims, and a claim's
+standing rises as independent finds corroborate it.
+
+THE ENGINE KNOWS NO HISTORY. `provenance.rs` names no civilisation and would
+compile in a different game; `archive.rs` holds the content. That seam is the
+one that pays, because the evidence tables grow with every film and the rule
+for reading them must not move when they do.
+
+Two rules carry the weight, and both exist because the obvious version was
+wrong:
+
+CORROBORATION COUNTS DISTINCT SOURCES, not finds. Blackstar's three Array
+readings share one instrument, so together they reach UNKNOWN and stop. His
+own array cannot confirm itself; the Carrion wreck is what makes it mean
+something. That is the lesson, not a limitation worked around.
+
+A CLAIM NOBODY HAS MADE CANNOT BE REFUTED. The first version drew SOURCES
+DISAGREE over an official record the player had never seen — found by running
+the thing, not by a test. An official date is somebody's ASSERTION, and stays
+dark until somebody asserts it. Now the 1996 dig layer banks silently and
+lands the moment you find the paperwork, which is a better beat than the one
+I set out to write.
+
+THE ASTERI MISTAKE IS COMPUTED. `orbits.rs` is a real long-period orbit
+solver — Kepler checked against Halley's published elements — because
+`voyage.rs` only does circular Hohmann transfers. The difference between
+their published 417-year return and the true 3,812 is a 0.312% error in
+perihelion speed, and at that precision the band has NO CEILING: their own
+data could not exclude "never returns". They published the optimistic end of
+an open band. Every figure falls out of the solver; none is asserted.
+
+    +/- 0.312%   P in [417, unbounded] yr   <- theirs
+
+THE MYSTERY ANCHOR is a menu dial for how much of this the game hands you
+already believing — and it is not a tutorial slider. Received knowledge
+enters as ONE CONTRADICTABLE SOURCE, and the received account includes the
+official record, which is false. HOMEY hands you a lie to catch; FRESH gives
+you a world with nothing yet to disbelieve. Same tables, different depth.
+
+THE SHIP IS THE MENU, so archaeology got a station: `Station::Chartroom`.
+`Medium` on each finding decides which surface can show it — a hard drive is
+read at the terminal holding it because it IS a hard drive, not because a
+screen was assigned. Only artifacts come home to the lamp.
+
+THE FINDING IS NOT THE READING. Three protagonists plus a villain campaign
+meant four evidence tables or one; `Lens` makes a new playable character a
+COLUMN rather than a table. Coverage is deliberately partial — a lens with
+nothing to add falls back to the object, tested, because four voices times
+thirty-five findings is mostly filler.
+
+`intel.rs` IS GONE, folded into the findings it duplicated. Its contract
+survives as archive tests, including the one that mattered: the reveal
+mission is late but not the finale.
+
+THE C ENGINE GOT THE SAME TABLES, GENERATED. `exengine/archive_gen.h` comes
+from `--arch emit-c`, following the convention `content_build.py` already
+sets; the ladder is implemented twice and `tests/test_provenance.c` replays
+fixtures the Rust suite also asserts, so a divergence is a test failure
+rather than the codex quietly disagreeing with the sim.
+
+AND THE DOCS STOPPED BEING DECORATION. `docs/STORY_BIBLE.md` is the canonical
+fiction — the thing that replaces pasting script drafts into a session — and
+its inventory is machine-checked. Set equality both ways on claims, lenses,
+films and strata: add content without listing it and the suite fails; keep
+naming something deleted and it fails too. Verified by breaking it on
+purpose. Documentation rots because nothing breaks when it does.
+
+THE CAMPAIGN'S SHAPE GOT DECIDED AND THEN GOT A LINT. It is Call of Duty's
+structure — authored set pieces introducing an extended kit one verb at a
+time — and then it INVERTS. A CoD campaign graduates you into multiplayer,
+which is a SUBSET: smaller maps, fewer verbs, the toys gone. This one
+graduates into a strict SUPERSET, Destiny's patrol loop over procedurally
+generated worlds, closer to Ark or Rust than to Destiny's fixed handful.
+
+That claim is exactly the kind that quietly stops being true: a mechanic gets
+built for one scripted mission and never wired into patrol, and nobody
+notices for six hours. So `curriculum.rs` is a ledger with lints — every
+mechanic introduced by EXACTLY ONE mission, the table monotone with mission
+order, the kit accumulating and never shrinking, raids allowed to deepen but
+never to own, and the load-bearing one:
+
+    NOTHING IS CAMPAIGN-ONLY
+
+verified by breaking it on purpose. `the_far_gate` is the funnel's hinge and
+a test checks most of the kit is taught before it, because opening the
+procedural sky onto a player who cannot use it is the failure mode. Two rows
+are honestly flagged unbuilt (`clinch`, `combine`) and a test pins that list
+to docs/PLAN.md's wiring-debt table so the two cannot drift.
+
+LOS ANGELES IS ONE CITY HELD TWICE. Findings had been sited on a
+DESTINATION -- seventeen of them said "earth" and nothing more -- which is
+fine for a table and useless the moment a player is expected to walk
+somewhere. `groundside.rs` gives them addresses, and gives each address TWO
+STATES: the bunker is an operational Directorate site in the archive era and
+four floors of damp in the present. A test refuses any place that reads the
+same in both eras, because a place with one state is a set, not a place.
+
+THE GEOGRAPHY ANSWERED A QUESTION THE TABLES RAISED AND NEVER CLOSED. The
+three findings that contradict the official 2003 excavation date -- 1998,
+1996, 1994 -- all describe THE RIDGE. `the_beach_opens` puts Unicron's
+fissure on the shore below it. So the record is not falsified to hide a
+building; it is falsified because somebody was digging toward the thing in
+the mantle a decade early, and 2003 is the smallest lie that stops anyone
+asking what for. The game never says this. `RIDGE_OVERLOOKS_BEACH` keeps the
+two adjacent by test and the inference stays the player's.
+
+ONE HOME BASE, BOTH ERAS, BOTH CASTS: the Directorate's abandoned bunker is
+the human campaign's safehouse and the LA hero's foothold at the same
+address. A test asserts each era has exactly one home and that they are the
+SAME one -- verified by decoupling them and watching it fail -- because
+quietly letting them drift apart is how the overlap would be thrown away
+without anyone deciding to. Its Transformer-side twin is the ship, which is
+why `Station::Chartroom` and the bunker do the same job in two campaigns.
+
+RAIDS CARRY HISTORY NOW, and the roster turned out to have been written for
+it: the nineteen wardens are already framed as "wardens, judges, archivists,
+seals". `judgementor` -- ancient defendants still orbiting as asteroid belts,
+one verdict never delivered -- opens a docket left open on a civilisation
+older than the machine's own jurisdiction. Layer 5 evidence reachable
+nowhere else, and a test asserts it shares no source with any campaign
+finding so it corroborates something new rather than repeating.
+
+The gate vocabulary grew to carry it: bare id is a mission (every existing
+row untouched), `warden:<id>` is a raid clear, resolved in one place by
+`archive::gate_open`. A prefix rather than a second field, because two
+nullable fields invite the state where both are set.
+
+THE EDIT LOOP WENT FROM ~200 s TO 3 s, which is the change that matters most
+for everything above. This crate is ONE package of 65k lines, so the
+multi-crate tricks do not apply -- `gate` finds changed crates and there is
+exactly one. The lever was the profile: `[profile.dev]` sets opt-level 2
+because "physics + png decode are unusable at opt 0", which is true of
+PLAYING the game and false of the test suite, which runs in 0.15 s and never
+touches the renderer. The loop had been paying optimizer time it could not
+use.
+
+    dev, opt 2, no incremental     ~200 s per edit/test cycle
+    ailite, opt 0, incremental        3 s per edit/test cycle
+    cold, once                      153 s
+
+Measured against a real semantic change, not a comment touch. `tools/fastcheck`
+pins it, with the caveat written down: the opt-0 binary is too slow to PLAY,
+so it is for tests, lints and the headless drivers only.
+
+"NO SECRET BASE" IS A LINE IN THE SOURCE, and it overruled me. Last session
+I gave the human campaign a home base: one building held by both casts, the
+Directorate's bunker as safehouse then and foothold now, with a test pinning
+them to the same address. Then the scene the team is built out of turned out
+to say the opposite -- old car, three people inside, NO SECRET BASE, no
+holograms, nobody completely trusting anyone yet. A safehouse with a wall of
+monitors is precisely what that scene refuses.
+
+So the archive era has NO home base and a test now asserts it stays that
+way. The present keeps one, because Aiden is a kid who stayed at a fissure
+rather than an operative with a network, and a fixed GTA-style home is right
+for him. The asymmetry is the design.
+
+WHAT THE ABSENCE BOUGHT was better than the base. `tradecraft.rs`: a car you
+stage out of, a CASE you carry, and a scattered relay network. The point is
+that FINDING STOPS BEING FREE -- in the ship campaign a scan puts something
+on the map; here it only puts it in the case, and nothing reaches the map
+until it is relayed. Every relay costs reach, exposure, or fidelity: a
+payphone call is one item, a hideout is eight, a contact retelling a serial
+number is not a photocopy of it.
+
+EXPOSURE IS NOT A PENALTY, IT IS A PLOT. A rooftop lamp reaches everyone who
+matters and everyone who does not -- which is HOW THE OFFICIAL RECORD COMES
+TO BE WRITTEN BY SOMEBODY WHO WAS NOT THERE. The payoff was already built:
+`facility_built_2003` is a claim the Directorate asserted, contradicted by
+three dig dates. Reporting is a move in an argument, not a save button. And
+the lamp sits on the ridge, which is also where the record was falsified.
+
+THE DOC GUARD EARNED ITS KEEP HERE. Correcting the home base broke
+`the_bible_does_not_lie_about_the_mechanics` -- the doc still claimed a
+shared base -- and the failure arrived in the same three-second run as the
+code change, which is exactly the case the test was written for.
+
+TERRAIN.RS HAD ZERO CALLERS AND STILL DOES IN THE GAME LOOP, but it is
+reachable and checkable now. 645 lines of physics-grounded worldgen -- dune
+spacing from saltation hop length, talus runout from gravity, craters that
+go central-peak at the right diameter -- and nothing had ever called it,
+because nothing converted a `patrol::Destination` (gravity in g, a weather
+flag, a sky) into a `terrain::Ground` (m/s2, a material, air density, u*).
+Two tables describing the same eighteen worlds in different units with no
+function between them. `mapsim::ground_for` is that function.
+
+Material is the one judgement in it and is stated as such: the route table
+does not record what a world is made of, so it is an explicit per-world
+mapping with reasoning, not a heuristic pretending to be a measurement.
+
+THE TOOL FOUND A BUG IN ITS FIRST RUN, which is the argument for building
+the headless view before the renderer. `--terrain grounds` prints a column
+of air density beside a column of friction velocity, and five rows read
+u* 0.25 over air 0.000. Pluto and the four exoworlds carry `weather: true`
+next to a vacuum sky. A friction velocity is a property of a moving fluid;
+with no fluid there is no aeolian transport, whatever the flag says. Wind is
+now suppressed where air is zero, the audit reports the route rows that
+claim weather they cannot have, and a test names the three rows that
+motivated it. Cheap to miss in a table, obvious in a column.
+
+Mars dunes come out 3.5x Earth's at the same sample point, which is the
+relation terrain.rs's own doc comment leads with -- now fed by real
+destinations instead of hand-picked constants.
+
+THE SUITE WAS RED ALL SESSION AND I KEPT CALLING IT PRE-EXISTING. Three
+failures, correctly attributed to code I had not touched, and reported that
+way every single run -- which means I had been reading "3 failed" as "fine",
+which is exactly how a fourth arrives unnoticed. Both turned out to be real
+bugs rather than stale expectations.
+
+LERP WAS NOT ENDPOINT-EXACT. `Traits::blend` used `a + (b - a) * w`, which
+is monotonic but does not return `b` at w = 1: tank->hoverer traction came
+back 0.19999999 against the hoverer's own 0.2. So a fully blended chassis
+was not equal to the thing it blended into. That is not cosmetic --
+`flies()` is a THRESHOLD on lift, and a chassis one ulp under the line does
+not fly. Taking the endpoints explicitly keeps exactness without giving up
+interior monotonicity, and both properties now have a test.
+
+SDF_CAPACITY NEVER LEARNED ABOUT TILING. The atlas became a TILES x TILES
+grid -- sixteen models sharing one depth slab, which is what let 126 models
+become 1,344 and the library stop being clipped -- and `sdf_capacity` kept
+computing depth-only stacking. It under-reported by a factor of sixteen.
+
+The interesting part is WHY nobody noticed: `.max(CSDF_MAXM)` swallowed the
+answer on every device. 4096 computed 256, the floor returned 1344, and the
+wrong number was never visible. The function's own doc says it is "NOT YET
+USED TO SIZE THE TEXTURE", so it was a stale number rather than a rendering
+bug -- and that is also the reason it rotted. An unused answer is never
+checked against reality. Its test asserted the pre-tiling 256 and 512 and so
+could not have caught it; the replacements check the RELATIONSHIP between
+capacity, slab and tiles instead of restating constants, plus the claim in
+CSDF_TILES' own comment that an untiled roster needs ten times the limit.
+
+735 passing, zero failing.
+
+THE NUMBERS I GUESSED ARE NOW IN ONE PLACE, SORTED BY HOW LIKELY THEY ARE TO
+BE WRONG. A lot of recent work is decisions nobody can check without playing
+-- whether the anchor should start at 45%, whether a case of six is pressure
+or annoyance, whether two independent sources is the right moment to say
+POSSIBLE. I can pick and reason; I cannot verify. So the useful question is
+how somebody finds the numbers afterwards, and scattered as consts across
+nine modules the answer was "badly".
+
+`tuning.rs` is a registry with three properties that matter. It reads the
+LIVE value through a function rather than restating it, so the ledger cannot
+drift -- and a test asserts every stated default equals the code's actual
+default. It says WHERE to change each one, and for config-backed knobs a
+second test proves the save-file key actually works, because "no rebuild
+needed" is a promise. And it carries a CONFIDENCE column, which is the
+load-bearing one: `--tune guesses` prints only the five nobody has ever
+verified, which is the actionable output of a playthrough rather than a wall
+of forty numbers.
+
+BOTH GUARDS FIRED IMMEDIATELY. The round-trip test caught `flip_land_assist`
+-- a config key I had invented; the real one is `land_assist`. Then it
+accused `cam_grav` of being broken when the key was fine and my PROBE was
+wrong: every key clamps to its own range, so `default + 1` is a silent
+no-op on anything bounded at 1.0. Probing from several directions fixed the
+test rather than the code, which is the distinction worth recording.
+
+THREE FEEL CONSTANTS BECAME CONFIG on the way: `case_cap`, and the
+provenance ladder's `arch_possible_at` / `arch_high_at`. The ladder gets a
+`sane()` clamp so an operator who inverts the rungs cannot make standing
+non-monotonic in the evidence -- a save-file edit should be able to retune
+pacing, not break the inference.
+
+FOUR DEAD MODULES JOINED UP INTO ONE PIPELINE. `terrain.rs`, `procgen.rs`
+and `drop.rs` had zero callers each; `foothold` and `loot` were reachable
+only from other dead code. They are not separate gaps, they are one chain
+nobody had ever run end to end: procgen decides what a bridge jump lands on,
+the ground seam converts it, terrain generates it, foothold says what is
+worth seizing, and drop is the twenty seconds between the hangar and the
+ground. `--terrain jump` and `--terrain drop` run it. Warnings 405 -> 387.
+
+THE DROP IS BALLISTIC, SO IT IS CHECKABLE WITHOUT A DISPLAY -- which is why
+it belongs beside the map tool. Steering swings the miss from 25 m to 130 m
+on the same line, and running it against the GENERATED world's gravity
+rather than a hardcoded 9.81 means a heavy world is a measurably harder
+drop. Both are tests now, and so is the claim drop.rs opens with: where you
+land is decided before you jump.
+
+STATIONS GOT ADDRESSES, AND "MENUS OBEY THE HULL" BECAME TRUE. `stations.rs`
+said that in its own doc comment and enforced it with a phase check, while
+`interior.rs` had been generating a real eight-room floor plan from
+`content::HUB` -- positions, doors, reachability -- with no caller at all.
+Every console now names the cell it stands in, placed by what the room IS:
+the armoury is the upgrade bay because that is where the chassis rigs are,
+the hold is the hangar because that is the room with a deck to bolt a chest
+to. A test walks the plan and fails if a console sits somewhere unreachable
+from the bridge.
+
+WHICH IMMEDIATELY FOUND A BUG UNDERNEATH. `Interior::reachable_from` walked
+every link in the plan whether or not the door was passable, so a depowered
+ship -- hatches shut, which `depower()` explicitly does -- still reported
+the whole interior as walkable. Anything asking "can the crew get there"
+got "yes, always", the one answer a failure mode exists to contradict. Split
+into `linked_from` (topology, unchanged by power) and `reachable_from`
+(doors respected), and the new test asserts losing power actually strands
+you. Two existing tests failed on the fix and both were right to: a freshly
+generated interior has its doors SHUT, and the old code simply never looked.
+
+753 passing, zero failing.
+
+THE CONSOLES OFFERED MISSIONS AND PRESSING THEM DID NOTHING, and the code
+said so out loud: `"{order:?} -- fly it from the terminal sims for now"`.
+`deck` already handled `Did`, `Refused` and `Goto` itself; the two that
+escaped to the shell -- a sortie and the week's nightfall -- were formatted
+into a toast and discarded. That is the whole of docs/PLAN.md's wiring debt
+compressed into one line of the event handler.
+
+They run now, through `campaign::MissionRun` -- the same deterministic
+resolver `--campaign` uses -- and the clear persists. WHAT THIS DOES NOT
+CLAIM: the mission is RESOLVED, not played, and the toast says
+"(resolved, not flown)" rather than letting a resolved clear look like a
+flown one. Flying them is the renderer's job and is still ahead. Saying so
+in the toast costs nothing and is the difference between wiring and
+pretending.
+
+The decision half split out as `order_target` so it could be tested at all:
+`run_order` loads and stores the save, which is untestable in a suite
+sharing one working directory. The pure lookup carries the whole mapping,
+and the failure worth catching lives there -- the Bridge builds rows from
+MISSIONS and the shell looks them up again by id, so if those two ever
+disagree the console offers a mission that silently does nothing. Which is
+the state this replaced.
+
+TWO SMALLER THINGS FOUND ON THE WAY. `parse_args` had `--mobile` and
+`--desktop-ui` listed TWICE, an unreachable-pattern warning nobody had read.
+And `--help` named none of the twelve headless drivers, so the only way to
+discover `--arch` or `--terrain` was to read main.rs. A tool nobody can find
+is a tool nobody runs; they are listed now.
+
+757 passing, 384 warnings (from 405 at the session's start).
+
+TWO DISCOVERY LOOPS WERE RUNNING AT ONCE. `--arch find` (scan it onto the
+map) and `--arch carry` (into the case, relay it later) belong to different
+campaigns and are mutually exclusive by design -- the ship makes relaying
+pointless, and in the archive era nothing reaches the map until it is
+relayed. Both worked, always, because NOTHING RECORDED WHICH CAMPAIGN WAS
+RUNNING. I had written the tradecraft layer, the era-split places, and a
+bible section about the asymmetry, and never noticed there was no current
+era anywhere in the save.
+
+`cfg story_era` is that, as a dial rather than a story flag, because
+switching between them is exactly what testing both needs. Each verb now
+refuses in the wrong era and names the other one.
+
+AND I SHIPPED THE GUARD WITHOUT IT LANDING. The edit that inserts the check
+into `find` did not match its target -- an earlier change had moved the
+surrounding lines -- so the patch applied cleanly to nothing and the tests
+still passed, because I had tested `Era::from_cfg` in isolation rather than
+the driver that consumes it. It was caught by running the actual command,
+which is the third time this session that the headless driver has found
+something a green suite did not. A unit test on a predicate proves the
+predicate; only the caller proves the wiring.
+
+CONTENT REACHABILITY IS NOW AUDITED, which is what a playthrough needs
+before it starts. Three tests: every claim is reachable WITHOUT EVER
+RAIDING (a raid may deepen the history -- that is the Judgementor docket --
+but must never be the only door to any of it); the deep strata are arguable
+from ungated content alone; and every finding is somewhere a player can
+actually stand, which for Earth means an address in `groundside` and
+elsewhere means a real route destination.
+
+761 passing.
+
+I SAID THE STATION WORK WAS UNPROVEN AND THEN PROVED IT, and it was worse
+than I expected. `menusim` has existed the whole time -- `--menu <station>`
+photographs a console as text frames, on the grounds that "if the cascade
+stutters here it will stutter in glass". I had added two stations' worth of
+rows and never once run it.
+
+THE CHARTROOM SHOWED THREE IDENTICAL ROWS. The label carried the standing
+and left the claim id out entirely, so every node rendered as
+"L2 UNKNOWN TECHNOLOGICAL RELATION — 1 for / 0 against" and a player could
+not tell them apart. The test I had written checked that the standing text
+appeared, which it did, three times. Leading with the claim fixes it, and
+the test now asserts the node rows are DISTINCT and each names itself --
+the property that was actually broken.
+
+THE CONSOLE IS 46 CHARACTERS WIDE AND NOTHING SAID SO. It was a bare
+literal at one call site in menusim. Both Bridge additions overflowed and
+lost precisely the informative tail: "— teaches tra~", "the open ~". Named
+it `menusim::LABEL_W` and added a guard that builds every station and fails
+on any row over budget.
+
+THAT GUARD IMMEDIATELY FOUND TWO OVERFLOWS I DID NOT WRITE -- the energon
+header at 49 chars and the nightfall label at 49 -- which had been
+truncating since they landed. A constraint nobody can see is a constraint
+nobody meets.
+
+The lesson is the same one as the era guard last session, and it is now
+three for three: a unit test on a value proves the value, and only the
+driver proves the presentation. `--menu` was sitting there the entire time.
+
+762 passing.
+
+THE LAST PATH WITH NO DRIVER NOW HAS ONE. `run_order` lived in main.rs's
+winit handler, so the one thing the shell had just learned to do -- execute
+a sortie -- was the one thing nothing headless could reach. Worse,
+`menusim` printed its own copy of the same disclaimer ("the shell flies
+this; `--campaign` runs it"), so the excuse existed in two places and the
+capability in neither.
+
+Moved into `stations.rs`, which already owns `Order`, and menusim calls the
+same function the winit handler calls. `--menu bridge --tape a` now runs the
+week's nightfall and `--tape d,a` runs the sortie, both persisting, and a
+second run correctly advances to the next mission because `camp.next()`
+moved. If it breaks, it breaks here first.
+
+AND IT GAINED A TEST THAT COULD NOT HAVE EXISTED BEFORE. Three tables have
+to agree for a console row to do anything: the Bridge builds rows from
+MISSIONS, `apply` turns a press into an Order, and `order_target` resolves
+that Order back to a mission. While the shell threw every order away a
+disagreement between them was invisible by construction. The test walks the
+Bridge's own rows, presses each one, and asserts every Sortie and Nightfall
+that comes back resolves to something real.
+
+763 passing.
+
+THE DIG WAS LOADED AND NEVER WRITTEN BACK. `Shipboard::store` persisted
+missions, wardens, nightfalls, chi, gear, vault, watch and hotbar, and not
+`finds`. Anything recovered at a console would have vanished on the next
+load -- silently, because until now nothing at a console could recover
+anything. A field added to a struct and forgotten in its own serializer is
+the quietest bug shape there is, and the only reason it never bit is that
+the feature it broke did not exist yet.
+
+WHICH IT DOES NOW. The archaeology layer had no in-game acquisition at all:
+`--arch find` is a command line, and the Chartroom was deliberately
+read-only. But going through what you brought back IS that room's job --
+"a long table under a hard lamp, and everything you carried home on it" --
+so it lists UNEXAMINED evidence and a press records it.
+
+THE GATE IS THE DESIGN: you can only examine evidence from a site where you
+have cleared a mission. Without that the Chartroom is a button that hands
+over the entire history and the archaeology layer is an inventory screen.
+Clearing `the_beach_opens` opens Earth's evidence and nothing else, sealed
+findings stay sealed, and pressing one reports which claims moved.
+
+The read-only contract narrowed rather than broke, which is the distinction
+worth keeping: pressing a NODE is still read-only, because the map is
+DERIVED from the evidence and is not somewhere you can write. The old test
+pressed a claim id and still passes unchanged.
+
+765 passing.
+
+I STOPPED WAITING FOR THE NEXT SILENT SERIALIZER BUG AND WENT AFTER THE
+CLASS. `finds` was added to `Save`, wired into `load`, and left out of
+`Shipboard::store` for several sessions. Nothing caught it because the
+serializer existed only as a pair of functions that touched the filesystem:
+a round trip could not be tested without clobbering the working directory,
+so it never was. **A file-bound serializer is an untestable one.**
+
+Split `parse`/`render` out of `load`/`store` -- headless core, thin shell,
+the same seam this project applies everywhere else and had somehow skipped
+in the one module where a dropped field is invisible. The round-trip test
+then writes itself: build a `Save` with all thirty-one fields set to
+distinctive values, render, parse, compare FIELD BY FIELD so a failure names
+what was lost.
+
+TWO GUARDS AGAINST THE NEXT ONE, both verified by reproducing the original
+bug on purpose:
+
+  * add a field to `Save` and forget it, and
+    `the_round_trip_test_covers_every_field` fails naming the field -- it
+    reads the struct declaration out of the source and checks each field
+    appears in the assertions.
+  * drop a line from `Shipboard::store` and
+    `shipboard_writes_back_everything_it_loaded` fails with
+    "Shipboard loads sv.finds and never writes it back", which is the
+    original bug reported in its own words.
+
+That second one is the interesting shape: it diffs a function's LOADS
+against its WRITES rather than testing behaviour, because the behaviour that
+would have exposed the bug did not exist yet when the bug landed.
+
+770 passing.
+
+CONFIG WAS THE OTHER UNTESTED SERIALIZER -- sixty-five keys, no round trip.
+It turned out to be CLEAN, which is worth recording as a result rather than
+skipping: the read and write key sets agree exactly, and every key moves its
+own line and only its own.
+
+THE INTERESTING PART IS THE BUG SET EQUALITY CANNOT SEE. `w("cam_dist",
+self.cam.height)` passes every structural check -- the key exists on both
+sides, the counts match -- and quietly swaps two settings the first time
+anybody saves. Catching that needs behaviour, and doing it without
+reflection needs a trick: perturb exactly ONE key, render the whole table,
+and diff against the unperturbed render. Only that key's line may differ.
+
+Both halves of a cross-wire are caught, from opposite directions, and I
+introduced each on purpose to check:
+
+  * write the wrong field INTO a key -> that key's own line never moves, and
+    the message names both causes because the symptom is identical to a key
+    the parser drops;
+  * write one field into TWO keys -> the shared key moves two lines, and the
+    failure prints both of them:
+    `'cam_dist' moved 2 lines: [("cfg cam_dist 4.900", ...), ("cfg cam_height 4.900", ...)]`
+
+The probe is multi-directional for the same reason the tuning ledger's is:
+every key clamps to its own range, so a single probe value is a silent
+no-op on anything bounded, and the test would pass by failing to test.
+
+773 passing. Every serializer in the crate now has a round trip.
+
+CAN THE RAID SYSTEM SERVE THE DETECTIVE CAMPAIGN? Partly, and working out
+WHICH part was the whole exercise.
+
+`foothold.rs` asks a good question in a Cybertronian accent: two ways into a
+place, trading against each other, judged against a clock, with no answer
+that is right in general. Clear an LZ -- fast, cheap, exposed throughout,
+and the ship has to stay. Seize a fortress -- slow, dear, and the sky stops
+mattering once you are inside. That is Hitman's core question, and the
+detective campaign asks it with none of the same nouns.
+
+What TRANSFERS is the decision shape. What does not: `Body` and
+`habitable_fraction` (a person in Los Angeles needs no habitability check),
+the nineteen Cybertronian wardens, and `loot`'s gear grades -- the human
+payload is evidence, which is `Case` and already built. A Judgementor in a
+warehouse is absurd.
+
+So `approach.rs` is the question with the nouns removed, and it has TWO REAL
+CALLERS rather than one and a hope: `foothold::assess` delegates its
+arithmetic and keeps its domain (reaching the site, whether that shelter
+stops THIS weather), and `tradecraft::infiltrate` is the same decision in
+1998. The translation is term for term -- weather window becomes how long
+before somebody else arrives, a grounded ship becomes a car parked where it
+can be seen.
+
+THE ABSTRACTION DID NOT FIT AND THAT WAS THE USEFUL PART. The raid's only
+currency is TIME, so its ranking maximises margin; the detective campaign's
+principal cost is BEING SEEN, which is not time at all. Modelling it as
+`effort` failed silently, because effort only applies when nothing is
+chasing you -- so the front door could never win and could never lose. An
+option that is never correct is an option that should not be on the list.
+`Opening::seen_cost` is the missing axis, in seconds-equivalent, counted
+under pressure. Foothold passes zero, which is why its tests never moved.
+
+AND I PUT ONE COST IN TWO PLACES. I first modelled the front door as "does
+not shelter you", which made the core reject it outright whenever a clock
+ran. But once you are through ANY door you are inside and out of view; what
+differs is how much of the entry was in the open and what being noticed
+there costs. Shelter is about where you END UP, not how you got there.
+
+The roof earns its place only when the service entrance is watched, which
+is a per-job fact rather than a property of the building -- so it is an
+argument, not a table.
+
+785 passing.
+
+COMMANDERS TRANSFER WITH NO TRANSLATION AT ALL, which is the cleanest
+answer this exercise has produced. The five archetypes are four dials --
+aggression, caution, encircle, regroup -- and nothing in them is
+Cybertronian: they describe how an armed group behaves under pressure. A
+Directorate strike team surrounds you for the same reason a Decepticon squad
+does. So the human campaign gets `skirmish.rs` for free and the only work is
+an argument about each society: the Directorate encircles, the Free State
+trades and leaves, the Covenant holds because it wants the digging to stop
+rather than to win a firefight, and the trio press because three people
+cannot afford a long engagement.
+
+VISION WAS NOT TRANSFERABLE BECAUSE IT DID NOT EXIST. Not in `skirmish`,
+which says so in its own doc -- "the shape of a fight without the geometry
+of one" -- and not in the C engine's `enemy.c`. It was the thing BOTH sides
+were missing, and I had already papered over the hole: `WayIn::seen_cost`
+was three hard-coded numbers, which is a model's output written down as an
+input.
+
+`perception.rs` makes detection a RATE rather than a die roll -- attention
+accumulates from distance, cover, motion and how hard the watcher is looking
+-- which answers the question `approach::Opening` actually needs (*how many
+seconds can I be here*) in closed form. The one physical claim is the
+falloff: angular size goes as 1/d, so the rate falls as the INVERSE SQUARE
+of distance, and that is why "stand a bit further back" is terrible advice
+at eight metres and excellent at fifty. Everything else is a dial.
+
+AND I DOUBLE-COUNTED THE SAME COST AGAIN, in a new place. I added an
+`is_watched` predicate to rule doors out, on top of `seen_cost` charging for
+them -- the same fact twice -- which ruled out the front door BY DEFINITION,
+since being seen is what the front door IS. Deleted, with a test left behind
+so the predicate does not come back. Being noticed is a cost; whether it is
+worth paying is `approach::choose`'s job, and it already knew how.
+
+The gradient that falls out is the one worth having, and it moves with the
+watcher rather than with a constant:
+
+    30s -> the front door    60s -> the service entrance    120s+ -> the roof
+
+Against a hunter the front door costs eight times more and the roof is free,
+because fifty metres is outside its thirty-five. Distance is the only answer
+to that encounter, which is the correct shape for the Jhiaxus horror.
+
+793 passing.
+
+SCALE: THE PROBLEM IS NOT THE CAMERA, IT IS THAT SIZE IS NOT DATA.
+
+`model_tuning.json` carries a per-model `scale` and Optimus Prime's is
+**0.4989**. Across 1,012 models the medians by kind sit between 0.5 and 1.8
+-- robots 0.904, vehicles 0.530 -- which is to say every model, whatever it
+depicts, is normalised into the same playable box. A Transformer and a
+Camaro are the same height in-game. The camera cannot adjust to size because
+nothing knows its size: there is one number per model and it means "fit this
+in the box", not "this is how tall it is".
+
+AND THE UNITS ARE NOT REAL-WORLD-RELATIVE, which is bigger. DESIGN.md's own
+conversion table divides RL's uu by a hundred and calls the result metres,
+so the tuning body is 0.38 m tall and 1.18 m long -- a QUARTER of a real
+sedan. Drop a 1.75 m person into that world and they are one and a half
+times the LENGTH of a car. `Class::EngineBody` exists to keep that body's
+tuning intact while stopping it being mistaken for a statement about
+vehicles, which is what it was doing: filed as a Vehicle, its thirteen-times
+chase ratio gave a real car a fifteen-metre helicopter shot.
+
+FRAMING IS PER CLASS because the right distance is a genre convention, not a
+function of height. Scaling everything off RL's ratio puts a person nine
+metres back. Within a class, size varies by `h^0.85` -- sublinear, because a
+body twice as tall does not want the camera exactly twice as far; some of
+that extra height is frame it is fine to fill. Bots are framed closer in
+proportion than people and with the camera BELOW the eyeline, which is the
+cheapest way to make a thing read as enormous rather than as a man in a suit.
+
+    human       1.75 m    3.5 m back    1.9 m up
+    car         1.45 m    4.1 m
+    bot         8.50 m   16.0 m         4.7 m up
+    2 Cal Plaza  228 m   343.3 m
+
+The existing camera is reproduced to the centimetre at the legacy body, so
+adopting this moves nothing about the current game -- asserted, because if
+it were not true the change would not be additive.
+
+ASSETS EXIST, and I was wrong to assume otherwise. The catalogue has 1,012
+representatives including `imported_two_california_plaza_los_angeles` (real:
+228 m, 52 floors, Bunker Hill -- verified), several brutalist blocks, city
+streets, NYC low-rise, and human references: `witwicky_suit_reference`,
+`humanoid_realistic_old_russian_guy_animated`, `female_human_face_reference`.
+
+The hard part is not the models. It is that a person and that tower in one
+shot is a 130:1 span and a 343 m pullback, and depth range is what actually
+breaks a renderer.
+
+801 passing.
+
+THE DEPTH RANGE IS ARITHMETIC, SO I CHECKED IT INSTEAD OF HAND-WAVING. Last
+entry ended on "a 130:1 span is what actually breaks a renderer", which was
+a claim with no number behind it. `camera.rs` builds
+`perspective_rh(fov, aspect, 0.08, 2600.0)` and `render.rs` allocates
+`Depth32Float`: an eight-centimetre near plane, a 2.6 km far plane, and
+STANDARD Z. That is the worst of the four combinations, because the
+perspective divide already concentrates precision near the camera and float32
+also concentrates its precision near zero -- and standard Z stacks both in
+the same place.
+
+    distance      standard      reversed      gain
+       343 m      0.0820 m     0.00002 m     3934x
+      1000 m      0.7312 m     0.00005 m    13407x
+      2500 m      3.0281 m     0.00001 m   448939x
+
+343 m is the pullback `--terrain scale` gives for Two California Plaza. A
+facade has detail at the centimetre, so standard Z there puts the windows and
+the wall in the same depth bucket. At 2.5 km it resolves three METRES.
+
+I MEASURED IT WRONG FIRST, in a way worth keeping. The reversed-Z value was
+inverted by computing `1.0 - z` in f32 and reusing the standard inverse --
+and that subtraction re-quantises onto the standard grid, because near zero
+`1.0 - tiny` throws the tiny away. The experiment reported the two schemes as
+IDENTICAL and would have "proved" reversed Z pointless. Each mapping now
+carries a direct inverse, the analysis runs in f64 so the only f32 rounding
+is the one under test, and the bug is a test so it cannot come back.
+
+AND THE STORY I WANTED WAS FALSE. I expected to find that only a pipeline
+change fixes this. Measured, nudging the near plane from 8 cm to 12 cm
+already buys 5 cm at 343 m without touching anything. The case for reversed Z
+is not that the alternative fails; it is the SIZE of the win -- three orders
+of magnitude finer, at the shipped near plane, for a flipped depth compare
+and a clear value of 0.0.
+
+NOT VERIFIED ON A GPU, and the report says so where somebody will read it.
+This is the arithmetic of the depth mapping and says nothing about shadow
+cascades or LOD popping, which are the other two things a 130:1 span breaks.
+
+807 passing.
+
+A THIRD LEVER ON DEPTH, AND IT IS THE FREE ONE. The near plane is a FIXED
+0.08 m in `camera.rs`. That is correct for a 38 cm body and absurd for a
+camera 343 m from a skyscraper: the perspective divide spends most of the
+buffer between eight centimetres and a metre, where in that shot there is
+nothing at all. `scale::near_for` scales it with the shot at 1/50 of the
+chase distance, which leaves the human case at almost exactly 0.08 m -- so
+close work does not move -- and gives the tower shot nearly seven metres of
+near plane, which costs nothing because nothing is drawn there.
+
+    as shipped        near 0.08 m, standard Z    0.09383 m
+    near plane only   near 6.87 m, standard Z    0.00070 m   (free)
+    reversed Z only   near 0.08 m, reversed Z    0.00001 m   (flipped compare)
+    both              near 6.87 m, reversed Z    0.00003 m
+
+THEY ARE ALTERNATIVES, NOT ADDITIVE, and I had written a test asserting they
+compose before the report printed all four rows next to each other. "Both" is
+WORSE than reversed Z alone. Reversed Z gets its precision from float32 being
+dense near zero, which is where it puts the far plane; pushing the near plane
+out on top redistributes the same budget and hands some back. So the
+recommendation is a choice rather than a stack:
+
+  * no pipeline change available -> scale the near plane. 130x better, free.
+  * able to flip the depth compare -> reversed Z, and KEEP the small near
+    plane, so nothing close is lost.
+
+The composing assumption is now a test asserting the opposite, because it was
+the kind of wrong that reads as obviously right.
+
+809 passing.
+
+AND THEN I LEFT THE FIX IN A MODULE NOTHING CALLED, which is the exact
+failure this session has spent its time correcting elsewhere. `scale.rs` and
+`depth.rs` measured a free 130x improvement and `camera.rs` went on
+hardcoding `perspective_rh(fov, aspect, 0.08, 2600.0)`. Analysis nobody
+applies is a document, not a change.
+
+The near plane is now derived in `view_proj` from the actual shot distance --
+`(self.look - self.pos).length()` was already there. The far plane became
+`Camera::FAR_M` so the renderer and the analysis cannot drift apart silently.
+
+THE SAFETY ARGUMENT HAS TO BE ARITHMETIC because the renderer is the one
+thing here I cannot look at. The gameplay camera sits 4.9 m back, so the near
+plane moves 0.08 -> 0.098 m; nothing in a chase shot is within ten
+centimetres of the eye, and a test asserts the gameplay value stays inside a
+narrow band while the tower shot gets its seven metres.
+
+MY FIRST INTEGRATION TEST WAS A TAUTOLOGY. It called `view_proj`, threw the
+result away, rebuilt the projection matrix itself with the near plane it
+expected, and asserted the two agreed -- which proves only that
+`perspective_rh` is `perspective_rh`. It would have passed with the wiring
+absent. The real version undoes the view (`vp * view.inverse()`) and reads
+the near plane back out of the matrix the camera actually returned, via
+`n = m32/m22`. Verified by deleting the wiring and watching it fail:
+
+    at 4.9 m the camera's own matrix has near 0.07999985, expected 0.098
+
+812 passing.
+
+I AUDITED MY OWN MODULES FOR THE THING I HAVE BEEN CORRECTING ELSEWHERE and
+found fifteen items across this session's work that existed only to be
+asserted by their own tests. A ledger whose data cannot be looked at is a
+test fixture wearing a table's clothes.
+
+Three outcomes, and the split is the point:
+
+  * SURFACE IT where the data was worth reading and simply had no reader.
+    `curriculum`'s `used_in`, `built` and `module` had never been printed;
+    `--tune kit` now shows the whole ledger, and the `built` column is
+    honest bookkeeping about wiring debt that belongs beside `--tune`'s
+    honest bookkeeping about guessed numbers. Likewise `Society::doctrine`
+    (the commander mapping was content nobody could see), `relays_at`,
+    `groundside::home` and `place_of`, the size ladder's `note`, and
+    `depth::near_needed_for`.
+
+  * DELETE IT where a second path already existed. `Case::take` delegated
+    straight to `take_capped` and stopped being called the moment the driver
+    started reading `cfg case_cap` — two doors to one room, one of them never
+    right. `curriculum::mechanic` was a by-name finder built for symmetry
+    with every other table here, and nothing ever wanted one mechanic by
+    name. `Class::all`, `Case::is_empty`.
+
+  * MOVE IT where it is genuinely test-only. `RIDGE_OVERLOOKS_BEACH`
+    documents a story fact for one test and now lives in that test module.
+
+And `config`'s `case_cap` default stopped repeating `6.0` and now derives
+from `tradecraft::CASE_CAP`, which is what made the constant live again
+rather than requiring a fake caller.
+
+375 warnings, from 405 at the start of the session, with far more code in
+the tree than there was then.
+
+812 passing.
+
+COMBINE WAS THE OTHER `built: false` ROW, and unlike `clinch` it did not need
+a screen. `assign`, `viable`, `combine_time_s` and `scale_vs` existed, were
+tested, and were called by nothing; the curriculum ledger had been reporting
+that accurately for several sessions without fixing it.
+
+It is worth a driver because the interesting claim is checkable: NOT EVERY
+SQUAD CAN COMBINE. Roles want proportions, proportions are measured off the
+models, and a squad of five identical racers fails at 0.42 coherence against
+a bar of 0.62 while a squad built for it merges at 0.95. `--combine grid`
+prints the fitness table so the assignment explains itself, which is the
+whole argument for greedy over a Hungarian solve.
+
+MY EXAMPLES ONLY DEMONSTRATED ONE OF THE TWO RULES. Both failing squads
+failed on COHERENCE, so `MIN_SYMMETRY` never decided anything the driver
+printed and a reader would have had no idea what it was for. The case I had
+written -- "one arm is a tank" -- fails on shape, because a tank makes a bad
+arm before it makes a mismatched one. Replaced with two GOOD arms of wildly
+different length: coherence 0.95, symmetry 0.25. A test now asserts each
+example fails for a different reason, so a rule cannot go undemonstrated
+again.
+
+AND A GESTALT IS A RUNG ON THE SIZE LADDER, which is what made this wireable
+at all. A combined body has a height, and since `scale.rs` exists that height
+means something: the squad above comes out at 11.9 m and 45 t, framed 21 m
+back and 7 m up, from `scale::camera_for` rather than from a multiplier
+somebody typed. `Gestalt::scale_vs` had been waiting for a scale system.
+
+`curriculum` now lists one unbuilt mechanic instead of two.
+
+814 passing.
+
+THE TUNING LEDGER OVERSTATED ITSELF, which is the same failure it exists to
+prevent. Its doc opened with "every number I guessed, in one place" and it
+covered ELEVEN OF SIXTY-FIVE config keys. A document that claims completeness
+and has 17% coverage is worse than one that claims nothing, because a reader
+with a playthrough's worth of notes will trust it and stop looking.
+
+The other fifty-four are now accounted for rather than quietly absent, in two
+categories that are real distinctions and not filing:
+
+  * RL_CALIBRATED (25) -- gravity, ball and car physics, the flip rules, the
+    chase camera. These are not judgment calls with a confidence level, they
+    are a reference implementation's numbers, and DESIGN.md carries the
+    conversion table. The right way to change one is to discover the
+    conversion was wrong, not to decide it feels better. Filing them as
+    GUESSES would bury the eleven that genuinely are.
+
+  * NOT_A_FEEL_KNOB (29) -- vsync, gyro deadzone, render scale, the colour
+    grade. Hardware, accessibility, and switches whose right value is
+    whatever the player says. A ledger that listed `vsync` beside the mystery
+    anchor would be telling somebody to go and have an opinion about vsync.
+
+AND A GUARD SO THE GAP CANNOT GROW: every config key must be in exactly one
+of the three, and the exemptions must give a reason. Adding a key without
+deciding fails with the key named. Verified by adding one. A stale exemption
+fails too, because a category that accumulates dead entries stops meaning
+anything.
+
+`--tune` now opens "11 chosen here, 5 never verified (25 more calibrated
+against Rocket League, 29 not feel knobs at all)", which is the true shape.
+
+814 passing.
+
+THE C-SIDE CAVEAT IS CLOSED, and it should have been closed hours earlier.
+"The CMake edits are unverified -- no cmake here" was reported at the end of
+every summary that touched the C engine. It was true and it was also four
+lines of shell: `pip install cmake` provides one, and the configure failure
+underneath it
+
+    Could not find a GL runtime library (GL/GLESv2/OpenGL)
+
+is not a missing dependency so much as a missing SYMLINK. Containers ship
+`libGL.so.1` and `libSDL2-2.0.so.0` and omit the unversioned names that
+`find_library` wants, because those belong to -dev packages. With no root
+there is no apt, and none is needed: a directory of symlinks you own, handed
+to CMake as `CMAKE_LIBRARY_PATH`, plus `-L` on the linker line for the
+libraries resolved by name.
+
+VERIFIED, finally, rather than asserted:
+
+  * `provenance.c` compiles as part of `cybertron_modules` through the real
+    target, not just under a hand-rolled gcc line;
+  * `test_provenance` is registered, builds, and runs as ctest #56;
+  * the whole project builds -- all 65 targets including `game`;
+  * 65 of 67 ctest tests pass.
+
+THE TWO FAILURES ARE NOT MINE AND I CHECKED RATHER THAN CLAIMED IT.
+`content_validate` wants five part_group meshes that are not in the tree in
+any form, `.iqm` or `.obj`. `model_tuning` compares `EX_N_IMPORTED` against
+the `imported_*.iqm` files in `engine_src/data`, of which there are ZERO --
+and the catalogue README says why: ".iqm is built, not stored". Neither test's
+source is touched by anything here.
+
+That second one incidentally corroborates the scale work: the baked header
+and `model_tuning.json` agree with each other at 1012 entries, so the 1,012
+models whose `scale` values I analysed are the real roster and not a partial
+read.
+
+`tools/sandbox_build.sh` makes it reproducible, with the two expected
+failures documented in the script so the next person does not spend the time
+I did deciding whether they matter.
+
+THE GENERATED HEADER HAD NO GUARD, which is the drift it exists to prevent
+reintroduced one level up. `archive_gen.h` is emitted from `archive.rs` by
+`--arch emit-c`, and nothing checked that the checked-in copy still matched.
+Edit a table, forget to regenerate, and the C engine reads a stale roster in
+silence.
+
+`test_provenance.c` cannot catch it: it validates the header against ITSELF —
+every finding links to a claim that exists, every id is unique, no dead ends.
+All of that stays true of a perfectly self-consistent header describing last
+week's content. A generated artifact needs a test against its SOURCE, and
+consistency tests read as if they are that test without being it.
+
+The emitter split into `render_c()` and a write, the same seam `save.rs` got
+for the same reason, and a Rust test now compares the rendered text against
+the file. It names the file, the line and both versions:
+
+    archive_gen.h is stale — run `--arch emit-c`.
+      line 76: on disk  { "museum_specimen", "earth", ...
+      line 76: expected { "museum_specimen", "luna",  ...
+
+Verified by moving a finding between worlds and watching it fire, then
+rebuilding the C target and re-running ctest to confirm the round trip.
+
+I ALSO LOOKED AT WIRING THE CODEX and did not. `EX_GS_CODEX` has 54 entries
+and several map cleanly onto claims -- "the array" onto `edge_lattice`,
+"unicron" onto `unicron_in_earth`. Showing a live STANDING there needs the C
+game to know what the player has found, and it has no save beyond a config
+file; the archaeology gameplay lives in the Rust fork. Wiring it would have
+meant inventing a dig for a game that does not have one, which is the
+fake-caller pattern with a nicer view. The bible's OPEN question stands, with
+a third option now recorded that I had not seen: annotate rather than gate,
+so the codex stays the reliable reference it is.
+
+817 passing, and the C suite at 65 of 67 with both failures being absent
+assets.
+
+THREE SEATING BUGS AND A SKIPPED FRAME, from a screenshot of a bot buried to
+the hips and a vehicle with limbs hanging outside it.
+
+  1. THE SEATING GUARD DID NOT MATCH ITS OWN CORRECTION. Both sites read
+     `d < self.car.half_h` and then lifted by `ride_h`. Anything sunk
+     between the two was judged fine and left there.
+  2. `Car::reset` ZEROED `ride_h`. Its own comment says "anything describing
+     the VEHICLE rather than its motion is silently lost on every kickoff,
+     respawn and map load" -- and `ride_h` was in the carry list, set to 0.0.
+  3. THE RESPAWN CLEARANCE used `half_h`, so a bot spawned partly inside the
+     ground before anything else ran.
+  4. THE FOLD NEVER RENDERED ITS LAST FRAME. `Xform::update` flips state to
+     Idle on the SAME call that `t` lands on 1.0 or 0.0, and `advance_xform`
+     gated on the state afterwards -- so the endpoint pose was never written.
+     Limbs stop a frame short of their sockets. That is the parts-outside-
+     the-vehicle bug, and it also froze the hitbox one frame early.
+
+THEN I FABRICATED TEST DATA THAT FLATTERED THE FIX. My seating test used
+half_h 0.9 against ride_h 1.5 -- a 60 cm band -- because it made the bug look
+convincing. `model.rs` has the real measurement for `analog`: 0.3775 against
+0.400. TWENTY-SEVEN TIMES smaller. A 2.25 cm bug dressed as a 60 cm one, and
+it would have stopped me looking for the rest of the cause, because 2.25 cm
+does not bury a bot to the hips. The test now carries the measured constants
+and a second test that BOUNDS what the fix can explain.
+
+WHICH LED TO THE REAL ONE. A smooth fold pins `cars.active` to the strip's
+first entry -- the vehicle -- and rewrites that model's meshes into the robot
+shape each frame. The geometry on screen is a robot; the `Model` whose
+`half_h` and `ride_h` would be read is a car. While the fold runs it does not
+matter, because the morph overwrites the dimensions every frame. It matters
+the instant anything else re-derives them: a garage switch, a car hotkey, a
+reload. For `analog` that is a `ride_h` of 0.239 against feet at 0.400 --
+sixteen centimetres, an order of magnitude past what the guard bug could
+account for. `dims_model` maps a displayed model to the model whose
+dimensions describe the CURRENT POSE, and `switch_car` uses it.
+
+AND THE TEST FOR IT DID NOT LAND THE FIRST TIME. The patch anchored on
+`mod order_tests`, which had moved to stations.rs several sessions earlier,
+so it applied cleanly to nothing and the count stayed at 826. Caught by
+filtering for the test and seeing "0 passed". Checking the count before and
+after an edit costs one grep.
+
+828 passing.
+
+KEYBINDS HAD NO CONFLICT CHECK OF ANY KIND. `slot()` hands out a `Vec<Bind>`
+per action and nothing ever looked across actions, so a rebind could shadow
+another silently and the only way to find out was to press the key and watch
+two things happen.
+
+`clashes()` compares AFTER `norm_key`, because that is what the dispatcher
+compares -- without it 'E' and 'e' look like different keys in the report and
+the same key at runtime, which would make the report clean and wrong. There
+is a test that feeds it a deliberate clash, because a detector that reports
+nothing is indistinguishable from a clean scheme.
+
+BOTH SHIPPED SCHEMES ARE CLEAN, which is worth stating as a result: the
+overlap being seen in play is not in the defaults. It is in a save's own
+binds, or it is modal.
+
+THE OTHER HALF IS THE ONE A TABLE CANNOT SHOW. Some keys never reach the
+action table at all -- the hotbar takes 1-9 directly in main.rs, the deck
+takes Escape, Tab, Enter and the arrows while a console is on stage, F11 is
+fullscreen. An action bound to one of those fires TWICE, once as the action
+and once as the shell's own behaviour, and no amount of reading the bindings
+would reveal it. `RESERVED_NAMED` plus a test now covers that side. The
+defaults are clean there too: only PageDown->Transform and Space->AutoTarget
+sit on named keys, and neither is reserved.
+
+`--keys` reads from the SAVE rather than the defaults, because that is where
+a player's overlaps actually are.
+
+AND IT FOUND THREE DEAD ACTIONS. `Car1`, `Car2` and `Car3` are unbound --
+the defaults comment says 1/2/3 were "freed from the legacy car-picker for
+the hotbar" -- but the actions still exist and `handle_action` still
+dispatches them to `switch_car`. They can never fire. Worth noting next to
+the dims fix: the car-hotkey route into `switch_car` is unreachable, so that
+particular trigger for the robot-seated-as-a-vehicle sink comes from the
+garage switch instead.
+
+833 passing.
+
+DRIVING ALL SIX CONSOLES ON A FRESH SAVE, which is not the state my own
+width guard was testing.
+
+THE MEDBAY HEADING OVERFLOWED AND THE TEST FOR IT PASSED. `chi::sheet` is
+written for the wide `--gear` view: an unattuned body reads "nothing yet --
+the body is a stranger to all seven", fifty characters before the caller's
+prefix, against a console that gives forty-six TOTAL. My guard used
+`board()`, whose chi is already populated, so it saw the short branch and
+never the long one. Testing the state that passes is not testing -- the same
+mistake as the fabricated seating numbers, two entries ago, in a different
+costume.
+
+Worth noting the overflow was not only the empty case: at three attuned
+elements the populated branch runs over too, so the fixture was one element
+short of catching it by luck rather than by design.
+
+`chi::sheet_short(&chi, max)` caps hard -- strongest attunements first, then
+a "+N" tail, because what gets dropped should be what matters least. The
+guard now builds every station in BOTH a played and a fresh state.
+
+AND THE HARD CAP WAS NOT HARD. Its own fallback branch -- the one that runs
+when not even a single entry fits -- returned "2 attuned", nine characters,
+under a cap of eight. The branch whose entire job was to guarantee the bound
+was the one that broke it. Caught by testing caps from 8 to 40 across every
+attunement count rather than at the one width the caller happens to use.
+
+STILL OPEN, and it matters for the mobile targets: `Menu::view` is a
+hardcoded 12 rows and nothing sets it from the panel's real capacity. The
+medbay is 24 rows and the wardeck 20, so both scroll -- but whether twelve
+rows FIT is a question about the screen, and on a PinePhone it very likely
+does not. That one needs a display to answer.
+
+837 passing.
+
+I SAID `Menu::view` NEEDED A DISPLAY AND IT DID NOT. The console's row
+geometry is two literals inside the draw call -- `top = 0.66`,
+`row_h = 0.072` -- against `TW_BOTTOM = -0.78`, all in NORMALISED UI space.
+How many rows the panel holds is therefore arithmetic, not observation, and
+the answer is the same on a PinePhone as on a desktop: twenty.
+
+`Menu::new` defaults `view` to 12 and nothing ever reconciled the two. So
+every station scrolled eight rows early, and the wardeck -- twenty wardens
+plus a heading -- scrolled when its roster would have very nearly fitted.
+`hud::deck_rows()` names the calculation, `Deck::fitted` applies it at all
+three build sites, and the whole roster now shows at once.
+
+THE DRIVER WAS REPORTING ON A WINDOW THE GAME DOES NOT USE. `menusim` builds
+menus with `build()` directly rather than through `Deck`, so it never saw
+`fitted` and kept showing twelve rows of a twenty-row panel. A driver that
+does not go through the same path as the shell is a driver that will agree
+with itself and disagree with the game -- the same shape as `run_order`
+living in the winit handler where nothing headless could reach it. Routed
+through `deck::fitted`.
+
+That is twice now that "this needs a screen" turned out to mean "this is
+geometry I have not written down yet". The first was depth precision. The
+test to apply is whether the quantity is defined in normalised units: if it
+is, the display cannot change the answer.
+
+840 passing.
+
+PERFORMANCE: `gravity_dir` COST 26.8 us PER CALL, five times the SDF it sits
+on, and every car and the ball hit it every frame. The reason is one line:
+the near-surface branch evaluates `sdf(p)` to decide whether it needs a
+normal, then calls `normal(p)`, which samples a TETRAHEDRON -- four more
+evaluations, none of them at `p`. The centre sample is taken and thrown away.
+Five SDFs at 5.2 us is 26.0 us against 26.8 measured; the model fits within
+3%.
+
+`normal_from(p, d)` is a forward difference that reuses the centre: three
+evaluations instead of four. Accuracy is not assumed -- a test measures the
+ANGLE against the tetrahedron over four hundred points on generated geometry,
+because a forward difference is biased where the tetrahedron is symmetric,
+and asserts the worst disagreement stays under twelve degrees inside the
+blend's own range.
+
+AND THE FIRST VERSION MADE THE GAME SLOWER WHILE THE MICROBENCHMARK IMPROVED.
+`gravity_dir` fell 22% and total SDF evaluations per step ROSE, 19.3 to 25.3,
+with two maps regressing. The old path called `normal(p)`, which populates a
+one-entry cache; anything downstream asking for the normal at the same point
+got it free. Saving one evaluation here cost four elsewhere. `normal_from`
+now serves and populates the same cache, and evaluations per step land at
+18.3 -- below the baseline rather than above it.
+
+THEN I NEARLY REPORTED A STEP-TIME REGRESSION THAT WAS NOISE. One sample said
+PERPLEXUS went 1.525 -> 1.605 ms. Five samples say 1.532 to 1.580, and
+worldgen for the same map swung 7 -> 14 ms between runs on work I had not
+touched. The honest result:
+
+    gravity_dir   26838 -> ~21600 ns   (-20%, spread +/-1.1%)
+    SDF per step   19.3 -> 18.3
+    step time      unchanged within noise
+
+Thirteen calls saving 5.2 us each is 0.07 ms against 1.55 ms. It is a real
+win on the call and on the evaluation count, and it is below the noise floor
+end to end. Worth keeping -- strictly fewer evaluations at a bounded accuracy
+cost -- but not the headline the microbenchmark offered.
+
+THE ACTUAL MOBILE RISK IS ELSEWHERE: worldgen is 400 ms on MONKEY RUN and
+197 ms on PERPLEXUS. On an ARM target that is seconds, and it is a load-time
+hitch rather than a frame-time one.
+
+842 passing.
+
+WORLDGEN: 400 ms -> 89 ms, AND I GUESSED THE CAUSE WRONG TWICE BEFORE
+MEASURING IT.
+
+First guess: the gravity index, because worldgen time tracked grav node count
+across the five maps. Second: the O(n^2) mouth-finding pass, whose shape-count
+ratio (864^2 vs 1263^2 predicts 2.14x, observed 2.08x) fitted beautifully. A
+temporary phase probe said the mouths block is 2.7 ms and the gravity index
+1.4 ms. Both stories were coherent and both were wrong; the arithmetic
+agreeing with a hypothesis is not evidence that the hypothesis is where the
+time goes.
+
+It is the ROUTE CLEARANCE pass: 8.6 ms -> 183.7 ms, 175 of the 190. Routes x
+segments x steps, each a full min-SDF over all 864 shapes, and its own comment
+says why -- "brute-force distance (the spatial grid is not built yet)".
+
+THE OBVIOUS FIX IS WRONG. The single call site only asks `raw(..) < want`, so
+stopping as soon as something is nearer looks free. It is not: the combination
+is not a min. Cuts SUBTRACT (`d.max(-dcut)`) and can carve a point clear again
+after a near shape has been seen, so an early-out would open routes through
+solid geometry.
+
+Reject on REACH instead, which is sound -- a shape farther than its own
+bounding radius cannot change the result -- and is the same test the runtime
+grid already applies in `sdf()`, so the route check now agrees with the physics
+SDF rather than being subtly stricter than it.
+
+AND THE MARGIN MATTERED. At +2 m the worlds CHANGED: PERPLEXUS 864 shapes
+became 856, MONKEY RUN 1263 became 1260, because `smin` reaches past a
+bounding radius. At +10, matching the runtime grid's own +4 reach and +6 probe
+budget, a five-map fingerprint (shapes, rings, routes, grav, summed positions)
+is bit-identical. That fingerprint is the only reason I know this is an
+optimisation and not a map change.
+
+    PERPLEXUS   197ms -> 52ms
+    MONKEY RUN  400ms -> 89ms
+
+Which matters on ARM, where 400 ms is seconds and it is a load hitch rather
+than a frame cost. Two tests pin it: the margin against the blend radius it
+has to cover, and worldgen determinism for a seed, without which a future perf
+change could alter the map silently.
+
+844 passing.
+
+THE TRIO AND THE VILLAIN HAVE POWERS NOW, and the mechanic came out of the
+archaeology layer rather than being invented next to it.
+`human_interface_unstable` was already a claim in `archive::CLAIMS`, already
+corroborated by an autopsy file describing tissue damaged by working
+CORRECTLY and by a rotation schedule cycling staff out sooner every revision.
+That is a specification: a human power is a WITHDRAWAL AGAINST A BODY and the
+balance never refills.
+
+The Watch is deliberately the other thing — one ability, a form selector,
+mastered before the story starts, costed but not degrading. Two power systems
+that differ in kind rather than in numbers.
+
+BURDEN IS PERMANENT, WHICH IS A REAL COST TO THE DESIGN and worth stating
+rather than glossing. A per-mission meter is the easy version and it makes
+the interface a stamina system: spend, sleep, spend again, and the fiction's
+central claim stops being true. Permanent means leaning on a power in Film 3
+makes you worse in Film 12, which can read as punishment for playing. The
+mitigation is that the arithmetic is VISIBLE -- costs are quoted in months of
+remaining service because the ledger is a calendar, and `--powers` prints
+what each use leaves behind before it is spent. A cost you can see is a
+decision; a cost you find afterwards is a trap.
+
+A FAILING INTERFACE COSTS 1.5x, past 80% spent, which is the trap the
+rotation ledger describes: the last of it goes fastest, which is what the
+Directorate kept discovering and shortening the schedule over.
+
+AND THE ARCHIVIST'S READOUT IS HIS MOTIVE. He starts at 86% -- failing, 1.3
+years left, and one use of `unmake` takes him to 0.3. His argument for
+destroying every fragment is a number rather than a monologue, and a test
+asserts he is the most spent of the four AND that the dearest power in the
+table is his.
+
+851 passing.
+
+BILLY'S FINALE WAS ANOTHER LIBRARY NOTHING CALLED. `converge` and `resolve`
+were written and tested with no caller, which matters more here than for most
+dead modules: the interesting thing about the scene is not that it succeeds,
+it is WHAT IT REFUSES -- a true nova (the arriving allies are in the radius),
+too small a draw, and a Watch not holding Photon Man (the held draw goes out
+broad instead of aimed). Three refusals that each state a piece of the
+fiction, and no way to read them short of the source.
+
+AND DRIVING IT FOUND SOMETHING NOBODY DECIDED. The treatment leaves Teleport
+and NewSun deliberately open; the mechanics do not. Photon Man costs almost
+the entire resolve pool -- 5% left against a 16% shift -- so straight after
+the strike Teleport REFUSES and NewSun does not. The leap only becomes
+possible if the Morpher survives about two more seconds.
+
+That is not a bug and it is better than a decision: the ending now depends on
+whether the scene gives him a beat, and NewSun is what happens if it does
+not. It falls out of two constants in `watch.rs` that were set for other
+reasons. Pinned with a test, because a tweak to either would silently rewrite
+which ending the story can have.
+
+I would not have found it by reading. The driver ran both branches, one came
+back refused, and the question was whether that was my harness or the game.
+
+852 passing.
+
+THE SHIP TABLE AND THE CAMERA HAD NEVER ASKED EACH OTHER ANYTHING.
+`ship::HULLS` carries real lengths -- 28 m for a hawkdrop up to a THREE
+KILOMETRE carrier, and the comment says "widesky really is a 3 km carrier and
+it really should feel like one". `scale.rs` topped out at Two California
+Plaza, 228 m, and I closed that entry saying a person and the tower was "the
+depth range the renderer has to survive".
+
+It is not. The carrier is thirteen times the tower, and framing it puts the
+camera 3,069 m back against a far plane of 2,600. The ship would be entirely
+behind it.
+
+    ark        1600 m   camera 1799 m
+    widesky    3000 m   camera 3069 m   PAST THE FAR PLANE
+
+Neither table is wrong; they were written apart. STATED AS A TEST RATHER THAN
+FIXED, because the fix is a decision with three defensible answers -- move the
+far plane (and pay for it in depth precision, which `--terrain depth` can
+price), frame carriers on a different curve, or accept that a 3 km ship is
+never shown whole and only ever seen in pieces. That wants somebody who can
+look at all three, and picking one quietly would be worse than leaving it
+named.
+
+The test asserts the carrier does NOT fit and that everything smaller does, so
+the boundary is real rather than the whole class being broken, and a second
+test joins every hull to a framing so the two tables cannot drift apart again.
+
+854 passing.
+
+THE JOINS ARE WHERE THE BUGS LIVE, so I went looking for them instead of
+waiting to trip over the next one. Three times this session two correct
+tables produced a wrong answer where they meet: findings against
+destinations, the posed model against the displayed one, hulls against the
+frustum. The common shape is a FREE STRING pointing into another table, with
+nothing checking it lands.
+
+`Boss.arena` is one. `chi::arena_element` matches on it and falls through to
+`Element::Water`, so "frostlien" compiles, runs, and trains the wrong element
+for a whole raid. The rule that makes the fallback a policy rather than a
+hole: an arena is either explicitly mapped, or it is a real patrol
+destination and the generalist default is deliberate. Anything else is a name
+that exists nowhere. Two more tests cover the reverse — a mapped arena
+nothing fights at, and whether the fallback is still reached by anything at
+all, because a default nothing uses is dead code wearing a policy's clothes.
+
+`Mission.champion` is worse. `Mission.dest` has been validated since it
+landed; `champion` sits FOUR LINES AWAY in the same struct and never was --
+and `campaign.rs` writes it straight into the final wave,
+`*wave.last_mut().unwrap() = c`, with no lookup on the way. A typo does not
+fail, it puts a troop id nothing knows about at the head of the mission's
+climax. Now checked, along with the champion not being one of the player's
+own classes.
+
+AND MY FIRST VERSION REPORTED IT BADLY. The typo probe came back as an
+`unwrap` panic from the second test rather than the named message from the
+first, because that test did `find(..).unwrap()` on the same id. Whichever
+test the harness happened to run first decided whether you got a diagnosis or
+a backtrace. Changed to `let Some(..) else { continue }` so an unknown id is
+reported by the test whose message explains it.
+
+860 passing.
+
+`Mission.site` AND `groundside::Place` ARE TWO NAMESPACES FOR THE SAME
+GROUND. Missions name a locale in prose -- "the beach", "the foundry", "the
+vault" -- and places are ids -- `the_beach`, `the_observatory`. Nothing
+joined them, and nothing could.
+
+That gap had already made something I built too coarse. `unexamined` gated
+evidence by DESTINATION, so clearing any single Earth mission opened all
+seventeen Earth findings at once, including an observatory and a museum the
+mission never went near. My own design note for that gate says "you can only
+examine evidence from somewhere you have actually been", and "been to Earth"
+is not "been everywhere on Earth".
+
+`Place::reached_by` is the join. Gating on it turns one unlock into a
+progression:
+
+    the beach                       5 findings
+    + the vault                    13
+    + the foundry, the trench      16
+
+AND MY TEST COULD NOT HAVE CAUGHT IT. It asserted that clearing an Earth
+mission opened "earth's evidence" and that nothing leaked from another world
+-- both true of the coarse gate and of the fine one. A test that only checks
+SOMETHING happened cannot see that too much happened. It now asserts the
+count is strictly less than every Earth finding, and that each unlocked item
+sits at a place the cleared mission actually reaches.
+
+Two more guards on the join itself: every place is reachable by a real
+mission (a place nothing reaches holds evidence nobody can ever examine), and
+no single mission reaches every place, which is the coarse gate expressed as
+a property rather than a story.
+
+862 passing.
+
+`Finding::source` IS THE HIGHEST-CONSEQUENCE FREE STRING IN THE PROJECT and
+nothing constrained it. It is the INDEPENDENCE KEY: two findings sharing one
+are two pages of one document and corroborate each other not at all. The
+whole standing ladder rests on that string matching.
+
+A typo does not fail. It SPLITS one body of evidence into two, and the map
+then reports corroboration the player never earned -- a claim reaching
+POSSIBLE or HIGH-CONFIDENCE off a single wreck read twice. The most important
+invariant in the archaeology layer was held up by spelling.
+
+`archive::SOURCES` closes the namespace, thirty-three entries, each saying
+what the body of evidence actually IS -- which the ids do not, since
+"scholarship" and "the_record" are both institutions and are not the same
+institution.
+
+THREE GUARDS, because a closed namespace is not enough on its own:
+
+  * every key cited is declared -- catches a key that matches NOTHING;
+  * every declared key is cited, with a real description -- catches a typo's
+    other half, and a body of evidence that got deleted;
+  * NO TWO KEYS ARE ONE CHARACTER APART -- catches the case the closed
+    namespace cannot, a typo that accidentally lands on a second real entry.
+    `luna_scar` against `luna_scan` compiles, passes the first two, and
+    quietly turns one launch strip into two independent observations.
+
+MY FIRST PROBE OF THE THIRD GUARD WAS WRONG. I RENAMED a source to test it,
+which leaves one entry rather than two, so no pair exists and the guard
+correctly said nothing. Adding one is the actual failure shape. Worth writing
+down because "the guard did not fire" and "my probe did not create the
+condition" look identical from the outside, and I nearly recorded the first.
+
+865 passing.
+
+I CALLED THE MYSTERY ANCHOR "A MAIN-MENU DIAL" AND NEVER PUT IT IN A MENU.
+
+It has been in `--tune` since it landed, in `config.rs`, in the save file, in
+the story bible, and described in three separate summaries as a setting on
+the main menu. It was reachable only by hand-editing `skydribble.save`. So
+were `story_era`, `case_cap` and both ladder thresholds -- every knob I added
+this session.
+
+Describing something as a setting does not put it in the settings. That is
+the same failure as `run_order` living where nothing could call it and
+`terrain.rs` having no caller, except this time I wrote the claim down
+repeatedly and never checked it.
+
+`tweak_rows` menu 8, STORY, linked under SETUP: the anchor, the campaign
+selector, both ladder thresholds, and the case capacity, grouped under
+headers that say what they do rather than what they are called.
+
+THE GUARD IS THE INTERESTING PART. `--tune` and the settings tree are two
+tables about the same thing and nothing joined them, which is the pattern
+this session keeps finding. The test walks the menu tree from the root
+following `Link` rows, drives every slider and toggle it finds to both ends,
+and asserts each ledger knob MOVES. Not "appears in a list" -- moves, through
+the same setter the UI calls.
+
+    'story_anchor' is in the tuning ledger and no menu row can move it —
+    it is a setting only in the sense that the save file has a line for it
+
+Verified by deleting the link and watching it fire. A second test asserts no
+settings menu is orphaned, because a page nothing links to is a page nobody
+can open, and STORY was one missing line from being exactly that.
+
+867 passing.
+
+TOWARD THE RENDERER GAP: `raidrun.rs` IS THE CONTRACT AND NOBODY HAD RUN IT.
+`skirmish.rs` calls it "the contract for the raid renderer" in its own doc.
+It had ONE reference in the tree. It is handed unit positions and a clock and
+hands back EVENTS and BEACONS, and it never moves anything -- a GROUND slam
+returns the velocity to apply, a grapple returns the impulse, because who
+applies them is the shell's business.
+
+That makes the event stream a specification for renderer work that can exist
+before there is a window, which is exactly what the gap needs. `--raidrun
+<boss>` steps a real plan at 120 Hz and prints it.
+
+THREE MISTAKES GETTING THERE, all mine, all instructive about the contract:
+
+  * FIRST RUN: 72,000 ticks, two events. It read like a broken sim. The
+    contract exposes THREE shell inputs and I was calling none of them --
+    `credit_kill` (a quota clears when the combat layer says something died,
+    never on its own), `champion_fell`, and `request_grapple`. A state
+    machine fed nothing does nothing, correctly.
+  * `advance()` RETURNS `over`, NOT "ok to continue". I read it as the
+    latter, so the driver stopped after phase one and looked like a
+    single-phase raid. The name reads either way at the call site, which is
+    why the fix carries a comment rather than just a sign flip.
+  * The units started far from the objectives and the quota cleared before
+    they arrived, so a GROUND boss produced no SLAM at all. Pacing in the
+    harness, not the sim -- but indistinguishable from a dead mechanic until
+    you look.
+
+Now: three phases, and the anti-air ceiling slams flyers at -22 m/s,
+eighty-eight times in phase one.
+
+    5.01s  ANCHOR    encounter 0 — champion down
+   42.12s  SLAM      unit 0, vy -22.0
+   85.01s  PHASE CLEARED
+
+Every Slam and Grapple in that list is a velocity the shell applies and the
+camera has to follow. That is the renderer's half of the contract, stated as
+a list, which is as close to a spec as this can get before somebody has a
+window open.
+
+867 passing.
+
+WHAT THE SHELL HAS TO BUDGET FOR, measured rather than assumed. The raid
+contract is now runnable, so the questions a renderer actually asks of it can
+be answered before anybody opens a window:
+
+  * PEAK EVENTS PER TICK IS FOUR, across all nineteen wardens driven to
+    completion. Not "under a bound I picked" -- I tightened the assertion
+    until it failed to find the real figure, and pinned that, so a regression
+    shows as a changed number rather than as a ceiling that quietly had room.
+    Four is nothing; the shell can absorb it without a queue.
+  * THE BEACON LIST IS STABLE WITHIN A PHASE. A renderer keys draw objects
+    off the index, so a list that changes length mid-phase forces a rebuild
+    and a list that reorders draws the wrong marker in the wrong place.
+    Asserted for all nineteen.
+  * ALL NINETEEN CAN BE FINISHED. A renderer built against a contract that
+    contains one uncompletable encounter finds out late.
+
+The drive feeds all three shell inputs and applies the velocities the sim
+returns, so it exercises the loop the way the shell will rather than the way
+a unit test would.
+
+869 passing.
+
+THE CAMPAIGN'S HALF OF THE SAME CONTRACT. `MissionRun::step` has existed
+since the module landed and EVERYTHING called `resolve`, which loops it at
+0.1 s and throws the events away. So the per-tick stream -- the thing a
+renderer actually consumes -- had never been looked at, only summed. Same
+blind spot as `raidrun`, reached from the opposite direction: there the
+contract had no caller, here it had one caller that discarded the interesting
+part.
+
+    campaign  peak 3 events per tick, all fifteen missions terminate
+    raid      peak 4 events per tick, all nineteen wardens finishable
+
+Both figures found by tightening the assertion until it failed, so a
+regression reads as a changed number rather than as headroom nobody was
+using.
+
+A second test walks the wave stream, because a renderer keying an intro
+animation off `WaveStart` needs it in order with no gaps, and needs never to
+see a `WaveCleared` for a wave that never started.
+
+AND IT CAUGHT MY ASSUMPTION RATHER THAN A BUG. I asserted zero-based wave
+indices; both emit sites push `wave_i + 1` on purpose, so the event reads
+"wave 1 of 3" to a player. The fix is not shifting an index past the failure
+-- it is asserting the convention, `started.first() == Some(&1)`, so the next
+person reading the enum does not have to go and check either.
+
+872 passing.
+
+THE FOLD AUDIT WAS REPORTING 3.5 MILLION FAULTS AND ALL BUT SIX PERCENT OF
+THEM WERE THE MODELS BEING MODELS.
+
+`--fold sweep` said 251 of 254 chassis were broken. Checking one showed why:
+every fault was at **t=0.00**, the untransformed vehicle pose, before
+anything had moved. A tank's road wheels sit inside its hull; that is how a
+tank is built. The check measured prim overlap against ZERO.
+
+The module's own doc anticipated this -- `OVERLAP_TOL` exists so "prims that
+SHOULD touch (a shoulder in its socket, a panel in its recess)" are not
+flagged -- but a fixed tolerance cannot cover a wheel fully inside a hull,
+where the relative depth is 1.0.
+
+THE BASELINE IS THE AUTHORED POSES, not zero. The question is not "do these
+overlap" but "do they overlap MORE than they do at rest in either end pose",
+because a part passing THROUGH another during transit is the fault and
+construction is not. Same reasoning as `redistribute_length_to_height`, which
+already caps mid-fold overshoot against the endpoints rather than against
+nothing.
+
+    3,538,315 faults  ->  213,172
+    every fault at t=0.00  ->  faults start at t=0.04, mid-fold
+
+AND THE TEST FOR IT WAS TESTING THE WRONG THING. `a_prim_passing_through_
+another_is_caught` built two prims that "start apart and END on top of each
+other" -- its own doc comment. That is not a sweep-through, it is a broken
+end pose, and under the new rule it is credited as construction. A SWAP is
+the real case: apart at both ends, crossing at t=0.5, so every bit of the
+overlap is transit. Fixed the fixture rather than the rule, and added the
+inverse -- a prim that never moves relative to another must never be
+reported.
+
+STILL 251 CHASSIS WITH FAULTS, and now that is a real number rather than
+noise: a straight vertex lerp from vehicle pose to bot pose moves parts along
+chords, so they cross. That is the actual state of the transformation
+animation engine, and the sweep now ranks which chassis fold worst instead of
+burying it under three and a half million non-events.
+
+873 passing.
+
+A TOP-TEN CANNOT TELL YOU WHETHER TEN THINGS ARE BROKEN OR EVERYTHING IS, and
+those want opposite responses: fix ten models, or fix the fold. `--fold
+sweep` printed only the ten worst, so the shape of the problem was invisible
+even after the fault count became meaningful.
+
+    spread: worst 2497, p90 1382, median 795, p10 392, best 58
+    NOT ONE of the 251 folds cleanly, and the best still has 58 faults.
+
+MY FIRST VERSION OF THE SUMMARY GOT IT BACKWARDS TWICE. The list is sorted
+DESCENDING, so `counts[len/10]` is the ninetieth percentile and I labelled it
+p10 — and then drew the conclusion FROM the labels, which is how correct data
+produces a confident wrong answer. It also judged "fold or models?" on a
+ratio between worst and median, which said "a long tail" while every single
+chassis was faulty. The right question is not the spread, it is whether ANY
+chassis folds cleanly. None does.
+
+SO IT IS THE FOLD. `Morph::sample` lerps vertices, so a part travels the
+CHORD between its two poses — the straight line — and any part whose start
+and end sit on opposite sides of another goes through it. Nothing in the
+pipeline routes around anything. Two prims demonstrate it: a part swinging
+across a stationary one faults in transit and never at an endpoint, and the
+same swing with the obstacle moved off the chord is clean.
+
+That is the real state of the transformation animation engine, and it is a
+design question rather than a bug list — an arc, a per-part detour, or
+ordering the fold so parts move out of each other's way. Fixing the worst ten
+chassis would change nothing about the other 241.
+
+874 passing.
+
+PORTING BEGINS: `warp_wave` AND `spearcon` OUT OF THE C TREE. Both came from
+the film scripts rather than from the code, and both are one idea -- something
+will happen at a place, at a time, and nobody can call it off. So the clock is
+shared (`hazard::Fuse`) and the two mechanics are thin over it.
+
+THE WARP WAVE is the better of the two and the reason to port carefully. The
+Ice-Clone leap is silent and undetectable; the only evidence is a gravity wave
+arriving SECONDS LATER at the landing point. The jumper knows it is coming and
+can warn allies, cannot stop or shape it, and IT IS INDIFFERENT TO WHO IS
+STANDING WHERE IT LANDS. A consequence you cannot aim, arriving after the
+fact, is an unusual thing to hand a player and it is exactly the
+Watch-bearer's register: the power is real and it is not obedient. A test
+pins that the landing point is fixed at leap time and nothing afterwards
+moves it.
+
+A DEFECT DID NOT SURVIVE THE PORT. `ex_spearcon_update` writes detonations
+into a caller-supplied buffer and returns how many went off -- incrementing
+that count whether or not it had room, so a caller iterating `0..n` over a
+shorter array reads past the end. Returning a `Vec` makes the failure
+unrepresentable rather than fixing it, which is the right trade in a language
+that can, and the C behaviour is recorded as a test asserting all sixteen are
+accounted for.
+
+Also: a second leap RESETS the pending wave rather than stacking one, which
+the C original gets right for a reason worth writing down -- there is only
+one of you, so there is only one arrival pending.
+
+883 passing.
+
+THE CODEX CAME ACROSS, all fifty-four entries, EXTRACTED RATHER THAN
+TRANSCRIBED -- a parser over `lore.c`'s initialiser emitting Rust, because
+fifty-four entries of somebody's actual writing is exactly the material a
+hand-copy quietly corrupts. A test asserts the count and that no line is long
+enough to suggest a mangled parse, since the line breaks are the writing's own
+rhythm rather than word wrap.
+
+AND IT ANSWERED AN OPEN QUESTION WITH AN OPTION I HAD NOT SEEN. The bible
+asked whether the codex should become something you excavate -- dimming until
+earned -- or stay a reliable reference. Both readings assumed a choice. It
+annotates: five entries name a claim, and reading one prints what the EVIDENCE
+currently says beside what the ENTRY says, with the entry readable either way.
+`--codex unicron` shows the settled account and then "[POSSIBLE SHARED ORIGIN]
+2 for / 0 against" underneath, which moves as the dig does.
+
+Five of fifty-four, with a test refusing more than a quarter: an annotation
+that fires on everything is decoration, and the case worth building for is
+the one entry the evidence ends up DISPUTING.
+
+887 passing.
+
+THE BRAIN SEAM IS ACROSS — `combat_json` and `commander_ai` out of the C tree
+into `brain.rs`, and it was the most valuable thing in there because it is not
+a feature. Its author's own framing: a commander FSM emits THE SAME COMMAND an
+LLM would, so the two are interchangeable behind one interface and the
+deterministic layer is a strict subset of what the model layer can express.
+`--brain wire` prints both and the JSON is byte-identical.
+
+THE DOCTRINE TABLE WAS ALREADY HERE. `content::COMMANDERS` carries the same
+five archetypes and the same four dials -- aggression, caution, encircle,
+regroup -- that the C loaded from `commanders.json`. This tree had the data
+and not the FSM, which is why the port is a hundred lines and not a thousand.
+
+THREE THINGS ARE LOAD-BEARING AND EASY TO MISS:
+
+  * THE SIGNALS. A snapshot carries aggression, recent damage, pressure and
+    kills alongside the positions. A brain that only sees positions plays
+    chess; one that sees HOW YOU ARE FIGHTING can react to you, and that is
+    the entire reason the loop is worth closing.
+
+  * THE TICK ECHO. The C describes it as ordering. For a model provider it is
+    the whole safety story: inference takes hundreds of milliseconds, the
+    frame cannot wait, so replies arrive stale as a matter of course, and
+    orders answering a battle two seconds gone are worse than none.
+
+  * TOLERANT PARSING IS A REQUIREMENT. A model asked for JSON returns JSON
+    wrapped in prose, or a code fence, or a `<thinking>` block, roughly
+    whenever it feels like it. A strict parser is a provider that fails
+    intermittently for reasons the player experiences as the enemy going
+    stupid. Tested against four wrappers and a made-up verb.
+
+EVERY FAILURE FALLS BACK RATHER THAN STALLING -- declined, unparseable, stale,
+or empty, the FSM answers instead, and a test walks all five paths asserting
+the squad never stops taking orders. And the model is trusted for verbs and
+never for the tick, or one wrong echo poisons freshness for every later reply.
+
+LOGSCOPE IS THE INTENDED PROVIDER and the dependency is one method:
+`trait Completion { fn complete(&mut self, prompt: &str) -> Option<String> }`.
+Deliberately that small so this crate takes no dependency on an inference
+stack -- `apps/logscope` is a Rust LLM workspace with a `gpu-gemm`
+wgpu->Vulkan engine and a local GGUF path, so it can serve this on the same
+devices the game targets, but an Ollama call or a fixture satisfies it
+identically and the game cannot tell.
+
+899 passing.
+
+THE HIVE IS ACROSS, and it is the enemy that does not fight like an army.
+`corruption.rs` has always modelled what corruption IS and never how a
+corrupted swarm DECIDES, which is why the infected have been fighting like
+soldiers with different stats.
+
+CRAWL, DANCE, FEED — borrowed from bees rather than from armies. Below
+critical mass the infected stay dispersed and creep, so a lone scout does not
+give the swarm away. One that gets close to prey emits a waggle dance that
+RECRUITS whatever is near it — stigmergic, not a broadcast: nothing commands
+anything, and the swarm self-organises because each individual reacts to what
+is beside it. Enough recruited and it tips.
+
+The consequence worth having is that KILLING THE SCOUT WORKS. There is no
+commander to decapitate, but there is a dance to interrupt, and if the prey
+gets back outside the radius the whole thing subsides to crawling rather than
+chasing. A player who works that out has learned something the enemy's
+statistics never told them.
+
+A `match` COST ME THE PACING AND A TEST CAUGHT IT. The C runs its three state
+checks as sequential `if`s, not `else if`, so the tick a scout arrives the
+hive enters DANCE and falls straight through to count recruits — tipping to
+FEED in that same tick if the pack is already gathered. A `match` looked
+equivalent and is not: it spends a tick per transition, so a swarm the player
+walked into took a second to notice them. Found by
+`recruitment_is_by_proximity_not_by_headcount` reading zero on both sides of
+its comparison, which is the kind of failure that is only legible because the
+test compared two things rather than asserting one.
+
+Fixing it then broke the arc test, correctly: with six clumped infected and a
+ravener's feed mass of two, crawl->feed really is one tick and the dance is
+never observable. The test had encoded the buggy pacing as the specification.
+Replaced with two that check what is actually true — a gathered pack tips
+instantly, and a SPREAD one dances and keeps dancing, waiting for numbers it
+does not have. That waiting is the mechanic.
+
+`--brain hive` shows all four strains against a closing player, and the
+strains genuinely differ: the stalker never gathers four within eleven metres
+and dances to the end, the lure tips at thirty.
+
+909 passing.
+
+CLEARING THREE DEAD ITEMS FOUND A REAL BUG, which is the argument for
+treating an unused-code warning as a question rather than a chore.
+
+`Fsm.squad` came across from the C's `squad_id` and was read by nothing. The
+lazy fix is to delete it. But asking what it was FOR exposed that `choose`
+averaged strength over EVERY live unit on the field — so a commander whose
+own squad was being wiped out kept pressing on the strength of somebody
+else's. `mine()` filters to the squad, a negative id still means the whole
+field for the single-commander case, and a test builds two squads (one at 8%
+health, one untouched) and asserts their commanders disagree. Reverting the
+filter makes it fail.
+
+The other two were smaller and got the same treatment rather than deletion.
+`ZONE_MID` was defined and never emitted, which meant a PRESS committed only
+its front rank — a probe with extra steps; the middle now follows the front
+in. `Strain::parse` had no caller, so `--brain hive <strain>` takes one.
+
+910 passing, and no dead code in either brain module.
+
+THE TUNING LOOP IS ACROSS, AND THE ARTIFACT IS NOT. `tools/tune_fsm.py`
+evolves transition matrices for a Markov behaviour FSM -- eight per-enemy
+movement behaviours, a matrix per context and vehicle archetype. THIS TREE HAS
+NO SUCH LAYER, so porting it meant building a system with no consumer and then
+a tuner for it. What transfers is the loop: a headless sim, a fitness
+function, a mutation search. And that has an immediate consumer, because
+`tuning.rs` says out loud that five numbers here have never been verified and
+`brain.rs` carries a comment admitting its posture gates are guesses.
+
+TWO SIM BUGS, BOTH CAUGHT BY TESTS COMPARING TWO THINGS rather than asserting
+one. The player kited at 9 m/s against a squad that moves at 7, so nothing was
+ever caught: encircle read 0.048 for a surrounder and 0.049 for an aggressor,
+and the search could not tell the doctrines apart because THE FIGHT NEVER
+HAPPENED. A fitness function measuring a fight that does not happen scores
+noise very precisely. Bounded the arena and slowed the player below the squad
+-- fights happen in places, and a player who can retreat infinitely is not
+being encircled by anybody.
+
+Then the surrounder still scored LOWER on encirclement than the aggressor,
+because my FLOCK_SPREAD pushed every unit sideways -- which ROTATES a
+formation without spreading it. Units starting on a ring already cover it, so
+orbiting only took them further out. Each unit now gets its own slot on the
+circle, which is what "spread out around a point" meant.
+
+And every context returned identical gates, which looked like the weights
+being decoration. They were not: the search used ONE FIXED SEED, so every
+context explored the identical candidate sequence. Seeded from the context
+name -- still deterministic, and now they look somewhere different.
+
+THE ANSWER IS A NEGATIVE RESULT AND THAT IS WORTH HAVING:
+
+    context       hurt    mind    scat provoke     score vs shipped
+    skirmish      0.34    0.29    0.38    0.51     0.878     +3.3%
+    swarm         0.52    0.39    0.30    0.62     0.673     +2.4%
+    hunt          0.56    0.52    0.40    0.60     0.831     +1.5%
+    hold          0.49    0.52    0.42    0.59     0.877     +1.4%
+
+By the criterion the tool prints for itself -- a couple of percent is noise --
+the shipped gates are fine. One detail is worth an eye though: every context
+wants `mind` at or below 0.40 and skirmish wants 0.29, which would put
+`surrounder` (caution 0.30) above the bar and make it state-sensitive. That is
+exactly the insensitivity I flagged when the FSM landed, arrived at
+independently by a search that did not know I had complained about it.
+
+NOTHING IS WRITTEN BACK. The fitness weights are themselves guesses -- better
+argued than the numbers they judge, and still guesses -- and an optimiser that
+edits the source is an efficient way to bake a bad objective function into a
+game.
+
+916 passing.
+
+GAME.C IS A DESIGN CORPUS, NOT A CODEBASE TO PORT. The salvage survey ended on
+a caveat -- 12,509 lines, perhaps 300 read, systems might be hiding inside it
+rather than in named modules. There are FORTY-TWO of them, and reading them
+changed what taking them means.
+
+The file opens with two hundred lines of design commentary: every system
+named, argued for, mostly sourced to the screenplay. Underneath, the
+implementations are inline against the C renderer. `AIDEN'S SKATEBOARD` --
+a human-scale vehicle mode, which is exactly what the human campaign needs --
+is two globals and a note that transform "hops on/off, near-double pace,
+board rendered underfoot". There is almost nothing to translate.
+
+So `docs/INHERITED_DESIGN.md` harvests all forty-two with their own prose.
+The design survives deletion in a way renderer-coupled C does not.
+
+AND SOME OF THEM WERE NEVER BUILT. `PALE VECTOR` -- the relic-keeper who
+whispers if you come near and WARPS OUT if you press him, who maintains the
+relics and remembers -- has a paragraph of design and close to no code. I
+tried to classify implemented-vs-not by grepping identifiers, and the
+heuristic was too crude to keep: "THE SUN ITSELF" matched on the word "the".
+Nothing is labelled, because a confident wrong label is worse than none.
+
+The ones with the strongest claim here: the skateboard, Pale Vector (whose
+register is the archaeology layer's exactly), DISGUISE PROTOCOL (a prop hunt
+falling out of the transform verb the game already has), AMALGAM OF THE GATE
+(a gestalt fused from every frame that ever failed -- and `combine.rs` now
+knows how to build a gestalt), and LOW-G LOCOMOTION.
+
+PALE VECTOR IS ACROSS, and the first thing to say is that I was wrong about
+him. The `game.c` survey listed him as documented-but-unbuilt on the strength
+of a grep that looked for the wrong identifier; the file has forty-one
+references to `g_pvec_*` and a complete update loop. Noted in
+INHERITED_DESIGN.md as a caution about the rest of that list.
+
+THE SHAPE IS THE CHARACTER. Three distances and nothing else: outside thirty
+metres he is scenery, inside it he talks on a cooldown, inside twelve he
+leaves for forty seconds. That is a complete design, because the only way to
+get everything he knows is to KEEP YOUR DISTANCE FOR A LONG TIME -- and the
+instinct that works on everything else in this game, close and press and
+take, is precisely the one that costs you. Holding at 20 m gets all four
+lines in 41 s. Walking in gets one.
+
+WHAT THE C HAD NOWHERE TO PUT: his four lines are archaeology claims spoken
+aloud -- "the lattice is stirring", "the array saw it first, no one wanted to
+look", "i maintain what was meant to stay buried". That engine had no
+provenance layer, so they were flavour text. Here they are TESTIMONY, and
+`provenance.rs` already had the right bearing for it: `Mentions`, from a
+single source. A whisper puts a claim on the board at UNKNOWN and moves it no
+further.
+
+That is right twice over. He is one voice, so he could never be corroboration
+alone; and he is a rumour rather than an artifact, so the map should record
+that somebody SAID this and not that it is so. A test asserts every claim he
+touches lands at exactly UNKNOWN and that his support count stays zero, and
+another asserts he still MATTERS -- without him those nodes are not merely
+unproven, they are invisible.
+
+Two flaws found by running it. The walk-in demo started at 25 m, so he
+appeared already inside press range and withdrew before saying anything --
+a demonstration of nothing. And two of his lines concern the edge lattice, so
+his testimony listed it twice: harmless to the assay, which counts distinct
+sources, and it would have READ as corroboration. One witness saying a thing
+twice is one witness.
+
+924 passing.
+
+THE AMALGAM AND THE DISGUISE ARE ONE SYSTEM, and porting them together is the
+only way either makes sense: a boulder is not a mechanic, it is an answer to
+something, and the amalgam is the something. Forge four relics while it sweeps
+the hollow -- forging makes you LOUD -- and the disguise buys eight seconds
+against a thirty-second recharge, because the gate notices patterns.
+
+It composes almost entirely out of things built here for other reasons.
+Detection is `perception::rate`. The disguise is cover that expires. The
+gestalt is `combine.rs`. So the port is mostly the LOOP, and the loop is one
+trade: THE ONLY WAY TO MAKE PROGRESS IS THE THING THAT GETS YOU FOUND.
+
+FOUR MODELLING BUGS, EACH FOUND BY THE ENCOUNTER BEING UNPLAYABLE:
+
+  * IT DRIFTED AWAY WHEN UNSURE, which is not hunting -- and with a starting
+    range of 40 m against a watcher that sees 35, the encounter never began.
+    That is `perception`'s own conclusion biting its first consumer: distance
+    is the only answer to a hunter, so a hunter that keeps its distance is not
+    a threat. It sweeps now.
+  * THE SWEEP WAS SIX SECONDS long, the whole hollow crossed and recrossed in
+    less time than one forge. A patrol has to be longer than the thing it
+    interrupts.
+  * ATTENTION WAS A RATCHET. It could only fall outside the amalgam's senses,
+    and the sweep never leaves them, so suspicion rose monotonically and every
+    strategy eventually lost. There was no way to shed it -- which means there
+    was no stealth, only a countdown wearing one.
+  * THERE WAS NO QUIET ACTION. Moving at sixteen metres still nets suspicion,
+    so a player caught out by the sweep could only spend the disguise or be
+    found. Crouching fixed it, and the source implied it all along: the
+    disguise is "crouch + transform", so crouching was already a state.
+
+AND I TUNED IT IN CIRCLES, inverting which strategy won four times over. That
+is the signal that the objective was mine rather than the game's, so the
+balance number is registered as a guess and the TEST WAS WEAKENED to match
+what I can actually defend: somebody can win, and reading the sweep is never
+worse than ignoring it. Pinning a difficulty I cannot playtest would encode my
+guess as a requirement.
+
+The safe forging distance is DERIVED from the constants rather than typed,
+because a magic threshold would stop meaning anything the moment the balance
+number moved -- and that number is admitted to be one that will.
+
+    forge blindly, hide early     Caught   — 2 relics
+    forge blindly, hold it back   Caught   — 2 relics
+    read the sweep, crouch near   Banished — 4 relics, never found, 78s
+
+935 passing.
+
+THE GRIP METER IS ACROSS -- `game.c`'s cling system, four multiplied terms and
+a clock. Vertical faces drain slow, UNDERSIDES drain fast, heavier builds
+drain faster, crawler alt-modes grip far better, and ice is slick.
+
+WHAT MADE IT WORTH PORTING rather than reinventing is that every term already
+had a home here. Orientation is the surface you latched to; build is
+`chassis_traits`' bulk; alt-mode is the chassis category; and the surface is
+`terrain::Material` -- the module that already knows ice from basalt because
+`mapsim` needed it to decide where dunes form.
+
+That last one is the change I made. The C reads a per-map `g_surface_grip` and
+computes `drain *= (2 - grip)`. Here slickness is DERIVED from the material,
+because a second per-map opinion about what a surface is made of is a chance
+for the two to disagree -- and the terrain module is already the authority on
+that question for dunes and talus.
+
+THE ASYMMETRY IS THE MECHANIC, and the table says it in one glance:
+
+                   metal    basalt  regolith       ice  soft ice
+    wall, light     32.3      30.8      23.9      19.6      18.0
+    wall, crawler   67.3      64.1      49.9      40.8      37.4
+    under, light     7.3       6.9       5.4       4.4       4.0
+    under, heavy     4.7       4.4       3.5       2.8       2.6
+
+Thirty-one seconds on a face and seven beneath one. A wall is somewhere you
+can stop and think; a ceiling is a move you have already committed to. A test
+pins both halves of that -- a wall must give more than fifteen seconds and an
+overhang fewer -- so retuning cannot quietly collapse the distinction into a
+single kind of surface.
+
+AND THE TABLE IS NOT THE MECHANIC. The driver first printed hang times and
+stopped, which left the whole stateful half -- recover, fall, lockout -- dead
+outside its own tests. Running an actual traverse fixed that and said the
+thing the table cannot:
+
+    9 m of ice overhang, 1.4 m/s
+      heavy    GRIP FAILED at 3.9 m ... 14 identical falls; it reaches 4.0 m
+      crawler  across in 6.4 s, no falls
+
+THE METER IS NOT A RESOURCE YOU SPEND, IT IS A DISTANCE YOU CAN REACH. A span
+longer than your hang time is not hard, it is SHUT, and the answer is a
+different frame rather than a better attempt. Fourteen identical failures at
+the same 3.4 m is the game saying so.
+
+A `release()` came across and nothing called it: letting go of a wall is the
+same event as arriving on the floor, and a separate method invites the two to
+disagree about the regrab lockout. Deleted, with a test pinning that a
+voluntary release does not lock you out the way a fall does.
+
+944 passing.
+
+STEALTH IS ACROSS, and the design under the pitch is better than the pitch.
+`game.c` sells it as Halo-style assassinations. What it actually has is TWO
+SENSING CHANNELS WITH OPPOSITE COUNTERS.
+
+SIGHT is range, a facing cone, and line of sight — beaten by geometry. Get
+behind something.
+
+SPARK RESONANCE is the Corrupted and the apex frames feeling a spark WORKING:
+firing, sprinting, abilities. No cone, no line of sight, THROUGH WALLS, at a
+range that grows with how loud you are — beaten by stopping.
+
+So the instinct that saves you from a sentry, duck behind a wall and keep
+shooting, is the one that lights you up for a hunter. `--stealth` prints the
+trap in two lines: behind a wall, still firing, the sentry senses `No` and the
+corrupted senses `Resonance` from 112 m. A player who has learned one enemy
+has learned the wrong lesson about the other.
+
+`perception.rs` has always modelled the first channel and never the second.
+
+I ALSO CLAIMED THE TWO MODULES COMPOSED AND THEY DID NOT. `sight_rate`
+delegated to `perception::rate` and nothing called it: `sense` treated being
+inside the cone as INSTANTLY SEEN, so the delegation was a decoration and the
+warning said so. Sight is a rate now — inside the cone is permission to start
+noticing, not the noticing — and a test pins that being seen takes time,
+that distance costs four times more of it, and that sneaking buys some.
+
+Likewise `Spark::act` and `decay` were dead because the driver printed static
+loudness values. Running the loop instead shows the thing the table cannot:
+one burst at thirty metres goes unfelt in 0.8s, and the hunter keeps coming
+for another 3.5 — so stopping is necessary and is not sufficient.
+
+955 passing, zero warnings in the module.
+
+AIDEN'S SKATEBOARD IS ACROSS, and the design line is three words while the
+design is in two numbers elsewhere in `game.c`: a human moves at 0.45 of a
+bot's pace, and on the board at 0.85.
+
+THE SCALE GAP IS A MOBILITY GAP. `scale.rs` established that a bot is five
+people tall and a tower is a hundred and thirty; those are rendering problems.
+This is the gameplay one -- a world built at Transformer scale is not merely
+large for a person, it is a commute:
+
+                                            bot    foot   board
+    a warehouse floor                        4s     10s      5s
+    the hollow                              14s     32s     17s
+    a patrol zone                           64s    143s     76s
+
+The board is a FIX AND NOT A POWER-UP: 85% of a bot is still slower than a
+bot. It makes the map the size it already was for everyone else, and a test
+pins that it stays under 1.0 -- if it reached parity the answer to human scale
+would be "stop being human", and the campaign's whole register goes with it.
+
+THE VERB IS THE SAME KEY AT BOTH SIZES, which is why the C hangs the board on
+TRANSFORM: at human scale folding is disabled and the board takes its place,
+so the verb means "become the thing that can cross this" either way. That is a
+better unification than a separate mount button, and I would not have found it
+from the design comment alone.
+
+AND A DEFENSIVE GUARD SURVIVES THE PORT. `game.c` snaps the avatar back to
+robot whenever scale is toggled, with a comment explaining that toggling
+mid-transform would strand you as a human-scale VEHICLE -- posed flat or
+upside down, with mode changes locked. It is unconditional so it doubles as a
+recovery for any stuck transform, and both directions are tested.
+
+Height and camera come from `scale::LADDER` rather than being restated here,
+so this module and the size ladder cannot disagree about how tall a person is.
+
+962 passing, zero dead code in the module.
+
+CRAWLER AMBUSH IS ACROSS, built on `cling.rs` -- the climb is a crawler's grip
+used offensively, and `usable()` asks that module whether a face will hold for
+the length of a climb rather than deciding separately. Two systems that
+disagreed about who can hold a wall would be worse than either.
+
+THREE THINGS MAKE IT HORROR RATHER THAN A GIMMICK, and all three are in the C:
+
+  * A CAP OF TWO. Not a swarm from above. Two is a threat you can look for and
+    still fail to find; a ceiling of them is a crowd, and a crowd is not
+    frightening. Twenty crawlers and a single spire still peaks at two, and a
+    test walks thirty seconds asserting it never exceeds the cap.
+  * THREE WARNINGS, THE LAST ONE LATE. "Something is CRAWLING the structure",
+    then the eyes catch the dark for 0.45s, then the dive -- which is 0.85s
+    long, so the final warning is shorter than the thing it warns about.
+  * THE POUNCE LEADS NOTHING. Flight time is fixed and the arc is solved once,
+    at launch, against where you were standing then. Standing still is a hit;
+    running puts you 5.1 m from where it lands. A crawler that tracked you
+    would be unfair; one that predicts badly is a puzzle.
+
+TWO BUGS OF MINE. `pounce_landing` returned the PERCH's height as the landing
+height, so a dive off an eighteen metre spire reported landing eighteen metres
+in the air -- caught by a test comparing it against a target on the ground,
+and the neighbouring ballistics test passed throughout because it integrated
+the arc properly. And `Event::Nothing` was a variant `step` can never return,
+since it hands back a Vec of what actually happened; deleted rather than given
+match arms, because a state that cannot be constructed beats one every caller
+has to remember to ignore.
+
+The glint was asserted by a test and invisible in the driver, which made the
+printed trace look like the encounter has two warnings rather than three.
+
+971 passing, zero dead code in the module.
+
+THE RIP IS ACROSS -- six characters expressed entirely in the velocities of
+somebody else's parts, which is a lovely way to say something about a player
+without a line of dialogue. Merciful barely moves them (speed 2.6); thrash
+throws everything (22.0); surgical lifts without throwing; precision makes a
+tight ring and the scout BLINKS to the flank rather than charging, because
+arriving rather than travelling is that whole archetype.
+
+AND THERE IS A SEVENTH THE DESIGN COMMENT DOES NOT LIST. Buried next to its
+condition: a big frame that gets its hands on a small enemy does not scatter
+it, it takes it in both hands and TEARS IT IN TWO along your own shoulder
+line. Prime will not -- mercy holds -- and the beast will not, because it
+already has its own idea. Everyone else will.
+
+What makes it read is COHERENCE. Every other style is a scatter; this one is
+the absence of one, two halves each moving as a single piece. Measured at
+1.00 against 0.13 for thrash.
+
+MEASURING THAT TOOK TWO GOES. Coherence over the whole body in three
+dimensions scored `Merciful` as high as a jazz rip -- its parts barely move
+sideways, so they all point straight up, and "all going up" reads as "all
+going the same way". Measured horizontally over the whole body a jazz rip
+scores ZERO instead, because its halves cancel. The metric that actually
+distinguishes it is horizontal coherence WITHIN ONE HALF, which is just the
+fiction stated arithmetically: each half moves as one piece.
+
+I also gave `Victim` an `Apex` variant out of habit from `stealth.rs`, where
+an apex frame is a real case because it turns an assassination into a wound.
+Here it changes nothing -- the override asks only whether the victim is small
+enough to pick up, and an apex answers no exactly as a standard does. A
+variant that only ever takes the other branch is a distinction the code does
+not make. Deleted.
+
+981 passing, zero dead code in the module.
+
+THE BOTS ARE A CENSUS, NOT 259 CHARACTERS. `tools/meta/bots.json` documents
+its own weakness with unusual honesty -- 89 distinct hooks across 259 bots,
+fifty-six grimorphs sharing one line, "placement metadata wearing a costume,
+not character" -- and the obvious fix is to write 178 more hooks. That is the
+wrong fix. A world with 259 named personalities has no crowd in it, and the
+crowd is what makes the named ones legible.
+
+So `census.rs` reads the DISTRIBUTION, and the distribution turns out to say
+things nobody typed, because the placement rules were written against the
+film material's geography:
+
+  * ALL FIFTY-SIX UNRECORDED SHAPES ARE ON CYBERTRON AND EVERY ONE IS
+    CORRUPTED. Their shared hook is "a shape the coalition has no record of",
+    which is a provenance statement rather than a character note -- and
+    `substrate_sample` already says from the other side that Cybertron's
+    architecture predates its own record of inventing it.
+  * EVERYTHING ON EARTH COULD BE PARKED. All 46 are Coalition, all cars,
+    trucks, racers and helicopters. No grimorph, no spaceship. Concealment as
+    a demographic fact.
+  * TEN OF ELEVEN WORLDS ARE MONOCULTURES. Only the outer rim is contested,
+    which is why the boundary is where the story keeps happening.
+
+It reaches the map as `Supports` from ONE source -- a headcount is a real
+observation, unlike Pale Vector's testimony which only ever `Mentions`, but
+it is still one body of evidence. Everything it touches lands at UNKNOWN and
+waits for a dig, and a test asserts exactly that. Counting bots is
+suggestive; it is not evidence twice over.
+
+AND I ALMOST DESTROYED A MODULE DOING IT. I wrote the new file to
+`src/roster.rs` without checking, and there was already a 484-line
+`roster.rs` -- the chassis loader that decides which models fit in GPU
+memory. `git checkout` restored it and the census moved to `census.rs`. The
+compiler caught it immediately (`the name roster is defined multiple times`)
+because my own sed had added a duplicate `mod`, but had the name been free it
+would have compiled and I would have silently deleted a working system.
+Checking whether a filename is taken costs nothing.
+
+AND THE DRIVER MADE A POINT I HAD NOT PLANNED. Listing the frames that stand
+out, per world, prints:
+
+    earth        car_bruiser_aka_special_ops_racer
+    cybertron    none -- every frame there is one of a crowd
+    outer_rim    raidboss_judgementor_aka_large_walker_tank
+
+CYBERTRON HAS NO INDIVIDUALS. Fifty-six frames and not one of them is
+anybody. That is the same fact as "a shape the coalition has no record of",
+said a second way, and it is what the corrupted ARE -- a place where the
+distinction between one frame and another stopped mattering. I did not write
+that; the roster did, and the census only had to read it out.
+
+Also: `judgementor` on the outer rim is the warden whose docket
+(`undelivered_verdict`) is the raid finding that carries Layer 5. The census
+and the archaeology layer already share their best characters.
+
+989 passing, zero dead code in the module.
+
+KUIPER AS SPACE: THREE COUPLED CHANGES, NOT ONE. The asteroid field is still
+skydribble's demo map -- eighteen worlds of radius 7 to 38 with real gravity
+wells and a black hole every five minutes, and it is the best map in the set.
+"Make the planets bigger" turns out to touch three systems, and `space.rs` is
+the arithmetic for all of them before anything touches worldgen. Measure, then
+wire, which is the order that worked for the near plane.
+
+LOD HAS TO BE ANGULAR. A distance rule is right when everything is the same
+size, and these radii already span 5.4x. What decides detail is how big a body
+LOOKS -- `2·atan(r/d)` -- so a giant at four hundred metres and a dwarf at
+seventy-four deserve identical treatment, and a distance rule gives them
+opposite ones. Measured: THE TWO RULES DISAGREE ON 24 OF 27 CASES.
+
+GRAVITY DOES NOT SURVIVE A RESCALE, and this is the one that would have bitten
+silently. `world.rs` tunes wells as `(r/15)^1.3` clamped to 0.35..1.6, with a
+comment recording that the exponent was pulled down from 1.6 so the field
+"no longer swallows a car that drifts past". That is written around a fifteen
+metre reference:
+
+     scale      dwarf      giant  variety left
+        1x       0.37       1.60           98%
+        2x       0.91       1.60           55%
+        5x       1.60       1.60            0%
+
+Past about five times every well pins to the ceiling and the field has NO SIZE
+VARIATION LEFT -- the exact opposite of what making the planets bigger was
+for. The fix is not a new exponent: the reference radius has to scale with the
+field, because the tuning was always a statement about a world's size relative
+to its NEIGHBOURS. Scaled that way it is unchanged at 100x, and a test asserts
+both halves.
+
+AND A LONGER VIEW COSTS DEPTH, which `depth.rs` can price:
+
+     10x reach 2100m, far plane 5250m -> standard Z resolves 4.891 m
+                                         reversed Z resolves 0.00007 m
+
+At ten times, standard Z cannot resolve a METRE at the far side of the field.
+The fix already exists and is free.
+
+THE FLOOR IS ONE FIELD AND IT IS NOT ARITHMETIC. `MapStyle` KUIPER carries
+`amp: 0.15`, so an asteroid field is generated over a terrain grid like every
+grounded map -- worlds the size of buildings hanging above a hill. Removing it
+means `ground_h`, seating, spawn clearance and the camera's terrain clamp all
+have to agree there is nothing to stand on, and I have not done it. There is a
+test asserting the floor is STILL THERE, so removing it arrives with a failing
+test rather than quietly never happening.
+
+998 passing, zero dead code in the module.
+
+"CYBERTRON HAS NO INDIVIDUALS" WAS A DATA ARTIFACT AND I READ IT AS POETRY.
+Last entry celebrated the census finding fifty-six frames with nobody among
+them, and said the roster wrote it rather than me. It did not. The ids are
+`grimorph_part4` through `grimorph_part88` -- PIECES OF ONE EXPLODED MODEL,
+listed in `bots.json` as if each were a bot. Cybertron does not have
+fifty-six anonymous residents. It has none, and a parts bin standing where
+they should be.
+
+That is a better reason to design some than the one I invented, and the
+correction is pinned in both modules rather than quietly edited out.
+
+SO THE FRAMES ARE DESIGNED FROM THE PLANET, not from a mood board. Every
+Cybertronian design starts at "angular and mean"; this one starts from what
+this codebase already knows the world IS, and the answers fall out:
+
+  * `Material::Metal` at grip 1.00 -- `cling.rs` calls it "purpose-built
+    handholds everywhere" -- so WHEELS ARE A SPECIALISATION, not a default.
+    Anything can climb. A rolling frame is the constrained one, which is what
+    makes choosing wheels say something.
+  * No weather, so nothing needs sealing. Open frames, exposed mechanism.
+  * `Sky::Lattice` is a built ceiling, so flight is bounded and vertical
+    travel is climbing between levels. Hence a `Railed` gait, which no
+    Earth-derived roster would have.
+  * Nothing erodes it, so fine articulation survives forever.
+
+RESEARCH GAVE THE REGISTER AND THE FAILURE MODE. Cybertronian alt-modes are
+angular and unconstrained by Earth physics, and armoured openly because at
+home there is nobody to hide from. And the failure is named outright -- a bad
+one "looks like a mishmash of robot parts" -- so `alt_mode_is_coherent` is
+that warning turned on my own writing, and the driver flags any frame that
+trips it.
+
+Twelve frames, varied along the axes the world provides rather than colour
+and attitude: gait (all five used), height (2.4 m to 15 m), and purpose (no
+two built for the same job -- asserted). SPANWRIGHT is four hundred years
+into a span and has not been told the war happened. TOLL still sounds an hour
+nothing remembers the meaning of. SMALLHOURS is the only frame that can look
+a person in the eye, which nobody designed on purpose. OFFCUT assembled
+itself out of salvage -- the parts bin stood up, which is the artifact
+answering back.
+
+The claims are checked against the systems rather than asserted: a clinging
+frame holds a Cybertronian overhang more than twice as long as the same bulk
+without the gait, per `cling.rs`, and the smallest frame is measured against
+`scale::LADDER`'s human.
+
+AND A STANDING NOTE ON THE CATALOGUE. It contains many third-party rips of
+copyrighted characters (`imported_both_transformers_fall_of_cybertron_*` and
+friends). None is a reference for any of this -- the grammar is a set of
+physical consequences of a metal world with no weather, and there is a test
+asserting no frame borrows a name from that pile.
+
+1006 passing, zero dead code in the module.
+
+THE GRAVITY FORMULA HAS FOUR THINGS WRONG AND I HAD FOUND THE SMALLEST ONE.
+`space.rs` analysed the clamp on `node.g` and concluded the tuning does not
+survive a rescale. True, and the least of it. Measuring the field itself:
+
+  1. SURFACE PULL DOES NOT SCALE WITH THE WORLD. A 19:1 spread of radius
+     becomes a 4.6:1 spread of pull, because both clamps bite. A two metre
+     platform pulls 0.35 where a uniform sphere gives 0.13 -- 2.6x too hard,
+     which is the reported complaint exactly: at close range everything is a
+     planet. Constant density makes surface gravity PROPORTIONAL TO RADIUS,
+     which is what the `^1.3` exponent and its clamps are approximating badly.
+
+  2. THERE IS NO FALLOFF UNTIL TWICE THE SURFACE. `w` is pinned at 1 while
+     `d < 1.95r`, so the field is FLAT from the centre out past the surface
+     and then decays linearly. From a 38 m world the engine reads 1.60 at
+     both 38 m and 74 m; the truth falls 2.53 -> 0.67. Real gravity peaks at
+     the surface and goes as 1/d² above it, and falls LINEARLY TO ZERO below
+     it, which the engine also does not do.
+
+  3. THE VOID PULLS. Beyond every well the field relaxes to 1.0 toward world
+     -Y. On a grounded map that is correct and deliberate -- it is the planet
+     you are standing on, and the nodes are local overrides. In kuiper it is
+     an invisible floor, which the map also literally has.
+
+  4. AND IT ONLY EVER LOOKS AT THE NEAREST NODE. Between two 20 m worlds 240 m
+     apart the engine reports 1.000; the real sum is 0.074 and the two pull
+     opposite ways. A field of planets should have Lagrange points and this
+     one cannot.
+
+`gravity.rs` carries the correct model -- shell theorem, both regimes -- the
+engine's model beside it, and the crossover where they agree. NOTHING IS
+PATCHED. `world.rs`'s constants are load-bearing for eighteen grounded maps
+where the flat near field is what makes a carved deck driveable, and the fix
+is a per-map ambient setting plus a real falloff. That is a decision, not a
+better exponent.
+
+1015 passing, zero dead code in the module.
+
+A VOXEL GAN'S CRITICS, AND A DECODER BUG FOUND ON THE WAY IN.
+`apps/beatspace` has a working DCGAN over mel spectrograms -- generator and
+discriminator hand-built from `Var`s so checkpointing keeps BatchNorm's
+running statistics. That half ports to 3D directly and is not the interesting
+part. A voxel GAN on its own MAKES BLOBS: a discriminator learns "does this
+look like the corpus", the corpus is a thousand vehicles, and the cheapest way
+to satisfy it is a vehicle-shaped lump. Nothing in that loss knows a frame
+needs two arms.
+
+THE CORPUS DECODER WAS WRONG. `.svxr` representatives are seven bytes per
+voxel -- three u16 coordinates and a palette index -- and
+`tools/solve_placements.py` read them at `off + i * 4` while unpacking six
+bytes, so every cell after the first came from a sliding window across two
+records. On `imported_grimorph_part4`: stride 4 puts 191 of 647 voxels inside
+the 0..32 grid, stride 7 puts all 647 inside it, and forty random
+representatives are all exactly `nvox * 7` bytes. Anything ever solved against
+representatives rather than originals was aligning to a cloud two thirds of
+which was out of bounds. Fixed there, with an assert, and the Rust decoder
+carries the same note.
+
+MY SKELETON CRITIC WAS WRONG TOO, AND THE DATA SAID SO. I built one that
+splits a volume into components and asks whether they form a body -- torso,
+head above it, limbs in pairs -- and IT SCORED REAL MODELS BELOW NOISE, 0.413
+against 0.494. The reason is in the corpus, not the weights: a representative
+is ONE PART, normalised to its own grid with its own `lo` and `step`, so a
+frame is many files with no shared origin. Placement was normalised away. A
+critic that needs relative position cannot run on this data at all, and tuning
+it would have been fitting weights to a false premise. The reference does
+exist -- `tools/mounts.json`, positions "in the vehicle pose's own space" --
+and wiring it is a separate job.
+
+WHAT THE CORPUS DOES SUPPORT WAS ALREADY THERE. `tools/part-labels.json` holds
+FOURTEEN CLUSTERS measured across the whole library, with shape features and
+the member names that fell into each: `rib, link, face` (396 parts, paired),
+`muscle, piston, shin` (530, paired), `pelvis, spine, clav` (95, paired). That
+is the cross-bot part vocabulary, derived rather than authored, and it knows
+about MIRRORING -- the one piece of skeleton information that survived
+normalisation. A generated part is plausible if it lands near one of those.
+
+AND THE HONEST RESULT IS A WEAK ONE. Real parts beat a density-matched blob by
+about five percent, 0.81 against 0.76. Not the twenty-five I first asserted,
+and the test now pins BOTH ENDS -- it fails if the margin vanishes and it
+fails if it exceeds 1.5x, which would mean this note is out of date. Coarse
+shape features are not very discriminative because the library's own clusters
+are broad enough to admit a blob. That is the argument FOR the learned half:
+the discriminator does the heavy lifting, and these two exist to stop it
+settling for a lump.
+
+NOT BUILT: the training loop. It needs GPU hours this environment does not
+have, and an untrainable thousand lines is worse than none.
+
+1022 passing, zero dead code in the module.
+
+THE MAPS ARE DELETABLE, WHICH UNBLOCKS THE GRAVITY FIX I HAD JUST RULED OUT.
+`gravity.rs` ended on "nothing is patched -- `world.rs`'s constants are
+load-bearing for eighteen grounded maps". True, and about a premise that
+turned out to be negotiable. Recorded rather than edited out, because it is a
+thing worth noticing about my own caution: I treated an existing constraint as
+a fixed one.
+
+THE CAMPAIGN STACK IS ALREADY INDEPENDENT, and not loosely -- it does not
+import `world.rs` at all. `terrain` imports nothing; `survival` imports `sun`;
+`procgen` imports foothold/raid/sun/survival. `procgen::World` is a DIFFERENT
+TYPE from `world::World` sharing no code, `Weather` lives in `survival.rs`,
+and `Material` does not appear in `world.rs` once. So the three things worth
+keeping -- weather, terrain building, material fidelity -- are already outside
+the thing being deleted.
+
+WHAT `world.rs` IS: 4,835 lines, of which 44% (2,156 lines, the focal arms at
+813-2969) is per-map content. The rest is skydribble SANDBOX -- SDF, shapes,
+portals, tiles, currents, the ball and goal machinery. Eight modules import
+it: six renderer, one headless driver, one bridge. None is campaign logic.
+
+AND `sim.rs`'s 115 REFERENCES ARE THE EASY CASE. I flagged that count as
+deciding whether the job is mechanical or a rewrite. It is the headless bot-AI
+harness behind `--sim` -- "real physics at 120 Hz, no window, no GPU, no
+audio" -- so it is a DRIVER and needs one world to run in, not eighteen.
+
+THE TUBES ARE INVERTED, and that is most of why they never felt right. Spin
+gravity is `a = ω²r`: ZERO ON THE AXIS, maximum at the wall. The engine
+computes `0.50 + 0.95·(1 - d/(r/1.45))` -- maximum on the axis, weakest at the
+wall. The comment history records both symptoms and neither diagnosis:
+
+    "a car flung into a wide pipe simply flew up the middle at constant
+     speed, never touching anything"
+
+That is CORRECT. You are weightless on the axis of a spinning habitat. It was
+read as a failure, the fix made the axis strongest, and then "at 1.7x it
+pinned" -- of course it did, it was flinging you outward hardest from the one
+place that should be still. `true_tube` is the right profile and it is the
+same shape as a sphere's interior, for the same reason: nothing outside your
+radius contributes.
+
+They are also 147 mentions from line 25 to line 4635, which is not a system
+but a thread woven through everything. A rewrite should start from the
+corrected profile and from putting the tube IN ONE PLACE.
+
+`docs/UNWIRING.md` has the order of work.
+
+1025 passing.
+
+THE BENCH — authoring frames in the game rather than in a second GUI.
+`[` and `]` already cycle the chassis, so the authoring keys sit beside them:
+`0` rerolls, `s` saves. Both were free — checked in `main.rs`, not assumed.
+`BLACKSTAR_CHECKPOINT_FILE` points at a trained generator.
+
+A CHARACTER IS A SEED, NOT A MESH, and everything follows from that. Stored as
+voxels, sharing one means sending a model file; stored as a seed it is
+`bsc1-3034b47aacce8c59-lib-spanwright` — short enough to paste into a message,
+and rerolling costs nothing.
+
+The price is that a seed only means something against the checkpoint that made
+it. So the code carries the checkpoint's fingerprint, and importing against a
+different one is REPORTED RATHER THAN RENDERED:
+
+    slot 0, but it needs checkpoint m96cf0626
+    and this one is m45ea62ca. NOT rendered
+
+A shared character that quietly comes out different is worse than one that
+refuses. It is still KEPT in the slot, though — you do not lose a friend's
+character because you have not downloaded a file yet.
+
+IT HAS TO WORK WITH NO CHECKPOINT, because most people will not have one and
+the feature cannot be a dead button for them. With none, the roll comes from
+the parts library: same keys, same slots, same export, a narrower space. That
+is not a consolation prize — `--voxel` measured the hand-built critics
+separating real parts from noise by five percent, so a trained generator has
+to be genuinely good before it beats picking real parts, and until then THE
+LIBRARY IS THE BETTER GENERATOR.
+
+SAVING REFUSES WHEN FULL rather than overwriting. Losing an authored character
+to a keypress is the one failure this feature cannot afford, and "the bench is
+full" is something a player can act on. Two tests: one fills every slot and
+asserts the ninth save returns None with the count unchanged, one clears a
+slot and saves into it.
+
+The fingerprint hashes the PATH, not the file. Reading a multi-gigabyte
+safetensors at startup to decide whether a share code matches is not a trade
+worth making; a path collision gives one wrong verdict, hashing the file makes
+every launch slower for everyone. Written down where the decision is, because
+it is the kind of thing that looks like an oversight later.
+
+1037 passing, zero dead code in the module.
+
+TRAINWATCH — I built the consumer and no window into the thing producing it.
+`bench.rs` takes a checkpoint; nothing watched the run that makes one.
+
+DELIBERATELY NOT A SECOND TRAINPAGE. `beatspace/src/trainpage.rs` already
+models the loss curve, the trend, the stall check and the log ring, and those
+are domain-free. What it cannot have is the half that matters here.
+
+LOSS CANNOT SEE MODE COLLAPSE. A GAN can sit at a perfectly healthy loss while
+emitting the same frame every time, and that is invisible in `d_loss` and
+`g_loss` — it is only visible in the SAMPLES. For voxels there is a way to see
+it without eyes: `voxel::CLUSTERS` is fourteen part classes measured off the
+real library, so a healthy generator lands across several and a collapsed one
+lands in one. The driver runs two watches with LITERALLY IDENTICAL loss curves
+and reports "learning" for one and "MODE COLLAPSE" for the other.
+
+THE FROZEN DISCRIMINATOR ALREADY HAD A NUMBER and I only had to read it.
+`beatspace/src/model.rs` records the failure from having had it: "d_loss
+pinned at 2ln2, g_loss at ln2, flat for forty points, after a vertical fall. A
+frozen input-independent D scores exactly there." That is detectable, and
+detecting it beats plotting it. `Health::FrozenDiscriminator` checks both
+constants and the flatness, and its message says WHY — no unit below the
+gate's threshold can receive a gradient — because the fix is to restart from
+before the fall, not to tune anything.
+
+ORDER MATTERS AND IS TESTED. A dead gate also looks like mode collapse and
+like a stall. Reporting "mode collapse" there sends somebody to tune diversity
+when the discriminator has stopped depending on its input, so frozen is
+checked first and a test asserts the diagnosis is not shadowed.
+
+COVERAGE IS THE ANSWER TO "WHAT CAN IT MAKE YET", and it comes free: the
+critics that shape the reward are the readout, so `observe` is the only bridge
+and nothing else needs instrumenting. On real volumes it grades cleanly —
+dust 0.00, forming 0.20, solid 0.61 — and dust reading zero is a diagnosis
+rather than a hole, since a generator emitting specks forms nothing big enough
+to judge.
+
+1050 passing, zero dead code in the module.
+
+A FAMILY PER PART CLASS, AND AN ASSEMBLER WITH ITS OWN SCORE. One GAN making
+whole bots has to learn anatomy and geometry at once, which is exactly what
+sank the skeleton critic: a representative carries no part IDENTITY and no
+placement, so there was nothing to check anatomy against. Fourteen
+generators, one per measured class, gives every part an identity — and then
+the pairing is a separate problem with a separate score, which is the half
+that was impossible before.
+
+THE ENGINEERING LIMIT IS THE DATA, MEASURED. `part-labels.json`'s classes run
+49 to 836 examples. At a floor of 200, TEN OF FOURTEEN can train their own
+generator and the rest sample the library — the same fallback `--bench` uses,
+because forty-nine examples is not a training set. There is also exactly ONE
+leg family against six arm families, which is a real gap in the corpus rather
+than in the design.
+
+REGIONS CAME FROM THE MEASURED `up` BIAS AND THAT WAS WRONG. I preferred it
+because it is a measurement and the member names looked authored, and argued
+the point in a test. The names are not authored -- they are what the harvester
+labelled parts as against the source skeletons, and a 27-word vocabulary with
+explicit left/right (`thighl`, `clavr`, `shinl`) carries body-region
+information a mean vertical bias cannot. The two disagree badly: `up` put
+cluster 0 in the head and its members are 42% torso and 0% head; it put
+cluster 8 in the head and that one is 90% torso.
+
+AND A DISTRIBUTION, NOT A HOME. Leg parts are spread across NINE OF FOURTEEN
+classes -- 35% of one, 19% of another, 12% of a third -- because the clusters
+are SHAPE families and a thigh and a clavicle look alike. Collapsing that to
+"cluster 12 is the leg one" throws away most of what the data knows, and the
+apparent "only one leg family" gap was an artifact of my own projection rather
+than a hole in the corpus.
+
+THE PENALTY IS THEN PRICED BY RARITY, and normalised against the BEST
+AVAILABLE family rather than against perfection. That normaliser is necessary,
+not a refinement: no cluster is predominantly an arm -- the best is 35% -- so
+pricing against 1.0 charges every arm in the library for being an arm, and a
+plain frame came out at 0.24 with a penalty of 0.61. The question a soft bound
+should ask is "how much worse than the best available choice".
+
+HARD AND SOFT, AND THE LINE IS THE DESIGN:
+
+  HARD where the assembly cannot exist or cannot be JUDGED. No torso is
+  nothing to attach to. Two heads is a slot filled twice. A part outweighing
+  its frame is a physical claim. One arm and no other side is hard for a
+  subtler reason -- there is no second side, so the symmetry checks have
+  nothing to compare against.
+
+  SOFT where it is unusual and might be excellent. A leg-class part used as an
+  arm, mismatched pairs, a pair-family part used alone. Every one is
+  somebody's favourite bot.
+
+    a plain frame                0.449
+    legs used as arms            0.287
+    mismatched arms              0.212
+    no torso                     REJECTED
+    one arm                      REJECTED
+    a head heavier than the body REJECTED
+
+AND THE SOFT BOUND IS OUT-ARGUABLE, which is the point. Legs-as-arms loses to
+a mediocre plain frame at part quality 0.55 and 0.75, and WINS at 0.95. The
+legs themselves now cost nothing, because cluster 12 IS the best leg family --
+and the head is the honest weak spot, since no family is head-ish at all. Two
+tests pin the calibration from both ends: a penalty that changes nothing is
+decoration, and one that always decides is a hard bound wearing a discount.
+No quality rescues a torso-less pile.
+
+1060 passing, zero dead code in the module.
+
+`guts` IS 39% OF THE LIBRARY AND I CALLED IT A TORSO. Chasing the "no family
+is head-ish" finding one step further turned up a third mapping error, and the
+largest: 1,733 of the library's 4,455 parts are named `guts`, and mapping that
+one word to Torso made almost every cluster read as "mostly torso". Which is
+why the pricing came out nonsensical and needed a normaliser to look sane —
+the normaliser was compensating for a bad input.
+
+THE TREE ALREADY HAD THE CLASSIFICATION AND I INVENTED MY OWN INSTEAD OF
+LOOKING. `tools/find-mounts.py` carries an argued INTERNAL list, written after
+a search for gun barrels kept returning struts:
+
+    INTERNAL = ("guts", "bone", "muscle", "cable", "link", "piston",
+                "vertebra", "rib", "coil", "core", "keel", "greeble",
+                "spine", "gyro")
+
+Using it changes the answer completely. FOUR OF THE FOURTEEN FAMILIES ARE
+94-99% INTERIOR -- they generate nothing but guts. Only a handful carry real
+anatomy.
+
+WHICH IS A BETTER ARCHITECTURE THAN THE ONE I PROPOSED, and it came out of the
+counts rather than out of me: the family is not fourteen equal generators, it
+is a few anatomical ones plus an INTERIOR-FILLER generator.
+
+AND THE STING:
+
+    family  7 is  82% anatomy and has   95 parts — TOO SMALL TO TRAIN
+    family 11 is  70% anatomy and has  122 parts — TOO SMALL TO TRAIN
+    family  0 is  57% anatomy and has  356 parts — trains
+
+THE TWO MOST ANATOMICAL FAMILIES ARE THE TWO SMALLEST, both under the floor,
+and the classes that CAN train are mostly the ones full of guts. That is the
+real constraint on a per-part family, and it is a corpus problem rather than a
+design one -- which is worth knowing before spending GPU hours on it.
+
+I also deleted `home_region`. It returned the mix's argmax, and once `guts`
+was classified correctly that answer is "trim" for twelve of fourteen: a
+column saying the same thing twelve times is noise with a heading. The driver
+prints anatomical SHARE and best-region instead. Kept as a note, because the
+argmax is the obvious thing to reach for and is wrong here for a reason
+specific to this corpus.
+
+1062 passing, zero dead code in the module.
+
+AND THE CORPUS CONSTRAINT DISSOLVES, which is better than reporting it. Last
+entry ended on "the two most anatomical families are the two smallest and both
+are under the floor — a corpus problem rather than a design one". Two levers
+turn out to fix it, and only the second one works.
+
+MIRRORING IS FREE AND EXACT. Eleven of the fourteen classes have
+`mirrored >= 0.9`: their parts exist as a left and a right, so reflecting a
+left thigh does not APPROXIMATE a right thigh, it produces one, and that part
+is genuinely in the library's distribution. Free data rather than a
+regularisation trick.
+
+IT IS ALSO NOT ENOUGH. Family 7 goes 95 to 190 against a floor of 200 — short
+by ten, of a number I invented — and family 11, the other anatomical one, does
+not mirror at all. A test pins both, so if the corpus or the floor moves it
+says so.
+
+POOLING BY ROLE IS THE ANSWER. A cluster is a SHAPE partition and training
+wants enough examples of a FUNCTIONAL thing; there is no reason an arm
+generator should care that one arm-ish cluster sits slightly apart from
+another. Pooled and mirrored, every role clears the floor:
+
+        role     pooled    trains?
+        head        325        yes
+       torso        383        yes
+         arm        690        yes
+         leg        762        yes
+        trim       8165        yes
+
+Head was the worst case at 163 and more than doubles.
+
+SO THE ARCHITECTURE IS NOT FOURTEEN SHAPE GENERATORS AND IT IS NOT FOUR. It is
+FIVE ROLE GENERATORS — head, torso, arm, leg, interior — and the shape
+clusters are how you SAMPLE within a role rather than what you train. That is
+a smaller, better-fed family than the one proposed, and every step of the
+argument came out of counting rather than out of me.
+
+1064 passing, zero dead code in the module.
+
+THE BALL-CHASER AS A MISSILE. `bots.rs` steers three hundred cars at a ball on
+CPU at frame rate and the structure ports directly — a target with a velocity,
+a chaser with a turn limit, a uniform grid so a pile stays a pile. One thing
+has to change and it is the steering law.
+
+Ballchase aims at `ball.pos + ball.vel * 0.25` and drives at it. That is PURE
+PURSUIT WITH A FIXED LEAD, and for a car chasing a ball it is right: the lead
+is short because the car is slow, and constantly re-aiming looks eager, which
+that module's doc calls "tuned for comedy". For a missile it tail-chases.
+
+PROPORTIONAL NAVIGATION turns in proportion to how fast the LINE OF SIGHT is
+rotating rather than to how far off-axis the target is. If the bearing is not
+changing you are already on a collision course and should not turn AT ALL,
+which is the exact opposite of pure pursuit and the whole reason it wins.
+
+    crossing       pure pursuit       proportional
+          0°    hit 7.49s 2997m    hit 7.49s 2997m
+         30°       MISS by 82 m    hit 7.06s 2823m
+         90°      MISS by 491 m    hit 4.47s 1787m
+        180°    hit 2.50s 1000m    hit 2.50s 1000m
+                          2 of 7            7 of 7
+
+Pure pursuit only manages the two shots where there is no crossing to lead.
+And the agility table is the practical half: at a 90° crossing PN hits at
+150 m/s² where pursuit still misses by 112 m at 250. A CHEAPER MISSILE HITS
+WITH IT, which is what matters if there are going to be hundreds of them the
+way there are hundreds of cars.
+
+TWO BUGS OF MINE, AND THE SECOND IS THE INSTRUCTIVE ONE.
+
+I integrated steering as `vel += a*dt` and renormalised, which is fine while
+`a·dt` is small against the speed and nonsense when it is not: at a turn limit
+of 100,000 the added vector dwarfs the velocity, so renormalising left the
+missile flying along its own lateral acceleration. PURE PURSUIT MISSED WITH
+INFINITE AGILITY, which cannot happen and was the tell. Lateral acceleration
+is a turn rate, `ω = a/v`, and rotating by `ω·dt` is exact at any magnitude.
+
+Then both laws still missed by a hundred metres and I nearly reported that as
+a finding. The DEFAULT ENGAGEMENT WAS GEOMETRICALLY IMPOSSIBLE: launching from
+300 m at 250 m/s is 1.2 seconds of flight, in which a 90 m/s² missile turns
+24.8° against 25.6° of lead required. Nothing could have hit it. Checked with
+five lines of trigonometry rather than by tuning until the numbers looked
+better, which is what I would have done an hour earlier in this session.
+
+1072 passing, zero dead code in the module.
+
+AND A SALVO HAS THE OPPOSITE PROBLEM TO A CROWD. `bots.rs` earned its
+reputation at three hundred cars by keeping them APART — a uniform grid so "a
+300-spartan pile stays a pile instead of a singularity". Missiles inherit that
+and get a worse version of it.
+
+PROPORTIONAL NAVIGATION IS DETERMINISTIC. Same target, same speed, same turn
+limit, same solution — so a salvo launched together converges on one point and
+arrives as a single warhead. Measured: twelve missiles land within 1.2 m of
+each other.
+
+A SEPARATION GRID CANNOT FIX THAT, which is the interesting part. By the time
+they are close enough to push apart the shot is over, and pushing fights the
+guidance rather than shaping it. The fix is upstream — give each missile its
+own AIM POINT around the target so they are solving different problems from
+launch:
+
+    aim spread  hits/12  impact spread
+            0m       12           1.2m
+           10m       12           8.9m
+           25m       12          23.0m
+           60m       12          57.0m
+
+The spread costs nothing: twelve hits at every setting, and a test asserts
+spreading cannot halve the hit rate — a spread that does that is not a spread,
+it is a miss distribution.
+
+AND THE CPU CLAIM HOLDS. 300 intercepts in 80 ms, all 300 hitting. PN is a
+cross product and a dot product per missile per tick, which is far less than
+the car physics the ball-chaser was already running at that count.
+
+1077 passing, zero dead code in the module.
+
+MANY LIMBS, A TIGHTER CLAMP, AND A SECOND AXIS TO EARN A PLACE ON.
+
+The old limb rule was that a limb needs its opposite side, which forbade
+everything interesting — three arms, six legs, a radial thing with no sides at
+all. Many are allowed now and the clamp got tighter in exchange: a ceiling,
+and an evenness rule on SIDED limbs only, since an odd number of centre-mounted
+ones is a radial body rather than a missing part.
+
+BUT THE REAL PROBLEM WAS THAT SCORING ON CORPUS MATCH ALONE IS A MACHINE FOR
+PRODUCING THE AVERAGE BOT. Anything novel is by construction less like the
+library, so that term can only ever punish it. A freak needs somewhere else to
+earn its place, and physics is the honest one — a six-legged thing matches
+nothing and stands up better than a biped, which is a real advantage the
+matching score cannot see.
+
+               frame   support    margin      score   topple @1g
+               biped      1.00      0.79      0.513        1.29s
+     top-heavy biped      1.00      0.59      0.467        1.32s
+         radial quad      1.00      1.56      0.775        1.56s
+      radial hexapod      1.00      2.11      0.775        1.80s
+ four legs, one side      0.00      0.70      0.589        1.04s
+
+The hexapod has no head, no arms and six legs from one family, and it BEATS a
+textbook biped. Four legs clumped on one side score 0.00 support, because
+evenness is measured as the length of the mean bearing rather than by counting
+feet.
+
+GRAVITY FEEDBACK makes the same frame a different design per world. An
+inverted pendulum falls in about `sqrt(h/g)`, so a top-heavy build has 1.32 s
+on Cybertron and 2.15 s on Mars — unusable at home and fine on the rim.
+
+A CHECK WRITTEN FOR THE OLD RULE REINTRODUCED THE EXACT BIAS. "A pair family
+used alone" fired on any CENTRE-mounted limb, so the radial hexapod paid it
+six times — 0.72 of penalty — and scored 0.055 against the top-heavy biped's
+0.467. Alone has to mean one of its kind on the whole frame.
+
+AND MAX_LIMBS IS NOT WHAT STOPS CENTIPEDES. Measured: a radial quad and a
+radial hexapod score IDENTICALLY, because stability saturates at a margin of
+1.5 and four evenly spread legs already clear it. Saturation removes the
+incentive; the clamp is a backstop against absurdity. Pinned in a test,
+because two mechanisms that look like they do the same job invite somebody to
+delete the one that is carrying it.
+
+1083 passing, zero dead code in the module.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

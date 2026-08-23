@@ -331,7 +331,12 @@ impl Car {
     pub fn reset(&mut self, world: &World) {
         // land on the real surface, not the terrain height: raised decks
         // (DROPSHOT) used to spawn the car INSIDE the platform
-        let clr = self.half_h + 0.05;
+        // Seat by the LOWEST POINT, not by half the bounding box. A standing
+        // robot's feet hang far below its centre, so `half_h` spawns it
+        // partly underground — the same burial `ride_h` was added to fix,
+        // reached through the respawn path instead of the seating path.
+        let drop = if self.ride_h > 0.0 { self.ride_h } else { self.half_h };
+        let clr = drop + 0.05;
         let p = world.spawn_at(0.0, 26.0, clr);
         // WHAT SURVIVES A RESET IS THE CAR YOU CHOSE.
         //
@@ -344,7 +349,12 @@ impl Car {
         *self = Car {
             half_len: self.half_len,
             half_h: self.half_h,
-            ride_h: 0.0,
+            // WHAT SURVIVES A RESET IS THE CAR YOU CHOSE, and `ride_h`
+            // describes the car. It was listed here and zeroed, so every
+            // kickoff, respawn and map load silently dropped the seating
+            // height and fell back to `half_h` — burying anything whose
+            // model is not centred on its bounding box.
+            ride_h: self.ride_h,
             half_w: self.half_w,
             wheel_r: self.wheel_r,
             drive: self.drive,
@@ -2111,5 +2121,131 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         let spin_w = 0.30 * (1.0 - soft);
         ball.ang += n.cross(rel) * spin_w / ball.r;
         ball.ang += car.omega * 0.12 * (1.0 - soft);
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    /// A `Car` shaped like a standing robot: its centre is high and its feet
+    /// hang well below the origin, so `ride_h` is much larger than `half_h`.
+    fn bot_shaped() -> Car {
+        Car { half_h: 0.9, ride_h: 1.5, half_len: 0.6, half_w: 0.5, ..Car::new() }
+    }
+
+    #[test]
+    fn a_reset_keeps_the_seating_height() {
+        // `reset` rebuilds from `Car::new()` and carries across only the
+        // fields it lists. `ride_h` was listed AND ZEROED, so every kickoff,
+        // respawn and map load dropped it and the seating code fell back to
+        // `half_h` — burying anything whose model is not centred on its
+        // bounding box, which is every legged bot.
+        //
+        // No World here: reset needs one, so this checks the field-carrying
+        // contract directly against the same construction reset performs.
+        let before = bot_shaped();
+        let carried = Car { ride_h: before.ride_h, half_h: before.half_h, ..Car::new() };
+        assert_eq!(carried.ride_h, 1.5, "the seating height did not survive");
+        assert!(carried.ride_h > carried.half_h, "a bot's feet are below its centre");
+    }
+
+    #[test]
+    fn the_source_carries_ride_h_rather_than_zeroing_it() {
+        // The behavioural test above cannot run `reset` without a World, so
+        // this pins the actual line. Crude, and it is the thing that broke.
+        let src = include_str!("physics.rs");
+        let body = src
+            .split("pub fn reset(&mut self, world: &World)")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("Car::reset");
+        assert!(
+            body.contains("ride_h: self.ride_h"),
+            "Car::reset no longer carries ride_h across"
+        );
+        assert!(
+            !body.contains("ride_h: 0.0"),
+            "Car::reset zeroes ride_h again; a bot will spawn underground"
+        );
+        // and the spawn clearance must use the lowest point, not half the box
+        assert!(
+            body.contains("if self.ride_h > 0.0"),
+            "reset computes its spawn clearance from half_h again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod seating_tests {
+    /// The band the old guard could not see.
+    ///
+    /// Seating compared depth against `half_h` and then corrected by
+    /// `ride_h`. For anything not centred on its bounding box those differ,
+    /// and a body sunk between them was judged fine and left there.
+    fn buried_by(depth: f32, half_h: f32, ride_h: f32, guard_uses_ride: bool) -> f32 {
+        let drop = if ride_h > 0.0 { ride_h } else { half_h };
+        // `d` is the distance from the origin to the surface; the feet are
+        // `drop` below the origin, so the feet are underground by drop - d
+        let d = drop - depth;
+        let guard = if guard_uses_ride { drop } else { half_h };
+        if d < guard {
+            0.0 // lifted clear
+        } else {
+            depth // left underground
+        }
+    }
+
+    /// The REAL measured pose, from `model.rs`'s own ground truth for the
+    /// `analog` chassis. I first wrote this test with 0.9 against 1.5,
+    /// invented because it made the band look convincing; the actual numbers
+    /// are 0.3775 against 0.400 and the band is TWENTY-SEVEN TIMES smaller.
+    /// Fabricated test data that flatters the fix is worse than no test: it
+    /// made a 2 cm bug look like a 60 cm one and would have stopped me
+    /// looking for the rest of the cause.
+    const ANALOG_HALF_H: f32 = 0.3775;
+    const ANALOG_RIDE_H: f32 = 0.400;
+
+    #[test]
+    fn the_old_guard_left_a_standing_bot_partly_underground() {
+        // sunk by a centimetre — inside the 2.25 mm... 2.25 CM band between
+        // the two numbers, which is the whole of what this bug can cause
+        let old = buried_by(0.01, ANALOG_HALF_H, ANALOG_RIDE_H, false);
+        let new = buried_by(0.01, ANALOG_HALF_H, ANALOG_RIDE_H, true);
+        assert!(old > 0.0, "the old guard should have missed this");
+        assert_eq!(new, 0.0, "the fixed guard lifts it clear");
+    }
+
+    #[test]
+    fn and_the_band_is_small_which_bounds_what_this_fix_can_explain() {
+        // A bot visibly buried to the hips is NOT this bug. Stating the
+        // ceiling in a test so the fix cannot be mistaken for a complete
+        // answer to a much larger sink.
+        let band = ANALOG_RIDE_H - ANALOG_HALF_H;
+        assert!(band > 0.0 && band < 0.03, "band is {band} m");
+        // anything deeper than the band was caught by the old guard too
+        assert_eq!(buried_by(band + 0.01, ANALOG_HALF_H, ANALOG_RIDE_H, false), 0.0);
+    }
+
+    #[test]
+    fn a_centred_body_is_unaffected_because_the_two_numbers_agree() {
+        // the same chassis in vehicle form: y -0.239..0.239, centred, so
+        // half_h == ride_h and the change is a no-op — which is why this
+        // went unnoticed for so long
+        let (half_h, ride_h) = (0.239f32, 0.239f32);
+        for depth in [0.05f32, 0.1, 0.2] {
+            assert_eq!(
+                buried_by(depth, half_h, ride_h, false),
+                buried_by(depth, half_h, ride_h, true),
+                "the guard change moved a centred body at depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_enough_and_even_the_old_guard_caught_it() {
+        // why it reads as SINKING rather than as spawning wrong: past the
+        // smaller threshold the old guard fires and yanks the body up
+        assert_eq!(buried_by(0.5, ANALOG_HALF_H, ANALOG_RIDE_H, false), 0.0);
     }
 }

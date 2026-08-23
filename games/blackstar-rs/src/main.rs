@@ -2,11 +2,15 @@
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
 mod anim;
+mod approach;
 mod actuator;
 mod airlock;
+mod amalgam;
 mod analog;
 mod ballistics;
+mod bench;
 mod bigbody;
+mod board;
 mod botpack;
 mod bots;
 mod roster;
@@ -14,6 +18,7 @@ mod sections;
 mod camera;
 mod chassis_traits;
 mod chord;
+mod cling;
 mod clinch;
 mod combine;
 mod config;
@@ -29,22 +34,36 @@ mod fx;
 mod gamepad;
 mod gyro;
 mod content;
+mod crawler;
+mod cybertronian;
+mod curriculum;
 mod corruption;
 mod cyber;
 mod custom;
 mod partcars;
 mod partdata;
+mod palevector;
 mod patrol;
+mod perception;
 mod trials;
+mod trainwatch;
+mod tuner;
+mod tuning;
 mod replay;
 mod academy;
 mod stream;
+mod hazard;
+mod hive;
 mod hud;
 mod hotbar;
 mod hydro;
 mod idle;
 mod input;
-mod intel;
+mod archive;
+mod assembler;
+mod archsim;
+mod orbits;
+mod provenance;
 mod joints;
 mod lift;
 mod loadout;
@@ -55,23 +74,30 @@ mod meshgen;
 mod model;
 mod net;
 mod physics;
+mod powers;
 mod platform;
 mod posture;
 mod procars;
 mod procgen;
 mod pulse;
 mod compact;
+mod brain;
 mod campaign;
+mod census;
 mod campsim;
 mod chi;
+mod codex;
 mod clones;
 mod exoworlds;
 mod deck;
+mod depth;
 mod gear;
 mod gearsim;
 mod menufx;
+mod mapsim;
 mod menusim;
 mod stations;
+mod stealth;
 mod vault;
 mod energon;
 mod finale;
@@ -80,6 +106,9 @@ mod orient;
 mod partdetect;
 mod loadbearing;
 mod grime;
+mod gravity;
+mod groundside;
+mod guidance;
 mod orientsim;
 mod partsim;
 mod skirmish;
@@ -91,21 +120,26 @@ mod raidrun;
 mod raidsim;
 mod relay;
 mod render;
+mod rip;
 mod style;
 mod subsea;
 mod sun;
 mod survival;
 mod save;
+mod scale;
 mod ship;
 mod sim;
 mod sound;
+mod space;
 mod terrain;
 mod touch;
+mod tradecraft;
 mod ui;
 mod weapons;
 mod xform;
 mod voyage;
 mod watch;
+mod voxel;
 mod world;
 
 use std::collections::{HashMap, HashSet};
@@ -179,6 +213,7 @@ enum Row {
 fn nav_here(menu: u8) -> usize {
     match menu {
         5 => 4,       // VIDEO
+        8 => 1,       // STORY lives under SETUP
         3 | 4 | 7 => 1, // CAR SETUP / FLIPS / MOTION live under SETUP
         _ => 1,
     }
@@ -237,6 +272,7 @@ pub fn sphere_visible(planes: &[[f32; 4]; 6], c: Vec3, r: f32) -> bool {
 
 fn menu_title(menu: u8) -> &'static str {
     match menu {
+        8 => "STORY",
         7 => "MOTION / GYRO",
         6 => "GAME MODES",
         1 => "CAMERA",
@@ -352,6 +388,22 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("EVERY BOT IS IN BALLCHASE MODE. GOOD LUCK.", Header),
             ("BACK", Back),
         ],
+        8 => vec![
+            // THE DIALS THE FICTION EXPOSES. `--tune` has carried these since
+            // they landed and the menu never did, so a knob documented as
+            // "a main-menu dial for how much history the game hands you
+            // already believing" was reachable only by hand-editing a save.
+            // Describing something as a menu setting does not put it in a menu.
+            ("WHAT YOU ALREADY BELIEVE", Header),
+            ("MYSTERY ANCHOR", Slider { get: |c| c.story.anchor, set: |c, v| c.story.anchor = v, min: 0.0, max: 1.0, step: 0.05, def: 0.45, fmt: 0 }),
+            ("CAMPAIGN (0 PRESENT / 1 ARCHIVE)", Slider { get: |c| c.story.era, set: |c, v| c.story.era = v, min: 0.0, max: 1.0, step: 1.0, def: 0.0, fmt: 1 }),
+            ("HOW THE MAP FIRMS UP", Header),
+            ("SOURCES FOR 'POSSIBLE'", Slider { get: |c| c.story.possible_at, set: |c, v| c.story.possible_at = v, min: 1.0, max: 8.0, step: 1.0, def: 2.0, fmt: 1 }),
+            ("SOURCES FOR 'HIGH CONFIDENCE'", Slider { get: |c| c.story.high_at, set: |c, v| c.story.high_at = v, min: 2.0, max: 12.0, step: 1.0, def: 3.0, fmt: 1 }),
+            ("WHAT YOU CAN CARRY", Header),
+            ("CASE CAPACITY", Slider { get: |c| c.story.case_cap, set: |c, v| c.story.case_cap = v, min: 1.0, max: 24.0, step: 1.0, def: 6.0, fmt: 1 }),
+            ("BACK", Back),
+        ],
         7 => vec![
             ("MOTION CONTROL", Header),
             ("GYRO DRIVE", Toggle { get: |c| c.gyro.on, set: |c, v| c.gyro.on = v }),
@@ -376,6 +428,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("CAR SETUP", Link(3)),
             ("FLIPS", Link(4)),
             ("VIDEO", Link(5)),
+            ("STORY", Link(8)),
             ("BACK", Back),
         ],
     }
@@ -482,8 +535,6 @@ fn parse_args() -> Opts {
             "--mute" => o.mute = true,
             "--mobile" => o.mobile = true,
             "--desktop-ui" => o.desktop_ui = true,
-            "--mobile" => o.mobile = true,
-            "--desktop-ui" => o.desktop_ui = true,
             "--dvorak" => o.dvorak = true,
             "--name" => o.name = args.next(),
             "--host" => o.host = true,
@@ -501,6 +552,48 @@ fn parse_args() -> Opts {
                 println!("  --host         announce a session on the fleet store at launch");
                 println!("  --join FRIEND  resolve FRIEND's session and dial in at launch");
                 println!("  --mute         run silent (doesn't change saved volume)");
+                println!();
+                // A dozen headless drivers had accumulated and `--help` named
+                // none of them, so the only way to find one was to read
+                // main.rs. A tool nobody can discover is a tool nobody runs.
+                println!("HEADLESS DRIVERS — no window, no GPU; each takes its own subcommand");
+                println!("  --sim <what>   physics/AI sims: all, flip, land, shot, perf, ... (see DESIGN.md)");
+                println!("  --campaign     the fifteen missions: slides, waves, objectives, progression");
+                println!("  --raid         the raid loop: generator, foothold, encounters, loot");
+                println!("  --arch <cmd>   the archaeological map: map, site, find, carry, relay,");
+                println!("                 city, read, why, anchor, orbit, audit, emit-c");
+                println!("  --terrain <c>  worlds and ground: grounds, profile, dunes, jump, drop, audit");
+                println!("  --raidrun <id> a raid at 120 Hz: the event stream a renderer consumes");
+                println!("  --finale       the red dwarf strike, and the three ways it refuses");
+                println!("  --powers       the human interface: what each power costs its host");
+                println!("  --keys         the live control scheme, overlaps and all");
+                println!("  --brain [what]  squad commanders: doctrines, the LLM seam, the wire");
+                println!("  --guidance     the ball-chaser as a missile: pursuit vs PN");
+                println!("  --assemble     part families, and the pairing score");
+                println!("  --trainwatch   GAN training diagnostics: collapse and coverage");
+                println!("  --bench [code] roll, keep and share authored frames");
+                println!("  --voxel        critics for a voxel GAN: skeleton and part matching");
+                println!("  --gravity      the well formula, checked against real physics");
+                println!("  --frames       cybertronian frames, designed from the planet");
+                println!("  --space        kuiper as space: angular LOD, gravity, depth, the floor");
+                println!("  --roster       the bot census, and what the distribution implies");
+                println!("  --rip          finishers: the style of the kill is who you are");
+                println!("  --crawler      the ambush from above: climb, perch, pounce");
+                println!("  --board        human scale, Aiden's skateboard, and the scale gap");
+                println!("  --stealth      sight vs spark resonance, and assassination");
+                println!("  --grip         clinging: walls, undersides, bulk and ice");
+                println!("  --amalgam      the gate-warden hunt: forge, hide, banish");
+                println!("  --pale         the relic-keeper: testimony that is never evidence");
+                println!("  --codex [entry] the 54-entry codex, annotated where evidence differs");
+                println!("  --hazard       delayed consequences: the warp wave, spearcons");
+                println!("  --combine      gestalts: which squads merge, and the fitness grid");
+                println!("  --tune [group] every judgment call; `--tune guesses` for the unverified ones");
+                println!("  --intel        Blackstar's Array logs, once his flagship falls");
+                println!("  --menu         the station consoles, previewed as text frames");
+                println!("  --gear         the bearer's sheet, the ship's vault, the clone gallery");
+                println!("  --fold         audit a transformation: self-intersection, collapse, pops");
+                println!("  --orient       diagnose or fix a bot pose's orientation");
+                println!("  --parts        classify a bot pose's prims (leg/wheel/thruster/wing/body)");
                 std::process::exit(0);
             }
             other => eprintln!("unknown arg {other:?} (try --help)"),
@@ -1029,18 +1122,143 @@ fn main() {
         return;
     }
     if argv.iter().any(|a| a == "--intel") {
-        // Blackstar's own Array logs, unlocked once his flagship falls
+        // Blackstar's own Array logs. They live in the archaeology tables
+        // now (see archive.rs); this flag stays as the shortcut it always
+        // was -- read the three readings together, the way he first did.
         let (sv, _, _) = save::load();
         let camp = campaign::CampaignLog::from_line(&sv.missions);
-        match intel::read(&camp) {
-            Some(frags) => {
-                println!("THE ARRAY LOGS -- recovered aboard Blackstar's own ship\n");
-                for f in frags {
-                    println!("[act {}] {}\n    {}\n", f.act, f.timestamp, f.text);
-                }
+        let dig = provenance::Dig::from_line(&sv.finds, archive::FINDINGS);
+        let logs: Vec<_> = archive::FINDINGS
+            .iter()
+            .filter(|f| f.gate == Some(archive::ARRAY_LOG_GATE))
+            .collect();
+        if !camp.is_cleared(archive::ARRAY_LOG_GATE) {
+            println!("nothing here yet -- these are Blackstar's own logs; board his ship first");
+        } else {
+            println!("THE ARRAY LOGS -- recovered aboard Blackstar's own ship\n");
+            for f in &logs {
+                let mark = if dig.has(f.id) { "*" } else { " " };
+                println!("{mark} [{}]\n    {}\n", f.id, f.blurb);
             }
-            None => println!("nothing here yet -- these are Blackstar's own logs; board his ship first"),
+            println!("(* already in the dig -- `--arch find <id>` to record the rest)");
         }
+        return;
+    }
+    if argv.iter().any(|a| a == "--brain") {
+        brain::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--guidance") {
+        guidance::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--assemble") {
+        assembler::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--trainwatch") {
+        trainwatch::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--bench") {
+        bench::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--voxel") {
+        voxel::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--gravity") {
+        gravity::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--frames") {
+        cybertronian::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--space") {
+        space::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--roster") {
+        census::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--rip") {
+        rip::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--crawler") {
+        crawler::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--board") {
+        board::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--stealth") {
+        stealth::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--grip") {
+        cling::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--amalgam") {
+        amalgam::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--pale") {
+        palevector::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--codex") {
+        codex::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--hazard") {
+        // delayed consequences: the warp wave and the lieutenants' spears
+        hazard::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--combine") {
+        // gestalts: who merges with whom, and how big the result is
+        combine::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--raidrun") {
+        // the raid renderer's contract, stepped at 120 Hz
+        raidrun::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--finale") {
+        // Billy holds the star short; Photon Man aims it
+        finale::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--powers") {
+        // the human interface, and what each of them has left
+        powers::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--keys") {
+        // overlapping binds, and keys the shell steals before the table sees them
+        input::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--tune") {
+        // every judgment call, guesses first
+        tuning::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--terrain") {
+        // route rows -> terrain::Ground, and the generator run headless
+        mapsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--arch") {
+        // the archaeological map: strata, findings, the Asteri arithmetic
+        archsim::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--campaign") {
@@ -1911,6 +2129,28 @@ fn main() {
 /// glTF strip, so the engine uses one duration for every bot until it does.
 const XFORM_DUR: f32 = 0.9;
 
+/// Which model's dimensions describe the body as it is CURRENTLY POSED.
+///
+/// Not always the displayed one. A smooth fold keeps `cars.active` pinned to
+/// the strip's first entry — the vehicle — and rewrites that model's meshes
+/// into the robot shape each frame. The geometry on screen is a robot; the
+/// `Model` whose `half_h` and `ride_h` would be read is a car.
+///
+/// While the fold is running that does not matter, because `advance_xform`
+/// overwrites the dimensions from `Morph::bounds_at` every frame. It matters
+/// the moment anything ELSE re-derives them — a garage switch, a car hotkey,
+/// a reload — because `apply_car_dims` then seats a robot using the car's
+/// numbers. For `analog` that is a `ride_h` of 0.239 against feet at 0.400:
+/// sixteen centimetres underground, which is an order of magnitude more than
+/// the 2.25 cm the half_h/ride_h guard bug could account for.
+fn dims_model(displayed: usize, strip: Option<&[usize]>, robot: bool) -> usize {
+    match strip {
+        // only remap the strip's own base, and only while standing up
+        Some(s) if robot && !s.is_empty() && displayed == s[0] => *s.last().unwrap(),
+        _ => displayed,
+    }
+}
+
 fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.half_len = m.half_len * size;
     car.half_h = (m.half_h * size).max(0.10);
@@ -2151,7 +2391,14 @@ impl Game {
     fn switch_car(&mut self, i: usize) {
         if i < self.cars.models.len() {
             self.cars.active = i;
-            apply_car_dims(&mut self.car, &self.cars.models[i], self.cfg.car.size);
+            // dimensions come from the pose, not from the model being drawn
+            let strip = self
+                .cars
+                .xform
+                .get(&i)
+                .map(|&(cid, _)| self.cars.chassis[cid].strip.clone());
+            let d = dims_model(i, strip.as_deref(), self.xf.is_robot());
+            apply_car_dims(&mut self.car, &self.cars.models[d], self.cfg.car.size);
             // Flight is a property of the CHASSIS, not of the pose, so it is
             // read from the registry rather than from the model. A jet stays
             // a jet through every frame of its fold.
@@ -2201,13 +2448,22 @@ impl Game {
     fn set_car_model(&mut self, m: usize) {
         self.switch_car(m);
         let d = self.world.sdf(self.car.pos);
-        if d < self.car.half_h {
+        // THE GUARD HAS TO USE THE SAME NUMBER AS THE CORRECTION.
+        //
+        // This read `d < self.car.half_h` while correcting by `drop`, so a
+        // body sunk by anything between the two — which for a standing robot
+        // is a wide band, `half_h` 0.9 against a `ride_h` of 1.5 — was seen
+        // as not sunk at all and never lifted. That is a PARTIAL burial that
+        // corrects itself the moment the body is deep enough to trip the
+        // smaller threshold, which is why it reads as the bot sinking rather
+        // than as it spawning wrong.
+        let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+        if d < drop {
             // Seat on the LOWEST POINT, not the half-height. They differ the
             // moment the body stops being centred on its bounding box, which is
             // exactly what standing up does — feet hang below centre while the
             // mass sits high. Falls back to half_h when ride_h is unset so a
             // model that never folds is unaffected.
-            let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
             self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
     }
@@ -2320,8 +2576,26 @@ impl Game {
 
     /// Step the running fold    /// Step the running fold, swapping the body when the strip index changes.
     fn advance_xform(&mut self, dt: f32) {
+        // THE FOLD MUST RENDER ITS LAST FRAME.
+        //
+        // `Xform::update` flips `state` to Idle on the SAME call that `t`
+        // reaches 1.0 or 0.0, so gating on `state == Transforming` after
+        // calling it means the endpoint pose is never written: the final
+        // mesh write is the previous frame's, short of the target by
+        // however much of the blend one frame covers.
+        //
+        // That is both reported bugs at once. Folding to vehicle leaves
+        // limbs a few percent out of their sockets — parts visibly outside
+        // the car — and folding to robot leaves `half_h`/`ride_h` at the
+        // second-to-last frame's values, so the body is seated against a
+        // hitbox that never finished growing.
+        //
+        // Run the body once more on the frame the fold ends. `t` is already
+        // clamped to the endpoint by then, so this is the exact final pose
+        // and not an extrapolation.
+        let was_folding = self.xf.state == xform::State::Transforming;
         self.xf.update(dt);
-        if self.xf.state != xform::State::Transforming {
+        if self.xf.state != xform::State::Transforming && !was_folding {
             return;
         }
         let t = self.xf.eased();
@@ -2399,13 +2673,22 @@ impl Game {
         }
         // lift clear as the body grows, or a standing robot ends up buried
         let d = self.world.sdf(self.car.pos);
-        if d < self.car.half_h {
+        // THE GUARD HAS TO USE THE SAME NUMBER AS THE CORRECTION.
+        //
+        // This read `d < self.car.half_h` while correcting by `drop`, so a
+        // body sunk by anything between the two — which for a standing robot
+        // is a wide band, `half_h` 0.9 against a `ride_h` of 1.5 — was seen
+        // as not sunk at all and never lifted. That is a PARTIAL burial that
+        // corrects itself the moment the body is deep enough to trip the
+        // smaller threshold, which is why it reads as the bot sinking rather
+        // than as it spawning wrong.
+        let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
+        if d < drop {
             // Seat on the LOWEST POINT, not the half-height. They differ the
             // moment the body stops being centred on its bounding box, which is
             // exactly what standing up does — feet hang below centre while the
             // mass sits high. Falls back to half_h when ride_h is unset so a
             // model that never folds is unaffected.
-            let drop = if self.car.ride_h > 0.0 { self.car.ride_h } else { self.car.half_h };
             self.car.pos += self.world.normal(self.car.pos) * (drop - d + 0.02);
         }
         if self.xf.state == xform::State::Idle {
@@ -3525,8 +3808,23 @@ impl Game {
                         d.input(menu::Input::Move(1));
                     }
                     Key::Named(NamedKey::Enter) => {
+                        // resolve the order OUTSIDE the deck's borrow: acting
+                        // on it needs the shell, and rebuilding the console
+                        // needs to replace the very thing being borrowed
                         if let Some(order) = d.input(menu::Input::Activate) {
-                            self.toastf(&format!("{order:?} — fly it from the terminal sims for now"));
+                            let st = d.station;
+                            let (line, changed) = stations::run_order(&order);
+                            if changed {
+                                // the save moved under the console, so the
+                                // console has to be rebuilt from it — a Deck
+                                // loads its Shipboard once, at open.
+                                if let Ok(nd) =
+                                    deck::Deck::open(st, ship::Phase::Cruise, nightfall::week_now())
+                                {
+                                    self.deck = Some(nd);
+                                }
+                            }
+                            self.toastf(&line);
                         }
                     }
                     _ => {}
@@ -6182,6 +6480,120 @@ impl Game {
                     * Mat4::from_scale(Vec3::new(side * wheel_r * 1.02, wheel_r * 1.02, wheel_r * 1.02));
                 push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dims_tests {
+    use super::dims_model;
+
+    const STRIP: [usize; 5] = [10, 11, 12, 13, 14]; // f00 vehicle .. f04 robot
+
+    #[test]
+    fn a_folded_body_is_measured_by_the_pose_it_is_in() {
+        // A smooth fold pins the displayed model to the strip's BASE and
+        // rewrites its meshes, so anything re-deriving dimensions read a
+        // car's numbers for a robot's body — `ride_h` 0.239 against feet at
+        // 0.400 on `analog`, sixteen centimetres of sink.
+        assert_eq!(dims_model(10, Some(&STRIP), true), 14, "robot should measure as f04");
+        assert_eq!(dims_model(10, Some(&STRIP), false), 10, "vehicle measures as itself");
+    }
+
+    #[test]
+    fn nothing_else_is_remapped() {
+        assert_eq!(dims_model(12, Some(&STRIP), true), 12, "a mid-strip pose is itself");
+        assert_eq!(dims_model(14, Some(&STRIP), true), 14, "the end pose is itself");
+        // a chassis with no fold is never touched, in either mode
+        assert_eq!(dims_model(7, None, true), 7);
+        assert_eq!(dims_model(7, None, false), 7);
+        // and an empty strip cannot panic on `last()`
+        assert_eq!(dims_model(0, Some(&[]), true), 0);
+    }
+}
+
+#[cfg(test)]
+mod tweak_reach_tests {
+    use super::*;
+
+    /// Every menu the settings tree can reach from the root, followed.
+    fn reachable_menus() -> Vec<u8> {
+        let mut seen = vec![0u8];
+        let mut i = 0;
+        while i < seen.len() {
+            let m = seen[i];
+            for (_, row) in tweak_rows(m) {
+                if let Row::Link(t) = row {
+                    if !seen.contains(&t) {
+                        seen.push(t);
+                    }
+                }
+            }
+            i += 1;
+        }
+        seen
+    }
+
+    /// THE GAP THIS CLOSES. `--tune` listed `story_anchor` as a knob and its
+    /// own documentation called it "a main-menu dial", and it was in no menu
+    /// at all — reachable only by hand-editing a save. Describing something
+    /// as a setting does not put it in the settings.
+    ///
+    /// So: every knob the tuning ledger presents as a `cfg` setting must be
+    /// movable from the menu tree. The ledger and the UI are two tables about
+    /// the same thing, and nothing joined them.
+    #[test]
+    fn every_tuning_knob_is_reachable_in_a_menu() {
+        let base = Config::default();
+        for knob in tuning::KNOBS {
+            // does any row in any reachable menu move this knob's value?
+            let moves_it = reachable_menus().into_iter().any(|m| {
+                tweak_rows(m).into_iter().any(|(_, row)| match row {
+                    Row::Slider { get, set, min, max, .. } => {
+                        let mut c = Config::default();
+                        // drive the slider to both ends and see if the knob follows
+                        for v in [min, max] {
+                            set(&mut c, v);
+                            if ((knob.read)(&c) - (knob.read)(&base)).abs() > 1e-6 {
+                                return true;
+                            }
+                        }
+                        let _ = get;
+                        false
+                    }
+                    Row::Toggle { set, .. } => {
+                        let mut c = Config::default();
+                        for v in [true, false] {
+                            set(&mut c, v);
+                            if ((knob.read)(&c) - (knob.read)(&base)).abs() > 1e-6 {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                })
+            });
+            assert!(
+                moves_it,
+                "'{}' is in the tuning ledger and no menu row can move it — \
+                 it is a setting only in the sense that the save file has a line for it",
+                knob.id
+            );
+        }
+    }
+
+    #[test]
+    fn no_settings_menu_is_orphaned() {
+        // a menu nothing links to is a page nobody can open; the STORY menu
+        // was one keystroke from being exactly that
+        let reach = reachable_menus();
+        for m in 1u8..=8 {
+            assert!(
+                reach.contains(&m),
+                "settings menu {m} ({}) cannot be reached from the root",
+                menu_title(m)
+            );
         }
     }
 }

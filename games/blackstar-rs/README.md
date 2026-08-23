@@ -461,3 +461,39 @@ Six hovercars: a cushion instead of wheels, momentum instead of grip, and a repu
 `[` and `]` cycle cars in singleplayer, on QWERTY and Dvorak alike.
 
 Hovercars run a fast-regenerating base thrust plus stronger pad charge, and pulse instead of jumping.
+
+ARCHAEOLOGY: the universe has six strata of history and you excavate them out of order. Finds bear on claims; independent sources move a claim from UNKNOWN to POSSIBLE to HIGH-CONFIDENCE, and disagreeing sources leave it CONTESTED rather than averaged. `--arch map`, `--arch site <dest>`, `--arch why <claim>`.
+
+`--arch orbit` recomputes the Asteri return: their published 417 years and the true 3,812 differ by 0.312% of the perihelion speed, and at that precision their own data could not exclude "never returns". The solver is `orbits.rs`, checked against Halley.
+
+MYSTERY ANCHOR (main menu, `cfg story_anchor`): how much history the game hands you already believing. Received knowledge is one contradictable source, and the received account includes the official record — so HOMEY hands you a lie to catch, FRESH a world with nothing yet to disbelieve.
+
+`--arch read <finding> [lens]` reads one object as the Transformer, the three human protagonists, or the Archivist. The finding is what is there; the reading is what somebody said about it.
+
+The ship's CHARTROOM station is where carried-home artifacts get looked at; terminals and cut walls are read where they stand. The story bible is `docs/STORY_BIBLE.md`, and its inventory is machine-checked against the code.
+
+GROUNDSIDE: Los Angeles is one city in two eras — the Directorate's bunker is an operational site in the archive era and four floors of damp in the present, and it is the home base in both. `--arch city [place] [then|now]`. The ridge whose excavation record was falsified overlooks the shore that opens in Film 1.
+
+TRADECRAFT: the human campaign has no base. A car you stage out of, a case you carry, and relays that each cost something — a payphone takes one item, a hideout takes eight, a contact retells it in their own words. Nothing reaches the archaeological map until you relay it, and a rooftop lamp reaches the people you didn't call.
+
+`--terrain grounds|profile <dest>|dunes|audit` connects the route table to `terrain.rs`: every destination's gravity, material, air and wind, and an ASCII cross-section of real generated ground. Mars dunes come out 3.5x Earth's, from saltation physics rather than a constant.
+
+`--tune` lists every judgment call with its live value, where to change it, and how much it is worth — `--tune guesses` filters to the ones nobody has verified. Most are `cfg` lines in the save file, so tuning is an edit and a relaunch, not a rebuild.
+
+`--terrain jump <seed>` runs the whole procedural chain — world, ground, generated terrain, footholds, raid — and `--terrain drop [seed] [altitude]` flies the twenty seconds from the hangar door to the ground under that world's real gravity. Steering into the ship's line lands you 25 m from the LZ; against it, 130 m.
+
+`--arch approach [guard|sentry|hunter]` shows the ways into a building against somebody watching it: what each costs if you are seen, and which one you would actually take at each amount of time. Detection is a rate, not a roll, and falls as the inverse square of distance.
+
+`--terrain depth` measures whether the z-buffer can hold a person and a skyscraper in one shot. It cannot, as shipped: standard Z resolves 82 mm at the tower's 343 m pullback and three metres at 2.5 km. Reversed Z gets 0.02 mm for a flipped depth compare.
+
+`--combine` answers which squads can merge into a gestalt and why. Roles want proportions measured off the models, so five identical racers fail on coherence and two good-but-mismatched arms fail on symmetry. `--combine grid` shows the fitness table behind the assignment.
+
+`--keys` prints the live control scheme from your save: any two actions sharing an input, any action bound to a key the shell handles itself (1-9 go to the hotbar, Escape/Tab/Enter/arrows to the deck), and anything unbound. `--keys defaults` compares against the shipped scheme.
+
+Worldgen is 52ms on PERPLEXUS and 89ms on MONKEY RUN, down from 197 and 400: the route-clearance pass was doing a full min-SDF over every shape per sample because the spatial grid is not built yet. It rejects on reach now, with the same margin the runtime grid uses, and generates bit-identical worlds.
+
+`--raidrun <boss>` steps a real raid at 120 Hz and prints the event stream: SLAM, GRAPPLE, SECURED, ANCHOR, PHASE CLEARED. The sim never moves a unit — every velocity in that list is one the shell applies, which makes the stream a specification for the renderer.
+
+`--bench [code]` rolls, keeps and shares authored frames. `0` rerolls, `s` saves to a slot, `[` `]` still cycle the chassis. `BLACKSTAR_CHECKPOINT_FILE=/path/to/file.safetensors` points at a trained generator; with none set the roll comes from the parts library. A character exports as a seed (`bsc1-…`), short enough to paste into a message.
+
+`--guidance` compares the ball-chaser's steering law against proportional navigation for missiles. Pure pursuit hits 2 of 7 crossing angles; PN hits 7 of 7, and needs less agility to do it.

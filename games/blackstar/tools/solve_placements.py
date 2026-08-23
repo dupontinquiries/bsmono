@@ -488,10 +488,22 @@ def load_representative(path):
     n, npal, nvox = _s.unpack_from("<HHI", b, 5)
     lo = _s.unpack_from("<3f", b, 13)
     step = _s.unpack_from("<f", b, 25)[0]
+    # SEVEN bytes per voxel: three u16 coords and a palette index. This read
+    # `off + i * 4` while unpacking six bytes, so every cell after the first
+    # was decoded from a sliding window across two records. Measured on
+    # `imported_grimorph_part4`: stride 4 puts 191 of 647 voxels inside the
+    # 0..32 grid; stride 7 puts all 647 inside it. Checked across forty random
+    # representatives — every one is exactly nvox*7 bytes after the header.
+    #
+    # Anything solved against representatives rather than originals was
+    # aligning to a cloud two thirds of which was out of bounds.
+    STRIDE = 7
     off = 29 + npal * 3
+    assert len(b) - off == nvox * STRIDE, (
+        f"{path}: {len(b) - off} bytes for {nvox} voxels, expected {nvox * STRIDE}")
     cells = []
     for i in range(nvox):
-        cells.append(_s.unpack_from("<3H", b, off + i * 4))
+        cells.append(_s.unpack_from("<3H", b, off + i * STRIDE))
     return cells, lo, step
 
 

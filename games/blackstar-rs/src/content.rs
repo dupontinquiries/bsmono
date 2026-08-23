@@ -910,3 +910,57 @@ mod content3_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod champion_join_tests {
+    use super::*;
+
+    /// `Mission.champion` is a free string that `campaign.rs` writes STRAIGHT
+    /// INTO THE FINAL WAVE — `*wave.last_mut().unwrap() = c` — with no lookup
+    /// on the way. So a typo does not fail, it puts a troop id nothing knows
+    /// about into the wave that is supposed to be the mission's climax, and
+    /// whatever resolves troops later gets to decide what that means.
+    ///
+    /// `dest` has been validated since it landed; `champion` never was, and
+    /// the two sit four lines apart in the same struct.
+    #[test]
+    fn every_champion_is_a_real_troop() {
+        for m in MISSIONS {
+            let Some(c) = m.champion else { continue };
+            assert!(
+                TROOPS.iter().any(|t| t.id == c),
+                "{} names champion '{c}', which is not a troop — it goes into \
+                 the final wave verbatim",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_champion_is_opposition_rather_than_one_of_yours() {
+        // the other half: a champion that is a PlayerClass would put a
+        // friendly unit at the head of the enemy's last wave
+        for m in MISSIONS {
+            let Some(c) = m.champion else { continue };
+            // find, not unwrap: an unknown id is the OTHER test's failure and
+            // should be reported there, with its message. An unwrap here
+            // means whichever test the harness happens to run first decides
+            // whether you get a diagnosis or a backtrace.
+            let Some(t) = TROOPS.iter().find(|t| t.id == c) else { continue };
+            assert_ne!(
+                t.role,
+                Role::PlayerClass,
+                "{} fields '{c}' as its champion, and that is one of ours",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn champions_are_used_at_all() {
+        // if nothing names one, the whole mechanic is dead and the tests
+        // above prove nothing
+        let n = MISSIONS.iter().filter(|m| m.champion.is_some()).count();
+        assert!(n >= 3, "only {n} missions field a champion");
+    }
+}

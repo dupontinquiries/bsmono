@@ -384,6 +384,88 @@ pub fn redistribute_length_to_height(actual: Vec3, veh_len: f32, bot_len: f32, t
 }
 
 #[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    /// Step a fold the way the shell does, recording the `t` values a caller
+    /// would actually act on if it gates on `state == Transforming` AFTER
+    /// calling `update` — which is what `Game::advance_xform` did.
+    fn observed(dir_to_robot: bool) -> Vec<f32> {
+        let mut x = Xform::new();
+        if !dir_to_robot {
+            x.t = 1.0;
+            x.mode = Mode::Robot;
+        }
+        x.since_last = MIN_INTERVAL_SEC;
+        assert!(x.request(1.0), "the fold should start");
+        let mut seen = Vec::new();
+        for _ in 0..600 {
+            x.update(1.0 / 60.0);
+            if x.state == State::Transforming {
+                seen.push(x.t);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn the_endpoint_is_never_observed_by_a_state_gated_caller() {
+        // THE TRAP, kept as a test so nobody re-introduces the gate.
+        //
+        // `update` flips state to Idle on the same call that `t` lands on the
+        // endpoint, so a caller that checks the state afterwards never sees
+        // t == 1.0 or t == 0.0. It sees the frame before, and if it is
+        // writing geometry from `t` that means the fold's final pose is never
+        // drawn: limbs stop short of their sockets, and the hitbox stops
+        // short of its final size.
+        let to_robot = observed(true);
+        assert!(!to_robot.is_empty());
+        let last = *to_robot.last().unwrap();
+        assert!(last < 1.0, "the gate would have observed the endpoint after all");
+        assert!(last > 0.9, "and it stops close to it, which is why it is easy to miss: {last}");
+
+        let to_vehicle = observed(false);
+        let last = *to_vehicle.last().unwrap();
+        assert!(last > 0.0, "same in the other direction");
+        assert!(last < 0.1, "{last}");
+    }
+
+    #[test]
+    fn t_does_land_exactly_on_the_endpoint() {
+        // the value is correct; only the observation is missed. So the fix is
+        // for the caller to run once more after the flip, not to change the
+        // clamp.
+        let mut x = Xform::new();
+        x.since_last = MIN_INTERVAL_SEC;
+        assert!(x.request(1.0));
+        for _ in 0..600 {
+            x.update(1.0 / 60.0);
+        }
+        assert_eq!(x.t, 1.0);
+        assert_eq!(x.state, State::Idle);
+        assert_eq!(x.mode, Mode::Robot);
+    }
+
+    #[test]
+    fn a_caller_that_runs_one_more_frame_sees_it() {
+        // what `advance_xform` does now: remember whether it WAS folding, and
+        // run the body on the frame the fold ends.
+        let mut x = Xform::new();
+        x.since_last = MIN_INTERVAL_SEC;
+        assert!(x.request(1.0));
+        let mut last_acted_on = None;
+        for _ in 0..600 {
+            let was = x.state == State::Transforming;
+            x.update(1.0 / 60.0);
+            if x.state == State::Transforming || was {
+                last_acted_on = Some(x.t);
+            }
+        }
+        assert_eq!(last_acted_on, Some(1.0), "the endpoint pose is written now");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -382,13 +382,31 @@ impl Interior {
 
     /// Walk the door graph from a room; used to prove the carve did not
     /// separate anything the plan says is connected.
+    /// Which rooms the PLAN connects, ignoring whether the doors are open.
+    /// The ship's topology, which does not change when the power does.
+    pub fn linked_from(&self, start: &str) -> Vec<&'static str> {
+        self.flood(start, |_| true)
+    }
+
+    /// Which rooms you can actually walk to right now.
+    ///
+    /// This used to be `linked_from` under this name: it walked every link in
+    /// the plan whether or not the door was passable, so a depowered ship —
+    /// hatches shut, which `depower` explicitly does — still reported the
+    /// whole interior as reachable. Anything asking "can the crew get there"
+    /// got the answer "yes, always", which is the one answer a failure mode
+    /// exists to contradict.
     pub fn reachable_from(&self, start: &str) -> Vec<&'static str> {
+        self.flood(start, |l: &Link| l.door.passable())
+    }
+
+    fn flood(&self, start: &str, open: impl Fn(&Link) -> bool) -> Vec<&'static str> {
         let Some(s) = self.cells.iter().position(|c| c.id == start) else { return Vec::new() };
         let mut seen = vec![s];
         let mut i = 0;
         while i < seen.len() {
             let cur = seen[i];
-            for l in &self.links {
+            for l in self.links.iter().filter(|l| open(l)) {
                 let other = if l.a == cur {
                     Some(l.b)
                 } else if l.b == cur {
@@ -413,6 +431,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn losing_power_actually_strands_you() {
+        // the behaviour the old reachability could not express: `depower`
+        // shuts the hatches, and a shut hatch is not a route. This returned
+        // "everything is reachable" on a dead ship before the door check.
+        let mut i = Interior::generate(110.0);
+        i.unseal();
+        let before = i.reachable_from("bridge").len();
+        assert_eq!(before, HUB.len());
+
+        i.depower();
+        i.step_doors(5.0);
+        let after = i.reachable_from("bridge").len();
+        assert!(after < before, "a depowered ship is still fully walkable ({after} rooms)");
+        // the topology is unchanged; it is the doors that moved
+        assert_eq!(i.linked_from("bridge").len(), HUB.len());
+    }
+
+    #[test]
     fn the_plan_survives_being_built() {
         let i = Interior::generate(110.0);
         assert_eq!(i.cells.len(), HUB.len());
@@ -420,7 +456,12 @@ mod tests {
         let doors: usize = HUB.iter().map(|r| r.exits.len()).sum();
         assert_eq!(i.links.len(), doors / 2, "doors and corridors disagree");
         // and nothing was separated by the carve
-        assert_eq!(i.reachable_from("bridge").len(), HUB.len());
+        // topology: the plan connects all eight rooms, doors or no doors
+        assert_eq!(i.linked_from("bridge").len(), HUB.len());
+        // and once the ship is at rest with its doors open, so does the walk
+        let mut open = Interior::generate(110.0);
+        open.unseal();
+        assert_eq!(open.reachable_from("bridge").len(), HUB.len());
     }
 
     #[test]

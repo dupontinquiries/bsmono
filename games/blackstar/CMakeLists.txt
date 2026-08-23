@@ -70,6 +70,7 @@ set(EXENGINE_CORE_SRC
 # ---- OUR new game modules, now first-class engine citizens ----
 set(CYBERTRON_MODULE_SRC
   ${EDIR}/coll_chunk.c
+  ${EDIR}/provenance.c
   ${EDIR}/events.c
   ${EDIR}/transform.c
   ${EDIR}/netcode.c
@@ -243,7 +244,7 @@ add_library(cybertron_modules STATIC ${CYBERTRON_MODULE_SRC}
 target_include_directories(cybertron_modules PUBLIC ${ENGINE_INCLUDES})
 target_compile_options(cybertron_modules PRIVATE -Wno-unused)
 
-foreach(t example_usage test_transform test_netcode test_gameplay test_element test_menu test_vfx test_gait test_weapon test_encounter test_pickup test_custom test_mapgen test_waves harness_step test_class test_feel test_material test_movesim test_genome test_signature test_climb test_warp_wave test_tsunami test_arc test_cyclone test_thorns test_photon test_matrix test_spearcon test_resonance test_corrupt test_graviton test_siphon test_truce test_containment test_absorb test_ally test_content_gen test_detail test_behavior test_combat test_weaponmod test_ability test_vehicle test_turret test_wheels test_enemy test_combat_json test_commander_ai test_hive_ai test_bodykind test_gates test_handoff test_drift)
+foreach(t example_usage test_transform test_netcode test_gameplay test_element test_menu test_vfx test_gait test_weapon test_encounter test_pickup test_custom test_mapgen test_waves harness_step test_class test_feel test_material test_movesim test_genome test_signature test_climb test_warp_wave test_tsunami test_arc test_cyclone test_thorns test_photon test_matrix test_spearcon test_resonance test_corrupt test_graviton test_siphon test_truce test_containment test_absorb test_ally test_content_gen test_detail test_behavior test_combat test_weaponmod test_ability test_vehicle test_turret test_wheels test_enemy test_combat_json test_commander_ai test_hive_ai test_bodykind test_gates test_handoff test_drift test_provenance)
   add_executable(${t} ${CMAKE_SOURCE_DIR}/tests/${t}.c)
   target_link_libraries(${t} PRIVATE cybertron_modules m)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # tests must keep their assert()s even in Release
@@ -333,6 +334,13 @@ endif()
 if(Python3_FOUND)
   add_test(NAME gltf_roundtrip
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_gltf.py)
+endif()
+if(Python3_FOUND)
+  # generated headers must match the source they claim to mirror; see the
+  # script for why this is not the same check as test_content_gen
+  add_test(NAME gen_fresh
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_gen_fresh.py
+                   --root ${CMAKE_SOURCE_DIR})
 endif()
 if(Python3_FOUND)
   add_test(NAME model_tuning

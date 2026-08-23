@@ -196,6 +196,53 @@ pub fn combine_time_s(g: &Gestalt, power_per_member: f32) -> f32 {
 }
 
 #[cfg(test)]
+mod driver_tests {
+    use super::*;
+
+    #[test]
+    fn the_examples_demonstrate_each_rule_exactly_once() {
+        // A driver whose examples all fail the same way teaches one rule and
+        // implies the other is decoration. `MIN_SYMMETRY` went undemonstrated
+        // until this test existed: the "lopsided" squad failed on COHERENCE,
+        // because a tank makes a bad arm before it makes a mismatched one.
+        let ex = examples();
+        assert_eq!(ex.len(), 3);
+
+        let g = assign(&ex[0].1).expect("the built-for-it squad assigns");
+        assert!(viable(&g), "coherence {} symmetry {}", g.coherence, g.symmetry);
+
+        let g = assign(&ex[1].1).expect("identical racers still assign");
+        assert!(!viable(&g));
+        assert!(g.coherence < MIN_COHERENCE, "should fail on shape: {}", g.coherence);
+        assert!(g.symmetry >= MIN_SYMMETRY, "identical bodies are perfectly symmetric");
+
+        let g = assign(&ex[2].1).expect("the mismatched-arm squad assigns");
+        assert!(!viable(&g));
+        assert!(
+            g.coherence >= MIN_COHERENCE,
+            "every body should suit its role here: {}",
+            g.coherence
+        );
+        assert!(g.symmetry < MIN_SYMMETRY, "should fail on symmetry: {}", g.symmetry);
+    }
+
+    #[test]
+    fn a_gestalt_is_a_rung_on_the_size_ladder() {
+        // the connection that made this wireable: a combined body has a
+        // HEIGHT, and since `scale.rs` exists that height means something —
+        // it frames like any other body rather than needing a multiplier
+        // somebody typed.
+        let g = assign(&examples()[0].1).unwrap();
+        let bot = crate::scale::sized("bot").unwrap();
+        let h = g.scale_vs(bot.height_m) * bot.height_m;
+        assert!(h > bot.height_m, "a gestalt should be taller than its members");
+        let (d, _) = crate::scale::camera_for(crate::scale::Class::Bot, h);
+        let (bd, _) = crate::scale::camera_for(crate::scale::Class::Bot, bot.height_m);
+        assert!(d > bd, "and should be framed further out");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -286,4 +333,152 @@ mod tests {
             assert_eq!(g.members.iter().filter(|(x, _)| *x == s).count(), 1, "{}", s.label());
         }
     }
+}
+
+// ------------------------------------------------------------- driver ---
+
+/// `--combine` — does this squad merge, and how big is what comes out?
+///
+/// The module shipped with none of this reachable: `assign`, `viable`,
+/// `combine_time_s` and `scale_vs` existed, were tested, and were called by
+/// nothing. `curriculum.rs` has been listing `combine` as `built: false`
+/// beside `clinch` ever since the ledger landed, which was accurate and did
+/// not fix it.
+///
+/// It is worth a driver rather than a shrug because the interesting claim is
+/// checkable without a screen: **not every squad can combine.** A squad of
+/// five identical racers should fail, and it should fail for a legible
+/// reason rather than a score. Printing the fitness grid shows why a body got
+/// a role, which is the whole argument for the greedy assignment.
+pub fn run(argv: &[String]) {
+    let i = argv.iter().position(|a| a == "--combine").unwrap_or(0);
+    let which = argv.get(i + 1).map(String::as_str).unwrap_or("squads");
+    match which {
+        "squads" => squads(),
+        "grid" => grid(),
+        other => {
+            println!("unknown: --combine {other}");
+            println!("try: squads | grid");
+        }
+    }
+}
+
+/// A mixed squad that should work, and a uniform one that should not.
+fn examples() -> Vec<(&'static str, Vec<Member>)> {
+    let m = |name, elongation, bulk, reach_m, mass| Member {
+        name,
+        elongation,
+        bulk,
+        reach_m,
+        mass,
+    };
+    vec![
+        (
+            "a squad built for it",
+            vec![
+                m("bulwark", 0.20, 0.95, 6.0, 14_000.0),
+                m("lance", 0.90, 0.28, 5.2, 6_000.0),
+                m("pike", 0.88, 0.32, 5.1, 6_400.0),
+                m("stride", 0.74, 0.72, 5.8, 9_000.0),
+                m("stanchion", 0.76, 0.78, 5.9, 9_400.0),
+            ],
+        ),
+        (
+            "five identical racers",
+            vec![
+                m("racer i", 0.70, 0.25, 4.4, 3_000.0),
+                m("racer ii", 0.70, 0.25, 4.4, 3_000.0),
+                m("racer iii", 0.70, 0.25, 4.4, 3_000.0),
+                m("racer iv", 0.70, 0.25, 4.4, 3_000.0),
+                m("racer v", 0.70, 0.25, 4.4, 3_000.0),
+            ],
+        ),
+        (
+            // Two GOOD arms of wildly different length. Every body is shaped
+            // for its role, so coherence passes; the thing that stops it is
+            // that one arm is a third the length of the other, which is what
+            // `symmetry` measures and nothing else in the model catches.
+            //
+            // The first version of this example was "one arm is a tank",
+            // which failed on COHERENCE instead — a tank is a bad arm — so
+            // the symmetry rule was never the deciding factor in any example
+            // the driver printed, and a reader would have had no idea what it
+            // was for.
+            "mismatched arms: both good, one enormous",
+            vec![
+                m("bulwark", 0.20, 0.95, 6.0, 14_000.0),
+                m("lance", 0.90, 0.28, 2.0, 3_000.0),
+                m("greatlance", 0.90, 0.28, 8.0, 9_000.0),
+                m("stride", 0.74, 0.72, 5.8, 9_000.0),
+                m("stanchion", 0.76, 0.78, 5.9, 9_400.0),
+            ],
+        ),
+    ]
+}
+
+fn squads() {
+    println!("COMBINATION — not every squad can\n");
+    for (label, members) in examples() {
+        println!("  {label}");
+        match assign(&members) {
+            None => println!("      will not assign at all\n"),
+            Some(g) => {
+                for (slot, m) in &g.members {
+                    println!("      {:<12} {}", slot.label(), m.name);
+                }
+                println!(
+                    "      coherence {:.2} (needs {MIN_COHERENCE:.2}), symmetry {:.2} (needs {MIN_SYMMETRY:.2})",
+                    g.coherence, g.symmetry
+                );
+                if viable(&g) {
+                    // the scale connection: a gestalt is a new rung on the
+                    // ladder, and `scale.rs` frames it like any other body
+                    let bot = crate::scale::sized("bot").unwrap();
+                    let h = g.scale_vs(bot.height_m) * bot.height_m;
+                    let (d, up) = crate::scale::camera_for(crate::scale::Class::Bot, h);
+                    println!(
+                        "      COMBINES: {:.1} m, {:.0} t, {:.0} s to fold",
+                        h,
+                        g.total_mass / 1000.0,
+                        combine_time_s(&g, 1.0)
+                    );
+                    println!(
+                        "      camera {d:.0} m back, {up:.0} m up ({:.1}x a standard frame)",
+                        g.scale_vs(bot.height_m)
+                    );
+                } else {
+                    let why = if g.coherence < MIN_COHERENCE {
+                        "the bodies are not shaped for the roles"
+                    } else {
+                        "every body suits its role; the mirrored pair does not match"
+                    };
+                    println!("      will not combine: {why}");
+                }
+                println!();
+            }
+        }
+    }
+    println!("  a squad of five identical bodies cannot merge, which is the");
+    println!("  interesting answer: roles want proportions, and proportions are");
+    println!("  measured off the models rather than assigned in a table.");
+}
+
+fn grid() {
+    println!("FITNESS — why a body gets a role\n");
+    let (_, members) = examples().into_iter().next().unwrap();
+    print!("  {:<12}", "");
+    for s in SLOTS {
+        print!(" {:>10}", s.label());
+    }
+    println!();
+    for m in &members {
+        print!("  {:<12}", m.name);
+        for s in SLOTS {
+            print!(" {:>10.2}", fitness(m, s));
+        }
+        println!();
+    }
+    println!("\n  the assignment is greedy on the strongest pairing, so the grid");
+    println!("  explains the result. A Hungarian solve would be marginally better");
+    println!("  and would not tell you why.");
 }

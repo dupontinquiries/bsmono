@@ -1,0 +1,55 @@
+#!/bin/sh
+# fastcheck — the edit/test loop for this crate, measured.
+#
+# Why this exists: `blackstar-rs` is ONE package of ~65k lines, so the usual
+# multi-crate tricks do not apply. `cargo ailite gate` finds changed crates and
+# checks only those; here there is exactly one crate, so gate degenerates into
+# a full check and buys nothing. The lever that does work is the profile.
+#
+# The crate's `[profile.dev]` sets `opt-level = 2`, with a comment explaining
+# why: "physics + png decode are unusable at opt 0". That is true of PLAYING
+# the game. It is not true of the test suite, which runs in 0.15 s and never
+# touches the renderer. So the loop was paying optimizer time it could not use.
+#
+# Measured on this box (1 vCPU, 3 GB):
+#
+#   dev profile, opt-level 2, no incremental   ~200 s per edit/test cycle
+#   ailite profile, opt-level 0, incremental      3 s per edit/test cycle
+#                                                13 s to also link the binary
+#   first run on the new profile (cold)         153 s, once
+#
+# The 3 s figure is a real semantic change (a new finding, two readings, a
+# changed assertion), not a comment touch — verified by running the rebuilt
+# binary and seeing the new content.
+#
+# CAVEATS, because the speedup is not free:
+#
+#  * opt-level 0 means the built binary is too slow to PLAY. Use
+#    `cargo build --release` (or plain dev) for anything you intend to drive.
+#    This script is for tests, lints and the headless `--arch`/`--sim` drivers.
+#  * it creates a second artifact tree at `target/ailite/`. Disk here was 5.2 G
+#    free against a 2.0 G `target/`; if that gets tight, `rm -rf target/ailite`
+#    costs one 153 s rebuild.
+#  * incremental trades disk for time. That is the right trade for an
+#    edit-heavy loop and the wrong one for CI.
+#
+# NOT adopted, and why: `ailite-schedule-first.patch` needs a forked cargo, and
+# its within-invocation ordering only pays when many units are cold on
+# multicore hardware — the opposite of this box. `ailite-cache` matters when a
+# sandbox resets and `target/` is lost; worth reaching for then, unnecessary
+# while the tree is warm.
+#
+# Usage:  tools/fastcheck            # run the whole suite
+#         tools/fastcheck archive::  # filter
+#         MODE=build tools/fastcheck # link the binary instead
+set -eu
+
+MODE="${MODE:-test}"
+export AILITE_INCREMENTAL="${AILITE_INCREMENTAL:-1}"
+export CARGO_PROFILE_AILITE_OPT_LEVEL="${CARGO_PROFILE_AILITE_OPT_LEVEL:-0}"
+export AILITE_QUIET="${AILITE_QUIET:-1}"
+
+start=$(date +%s)
+cargo ailite "$MODE" --no-default-features --offline --bin skydribble "$@" || rc=$?
+echo "fastcheck: ${MODE} in $(( $(date +%s) - start ))s" >&2
+exit "${rc:-0}"

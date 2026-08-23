@@ -107,7 +107,26 @@ impl Traits {
     /// exists: "70% tank, 30% hoverer" is a sentence about a real chassis.
     pub fn blend(self, other: Traits, w: f32) -> Traits {
         let w = w.clamp(0.0, 1.0);
-        let m = |a: f32, b: f32| a + (b - a) * w;
+        // Endpoint-exact lerp. `a + (b - a) * w` is monotonic but NOT exact at
+        // w = 1: for tank->hoverer traction it returns 0.19999999 where the
+        // hoverer's own value is 0.2, so a fully blended chassis was not equal
+        // to the thing it blended into. That matters wherever a blend is
+        // compared, keyed, or thresholded — `flies()` is a threshold on lift,
+        // and a chassis one ulp under the line does not fly.
+        //
+        // The two standard forms trade off against each other: the difference
+        // form is monotonic, `a*(1-w) + b*w` is endpoint-exact but can be
+        // non-monotonic in the interior. Taking the endpoints explicitly keeps
+        // both properties.
+        let m = |a: f32, b: f32| {
+            if w <= 0.0 {
+                a
+            } else if w >= 1.0 {
+                b
+            } else {
+                a + (b - a) * w
+            }
+        };
         Traits {
             traction: m(self.traction, other.traction),
             lift: m(self.lift, other.lift),
@@ -249,6 +268,37 @@ mod tests {
         let h = Traits::from_category("hoverer");
         assert_eq!(t.blend(h, -1.0), t);
         assert_eq!(t.blend(h, 2.0), h);
+        // exactly at the ends, not merely near them
+        assert_eq!(t.blend(h, 0.0), t);
+        assert_eq!(t.blend(h, 1.0), h);
+    }
+
+    #[test]
+    fn a_full_blend_flies_exactly_as_the_thing_it_blended_into() {
+        // the reason endpoint exactness is not pedantry: `flies()` is a
+        // threshold on lift, so a chassis one ulp under the line silently
+        // stops flying
+        for a in ["tank", "hoverer", "flyer", "boat", "spaceship"] {
+            for b in ["tank", "hoverer", "flyer", "boat", "spaceship"] {
+                let (x, y) = (Traits::from_category(a), Traits::from_category(b));
+                assert_eq!(x.blend(y, 1.0), y, "{a} fully blended into {b} is not {b}");
+                assert_eq!(x.blend(y, 1.0).flies(), y.flies(), "{a}->{b} changed flight");
+            }
+        }
+    }
+
+    #[test]
+    fn blending_stays_monotonic_in_the_interior() {
+        // the property the difference form was chosen for; taking the
+        // endpoints explicitly must not have cost it
+        let t = Traits::from_category("tank");
+        let h = Traits::from_category("hoverer");
+        let mut prev = t.hover;
+        for i in 0..=20 {
+            let v = t.blend(h, i as f32 / 20.0).hover;
+            assert!(v >= prev - 1e-6, "hover went backwards at w={}", i as f32 / 20.0);
+            prev = v;
+        }
     }
 
     #[test]

@@ -193,6 +193,47 @@ pub fn audit(m: &mut Morph, pop_tol: f32) -> Report {
     let rest: Vec<Option<Aabb>> = (0..prims).map(|p| Aabb::of(&m.sample(p, 0.0).verts)).collect();
     let mut prev: Vec<Option<Vec<Vec3>>> = vec![None; prims];
 
+    // THE AUTHORED POSES ARE THE BASELINE, not zero overlap.
+    //
+    // A tank's road wheels sit inside its hull; a shoulder sits in its
+    // socket. That is how the models are built, and measuring against zero
+    // reported it as a fault at t=0.00 before anything had moved. The sweep
+    // said 251 of 254 chassis were broken with 3.5 MILLION faults — a number
+    // so large and so wrong that the only possible response was to ignore the
+    // tool, which is worse than not having it.
+    //
+    // What the module exists to find is a part passing THROUGH another during
+    // transit. So the question is not "do these overlap" but "do they overlap
+    // MORE than they do at rest in either end pose". Same reasoning as
+    // `redistribute_length_to_height`, which caps mid-fold overshoot against
+    // the endpoints rather than against nothing.
+    let pair_baseline = |m: &mut Morph| -> Vec<f32> {
+        let mut base = vec![0.0f32; prims * prims];
+        for t in [0.0f32, 1.0] {
+            let boxes: Vec<Option<Aabb>> =
+                (0..prims).map(|p| Aabb::of(&m.sample(p, t).verts)).collect();
+            for a in 0..prims {
+                for b in (a + 1)..prims {
+                    let (Some(ba), Some(bb)) = (boxes[a], boxes[b]) else { continue };
+                    let d = ba.overlap_depth(&bb);
+                    if d <= 0.0 {
+                        continue;
+                    }
+                    let scale = ba.shortest_axis().min(bb.shortest_axis());
+                    if scale > 1e-6 {
+                        let rel = d / scale;
+                        let e = &mut base[a * prims + b];
+                        if rel > *e {
+                            *e = rel;
+                        }
+                    }
+                }
+            }
+        }
+        base
+    };
+    let baseline = pair_baseline(m);
+
     for s in 0..SAMPLES {
         let t = s as f32 / (SAMPLES - 1) as f32;
         let mut boxes: Vec<Option<Aabb>> = Vec::with_capacity(prims);
@@ -248,9 +289,11 @@ pub fn audit(m: &mut Morph, pop_tol: f32) -> Report {
                 }
                 let scale = ba.shortest_axis().min(bb.shortest_axis());
                 let rel = depth / scale;
-                worst_overlap = worst_overlap.max(rel);
-                if rel > OVERLAP_TOL {
-                    faults.push(Fault::SelfIntersection { a, b, t, depth: rel });
+                // excess over what the end poses already do
+                let excess = rel - baseline[a * prims + b];
+                worst_overlap = worst_overlap.max(excess);
+                if excess > OVERLAP_TOL {
+                    faults.push(Fault::SelfIntersection { a, b, t, depth: excess });
                 }
             }
         }
@@ -264,7 +307,7 @@ mod tests {
     use super::*;
     use crate::meshgen::Vertex;
 
-    fn cube(cx: f32, cy: f32, cz: f32, r: f32) -> Vec<Vertex> {
+    pub(super) fn cube(cx: f32, cy: f32, cz: f32, r: f32) -> Vec<Vertex> {
         let mut out = Vec::new();
         for i in 0..8 {
             let sx = if i & 1 == 0 { -r } else { r };
@@ -287,12 +330,19 @@ mod tests {
         assert_eq!(r.prims, 2);
     }
 
-    /// the case this module exists for: an arm sweeping through a torso.
-    /// Two prims that start apart and END on top of each other.
+    /// The case this module exists for: an arm sweeping THROUGH a torso —
+    /// apart at both ends, overlapping only in transit.
+    ///
+    /// The fixture used to end with both prims on the same point, and its own
+    /// doc said so: "start apart and END on top of each other". That is not a
+    /// sweep-through, it is a broken end pose, and once intersection is
+    /// measured against the authored poses it is credited as construction.
+    /// A swap tests the real thing: they cross at t=0.5 and are clear at
+    /// both ends, so every bit of the overlap is transit.
     #[test]
     fn a_prim_passing_through_another_is_caught() {
         let a = vec![cube(-3.0, 0.0, 0.0, 0.5), cube(3.0, 0.0, 0.0, 0.5)];
-        let b = vec![cube(0.0, 0.0, 0.0, 0.5), cube(0.0, 0.0, 0.0, 0.5)];
+        let b = vec![cube(3.0, 0.0, 0.0, 0.5), cube(-3.0, 0.0, 0.0, 0.5)];
         let idx = vec![vec![0u32, 1, 2], vec![0u32, 1, 2]];
         let mut m = Morph::build(vec![a, b], idx).unwrap();
         let r = audit(&mut m, 100.0); // pop tolerance high: isolate the intersection
@@ -300,6 +350,23 @@ mod tests {
             r.faults.iter().any(|f| matches!(f, Fault::SelfIntersection { .. })),
             "interpenetration went unnoticed: worst overlap {:.2}",
             r.worst_overlap
+        );
+    }
+
+    /// The other half of the same rule: overlap that is there in BOTH end
+    /// poses is how the model is built and must not be reported.
+    #[test]
+    fn overlap_the_model_was_authored_with_is_not_a_fault() {
+        // a wheel inside a hull: coincident at rest, coincident when folded,
+        // and it never moves relative to the other prim
+        let at_rest = vec![cube(0.0, 0.0, 0.0, 1.0), cube(0.0, 0.0, 0.0, 0.4)];
+        let idx = vec![vec![0u32, 1, 2], vec![0u32, 1, 2]];
+        let mut m = Morph::build(vec![at_rest.clone(), at_rest], idx).unwrap();
+        let r = audit(&mut m, 100.0);
+        assert!(
+            !r.faults.iter().any(|f| matches!(f, Fault::SelfIntersection { .. })),
+            "a prim that never moves relative to another was called a fault: {:?}",
+            r.faults.first()
         );
     }
 
@@ -386,5 +453,55 @@ mod tests {
             after.worst_pop > 0.0,
             "compaction moved vertices but the audit measured none of it"
         );
+    }
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::tests::cube;
+    use super::*;
+
+    /// WHY EVERY CHASSIS FAULTS, as a two-prim demonstration.
+    ///
+    /// The sweep says not one of 251 folds cleanly and the best still has 58
+    /// faults. That is not 251 bad models; it is one property of the fold.
+    /// `Morph::sample` lerps vertices, so a part travels the CHORD between
+    /// its two poses — the straight line — and any part whose start and end
+    /// are on opposite sides of another part goes through it.
+    ///
+    /// Nothing in the pipeline routes around anything. Worth stating as a
+    /// test so the conclusion in `--fold sweep` is not just a sentence
+    /// somebody wrote.
+    #[test]
+    fn a_lerp_takes_the_chord_and_the_chord_goes_through_things() {
+        // A swings from one side to the other; B sits still in the middle.
+        // Both end poses are clear; the straight path is not.
+        let pose_a = vec![cube(-3.0, 0.0, 0.0, 0.5), cube(0.0, 2.5, 0.0, 0.5)];
+        let pose_b = vec![cube(3.0, 0.0, 0.0, 0.5), cube(0.0, 2.5, 0.0, 0.5)];
+        let idx = vec![vec![0u32, 1, 2], vec![0u32, 1, 2]];
+        let mut m = Morph::build(vec![pose_a, pose_b], idx).unwrap();
+        let r = audit(&mut m, 100.0);
+        // clear at both ends, so anything reported is transit
+        assert!(
+            !r.faults.iter().any(|f| matches!(f, Fault::SelfIntersection { .. })),
+            "these two never meet; the chord passes below the stationary prim"
+        );
+
+        // now put the obstacle ON the chord
+        let pose_a = vec![cube(-3.0, 0.0, 0.0, 0.5), cube(0.0, 0.0, 0.0, 0.6)];
+        let pose_b = vec![cube(3.0, 0.0, 0.0, 0.5), cube(0.0, 0.0, 0.0, 0.6)];
+        let idx = vec![vec![0u32, 1, 2], vec![0u32, 1, 2]];
+        let mut m = Morph::build(vec![pose_a, pose_b], idx).unwrap();
+        let r = audit(&mut m, 100.0);
+        assert!(
+            r.faults.iter().any(|f| matches!(f, Fault::SelfIntersection { .. })),
+            "a part swinging across a stationary one did not register"
+        );
+        // and it happens in transit, not at an endpoint
+        for f in &r.faults {
+            if let Fault::SelfIntersection { t, .. } = f {
+                assert!(*t > 0.0 && *t < 1.0, "reported at an endpoint: t={t}");
+            }
+        }
     }
 }

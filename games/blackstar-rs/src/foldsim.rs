@@ -361,4 +361,40 @@ fn sweep(with_compaction: bool) {
     for (n, name) in worst.iter().take(10) {
         println!("  {n:4} faults  {name}");
     }
+
+    // A top-ten alone cannot tell you whether ten chassis fold badly or all
+    // of them do, and those want completely different responses: fix ten
+    // models, or fix the fold. The distribution answers it.
+    if !worst.is_empty() {
+        // `worst` is sorted DESCENDING, so index len/10 is the ninetieth
+        // percentile and len*9/10 is the tenth. My first version labelled
+        // them the other way round and then drew a conclusion from the
+        // labels, which is how you get a confident wrong answer out of
+        // correct data.
+        let counts: Vec<usize> = worst.iter().map(|(n, _)| *n).collect();
+        let n = counts.len();
+        println!(
+            "\n  spread: worst {}, p90 {}, median {}, p10 {}, best {}",
+            counts[0],
+            counts[n / 10],
+            counts[n / 2],
+            counts[n * 9 / 10],
+            counts[n - 1]
+        );
+        // The question is not the spread, it is whether ANY chassis folds
+        // cleanly. A ratio between worst and median can look like a tail
+        // while every single model is still faulty.
+        if clean == 0 {
+            println!(
+                "  NOT ONE of the {} folds cleanly, and the best still has {} faults.",
+                clean + dirty,
+                counts[n - 1]
+            );
+            println!("  this is the FOLD, not the models: a straight vertex lerp moves every");
+            println!("  part along a chord, so parts that pass each other on the way cross.");
+            println!("  fixing the worst ten would change nothing about the other {}.", n - 10);
+        } else {
+            println!("  {clean} fold cleanly; the rest are worth looking at individually.");
+        }
+    }
 }

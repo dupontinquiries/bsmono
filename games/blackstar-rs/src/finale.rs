@@ -128,6 +128,41 @@ mod tests {
     use crate::weapons::{Star, STAR_FULL};
 
     #[test]
+    fn the_two_endings_are_not_symmetric_and_the_gap_is_two_seconds() {
+        // Found by driving `--finale`, not by reading: NewSun is always
+        // available and Teleport is REFUSED straight after the strike,
+        // because Photon Man costs almost the whole resolve pool (5% left
+        // against a 16% shift). It becomes possible only if the Morpher
+        // survives long enough to recover eleven percent.
+        //
+        // Nobody wrote that rule; it falls out of two costs in `watch.rs`.
+        // Pinned here because it is now a story fact — the ending depends on
+        // whether the scene gives him a beat — and a tweak to SHIFT_COST or
+        // the Photon cost would silently rewrite it.
+        let after_photon = || {
+            let mut w = Watch::default();
+            w.shift(PHOTON, true).unwrap();
+            w
+        };
+        assert!(!teleport_affordable(&after_photon()), "Teleport should not be free after Photon");
+
+        let mut w = after_photon();
+        assert!(resolve(Ending::Teleport, &mut w).is_err(), "Teleport ran anyway");
+        let mut w = after_photon();
+        assert!(resolve(Ending::NewSun, &mut w).is_ok(), "NewSun should always be available");
+
+        // and the gap is short enough to be a dramatic beat rather than a
+        // different scene
+        let need = (crate::watch::SHIFT_COST - after_photon().resolve()).max(0.0)
+            / crate::watch::REGEN_PER_SEC;
+        assert!(need > 0.0 && need < 5.0, "the recovery beat is {need}s");
+        let mut rested = after_photon();
+        rested.tick(need + 0.5);
+        assert!(teleport_affordable(&rested), "the beat did not pay for the leap");
+        assert!(resolve(Ending::Teleport, &mut rested).is_ok());
+    }
+
+    #[test]
     fn a_true_nova_refuses_outright_no_matter_who_is_watching() {
         // this is the whole point of the correction: full force is not
         // an option here, not even with Photon Man aiming it
@@ -196,4 +231,101 @@ mod tests {
         assert!(msg.contains("new sun"));
         assert_eq!(watch.current_name(), before, "the new-sun ending changed what the Watch is doing");
     }
+}
+
+// --------------------------------------------------------------- driver ---
+
+/// `--finale` — the red dwarf strike, and the three ways it refuses.
+///
+/// `converge` and `resolve` were written, tested, and called by nothing.
+/// That matters more here than for most dead modules: the interesting thing
+/// about this scene is not that it succeeds, it is WHAT IT REFUSES. A true
+/// nova is turned away because the arriving allies are standing in the
+/// radius; a small draw because a shrug does not touch a fleet; a Watch not
+/// holding Photon Man because the held draw goes out broad instead of aimed.
+///
+/// Three refusals that each state a piece of the fiction, and no way to read
+/// them short of the source.
+pub fn run(argv: &[String]) {
+    let i = argv.iter().position(|a| a == "--finale").unwrap_or(0);
+    let arg = argv.get(i + 1).map(String::as_str);
+
+    println!("THE RED DWARF STRIKE\n");
+    println!("  Billy does not release fully. He holds the charge short of a nova");
+    println!("  -- dims the star toward a red dwarf -- and Photon Man aims it, away");
+    println!("  from the airspace the arriving Clone worlds are leaping into.");
+    println!("  Restraint is not his instinct, which is why doing it once counts.\n");
+
+    // the refusals, each with the state that causes it
+    let aimed = photon_watch();
+    let wrong_form = Watch::default();
+    println!("  WHAT IT REFUSES\n");
+    for (what, mult, full, w) in [
+        ("a true nova", 9.0f32, true, &aimed),
+        ("too small a draw", 1.0, false, &aimed),
+        ("nobody aiming it", 9.0, false, &wrong_form),
+    ] {
+        match converge(mult, full, w) {
+            Err(e) => println!("    {:<18} {}", what, e),
+            Ok(c) => println!("    {:<18} UNEXPECTEDLY ALLOWED ({} cleared)", what, c.fleet_cleared),
+        }
+    }
+
+    println!("\n  WHAT IT DOES, by how much of the star he holds\n");
+    println!("    {:>6}  {:>14}", "mult", "fleet cleared");
+    for mult in [3.0f32, 4.0, 6.0, 9.0, 12.0] {
+        match converge(mult, false, &aimed) {
+            Ok(c) => println!("    {mult:>6.1}  {:>14}", c.fleet_cleared),
+            Err(e) => println!("    {mult:>6.1}  {e}"),
+        }
+    }
+
+    // and the two endings, which the treatment deliberately leaves open
+    let which = match arg {
+        Some("teleport") => Some(Ending::Teleport),
+        Some("newsun") => Some(Ending::NewSun),
+        _ => None,
+    };
+    // THE TWO ENDINGS ARE NOT SYMMETRIC, and that turns out to be the
+    // interesting thing. NewSun is always available. Teleport needs the
+    // Morpher to hold one more form, and Photon Man costs almost the whole
+    // resolve pool — 5% left against a 16% shift — so straight after the
+    // strike it REFUSES. It only becomes possible if he survives long enough
+    // to recover eleven percent.
+    //
+    // So the choice is not a menu. NewSun is what happens if the scene does
+    // not give him that beat, and the mechanics say so without anyone having
+    // written the rule down.
+    println!("\n  THE ENDING is still open, and the two are NOT symmetric:\n");
+    let rest_s = (crate::watch::SHIFT_COST - photon_watch().resolve()).max(0.0)
+        / crate::watch::REGEN_PER_SEC;
+    for e in [Ending::Teleport, Ending::NewSun] {
+        if which.map_or(false, |w| w != e) {
+            continue;
+        }
+        let mut now = photon_watch();
+        println!("    {:?}", e);
+        match resolve(e, &mut now) {
+            Ok(s) => println!("      straight after the strike: {s}"),
+            Err(s) => println!("      straight after the strike: REFUSED — {s}"),
+        }
+        let mut rested = photon_watch();
+        rested.tick(rest_s + 0.5);
+        match resolve(e, &mut rested) {
+            Ok(s) => println!("      after {rest_s:.0}s of holding on: {s}"),
+            Err(s) => println!("      after {rest_s:.0}s of holding on: still refused — {s}"),
+        }
+    }
+    println!("\n  Photon Man costs almost the whole pool, so Teleport needs {rest_s:.0}s");
+    println!("  the scene may not have. NewSun is what happens if it does not.");
+    println!("\n  --finale teleport | newsun  for one of them");
+}
+
+/// A Watch actually holding Photon Man, which every success path needs.
+fn photon_watch() -> Watch {
+    let mut w = Watch::default();
+    // reach the state the way the game does — `shift` is the real path and
+    // carries its own resolve cost — rather than writing the field
+    let _ = w.shift(PHOTON, true);
+    w
 }

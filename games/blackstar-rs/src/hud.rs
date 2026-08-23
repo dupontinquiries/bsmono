@@ -223,8 +223,8 @@ pub fn draw_deck(ui: &mut Vec<UiVert>, a: f32, v: &crate::deck::DeckView) {
     label(ui, -0.58, 0.83, 0.011, a, PAPER, v.title());
     label(ui, -0.58, 0.744, 0.0066, a, DIM, v.room());
 
-    let top = 0.66;
-    let row_h = 0.072;
+    let top = DECK_TOP;
+    let row_h = DECK_ROW_H;
     let rows = v.rows();
     // the cursor bar first, under the text: spring y in visible units
     let (cy, squash) = v.cursor();
@@ -387,6 +387,24 @@ pub const T_HINT: f32 = 0.0068;
 pub const TW_ROW_H: f32 = 0.062;
 /// Bottom of the scrolling viewport (above the legend).
 pub const TW_BOTTOM: f32 = -0.78; // above the nav strip
+
+/// The station console's own row geometry.
+///
+/// These were literals inside the draw call, so nothing else could ask how
+/// many rows the panel holds — and `Menu::view` was a hardcoded 12 while the
+/// panel fits twenty. The deck scrolled eight rows early, and the wardeck's
+/// twenty rows scrolled when they would have fitted exactly.
+///
+/// Normalised UI space, so the answer does not depend on the display: this
+/// is a geometry question, not a screen question, which is why it can be
+/// settled here rather than by looking.
+pub const DECK_TOP: f32 = 0.66;
+pub const DECK_ROW_H: f32 = 0.072;
+
+/// How many console rows the panel actually holds.
+pub fn deck_rows() -> usize {
+    vis_rows(DECK_ROW_H, DECK_TOP, TW_BOTTOM)
+}
 
 /// How many rows fit in a menu viewport.
 pub fn vis_rows(row_h: f32, top: f32, bottom: f32) -> usize {
@@ -624,7 +642,11 @@ pub fn catalog_menu(
     }
     let row_h = if wide { 0.052 } else { 0.046 };
     let top = if wide { 0.72 } else { 0.26 };
-    let vis = ((top - TW_BOTTOM) / row_h) as usize;
+    // through the shared helper: this was the one panel with its own copy of
+    // the formula, so it also missed `vis_rows`'s floor — a layout that ever
+    // squeezed to nothing would have given a window of zero rows here and a
+    // usable three everywhere else
+    let vis = vis_rows(row_h, top, TW_BOTTOM);
     let start = scroll.min(rows.len().saturating_sub(vis.min(rows.len())));
     let end = (start + vis).min(rows.len());
     scrollbar(ui, a, px1 - 0.03, TW_BOTTOM, top + 0.02, rows.len(), vis, start);
