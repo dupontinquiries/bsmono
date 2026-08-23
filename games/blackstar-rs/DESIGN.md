@@ -6173,6 +6173,26 @@ depend on menu navigation.
 
 1115 passing.
 
+THE SHIP IS IN THE SCENE. Uploaded once at launch, drawn every frame at the
+world origin, one draw call of about a thousand triangles — 26 m across and
+10.3 m tall.
+
+AND THE OBVIOUS TRANSFORM WAS WRONG. I lifted the hull by `-deck_y`, which is
+where you STAND — but the rooms extend below the deck, so the ship sat 4.9 m
+UNDERGROUND. On screen that looks like nothing drew at all, which is the worst
+possible failure because it points at the draw call rather than at the
+transform, and it would have cost a playtest to find.
+
+A test caught it before the build finished: take the mesh's own lowest vertex,
+apply the lift, and assert the floor is above ground. `ground_lift` is the
+mesh's floor rather than the deck.
+
+That is the argument for the arithmetic checks in general. I could not look at
+this, so the only way to know the ship was not buried was to compute where it
+lands — and the computation is three lines.
+
+1116 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

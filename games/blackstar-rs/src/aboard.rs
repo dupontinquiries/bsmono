@@ -155,6 +155,21 @@ impl Aboard {
 
 // -------------------------------------------------------------- shape ---
 
+/// How far to lift the hull so it rests on the ground.
+///
+/// `-deck_y` is the obvious answer and it is wrong: the deck is where you
+/// STAND, and the rooms extend below it. Lifting by the deck leaves the hull
+/// 4.9 m underground on a 70 m ship, which on screen looks like nothing drew
+/// at all — the worst possible failure, because it points at the draw call
+/// rather than at the transform.
+///
+/// The mesh's own lowest vertex is the answer.
+pub fn ground_lift(ship: &Interior) -> f32 {
+    let m = hull_mesh(ship);
+    let lo = m.verts.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+    -lo + 0.1
+}
+
 /// A drawable mesh for the ship's interior.
 ///
 /// **`interior.rs` gives you a ship you can walk in and nothing to look at.**
@@ -285,6 +300,15 @@ pub fn run(argv: &[String]) {
         dark.consoles_reachable().len(), STATIONS.len());
 
     println!("\n  AND SOMETHING TO LOOK AT\n");
+    println!("    parked at the origin, lifted {:.1} m so it rests on the ground.",
+        ground_lift(&a.ship));
+    {
+        let m = hull_mesh(&a.ship);
+        let span = m.verts.iter().map(|v| v.pos[0].abs()).fold(0.0f32, f32::max) * 2.0;
+        let tall = m.verts.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max)
+            - m.verts.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+        println!("    {span:.0} m across, {tall:.1} m tall — drive to 0,0 and look.\n");
+    }
     let lit = hull_mesh(&a.ship);
     let mut sealed_ship = Aboard::new(hull);
     sealed_ship.power_out();
@@ -435,6 +459,26 @@ mod tests {
         );
         // the rooms are still there — it is a sealed ship, not an empty one
         assert!(b.verts.len() >= dark.ship.cells.len() * 8);
+    }
+
+    #[test]
+    fn the_hull_sits_where_the_draw_call_puts_it() {
+        // main.rs lifts the mesh by -deck_y so it rests on the ground rather
+        // than half-buried. If that sign is wrong the ship is underground and
+        // looks like nothing drew — worth knowing the numbers before looking.
+        let a = Aboard::new(70.0);
+        let m = hull_mesh(&a.ship);
+        let lo_y = m.verts.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+        let hi_y = m.verts.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+        let lifted_lo = lo_y + ground_lift(&a.ship);
+        assert!(
+            lifted_lo > -1.0,
+            "the lifted hull's floor is at {lifted_lo:.2} — it will be underground"
+        );
+        // and it is a ship-sized object, not a speck or a continent
+        let span = m.verts.iter().map(|v| v.pos[0].abs()).fold(0.0f32, f32::max) * 2.0;
+        assert!((20.0..200.0).contains(&span), "the hull spans {span:.0} m");
+        assert!(hi_y - lo_y > 2.0, "the hull is {:.1} m tall", hi_y - lo_y);
     }
 
     #[test]

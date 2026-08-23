@@ -105,7 +105,14 @@ fixed, and moving between them is a position and a walkable check.
       for a 70 m hull, which is nothing. Shut corridors are omitted, so the
       mesh and `reachable_from` agree about what is passable instead of being
       two answers to the same question.
-- [~] **The upload path exists and nothing calls it.** `Aboard::upload_hull`
+- [x] **The ship is in the scene.** Uploaded once at launch and drawn every
+      frame at the world origin — 26 m across, 10.3 m tall, one draw call.
+      Drive to 0,0 and look.
+      **What to check:** that it is there at all; that it is not inside the
+      terrain; that the rooms read as rooms rather than one block. If it is
+      invisible, the mesh slot or the draw is wrong; if it is a grey lump, the
+      lighting params `[0.35, 0.0, 0.25, 0.0]` are the dial.
+- [~] (was) The upload path exists and nothing calls it. `Aboard::upload_hull`
       registers the mesh with `Gpu::add_mesh` and remembers the slot,
       re-uploading when the doors move. It type-checks — `wgpu` is not
       feature-gated, so `render.rs` is in the build the tests run against —

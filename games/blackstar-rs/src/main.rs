@@ -686,6 +686,8 @@ struct Game {
     /// morph is rebuilt every time the active car changes.
     bot_categories: std::collections::HashMap<String, String>,
     gpu: render::Gpu,
+    /// the ship interior, and the mesh slot its hull was uploaded to
+    aboard: aboard::Aboard,
     world: World,
     car: Car,
     ball: Ball,
@@ -1816,6 +1818,7 @@ fn main() {
     let mut game = Game {
         bot_categories: bot_categories_loaded,
         gpu,
+        aboard: aboard::Aboard::new(70.0),
         world,
         car,
         ball,
@@ -1923,6 +1926,14 @@ fn main() {
         air_t: 0.0,
         air_link: 0.0,
     };
+
+    // Upload the ship's hull once. `Aboard::upload_hull` needs `&mut Gpu`, so
+    // it happens here rather than in the struct literal — Game owns the gpu.
+    {
+        let mut ab = std::mem::replace(&mut game.aboard, aboard::Aboard::new(1.0));
+        ab.upload_hull(&mut game.gpu);
+        game.aboard = ab;
+    }
 
     // ---- launch-time multiplayer: bsgames handoff first, then CLI ---------
     if game.save.name.is_empty() && (opts.host || opts.join.is_some()) {
@@ -5924,6 +5935,29 @@ impl Game {
                 Mat4::IDENTITY,
                 self.style().grass,
                 [1.0, 0.0, 0.04, 0.0],
+            );
+        }
+
+        // THE SHIP. Parked at the origin, lifted clear of the deck so it sits
+        // on the ground rather than half-buried. One draw, ~1000 triangles.
+        //
+        // Same shape as the terrain chunks above: a mesh slot, an identity-ish
+        // transform, a colour. Placed here rather than behind a mode because
+        // the fastest way to find out whether it looks right is to be able to
+        // drive up to it.
+        if let Some(slot) = self.aboard.hull_slot {
+            let lift = Mat4::from_translation(Vec3::new(
+                0.0,
+                aboard::ground_lift(&self.aboard.ship),
+                0.0,
+            ));
+            push(
+                &mut objs,
+                slot,
+                None,
+                lift,
+                [0.62, 0.66, 0.72, 1.0],
+                [0.35, 0.0, 0.25, 0.0],
             );
         }
 
