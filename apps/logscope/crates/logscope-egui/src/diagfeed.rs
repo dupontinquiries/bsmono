@@ -290,6 +290,39 @@ pub fn clear() {
 /// Dismissing a banner must not DELETE the diagnostics — the button sits next to one that opens the
 /// page showing them, and wiping the evidence on the way to reading it is the worst possible
 /// pairing. It suppresses the banner until something new arrives instead.
+/// Serialises the tests that drive the process-global [`FEED`].
+///
+/// `clear()` / `record()` / `banner()` all operate on one static, so any two
+/// tests using them are the same test running twice with interleaved steps.
+/// Reported from a fleet build (2026-08-23): `a_failure_outranks_a_later_warning`
+/// unwrapped `None`, and `the_banner_shows_what_the_panel_ranks_first` asserted
+/// against a line another test had recorded —
+///
+///     left:  Some("load failed: 30 of 40 blocks carry ssm_* tensors")
+///     right: Some("load failed: something structural")
+///
+/// — which is one test's fixture appearing in another's assertion, the
+/// signature of a shared mutable global rather than of a logic error.
+///
+/// It passed everywhere it had been run before because those machines had ONE
+/// core, so libtest's default thread pool was one thread and the tests were
+/// serial by accident. It is a real defect that a 1-CPU sandbox structurally
+/// cannot surface, which is worth remembering the next time a suite is green
+/// here and not there.
+///
+/// A lock rather than `--test-threads=1`: the flag would serialise the whole
+/// crate's 981 tests to fix ten of them, and a future test that touches the
+/// feed would silently rejoin the race.
+///
+/// `.unwrap_or_else(|e| e.into_inner())` because a panicking test poisons the
+/// mutex, and the next test should report its own failure rather than a
+/// poisoning error that hides it.
+#[cfg(test)]
+fn feed_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 static DISMISSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 use std::sync::atomic::Ordering::Relaxed as O;
 
@@ -321,6 +354,7 @@ mod sink {
     /// exactly that mistake).
     #[test]
     fn the_sink_records_ranks_and_counts() {
+        let _feed = crate::diagfeed::feed_guard();
         clear();
         assert_eq!(attention(), 0);
         record("wgpu-engine: adapter = Apple M2 Ultra [Vulkan]");
@@ -528,8 +562,46 @@ pub fn summarise(text: &str) -> String {
 mod banner_tests {
     use super::*;
 
+
+    /// Every test that touches the global feed takes `feed_guard()`.
+    ///
+    /// The lock only works if it is taken. A new test calling `record()`
+    /// without it rejoins the race silently — and, on a 1-CPU machine, passes
+    /// while doing so. That is exactly how the two failures this guard exists
+    /// for reached a fleet build in the first place.
+    ///
+    /// Structural, because the alternative is trusting nine call sites to stay
+    /// correct and a tenth to be written correctly.
+    #[test]
+    fn every_test_touching_the_global_feed_takes_the_guard() {
+        let src = include_str!("diagfeed.rs");
+        // Split into test functions, crudely but sufficiently: each `#[test]`
+        // starts one and the next `#[test]` (or EOF) ends it.
+        let mut offenders = Vec::new();
+        let parts: Vec<&str> = src.split("#[test]").skip(1).collect();
+        for body in parts {
+            let name = body
+                .split("fn ").nth(1).unwrap_or("")
+                .split('(').next().unwrap_or("").trim().to_string();
+            if name == "every_test_touching_the_global_feed_takes_the_guard" { continue }
+            let touches = body.contains("clear()")
+                || body.contains("record(")
+                || body.contains("banner()")
+                || body.contains("dismiss_banner()");
+            if touches && !body.contains("feed_guard()") {
+                offenders.push(name);
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these tests drive the process-global FEED without taking feed_guard(), so they race each other under parallel libtest: {offenders:?}. Add `let _feed = crate::diagfeed::feed_guard();` as the first line. A 1-CPU machine will not catch this for you."
+        );
+    }
+
     #[test]
     fn nothing_worth_saying_shows_nothing() {
+        let _feed = crate::diagfeed::feed_guard();
         clear();
         record("wgpu-engine: adapter = Apple M2 Ultra [Vulkan]");
         record("wgpu-engine: [m.gguf] roofline — 25 GB/s of 800 spec = 3% of the decode ceiling");
@@ -540,6 +612,7 @@ mod banner_tests {
     /// The case this exists for: the paste that lost its middle.
     #[test]
     fn a_truncated_paste_says_so_with_the_number() {
+        let _feed = crate::diagfeed::feed_guard();
         clear();
         record("wgpu-engine: context 13412 tokens > 3840 window — kept 1024 head + 2800 tail, \
 9588 elided from the middle and MARKED as such (raise n_ctx for more)");
@@ -554,6 +627,7 @@ mod banner_tests {
     /// recency, matching the panel's own ranking so the two never disagree.
     #[test]
     fn a_failure_outranks_a_later_warning() {
+        let _feed = crate::diagfeed::feed_guard();
         clear();
         record("worker: load failed: 30 of 40 blocks carry ssm_* tensors — HYBRID RECURRENT model");
         record("wgpu-engine: [m.gguf] TEMPLATE MISMATCH — the prompt carries marker TEXT");
@@ -572,6 +646,7 @@ marker TEXT that this tokenizer does not know"), "TEMPLATE MISMATCH");
     /// A line with no em-dash must not be reduced to nothing.
     #[test]
     fn a_short_line_survives_intact() {
+        let _feed = crate::diagfeed::feed_guard();
         let s = summarise("worker: load failed: missing feed_forward_length");
         assert!(s.contains("missing feed_forward_length"), "{s}");
     }
@@ -586,6 +661,7 @@ mod banner_agrees_with_the_panel {
     /// the panel shows FIRST among interrupting entries is what the banner summarises.
     #[test]
     fn the_banner_shows_what_the_panel_ranks_first() {
+        let _feed = crate::diagfeed::feed_guard();
         for order in [
             vec!["wgpu-engine: adapter = M2",
                  "wgpu-engine: [a] TEMPLATE MISMATCH — marker text",
@@ -608,6 +684,7 @@ mod banner_agrees_with_the_panel {
     /// And nothing interrupting still means no banner, via the cheap path too.
     #[test]
     fn the_cheap_path_stays_silent_when_it_should() {
+        let _feed = crate::diagfeed::feed_guard();
         clear();
         record("wgpu-engine: adapter = M2 Ultra");
         record("wgpu-engine: [m] roofline — 3% of the decode ceiling");
@@ -624,6 +701,7 @@ mod dismissal {
     /// "details" button opens a page to show.
     #[test]
     fn dismissing_hides_the_banner_and_keeps_the_evidence() {
+        let _feed = crate::diagfeed::feed_guard();
         clear();
         record("worker: load failed: 30 of 40 blocks carry ssm_* tensors");
         assert!(banner().is_some());
@@ -644,6 +722,7 @@ mod dismissal {
     /// furniture.
     #[test]
     fn a_repeat_of_a_dismissed_line_stays_quiet() {
+        let _feed = crate::diagfeed::feed_guard();
         clear();
         record("wgpu-engine: [m] device error (non-fatal, logged): Validation Error");
         dismiss_banner();
