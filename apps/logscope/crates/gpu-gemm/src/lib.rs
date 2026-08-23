@@ -748,7 +748,15 @@ type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, (wgpu::Buffer, u64, u64), wg
 /// TOTAL live dims buffer count (cache cap + ring) so Metal's buffer-object ceiling is never hit no
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
 /// a slot is never rewritten while an in-flight dispatch still reads it.
-const DIMS_RING_SIZE: usize = 2048;
+/// Upper bound on the dims reuse ring. The EFFECTIVE size is `Gpu::dims_ring_cap`
+/// — see `dims_ring_cap_for`.
+///
+/// The ring GROWS LAZILY to this size and only then starts reusing slots, so its
+/// cap is a real claim on objects rather than a notional ceiling. At a flat 2048
+/// against Apple Vulkan's 3072 soft cap that is 67% of the whole budget for the
+/// ring alone, and cache+ring together reached exactly 100% of it before a
+/// single slot was ever reused.
+const DIMS_RING_SIZE_MAX: usize = 2048;
 
 /// How large the dims CONTENT cache may grow on this backend.
 ///
@@ -766,10 +774,28 @@ fn dims_cap_for(soft_object_cap: usize) -> usize {
     (soft_object_cap / 3).clamp(256, DIMS_CACHE_CAP_MAX)
 }
 
+/// How many slots the dims reuse RING may hold on this backend.
+///
+/// The ring is the good structure — bounded and recycled — but it grows lazily
+/// to its cap before reusing anything, so the cap is spent objects, not a
+/// notional limit. A quarter of the soft cap: with the cache at a third, the two
+/// together claim ~58% of the budget instead of the 200% a flat 4096+2048 asked
+/// for on Apple Vulkan.
+///
+/// A smaller ring wraps more often, and a wrap costs a `flush_and_wait` fence.
+/// That is the trade being made deliberately: fences are a throughput cost the
+/// engine already measures (`SUBMIT_BY_DIMS_WRAP`), while exceeding the
+/// allocation ceiling is a clamped decode window, which the fleet log shows
+/// costs more.
+fn dims_ring_cap_for(soft_object_cap: usize) -> usize {
+    (soft_object_cap / 4).clamp(128, DIMS_RING_SIZE_MAX)
+}
+
 /// ## A structural difference from llama.cpp, measured in buffer objects
 ///
 /// Every dispatch here needs four u32s of shape, and we pass them in a UNIFORM BUFFER — cached by
-/// content up to `DIMS_CACHE_CAP` with a `DIMS_RING_SIZE` ring behind it. **Up to 6144 buffer objects
+/// content up to `Gpu::dims_cap` with a `Gpu::dims_ring_cap` ring behind it — both now derived from
+/// the backend's object budget, having been flat 4096 and 2048 (**6144 buffer objects**
 /// holding sixteen bytes each.** The governor's own model puts `baseline_objects` at 6400 against a
 /// `soft_object_cap` of 8192, so the engine starts at 78% of its object budget before allocating a
 /// single weight.
@@ -963,6 +989,8 @@ pub struct Gpu {
     /// A field rather than a const because the right value is a fraction of a
     /// budget that differs 2.7x between Metal and Apple Vulkan.
     dims_cap: usize,
+    /// Effective cap on the dims reuse ring, from `dims_ring_cap_for`.
+    dims_ring_cap: usize,
     /// Bind-group cache (opt-in via LOGSCOPE_BG_CACHE): a fresh bind group was created on EVERY dispatch,
     /// which the Asahi profile shows as a dispatch-bound (CPU-setup) hotspot — ~480 creations/token on a
     /// 48-layer MoE decode. A bind group only encodes WHICH buffers bind to WHICH slots (not their
@@ -1037,7 +1065,7 @@ pub struct Gpu {
     pending_keep: Mutex<Vec<Keep>>,
     /// Reusable dims-uniform ring (see ring_dims): a fixed set of UNIFORM buffers rewritten in rotation
     /// for the per-position dims that would otherwise create a new Metal buffer every dispatch. `(buffers,
-    /// next_index, writes_since_fence)`. Lazily filled up to DIMS_RING_SIZE. Caps total dims buffer count.
+    /// next_index, writes_since_fence)`. Lazily filled up to `dims_ring_cap`. Caps total dims buffer count.
     dims_ring: Mutex<(Vec<std::sync::Arc<wgpu::Buffer>>, usize, usize)>,
     /// Reusable MAP_READ staging buffers, keyed by exact size. See StagingPool.
     staging: StagingPool,
@@ -1643,7 +1671,8 @@ impl Gpu {
         // Same budget the governor steers by, so the dims cache cannot claim more
         // objects than the window is allowed to assume are free.
         let dims_cap = dims_cap_for(governor.lock().unwrap().budget().soft_object_cap);
-        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), dims_cap, bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let dims_ring_cap = dims_ring_cap_for(governor.lock().unwrap().budget().soft_object_cap);
+        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), dims_cap, dims_ring_cap, bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -3892,11 +3921,11 @@ impl Gpu {
     fn ring_dims(&self, dims: &[u8]) -> std::sync::Arc<wgpu::Buffer> {
         let mut ring = self.dims_ring.lock().unwrap();
         let (buffers, next, _writes) = &mut *ring;
-        if buffers.len() < DIMS_RING_SIZE {
-            // still growing the ring — allocate a new reusable slot (bounded by DIMS_RING_SIZE total)
+        if buffers.len() < self.dims_ring_cap {
+            // still growing the ring — allocate a new reusable slot (bounded by dims_ring_cap total)
             let b = self.make_dims_buffer(dims);
             buffers.push(b.clone());
-            *next = buffers.len() % DIMS_RING_SIZE;
+            *next = buffers.len() % self.dims_ring_cap;
             return b;
         }
         // ring full: reuse slot `next`. If we're about to wrap to slot 0, fence first so no in-flight
@@ -3925,11 +3954,14 @@ impl Gpu {
         let (buffers, next, _writes) = &mut *ring;
         let b = buffers[idx].clone();
         self.queue.write_buffer(&b, 0, dims);
-        *next = (idx + 1) % DIMS_RING_SIZE;
+        // buffers.len() rather than the cap: in this branch the ring is full so
+        // they are equal, and using the actual length cannot desynchronise if the
+        // cap is ever derived differently from the growth condition above.
+        *next = (idx + 1) % buffers.len().max(1);
         b
     }
-    /// Total live dims UNIFORM buffers (content cache + reuse ring). Bounded by DIMS_CACHE_CAP +
-    /// DIMS_RING_SIZE regardless of generation length — the invariant the M4 buffer-count fix rests on.
+    /// Total live dims UNIFORM buffers (content cache + reuse ring). Bounded by `dims_cap` +
+    /// `dims_ring_cap` regardless of generation length — the invariant the M4 buffer-count fix rests on.
     pub fn dims_buffer_count(&self) -> usize {
         self.dims_cache.lock().unwrap().len() + self.dims_ring.lock().unwrap().0.len()
     }

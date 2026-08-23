@@ -412,11 +412,17 @@ mod tests {
 would be permitted to consume the whole budget it is being steered within",
                 b.soft_object_cap
             );
-            // And leave room for the ring plus something to actually run.
+            // CACHE + RING TOGETHER, which is the invariant that was actually
+            // violated. The ring grows lazily to its cap before reusing a slot,
+            // so both are spent objects and only their sum matters. A flat
+            // 4096 + 2048 was 6144 against Apple Vulkan's 3072 — 200% of the
+            // budget for the two structures the baseline claims to include.
+            let ring = crate::dims_ring_cap_for(b.soft_object_cap);
             assert!(
-                cap + crate::DIMS_RING_SIZE.min(b.soft_object_cap) <= b.soft_object_cap * 2,
-                "{name}: cap {cap} + ring is more than double the budget {}",
-                b.soft_object_cap
+                cap + ring <= b.soft_object_cap * 3 / 4,
+                "{name}: dims cache {cap} + ring {ring} = {} claims more than 75% of the {} \
+object budget, leaving too little for KV, the arena and a decode window",
+                cap + ring, b.soft_object_cap
             );
         }
     }
