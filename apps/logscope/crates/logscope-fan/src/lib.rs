@@ -62,6 +62,10 @@
 // How far the operator has gone past each node: what lets the graph badge an
 // unanswered question instead of the run having to stop for it.
 #[allow(dead_code)] pub mod readmark;
+// Whether a work budget applies at all: a laptop on battery and an Asahi
+// desktop on mains are not the same machine, and neither is a Jackery in the
+// sun. Every unknown resolves to metered.
+#[allow(dead_code)] pub mod powerbudget;
 #[allow(dead_code)] pub mod reply;
 #[allow(dead_code)] pub mod capability;
 #[allow(dead_code)] pub mod liaison_fan;
