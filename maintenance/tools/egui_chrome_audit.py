@@ -36,10 +36,34 @@ IF = re.compile(r'^\s*(\}\s*)?(else\s+)?if\b|^\s*match\b')
 
 
 def scan(path):
-    """(id, side, guarded, nested) per panel."""
+    """(id, side, guarded, nested) per panel.
+
+    SKIPS `#[cfg(test)]` modules. A test that builds a panel to measure it is
+    not chrome anybody sees, and counting it produced the tool's first false
+    positive: voiceterm's headless layout test constructs an unguarded
+    `SidePanel::left("tabbar")` to check its width, and the audit reported the
+    shipped column — correctly gated twenty lines of source away — as standing.
+
+    That is the failure mode this tool most needed to avoid. A counter that
+    cries wolf on the one crate it was built for is a counter people stop
+    reading, and the gate it flagged was intact.
+    """
     out, depth, if_depths, panel_depths = [], 0, [], []
+    test_depth = None          # brace depth at which a #[cfg(test)] block opened
+    pending_test = False       # saw the attribute, waiting for its `{`
     for line in path.read_text(errors="replace").splitlines():
         stripped = line.strip()
+        if "#[cfg(test)]" in stripped:
+            pending_test = True
+        if pending_test and "{" in stripped:
+            test_depth = depth
+            pending_test = False
+        if test_depth is not None:
+            # Inside a test module: advance the depth and skip everything else.
+            depth += stripped.count("{") - stripped.count("}")
+            if depth <= test_depth:
+                test_depth = None
+            continue
         if IF.match(line):
             if_depths.append(depth)
         m = PANEL.search(line)
