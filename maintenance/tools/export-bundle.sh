@@ -40,16 +40,25 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 echo "consolidating packs (REPO_SIZE.md step 1)…"
-# STDIN CLOSED. `git gc` spawns `git repack`, which inherits stdin, and if the
-# caller left anything readable there repack consumes it as arguments and dies:
+# STDIN CLOSED, and the reason is narrower than an earlier version of this
+# comment claimed.
 #
-#   fatal: bad revision 'ls: cannot access .git/gc.log ...'
-#   fatal: failed to run repack
+# `git gc` intermittently died with `fatal: bad revision '<some previous
+# command's output>'` followed by `failed to run repack`. That reads like a
+# corrupt pack index and is not: `git fsck` is clean, `git repack -a -d -l`
+# alone succeeds, and a traced `git gc` run succeeds too.
 #
-# The quoted text is the PREVIOUS command's output, which is what made it look
-# like repository corruption — `git fsck` was clean and `git repack -a -d -l`
-# alone succeeded every time. Reproduced and fixed by adding `< /dev/null`.
-# An export is the last thing that should fail for a reason outside itself.
+# It only failed when invoked inside a chained shell command, and the text it
+# quoted was stale output from a command several steps earlier — including once
+# when stdin was ALREADY redirected from /dev/null, which rules out the simple
+# "repack ate the caller's stdin" story I first wrote here. The remaining
+# suspect is `gc`'s cruft pass: `pack-objects --cruft` reads object names on
+# stdin, so an inherited stream with anything in it is a hazard whatever put it
+# there.
+#
+# `< /dev/null` is cheap and correct regardless, and this script's own
+# invocation — a plain line in a script file — is the shape that has never
+# failed. Verified after the fact rather than assumed.
 git gc --quiet < /dev/null
 
 # refs/notes/toolcalls is NOT included by --all. Omitting it is failure mode #3
