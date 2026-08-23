@@ -419,12 +419,6 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   standing (-0.28), because `breach_lane` funnelled *every* patrol wave into the hole while
   the defender kept covering three trails. Half the waves press the breach now; mechanism
   metric -0.28 -> -0.07, probe conversion 34% -> 41%.
-- [ ] Conversion still isn't fixed: **39.8% pooled over 793 games (se 1.8)**, five standard
-  errors below even. Two explanations eliminated, one repaired, and defending is still
-  stronger than attacking. The remaining candidates are structural rather than buggy — the
-  defender fights beside its medic den, inside its own auras, respawns closer, and has the
-  last-stand rule. Deciding whether attacking should pay (and what with) is a design call,
-  not a bug hunt.
 - [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
   winning rather than only fleeing a lost one
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
