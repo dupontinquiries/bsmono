@@ -46,6 +46,17 @@ pub const BUTTONS_H: f32 = 44.0;
 /// Height of the minimal locator that survives in voice mode.
 pub const LOCATOR_H: f32 = 14.0;
 
+/// Default width of the vertical tab column, from `main.qml`'s
+/// `property real termSidebarWidth: 168` (main.qml:4015).
+///
+/// Width, not height, and that is the point: this module measured chrome in
+/// points of HEIGHT only, so when the tab column was brought under the same
+/// gate as the strip and the buttons, `reclaimed()` did not notice a 168-point
+/// column disappearing. On a phone held in portrait that is the more valuable
+/// axis — a terminal wraps, so a narrower pane costs every line, while a
+/// shorter one costs the oldest lines.
+pub const TAB_COLUMN_W: f32 = 168.0;
+
 /// How much chrome is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChromeMode {
@@ -73,6 +84,26 @@ impl ChromeMode {
     /// Height handed back to the panes by switching to voice.
     pub fn reclaimed(self) -> f32 {
         ChromeMode::Touch.chrome_height() - self.chrome_height()
+    }
+
+    /// Width handed back by hiding the vertical tab column.
+    ///
+    /// Separate from [`reclaimed`] rather than folded into it, because they are
+    /// different axes and adding them would produce a number in no unit at all.
+    pub fn reclaimed_width(self) -> f32 {
+        match self {
+            ChromeMode::Touch => 0.0,
+            ChromeMode::Voice => TAB_COLUMN_W,
+        }
+    }
+
+    /// Roughly how many terminal COLUMNS that is, at a given character width.
+    ///
+    /// The same honest-unit argument as `reclaimed_rows`: "168 points" means
+    /// nothing, "twenty more columns before the line wraps" is the trade.
+    pub fn reclaimed_cols(self, char_w: f32) -> u32 {
+        if char_w <= 0.0 { return 0; }
+        (self.reclaimed_width() / char_w).floor().max(0.0) as u32
     }
 
     /// Roughly how many terminal rows that is, at a given row height.
@@ -366,4 +397,38 @@ mod tests {
         assert!(ESCAPE_HINT.contains("Ctrl"));
         assert!(ESCAPE_HINT.contains("Shift"));
     }
+
+    /// Voice mode hides the tab COLUMN as well as the strip and the buttons,
+    /// and the accounting has to say so.
+    ///
+    /// It did not. This module measured height only, so bringing the tab column
+    /// under the same gate reclaimed 168 points of width that `reclaimed()`
+    /// reported as zero — the mode was quietly giving back more than it
+    /// claimed, which is the friendlier direction to be wrong in and still
+    /// wrong.
+    #[test]
+    fn voice_mode_reclaims_width_as_well_as_height() {
+        assert_eq!(ChromeMode::Touch.reclaimed_width(), 0.0);
+        assert_eq!(ChromeMode::Voice.reclaimed_width(), TAB_COLUMN_W);
+        assert!(ChromeMode::Voice.reclaimed() > 0.0, "and height, still");
+    }
+
+    #[test]
+    fn reclaimed_columns_is_the_unit_a_user_can_act_on() {
+        // ~8pt monospace advance: 168 / 8 = 21 columns.
+        assert_eq!(ChromeMode::Voice.reclaimed_cols(8.0), 21);
+        assert_eq!(ChromeMode::Touch.reclaimed_cols(8.0), 0);
+        // Guard the divide, as reclaimed_rows does.
+        assert_eq!(ChromeMode::Voice.reclaimed_cols(0.0), 0);
+        assert_eq!(ChromeMode::Voice.reclaimed_cols(-3.0), 0);
+    }
+
+    /// The width constant is a citation, not a taste.
+    #[test]
+    fn the_tab_column_width_matches_the_qml() {
+        // main.qml:4015 — `property real termSidebarWidth: 168`. If the QML
+        // moves, this should move with it rather than drift.
+        assert_eq!(TAB_COLUMN_W, 168.0);
+    }
+
 }

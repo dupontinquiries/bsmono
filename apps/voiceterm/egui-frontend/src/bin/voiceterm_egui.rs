@@ -1562,8 +1562,30 @@ impl eframe::App for VoicetermApp {
             });
         }
 
-        // the vertical tab sidebar sits between the session sidebar and the terminal
-        egui::SidePanel::left("tabbar").resizable(false).exact_width(120.0).show(ctx, |ui| {
+        // THE VERTICAL TAB COLUMN, matched to the QML rather than approximated.
+        //
+        // Three differences from `main.qml`'s `vTabBar`, all of which made this
+        // surface heavier than the one it ports:
+        //
+        // 1. It ignored ChromeMode. `sidebar` and `keycaps` hide in Voice mode
+        //    and this did not, so "voice hides the chrome" left a 120px column
+        //    standing. chrome_mode.rs's own accounting only counts HEIGHT
+        //    (STRIP_H + BUTTONS_H), so the reclaim figure never noticed.
+        // 2. Fixed at 120px. The QML is `width: root.termSidebarWidth`,
+        //    default 168, dragged between 110 and 340 with snap detents
+        //    (main.qml:4015, 4685). Fixed-width here meant the one dimension a
+        //    phone user most wants to trade was not tradeable.
+        // 3. Qt hosts ONE left bar. `vTabBar` holds "work tabs (scrollable) + a
+        //    default fence + system tabs, same model as the old top strip (now
+        //    hidden)" — while this surface stacks `sidebar` (160) beside
+        //    `tabbar` (120) for 280px against Qt's 168. Merging them is the
+        //    real fidelity fix and is not this change; gating and sizing are.
+        if show_chrome {
+        egui::SidePanel::left("tabbar")
+            .resizable(true)
+            .default_width(168.0)          // main.qml:4015 termSidebarWidth
+            .width_range(110.0..=340.0)    // main.qml:4685 drag clamp
+            .show(ctx, |ui| {
             ui.add_space(4.0);
             let mut apply: Vec<voiceterm_egui::gesture_menus::WsCall> = Vec::new();
             const ROW_PITCH: f32 = 33.0; // QML v0.1.803: 30px row + 3px spacing
@@ -1641,6 +1663,7 @@ impl eframe::App for VoicetermApp {
                 }
             }
         });
+        }  // if show_chrome — the tab column follows the sidebar and keycaps
 
         // THE COMMAND PALETTE, above everything. Ctrl+P or "open command
         // palette" — the eleven-tab switcher's replacement, and the reason the
