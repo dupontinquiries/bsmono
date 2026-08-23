@@ -166,11 +166,21 @@ fn to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
 /// A sortable local-ish stamp for the session directory. Seconds since the
 /// epoch rather than a formatted date: no chrono dependency, and it sorts.
 fn timestamp() -> String {
-    let secs = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("session-{secs}")
+        .unwrap_or_default();
+    // SECONDS AND MILLIS. `Session::create` now refuses an existing directory
+    // rather than overwriting a previous run's crops, which turns a
+    // second-granularity stamp into a real failure: start `listen`, stop it,
+    // start it again within the same second and the second run dies at
+    // creation. That is a plausible thing to do while tuning with --dry-run.
+    //
+    // The millisecond keeps the name sortable and makes the collision as
+    // unlikely as the refusal assumes. It is not a guarantee — two processes
+    // could still land in the same millisecond — and the refusal is what covers
+    // that, which is the right division: the stamp makes collisions rare, the
+    // refusal makes them harmless.
+    format!("session-{}-{:03}", now.as_secs(), now.subsec_millis())
 }
 
 #[cfg(test)]

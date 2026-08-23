@@ -126,6 +126,26 @@ impl Session {
     /// timestamp, but a test passes something fixed.
     pub fn create(root: &Path, stamp: &str, n_mels: usize, time_frames: usize) -> Result<Session> {
         let dir = root.join(stamp);
+        // REFUSE AN EXISTING DIRECTORY rather than writing into it.
+        //
+        // `create_dir_all` succeeds on one that already exists and `written`
+        // starts at 0, so the second session's `crop-000000.bspc` lands on top
+        // of the first's — three captures silently become one. Reachable two
+        // ways: two runs inside the same second (the stamp is unix SECONDS), or
+        // any caller reusing a name.
+        //
+        // Refusing rather than auto-suffixing, because a session directory is
+        // the operator's AUDIT unit: `listen` writes crops from a microphone
+        // that ran unattended, and quietly splitting one run across
+        // `session-1` and `session-1-2` makes "what did this capture" a
+        // question with two answers. An error names the collision and costs one
+        // restart; a silent merge or a silent overwrite costs the recording.
+        if dir.exists() {
+            anyhow::bail!(
+                "session directory {} already exists — refusing to write into it. A second \
+session with the same stamp would overwrite crop-000000 onward and lose the first run's captures. \
+Move or remove it, or pass a different stamp.", dir.display());
+        }
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating session dir {}", dir.display()))?;
         Ok(Session { dir, n_mels, time_frames, written: 0 })
@@ -367,6 +387,47 @@ spanning two captured sounds");
         assert_eq!(p.should_stop(1e9, 0, false), None, "no deadline means no deadline");
         assert_eq!(p.should_stop(1e9, 2, false), Some(Stopped::Budget),
                    "the budget is still the backstop");
+    }
+
+
+    /// Two sessions with the same stamp silently overwrite each other.
+    ///
+    /// `create_dir_all` succeeds on an existing directory and `written` starts
+    /// at 0, so the second session's `crop-000000.bspc` lands on top of the
+    /// first's. Reachable two ways: two runs inside the same second (the stamp
+    /// is unix SECONDS), or any caller that reuses a name.
+    ///
+    /// Written to FAIL first, as the demonstration. The fix follows in the same
+    /// commit; the test stays as the guard.
+    #[test]
+    fn a_second_session_does_not_overwrite_the_first() {
+        let root = tmp("collide");
+        let mut a = Session::create(&root, "session-1", 4, 2).unwrap();
+        for _ in 0..3 { a.write_crop(&vec![1.0; 8]).unwrap(); }
+
+        let second = Session::create(&root, "session-1", 4, 2);
+        match second {
+            // Either it refuses...
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("session-1"), "the refusal must name the collision: {e}");
+            }
+            // ...or it lands somewhere else. Silently reusing the directory is
+            // the one outcome that loses data.
+            Ok(mut b) => {
+                b.write_crop(&vec![2.0; 8]).unwrap();
+                assert_ne!(b.dir(), a.dir(),
+                    "the second session reused the first's directory: crop-000000 is overwritten \
+and three captures become one");
+            }
+        }
+
+        // Whatever route was taken, the first session's crops are intact.
+        let raw = std::fs::read(a.dir().join("crop-000000.bspc")).unwrap();
+        let v = f32::from_le_bytes(raw[12..16].try_into().unwrap());
+        assert_eq!(v, 1.0, "the first session's first crop was overwritten");
+        assert_eq!(std::fs::read_dir(a.dir()).unwrap().count(), 3, "all three must survive");
+        std::fs::remove_dir_all(&root).ok();
     }
 
 }
