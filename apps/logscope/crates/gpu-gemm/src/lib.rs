@@ -683,7 +683,23 @@ const POST_READBACK_FLUSH_CAP: u32 = 32;
 const SLOT_FLUSH: usize = 16;
 /// Content-cache cap: distinct (shape) dims that get their own permanent buffer. Sized to comfortably
 /// hold every stable per-shape uniform a model uses after warmup; per-position dims spill to the ring.
-const DIMS_CACHE_CAP: usize = 4096;
+/// Upper bound on the dims content cache. The EFFECTIVE cap is
+/// `Gpu::dims_cap`, derived per backend from the governor's object budget —
+/// see `dims_cap_for`.
+///
+/// This was a flat 4096 and the arithmetic only works on Metal. The module note
+/// below reasons it out against `soft_object_cap: 8192, baseline_objects: 6400`
+/// and concludes the engine "starts at 78% of its object budget". On Apple
+/// Vulkan the same figures are 3072 and 2600 — so 4096 cache + 2048 ring is
+/// 6144 objects against a budget of 3072, twice the entire allowance, for a
+/// structure the baseline claims to already include.
+///
+/// Measured consequence, from a fleet run on Llama-3.3-8B: "soft cap 3072
+/// objects, ~7535 live", window clamped 4 -> 2, 4.51 tok/s at 1 submit/token
+/// with 52% of submits being readbacks. Locally the split is dims 100% / pool
+/// 0% and the cache runs at 76% hit — so a quarter of dispatches each add a
+/// buffer that is never evicted.
+const DIMS_CACHE_CAP_MAX: usize = 4096;
 /// Cache cap for bind groups (opt-in bg cache). Sized for a large-layer MoE decode's distinct
 /// (pipeline, buffers, dims) combos across the recycled activation set; once full it falls back to
 /// create-without-cache, so it's never worse than the old always-create path.
@@ -733,6 +749,22 @@ type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, (wgpu::Buffer, u64, u64), wg
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
 /// a slot is never rewritten while an in-flight dispatch still reads it.
 const DIMS_RING_SIZE: usize = 2048;
+
+/// How large the dims CONTENT cache may grow on this backend.
+///
+/// The cache never evicts — that is what makes it a cache — so its cap is a
+/// standing claim on the object budget. The ring behind it is bounded and
+/// RECYCLED, so pushing traffic there under pressure is the correct
+/// degradation: slightly lower reuse, no growth.
+///
+/// A third of the soft cap, floored so a tight backend keeps a useful cache and
+/// ceilinged at the old constant so no backend gets worse than before. On Apple
+/// Vulkan (3072) that is 1024 rather than 4096; on Metal (8192) it is 2730,
+/// still under the 4096 the note assumed and comfortably inside a budget that
+/// was already 78% spent.
+fn dims_cap_for(soft_object_cap: usize) -> usize {
+    (soft_object_cap / 3).clamp(256, DIMS_CACHE_CAP_MAX)
+}
 
 /// ## A structural difference from llama.cpp, measured in buffer objects
 ///
@@ -906,6 +938,10 @@ pub struct Gpu {
     /// fill the rest and, once full, fall back to create-without-cache (i.e. never worse than before).
     /// Bit-exact: identical bytes, identical binding — every `--gate-*` is unchanged.
     dims_cache: Mutex<HashMap<Vec<u8>, std::sync::Arc<wgpu::Buffer>>>,
+    /// Effective cap on `dims_cache`, from `dims_cap_for(budget.soft_object_cap)`.
+    /// A field rather than a const because the right value is a fraction of a
+    /// budget that differs 2.7x between Metal and Apple Vulkan.
+    dims_cap: usize,
     /// Bind-group cache (opt-in via LOGSCOPE_BG_CACHE): a fresh bind group was created on EVERY dispatch,
     /// which the Asahi profile shows as a dispatch-bound (CPU-setup) hotspot — ~480 creations/token on a
     /// 48-layer MoE decode. A bind group only encodes WHICH buffers bind to WHICH slots (not their
@@ -1583,7 +1619,10 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        // Same budget the governor steers by, so the dims cache cannot claim more
+        // objects than the window is allowed to assume are free.
+        let dims_cap = dims_cap_for(governor.lock().unwrap().budget().soft_object_cap);
+        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), dims_cap, bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -4178,7 +4217,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
                 b.clone()
             } else {
                 DIMS_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if cache.len() < DIMS_CACHE_CAP {
+                if cache.len() < self.dims_cap {
                     let b = self.make_dims_buffer(dims);
                     cache.insert(dims.to_vec(), b.clone());
                     b

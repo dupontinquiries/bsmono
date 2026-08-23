@@ -381,4 +381,44 @@ mod tests {
         let k = g.window_for(128, 0, false);
         assert!(k >= 2, "even a generous backend keeps a floor");
     }
+
+    /// The dims cache must fit inside the object budget it is spending.
+    ///
+    /// `DIMS_CACHE_CAP` was a flat 4096 with a 2048 ring behind it — 6144
+    /// objects. That arithmetic was reasoned against Metal (`soft_object_cap`
+    /// 8192) and never re-derived for Apple Vulkan, where the cap is 3072. So
+    /// on the fleet's actual backend the dims structures alone could claim
+    /// twice the entire budget, for a structure `baseline_objects` (2600)
+    /// claims to already include.
+    ///
+    /// Observed: "soft cap 3072 objects, ~7535 live", window clamped 4 -> 2.
+    ///
+    /// This pins the relationship rather than the number, because the number is
+    /// now derived and the relationship is what was actually violated.
+    #[test]
+    fn the_dims_cache_cap_fits_inside_every_backend_object_budget() {
+        for (name, gb, unified, vma) in [
+            ("metal", WgpuBackend::Metal, true, false),
+            ("apple-vulkan", WgpuBackend::Vulkan, true, true),
+            ("desktop-vulkan", WgpuBackend::Vulkan, false, false),
+            ("dx12", WgpuBackend::Dx12, false, false),
+            ("gl", WgpuBackend::Gl, false, false),
+        ] {
+            let b = Budget::for_backend(gb, unified, vma);
+            let cap = crate::dims_cap_for(b.soft_object_cap);
+            assert!(
+                cap < b.soft_object_cap,
+                "{name}: dims cache cap {cap} is not below the soft object cap {} — the cache \
+would be permitted to consume the whole budget it is being steered within",
+                b.soft_object_cap
+            );
+            // And leave room for the ring plus something to actually run.
+            assert!(
+                cap + crate::DIMS_RING_SIZE.min(b.soft_object_cap) <= b.soft_object_cap * 2,
+                "{name}: cap {cap} + ring is more than double the budget {}",
+                b.soft_object_cap
+            );
+        }
+    }
+
 }
