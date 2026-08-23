@@ -804,8 +804,76 @@ pub fn int8_worth_it(src_ggml_type: u32) -> bool {
         0 | 1 => true,      // F32, F16: a real compression
         // Every K-quant and Q8_0 already has per-block scales at 32-weight granularity or finer.
         // Re-encoding them to int8 doubles the size and cannot add information.
+        //
+        // 16..=19 are IQ CODEBOOK formats (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S), which do NOT carry
+        // per-32 scales — they store indices into a ternary grid with a coarser scale. The answer
+        // is the same (int8 from them is not a compression) but the reason is not, and the caller's
+        // diagnostic says "already carries per-32 scales" for all of them, which is false for these
+        // four. Kept in one arm because the decision is identical; the wording is the caller's to fix.
         2..=20 => false,
         _ => false,         // unknown: do not spend the disk on a guess
+    }
+}
+
+/// What quant types are actually in this file, by weight count.
+///
+/// ## Why one tensor is not enough
+///
+/// The loader characterises a model by sampling `blk.0.attn_q.weight` — for a
+/// uniform Q4_K file that is exact and free. For an UNSLOTH DYNAMIC (`UD-`)
+/// mix it is a guess: a single Qwen3-14B-UD-IQ1_S load reported
+///
+/// ```text
+/// loader: cpu-dequant type=11 0.33 GB          (Q3_K)
+/// Q5_K → int8-resident TRANSCODE
+/// int8 cache SKIPPED — source is ggml type 16  (IQ2_XXS)
+/// ```
+///
+/// — three different formats, from a file named for a fourth (IQ1_S, type 19).
+/// The "source is ggml type 16" line is true of the tensor it sampled and says
+/// nothing about the other 39 layers.
+///
+/// That matters beyond cosmetics because the failure mode is silent.
+/// `cpudecode.rs` already carries the warning in its own words: reading a
+/// tensor "as another format would produce plausible garbage" — not a crash, a
+/// confident wrong answer. When such a model emits gibberish, the FIRST
+/// question is which formats were actually in it, and the log could not say.
+///
+/// Returns (type, tensor count, weight count) sorted by weight count, so the
+/// dominant format leads.
+pub fn type_histogram(g: &crate::gguf::Gguf) -> Vec<(u32, usize, u64)> {
+    let mut by: std::collections::BTreeMap<u32, (usize, u64)> = Default::default();
+    for t in &g.tensors {
+        let params: u64 = t.dims.iter().product::<u64>().max(1);
+        let e = by.entry(t.ggml_type).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += params;
+    }
+    let mut v: Vec<(u32, usize, u64)> = by.into_iter().map(|(k, (c, p))| (k, c, p)).collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v
+}
+
+/// One line naming every format in the file, dominant first.
+///
+/// Printed at load because a mixed file is the case where every other
+/// type-derived line in the log is a partial truth.
+pub fn type_histogram_line(g: &crate::gguf::Gguf) -> String {
+    let h = type_histogram(g);
+    let total: u64 = h.iter().map(|(_, _, p)| p).sum::<u64>().max(1);
+    let parts: Vec<String> = h.iter()
+        .map(|(t, c, p)| format!("{} {:.0}% ({} tensor{})",
+            crate::gguf::type_name(*t), 100.0 * *p as f64 / total as f64,
+            c, if *c == 1 { "" } else { "s" }))
+        .collect();
+    if h.len() <= 1 {
+        format!("weights: {}", parts.join(", "))
+    } else {
+        // Named as a mix explicitly. An operator reading "IQ1_S" on the filename
+        // and "Q3_K" in a dequant line should not have to infer that both are
+        // true.
+        format!("weights: MIXED — {} — every type-derived line below describes only \
+the tensors of that type", parts.join(", "))
     }
 }
 
@@ -1938,4 +2006,57 @@ mod file_view_refusal_tests {
         // it better than a guess here would.
         assert!(file_view_refusal(None, Some(12), Some(12)).is_none());
     }
+
+    /// Build a `Gguf` with just the tensor list the histogram reads. `Gguf` has
+    /// no `Default` and four required fields; the other three are irrelevant
+    /// here and naming them once beats repeating them in every case.
+    fn gguf_of(tensors: Vec<crate::gguf::TensorInfo>) -> crate::gguf::Gguf {
+        crate::gguf::Gguf { version: 3, metadata: Default::default(), tensors, data_offset: 0 }
+    }
+
+    fn tensor(name: &str, ggml_type: u32, dims: &[u64]) -> crate::gguf::TensorInfo {
+        crate::gguf::TensorInfo { name: name.into(), dims: dims.to_vec(), ggml_type, offset: 0 }
+    }
+
+    /// A UD mix must be reported as a mix.
+    #[test]
+    fn a_mixed_file_is_named_as_mixed() {
+        // The shape of Qwen3-14B-UD-IQ1_S: several formats, one dominant.
+        let g = gguf_of(vec![
+            tensor("blk.0.attn_q.weight", 16, &[5120, 5120]),   // IQ2_XXS
+            tensor("blk.0.ffn_down.weight", 19, &[17408, 5120]), // IQ1_S
+            tensor("blk.1.attn_q.weight", 11, &[5120, 5120]),   // Q3_K
+            tensor("output.weight", 13, &[151936, 5120]),        // Q5_K
+        ]);
+        let line = type_histogram_line(&g);
+        assert!(line.contains("MIXED"), "{line}");
+        for name in ["IQ2_XXS", "IQ1_S", "Q3_K", "Q5_K"] {
+            assert!(line.contains(name), "{name} missing from: {line}");
+        }
+    }
+
+    /// A uniform file must NOT be shouted about.
+    #[test]
+    fn a_uniform_file_is_reported_plainly() {
+        let g = gguf_of(vec![
+            tensor("blk.0.attn_q.weight", 12, &[4096, 4096]),
+            tensor("blk.1.attn_q.weight", 12, &[4096, 4096]),
+        ]);
+        let line = type_histogram_line(&g);
+        assert!(!line.contains("MIXED"), "one format is not a mix: {line}");
+        assert!(line.contains("Q4_K"), "{line}");
+    }
+
+    /// Dominant format first, by WEIGHTS not tensor count — a hundred tiny norm
+    /// tensors must not outrank one output matrix.
+    #[test]
+    fn the_histogram_ranks_by_weights_not_tensor_count() {
+        let mut tensors = vec![tensor("output.weight", 13, &[151936, 5120])];
+        for i in 0..100 { tensors.push(tensor(&format!("blk.{i}.norm"), 0, &[5120])); }
+        let g = gguf_of(tensors);
+        let h = type_histogram(&g);
+        assert_eq!(h[0].0, 13, "Q5_K holds far more weights than 100 norms: {h:?}");
+        assert_eq!(h[0].1, 1, "and it is one tensor");
+    }
+
 }

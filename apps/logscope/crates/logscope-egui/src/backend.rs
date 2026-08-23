@@ -424,6 +424,17 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                     // from Q4_K has the SAME scale granularity (one per 32 weights), so it stores 4-bit
                     // values in 8 bits and cannot add precision — it doubles memory and writes
                     // gigabytes of cache that buy nothing. ~7.5 GiB per 8B model, on device, per model.
+                    // WHAT IS ACTUALLY IN THE FILE, before any line that samples
+                    // one tensor and speaks for the whole model.
+                    //
+                    // A Qwen3-14B-UD-IQ1_S load reported a Q3_K dequant, a Q5_K
+                    // transcode and "source is ggml type 16" (IQ2_XXS) — three
+                    // formats, from a file named for a fourth. Each line was
+                    // true of the tensors it saw and none said the file was
+                    // mixed. When that model then emitted gibberish, the first
+                    // question was which formats were in it, and the log could
+                    // not answer.
+                    crate::diag!("loader: {}", gpu_kernels::memplan::type_histogram_line(&g));
                     let src_type = g.tensor("blk.0.attn_q.weight").map(|t| t.ggml_type).unwrap_or(0);
                     let incoming_est = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
                     if !gpu_kernels::memplan::int8_worth_it(src_type) {
