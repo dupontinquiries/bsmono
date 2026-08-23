@@ -1571,7 +1571,24 @@ fn bayer4(c: vec2<f32>) -> f32 {
 @fragment fn fs(i: VO) -> @location(0) vec4<f32> {
   let uv = i.uv;
   let nightmare = fx.misc.x; let night = fx.misc.y; let t = fx.misc.z;
-  let texel = fx.screen.xy;
+  // EDGE TAPS ARE ONE OUTPUT PIXEL, NOT ONE SOURCE TEXEL.
+  //
+  // `fx.screen.xy` is 1/scene_w,1/scene_h — the SUPERSAMPLED texel. In High
+  // (AAA) the scene target is 1.85x the window, so that step is 0.54 of an
+  // output pixel and this outline filter runs at sub-pixel spacing. Its result
+  // then changes between adjacent output pixels for reasons invisible at
+  // output resolution, the `edge * 0.8` ink mix follows it, and the 26-level
+  // Bayer quantisation at the bottom turns that into a hard dot lattice —
+  // the reported "High graphics has rendering issues", strongest over water
+  // and sky where the depth gradient is smooth and the taps disagree most.
+  //
+  // Everything else in this shader already works in OUTPUT pixels (`px = uv *
+  // fx.screen.zw` for paper, grain and stars). The edge detector was the only
+  // thing in source space, which is why Standard — where the two spaces are
+  // identical — looks correct and AAA does not.
+  //
+  // One output pixel in UV is 1/outputW, and `fx.screen.zw` IS the output size.
+  let texel = vec2<f32>(1.0, 1.0) / fx.screen.zw;
   let c = textureSample(tex, samp, uv);
   let dC = c.a;
   let dR = textureSample(tex, samp, uv + vec2<f32>(texel.x, 0.0)).a;
