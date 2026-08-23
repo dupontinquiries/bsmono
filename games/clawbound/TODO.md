@@ -590,6 +590,17 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   `build_battle`'s ancestor-crest branch in place of the team-colour fallback
   that was there before.
 
+- [x] `replay.rs` — a match is its setup plus the keys pressed, so a replay is a header and
+  the ticks where input *changed* (780 ticks recorded as 11 events). `--record FILE` writes
+  one, `--replay FILE` re-runs it and compares digests. Three things this buys: a bug report
+  that runs, whole-match regression fixtures nobody had to hand-build
+  (`tests/replays/*.replay`, checked by `tests/replay_regression.rs`), and an honest check
+  on the determinism every other part of this crate assumes — including any future netcode.
+- [x] The tamper test is asserted where it is *true* rather than where it reads well: a
+  different land, enemy clan or laning doctrine all fail to reproduce a recording, but
+  flipping `wombo` on a ten-second recording reproduces it exactly, because the clans have
+  not met yet. That assertion says so.
+
 ## Roadmap (multi-turn)
 -29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an
    invisible trail the hunter tracks; it's something you sense and *see*.

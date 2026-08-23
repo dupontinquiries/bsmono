@@ -138,7 +138,6 @@ const MEDIC_HEAL: f32 = 16.0;        // hp/s at the medic's den, before herbs
 const PREY_CAMPS_BASE: [(f32, f32); 2] = [(-70.0, 20.0), (-20.0, -70.0)];
 const PREY_HP: f32 = 26.0;
 const PREY_RESPAWN: f32 = 22.0;
-const PREY_WORTH: f32 = 1.0;
 const RICH_WORTH: f32 = 3.0;         // the contention ground's prey
 const CARRY_SLOW: f32 = 0.75;
 const CONTEND_R: f32 = 20.0;

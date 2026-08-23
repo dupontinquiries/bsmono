@@ -25,6 +25,7 @@
 use clawbound_rs::ancestor::{self, Ancestor};
 use clawbound_rs::battleground::{Battleground, Carry, Mind, Role, CLAN_A};
 use clawbound_rs::draft::{roster_line, Draft};
+use clawbound_rs::replay::{describe, Recorder, Replay};
 use std::io::{BufRead, Write};
 
 const W: usize = 78;
@@ -263,6 +264,25 @@ fn main() {
         return;
     }
 
+    // `--replay FILE` re-runs a recorded match and checks it still reproduces.
+    if let Some(i) = args.iter().position(|a| a == "--replay") {
+        let path = args.get(i + 1).expect("--replay wants a file");
+        let text = std::fs::read_to_string(path).expect("read replay");
+        let r = Replay::from_text(&text).expect("parse replay");
+        println!("{}", describe(&r));
+        let got = r.play();
+        if got == r.digest {
+            println!("reproduced exactly (digest {:016x})", got);
+        } else {
+            println!(
+                "DIVERGED: recorded {:016x}, replayed {:016x} — the sim changed under this replay",
+                r.digest, got
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let who = args.get(1).map(|s| s.as_str()).unwrap_or("lion");
     let mut bg = Battleground::new(pick(who));
 
@@ -270,13 +290,51 @@ fn main() {
     // so it can be diffed between builds or dropped into CI.
     if let Some(script) = args.get(2) {
         let tail: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        // `--record FILE` writes the match out as a replay: the same keys, in a
+        // file that reproduces this exact match on any machine that runs it
+        let record = args
+            .iter()
+            .position(|a| a == "--record")
+            .and_then(|i| args.get(i + 1).cloned());
+        let picks_a = [pick(who), Ancestor::Lion, Ancestor::Puma];
+        let mut rec = record.as_ref().map(|_| {
+            let a: [Ancestor; 3] = [
+                bg.warriors[0].ancestor.unwrap(),
+                bg.warriors[1].ancestor.unwrap(),
+                bg.warriors[2].ancestor.unwrap(),
+            ];
+            let b: [Ancestor; 3] = [
+                bg.warriors[3].ancestor.unwrap(),
+                bg.warriors[4].ancestor.unwrap(),
+                bg.warriors[5].ancestor.unwrap(),
+            ];
+            let _ = picks_a;
+            Recorder::new(a, b, 0, &bg, true)
+        });
+        let mut run = |bg: &mut Battleground, i: (f32, f32, bool, Option<usize>)| match rec.as_mut()
+        {
+            // the recorder drives the same set_input/step pair `beat` does, one
+            // tick at a time, so a recording is not a second code path
+            Some(r) => {
+                for t in 0..6 {
+                    let one = if t == 0 { i } else { (i.0, i.1, false, None) };
+                    r.step(bg, one.0, one.1, one.2, one.3);
+                }
+            }
+            None => beat(bg, i),
+        };
         for c in script.chars() {
             if let Some(i) = key(c) {
-                beat(&mut bg, i);
+                run(&mut bg, i);
             }
         }
         for _ in 0..tail {
-            beat(&mut bg, (0.0, 0.0, false, None));
+            run(&mut bg, (0.0, 0.0, false, None));
+        }
+        if let (Some(r), Some(path)) = (rec, record) {
+            let replay = r.finish(&bg);
+            std::fs::write(&path, replay.to_text()).expect("write replay");
+            eprintln!("wrote {path}: {}", describe(&replay));
         }
         println!("{}", draw(&bg));
         print!("{}", hud(&bg));
