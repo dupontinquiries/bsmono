@@ -487,7 +487,20 @@ only by its own tests.
   every time and makes the log honest about why the model kept going; given the
   reason strings, visible is probably right.
 
-- **C9-8b — `readmark` feeds nothing.** `verified`. Tracks how far the operator
+- **C9-8b — `readmark` feeds nothing.** `in-progress` · `verified` (c10,
+  `7ab8700b`). The LOGIC either side of the gap is now pinned to compose:
+  `crates/logscope-fan/tests/readmark_feeds_continuation.rs` drives
+  `open_questions` into `decide`'s `questions_are_flagged` through the public
+  surface only, and needed nothing unexported — the halves fit. Both
+  directions are covered (badgeable → `KeepGoingCheck`, unbadgeable → hard
+  stop) and both fail on broken copies.
+  Still open, and it is all renderer work: nothing supplies scroll fractions
+  to `observe`, nothing draws the badge. **And a caveat no type can enforce** —
+  `questions_are_flagged: true` is the caller's PROMISE to render, not a
+  derivable fact. A caller that passes true and draws nothing gets the worst
+  outcome available: the run carries on and the question is buried with no
+  mark, which is worse than never having had the flag.
+  ORIGINAL NOTE: Tracks how far the operator
   has gone past each node plus a watermark. `open_questions` returns the ids to
   badge and `since_watermark` the unreviewed span, so the graph renderer needs
   no logic of its own — but nothing supplies scroll fractions and nothing draws
