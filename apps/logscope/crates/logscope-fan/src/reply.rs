@@ -29,6 +29,22 @@
 //! a header, `parse_tools` wants brace-balanced JSON. Those are policies over a
 //! correct scan, and mixing the scan into each policy is how they drifted apart.
 //!
+//! ## It is not right for every caller
+//!
+//! Being spec-correct is not the same as being what a site wants.
+//! `workspace_exec::parse_plan` was migrated to this and reverted: a ```plan
+//! block quoting a ```rust snippet is, by the spec, CLOSED by that snippet, so
+//! the scanner correctly truncated a plan that a lenient reader recovers
+//! whole. Models emit that malformation constantly, and losing steps is a
+//! silent wrong answer while over-reading costs that site nothing.
+//!
+//! `parse_tools` is the other decline: it ends a block where the JSON is
+//! brace-balanced, which is stronger than any fence rule for its job.
+//!
+//! So this is the right scan for callers that want strictness, and the wrong
+//! one for callers that must tolerate a known malformation. Adopt per site,
+//! with a test that fails if the choice was wrong.
+//!
 //! Pure, std-only, no allocation beyond the returned spans.
 
 /// One fenced block, as it appears in the reply.

@@ -622,6 +622,30 @@ impl Plan {
 /// non-empty line becomes a step (stripped of its marker). Empty if neither shape is present.
 pub fn parse_plan(text: &str) -> Plan {
     // fenced ```plan … ```
+    // WHY THIS DOES NOT USE `logscope_fan::reply::fences`, having been tried.
+    //
+    // That scanner is CommonMark-correct: a fence closes on a run at least as
+    // long as the opener, so a three-tick block cannot contain three-tick
+    // blocks. Migrating this site to it reverted the nested-fence fix and the
+    // test caught it immediately — a ```plan block quoting a ```rust snippet is,
+    // by the spec, closed BY that snippet, and everything after is outside.
+    //
+    // The spec is right and the input is malformed. But models emit exactly
+    // this shape constantly, and the choice here is between reading it the way
+    // the author obviously meant and reading it the way a parser is entitled
+    // to. Losing steps 2 and 3 of a plan is a silent wrong answer; over-reading
+    // a malformed block costs nothing, because `lines_to_steps` keeps only list
+    // items and `strip_nested_fences` drops quoted content.
+    //
+    // So this stays lenient deliberately: bound at the next block marker, take
+    // the LAST fence inside that region. A four-tick plan block would be
+    // handled correctly by either, and if models settle on that convention this
+    // can migrate.
+    //
+    // The general lesson, since the shared scanner was introduced two commits
+    // ago as the fix for three parsers: a primitive being MORE CORRECT does not
+    // make it right for every caller. Two of the four sites want strictness;
+    // this one wants tolerance of a known malformation.
     if let Some(start) = text.find("```plan") {
         let after = &text[start + "```plan".len()..];
         // THE LAST FENCE INSIDE THE PLAN REGION, not the first and not the last
