@@ -373,7 +373,16 @@ relevant half for this stack than the Python side.
   len, kv_dim) -> KvCache` (warm→hot yields a fresh owned value), and
   `KvCache` at lib.rs:13260 derives nothing.
 
-  **The seam that fits, designed but NOT implemented:** give `PrefixStore` a
+  **UPDATE (c10, `f045efd3`): the seam below is now IMPLEMENTED for (1)+(2).**
+  `PrefixStore::take` transfers ownership out, `run_fleet_trie_cached` hands
+  every node cache back at the end, and `run_fleet_trie` delegates to a shared
+  inner with `store: Option<&mut PrefixStore>` so the validated path is the
+  same code with `None`. 1219 tests pass on llvmpipe. Still open: the
+  collision length guard is reasoned-correct but not test-enforced (this
+  fixture's argmax does not move on garbage KV — needs M2), warm-tier hits are
+  untested because every test keeps the budget hot, and (3) is untouched.
+
+  **The seam that fits, as originally designed:** give `PrefixStore` a
   `take(&mut self, gpu, key) -> Option<(usize, KvCache)>` that REMOVES the
   entry and transfers ownership (promoting warm→hot on the way out). Then
   `run_fleet_trie_cached(&self, …, store: &mut PrefixStore)` is a small delta
