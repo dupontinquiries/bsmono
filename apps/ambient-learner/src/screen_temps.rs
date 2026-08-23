@@ -201,6 +201,42 @@ pub struct ScreenTempFrame {
     pub generation: u32,
 }
 
+impl std::fmt::Debug for ScreenTempFrame {
+    /// Hand-written rather than derived, because a frame is `cols * rows`
+    /// floats and a derive would print every one of them.
+    ///
+    /// This exists because the tests below call `parse_frame(..).unwrap_err()`,
+    /// and `unwrap_err` requires `T: Debug` so it can show the unexpected Ok
+    /// value in its panic message. A fleet build caught it — three errors, all
+    /// this one bound. Deriving would have compiled just as well, and then the
+    /// first time a parse test failed on a real 1920x1080-derived grid it would
+    /// have printed two million floats into the test log and buried the
+    /// assertion that mattered.
+    ///
+    /// So: the shape, the identity, and a couple of samples. Enough to tell one
+    /// frame from another when a panic prints it, which is the whole job.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.temperatures_celsius.len();
+        let mut d = f.debug_struct("ScreenTempFrame");
+        d.field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("timestamp_unix_nanos", &self.timestamp_unix_nanos)
+            .field("generation", &self.generation)
+            .field("temperatures_celsius.len", &n);
+        // The count is the thing that disagrees when a parse goes wrong, so
+        // flag the mismatch here rather than making a reader multiply.
+        let expect = self.cols as usize * self.rows as usize;
+        if n != expect {
+            d.field("EXPECTED_len", &expect);
+        }
+        if n > 0 {
+            d.field("first", &self.temperatures_celsius[0])
+                .field("last", &self.temperatures_celsius[n - 1]);
+        }
+        d.finish_non_exhaustive()
+    }
+}
+
 impl ScreenTempFrame {
     /// Encode the frame in our binary wire format.
     ///
@@ -374,15 +410,28 @@ fn apply_separable_gaussian(
 
     // 1D x-weights: G_x(c) = exp(-(xs[c] - cx)² / 2σ²)
     // Computed once per sensor; reused across all rows.
+    //
+    // THE CUTOFF IS PER-AXIS AND CENTRE-BASED, matching the reference.
+    // `c_lo..c_hi` above is a bounding box derived from the range EDGES with
+    // floor/ceil, so it admits cells whose centre lies just outside 3σ — the
+    // reference skips those with `if dx.abs() > cutoff { continue }` and this
+    // did not, so the two disagreed by a full Gaussian tail value at the
+    // boundary. Measured: 0.046 against an expected 0, for a cell 0.306 from
+    // the source at a 0.3 cutoff, in the (0.05, 0.05) near-corner case.
+    //
+    // Zeroing the weight rather than tightening the loop bounds: the bounds
+    // then stay a pure performance concern that cannot affect output, which is
+    // what a bounding box should be. Getting `c_lo`/`c_hi` off by one now
+    // costs a wasted multiply instead of a wrong pixel.
     for c in c_lo..c_hi {
         let dx = xs[c] - cx;
-        x_weights[c] = (-dx * dx * inv_2sigma_sq).exp();
+        x_weights[c] = if dx.abs() > cutoff { 0.0 } else { (-dx * dx * inv_2sigma_sq).exp() };
     }
 
-    // 1D y-weights: same idea.
+    // 1D y-weights: same idea, same cutoff rule.
     for r in r_lo..r_hi {
         let dy = ys[r] - cy;
-        y_weights[r] = (-dy * dy * inv_2sigma_sq).exp();
+        y_weights[r] = if dy.abs() > cutoff { 0.0 } else { (-dy * dy * inv_2sigma_sq).exp() };
     }
 
     // Outer product: grid[r,c] += amplitude · y_weights[r] · x_weights[c].
@@ -1067,4 +1116,52 @@ mod tests {
             assert!((t - 21.5).abs() < 0.001);
         }
     }
+
+    /// The Debug impl summarises instead of dumping the frame.
+    ///
+    /// It exists only so `unwrap_err()` compiles, which means nothing forces it
+    /// to stay small — a later `#[derive(Debug)]` would satisfy every caller
+    /// and quietly make a failing parse test print millions of floats. This is
+    /// the thing that would notice.
+    #[test]
+    fn debug_summarises_the_frame_rather_than_printing_every_value() {
+        let cols: u16 = 64;
+        let rows: u16 = 36;
+        let f = ScreenTempFrame {
+            cols, rows,
+            temperatures_celsius: (0..(cols as usize * rows as usize))
+                .map(|i| i as f32).collect::<Vec<_>>().into_boxed_slice(),
+            timestamp_unix_nanos: 1_766_000_000_000_000_000,
+            generation: 7,
+        };
+        let s = format!("{f:?}");
+
+        // Short enough that a panic message stays readable. 2304 floats
+        // rendered individually would be tens of kilobytes.
+        assert!(s.len() < 400, "Debug output is {} bytes; it must summarise: {s}", s.len());
+
+        // And still identifies the frame.
+        for needle in ["cols: 64", "rows: 36", "generation: 7", "temperatures_celsius.len: 2304"] {
+            assert!(s.contains(needle), "Debug output is missing {needle}: {s}");
+        }
+        // A middle value must NOT appear on its own — that would mean the
+        // buffer is being walked.
+        assert!(!s.contains("1152.0"), "the buffer is being printed: {s}");
+    }
+
+    /// A length that disagrees with cols*rows is called out, because that is
+    /// exactly the state a parse failure leaves behind and the reason someone
+    /// is reading this output at all.
+    #[test]
+    fn debug_flags_a_length_that_does_not_match_the_dimensions() {
+        let f = ScreenTempFrame {
+            cols: 4, rows: 4,
+            temperatures_celsius: vec![1.0f32; 9].into_boxed_slice(), // 9, not 16
+            timestamp_unix_nanos: 0,
+            generation: 0,
+        };
+        let s = format!("{f:?}");
+        assert!(s.contains("EXPECTED_len: 16"), "a mismatch must be named: {s}");
+    }
+
 }
