@@ -45,17 +45,37 @@ git gc --quiet
 # refs/notes/toolcalls is NOT included by --all. Omitting it is failure mode #3
 # in SKILL_session_capture.md: the receiving clone shows every observed_calls
 # as null and looks exactly like a repo where capture was never enabled.
-echo "writing $path"
-git bundle create "$path" --all refs/notes/toolcalls
+# WRITE LOCALLY, THEN COPY. /mnt/user-data/outputs is a FUSE (rclone) mount, and
+# `git bundle create` writing straight to it dies with
+#   fatal: sha1 file '<stdout>' write error: Bad file descriptor
+#   error: pack-objects died
+# after having already created a zero-length file — so the failure looks like a
+# corrupt bundle rather than an unsupported filesystem. Staging on local disk
+# also means verify runs against the bytes git wrote, before anything crosses
+# the mount.
+stage="$(mktemp -d)/$(basename "$path")"
+trap 'rm -rf "$(dirname "$stage")"' EXIT
+
+echo "writing $stage"
+git bundle create "$stage" --all refs/notes/toolcalls
 
 echo "verifying…"
-git bundle verify "$path" | tail -4
+git bundle verify "$stage" | tail -4
 
-size_mib=$(( $(stat -c %s "$path") / 1024 / 1024 ))
+size_mib=$(( $(stat -c %s "$stage") / 1024 / 1024 ))
 echo "size: ${size_mib} MiB (budget ${LIMIT_MIB} MiB)"
 if [ "$size_mib" -gt "$LIMIT_MIB" ]; then
   echo "OVER BUDGET — see maintenance/REPO_SIZE.md before sending" >&2
   exit 2
+fi
+
+echo "copying to $path"
+cp "$stage" "$path"
+# Confirm the copy survived the crossing: a truncated write on a network mount
+# is silent, and the bundle would fail verify on the far side instead of here.
+if [ "$(stat -c %s "$stage")" != "$(stat -c %s "$path")" ]; then
+  echo "copy is short: $(stat -c %s "$path") of $(stat -c %s "$stage") bytes" >&2
+  exit 3
 fi
 
 notes=$(git notes --ref=toolcalls list | wc -l)
