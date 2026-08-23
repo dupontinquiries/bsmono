@@ -6428,7 +6428,14 @@ Verified by reintroducing the divergence: it fails at step 8 with "9 corridors
 drawn, 2 routable". That check is the point, and it is the one I skipped the
 first time I wrote a regression test in this session.
 
-1133 passing.
+AND THE SCAN HAD THIS MODULE'S OWN BUG IN IT. The driver carried its own
+array of needles beside `KNOWN`, the table meant to hold them — a second
+implementation of the thing the module exists to find, inside the module.
+It reads `KNOWN` now, and prints WHAT TO USE INSTEAD, because a scan that says
+"this line is suspicious" and stops makes the reader go and find the answer
+the table already holds.
+
+1133 passing, zero dead code in the module.
 
 ## Stretch goals (still not in this cut)
 

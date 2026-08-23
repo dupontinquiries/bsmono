@@ -55,16 +55,11 @@ pub struct Site {
 /// Expressions that have already bitten, kept so the scan has known-answers
 /// to check itself against.
 pub static KNOWN: &[Site] = &[
-    Site {
-        file: "physics.rs",
-        needle: "ride_h > 0.0",
-        instead: "Car::stand_h",
-    },
-    Site {
-        file: "main.rs",
-        needle: "ride_h > 0.0",
-        instead: "Car::stand_h",
-    },
+    Site { file: "physics.rs", needle: "ride_h > 0.0", instead: "Car::stand_h" },
+    Site { file: "main.rs", needle: "ride_h > 0.0", instead: "Car::stand_h" },
+    Site { file: "aboard.rs", needle: "door.void()", instead: "Door::passable for routing" },
+    Site { file: "main.rs", needle: "door.void()", instead: "Door::passable for routing" },
+    Site { file: "interior.rs", needle: "door.passable()", instead: "one carve rule" },
 ];
 
 /// Count non-comment occurrences of a needle in live (non-test) code.
@@ -110,16 +105,42 @@ pub fn run() {
         ("aboard.rs", include_str!("aboard.rs")),
         ("interior.rs", include_str!("interior.rs")),
     ];
-    println!("  {:<14} {:>6}  {}", "file", "hits", "expression");
+
     let mut total = 0;
+    // FROM `KNOWN`, not a second list. The driver had its own array of
+    // needles beside the table meant to hold them, which is this module's own
+    // bug class inside this module. Anything the scan should look for goes in
+    // `KNOWN` and the driver reads it.
+    let needles: Vec<(&str, &str)> = {
+        let mut v: Vec<(&str, &str)> =
+            KNOWN.iter().map(|s| (s.needle, s.instead)).collect();
+        v.sort_unstable();
+        v.dedup_by_key(|(n, _)| *n);
+        v
+    };
+    println!(
+        "  {} expressions from KNOWN, across {} files\n",
+        needles.len(),
+        files.len()
+    );
+    // WHAT TO USE INSTEAD is the half worth printing. A scan that says "this
+    // line is suspicious" and stops makes the reader go and find the answer;
+    // the table already holds it.
+    println!("  {:<12} {:>4}  {:<18} {}", "file", "hits", "expression", "use instead");
     for (name, src) in files {
-        for needle in ["ride_h > 0.0", "door.void()", "door.passable()", "half_h;"] {
+        for (needle, instead) in needles.iter().copied() {
             let n = open_coded(src, needle);
             if n > 0 {
                 total += n;
-                println!("  {name:<14} {n:>6}  {needle}");
+                println!("  {name:<12} {n:>4}  {needle:<18} {instead}");
             }
         }
+    }
+
+    // and where each was first found, so a hit has provenance
+    println!("\n  first found in:");
+    for s in KNOWN {
+        println!("    {:<18} {}", s.needle, s.file);
     }
     println!("\n  {total} open-codings in live code.\n");
     println!("  Crude on purpose. It greps, it cannot tell an invariant from a");
