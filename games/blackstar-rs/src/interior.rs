@@ -342,6 +342,37 @@ impl Interior {
         probes.iter().all(|o| self.walkable(p + *o))
     }
 
+    /// Which room a point is in, if any.
+    ///
+    /// The lookup that was missing, and the reason `main.rs` referenced this
+    /// module zero times: a complete walkable ship with no way to ask "where
+    /// am I" cannot drive a console, so the eight rooms and their fixtures
+    /// stayed a diagram.
+    ///
+    /// Corridors deliberately return `None`. Standing in a doorway is between
+    /// rooms, not in both, and a console that opens while you are halfway
+    /// through a door is worse than one that waits.
+    pub fn room_at(&self, p: Vec3) -> Option<&Cell> {
+        self.cells.iter().find(|c| {
+            let d = (p - c.centre).abs();
+            d.x <= c.half.x && d.y <= c.half.y + 1.0 && d.z <= c.half.z
+        })
+    }
+
+    /// The nearest room's id, whether or not you are inside it. For a
+    /// waypoint marker rather than for opening anything.
+    pub fn nearest_room(&self, p: Vec3) -> Option<&Cell> {
+        self.cells.iter().min_by(|a, b| {
+            a.centre.distance(p).partial_cmp(&b.centre.distance(p)).unwrap()
+        })
+    }
+
+    /// Somewhere to stand in a room — its centre, on the deck.
+    pub fn stand_in(&self, id: &str) -> Option<Vec3> {
+        let c = self.cell(id)?;
+        Some(Vec3::new(c.centre.x, self.deck_y, c.centre.z))
+    }
+
     pub fn cell(&self, id: &str) -> Option<&Cell> {
         self.cells.iter().find(|c| c.id == id)
     }

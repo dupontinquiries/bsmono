@@ -6030,6 +6030,40 @@ playtest rather than a switch.
 
 1098 passing.
 
+THE SHIP IS A PLACE NOW, and it was the right thing to build before the scale
+work: none of `--rescale`'s problem applies indoors. The rooms are authored,
+the scale is fixed, and moving between them is a position and a walkable
+check.
+
+`interior.rs` built a complete walkable ship — eight rooms from `hub_plan.h`,
+corridors, doors that seal and unseal, an SDF, a walkable test, fixture
+positions — and `main.rs` referenced it ZERO TIMES. `stations.rs` gave every
+console a `cell()` naming its room, and nothing ever read it. So the ship was
+a diagram with a menu bolted to it.
+
+The missing piece was one lookup: `room_at`. A walkable ship with no way to
+ask "where am I" cannot drive a console, which is what "referenced zero
+times" meant in practice.
+
+BEING IN THE ROOM IS WHAT OPENS A CONSOLE. I declared a three-metre activation
+radius out of habit and deleted it unused: the room rule needs no tuning,
+cannot put two consoles in range at once, and makes the answer to "why can't
+I use this" always "you are not in there", which a player can see. A radius
+would have added a number to get wrong.
+
+AND POWER FAILURE FINALLY DOES SOMETHING. From the bridge with the doors
+shut, 1 of 7 consoles is reachable and six are stranded by name.
+
+TWO THINGS I EXPECTED WRONG, both about doors being animated rather than
+boolean. A freshly generated ship has every door at travel 0, so a new
+`Aboard` reached exactly one room — correct, and my test read "1 vs 1" and
+concluded the sealing was broken. Then `depower` sets doors CLOSING rather
+than closed, so asking immediately gave "7 vs 7". Both fixed by running the
+doors out; a ship you have just boarded is sealed, and unsealing is what
+boarding means.
+
+1106 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

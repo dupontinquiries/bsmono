@@ -83,6 +83,26 @@ human moves at 0.45 of a bot's pace and the maps are built for neither.
       costs. It has never been asked at runtime.
 - [ ] `drop.rs` has the descent physics; `--terrain drop` flies it headlessly.
 
+### 2b. The ship as a place — DONE at the simulation layer
+
+The ship was the right thing to build before the scale work, because none of
+`--rescale`'s problem applies indoors: the rooms are authored, the scale is
+fixed, and moving between them is a position and a walkable check.
+
+- [x] **`interior.rs` is reachable.** It built a complete walkable ship —
+      eight rooms, corridors, doors that seal, an SDF, fixture positions — and
+      `main.rs` referenced it **zero times**. `aboard.rs` is the join.
+- [x] **Consoles live somewhere.** `Station::cell()` has named a room since
+      the stations landed and nothing used it. Being IN the room is what opens
+      a console; there is no activation radius, because a radius is a number
+      to get wrong and "you are not in there" is a reason a player can see.
+- [x] **Power failure means something.** From the bridge with the doors shut,
+      1 of 7 consoles is reachable. `interior.rs` has modelled sealing since
+      it landed and could not stop anybody, because nothing asked where you
+      were.
+- [ ] A renderer for it. The rooms have positions, sizes and fixtures; nothing
+      draws them.
+
 ### 3. Campaign missions you can play
 
 - [ ] `content::MISSIONS` has fifteen with sites, beats and gates.

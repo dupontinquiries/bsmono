@@ -4,6 +4,7 @@
 mod anim;
 mod approach;
 mod actuator;
+mod aboard;
 mod airlock;
 mod amalgam;
 mod analog;
@@ -569,6 +570,7 @@ fn parse_args() -> Opts {
                 println!("  --powers       the human interface: what each power costs its host");
                 println!("  --keys         the live control scheme, overlaps and all");
                 println!("  --brain [what]  squad commanders: doctrines, the LLM seam, the wire");
+                println!("  --aboard [len] walk the ship: rooms, consoles, sealed doors");
                 println!("  --rescale      what a real-sized robot costs, per constant");
                 println!("  --guidance     the ball-chaser as a missile: pursuit vs PN");
                 println!("  --assemble     part families, and the pairing score");
@@ -1148,6 +1150,10 @@ fn main() {
     }
     if argv.iter().any(|a| a == "--brain") {
         brain::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--aboard") {
+        aboard::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--rescale") {
