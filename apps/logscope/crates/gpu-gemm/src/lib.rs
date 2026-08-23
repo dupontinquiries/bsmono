@@ -10995,7 +10995,34 @@ LOGSCOPE_NO_Q4_0_TRANSCODE=1 restores the old path");
             // Modelled on the q4 fast path immediately below, which established that a tensor can go
             // from mmap to GPU without a dequantize pass. This is the same move for a format where it
             // is the difference between loading and not.
+            // NATIVE IQ1_S IS DECODE-ONLY, AND NOTHING CONVERTS FOR PREFILL.
+            //
+            // `linear_iq1_s_t` asserts `m == 1` with the message "batched prefill
+            // converts instead". Nothing converts. `Lin::apply` dispatches
+            // `LinKind::Iq1` straight to that matvec at any `m`, so the first
+            // multi-token forward panics — which for a real model is `prewarm`,
+            // during load, before a single token is generated:
+            //
+            //     assertion `left == right` failed: IQ1_S matvec is decode-only
+            //       left: 2   right: 1
+            //     ...  Gpu::ffn_apply -> Gpu::prewarm -> Engine::load
+            //
+            // Reported on Qwen3-14B-UD-IQ1_S from a fleet run. The format works
+            // for decode and there is no prefill path, so a checkpoint loaded
+            // this way cannot answer a prompt at all.
+            //
+            // So: refuse at load, naming the flag that works, instead of
+            // accepting the weights and panicking a few milliseconds later on a
+            // worker thread. `LOGSCOPE_IQ1_NATIVE=1` forces the old behaviour
+            // for anyone measuring the decode kernel deliberately.
+            //
+            // NOT converted here on the operator's behalf, deliberately: at
+            // 1.5625 bpw the conversion to q4's 4.5 is a 2.88x inflation, so a
+            // 30 GiB checkpoint becomes 87 GiB and is refused for memory. That
+            // trade belongs to whoever knows the machine, which is why the
+            // refusal names both directions.
             if quantize && t.ggml_type == 19 && k % 256 == 0
+                && std::env::var("LOGSCOPE_IQ1_NATIVE").is_ok()
                 && std::env::var("LOGSCOPE_NO_IQ1_NATIVE").is_err() {
                 let count = t.dims.iter().product::<u64>() as usize;
                 if count == n * k {
@@ -14162,7 +14189,12 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         // Decode only. This variant exists so a 30.3 GiB checkpoint can stay resident, and residency
         // matters at m == 1; claiming batch support it does not have would be the same kind of lie as
         // a gate testing a path nothing calls.
-        assert_eq!(m, 1, "IQ1_S matvec is decode-only; batched prefill converts instead");
+        assert_eq!(m, 1,
+            "IQ1_S matvec is decode-only and NOTHING converts for prefill — the previous wording \
+of this message claimed otherwise and no such path exists. Reaching here with m={m} means a \
+native-IQ1 weight took a batched forward, which the loader now refuses by default; you are here \
+because LOGSCOPE_IQ1_NATIVE=1 is set. Unset it to load this checkpoint through the converting \
+path (2.88x larger resident), or keep it and use decode-only paths.");
         let out = self.alloc(1, w.n);
         // THE DIMS WERE SHIFTED BY ONE FIELD. The shader declares
         //     struct D { m, n, k, kb, gx, ... }

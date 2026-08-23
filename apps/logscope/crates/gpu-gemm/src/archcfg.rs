@@ -1246,6 +1246,50 @@ inline r#\"...\"# in lib.rs is what compiles. Change lib.rs, then re-sync the fi
         );
     }
 
+/// Native IQ1_S stays OPT-IN while it has no prefill path.
+    ///
+    /// `linear_iq1_s_t` asserts `m == 1`, and `Lin::apply` sends `LinKind::Iq1`
+    /// to it at any `m`. There is no conversion anywhere — the assertion's own
+    /// message used to claim "batched prefill converts instead", and grepping
+    /// for that path finds nothing. So a checkpoint loaded natively panics on
+    /// its first multi-token forward, which is `prewarm`, during load:
+    ///
+    /// ```text
+    /// assertion `left == right` failed: IQ1_S matvec is decode-only
+    ///   left: 2   right: 1
+    ///   Gpu::ffn_apply -> Gpu::prewarm -> Engine::load
+    /// ```
+    ///
+    /// Reported on Qwen3-14B-UD-IQ1_S from a fleet run.
+    ///
+    /// The gate is now `LOGSCOPE_IQ1_NATIVE=1` — present to opt IN, rather than
+    /// `LOGSCOPE_NO_IQ1_NATIVE` to opt out. This pins the polarity, because
+    /// flipping it back is a one-word edit that turns every IQ1_S load into a
+    /// panic again, and no test on this machine would notice: there is no
+    /// IQ1_S fixture here, so the runtime path is unreachable and only the
+    /// source can be checked.
+    ///
+    /// Delete this test when a batched IQ1_S path exists — and it should be
+    /// deleted then, not weakened.
+    #[test]
+    fn native_iq1_s_is_opt_in_while_it_has_no_prefill_path() {
+        let lib = include_str!("lib.rs");
+
+        // The decode-only assertion must still be there. If it is gone, either
+        // a batched path landed (good — remove this test) or the guard was
+        // dropped (bad).
+        assert!(
+            lib.contains("IQ1_S matvec is decode-only"),
+            "the m == 1 assertion is gone from linear_iq1_s_t — if a batched IQ1_S path now exists, delete this test; if the guard was merely removed, a batched forward will read garbage instead of panicking, which is worse"
+        );
+
+        // And the loader must require the flag to be PRESENT.
+        assert!(
+            lib.contains(r#"std::env::var("LOGSCOPE_IQ1_NATIVE").is_ok()"#),
+            "the native IQ1_S loader path is no longer opt-in. While no prefill path exists, taking it by default means every IQ1_S checkpoint panics inside prewarm during load, before generating a token."
+        );
+    }
+
     /// The mirror: notes must not describe as PENDING anything the engine already honours. Group
     /// routing was reported pending for 50 bundles after it landed.
     #[test]
