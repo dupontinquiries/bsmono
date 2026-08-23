@@ -23,7 +23,12 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::review_gate::{Assessment, Posture, Thresholds};
+// `Posture` is used only by the tests below, so importing it here warns in a
+// non-test build. Scoped rather than deleted: the tests need it, and a
+// deleted import just moves the problem to whoever adds the next assertion.
+use crate::review_gate::{Assessment, Thresholds};
+#[cfg(test)]
+use crate::review_gate::Posture;
 
 #[derive(Clone, Debug)]
 pub struct Governor {

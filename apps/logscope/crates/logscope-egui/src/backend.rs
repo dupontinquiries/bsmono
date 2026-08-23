@@ -186,7 +186,16 @@ pub(crate) mod engine {
         /// Deliberately measure-before-mutate. The detector was built from one seventeen-turn log and
         /// its job is to rewrite the operator's transcript; before it is allowed to do that it should
         /// be seen firing, or not firing, on real traffic. A wrong compaction is expensive and silent.
-        horizon: std::cell::RefCell<gpu_kernels::horizon::Horizon>,
+        ///
+        /// `Mutex`, not `RefCell`. `logscope-fabricd` serves this worker as
+        /// `Arc<dyn Worker + Send + Sync>`, and a `RefCell` is not `Sync`, so the
+        /// daemon would not compile the moment this field existed. It never did —
+        /// the error only appears under `--features wgpu-engine`, which the GUI
+        /// build does not enable, so the binary that needs the bound is the one
+        /// nobody was building.
+        ///
+        /// One borrow site and it is per-turn, so the lock is free in practice.
+        horizon: std::sync::Mutex<gpu_kernels::horizon::Horizon>,
     }
     impl Engine {
         pub fn load(path: &str) -> Result<Self, String> {
@@ -694,7 +703,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 _ => None,
             };
             Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false, spec_anchor: None,
-                horizon: std::cell::RefCell::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)) })
+                horizon: std::sync::Mutex::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)) })
         }
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
@@ -726,7 +735,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 // A lane starts with no speculative anchor: the cache is not shareable across lanes
                 // (each holds its own KV) and a lane's first prompt is a different branch anyway.
                 spec_anchor: None,
-                horizon: std::cell::RefCell::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)),
+                horizon: std::sync::Mutex::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)),
                 eos: self.eos, stop_ids: self.stop_ids.clone(), template: self.template,
                 rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
                 anchors: Vec::new(), kv_cap: 1, pool: None, warm: self.warm,
@@ -1114,14 +1123,14 @@ verification pass (1.00 means the drafter paid for nothing)",
                 // ordinary forward would have.
                 if per_pass < 1.15 && st.rounds > 8 {
                     let mut why: Vec<String> = Vec::new();
-                    if params.temperature > 1.0 {
+                    if p.temperature > 1.0 {
                         why.push(format!("temperature {:.2} is above 1.0 — sampling away from the \
-drafter's greedy guess is exactly what rejects it", params.temperature));
+drafter's greedy guess is exactly what rejects it", p.temperature));
                     }
-                    if (params.repeat_penalty - 1.0).abs() > 0.01 {
+                    if (p.repeat_penalty - 1.0).abs() > 0.01 {
                         why.push(format!("repeat_penalty {:.2} is not 1.0 — it reshapes the \
 target distribution per position, so the draft is scored against something the drafter never saw",
-                            params.repeat_penalty));
+                            p.repeat_penalty));
                     }
                     let tail = if why.is_empty() {
                         "sampling is not the cause (temperature <= 1.0, penalty off), so this text \
@@ -1321,7 +1330,9 @@ was evicted)", prompt_ids.len())
             // move the n_ctx slider mid-session, and a watcher advising against a window that is no
             // longer in force is worse than no watcher.
             {
-                let mut hz = self.horizon.borrow_mut();
+                // A poisoned lock here must not take down a serving daemon: the
+                // watcher is advisory and observes numbers already printed.
+                let mut hz = self.horizon.lock().unwrap_or_else(|e| e.into_inner());
                 if hz.window() != window { *hz = gpu_kernels::horizon::Horizon::new(window, 512, l.max(1)); }
                 hz.observe(gpu_kernels::horizon::Turn {
                     prompt_len: prompt_ids.len(),
