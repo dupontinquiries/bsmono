@@ -230,7 +230,20 @@ pub fn desktop_filename(name: &str, label: &str) -> String {
 /// whether a binary defaults to a GUI, and running it to find out is not
 /// something a launcher-writer can do.
 pub fn gui_launch_args(name: &str) -> &'static [&'static str] {
-    match name {
+    // MATCH ON THE APP NAME, NOT THE PINNED TARGET. The apps page launches a
+    // specific version — `run_local(&format!("{name}@{label}"), "")` — so what
+    // arrives here is `beatspace@import-20260823013848`, not `beatspace`, and an
+    // exact match silently returns nothing. Reported from a real launch: the run
+    // button started the binary bare, clap printed its usage and the process
+    // exited, so the button looked dead while the table it was supposed to
+    // consult was right here and correct.
+    //
+    // The desktop-entry path never hit this because `desktop_entry` is called
+    // with the bare name. One table, two callers, two different key shapes — so
+    // normalise here rather than at one call site, or the next caller
+    // rediscovers it.
+    let base = name.split('@').next().unwrap_or(name);
+    match base {
         "beatspace" => &["gui"],
         _ => &[],
     }
@@ -457,4 +470,66 @@ mod remove_tests {
         remove("demo", "v1").unwrap();
         assert_eq!(load_manifest("demo").current, None);
     }
+
+    /// The pinned-target form resolves to the same launch args as the bare name.
+    ///
+    /// This is the bug that reached a user. `apps.rs` launches a SPECIFIC
+    /// version — `run_local(&format!("{name}@{label}"), "")` — so the lookup key
+    /// is `beatspace@import-20260823013848`. The table matched `"beatspace"`
+    /// exactly, missed, and returned no args; beatspace printed its usage and
+    /// exited, and the run button appeared to do nothing.
+    ///
+    /// The table was right the whole time. The desktop-entry path worked,
+    /// because `desktop_entry` passes the bare name. One table, two callers,
+    /// two key shapes.
+    #[test]
+    fn a_pinned_version_gets_the_same_launch_args_as_the_bare_name() {
+        let bare = gui_launch_args("beatspace");
+        assert_eq!(bare, &["gui"], "the bare name must still work");
+        for target in [
+            "beatspace@import-20260823013848",
+            "beatspace@v0.2.0",
+            "beatspace@main",
+        ] {
+            assert_eq!(gui_launch_args(target), bare,
+                "{target} must resolve to the same args as `beatspace`; an app pinned to a version is still that app");
+        }
+    }
+
+    /// An app with no entry gets nothing, pinned or not — the table must not
+    /// start inventing verbs for apps that open a window when run bare.
+    #[test]
+    fn an_app_without_an_entry_gets_no_args_in_either_form() {
+        assert!(gui_launch_args("aperture").is_empty());
+        assert!(gui_launch_args("aperture@import-20260823013848").is_empty());
+        assert!(gui_launch_args("").is_empty());
+    }
+
+    /// The suffix split must not swallow a name that merely contains the base.
+    #[test]
+    fn a_different_app_is_not_matched_by_prefix() {
+        // Only an exact base name counts; `beatspace-tools` is a different app.
+        assert!(gui_launch_args("beatspace-tools").is_empty());
+        assert!(gui_launch_args("beatspace-tools@v1").is_empty());
+    }
+
+    /// The desktop entry carries the verb BEFORE %U.
+    ///
+    /// Order matters and is easy to get backwards: a file argument arriving
+    /// before the subcommand makes clap read the path as the command name.
+    #[test]
+    fn the_desktop_entry_puts_the_verb_before_the_file_placeholder() {
+        let v = AppVersion {
+            label: "import-20260823013848".into(),
+            commit: "abcdef1234567890".into(),
+            oid: "0011223344556677".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            installed: 1_766_000_000,
+            path: "/home/u/.local/share/gitmind/bin/beatspace@import-20260823013848".into(),
+        };
+        let entry = desktop_entry(&v, "beatspace", false, None);
+        let exec = entry.lines().find(|l| l.starts_with("Exec=")).expect("Exec line");
+        assert!(exec.ends_with(" gui %U"), "verb must precede %U, got: {exec}");
+    }
+
 }
