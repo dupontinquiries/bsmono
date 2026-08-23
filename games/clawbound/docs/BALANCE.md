@@ -256,6 +256,43 @@ and it is where the next investigation should start: what happens to a
 freshkill lead over the following two minutes, and why the growth curve does not
 turn it into map control.
 
+## The economy was decorative
+
+`examples/economy_probe.rs` samples both piles every second and asks what a
+freshkill lead is worth. Two things came out of it, and the first corrects an
+earlier claim in this document.
+
+**A lead does compound.** Slope of the lead 120 seconds later against the lead
+now: **1.21** — an organically earned lead grows about a fifth. What evaporated
+in the spoils experiment was a *granted* lead, which is a different thing: hand
+a clan twelve freshkill it did not hunt for and the system regresses it away.
+
+**But the prize was almost nothing.** Mean growth multiplier, leader against
+trailer: **1.138 vs 1.108**. A whole clan's advantage in the food economy was
+buying under three percent damage — because `GROWTH_HALF` was 16 while real
+piles hover around three. The curve's entire interesting range sat above
+anything a match ever reached. Half-point is 6 now, sized to the economy that
+exists rather than the one the constant was guessed for, and there is a test
+that the difference between a pile of three and a pile of nine is worth more
+than a tenth of a multiplier.
+
+| | half = 16 | half = 6 |
+|---|---|---|
+| composition-decided pairs | 54% | **53%** (210/400) |
+| mean growth, leader / trailer | 1.138 / 1.108 | 1.245 / 1.217 |
+| lead surviving two minutes | 121% | 134% |
+
+Composition-determinism did not move, and the leader/trailer *gap* barely moved
+either (0.030 to 0.028) — which points at the real finding: **leads stay small
+because the economy self-equalises.** The clan that is behind hunts 1.9x as
+much, every run, because the clan that is ahead is busy fighting. Nobody
+designed that rubber band; it falls out of an AI that farms when it is not
+otherwise engaged.
+
+Whether a clan-war mode wants an economy that quietly refuses to let anyone get
+ahead is a design question, and a more interesting one than any number in this
+file. It is not answered here.
+
 ## What this says, and what it does not
 
 Ten of thirteen kits are statistically indistinguishable from even. The three

@@ -143,7 +143,14 @@ const RICH_WORTH: f32 = 3.0;         // the contention ground's prey
 const CARRY_SLOW: f32 = 0.75;
 const CONTEND_R: f32 = 20.0;
 const GROWTH_CAP: f32 = 0.8;         // pile can add at most +80% power
-const GROWTH_HALF: f32 = 16.0;       // pile worth at which half the cap is reached
+/// The pile at which a clan has half the growth it can ever have. **Sized to the
+/// economy that exists, not the one the number was guessed for**: the probe
+/// found the mean growth multiplier running at 1.138 against 1.108 — a whole
+/// clan's freshkill lead buying under three percent damage — because the
+/// half-point was 16 while real piles hover around three. The curve's entire
+/// interesting range sat above anything a match ever reached, so the economy
+/// was decorative. At 6 a typical lead is worth something a fight can feel.
+const GROWTH_HALF: f32 = 6.0;       // pile worth at which half the cap is reached
 
 // herbs
 /// One herb patch on clan A's side; the other is its reflection, generated —
@@ -3160,6 +3167,25 @@ mod tests {
         }
         assert!(!plain.heal_trees[t2].alive());
         assert_eq!(plain.clans[CLAN_A as usize].pile, p0);
+    }
+
+    #[test]
+    fn the_growth_curve_bites_inside_the_piles_a_match_actually_reaches() {
+        // A curve whose interesting range sits above anything the mode produces
+        // is a decoration. Real piles run single digits, so that is where the
+        // difference has to live.
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.clans[CLAN_A as usize].pile = 3.0;
+        let modest = bg.growth(CLAN_A);
+        bg.clans[CLAN_A as usize].pile = 9.0;
+        let fed = bg.growth(CLAN_A);
+        assert!(
+            fed - modest > 0.1,
+            "three against nine should be worth more than a tenth: {modest:.3} -> {fed:.3}"
+        );
+        // and it still saturates rather than running away
+        bg.clans[CLAN_A as usize].pile = 1e6;
+        assert!(bg.growth(CLAN_A) < 1.0 + GROWTH_CAP + 1e-4);
     }
 
     #[test]

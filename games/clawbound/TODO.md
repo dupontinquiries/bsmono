@@ -301,9 +301,19 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   felled border spills 12 freshkill. It **did not help**: breacher wins 41% -> 34%, and the
   reward evaporates — a +14.3 pile lead at the break is +0.7 by match end while the
   defender out-farms it back. The attacker's problem is not that borders pay too little.
-- [ ] The better question, now visible: **a freshkill lead does not compound.** Track a
-  clan's pile lead over the two minutes after it opens and find out why growth does not
-  turn into map control — that is where the attacker/defender asymmetry actually lives.
+- [x] Probed it (`examples/economy_probe.rs`) and the premise was half wrong: an *earned*
+  lead does compound (slope 1.21 over two minutes); it was the *granted* spoils lead that
+  regressed away. What was actually broken: `GROWTH_HALF` was 16 while real piles hover
+  around **three**, so the whole interesting range of the growth curve sat above anything a
+  match reached and a clan's entire food advantage bought under 3% damage (1.138 v 1.108).
+  Half-point is 6 now, with a test that a pile of nine beats a pile of three by more than a
+  tenth of a multiplier.
+- [ ] The deeper finding, unresolved and more interesting than the constant: **the economy
+  self-equalises.** The trailing clan hunts 1.9x as much in every run, because the leading
+  clan is busy fighting — an emergent rubber band nobody designed. Composition-determinism
+  did not move (53%) and the leader/trailer growth gap barely did (0.030 -> 0.028), because
+  leads stay small no matter how the curve is shaped. Whether a clan war *wants* an economy
+  that refuses to let anyone pull ahead is a design question.
 - [ ] Conversion still isn't fixed: **39.8% pooled over 793 games (se 1.8)**, five standard
   errors below even. Two explanations eliminated, one repaired, and defending is still
   stronger than attacking. The remaining candidates are structural rather than buggy — the
