@@ -146,6 +146,19 @@ absorbing all of it.
   A 45% ± 7.9, consistent with their 51%; `mirror_probe` still reports
   divergence after first contact, which is their own open TODO item, not a
   merge regression.
+  POOLED 784-GAME RUN (the scale their own `docs/BALANCE.md` says is required,
+  because at ~70 appearances draft luck swamps a kit's ±6): **clan A 391/783 =
+  50%**, exactly the symmetry the map claims, and roster spread 44-56% against
+  their committed table's 44-55%. The kits flagged outside 2se DIFFER from
+  theirs (we get Twofang 56% high, Goldenmane 44% low; their pre-fix table
+  flagged Windclaw, Rainspots, Snowhush). Windclaw lands at 55% here against
+  the 49% their patch-22 fix claims — exactly 2se at n=784, and one kit at 2se
+  out of thirteen is what chance produces. The fix itself is verifiably PRESENT
+  rather than lost in the merge: `prey_taken` exists, prey credits it
+  (battleground.rs:1207), and a test asserts prey does not credit `kills`. So
+  this is sampling, not a dropped commit — but nobody has reproduced their
+  exact per-kit figures, and that is worth saying rather than rounding to
+  "reproduces".
 
 ### New, from integrating
 
