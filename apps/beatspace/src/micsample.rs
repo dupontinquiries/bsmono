@@ -689,4 +689,174 @@ rejection has stopped working",
         assert_eq!(r.total(), 10);
     }
 
+
+    // ── noise floors ────────────────────────────────────────────────────────
+    //
+    // Every fixture above sits on synthetic silence at a flat -80 dB, which no
+    // room provides. A real floor is a fridge, traffic, a fan — steady, not
+    // flat, and tens of dB above the digital floor. `threshold_mult` is
+    // median-RELATIVE, so it should handle this by construction; "should by
+    // construction" is exactly the claim worth checking, since it was the one
+    // thing the synthetic fixtures could not honestly simulate.
+
+    /// Deterministic pseudo-noise, so a failure is reproducible.
+    fn noisy(seed: u32, floor_db: f32, spread: f32) -> Vec<f32> {
+        (0..N_MELS)
+            .map(|m| {
+                let h = (seed.wrapping_mul(2654435761).wrapping_add(m as u32 * 40503)) >> 8;
+                let u = (h & 0xffff) as f32 / 65535.0;
+                floor_db + (u - 0.5) * spread
+            })
+            .collect()
+    }
+
+    /// A fridge: steady low-frequency energy, well above the digital floor.
+    fn hum(seed: u32) -> Vec<f32> {
+        (0..N_MELS)
+            .map(|m| {
+                let h = (seed.wrapping_mul(69069).wrapping_add(m as u32 * 7919)) >> 8;
+                let jitter = ((h & 0xff) as f32 / 255.0 - 0.5) * 1.5;
+                let base = if m < N_MELS / 6 { -35.0 } else { -70.0 };
+                base + jitter
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_room_with_a_noise_floor_does_not_trigger_on_the_floor_itself() {
+        // 40 dB above the synthetic silence the other tests use.
+        let frames: Vec<Vec<f32>> = (0..4000).map(|i| noisy(i, -40.0, 4.0)).collect();
+        let (s, _) = run(Gate::default(), &frames);
+        // ONSETS, not keeps. `keeps == 0` here would pass for the wrong reason:
+        // the novelty and refractory gates downstream reject repeated room tone
+        // whatever the threshold does, so a keeps-based assertion is satisfied
+        // by a completely broken threshold. Measured and verified — the first
+        // version of this test passed with `threshold_mult` at 1.02.
+        assert_eq!(s.onsets, 0,
+            "a steady noise floor produced {} onsets — an all-day session in a room \
+with a fridge would spend its time rejecting room tone", s.onsets);
+        assert_eq!(s.keeps, 0);
+    }
+
+    #[test]
+    fn a_transient_over_a_noise_floor_is_still_heard() {
+        // The other half: adapting to the floor must not mean going deaf.
+        let mut frames: Vec<Vec<f32>> = (0..600).map(|i| noisy(i, -40.0, 4.0)).collect();
+        for age in 0..14 {
+            let decay = (-(age as f32) * 0.4).exp();
+            let f: Vec<f32> = (0..N_MELS)
+                .map(|m| {
+                    let base = noisy(9000 + age as u32, -40.0, 4.0)[m];
+                    base + 45.0 * decay
+                })
+                .collect();
+            frames.push(f);
+        }
+        frames.extend((0..300).map(|i| noisy(20_000 + i, -40.0, 4.0)));
+        let (s, _) = run(Gate::default(), &frames);
+        assert_eq!(s.keeps, 1,
+            "a clear transient over a noise floor yielded {} crops", s.keeps);
+    }
+
+    #[test]
+    fn a_fridge_hum_is_ignored_and_a_knock_over_it_is_not() {
+        let mut frames: Vec<Vec<f32>> = (0..800).map(hum).collect();
+        // A knock: mid-band energy the hum does not occupy.
+        for age in 0..12 {
+            let decay = (-(age as f32) * 0.35).exp();
+            let f: Vec<f32> = (0..N_MELS)
+                .map(|m| {
+                    let base = hum(5000 + age as u32)[m];
+                    if (N_MELS / 4..N_MELS / 2).contains(&m) { base + 50.0 * decay } else { base }
+                })
+                .collect();
+            frames.push(f);
+        }
+        frames.extend((0..300).map(|i| hum(30_000 + i)));
+        let (s, _) = run(Gate::default(), &frames);
+        assert_eq!(s.keeps, 1, "hum plus one knock yielded {} crops", s.keeps);
+        assert!(s.rejected.total() < 20,
+                "the hum should not be generating onsets to reject: {:?}", s.rejected);
+    }
+
+    /// The floor RISING mid-session — someone turns on a fan — must not become
+    /// a permanent onset generator.
+    #[test]
+    fn a_floor_that_rises_settles_rather_than_firing_forever() {
+        let mut frames: Vec<Vec<f32>> = (0..600).map(|i| noisy(i, -55.0, 3.0)).collect();
+        frames.extend((0..3000).map(|i| noisy(60_000 + i, -35.0, 3.0)));
+        let (s, _) = run(Gate::default(), &frames);
+        assert!(s.keeps <= 2,
+            "a step change in the noise floor produced {} crops; the threshold is \
+not re-settling and a fan switching on would cost the whole budget", s.keeps);
+    }
+
+    /// The quiet-room floor exists for this: with a median near zero, a
+    /// multiplier alone thresholds at zero and every faint rustle is an onset.
+    #[test]
+    fn a_near_silent_room_does_not_fire_on_dither() {
+        let frames: Vec<Vec<f32>> = (0..3000).map(|i| noisy(i, -79.5, 0.4)).collect();
+        let (s, _) = run(Gate::default(), &frames);
+        assert_eq!(s.keeps, 0,
+            "{} crops from a near-silent room — the absolute floor in threshold() \
+is not holding", s.keeps);
+    }
+
+
+    /// THE TEST THAT ACTUALLY CONSTRAINS `threshold_mult`.
+    ///
+    /// Everything else here uses transients 70 dB over the floor, which is a
+    /// door slam next to the microphone. Those fire at any sane multiplier —
+    /// verified the embarrassing way: the whole module's tests passed with
+    /// `threshold_mult` set to 40, a value that would make the gate deaf to
+    /// anything short of a gunshot. So none of them was testing the threshold.
+    ///
+    /// It pins the FLUX WINDOW too, verified the same way: crippling
+    /// `flux_window` from 300 to 4 fails this test and nothing else. So one
+    /// test covers both onset parameters, and before it existed neither was
+    /// covered at all.
+    ///
+    /// A companion test was tried and deleted rather than kept: it asserted
+    /// that a short window makes a steady noise floor fire, to demonstrate what
+    /// adaptation buys. It does not. A 2.5x multiplier alone rejects stationary
+    /// noise at any window length — adaptation earns its place on level
+    /// CHANGES, not on steady tone. The claim was false and an assertion of a
+    /// false claim is worse than no assertion.
+    ///
+    /// A MARGINAL event is what pins it: a soft knock a few dB over a real
+    /// noise floor, the quietest thing a sample library still wants. It must be
+    /// heard at the default and it must not be heard at a wildly high
+    /// multiplier, and both halves are asserted.
+    #[test]
+    fn a_marginal_event_over_a_noise_floor_pins_the_onset_multiplier() {
+        let build = |boost: f32| {
+            let mut frames: Vec<Vec<f32>> = (0..600).map(|i| noisy(i, -45.0, 3.0)).collect();
+            for age in 0..10 {
+                let decay = (-(age as f32) * 0.3).exp();
+                let f: Vec<f32> = (0..N_MELS)
+                    .map(|m| noisy(7000 + age as u32, -45.0, 3.0)[m] + boost * decay)
+                    .collect();
+                frames.push(f);
+            }
+            frames.extend((0..300).map(|i| noisy(40_000 + i, -45.0, 3.0)));
+            frames
+        };
+
+        // Audible-but-soft: the default must hear it.
+        let (heard, _) = run(Gate::default(), &build(18.0));
+        assert!(heard.onsets > 0,
+            "a soft knock 18 dB over the floor produced no onsets — the default \
+multiplier is too high for a quiet room");
+        assert_eq!(heard.keeps, 1, "and it should be kept, got {}", heard.keeps);
+
+        // The same event with the gate set deaf: it must NOT be heard. Without
+        // this half the test above passes for any multiplier at all.
+        let deaf = Gate { threshold_mult: 40.0, ..Gate::default() };
+        let (missed, _) = run(deaf, &build(18.0));
+        assert_eq!(missed.onsets, 0,
+            "a 40x multiplier still heard the knock, so this test does not \
+constrain the threshold either");
+    }
+
+
 }
