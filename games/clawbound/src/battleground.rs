@@ -1201,8 +1201,18 @@ impl Battleground {
                 if let Some(slot) = ability { self.cast(0, slot.min(2)); }
                 if claw {
                     if let Some(t) = self.nearest_enemy(0, self.warriors[0].reach) {
-                        let dmg = self.strike_of(0) * dt;
+                        // the same blow an AI ancestor throws — target-dependent
+                        // riders, on-hit effects, and the kill credited. A player's
+                        // claw that quietly skipped Hush of Snows or The Saber
+                        // Finishes would make the kits play differently in a human's
+                        // paws than in the sim they were balanced in.
+                        let dmg = self.strike_of(0) * self.strike_vs(0, t) * dt;
+                        let alive_before = self.warriors[t].alive();
                         self.hurt(t, dmg);
+                        self.on_hit(0, t);
+                        if alive_before && !self.warriors[t].alive() {
+                            self.warriors[0].kills += 1;
+                        }
                     }
                 }
             }
@@ -2275,6 +2285,94 @@ mod tests {
             seen[MID_LANE] > seen[SOLO_LANE],
             "the middle should carry the most patrol traffic: {seen:?}"
         );
+    }
+
+    #[test]
+    fn the_player_drives_their_own_warrior_and_the_ai_lets_go() {
+        // The whole `set_input` path had no test: every other test in this file
+        // drives the AI. A human's warrior has to move where it is told, cast
+        // what it is told, and stop being second-guessed by `think`.
+        let mut bg = Battleground::new(Ancestor::Serval);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors.retain(|w| w.team == CLAN_A);
+        let start = (bg.warriors[0].x, bg.warriors[0].z);
+        // walk east for a second
+        for _ in 0..30 {
+            bg.set_input(1.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        let moved = bg.warriors[0].x - start.0;
+        assert!(moved > 3.0, "the player's warrior should have walked east, got {moved}");
+        assert!((bg.warriors[0].z - start.1).abs() < 0.01, "and not drifted north");
+        assert!(bg.player_driven, "the first input hands the seat over");
+        // the AI must not be steering it any more: hold no input and it holds still
+        let held = (bg.warriors[0].x, bg.warriors[0].z);
+        for _ in 0..30 {
+            bg.set_input(0.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert!(
+            dist(bg.warriors[0].x, bg.warriors[0].z, held.0, held.1) < 0.01,
+            "an idle player is idle, not auto-piloted"
+        );
+        // a rooted player cannot walk, and knows it
+        bg.warriors[0].root_t = 1.0;
+        let rooted = (bg.warriors[0].x, bg.warriors[0].z);
+        for _ in 0..15 {
+            bg.set_input(1.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert!(dist(bg.warriors[0].x, bg.warriors[0].z, rooted.0, rooted.1) < 0.01);
+    }
+
+    #[test]
+    fn the_players_claw_is_the_same_blow_an_ancestor_throws() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Lynx, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Leopard, Ancestor::Panther],
+        );
+        bg.patrol_t = [1e9; 2];
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        bg.warriors[e].x = x + 1.5;
+        bg.warriors[e].z = z;
+        bg.warriors[e].root_t = 100.0; // hold it still; this is about the blow
+        let hp0 = bg.warriors[e].hp;
+        bg.set_input(0.0, 0.0, true, None);
+        bg.step(1.0 / 30.0);
+        assert!(bg.warriors[e].hp < hp0, "the claw should land");
+        // Snowhush's Hush of Snows must fire from a human's paw too
+        assert!(bg.warriors[e].slow_t > 0.0, "on-hit riders apply to player blows");
+        // and the kill is credited
+        bg.warriors[e].hp = 0.01;
+        bg.set_input(0.0, 0.0, true, None);
+        bg.step(1.0 / 30.0);
+        assert!(!bg.warriors[e].alive());
+        assert_eq!(bg.warriors[0].kills, 1, "a player's kill counts as a kill");
+    }
+
+    #[test]
+    fn the_player_casts_by_slot_and_pays_the_cooldown() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        // Nobody within reach — the first draft of this test parked a rooted
+        // Nightpelt five metres away and watched the shield vanish inside the
+        // same tick: at night its Pounce of Midnight lands 29 against a 28-point
+        // Mane of Dawn. The kits are working; the test was measuring a duel.
+        for i in 0..bg.warriors.len() {
+            if bg.warriors[i].team == CLAN_B {
+                bg.warriors[i].x = 140.0;
+                bg.warriors[i].z = 140.0;
+            }
+        }
+        bg.set_input(0.0, 0.0, false, Some(1)); // Mane of Dawn
+        bg.step(1.0 / 30.0);
+        assert!(bg.warriors[0].shield > 0.0, "slot 1 should have gone off");
+        assert!(bg.warriors[0].cds[1] > 0.0, "and started its cooldown");
+        // an out-of-range slot index is clamped rather than panicking
+        bg.set_input(0.0, 0.0, false, Some(9));
+        bg.step(1.0 / 30.0);
+        assert!(bg.warriors[0].cds[2] > 0.0, "slot 9 clamps to the ultimate");
     }
 
     #[test]

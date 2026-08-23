@@ -261,8 +261,23 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   direction is weak but real evidence that holding an ability costs more than it buys in
   fights this short, so **`wombo` now defaults off**. The code, the switch and the tests
   stay: the behaviour wants an AI that can promise the follow-up rather than hope for it.
-- [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
-  camera follow; needs the `app` feature stack (winit/wgpu) compiled
+- [x] Playable *now*, without the blocked GUI stack: `examples/battleground_play.rs` — a
+  terminal client with a top-down ASCII view (terrain, brush, stone, water, high ground,
+  prey, herbs, zones, both clans, structures), a HUD (ability cooldowns by name, pile,
+  herbs, Great Tree hp, contention and Skyrock holders), and one warrior under your paw.
+  Interactive by line, or scripted (`-- lynx "wwwd1f" 60`) which is deterministic and
+  diffable. Keystroke and script share one `key()` mapping, so the scripted path exercises
+  exactly what a human's press does.
+- [x] The `set_input` path had **no test at all** — everything in battleground.rs drove the
+  AI. Now covered: the player moves where told and only where told (an idle player is idle,
+  not auto-piloted), a root stops them, slots cast and pay cooldowns, an out-of-range slot
+  clamps rather than panics, and the player's claw is the *same blow* an ancestor throws —
+  target riders, on-hit effects (Hush of Snows fires from a human's paw) and kill credit,
+  which it previously skipped.
+- [ ] --play wiring in app.rs (the real client): input → `set_input`, ability keys, HUD
+  (pile/herbs/tree hp), camera follow; needs the `app` feature stack (winit/wgpu) compiled.
+  NOTE: the incoming series wrote "still needs rustc >= 1.76" here; that blocker was
+  retired on this side and the wording is kept as-is deliberately.
 - [x] Player-pick draft UI in menu.rs — `Screen::Draft`, 6 pick slots (3 per
   clan) cycling through the 13-ancestor roster with no-duplicate cycling,
   `MenuCmd::StartBattleground([Ancestor;3], [Ancestor;3])`. Reachable from

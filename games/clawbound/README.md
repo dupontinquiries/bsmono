@@ -13,7 +13,7 @@ web build all run the exact same deterministic logic.
 | **Survive** | 6 cats vs 1 hunter | Outlast the hunter for the round using cover |
 | **Prowl** | 1 cat vs 1 stalker | Clear rotating objectives (Reach / Rendezvous / Survive / Forage), hunt prey, survive a shrinking ring; respawn on catch |
 | **Pop Island** | 3 vs 3 teams | "Yarn Ball Capture" — carry yarn to your base; most captures over two periods wins (sudden-death overtime on a tie) |
-| **Battleground** | clan vs clan | "Battleground of the Ancestors" — legendary First Warriors, three trails, Trees of Healing; fell the enemy Great Tree (`battle` render mode; --play wiring pending) |
+| **Battleground** | clan vs clan (playable in a terminal: `cargo run --example battleground_play`) | "Battleground of the Ancestors" — legendary First Warriors, three trails, Trees of Healing; fell the enemy Great Tree (`battle` render mode; --play wiring pending) |
 
 Prowl and Pop Island are ports of two browser prototypes onto the native engine,
 sharing the `class` / `powerup` / `ring` primitives.
