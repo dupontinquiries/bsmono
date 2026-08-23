@@ -527,6 +527,37 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   clamps rather than panics, and the player's claw is the *same blow* an ancestor throws —
   target riders, on-hit effects (Hush of Snows fires from a human's paw) and kill credit,
   which it previously skipped.
+## Sound: a hybrid soundscape that lives with the world
+
+- [x] `soundscape.rs` — two halves, because ambience and information are different jobs.
+  **Beds** are the AmbientSounds idea kept: layers chosen by *sampling* the world around the
+  listener (canopy, water fraction, height, night, leaf-bare) on a ring rather than a single
+  point — one sample under the paws says "in a puddle", nine say "at the river" — each
+  crossfading so a treeline is a slope rather than a cut. Nothing is authored twice: the
+  terrain already answers these questions.
+- [x] **Nodes** are the half a MOBA needs and a block game does not: emitters that live at a
+  place *and carry state*. A hunting camp murmurs while its prey is alive and goes quiet
+  once taken, so a player learns to hear a camp somebody else has cleared; a Heal Tree hums
+  while it stands and **creaks while it is being gnawed**, which is a warning arriving
+  through the ears from a lane you cannot see. Nodes are not faded in — an emitter you are
+  standing beside should be audible the moment you are beside it.
+- [x] **Events** are one-shots that duck the beds and are not ducked themselves: a border
+  falling, the Skyrock changing paws, night, a herb delivered, your own death, victory.
+  They fire on the frame they happen and only then — the first version kept re-emitting for
+  the length of the duck, which for a fire-and-forget backend is the same thunderclap
+  played thirty-six times.
+- [x] The mix is scaled if the looping layers sum past 1.0, so a backend is never handed a
+  clipping frame; events are exempt, because a cue that matters should not be quietened by
+  a busy field. Pan is computed against the listener's facing.
+- [x] Pure and testable: it takes a world and a listener and returns `(cue, gain, pan)`. No
+  audio device, no file paths — a missing asset is a silent cue rather than a crash.
+  `examples/soundscape_walk.rs` walks the map printing the mix, then plays a match printing
+  the cues as they fire.
+- [ ] Backend: map `Cue::id()` to files and play them (the app's audio path). The one design
+  note worth carrying over from AmbientSounds is per-sound `length`/`transition` for
+  variation within a bed — several files per cue, chosen round-robin, so a loop does not
+  become a tick.
+
 ## Graphics: camera, ability guides, casting
 
 - [x] The camera came in: the `battle` render mode was framed two hundred units out on the

@@ -44,5 +44,6 @@ pub mod ring;
 pub mod sim;
 pub mod weather;
 pub mod wire;
+pub mod soundscape;
 pub mod world;
 pub mod worldscript;
