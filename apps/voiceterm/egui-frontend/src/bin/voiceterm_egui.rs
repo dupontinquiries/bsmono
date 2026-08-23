@@ -2630,6 +2630,30 @@ impl eframe::App for VoicetermApp {
                 ui, voiceterm_egui::pty_input::TermMode::default(),
                 self.workspace.tabs.len() > 1)
             {
+                // THE BYTES, WHICH THIS LOOP USED TO THROW AWAY.
+                //
+                // `drain_egui` consumes the frame's key events and returns an
+                // `Outcome` per press: `chord` for a UI action, `bytes` for
+                // terminal input. Only `chord` was read. So every encoded
+                // keystroke — arrows, Ctrl-C, Backspace, Alt-word-motions, the
+                // whole reason pty_input exists — was computed correctly and
+                // dropped on the floor, and the terminal took no keyboard input
+                // at all.
+                //
+                // It is `pty_out` they belong in, not a direct `feed_pty`: that
+                // buffer is what a host drains to a real shell, and the local
+                // echo below replays only its unseen tail. Appending here means
+                // the same bytes both reach a future PTY and appear on screen,
+                // through one path rather than two that can disagree.
+                if !out.bytes.is_empty() {
+                    self.pty_out.extend_from_slice(&out.bytes);
+                }
+                // `out.snap_to_bottom` is deliberately not consumed. This view
+                // draws a fixed grid with no scrollback, so it is always
+                // showing the tail and there is nothing to scroll. Wiring it to
+                // the one `stick_to_bottom` ScrollArea in this file would point
+                // it at a different panel. A host that adds scrollback should
+                // read it then — the encoder already computes it correctly.
                 if let Some(c) = out.chord {
                     chorded = true;
                     use voiceterm_egui::pty_input::Chord;
