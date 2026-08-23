@@ -1290,6 +1290,35 @@ inline r#\"...\"# in lib.rs is what compiles. Change lib.rs, then re-sync the fi
         );
     }
 
+/// The immediate-data (ex push-constant) capability is REACHABLE.
+    ///
+    /// lib.rs's llama.cpp comparison note recorded this as an open question:
+    /// "wgpu 29 does not expose PUSH_CONSTANTS or max_push_constant_size under
+    /// the names this crate would need". Those names are gone because wgpu
+    /// renamed the feature to IMMEDIATES, not because it is missing.
+    ///
+    /// This compiles only if the API exists, which is the whole assertion —
+    /// `Limits::max_immediate_size` is the field, and its own doc gives Vulkan
+    /// 128-256 bytes against our 16-byte dims payload.
+    ///
+    /// Worth pinning because the note sat as "unverified" while the answer was
+    /// one grep away, and a rename is exactly the kind of thing that would put
+    /// it back there.
+    #[test]
+    fn wgpu_exposes_immediate_data_the_dims_buffers_could_use() {
+        let l = wgpu::Limits::default();
+        // The field exists. Default is 0 — a non-zero size must be requested at
+        // device creation with Features::IMMEDIATES, which is the work, not the
+        // blocker.
+        let _: u32 = l.max_immediate_size;
+        assert_eq!(wgpu::IMMEDIATE_DATA_ALIGNMENT, 4,
+            "dims are u32s; if the alignment ever exceeds 4 the payload needs padding");
+        assert!(crate::DIMS_PUSH_BYTES <= 128,
+            "the dims payload is {} bytes; Vulkan's documented floor for immediates is 128, and \
+above it the substitution stops being free",
+            crate::DIMS_PUSH_BYTES);
+    }
+
     /// The mirror: notes must not describe as PENDING anything the engine already honours. Group
     /// routing was reported pending for 50 bundles after it landed.
     #[test]

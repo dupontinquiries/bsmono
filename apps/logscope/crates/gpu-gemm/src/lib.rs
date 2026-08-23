@@ -784,11 +784,32 @@ fn dims_cap_for(soft_object_cap: usize) -> usize {
 /// * the `dims_alloc_failed` path and the M4 "Buffer 'dims' invalid" crash it exists to survive,
 /// * the `SUBMIT_BY_DIMS_WRAP` attribution category, because it would not exist.
 ///
-/// NOT ATTEMPTED HERE, and the capability is unverified: wgpu 29 does not expose `PUSH_CONSTANTS` or
-/// `max_push_constant_size` under the names this crate would need, so whether it is reachable through
-/// this abstraction is an open question rather than a known yes. Recorded because the object-count
-/// arithmetic is the strongest argument yet for why our memory behaviour differs from llama.cpp's, and
-/// it does not depend on the answer.
+/// ## THE CAPABILITY IS THERE — wgpu RENAMED IT
+///
+/// This paragraph used to say the capability was unverified, because "wgpu 29 does not expose
+/// `PUSH_CONSTANTS` or `max_push_constant_size` under the names this crate would need". Those names
+/// are gone because wgpu renamed the feature to IMMEDIATE DATA, not because the feature is absent.
+/// Read out of the vendored crates rather than guessed:
+///
+/// * `wgpu::ComputePass::set_immediates(&mut self, offset: u32, data: &[u8])`
+///   — `wgpu-29.0.4/src/api/compute_pass.rs:124`
+/// * `Limits::max_immediate_size: u32` — `wgpu-types-29.0.3/src/limits.rs:240`, whose own doc says
+///   **"Vulkan: 128-256 bytes, DX12: 128, Metal: 4096"**
+/// * `Features::IMMEDIATES`, required to request a non-zero size at device creation
+/// * `IMMEDIATE_DATA_ALIGNMENT: u32 = 4` — our dims are 4-byte aligned already
+///
+/// Our payload is [`DIMS_PUSH_BYTES`] = 16, against a documented Vulkan floor of 128. It fits eight
+/// times over on the tightest backend named.
+///
+/// So the deletions listed above are reachable, and the object arithmetic says what they are worth:
+/// the dims cache and ring are **100% of live buffer objects** in a local measurement (dims 384 /
+/// pool 0 after 41 tokens), and a fleet run reports ~7535 live against Apple Vulkan's 3072 soft cap
+/// with the decode window clamped 4 → 2 as a direct result.
+///
+/// STILL NOT ATTEMPTED, and now for honest reasons rather than an unknown: it is a change to every
+/// dispatch site plus every WGSL entry point's uniform declaration, the failure mode is a driver
+/// that silently accepts a wrong offset, and nothing here can run it on the hardware where it
+/// matters. What has changed is that it is a scheduling decision instead of a research question.
 pub const DIMS_PUSH_BYTES: u32 = 16;
 /// Fixed uniform-buffer size for every dims buffer (largest dims payload is 16 u32 = 64 bytes; round up).
 const DIMS_BUF_SIZE: u64 = 256;
