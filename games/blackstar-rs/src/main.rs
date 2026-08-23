@@ -120,6 +120,7 @@ mod raidrun;
 mod raidsim;
 mod relay;
 mod render;
+mod rescale;
 mod rip;
 mod style;
 mod subsea;
@@ -568,6 +569,7 @@ fn parse_args() -> Opts {
                 println!("  --powers       the human interface: what each power costs its host");
                 println!("  --keys         the live control scheme, overlaps and all");
                 println!("  --brain [what]  squad commanders: doctrines, the LLM seam, the wire");
+                println!("  --rescale      what a real-sized robot costs, per constant");
                 println!("  --guidance     the ball-chaser as a missile: pursuit vs PN");
                 println!("  --assemble     part families, and the pairing score");
                 println!("  --trainwatch   GAN training diagnostics: collapse and coverage");
@@ -1146,6 +1148,10 @@ fn main() {
     }
     if argv.iter().any(|a| a == "--brain") {
         brain::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--rescale") {
+        rescale::run();
         return;
     }
     if argv.iter().any(|a| a == "--guidance") {

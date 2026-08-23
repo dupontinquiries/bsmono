@@ -5992,6 +5992,44 @@ surface was not.
 
 1090 passing.
 
+"WALKING AROUND AS A ROBOT" IS NOT A WIRING JOB, and finding that out was
+worth more than wiring `Avatar` in would have been.
+
+`apply_car_dims` already threads a `size` through every dimension, so the
+plumbing exists. But `cfg car_size` clamps to 0.55-2.0 and a bot needs 22.4x
+against the engine's 0.38 m tuning body — and raising the clamp is not the
+fix, because at 22x every constant is wrong by a DIFFERENT EXPONENT:
+
+      constant        now      correct   naive (xk)    error
+          GRAV       6.50         6.50       145.39    22.4x
+       CAR_MAX      23.00       108.78       514.47     4.7x
+   BOOST_DRAIN      33.30         7.04       744.87   105.8x
+         M_CAR     180.00   2014552.25      4026.32     0.0x
+
+Froude: length k, time sqrt(k), speed sqrt(k), ACCELERATION 1, mass k^3.
+Gravity was never wrong — it is an acceleration, and accelerations are
+scale-free — so the intuitive "multiply everything by k" makes a heavier
+world rather than a bigger one, and a bot that accelerates twenty-two times
+too hard.
+
+AND I GOT THE SECOND HALF WRONG FIRST. I asserted Froude PRESERVES
+body-lengths-per-second and wrote a test saying so. It does not: speed goes
+as sqrt(k) and length as k, so relative speed goes as 1/sqrt(k) and big
+things are relatively SLOWER — which is why an elephant is not as quick for
+its size as a mouse. The car's 61 bl/s becomes 12.8, so the scaling does most
+of the work.
+
+Not all of it. A cheetah manages about 4 bl/s and is the fastest thing on
+land, so the scaled bot is still three times that and doing 392 km/h. The
+exponents are right and the INPUT is not: scaling tells you how a number
+changes with size, and cannot tell you the number was never a robot'"'"'s to
+begin with. The feel numbers have to be re-derived.
+
+`--rescale` has the table. `PRIORITIES.md` now says a day of work and a
+playtest rather than a switch.
+
+1098 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

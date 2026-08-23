@@ -40,9 +40,19 @@ fixed. What is missing is that **the player is still a Rocket League car**:
 and `scale.rs` says a bot is 8.5 m. `board.rs` measured the consequence — a
 human moves at 0.45 of a bot's pace and the maps are built for neither.
 
-- [ ] Make the player body switch between `Scale::Titan` and `Scale::Human`
-      at runtime, not just in a table. `board.rs::Avatar` is the model; nothing
-      calls it.
+- [ ] **This is not a wiring job — `--rescale` prices it.** `apply_car_dims`
+      already threads a `size` through every dimension, but `cfg car_size` is
+      clamped to 0.55–2.0 and a bot needs **22.4x**. Raising the clamp is not
+      the fix: at 22x every constant tuned around the 0.38 m body is wrong,
+      and wrong by DIFFERENT EXPONENTS — speeds go as √k, accelerations do not
+      move at all, mass goes as k³. Scaling everything by k gives a bot that
+      accelerates 22x too hard.
+      Then the harder half: Froude fixes the exponents and cannot fix the
+      input. The RL car does 61 body-lengths per second; scaled, the bot does
+      12.8, against a cheetah's 4. The feel numbers have to be RE-DERIVED, not
+      scaled. A day of work and a playtest.
+- [ ] `board.rs::Avatar` is the model for the switch; wire it after the
+      constants are settled, not before.
 - [ ] Legged locomotion at all. Everything today rolls. `cling.rs` knows about
       gaits, `cybertronian.rs` names five of them, and the physics has wheels.
 - [ ] Third-person camera for a walking body — `scale::camera_for` computes it
