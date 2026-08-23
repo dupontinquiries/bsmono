@@ -278,7 +278,7 @@ than a tenth of a multiplier.
 
 | | half = 16 | half = 6 |
 |---|---|---|
-| composition-decided pairs | 54% | **53%** (210/400) |
+| composition-decided pairs | 54% | **52%** (210/400) |
 | mean growth, leader / trailer | 1.138 / 1.108 | 1.245 / 1.217 |
 | lead surviving two minutes | 121% | 134% |
 
