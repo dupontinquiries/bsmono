@@ -183,8 +183,261 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] `siege` kit trait (data-driven, budget-costed): heavy kits bite wood harder. Honest
   negative result — it moved Oldroar 33% -> 31% on its own; the retreat loop was the cure.
   Kept because the archetype should have the job, and it is tested.
-- [ ] Remaining spread (Faryowl 61%, Goldenmane 39%) is inside +-6% standard error at
-  n=42..82 games per kit — needs a longer run before anyone touches a number
+- [x] Laning is doctrine now, not draft order: `ancestor::sociability` scores how much of a
+  kit is spent on other cats (heal/rain +3, shield +2, control +1, **stealth -3** — a veil
+  shared is a veil wasted) plus +2 for a thin pelt (under 150 hp needs a bodyguard), and
+  the least sociable of a clan's three walks the river alone. Plus a duo doctrine: only one
+  lane-mate peels off to the economy at a time, because a lane held by nobody is given away.
+- [x] Settled by A/B on **identical drafts and lands** (`LanePolicy::Seat` vs `Kit`, 160
+  games each) rather than by comparing two runs that differed in more than one thing:
+  kit laning is decisively flatter — **sd 4.2 against 6.9**, range 18 against 24. The
+  intermediate result that looked like a regression (spread 36-67) was two non-identical
+  runs being compared, exactly the noise-chasing this switch exists to prevent.
+- [x] The frailty term was itself found by measurement: sorting on ally-facing tools alone
+  sent the 130-hp yowler down the river and cost it 19 points (55% -> 36%) in 168 games.
+- [x] Faryowl's 61% traced to a mechanism, not a number: the kite in the Fight branch let a
+  ranged cat give ground *and* land its blow in the same tick, so at speed 6.4 it outran
+  every kit slower than itself while still hitting — free damage against half the roster.
+  Backing away and biting are not the same motion, so giving ground now costs the strike.
+- [x] Three arms measured on identical drafts and lands (160 games each), because the first
+  fix overshot: kite free -> Faryowl 61%, sd 4.2, 1 kit outside +-7; kite **silent** ->
+  Faryowl 42% and Stillsmoke 37%, sd 6.2, 3 outside; kite at **half** -> Faryowl 53%,
+  sd 4.3, 1 outside. Half keeps the trade real without deleting the archetype, and a yowl
+  thrown over the shoulder being a weaker yowl is the version that was true anyway.
+  Abilities still land at full while kiting — spacing is what a yowler's abilities are paid
+  for; it was the free auto-attack that was wrong.
+- [x] Nightpelt's 62% was the same class of bug as Faryowl's kite, found by asking what the
+  kit got for free rather than by tuning: **stealth did not break on striking**. A veiled
+  cat was skipped by `nearest_enemy` entirely while still landing every blow — untargetable
+  and undiminished. Now the blow ends the ambush. The bonus is banked first (`strike_of`
+  reads the veil when the damage is computed), so a kit still gets its whole opening strike
+  from the dark and then has to be somewhere; shields, heals and Veilwalker itself do not
+  give a cat away.
+  Result on the same 160 games: Nightpelt 62% -> 46%, and the **tightest roster yet** —
+  sd 4.2, range 15, every kit within 8 points of even (was range 18, worst 12).
+- [x] The balance harness now separates side bias from draft-set luck: it reports how many
+  draft pairs split 1-1 (composition decided it) against how many one side took twice.
+  Latest: 33 split, 18 to clan A twice, 29 to clan B twice — a 1.6 SD lean, i.e. not
+  enough to act on, and the mirror probe's 51% over identical drafts remains the authority
+  on side fairness. The harness's 43% is mostly orientation-decided pairs, which is chaos.
+- [x] Shields honour their declared `dur` now — every kit's shield spec carried a duration
+  the sim ignored, so guard-hair held until something broke it and a lion could raise Mane
+  of Dawn once and wear it all match. Third free lunch of the week after the kite and the
+  veil, found the same way: asking what a kit gets without paying.
+- [x] **A correction to how the last few passes were argued.** Two independent draft sets
+  (same code, same 160-game shape, different draft seed) disagree wildly per kit: Riptail
+  66% then 39%, Suneye 55% then 40%, Faryowl 47% then 64%. At n≈70-90 games a kit's
+  standard error is ±6, and *which drafts it lands in* swamps that again. So the per-kit
+  table cannot resolve a kit-sized effect on one arm, and the rate improvements quoted for
+  the kite and veil fixes were weaker evidence than they read as. Those changes stand on
+  their mechanism — a cat that backs away while biting, a cat that strikes while
+  untargetable — which is why it was worth finding mechanisms rather than tuning numbers.
+- [x] Proof by counter-example, kept because it is the clearest one: *lengthening* the
+  shield durations to compensate for the nerf measured the buffed kit eleven points WORSE
+  (Goldenmane 49 -> 38). No buff does that; noise does. The durations went back to their
+  authored values and the lesson went into the harness instead — it now prints ± standard
+  error per kit and flags only rates outside two of them, and takes a draft-set seed so
+  independent sets can be pooled.
+- [x] Protocol written down and *run*: `docs/BALANCE.md` holds the pooled baseline — five
+  independent draft sets, **800 matches, 4,800 kit appearances**, ±2se ≈ ±5 points.
+  Result: **sd 3.3, range 12, ten of thirteen kits statistically even.** The three outside
+  two standard errors are Windclaw 55%, Rainspots 55%, Snowhush 44% — the weakest kind of
+  real, and each worth a mechanism hunt rather than a number nudge.
+- [x] The 800-game run is affordable because the jungle stopped reallocating: `thickets()`,
+  `walls()` and `mists()` rebuilt three Vecs on every call, and their callers are
+  `concealment_at` and `sees`, which run once per warrior pair per tick. Cached behind a
+  OnceLock with slice accessors for the hot path: **12,209 -> 27,883 sim steps/s (2.3x)**,
+  and the pooled protocol went from nineteen minutes to eight.
+- [x] Mechanism hunt done, and all three hypotheses were right (`docs/BALANCE.md` has the
+  before/after): Windclaw stacked Skyward Hunger off **prey** because the prey rework
+  credited mice as kills (55% -> 49%); Riverborn mended with no cost, cooldown or cap so
+  Rainspots could outlast anything that came to the water, and now mends only between
+  fights (55% -> 53%); Snowhush's chill was value only a packmate could spend, so the lynx
+  collects on it itself now, +25% into the slowed or rooted (44% -> 48%).
+- [x] Found while testing those: `Mind::AtMedic` healed **unconditionally**, so anything
+  that put a warrior in that state healed it wherever it stood. `think` never does that
+  from far away, so it never showed in play — two earlier tests were written around the
+  quirk before it was understood as a bug. Now the den heals only at the den.
+- [x] That hypothesis — spread dominated by AI quality rather than kit power — was testable
+  and true. The harness already measured it: only **44%** of draft pairs were decided by
+  the composition rather than by which orientation the chaos favoured. Warriors picked the
+  nearest visible enemy, so three cats chewed three healthy targets and killed nobody.
+- [x] Focus fire: a warrior now prefers the enemy closest to falling, trading up to eight
+  lengths for it. Composition-decided pairs **44% -> 54%** over 800 games. Dispersion rose
+  (3.3 -> 4.5) and that is the point: the old flatness was partly the AI hiding the roster,
+  and every kit number taken before this was taken through a duller instrument.
+- [ ] Re-run the mechanism hunt under focus fire — Duskstripe -6 and Oldroar at 41% are the
+  new candidates, but they are one arm-set old and the instrument just changed
+- [x] Odds doctrine: a warrior breaks off when outmatched, not only when wounded — counts
+  what it can *see* within 16 lengths, margin of two (one flaps as packmates cross the
+  radius), veiled cats uncounted. **The flattest roster yet: sd 4.5 -> 2.9, range 17 -> 10,
+  kits outside 2se 3 -> 1**, while composition-determinism *held* at 54% — so unlike the
+  old flatness this is not the AI hiding the roster, it is the roster being closer together
+  when played competently. Biggest gainers are the kits that were dying for nothing:
+  Oldroar +7, Snowhush +8, Riptail +6.
+- [x] Collapse-on-breach: healthy warriors abandon an intact trail for the lane whose Heal
+  Tree fell (before, only patrol spawns and respawns funnelled there, so a clan could break
+  a border and keep walking past the hole). Correct play, and it **measured worse** —
+  dispersion 2.9 -> 4.2, kits outside 2se 1 -> 2, composition-determinism 54% -> 52%. Lives
+  behind `collapse_on_breach`, default off. Suspected cause is in the rule: *every* healthy
+  warrior goes, so the clan trades one broken border for two empty lanes.
+- [x] Holder-push tested: everyone collapses *except* the lowest seat on each lane. The
+  abandonment diagnosis was right — composition-determinism back to 54%, dispersion 4.2 ->
+  3.5 — but pushing still does not beat not pushing (sd 2.9). Default stays off.
+- [x] New metric, because both existing ones measure the roster and none measured the AI:
+  **does the clan that breaks the first border win?** Pooled answer **43% over 320 games** —
+  taking the first objective was slightly a *liability*.
+- [x] First explanation found and fixed: the Great Tree's root guard was all-or-nothing, so
+  two standing Heal Trees hardened it exactly as much as three and a felled border bought
+  nothing. It scales now, a third of the guard per border. Tested.
+- [x] Instrumented it (`examples/breach_probe.rs`) and the overextension theory was **wrong**:
+  deaths after a break were even (21 v 25) and at identical depth (103m from each cat's own
+  camp), and the breacher was *ahead* on freshkill at the moment of the break in 17/29.
+  What the probe found instead: the breacher ended with fewer of its **own** borders
+  standing (-0.28), because `breach_lane` funnelled *every* patrol wave into the hole while
+  the defender kept covering three trails. Half the waves press the breach now; mechanism
+  metric -0.28 -> -0.07, probe conversion 34% -> 41%.
+- [x] Tried paying the attacker (`spoils`, default off — a design switch, not a bug fix): a
+  felled border spills 12 freshkill. It **did not help**: breacher wins 41% -> 34%, and the
+  reward evaporates — a +14.3 pile lead at the break is +0.7 by match end while the
+  defender out-farms it back. The attacker's problem is not that borders pay too little.
+- [x] Probed it (`examples/economy_probe.rs`) and the premise was half wrong: an *earned*
+  lead does compound (slope 1.21 over two minutes); it was the *granted* spoils lead that
+  regressed away. What was actually broken: `GROWTH_HALF` was 16 while real piles hover
+  around **three**, so the whole interesting range of the growth curve sat above anything a
+  match reached and a clan's entire food advantage bought under 3% damage (1.138 v 1.108).
+  Half-point is 6 now, with a test that a pile of nine beats a pile of three by more than a
+  tenth of a multiplier.
+- [ ] The deeper finding, unresolved and more interesting than the constant: **the economy
+  self-equalises.** The trailing clan hunts 1.9x as much in every run, because the leading
+  clan is busy fighting — an emergent rubber band nobody designed. Composition-determinism
+  did not move (53%) and the leader/trailer growth gap barely did (0.030 -> 0.028), because
+  leads stay small no matter how the curve is shaped. Whether a clan war *wants* an economy
+  that refuses to let anyone pull ahead is a design question.
+- [ ] Conversion still isn't fixed: **39.8% pooled over 793 games (se 1.8)**, five standard
+  errors below even. Two explanations eliminated, one repaired, and defending is still
+  stronger than attacking. The remaining candidates are structural rather than buggy — the
+  defender fights beside its medic den, inside its own auras, respawns closer, and has the
+  last-stand rule. Deciding whether attacking should pay (and what with) is a design call,
+  not a bug hunt.
+- [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
+  winning rather than only fleeing a lost one
+- [x] Chased the pooled 46.9% clan-A rate to ground with `examples/side_probe.rs` rebuilt as
+  a real instrument: 40 **mirror matches** (identical drafts both sides, folded terrain, so
+  every remaining asymmetry is in the sim). Result **A 20 / B 19 / 1 undecided — 51%**.
+  There is no side bias in the simulation. The harness number was partly draw accounting
+  (draws sat in the denominator but never in clan A's column) and the rest is sample noise
+  across differing draft sets; the balance harness now reports decided games only.
+- [x] The probe's own first-blood metric caught a lesson worth keeping: scanning for "the
+  first wounded warrior" reported a 78/22 skew that was **pure artefact** — clan A holds
+  the low indices and wins every simultaneous tie in the iteration order. Counting both
+  clans' wounds in the first tick any appear gives A 9, simultaneous 23, B 8. An
+  instrument that shares the thing it measures' index order will measure its own index
+  order.
+- [x] Faryowl's 61% traced to a mechanism, not a number: the kite in the Fight branch let a
+  ranged cat give ground *and* land its blow in the same tick, so at speed 6.4 it outran
+  every kit slower than itself while still hitting — free damage against half the roster.
+  Backing away and biting are not the same motion, so giving ground now costs the strike.
+- [x] Three arms measured on identical drafts and lands (160 games each), because the first
+  fix overshot: kite free -> Faryowl 61%, sd 4.2, 1 kit outside +-7; kite **silent** ->
+  Faryowl 42% and Stillsmoke 37%, sd 6.2, 3 outside; kite at **half** -> Faryowl 53%,
+  sd 4.3, 1 outside. Half keeps the trade real without deleting the archetype, and a yowl
+  thrown over the shoulder being a weaker yowl is the version that was true anyway.
+  Abilities still land at full while kiting — spacing is what a yowler's abilities are paid
+  for; it was the free auto-attack that was wrong.
+- [x] Nightpelt's 62% was the same class of bug as Faryowl's kite, found by asking what the
+  kit got for free rather than by tuning: **stealth did not break on striking**. A veiled
+  cat was skipped by `nearest_enemy` entirely while still landing every blow — untargetable
+  and undiminished. Now the blow ends the ambush. The bonus is banked first (`strike_of`
+  reads the veil when the damage is computed), so a kit still gets its whole opening strike
+  from the dark and then has to be somewhere; shields, heals and Veilwalker itself do not
+  give a cat away.
+  Result on the same 160 games: Nightpelt 62% -> 46%, and the **tightest roster yet** —
+  sd 4.2, range 15, every kit within 8 points of even (was range 18, worst 12).
+- [x] The balance harness now separates side bias from draft-set luck: it reports how many
+  draft pairs split 1-1 (composition decided it) against how many one side took twice.
+  Latest: 33 split, 18 to clan A twice, 29 to clan B twice — a 1.6 SD lean, i.e. not
+  enough to act on, and the mirror probe's 51% over identical drafts remains the authority
+  on side fairness. The harness's 43% is mostly orientation-decided pairs, which is chaos.
+- [x] Shields honour their declared `dur` now — every kit's shield spec carried a duration
+  the sim ignored, so guard-hair held until something broke it and a lion could raise Mane
+  of Dawn once and wear it all match. Third free lunch of the week after the kite and the
+  veil, found the same way: asking what a kit gets without paying.
+- [x] **A correction to how the last few passes were argued.** Two independent draft sets
+  (same code, same 160-game shape, different draft seed) disagree wildly per kit: Riptail
+  66% then 39%, Suneye 55% then 40%, Faryowl 47% then 64%. At n≈70-90 games a kit's
+  standard error is ±6, and *which drafts it lands in* swamps that again. So the per-kit
+  table cannot resolve a kit-sized effect on one arm, and the rate improvements quoted for
+  the kite and veil fixes were weaker evidence than they read as. Those changes stand on
+  their mechanism — a cat that backs away while biting, a cat that strikes while
+  untargetable — which is why it was worth finding mechanisms rather than tuning numbers.
+- [x] Proof by counter-example, kept because it is the clearest one: *lengthening* the
+  shield durations to compensate for the nerf measured the buffed kit eleven points WORSE
+  (Goldenmane 49 -> 38). No buff does that; noise does. The durations went back to their
+  authored values and the lesson went into the harness instead — it now prints ± standard
+  error per kit and flags only rates outside two of them, and takes a draft-set seed so
+  independent sets can be pooled.
+- [x] Protocol written down and *run*: `docs/BALANCE.md` holds the pooled baseline — five
+  independent draft sets, **800 matches, 4,800 kit appearances**, ±2se ≈ ±5 points.
+  Result: **sd 3.3, range 12, ten of thirteen kits statistically even.** The three outside
+  two standard errors are Windclaw 55%, Rainspots 55%, Snowhush 44% — the weakest kind of
+  real, and each worth a mechanism hunt rather than a number nudge.
+- [x] The 800-game run is affordable because the jungle stopped reallocating: `thickets()`,
+  `walls()` and `mists()` rebuilt three Vecs on every call, and their callers are
+  `concealment_at` and `sees`, which run once per warrior pair per tick. Cached behind a
+  OnceLock with slice accessors for the hot path: **12,209 -> 27,883 sim steps/s (2.3x)**,
+  and the pooled protocol went from nineteen minutes to eight.
+- [x] Mechanism hunt done, and all three hypotheses were right (`docs/BALANCE.md` has the
+  before/after): Windclaw stacked Skyward Hunger off **prey** because the prey rework
+  credited mice as kills (55% -> 49%); Riverborn mended with no cost, cooldown or cap so
+  Rainspots could outlast anything that came to the water, and now mends only between
+  fights (55% -> 53%); Snowhush's chill was value only a packmate could spend, so the lynx
+  collects on it itself now, +25% into the slowed or rooted (44% -> 48%).
+- [x] Found while testing those: `Mind::AtMedic` healed **unconditionally**, so anything
+  that put a warrior in that state healed it wherever it stood. `think` never does that
+  from far away, so it never showed in play — two earlier tests were written around the
+  quirk before it was understood as a bug. Now the den heals only at the den.
+- [x] That hypothesis — spread dominated by AI quality rather than kit power — was testable
+  and true. The harness already measured it: only **44%** of draft pairs were decided by
+  the composition rather than by which orientation the chaos favoured. Warriors picked the
+  nearest visible enemy, so three cats chewed three healthy targets and killed nobody.
+- [x] Focus fire: a warrior now prefers the enemy closest to falling, trading up to eight
+  lengths for it. Composition-decided pairs **44% -> 54%** over 800 games. Dispersion rose
+  (3.3 -> 4.5) and that is the point: the old flatness was partly the AI hiding the roster,
+  and every kit number taken before this was taken through a duller instrument.
+- [ ] Re-run the mechanism hunt under focus fire — Duskstripe -6 and Oldroar at 41% are the
+  new candidates, but they are one arm-set old and the instrument just changed
+- [x] Odds doctrine: a warrior breaks off when outmatched, not only when wounded — counts
+  what it can *see* within 16 lengths, margin of two (one flaps as packmates cross the
+  radius), veiled cats uncounted. **The flattest roster yet: sd 4.5 -> 2.9, range 17 -> 10,
+  kits outside 2se 3 -> 1**, while composition-determinism *held* at 54% — so unlike the
+  old flatness this is not the AI hiding the roster, it is the roster being closer together
+  when played competently. Biggest gainers are the kits that were dying for nothing:
+  Oldroar +7, Snowhush +8, Riptail +6.
+- [x] Collapse-on-breach: healthy warriors abandon an intact trail for the lane whose Heal
+  Tree fell (before, only patrol spawns and respawns funnelled there, so a clan could break
+  a border and keep walking past the hole). Correct play, and it **measured worse** —
+  dispersion 2.9 -> 4.2, kits outside 2se 1 -> 2, composition-determinism 54% -> 52%. Lives
+  behind `collapse_on_breach`, default off. Suspected cause is in the rule: *every* healthy
+  warrior goes, so the clan trades one broken border for two empty lanes.
+- [x] Holder-push tested: everyone collapses *except* the lowest seat on each lane. The
+  abandonment diagnosis was right — composition-determinism back to 54%, dispersion 4.2 ->
+  3.5 — but pushing still does not beat not pushing (sd 2.9). Default stays off.
+- [x] New metric, because both existing ones measure the roster and none measured the AI:
+  **does the clan that breaks the first border win?** Pooled answer **43% over 320 games** —
+  taking the first objective was slightly a *liability*.
+- [x] First explanation found and fixed: the Great Tree's root guard was all-or-nothing, so
+  two standing Heal Trees hardened it exactly as much as three and a felled border bought
+  nothing. It scales now, a third of the guard per border. Tested.
+- [x] Instrumented it (`examples/breach_probe.rs`) and the overextension theory was **wrong**:
+  deaths after a break were even (21 v 25) and at identical depth (103m from each cat's own
+  camp), and the breacher was *ahead* on freshkill at the moment of the break in 17/29.
+  What the probe found instead: the breacher ended with fewer of its **own** borders
+  standing (-0.28), because `breach_lane` funnelled *every* patrol wave into the hole while
+  the defender kept covering three trails. Half the waves press the breach now; mechanism
+  metric -0.28 -> -0.07, probe conversion 34% -> 41%.
+- [ ] Remaining levers: hold an ult for a structure push; call a packmate *to* a fight worth
+  winning rather than only fleeing a lost one
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean
@@ -220,10 +473,20 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   2,811,122), so the container only earns its keep when files ship loose. Loader prefers
   the raw web; both are gitignored (committing a derived pack beside its source is exactly
   the trap FLEET_COMPRESSION.md records: a 904 MB bundle).
-- [ ] **Your call, not mine:** dropping the loose IQMs. Shipping only the pack takes
-  assets from 19.0 MB to 2.8 MB, but reclaiming it needs a history rewrite
-  (`git filter-repo --invert-paths`), and the pack is lossy-by-design at 14 bits — the
-  IQMs are the only way back to a finer ladder. Decide before rewriting, not after.
+- [x] The loose IQMs are gone: `assets/` 19.0 MB -> 6.3 MB (the committed `animals.web` is
+  3.7 MB, 2.97 MB as a git object). `Model::load` reads the pack as its normal path, the
+  `.iqm` branch survives as the way to re-run the round-trip test against restored source,
+  and the shipped-asset tests now assert against the pack. `docs/ASSET_ARCHIVE.md` records
+  what went, the exact restore commands, and the `git filter-repo` invocation.
+- [x] The raw web is committed and the `.zst` is gitignored, measured: as a git object the
+  raw web costs 2.97 MB against the container's 2.81 MB (155 KB apart) while the container
+  costs ~37 ms of ruzstd on first touch against ~4 ms. For a repo file read at startup that
+  trade goes the other way.
+- [ ] **History rewrite deliberately NOT done here.** `git filter-repo` renames every commit
+  hash from the first that touched the IQMs, which would make this bundle unappliable to
+  the base it was built on — a rewrite cannot be delivered as a patch. Run it locally when
+  clone size matters, after archiving the originals outside git; commands in
+  docs/ASSET_ARCHIVE.md.
 - [ ] Decode speed: 1.3 ms/model (21.9 ms for all 17) against 5.6 ms for parsing the loose
   IQMs — 4x slower, invisible for statues, worth revisiting if a mode ever streams these
 - [ ] The triangle stream could be ~8% smaller with per-triangle (b-a, c-a) deltas instead
@@ -232,12 +495,164 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 
 - [ ] Landform-carved heightfield (walls/crags as real terrain relief rather than placed
   slabs) would need a per-mode heightfield overlay in world — a bigger seam, deferred
-- [ ] Controllers in AI hands don't wombo (a pull with no packmate AoE follow-up wastes
-  the gather) — both controller-led report matches ran longest and lost their single
-  sample; consider auto_cast coordination (hold Earthshaker/Eclipse for a fresh
-  Undertow) before tuning numbers
-- [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
-  camera follow; needs the `app` feature stack (winit/wgpu) compiled
+- [x] Crowd-control coordination in `auto_cast`: a controller saves its pull/root for a
+  crowd, an area ult holds a few seconds for a gather that is coming, and the pulled carry
+  a `pulled_t` mark so the follow-up can see the moment. Ults also now want a bigger crowd
+  than techniques (3 vs 2) — without that the gather kits burned The River Takes on any
+  two scouts. Behind `Battleground::wombo` so it can be ablated, not just believed.
+- [x] Ablation says the coordination alone was worth **nothing**: 168 games each way, same
+  drafts, same lands — clan A 48% off vs 49% on, every kit inside its own standard error
+  (Riptail 52% -> 49%). Recorded rather than quietly kept.
+- [x] The diagnosis was the real finding: ancestors were assigned `slot % LANES`, one per
+  trail, so **the map had a duo lane with nobody duoing** and the coordination had no
+  partner. Ancestors now lane like the country is shaped — seat 0 walks the river solo,
+  seats 1-2 climb the mountain together, the middle is the patrols' with a weighted wave
+  rotation. Roster spread went 37-65% -> **42-57%**, flatter than any kit tuning achieved.
+- [x] Re-ran the wombo ablation with duos in place: still nothing (47% clan A either way,
+  spread 43-58 off against 42-57 on), and Riptail — the kit it exists for — came out worse
+  in *both* ablations (52 -> 49, then 56 -> 50). Two independent runs agreeing on the
+  direction is weak but real evidence that holding an ability costs more than it buys in
+  fights this short, so **`wombo` now defaults off**. The code, the switch and the tests
+  stay: the behaviour wants an AI that can promise the follow-up rather than hope for it.
+- [x] Playable *now*, without the blocked GUI stack: `examples/battleground_play.rs` — a
+  terminal client with a top-down ASCII view (terrain, brush, stone, water, high ground,
+  prey, herbs, zones, both clans, structures), a HUD (ability cooldowns by name, pile,
+  herbs, Great Tree hp, contention and Skyrock holders), and one warrior under your paw.
+  Interactive by line, or scripted (`-- lynx "wwwd1f" 60`) which is deterministic and
+  diffable. Keystroke and script share one `key()` mapping, so the scripted path exercises
+  exactly what a human's press does.
+- [x] The `set_input` path had **no test at all** — everything in battleground.rs drove the
+  AI. Now covered: the player moves where told and only where told (an idle player is idle,
+  not auto-piloted), a root stops them, slots cast and pay cooldowns, an out-of-range slot
+  clamps rather than panics, and the player's claw is the *same blow* an ancestor throws —
+  target riders, on-hit effects (Hush of Snows fires from a human's paw) and kill credit,
+  which it previously skipped.
+## Sound: a hybrid soundscape that lives with the world
+
+- [x] `soundscape.rs` — two halves, because ambience and information are different jobs.
+  **Beds** are the AmbientSounds idea kept: layers chosen by *sampling* the world around the
+  listener (canopy, water fraction, height, night, leaf-bare) on a ring rather than a single
+  point — one sample under the paws says "in a puddle", nine say "at the river" — each
+  crossfading so a treeline is a slope rather than a cut. Nothing is authored twice: the
+  terrain already answers these questions.
+- [x] **Nodes** are the half a MOBA needs and a block game does not: emitters that live at a
+  place *and carry state*. A hunting camp murmurs while its prey is alive and goes quiet
+  once taken, so a player learns to hear a camp somebody else has cleared; a Heal Tree hums
+  while it stands and **creaks while it is being gnawed**, which is a warning arriving
+  through the ears from a lane you cannot see. Nodes are not faded in — an emitter you are
+  standing beside should be audible the moment you are beside it.
+- [x] **Events** are one-shots that duck the beds and are not ducked themselves: a border
+  falling, the Skyrock changing paws, night, a herb delivered, your own death, victory.
+  They fire on the frame they happen and only then — the first version kept re-emitting for
+  the length of the duck, which for a fire-and-forget backend is the same thunderclap
+  played thirty-six times.
+- [x] The mix is scaled if the looping layers sum past 1.0, so a backend is never handed a
+  clipping frame; events are exempt, because a cue that matters should not be quietened by
+  a busy field. Pan is computed against the listener's facing.
+- [x] Pure and testable: it takes a world and a listener and returns `(cue, gain, pan)`. No
+  audio device, no file paths — a missing asset is a silent cue rather than a crash.
+  `examples/soundscape_walk.rs` walks the map printing the mix, then plays a match printing
+  the cues as they fire.
+- [ ] Backend: map `Cue::id()` to files and play them (the app's audio path). The one design
+  note worth carrying over from AmbientSounds is per-sound `length`/`transition` for
+  variation within a bed — several files per cue, chosen round-robin, so a loop does not
+  become a tick.
+
+## Graphics: camera, ability guides, casting
+
+- [x] The camera came in: the `battle` render mode was framed two hundred units out on the
+  whole territory, which is a map screenshot rather than a game. It now follows the player's
+  warrior at ~30 units, and `castguide::camera_dist` gives the app and the menu one shared
+  answer for what each zoom step means (0 closest 20m .. 4 widest 34m, default 24 — nearer
+  than the 34 capture mode used).
+- [x] Zooming in broke the ground markers, which is the part worth recording: the contention
+  ground, the Heal Tree auras, the Skyrock and the camp pads were **filled translucent
+  discs**, fine as gentle washes at two hundred units and opaque slabs across the whole
+  frame at thirty. They are **rings** now — an outline says "this far" and still shows the
+  ground it describes.
+- [x] `castguide.rs`: placeholder ability guides, headless. Every kit's verb already implies
+  a shape — a ring around you (Aoe/Fear/Shield/Heal), a placed disc (Zone/Rain), a travel
+  line (Dash), a wedge (Root/Pull), a reticle (Strike/Execute) — and the aim is clamped into
+  range, because a guide that shows a reach the ability does not have is a guide that lies.
+  Cooling abilities are greyed rather than hidden: a range you cannot see is a range you
+  cannot learn.
+- [x] Tooltips assembled in one place (`castguide::tooltip`) so two screens cannot describe
+  the same ability differently: name, what it does, then "range 13 · 2.2x claw · 1.8s ·
+  cooldown 58s" — power in *claws*, the unit a player can feel. The ultimate's tooltip
+  carries the kit's passive, where there is room for it.
+- [x] Casting options: Quick (press to cast), Normal (press, aim, press, with a cancel that
+  spends no cooldown, and a different slot re-aims rather than firing both), Instant (quick
+  and no guide). Guides toggle **independently** of cast mode, because wanting a reticle and
+  wanting to press once are two different preferences.
+- [x] Menu rows for all three (`Ability guides`, `Casting`, `Camera`), with Back now found at
+  the end of the list rather than hard-coded to row 6.
+- [ ] App-side: the guides need drawing from `battleview` + `castguide` in `render_battle`,
+  and the tooltip wants an egui panel. Same rustc >= 1.76 blocker; the shapes, the words and
+  the state machine are done and tested, and the `battle` render mode is a working reference
+  implementation of exactly this drawing.
+
+## Quick play and the 5v5 select page
+
+- [x] The battleground fields **up to five a side** (`Battleground::new_roster`, `MAX_CLAN`),
+  and five is where the map's lanes finally make sense: a river solo, a mountain duo, a
+  middle that is somebody's rather than nobody's, and a **roamer** with no lane at all.
+  Rosters of one to five all build and run; the three-a-side constructors are thin wrappers,
+  so every existing test and balance number still means what it meant.
+- [x] `lobby.rs` — quick play and the select page, headless like `draft` and `battleview`.
+  One `LobbyInput` set for three sets of hands, with a test that a **controller** (walk the
+  grid, wrapping so a stick never finds a wall), a **keyboard** (type "still", land on
+  Stillsmoke) and a **thumb** (tap a grid cell, layout supplied by `Lobby::grid` so the
+  hit-test cannot disagree with the render) all reach the same cat and lock it.
+- [x] The clock decides: 30s to pick, bots choosing with rising urgency so the column
+  resolves before the buzzer rather than on it, anyone unlocked auto-picked from what they
+  were hovering, then a 5s ready beat and launch. Everyone locking early skips the rest of
+  the clock; nobody locking still starts a legal match.
+- [x] `MenuCmd::QuickPlay` is the first row of the title screen — one press to a match — and
+  the rows beneath it are asserted to still go where they went.
+- [x] `examples/lobby_demo.rs` runs the page and the match it produces end to end.
+- [ ] The app-side page itself (portraits, clan columns, the countdown ring, thumb targets
+  sized for a phone) — same blocker as the render work below: it needs the `app` feature and
+  rustc >= 1.76. The state machine it drives is done and tested, so this is layout.
+
+## The battleground in the app: what is done, what is left
+
+The mode is simulated, balanced, playable in a terminal and recorded/replayed —
+and until this pass it could not be reached from the menu, which is the only door
+most players use. The remaining work is now precisely bounded.
+
+- [x] `menu.rs`: `GameMode::Battleground` exists, appears in `GAME_MODES`, and brings its own
+  rows — an ancestor with its passive and three ability names, instead of hunter/class/clan,
+  because those are choices the mode does not have. Left/right walks the thirteen.
+  `MenuCmd::StartBattleground(Ancestor)` is its own command rather than being squeezed
+  through `StartMode`'s three arguments, two of which it would ignore. Tested, including
+  that the other four modes' rows and commands are unchanged.
+- [x] `battleview.rs`: the pure view model — `marks()` (every drawable thing with its ground
+  height, team, fill fraction, carried burden and whether it is *you*, culled to a radius),
+  `hud()` (one consistent read of ability cooldowns by name, piles, herbs, Great Tree hp,
+  borders standing, contention and Skyrock holders, respawn timer, outcome), and `focus()`
+  (follow the driven warrior; fall back to the centre of the living clan rather than
+  staring at a corpse). Tested, so what is left in `app.rs` is mapping rather than logic.
+- [ ] `app.rs`, mirroring `render_capture` (~1001-1135) exactly:
+  1. `battle: Option<Battleground>` beside `capture`/`prowl` on the app state, cleared in
+     the other `MenuCmd` arms the same way they clear each other;
+  2. a `MenuCmd::StartBattleground(a)` arm: `state.battle = Some(Battleground::new(a))`;
+  3. `render_battle(dt)`: `keys.move_vec()` → `move_world(yaw, ..)` → `set_input`, with
+     `keys.ability` mapped to slots 1/2/3 and left-click/dodge to the claw;
+  4. `build_battle_entities()` from `battleview::marks` — the shapes already exist in
+     `main.rs`'s `battle` mode (canopies scaled by `fill`, aura rings, crests, carries);
+  5. an egui panel from `battleview::hud`, laid out like the capture HUD;
+  6. `self.focus = v3(fx, height_at(fx,fz), fz)` from `battleview::focus`, `write_camera(34.0)`;
+  7. the `render()` dispatch line: `if self.battle.is_some() { self.render_battle(dt); return; }`.
+  **Unwritten because it cannot be compiled here**: the `app` feature needs rustc >= 1.76
+  (egui 0.28 / emath) and this sandbox is pinned at 1.75. Writing renderer glue that has
+  never been through a compiler is how a codebase acquires code nobody trusts.
+
+  MERGE NOTE on the blocker above: the incoming series was written in a sandbox
+  pinned to rustc 1.75, which is why the `app.rs` glue is specified but unwritten.
+  THAT CONSTRAINT DOES NOT HOLD HERE — this tree builds on 1.96. The seven steps
+  stay exactly as written because they are still the plan; only the reason for
+  their being unwritten has expired, and someone can now actually compile them.
+
 - [x] Player-pick draft UI in menu.rs — `Screen::Draft`, 6 pick slots (3 per
   clan) cycling through the 13-ancestor roster with no-duplicate cycling,
   `MenuCmd::StartBattleground([Ancestor;3], [Ancestor;3])`. Reachable from
@@ -245,6 +660,21 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   confirmed draft, reopen the menu) rather than a fake live match — the
   separate "--play wiring in app.rs" item below is what a real Battleground
   match needs, and isn't done yet.
+- [x] `draft.rs` — the pick screen's logic, headless so the TTY client, a future menu and the
+  tests share one set of rules: names resolve by warrior *or* species ("stillsmoke" or
+  "suanni"), no duplicates within a clan, undo, autofill, and a deterministic counter-pick
+  that scores each remaining ancestor against what you brought (reach or a gap-closer for
+  thin pelts, the sun-priest's light for veils, speed against siege, burst against menders).
+  Deterministic on purpose: an opponent you cannot predict is only unfair, and a rule you
+  can read is a rule you can learn to beat.
+- [x] `battleground_play --roster` prints the thirteen with their stats and passives;
+  `--draft` runs the pick screen and starts the match against the counter-picked clan.
+- [x] The counter excludes your own picks. The *rules* allow a mirror (side_probe needs it),
+  but answering a sun-priest by bringing the same sun-priest reads as a shrug.
+  MERGE NOTE: the draft exists TWICE after the split — `menu.rs`'s `Screen::Draft` above
+  (this side, GUI-facing) and `draft.rs` here (incoming, headless + TTY). Both kept: the
+  headless one is where the rules belong and the menu one is already wired to `app.rs`.
+  Collapsing menu.rs onto draft.rs is the obvious follow-up and is not done.
 - [x] Map fairness: the mid trail crosses the wide river basin (a genuine "river lane" —
   Rainspots country) — extend mapeval to grade lane water-fractions per clan side.
   `mapeval::lane_water_report(camp_a, camp_b, bends, samples)`: per lane, the water
@@ -261,10 +691,75 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   runs cleanly; if a future terrain change (different river course, different seed)
   reintroduces a lopsided lane, this is what will catch it — nothing to fix on the
   current map by this metric. 3 tests.
+- [x] `mapeval::lane_score` — the SAME question answered a second time, from the other
+  side of the split, and kept because it answers more of it. Where `lane_water_report`
+  grades water fairness per clan half, this profiles each trail for height, wet fraction,
+  cover and climb along the walk the patrols actually take, and reports both
+  **distinctness** (are the trails different from each other, or the country was shaped
+  for nothing) and **clan_gap** (are they the same for both clans).
+  `examples/lane_report.rs` prints it per land in about a second.
+  Measured across three lands: clan gap **0.0000** every time (the reflection holds),
+  distinctness 0.35-0.41, and the shape the terrain work aimed at is visible in the
+  numbers — duo sits 3-5 units above solo, solo takes the water and the most climb.
+  This is the standing guard that would have caught the two-symmetry-conventions bug in
+  one call instead of a mirror probe and three commits, and it is a unit test now.
+  MERGE NOTE: both live. They do not collide (`LaneWaterReport` vs `LaneProfile`/
+  `LaneScore`) and they agree on the finding that matters — the map is symmetric — which
+  is a genuine independent confirmation rather than duplication to tidy away. If one
+  should go it is a later decision with both sets of numbers in hand.
 - [x] Ancestor crest colours per-kit in the battle render — `ancestor::crest_color`
   (13 distinct hex colours, one per legend, tested for uniqueness), wired into
   `build_battle`'s ancestor-crest branch in place of the team-colour fallback
   that was there before.
+
+- [x] `replay.rs` — a match is its setup plus the keys pressed, so a replay is a header and
+  the ticks where input *changed* (780 ticks recorded as 11 events). `--record FILE` writes
+  one, `--replay FILE` re-runs it and compares digests. Three things this buys: a bug report
+  that runs, whole-match regression fixtures nobody had to hand-build
+  (`tests/replays/*.replay`, checked by `tests/replay_regression.rs`), and an honest check
+  on the determinism every other part of this crate assumes — including any future netcode.
+- [x] The tamper test is asserted where it is *true* rather than where it reads well: a
+  different land, enemy clan or laning doctrine all fail to reproduce a recording, but
+  flipping `wombo` on a ten-second recording reproduces it exactly, because the clans have
+  not met yet. That assertion says so.
+
+- [x] `lockstep.rs` — the deterministic-lockstep **protocol** for two-clan matches, sitting on
+  the determinism `replay.rs` proves every test run: peers exchange inputs (a frame each per
+  tick, a digest each second) rather than state, both run the same sim, nobody is the
+  server. Input delay of 6 ticks (200ms), a tick advances only when both sides' inputs are
+  in, digests compared on arrival, and a quiet peer stalls then loses the match rather than
+  hanging forever. Protocol-then-transport: it knows nothing about sockets or
+  `shared/netcode`, and the tests run a 600-tick match between two in-process peers with no
+  port opened.
+- [x] Writing it caught a genuine protocol bug of the kind that only shows in a real
+  exchange: comparing digests at the moment of *hashing* catches nothing, because the other
+  peer's claim for that tick is still in flight. Whichever half arrives second does the
+  comparing now, and the desync test proves it by nudging one warrior half a length in one
+  peer's world — which is exactly what a real desync looks like from the inside.
+- [x] Transport: `wire.rs` — a hand-written codec (an input is **8 bytes**, a digest check 13,
+  so a tick of two players costs 16 bytes of payload) plus `UdpLink`, a deliberately dumb
+  non-blocking UDP carrier. Movement travels as two i8 axes rather than f32: the sim
+  normalises the vector anyway, it is a quarter of the bytes, and two peers that agree on
+  the *bytes* agree on the input with no float parsing in between. Tested end to end — two
+  peers, two real loopback sockets, 240 ticks, same digest.
+- [x] No hard dependency on `shared/netcode`. That crate's job ends with two peers holding
+  each other's socket address, which is exactly what `UdpLink::connect` wants; keeping the
+  seam there means a LAN match between two handsets on the same wifi does not have to pay
+  for discovery it does not need. Match setup can still be agreed by exchanging a
+  `replay::Replay` header, which already carries draft, seed and every doctrine switch.
+- [ ] What a deployment needs on top, and where it belongs: resend-until-acked for the last
+  few input frames. A lost packet only *stalls* lockstep (a tick will not run without both
+  inputs), so this is a latency fix rather than a correctness one, and it is a transport
+  concern — it goes in `wire.rs`, not in the protocol.
+- [x] Both clans' leaders are drivable now (`set_input_for(side, ..)`, `driven(side)`), so
+  lockstep applies both frames instead of carrying one it could not spend. A peer that drove
+  only its own leader and left the other clan's to the AI would be running a different match
+  from the one across the link — the classic move-one desync — so both peers apply both.
+  `set_input` still means clan A, and an undriven clan still thinks for itself (tested:
+  driving one side must not switch the other side's AI off).
+- [x] The recorded-match regression passed unchanged through that refactor, which is exactly
+  what the fixture is for: clan B's seat 0 became `is_player` but nobody drives it, so the
+  match must play identically — and it does, to the digest.
 
 ## Roadmap (multi-turn)
 -29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an

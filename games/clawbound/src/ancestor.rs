@@ -361,6 +361,37 @@ impl Ancestor {
     pub fn name(self) -> &'static str { kit(self).name }
 }
 
+/// How much of a kit's strength is spent on **other cats**. Shields, heals,
+/// rain and Goldenmane's Pride's Warmth are worth nothing to a warrior walking a
+/// trail alone; stealth and execute damage are worth everything. A clan uses
+/// this to decide who walks with the pride and who walks the river alone —
+/// which is doctrine, not decoration: measured, the aura kits were being sent
+/// down the solo lane by seat order and their whole passive was going unspent.
+pub fn sociability(a: Ancestor) -> i32 {
+    let k = kit(a);
+    let mut s = 0;
+    for v in k.abilities.iter().map(|ab| ab.verb).chain(std::iter::once(k.ult.verb)) {
+        s += match v {
+            Verb::Heal | Verb::Rain => 3,
+            Verb::Shield => 2,
+            // control is worth more beside a packmate who can punish the held
+            Verb::Root | Verb::Pull | Verb::Slow | Verb::Knockback => 1,
+            // the ambusher's tools are worth *less* in company: a veil shared is
+            // a veil wasted, and the first blow from the dark wants no witnesses
+            Verb::Stealth => -3,
+            _ => 0,
+        };
+    }
+    if a == Ancestor::Lion { s += 3; }   // Pride's Warmth is an aura on packmates
+    // A warrior who cannot take a blow walks with someone who can. Measured the
+    // hard way: sorting on ally-facing tools alone sent the thin-pelted yowler
+    // down the river alone and cost it nineteen points of win rate (55% -> 36%)
+    // in 168 games, because a 130-hp cat with no packmate is a dive waiting to
+    // happen however far its voice carries.
+    if k.hp < 150.0 { s += 2; }
+    s
+}
+
 /// A single balance number per kit so tuning drift is caught by a test, in the
 /// spirit of clan.rs's trait-sum check: hp is worth its healing burden, attack its
 /// threat, speed its map control. Roughly commensurate scales.
@@ -443,6 +474,43 @@ mod tests {
         let control = |v: Verb| matches!(v, Verb::Root | Verb::Pull | Verb::Slow | Verb::Fear | Verb::Knockback);
         assert!(verbs(Ancestor::Lynx).iter().filter(|&&v| control(v)).count() >= 2);
         assert!(verbs(Ancestor::Jaguar).iter().filter(|&&v| control(v)).count() >= 2);
+    }
+
+    #[test]
+    fn sociability_sorts_the_pride_from_the_loners() {
+        // the menders and warders want company
+        for a in [Ancestor::Lion, Ancestor::Leopard, Ancestor::Suanni] {
+            assert!(sociability(a) > 0, "{} should want a packmate", kit(a).name);
+        }
+        // the ambushers do not
+        for a in [Ancestor::Tiger, Ancestor::Panther] {
+            assert!(sociability(a) < 0, "{} should hunt alone", kit(a).name);
+        }
+        // and the ordering is strict enough to make a decision with
+        assert!(sociability(Ancestor::Lion) > sociability(Ancestor::Smilodon));
+        assert!(sociability(Ancestor::Smilodon) > sociability(Ancestor::Panther));
+        // the thin-pelted want a bodyguard even when their tools are selfish
+        assert!(sociability(Ancestor::Serval) > sociability(Ancestor::Smilodon),
+            "the yowler needs company more than the saber-tooth does");
+        assert!(sociability(Ancestor::SunCat) > sociability(Ancestor::Tiger));
+    }
+
+    #[test]
+    fn a_shield_is_worth_holding_for() {
+        // The shields' declared durations were dead numbers until the sim began
+        // honouring them; uptime went from permanent to dur/cd. The durations
+        // themselves are left at their authored values: an attempt to compensate
+        // by lengthening them measured WORSE (dispersion 4.6 -> 7.0), but on a
+        // single 160-game arm where the buffed kit's own rate fell eleven points,
+        // which is a result no buff can produce and noise easily can. The lesson
+        // went into the harness rather than into these numbers.
+        for a in [Ancestor::Lion, Ancestor::Puma] {
+            let k = kit(a);
+            let s = k.abilities.iter().find(|ab| ab.verb == Verb::Shield).expect("has a shield");
+            let uptime = s.dur / s.cd;
+            assert!(uptime > 0.2, "{}: shield uptime {uptime:.2} is too thin to build around", k.name);
+            assert!(uptime < 0.6, "{}: shield uptime {uptime:.2} is close enough to permanent", k.name);
+        }
     }
 
     #[test]

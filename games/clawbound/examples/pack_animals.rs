@@ -1,5 +1,11 @@
-//! Build assets/animals.web.zst from assets/animals/*.iqm, and report what each
-//! stage bought. Run: cargo run --release --example pack_animals
+//! Rebuild assets/animals.web from source IQMs, and report what each stage
+//! bought. Run: cargo run --release --example pack_animals
+//!
+//! The loose IQMs no longer ship — the pack replaced them — so this only runs
+//! where the originals have been restored beside the crate (see
+//! docs/ASSET_ARCHIVE.md). It is kept, and kept working, because a lossy
+//! pipeline whose encoder you cannot re-run is a pipeline you cannot revisit:
+//! re-packing at a finer ladder is a `--bits` away, but only from the source.
 //!
 //! Compression is left to the zstd CLI on purpose — the same split bsweb makes
 //! (it takes decompressed bytes; the container is the caller's). If zstd is not
@@ -15,8 +21,13 @@ fn main() {
     let dir = std::path::Path::new("assets/animals");
     let mut models = Vec::new();
     let mut raw_total = 0usize;
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .expect("assets/animals")
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        eprintln!("assets/animals is absent — the source IQMs were removed when the pack");
+        eprintln!("replaced them. Restore them beside the crate to re-pack; see");
+        eprintln!("docs/ASSET_ARCHIVE.md for where they went and how to get them back.");
+        std::process::exit(1);
+    };
+    let mut entries: Vec<_> = rd
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map(|x| x == "iqm").unwrap_or(false))

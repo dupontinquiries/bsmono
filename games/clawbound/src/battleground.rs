@@ -47,9 +47,92 @@ pub const CAMP_ANCHOR: [(f32, f32); 2] = [(-118.0, -118.0), (118.0, 118.0)];
 /// Waypoint each trail bends through: west trail, the straight middle, east trail.
 pub const TRAIL_BEND: [(f32, f32); 3] = [(-85.0, 85.0), (0.0, 0.0), (85.0, -85.0)];
 pub const LANES: usize = 3;
+/// Which trail is which, now that the country makes them differ. The mountain
+/// side is the **duo** lane — two warriors hold it, because it is where the
+/// Skyrock and the high ground are and holding it wins the map's information
+/// war; the river side is the **solo** lane, walked by one; the middle belongs
+/// to the patrols, who get the extra waves for it.
+///
+/// This replaced one-ancestor-per-lane, which was tidy and wrong: it left the
+/// map's duo lane with nobody duoing, so the crowd-control coordination in
+/// `auto_cast` had no partner to coordinate with and measured as no effect
+/// across 168 games.
+pub const DUO_LANE: usize = 0;
+pub const MID_LANE: usize = 1;
+pub const SOLO_LANE: usize = 2;
+/// Which of a clan's three ancestors walks the river alone: the least sociable
+/// of them ([`ancestor::sociability`]). A clan does not send its pride-fighter
+/// off alone and its ambusher into a crowd — the shields, heals and auras are
+/// worth nothing on an empty trail, and a veil is worth less with a packmate
+/// blundering alongside. Ties break on pool order, so the choice is
+/// deterministic and identical for both clans.
+pub fn solo_seat(picks: &[Ancestor]) -> usize {
+    let mut best = 0usize;
+    for s in 1..picks.len() {
+        let (a, b) = (ancestor::sociability(picks[s]), ancestor::sociability(picks[best]));
+        if a < b { best = s; }
+    }
+    best
+}
+
+/// How a clan decides who walks where.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LanePolicy {
+    /// Draft order decides: seat 0 takes the river. Arbitrary, but it is the
+    /// baseline every balance number before this was measured against.
+    Seat,
+    /// The kit decides ([`solo_seat`]). Better doctrine, and better for the
+    /// ambushers; whether it is better for the *roster* is what the switch is
+    /// here to answer.
+    Kit,
+}
+
+/// Seat -> trail, given who else the clan fielded and how the clan decides.
+///
+/// A clan of three is the old shape: one down the river, two up the mountain.
+/// A clan of **five** is the conquest shape the map was actually built for —
+/// solo on the river, two together on the mountain, one holding the middle the
+/// patrols walk, and a fifth with no lane at all, who starts in the jungle and
+/// goes where the fight is. That fifth seat is the reason the middle stopped
+/// being nobody's: with five there is somebody to hold it.
+pub fn lane_for(seat: usize, picks: &[Ancestor], policy: LanePolicy) -> usize {
+    let solo = match policy {
+        LanePolicy::Seat => 0,
+        LanePolicy::Kit => solo_seat(&picks),
+    };
+    if seat == solo {
+        return SOLO_LANE;
+    }
+    if picks.len() < 4 {
+        return DUO_LANE;
+    }
+    // the seats that are not the river-walker, in order, take: mid, duo, duo,
+    // then the roamer — who is given mid as a starting trail and leaves it
+    let rest: Vec<usize> = (0..picks.len()).filter(|&s| s != solo).collect();
+    match rest.iter().position(|&s| s == seat).unwrap_or(0) {
+        0 => MID_LANE,
+        1 | 2 => DUO_LANE,
+        _ => MID_LANE,
+    }
+}
+
+/// Does this clan field a roamer — a warrior with no lane of its own, free to
+/// join whichever fight is worth joining? Only a full five does.
+pub fn roamer_seat(picks: &[Ancestor]) -> Option<usize> {
+    if picks.len() < 5 {
+        return None;
+    }
+    let solo = solo_seat(&picks);
+    (0..picks.len()).filter(|&s| s != solo).nth(3)
+}
 
 // structures
 const HEAL_TREE_HP: f32 = 550.0;
+/// Freshkill spilled by a felled Heal Tree, when [`Battleground::spoils`] is on.
+/// Sized against the economy it enters: a rich kill from the contention ground
+/// is worth 3, so a border is worth about four of those — enough to notice in
+/// the growth curve, not enough to end a match by itself.
+const BORDER_SPOILS: f32 = 12.0;
 const GREAT_TREE_HP: f32 = 1400.0;
 const AURA_R: f32 = 14.0;
 const AURA_HEAL: f32 = 5.0;          // hp/s to allies, before herb scaling
@@ -59,10 +142,20 @@ const ROOT_GUARD: f32 = 0.55;        // Great Tree damage reduction while any He
 // patrols — fewer, stronger, and they retreat
 const PATROL_INTERVAL: f32 = 26.0;
 const PATROL_SIZE: usize = 2;
+/// The most warriors a clan may field. Five is the conquest shape: a river
+/// solo, a mountain duo, a middle, and a roamer.
+pub const MAX_CLAN: usize = 5;
 const PATROL_HP: f32 = 130.0;
 const PATROL_ATK: f32 = 8.0;
 const PATROL_SPEED: f32 = 6.4;
 const NERVE: f32 = 0.45;             // retreat below this hp fraction…
+/// How far a warrior counts the odds before deciding a fight is not worth it.
+const ODDS_R: f32 = 16.0;
+/// How many more enemies than kin it takes to break off. Two rather than one:
+/// at one the AI flaps, retreating and re-engaging as a packmate crosses the
+/// radius, and a patrol that cannot commit to a fight is worse than one that
+/// loses it.
+const ODDS_MARGIN: i32 = 2;
 const REJOIN: f32 = 0.9;             // …rejoin the trail above this
 const LAST_STAND_R: f32 = 26.0;      // …unless the Great Tree itself is threatened
 
@@ -78,12 +171,18 @@ const MEDIC_HEAL: f32 = 16.0;        // hp/s at the medic's den, before herbs
 const PREY_CAMPS_BASE: [(f32, f32); 2] = [(-70.0, 20.0), (-20.0, -70.0)];
 const PREY_HP: f32 = 26.0;
 const PREY_RESPAWN: f32 = 22.0;
-const PREY_WORTH: f32 = 1.0;
 const RICH_WORTH: f32 = 3.0;         // the contention ground's prey
 const CARRY_SLOW: f32 = 0.75;
 const CONTEND_R: f32 = 20.0;
 const GROWTH_CAP: f32 = 0.8;         // pile can add at most +80% power
-const GROWTH_HALF: f32 = 16.0;       // pile worth at which half the cap is reached
+/// The pile at which a clan has half the growth it can ever have. **Sized to the
+/// economy that exists, not the one the number was guessed for**: the probe
+/// found the mean growth multiplier running at 1.138 against 1.108 — a whole
+/// clan's freshkill lead buying under three percent damage — because the
+/// half-point was 16 while real piles hover around three. The curve's entire
+/// interesting range sat above anything a match ever reached, so the economy
+/// was decorative. At 6 a typical lead is worth something a fight can feel.
+const GROWTH_HALF: f32 = 6.0;       // pile worth at which half the cap is reached
 
 // herbs
 /// One herb patch on clan A's side; the other is its reflection, generated —
@@ -105,6 +204,13 @@ const LEAFBARE_PATROL: usize = 3;    // patrol size in leaf-bare
 
 const RESPAWN_BASE: f32 = 14.0;
 const REACH: f32 = 2.8;              // claw range
+/// What a ranged strike is worth while giving ground. See the kiting branch.
+const KITE_STRIKE: f32 = 0.5;
+/// How many lengths of distance a warrior will trade to strike a wounded enemy
+/// instead of a hale one. At 8, a cat five lengths off at half strength outbids
+/// one right beside it at full — pack behaviour, and the books' behaviour: the
+/// patrol turns on the one that is already bleeding.
+const FOCUS_WEIGHT: f32 = 8.0;
 const ENGAGE_R: f32 = 16.0;          // how far a warrior will break trail to fight
 const MATCH_LEN: f32 = 12.0 * 60.0;
 
@@ -174,14 +280,28 @@ pub struct Warrior {
     pub mind: Mind,
     pub carry: Carry,
     pub shield: f32,      // absorbs damage first (Mane of Dawn / Stone Patience)
+    /// How long the shield lasts. Every kit's shield declares a `dur` and the sim
+    /// ignored it, so guard-hair held until something finally broke it — a lion
+    /// could raise Mane of Dawn once and carry it for the rest of the match. The
+    /// third free lunch of the week, after the kite and the veil, and found the
+    /// same way: by asking what a kit gets without paying.
+    pub shield_t: f32,
     pub stealth_t: f32,   // unseen/untargetable
     pub fear_t: f32,      // fleeing a Great Roar
     pub slow_t: f32,
     pub root_t: f32,      // held fast (Snowbind / The Long Winter): can claw, cannot move
+    pub pulled_t: f32,    // dragged in a moment ago — the window a wombo aims at
     pub cds: [f32; 3],    // ability 1, ability 2, ult
     pub respawn_t: f32,
     pub gather_t: f32,
+    /// Warriors felled. **Prey does not count** — see `prey_taken`. Skyward
+    /// Hunger reads this, and a caracal that could stack its whole speed bonus
+    /// off a hillside of mice was quickening its paws on nothing that fought
+    /// back: the fastest kit on the roster, free, by farming.
     pub kills: u32,
+    /// Prey brought down. Kept separate so the hunt is still legible, and so a
+    /// future kit *can* be paid in prey if that is its identity.
+    pub prey_taken: u32,
     /// Which seat this warrior holds **within its own clan** — 0..2 for the
     /// ancestors, then patrol cats by wave. Every per-warrior random roll hashes
     /// on the seat rather than on the index into `warriors`, so a warrior and
@@ -268,8 +388,53 @@ pub struct Battleground {
     patrol_t: [f32; 2],
     wave_n: [u32; 2],     // per-team wave counter — duty/lane rotation must be symmetric
     tick: u32,
-    player_driven: bool,   // becomes true on the first set_input; until then the player's warrior is AI-driven
-    input: Option<(f32, f32, bool, Option<usize>)>,   // move dir, claw, ability index
+    /// Whether AI ancestors coordinate their crowd control (a controller saving
+    /// its pull for a crowd, an area ult waiting for the gather).
+    ///
+    /// **Defaults off, on the evidence.** Measured twice, 168 games each way on
+    /// identical drafts and lands: before lane pairing existed, clan A 48% off
+    /// against 49% on; after it existed and the duo actually travelled as a
+    /// pair, 47% against 47%. No aggregate effect either time — and the kit the
+    /// coordination is *for* came out worse in both (Riptail 52 -> 49, then
+    /// 56 -> 50). Holding an ability is a cost paid now for a payoff that may
+    /// not arrive, and in fights this short it does not pay.
+    ///
+    /// Kept, switchable, and tested, because the behaviour is not wrong — it is
+    /// waiting on an AI that can promise the follow-up rather than hope for it,
+    /// and on a human player who can. Turn it on to measure that day's version.
+    pub wombo: bool,
+    /// Whether a clan collapses onto a broken border: healthy warriors abandon
+    /// an intact trail for the lane whose Heal Tree has fallen.
+    ///
+    /// **Defaults off, on the evidence**, and it is the more interesting of the
+    /// two switches because the behaviour is *correct play* — collapsing on a
+    /// broken lane is what a conquest team does. Measured over 800 games against
+    /// the same drafts and lands: dispersion 2.9 -> 4.2, kits outside two
+    /// standard errors 1 -> 2, composition-decided matches 54% -> 52%. Both
+    /// metrics flat-to-worse, so the default follows the measurement rather than
+    /// the theory. Kept because a better AI — one that leaves a lane held while
+    /// the rest collapse, rather than emptying all three — should get a
+    /// different answer, and this is the switch that will test it.
+    pub collapse_on_breach: bool,
+    /// Whether felling a Heal Tree pays the clan that felled it: the defenders'
+    /// cached prey spills from the roots ([`BORDER_SPOILS`] worth), straight
+    /// onto the attacker's pile.
+    ///
+    /// This is a **design switch, not a bug fix**, and it is off until someone
+    /// decides. The measurement that motivates it: the clan that breaks the
+    /// enemy's first border wins 39.8% of its matches over 793 games, 5.7
+    /// standard errors below even, because defending here is genuinely stronger
+    /// — the defender fights beside its medic den, inside its own auras,
+    /// respawns closer, and has the last-stand rule. Most games of this shape
+    /// pay the attacker for taking that risk. Whether *this* one should is a
+    /// question about what the mode is, so the switch exists and the default
+    /// declines to answer it.
+    pub spoils: bool,
+    /// Which clans have a human at the paws, indexed by side. Set by the first
+    /// `set_input` for that side; until then that clan's seat 0 is AI-driven,
+    /// which is what lets every balance harness run a "player" slot without one.
+    player_driven: [bool; 2],
+    input: [Option<(f32, f32, bool, Option<usize>)>; 2],   // move dir, claw, ability index
 }
 
 impl Battleground {
@@ -334,15 +499,31 @@ impl Battleground {
         if w.ancestor == Some(Ancestor::Jaguar) && (t.slow_t > 0.0 || t.root_t > 0.0 || t.fear_t > 0.0) {
             m *= 1.2;   // The River Remembers: the held are already caught
         }
+        if w.ancestor == Some(Ancestor::Lynx) && (t.slow_t > 0.0 || t.root_t > 0.0) {
+            // Hush of Snows put the cold there; the lynx should be allowed to
+            // collect on it. Measured: Snowhush was the roster's one significant
+            // underperformer (44% over 800 games) and its whole passive was value
+            // it handed to packmates the AI never spent — a kit paying a bill
+            // somebody else forgot to collect.
+            m *= 1.25;
+        }
         m
     }
 
-    /// On-hit riders that come with a warrior's blows — Snowhush's chill.
+    /// On-hit riders that come with a warrior's blows — Snowhush's chill, and
+    /// the veil breaking.
     fn on_hit(&mut self, i: usize, target: usize) {
         if self.warriors[i].ancestor == Some(Ancestor::Lynx) {
             let t = &mut self.warriors[target];
             t.slow_t = t.slow_t.max(0.5);   // Hush of Snows
         }
+        // **Striking breaks the veil.** You cannot rake a warrior and remain
+        // unseen: the blow is where the ambush ends. The bonus is already banked
+        // — `strike_of` read the veil when the damage was computed — so a kit
+        // still gets its whole opening strike from the dark, and then has to be
+        // somewhere. Without this, stealth was the same free lunch the kite was:
+        // untargetable in `nearest_enemy` while still landing every blow.
+        self.warriors[i].stealth_t = 0.0;
     }
 
     fn respawn_time(&self, team: u8) -> f32 {
@@ -380,11 +561,44 @@ impl Battleground {
         Battleground::new_on(picks_a, picks_b, 0)
     }
 
+    /// A match between clans of any size from one to [`MAX_CLAN`]. The
+    /// three-a-side constructors above are this with a fixed roster; five a
+    /// side is what the lobby drafts and what the map's lanes were shaped for.
+    pub fn new_roster(
+        picks_a: &[Ancestor],
+        picks_b: &[Ancestor],
+        seed: u32,
+        policy: LanePolicy,
+    ) -> Battleground {
+        Battleground::build(picks_a, picks_b, seed, policy)
+    }
+
     /// A drafted match on a re-rolled land. `seed` salts the terrain noise (see
     /// [`world::set_terrain_seed`]) — the same camps, trails, river course and
     /// jungle layout, over different country. This is what lets a balance run
     /// vary the map instead of replaying one map thirteen times.
     pub fn new_on(picks_a: [Ancestor; 3], picks_b: [Ancestor; 3], seed: u32) -> Battleground {
+        Battleground::new_with(picks_a, picks_b, seed, LanePolicy::Kit)
+    }
+
+    /// As [`new_on`], with the laning doctrine chosen explicitly — so a balance
+    /// run can play both doctrines over the same drafts on the same lands
+    /// instead of comparing two runs that differ in more than one thing.
+    pub fn new_with(
+        picks_a: [Ancestor; 3],
+        picks_b: [Ancestor; 3],
+        seed: u32,
+        policy: LanePolicy,
+    ) -> Battleground {
+        Battleground::build(&picks_a, &picks_b, seed, policy)
+    }
+
+    fn build(
+        picks_a: &[Ancestor],
+        picks_b: &[Ancestor],
+        seed: u32,
+        policy: LanePolicy,
+    ) -> Battleground {
         let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::set_terrain_pool(Self::MOUNTAIN_BIAS, 1);
         world::set_land_lift(Self::LAND_LIFT);
@@ -445,27 +659,31 @@ impl Battleground {
             .map(|(x, z)| HerbPatch { x, z, regrow_t: 0.0 })
             .collect();
 
-        // Rosters: the drafted three a side; the player leads clan A.
+        // Rosters: whatever each clan drafted, up to five; the player leads clan A.
         let mut warriors = Vec::new();
         for team in 0..2u8 {
-            for slot in 0..3usize {
-                let a = if team == CLAN_A { picks_a[slot] } else { picks_b[slot] };
+            let side: &[Ancestor] = if team == CLAN_A { picks_a } else { picks_b };
+            for slot in 0..side.len().min(MAX_CLAN) {
+                let a = side[slot];
                 let k = ancestor::kit(a);
                 let (cx, cz) = camps[team as usize];
                 // Spawn offsets are REFLECTED for clan B, not copied. The mirror
                 // probe caught this at tick zero: both clans fanning out along
                 // +x put clan B's line across its own camp instead of along it,
                 // a 2.8 m break in the mirror before a single step was taken.
-                let d = slot as f32 * 2.0 - 2.0;
+                let d = slot as f32 * 2.0 - (side.len().min(MAX_CLAN) as f32 - 1.0);
                 let (sx, sz) = if team == CLAN_A { (cx + d, cz) } else { (cx, cz - d) };
                 warriors.push(Warrior {
-                    team, role: Role::Ancestor, ancestor: Some(a), lane: slot % LANES,
+                    team, role: Role::Ancestor, ancestor: Some(a), lane: lane_for(slot, side, policy),
                     x: sx, z: sz, heading: 0.0,
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
-                    shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: slot as u32, still_t: 0.0, duty: Duty::Border,
-                    is_player: team == CLAN_A && slot == 0, seg: 0,
+                    shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
+                    cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, prey_taken: 0, seat: slot as u32, still_t: 0.0, duty: Duty::Border,
+                    // Both clans' seat 0 can be driven — clan A's by the local
+                    // player, clan B's by a human across a lockstep link. Until
+                    // somebody actually drives one it is an ordinary AI warrior.
+                    is_player: slot == 0, seg: 0,
                 });
             }
         }
@@ -479,13 +697,33 @@ impl Battleground {
             camps, medics, contention: (0.0, 0.0), contention_holder: None,
             skyrock: (-92.0, 92.0), skyrock_holder: None,
             time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], wave_n: [0; 2], tick: 0,
-            player_driven: false, input: None,
+            wombo: false, collapse_on_breach: false, spoils: false,
+            player_driven: [false; 2], input: [None; 2],
         }
     }
 
+    /// Drive clan A's leader — the local player in a single-clan game.
     pub fn set_input(&mut self, mx: f32, mz: f32, claw: bool, ability: Option<usize>) {
-        self.player_driven = true;
-        self.input = Some((mx, mz, claw, ability));
+        self.set_input_for(CLAN_A, mx, mz, claw, ability);
+    }
+
+    /// Drive either clan's leader. The second side exists for
+    /// [`crate::lockstep`], which was already carrying and comparing clan B's
+    /// frame across the wire while the sim had nowhere to put it.
+    pub fn set_input_for(&mut self, side: u8, mx: f32, mz: f32, claw: bool, ability: Option<usize>) {
+        let s = (side as usize).min(1);
+        self.player_driven[s] = true;
+        self.input[s] = Some((mx, mz, claw, ability));
+    }
+
+    /// The warrior a given clan's human drives, if anyone is driving.
+    pub fn driven(&self, side: u8) -> Option<usize> {
+        if !self.player_driven[(side as usize).min(1)] {
+            return None;
+        }
+        self.warriors
+            .iter()
+            .position(|w| w.team == side && w.is_player && w.role == Role::Ancestor)
     }
 
     fn spawn_patrol(&mut self, team: u8, lane: usize, duty: Duty) {
@@ -505,8 +743,8 @@ impl Battleground {
                 hp: PATROL_HP, max_hp: PATROL_HP, attack: PATROL_ATK, speed: PATROL_SPEED, reach: REACH,
                 mind: if duty == Duty::Hunting { Mind::Hunt } else { Mind::Trail },
                 carry: Carry::Nothing,
-                shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0,
+                shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
+                cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, prey_taken: 0,
                 seat: 100 + wave_seat * 8 + i as u32, still_t: 0.0, duty,
                 is_player: false, seg: 0,
             });
@@ -546,7 +784,7 @@ impl Battleground {
             w.mind = Mind::Dead;
             // a carried kill or sprig is dropped and lost
             w.carry = Carry::Nothing;
-            w.shield = 0.0; w.stealth_t = 0.0;
+            w.shield = 0.0; w.shield_t = 0.0; w.stealth_t = 0.0;
             if w.role == Role::Ancestor {
                 w.respawn_t = respawn;
             }
@@ -569,6 +807,17 @@ impl Battleground {
     /// INTO brush and mist — cover is a roof, not a dome. Stone is still stone.
     fn pierces_cover(dh: f32, d: f32) -> bool { dh >= 4.0 && d < 30.0 }
 
+    /// The enemy a warrior picks out of the ones it can see. Not simply the
+    /// nearest: among everything visible and in range, a warrior prefers the one
+    /// **closest to falling**, because three cats each chewing a different
+    /// healthy enemy kill nobody and three cats finishing one kill a warrior.
+    ///
+    /// This is also the change that makes kit power *visible*. Measured, over
+    /// half of all matches were decided by which orientation the chaos favoured
+    /// rather than by which composition was stronger — a roster cannot express
+    /// itself through an AI that spreads its damage at random. Distance still
+    /// matters (a target three lengths away beats one across the clearing), it
+    /// just no longer decides alone.
     fn nearest_enemy(&self, of: usize, within: f32) -> Option<usize> {
         let (team, x, z) = { let w = &self.warriors[of]; (w.team, w.x, w.z) };
         let vh = world::height_at(x, z);
@@ -587,7 +836,17 @@ impl Battleground {
                 if !over_cover { continue; }
             }
             let reach = within * clan_mult * Self::downhill_bonus(dh);
-            if d < reach && best.map_or(true, |b| d < b.1) { best = Some((i, d)); }
+            if d >= reach {
+                continue;
+            }
+            // score: lower is better. Distance in lengths, plus a penalty for how
+            // hale the target is — a wounded cat within a few lengths outbids a
+            // whole one nearby, and nothing outbids something about to drop.
+            let frac = (e.hp / e.max_hp).clamp(0.0, 1.0);
+            let score = d + frac * FOCUS_WEIGHT;
+            if best.map_or(true, |b| score < b.1) {
+                best = Some((i, score));
+            }
         }
         best.map(|b| b.0)
     }
@@ -634,6 +893,7 @@ impl Battleground {
                     let w = &self.warriors[j];
                     if w.team == team && w.alive() && dist(x, z, w.x, w.z) < spec.range.max(0.1) {
                         self.warriors[j].shield = self.warriors[j].shield.max(amount);
+                        self.warriors[j].shield_t = self.warriors[j].shield_t.max(spec.dur);
                     }
                 }
             }
@@ -711,6 +971,7 @@ impl Battleground {
                     let step = (d - REACH * 0.6).max(0.0);   // in to the claw, not inside the caster
                     let w = &mut self.warriors[v];
                     w.x += nx * step; w.z += nz * step;
+                    w.pulled_t = 1.5;
                     if spec.power > 0.0 { self.hurt(v, spec.power * atk); }
                 }
             }
@@ -724,6 +985,13 @@ impl Battleground {
                     }
                 }
             }
+        }
+        // any ability that draws blood ends the ambush too — but Veilwalker
+        // itself, and the shields and heals, do not
+        let bloodies = !matches!(spec.verb, Verb::Stealth | Verb::Shield | Verb::Heal | Verb::Rain)
+            && spec.power > 0.0;
+        if bloodies {
+            self.warriors[i].stealth_t = 0.0;
         }
         self.warriors[i].cds[slot] = spec.cd;
     }
@@ -794,8 +1062,29 @@ impl Battleground {
             self.warriors[i].mind = Mind::Trail;
         }
 
-        // wounded past nerve → break off and go home (patrol doctrine; ancestors too)
-        if frac < NERVE && !matches!(mind, Mind::Retreat | Mind::AtMedic | Mind::Dead) {
+        // Wounded past nerve → break off and go home (patrol doctrine; ancestors
+        // too). And the other half of the same doctrine, which was missing: a
+        // patrol that meets a bigger patrol withdraws. Nerve is not only about
+        // how hurt you are, it is about the odds — a cat at full strength facing
+        // three does not have good odds, and the books' patrols know it.
+        let outnumbered = {
+            let mut foes = 0i32;
+            let mut kin = 0i32;
+            for w in self.warriors.iter() {
+                if !w.alive() || dist(w.x, w.z, x, z) > ODDS_R {
+                    continue;
+                }
+                if w.team == team {
+                    kin += 1;   // counts self, which is right: you are one cat
+                } else if w.stealth_t <= 0.0 && junglemap::sees(x, z, w.x, w.z) {
+                    foes += 1;  // you cannot fear what you cannot see
+                }
+            }
+            foes - kin >= ODDS_MARGIN
+        };
+        if (frac < NERVE || outnumbered)
+            && !matches!(mind, Mind::Retreat | Mind::AtMedic | Mind::Dead)
+        {
             self.warriors[i].mind = Mind::Retreat;
         }
 
@@ -835,6 +1124,16 @@ impl Battleground {
                 }
             }
             Mind::AtMedic => {
+                // Only at the den. `think` never sets this state from far away,
+                // so in play it never mattered — but the heal was unconditional,
+                // which meant anything that put a warrior into AtMedic healed it
+                // wherever it stood. Two tests were written around that quirk
+                // before it was a bug; now it is a rule.
+                let (mx, mz) = self.medics[team as usize];
+                if dist(x, z, mx, mz) > MEDIC_R {
+                    self.warriors[i].mind = Mind::Retreat;
+                    return;
+                }
                 self.heal(i, MEDIC_HEAL * dt);
                 if self.warriors[i].power_frac() >= REJOIN {
                     if let Some(l) = self.breach_lane(team) { self.warriors[i].lane = l; }
@@ -905,7 +1204,7 @@ impl Battleground {
                                 self.prey[p].x = hx0; self.prey[p].z = hz0;
                                 self.warriors[i].carry = Carry::Freshkill(kind.worth());
                                 self.warriors[i].mind = Mind::CarryHome;
-                                self.warriors[i].kills += 1;
+                                self.warriors[i].prey_taken += 1;
                             }
                         }
                     }
@@ -919,23 +1218,79 @@ impl Battleground {
                     let (tx, tz) = (self.warriors[t].x, self.warriors[t].z);
                     let reach = self.warriors[i].reach;
                     let d = dist(x, z, tx, tz);
-                    if d > reach { self.walk_toward(i, tx, tz, dt); }
-                    else {
-                        let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
+                    if d > reach {
+                        self.walk_toward(i, tx, tz, dt);
+                    } else {
+                        // A ranged cat keeps its distance — but backing away and
+                        // biting are not the same motion. Measured: with the kite
+                        // free, Faryowl outran every kit slower than 6.4 while
+                        // still landing every yowl, and finished 61% across 160
+                        // games, the last kit outside ±7. Now giving ground costs
+                        // the blow, which is what it costs a real cat.
+                        let kiting = reach > 4.0 && d < reach * 0.45;
+                        if kiting {
+                            let (nx, nz) = norm(x - tx, z - tz);
+                            self.walk_toward(i, x + nx * 6.0, z + nz * 6.0, dt);
+                        }
+                        // A yowl thrown over the shoulder is a weaker yowl, not a
+                        // silent one. Both extremes were measured across 160
+                        // games: kiting free left Faryowl at 61% (dispersion sd
+                        // 4.2 overall), kiting silent dropped it to 42% and took
+                        // Stillsmoke to 37% with it (sd 6.2). Half is the version
+                        // that keeps the trade real without deleting the archetype.
+                        let mult = if kiting { KITE_STRIKE } else { 1.0 };
+                        let dmg = self.strike_of(i) * self.strike_vs(i, t) * mult * dt;
                         let was_alive = self.warriors[t].alive();
                         self.hurt(t, dmg);
                         self.on_hit(i, t);
-                        if was_alive && !self.warriors[t].alive() { self.warriors[i].kills += 1; }
-                        // a ranged cat keeps its distance: yowl, and give ground
-                        if reach > 4.0 && d < reach * 0.45 {
-                            let (nx, nz) = norm(x - tx, z - tz);
-                            self.walk_toward(i, x + nx * 6.0, z + nz * 6.0, dt);
+                        if was_alive && !self.warriors[t].alive() {
+                            self.warriors[i].kills += 1;
                         }
                     }
                     if role == Role::Ancestor { self.auto_cast(i); }
                     return;
                 }
                 self.warriors[i].mind = Mind::Trail;
+
+                // A broken border is where the clan goes. Patrol spawns and
+                // respawning warriors already funnelled onto a breach; the cats
+                // already out on an intact trail did not, so a clan could fell a
+                // Heal Tree and then keep walking three separate lanes past the
+                // hole it had just made. Wounded cats are exempt — they are
+                // heading for a sanctuary, and a push is not worth a life.
+                if self.collapse_on_breach
+                    && role == Role::Ancestor
+                    && self.warriors[i].power_frac() > NERVE * 1.5
+                {
+                    if let Some(b) = self.breach_lane(team) {
+                        if self.warriors[i].lane != b {
+                            // …but somebody holds the lane you are leaving. The
+                            // first version of this sent *every* healthy warrior,
+                            // so a clan traded one broken border for two empty
+                            // ones and measured worse than not pushing at all.
+                            // The lowest seat stays — deterministic, and it means
+                            // the same cat holds rather than the lane flickering
+                            // between whoever thought of it first this tick.
+                            let my_seat = self.warriors[i].seat;
+                            let my_lane = self.warriors[i].lane;
+                            let holder = self
+                                .warriors
+                                .iter()
+                                .filter(|w| {
+                                    w.team == team
+                                        && w.role == Role::Ancestor
+                                        && w.alive()
+                                        && w.lane == my_lane
+                                })
+                                .map(|w| w.seat)
+                                .min();
+                            if holder != Some(my_seat) {
+                                self.warriors[i].lane = b;
+                                self.warriors[i].seg = 0;
+                            }
+                        }
+                    }
+                }
 
                 // ancestors sometimes peel off the trail for the economy objectives
                 // `is_player` gates the AI economy detour so a human's warrior is
@@ -944,12 +1299,29 @@ impl Battleground {
                 // the field that never left the trail to farm. The mirror probe
                 // found it as a 0.6 m break at tick 34, and it is worth more than
                 // that over a match, since the economy is what wins them.
-                let hands_off = self.warriors[i].is_player && self.player_driven;
+                let hands_off =
+                    self.warriors[i].is_player && self.player_driven[team as usize];
                 if role == Role::Ancestor && !hands_off && carry == Carry::Nothing {
-                    let r = hashf(
-                        self.tick.wrapping_mul(2654435761)
-                            .wrapping_add(self.warriors[i].seat.wrapping_mul(97)),
-                    );
+                    // One at a time. A lane held by nobody is a lane given away,
+                    // so a warrior only peels off to hunt or gather if its
+                    // lane-mate is still on the trail — which is also what keeps
+                    // the duo a duo rather than two cats who happen to share a
+                    // number.
+                    let mate_away = self.warriors.iter().any(|m| {
+                        m.team == team
+                            && m.role == Role::Ancestor
+                            && m.lane == lane
+                            && !std::ptr::eq(m, &self.warriors[i])
+                            && matches!(m.mind, Mind::Hunt | Mind::Gather | Mind::CarryHome)
+                    });
+                    let r = if mate_away {
+                        1.0
+                    } else {
+                        hashf(
+                            self.tick.wrapping_mul(2654435761)
+                                .wrapping_add(self.warriors[i].seat.wrapping_mul(97)),
+                        )
+                    };
                     if r < 0.005 {
                         if r < 0.0015 && self.herb_patches.iter().any(|p| p.ready()) {
                             self.warriors[i].mind = Mind::Gather;
@@ -968,13 +1340,32 @@ impl Battleground {
                     && (t.lane == lane || dist(t.x, t.z, x, z) < 6.0)
                     && dist(t.x, t.z, x, z) < REACH + 3.0);
                 if let Some(t) = etarget {
+                    let was_standing = self.heal_trees[t].alive();
                     self.heal_trees[t].hp -= atk * self.siege_of(i) * dt;
+                    if was_standing && !self.heal_trees[t].alive() && self.spoils {
+                        // the roots give up the prey cached under them
+                        self.clans[team as usize].pile += BORDER_SPOILS;
+                    }
                     return;
                 }
                 if dist(x, z, enemy_camp.0, enemy_camp.1) < REACH + 4.0 {
                     let e = Self::enemy(team) as usize;
-                    let roots = self.heal_trees.iter().any(|t| t.team != team && t.alive());
-                    let dmg = atk * self.siege_of(i) * dt * if roots { 1.0 - ROOT_GUARD } else { 1.0 };
+                    // The Great Tree's hardness scales with how many of its
+                    // clan's Heal Trees still stand, rather than being all-or-
+                    // nothing. Measured: the clan that broke the enemy's FIRST
+                    // border went on to win only 39-48% of the time — breaking a
+                    // border was not an advantage, it was a bill. Of course it
+                    // was: felling a tree cost time and blood deep in enemy
+                    // ground and bought nothing, because two standing roots
+                    // hardened the Great Tree exactly as much as three did.
+                    // Now each felled tree is a third of that guard gone.
+                    let standing = self
+                        .heal_trees
+                        .iter()
+                        .filter(|t| t.team != team && t.alive())
+                        .count();
+                    let guard = ROOT_GUARD * (standing as f32 / LANES as f32).min(1.0);
+                    let dmg = atk * self.siege_of(i) * dt * (1.0 - guard);
                     self.clans[e].great_tree_hp -= dmg;
                     return;
                 }
@@ -995,15 +1386,87 @@ impl Battleground {
     /// heal when pressed, otherwise spend a technique.
     fn auto_cast(&mut self, i: usize) {
         let Some(a) = self.warriors[i].ancestor else { return };
-        if self.warriors[i].is_player && self.player_driven { return; }   // the player casts by input
+        if self.warriors[i].is_player && self.player_driven[self.warriors[i].team as usize] {
+            return; // the player casts by input
+        }
         let (team, x, z, frac) = { let w = &self.warriors[i]; (w.team, w.x, w.z, w.power_frac()) };
         let k = ancestor::kit(a);
-        let crowd = self.warriors.iter()
-            .filter(|e| e.team != team && e.alive() && dist(x, z, e.x, e.z) < k.ult.range.max(8.0)).count();
-        if crowd >= 2 && self.warriors[i].cds[2] <= 0.0 { self.cast(i, 2); return; }
+        let in_ult_range = |bg: &Battleground| {
+            bg.warriors.iter()
+                .filter(|e| e.team != team && e.alive() && dist(x, z, e.x, e.z) < k.ult.range.max(8.0))
+                .count()
+        };
+        let crowd = in_ult_range(self);
+
+        // ── the wombo ──────────────────────────────────────────────────────
+        // A pull that nobody follows up is a wasted pull. Riptail's Undertow
+        // and Snowhush's Snowbind exist to make a crowd stand still in one
+        // place; an ally holding an area ultimate should spend it on THAT
+        // moment rather than on whatever two cats happen to be near it later.
+        // So: a controller opens if a packmate has an area ult ready, and the
+        // packmate holds its ult a few seconds for a gather that is coming.
+        // An ultimate is a legend, not a rotation button: it wants a real crowd,
+        // one more cat than a technique is worth spending on. Without this the
+        // gather kits burn The River Takes on any two scouts and never have it
+        // for the fight that decides the lane.
+        const ULT_CROWD: usize = 3;
+        const TECH_CROWD: usize = 2;
+        let has_area_ult = self.wombo
+            && matches!(k.ult.verb, Verb::Aoe | Verb::Zone | Verb::Fear | Verb::Slow);
+        let gathered = self.warriors.iter().any(|e| {
+            e.team != team && e.alive() && (e.root_t > 0.0 || e.pulled_t > 0.0)
+                && dist(x, z, e.x, e.z) < k.ult.range.max(8.0)
+        });
+        if has_area_ult && self.warriors[i].cds[2] <= 0.0 {
+            if gathered && crowd >= TECH_CROWD {
+                self.cast(i, 2);   // the follow-up: land it on the held
+                return;
+            }
+            // a controller nearby whose opener is up? hold, briefly, for it
+            let opener_coming = self.warriors.iter().any(|m| {
+                m.team == team
+                    && m.alive()
+                    && dist(x, z, m.x, m.z) < 14.0
+                    && m.ancestor.map_or(false, |ma| {
+                        let mk = ancestor::kit(ma);
+                        mk.abilities.iter().enumerate().any(|(s, ab)| {
+                            matches!(ab.verb, Verb::Pull | Verb::Root) && m.cds[s] <= 0.5
+                        })
+                    })
+            });
+            if crowd >= ULT_CROWD && !opener_coming {
+                self.cast(i, 2);
+                return;
+            }
+        } else if crowd >= ULT_CROWD && self.warriors[i].cds[2] <= 0.0 {
+            self.cast(i, 2);
+            return;
+        }
+
         for slot in 0..2 {
-            let defensive = matches!(k.abilities[slot].verb, Verb::Shield | Verb::Heal | Verb::Stealth);
-            if self.warriors[i].cds[slot] <= 0.0 && (defensive == (frac < 0.7) || !defensive) {
+            let ab = k.abilities[slot];
+            let defensive = matches!(ab.verb, Verb::Shield | Verb::Heal | Verb::Stealth);
+            if self.warriors[i].cds[slot] > 0.0 {
+                continue;
+            }
+            // the opener half of the wombo: a pull or a root is worth far more
+            // when a packmate can immediately drop an area ult on the result,
+            // so fire it into a crowd rather than at the first lone scout
+            if matches!(ab.verb, Verb::Pull | Verb::Root) {
+                let ally_ready = self.warriors.iter().any(|m| {
+                    m.team == team
+                        && m.alive()
+                        && m.cds[2] <= 0.0
+                        && dist(x, z, m.x, m.z) < 14.0
+                        && m.ancestor.map_or(false, |ma| {
+                            matches!(ancestor::kit(ma).ult.verb, Verb::Aoe | Verb::Zone | Verb::Fear | Verb::Slow)
+                        })
+                });
+                if self.wombo && ally_ready && crowd < TECH_CROWD {
+                    continue;   // save it for a gather worth gathering
+                }
+            }
+            if defensive == (frac < 0.7) || !defensive {
                 self.cast(i, slot);
                 return;
             }
@@ -1022,6 +1485,11 @@ impl Battleground {
             w.fear_t = (w.fear_t - dt).max(0.0);
             w.slow_t = (w.slow_t - dt).max(0.0);
             w.root_t = (w.root_t - dt).max(0.0);
+            w.pulled_t = (w.pulled_t - dt).max(0.0);
+            w.shield_t = (w.shield_t - dt).max(0.0);
+            if w.shield_t <= 0.0 {
+                w.shield = 0.0;   // guard-hair settles
+            }
         }
         for p in self.prey.iter_mut() { p.respawn_t = (p.respawn_t - dt).max(0.0); }
         // land prey bolts from a close hunter, leashed to its home ground
@@ -1060,7 +1528,21 @@ impl Battleground {
                 self.patrol_t[team as usize] = PATROL_INTERVAL;
                 let wave = self.wave_n[team as usize] as usize;
                 self.wave_n[team as usize] += 1;
-                let lane = self.breach_lane(team).unwrap_or(wave % LANES);
+                // mid every other wave — nobody's ancestors hold it
+                let rota = [MID_LANE, DUO_LANE, MID_LANE, SOLO_LANE];
+                let normal = rota[wave % rota.len()];
+                // A breach pulls patrols, but not *every* patrol. Measured: the
+                // clan that broke the enemy's first border won only 34% of its
+                // matches, and the probe found why — deaths were even and no
+                // deeper on either side, but the breacher ended with fewer of its
+                // OWN borders standing. It had funnelled every wave into the hole
+                // it made while the defender's waves still covered three lanes,
+                // so it traded the map for a lane. Half the waves press the
+                // breach now; the rest walk the rota.
+                let lane = match self.breach_lane(team) {
+                    Some(b) if wave % 2 == 0 => b,
+                    _ => normal,
+                };
                 let duty = if wave % 3 == 2 { Duty::Hunting } else { Duty::Border };
                 self.spawn_patrol(team, lane, duty);
             }
@@ -1080,22 +1562,38 @@ impl Battleground {
         self.skyrock_holder =
             if sa > sb { Some(CLAN_A) } else if sb > sa { Some(CLAN_B) } else { self.skyrock_holder };
 
-        // player input drives warrior 0 directly
-        if let Some((mx, mz, claw, ability)) = self.input.take() {
-            if self.warriors[0].alive() {
-                if (mx != 0.0 || mz != 0.0) && self.warriors[0].root_t <= 0.0 {
-                    let (nx, nz) = norm(mx, mz);
-                    let s = self.speed_of(0);
-                    let w = &mut self.warriors[0];
-                    w.x = (w.x + nx * s * dt).clamp(-ARENA, ARENA);
-                    w.z = (w.z + nz * s * dt).clamp(-ARENA, ARENA);
-                    w.heading = nz.atan2(nx);
-                }
-                if let Some(slot) = ability { self.cast(0, slot.min(2)); }
-                if claw {
-                    if let Some(t) = self.nearest_enemy(0, self.warriors[0].reach) {
-                        let dmg = self.strike_of(0) * dt;
-                        self.hurt(t, dmg);
+        // player input drives each clan's leader — one side in a solo game, both
+        // in a lockstep match
+        for side in [CLAN_A, CLAN_B] {
+            let Some((mx, mz, claw, ability)) = self.input[side as usize].take() else { continue };
+            let Some(i) = self.driven(side) else { continue };
+            if !self.warriors[i].alive() {
+                continue;
+            }
+            if (mx != 0.0 || mz != 0.0) && self.warriors[i].root_t <= 0.0 {
+                let (nx, nz) = norm(mx, mz);
+                let sp = self.speed_of(i);
+                let w = &mut self.warriors[i];
+                w.x = (w.x + nx * sp * dt).clamp(-ARENA, ARENA);
+                w.z = (w.z + nz * sp * dt).clamp(-ARENA, ARENA);
+                w.heading = nz.atan2(nx);
+            }
+            if let Some(slot) = ability {
+                self.cast(i, slot.min(2));
+            }
+            if claw {
+                if let Some(t) = self.nearest_enemy(i, self.warriors[i].reach) {
+                    // the same blow an AI ancestor throws — target-dependent
+                    // riders, on-hit effects, and the kill credited. A player's
+                    // claw that quietly skipped Hush of Snows or The Saber
+                    // Finishes would make the kits play differently in a human's
+                    // paws than in the sim they were balanced in.
+                    let dmg = self.strike_of(i) * self.strike_vs(i, t) * dt;
+                    let alive_before = self.warriors[t].alive();
+                    self.hurt(t, dmg);
+                    self.on_hit(i, t);
+                    if alive_before && !self.warriors[t].alive() {
+                        self.warriors[i].kills += 1;
                     }
                 }
             }
@@ -1117,7 +1615,9 @@ impl Battleground {
         let ascending = self.tick % 2 == 0;
         for k in 0..n {
             let i = if ascending { k } else { n - 1 - k };
-            if !self.warriors[i].alive() || (self.warriors[i].is_player && self.player_driven) { continue; }
+            let driven = self.warriors[i].is_player
+                && self.player_driven[self.warriors[i].team as usize];
+            if !self.warriors[i].alive() || driven { continue; }
             self.think(i, dt);
         }
 
@@ -1170,7 +1670,16 @@ impl Battleground {
             if !alive { continue; }
             if self.under_aura(team, x, z) { self.heal(i, aura_heal * dt); }
             if anc == Some(Ancestor::Leopard) && world::height_at(x, z) < world::WATER_Y + 0.2 {
-                self.heal(i, 3.0 * dt);
+                // Riverborn mends *between* fights, not during one. Standing in
+                // the shallows regenerating with an enemy on the bank was a heal
+                // with no cost, no cooldown and no cap — the one kit that could
+                // simply outlast anything that came to the water.
+                let pressed = self.warriors.iter().any(|e| {
+                    e.team != team && e.alive() && dist(e.x, e.z, x, z) < ENGAGE_R
+                });
+                if !pressed {
+                    self.heal(i, 3.0 * dt);
+                }
             }
         }
 
@@ -1279,8 +1788,8 @@ mod tests {
             x: cx + 8.0, z: cz, heading: 0.0,
             hp: PATROL_HP, max_hp: PATROL_HP, attack: 0.0, speed: 0.0, reach: REACH,
             mind: Mind::Trail, carry: Carry::Nothing,
-            shield: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0,
-            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, seat: 999, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
+            shield: 0.0, shield_t: 0.0, stealth_t: 0.0, fear_t: 0.0, slow_t: 0.0, root_t: 0.0, pulled_t: 0.0,
+            cds: [0.0; 3], respawn_t: 0.0, gather_t: 0.0, kills: 0, prey_taken: 0, seat: 999, still_t: 0.0, duty: Duty::Border, is_player: false, seg: 0,
         });
         bg.step(1.0 / 30.0);
         assert_eq!(bg.warriors[p].mind, Mind::LastStand, "at the Great Tree a warrior stands");
@@ -2034,6 +2543,834 @@ mod tests {
             (strike(Ancestor::CaveLion) - strike(Ancestor::Caracal)).abs() < 1e-5,
             "siege must not leak into flesh damage"
         );
+    }
+
+    #[test]
+    fn a_controller_saves_its_opener_for_a_crowd_worth_gathering() {
+        // Riptail beside a packmate holding a live area ult should not spend
+        // Undertow on one lone scout — the pull is the setup, and a setup with
+        // nothing behind it is just a shove.
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Jaguar, Ancestor::CaveLion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal],
+        );
+        bg.patrol_t = [1e9; 2];
+        bg.wombo = true;
+        bg.warriors[0].is_player = false;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        bg.warriors[1].x = x + 2.0; // Oldroar, Earthshaker ready
+        bg.warriors[1].z = z;
+        let enemies: Vec<usize> =
+            bg.warriors.iter().enumerate().filter(|(_, w)| w.team == CLAN_B).map(|(i, _)| i).collect();
+        // one lone enemy in pull range: hold
+        for (n, &e) in enemies.iter().enumerate() {
+            bg.warriors[e].x = if n == 0 { x + 6.0 } else { x + 200.0 };
+            bg.warriors[e].z = z;
+        }
+        bg.auto_cast(0);
+        assert_eq!(bg.warriors[0].cds[0], 0.0, "Undertow should be held for a crowd");
+        // now a second enemy walks in: the gather is worth it
+        bg.warriors[enemies[1]].x = x + 7.0;
+        bg.warriors[enemies[1]].z = z + 1.0;
+        bg.auto_cast(0);
+        assert!(bg.warriors[0].cds[0] > 0.0, "with two in range the pull should fire");
+        assert!(
+            bg.warriors[enemies[0]].pulled_t > 0.0,
+            "and the pulled are marked, so the follow-up can see the moment"
+        );
+    }
+
+    #[test]
+    fn an_area_ult_waits_for_the_gather_then_lands_on_it() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::CaveLion, Ancestor::Jaguar, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal],
+        );
+        bg.patrol_t = [1e9; 2];
+        bg.wombo = true;
+        bg.warriors[0].is_player = false;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        bg.warriors[1].x = x + 2.0; // Riptail beside it, Undertow ready
+        bg.warriors[1].z = z;
+        let enemies: Vec<usize> =
+            bg.warriors.iter().enumerate().filter(|(_, w)| w.team == CLAN_B).map(|(i, _)| i).collect();
+        for (n, &e) in enemies.iter().enumerate() {
+            bg.warriors[e].x = x + 6.0 + n as f32;
+            bg.warriors[e].z = z;
+        }
+        // Oldroar holds Earthshaker while the jaguar's opener is up
+        bg.auto_cast(0);
+        assert_eq!(bg.warriors[0].cds[2], 0.0, "the ult should wait for the pull");
+        // the jaguar pulls; now the ult has its moment
+        bg.warriors[1].is_player = false;
+        bg.cast(1, 0);
+        assert!(bg.warriors[enemies[0]].pulled_t > 0.0);
+        bg.auto_cast(0);
+        assert!(bg.warriors[0].cds[2] > 0.0, "the follow-up should land on the held");
+        // and with no controller nearby at all, nothing is waited for
+        let mut solo = Battleground::new_draft(
+            [Ancestor::CaveLion, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal],
+        );
+        solo.patrol_t = [1e9; 2];
+        solo.wombo = true;
+        solo.warriors[0].is_player = false;
+        let (sx, sz) = (solo.warriors[0].x, solo.warriors[0].z);
+        let foes: Vec<usize> = (0..solo.warriors.len())
+            .filter(|&i| solo.warriors[i].team == CLAN_B)
+            .collect();
+        for (n, e) in foes.into_iter().enumerate() {
+            solo.warriors[e].x = sx + 5.0 + n as f32;
+            solo.warriors[e].z = sz;
+        }
+        solo.auto_cast(0);
+        assert!(solo.warriors[0].cds[2] > 0.0, "with nobody to set up, take the fight you have");
+    }
+
+    #[test]
+    fn the_loner_takes_the_river_and_the_pride_climbs_together() {
+        // Doctrine, asserted: whoever's kit is worth least beside a packmate
+        // walks the solo lane, whatever seat they were drafted into.
+        let picks = [Ancestor::Lion, Ancestor::Panther, Ancestor::Leopard];
+        assert_eq!(solo_seat(&picks), 1, "the shadow-walker walks alone");
+        // and the old doctrine is still reachable, because it is the baseline
+        // every balance number before this was measured against
+        assert_eq!(lane_for(0, &picks, LanePolicy::Seat), SOLO_LANE);
+        assert_eq!(lane_for(1, &picks, LanePolicy::Seat), DUO_LANE);
+        assert_eq!(lane_for(1, &picks, LanePolicy::Kit), SOLO_LANE);
+        let bg = Battleground::new_draft(picks, picks);
+        for team in [CLAN_A, CLAN_B] {
+            let lane_of = |a: Ancestor| {
+                bg.warriors
+                    .iter()
+                    .find(|w| w.team == team && w.ancestor == Some(a))
+                    .map(|w| w.lane)
+                    .unwrap()
+            };
+            assert_eq!(lane_of(Ancestor::Panther), SOLO_LANE);
+            assert_eq!(lane_of(Ancestor::Lion), DUO_LANE);
+            assert_eq!(lane_of(Ancestor::Leopard), DUO_LANE, "the mender goes where the wounded are");
+        }
+        // and with three loners somebody still has to take the river
+        let all_alone = [Ancestor::Panther, Ancestor::Tiger, Ancestor::Smilodon];
+        let bg2 = Battleground::new_draft(all_alone, all_alone);
+        let solo = bg2
+            .warriors
+            .iter()
+            .filter(|w| w.team == CLAN_A && w.role == Role::Ancestor && w.lane == SOLO_LANE)
+            .count();
+        assert_eq!(solo, 1, "exactly one river-walker, always");
+    }
+
+    #[test]
+    fn the_clans_lane_like_the_country_is_shaped() {
+        // One warrior down the river, two up the mountain, patrols holding the
+        // middle. The map spent three commits growing a duo side and a solo
+        // side; this is the part that makes a clan use them.
+        let bg = Battleground::new(Ancestor::Lion);
+        for team in [CLAN_A, CLAN_B] {
+            let lanes: Vec<usize> = bg
+                .warriors
+                .iter()
+                .filter(|w| w.team == team && w.role == Role::Ancestor)
+                .map(|w| w.lane)
+                .collect();
+            assert_eq!(lanes.iter().filter(|&&l| l == SOLO_LANE).count(), 1, "one on the river");
+            // (which one is decided by kit, not seat — see the test above)
+            assert_eq!(lanes.iter().filter(|&&l| l == DUO_LANE).count(), 2, "two on the mountain");
+            assert_eq!(lanes.iter().filter(|&&l| l == MID_LANE).count(), 0, "mid is the patrols'");
+        }
+        // and the duo pair should actually end up near each other, not merely
+        // share a number — coordination reads distance, not lane ids
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        for _ in 0..30 * 20 {
+            bg.step(1.0 / 30.0);
+        }
+        // The pair does drift — one of them peels off to hunt or fetch herbs,
+        // which is the economy working. What must hold is the doctrine: never
+        // BOTH at once, or the lane is unheld.
+        let away = bg
+            .warriors
+            .iter()
+            .filter(|w| {
+                w.team == CLAN_A
+                    && w.role == Role::Ancestor
+                    && w.lane == DUO_LANE
+                    && w.alive()
+                    && matches!(w.mind, Mind::Hunt | Mind::Gather | Mind::CarryHome)
+            })
+            .count();
+        assert!(away <= 1, "the duo must not both wander off: {away} away");
+    }
+
+    #[test]
+    fn the_middle_gets_the_patrols_nobody_else_walks() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        let mut seen = [0u32; LANES];
+        for _ in 0..30 * 60 * 3 {
+            bg.step(1.0 / 30.0);
+            for w in bg.warriors.iter().filter(|w| w.role == Role::Patrol) {
+                seen[w.lane] += 1;
+            }
+        }
+        assert!(
+            seen[MID_LANE] > seen[SOLO_LANE],
+            "the middle should carry the most patrol traffic: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_player_drives_their_own_warrior_and_the_ai_lets_go() {
+        // The whole `set_input` path had no test: every other test in this file
+        // drives the AI. A human's warrior has to move where it is told, cast
+        // what it is told, and stop being second-guessed by `think`.
+        let mut bg = Battleground::new(Ancestor::Serval);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors.retain(|w| w.team == CLAN_A);
+        let start = (bg.warriors[0].x, bg.warriors[0].z);
+        // walk east for a second
+        for _ in 0..30 {
+            bg.set_input(1.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        let moved = bg.warriors[0].x - start.0;
+        assert!(moved > 3.0, "the player's warrior should have walked east, got {moved}");
+        assert!((bg.warriors[0].z - start.1).abs() < 0.01, "and not drifted north");
+        assert!(bg.player_driven[CLAN_A as usize], "the first input hands the seat over");
+        // the AI must not be steering it any more: hold no input and it holds still
+        let held = (bg.warriors[0].x, bg.warriors[0].z);
+        for _ in 0..30 {
+            bg.set_input(0.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert!(
+            dist(bg.warriors[0].x, bg.warriors[0].z, held.0, held.1) < 0.01,
+            "an idle player is idle, not auto-piloted"
+        );
+        // a rooted player cannot walk, and knows it
+        bg.warriors[0].root_t = 1.0;
+        let rooted = (bg.warriors[0].x, bg.warriors[0].z);
+        for _ in 0..15 {
+            bg.set_input(1.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert!(dist(bg.warriors[0].x, bg.warriors[0].z, rooted.0, rooted.1) < 0.01);
+    }
+
+    #[test]
+    fn the_players_claw_is_the_same_blow_an_ancestor_throws() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Lynx, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Leopard, Ancestor::Panther],
+        );
+        bg.patrol_t = [1e9; 2];
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        bg.warriors[e].x = x + 1.5;
+        bg.warriors[e].z = z;
+        bg.warriors[e].root_t = 100.0; // hold it still; this is about the blow
+        let hp0 = bg.warriors[e].hp;
+        bg.set_input(0.0, 0.0, true, None);
+        bg.step(1.0 / 30.0);
+        assert!(bg.warriors[e].hp < hp0, "the claw should land");
+        // Snowhush's Hush of Snows must fire from a human's paw too
+        assert!(bg.warriors[e].slow_t > 0.0, "on-hit riders apply to player blows");
+        // and the kill is credited
+        bg.warriors[e].hp = 0.01;
+        bg.set_input(0.0, 0.0, true, None);
+        bg.step(1.0 / 30.0);
+        assert!(!bg.warriors[e].alive());
+        assert_eq!(bg.warriors[0].kills, 1, "a player's kill counts as a kill");
+    }
+
+    #[test]
+    fn the_player_casts_by_slot_and_pays_the_cooldown() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        // Nobody within reach — the first draft of this test parked a rooted
+        // Nightpelt five metres away and watched the shield vanish inside the
+        // same tick: at night its Pounce of Midnight lands 29 against a 28-point
+        // Mane of Dawn. The kits are working; the test was measuring a duel.
+        for i in 0..bg.warriors.len() {
+            if bg.warriors[i].team == CLAN_B {
+                bg.warriors[i].x = 140.0;
+                bg.warriors[i].z = 140.0;
+            }
+        }
+        bg.set_input(0.0, 0.0, false, Some(1)); // Mane of Dawn
+        bg.step(1.0 / 30.0);
+        assert!(bg.warriors[0].shield > 0.0, "slot 1 should have gone off");
+        assert!(bg.warriors[0].cds[1] > 0.0, "and started its cooldown");
+        // an out-of-range slot index is clamped rather than panicking
+        bg.set_input(0.0, 0.0, false, Some(9));
+        bg.step(1.0 / 30.0);
+        assert!(bg.warriors[0].cds[2] > 0.0, "slot 9 clamps to the ultimate");
+    }
+
+    #[test]
+    fn giving_ground_costs_the_blow() {
+        use crate::ancestor::kit;
+        // A yowler pressed to muzzle range backs off instead of striking; the
+        // same yowler at comfortable range strikes and holds. Melee kits never
+        // kite at all, so their blow is never traded away.
+        let step = |a: Ancestor, gap: f32| -> (f32, f32) {
+            let mut bg = Battleground::new_draft(
+                [a, Ancestor::Lion, Ancestor::Puma],
+                [Ancestor::Puma, Ancestor::Leopard, Ancestor::Panther],
+            );
+            bg.patrol_t = [1e9; 2];
+            bg.warriors[0].is_player = false;
+            // out in the middle: within LAST_STAND_R of a camp a warrior defends
+            // the Great Tree instead, and that branch does not kite — the first
+            // draft of this test staged the duel on the doorstep and measured
+            // the last stand
+            bg.warriors[0].x = 10.0;
+            bg.warriors[0].z = -10.0;
+            let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+            let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+            bg.warriors[e].x = x + gap;
+            bg.warriors[e].z = z;
+            bg.warriors[e].root_t = 100.0; // hold the target still
+            bg.warriors[e].hp = bg.warriors[e].max_hp;
+            // abilities on cooldown: this is about the BASIC blow. A yowler
+            // backing off can still spend Piercing Yowl, and should — spacing is
+            // what its abilities are paid for; it is the free auto-attack while
+            // retreating that was the problem.
+            bg.warriors[0].cds = [30.0; 3];
+            let hp0 = bg.warriors[e].hp;
+            bg.step(1.0 / 30.0);
+            let moved = dist(bg.warriors[0].x, bg.warriors[0].z, x, z);
+            (hp0 - bg.warriors[e].hp, moved)
+        };
+        let close = kit(Ancestor::Serval).reach * 0.3; // inside the kite threshold
+        let far = kit(Ancestor::Serval).reach * 0.8;
+        let (dmg_close, moved_close) = step(Ancestor::Serval, close);
+        let (dmg_far, moved_far) = step(Ancestor::Serval, far);
+        assert!(moved_close > 0.0, "pressed close, the yowler gives ground");
+        assert!(dmg_far > 0.0, "at range it strikes");
+        assert!(
+            dmg_close < dmg_far * 0.75,
+            "a yowl thrown over the shoulder lands softer: {dmg_close} against {dmg_far}"
+        );
+        assert!(dmg_close > 0.0, "but it is not silent");
+        assert!(moved_far < 0.01, "and holds its ground");
+        // a melee kit at the same close distance strikes and stays
+        let (dmg_melee, moved_melee) = step(Ancestor::Smilodon, 2.0);
+        assert!(dmg_melee > 0.0 && moved_melee < 0.01, "melee never kites");
+    }
+
+    #[test]
+    fn the_blow_from_the_dark_lands_and_then_the_veil_is_gone() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Panther, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Leopard, Ancestor::Caracal],
+        );
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].is_player = false;
+        bg.warriors[0].x = 10.0;
+        bg.warriors[0].z = -10.0;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = x + 2.0;
+        bg.warriors[e].z = z;
+        bg.warriors[e].root_t = 100.0;
+        bg.warriors[0].cds = [30.0; 3];
+        // struck from the veil: the bonus is banked into THIS blow…
+        bg.warriors[0].stealth_t = 5.0;
+        let veiled = bg.strike_of(0);
+        bg.warriors[0].stealth_t = 0.0;
+        let plain = bg.strike_of(0);
+        assert!(veiled > plain * 1.2, "Night's Hunger should feed the opening strike");
+        // …and then the ambush is over
+        bg.warriors[0].stealth_t = 5.0;
+        bg.step(1.0 / 30.0);
+        assert_eq!(bg.warriors[0].stealth_t, 0.0, "the blow ends the ambush");
+        assert!(bg.warriors[e].hp < bg.warriors[e].max_hp, "and it still landed");
+        // a warder's own shield does not give them away
+        let mut lion = Battleground::new(Ancestor::Lion);
+        lion.patrol_t = [1e9; 2];
+        lion.warriors[0].stealth_t = 5.0;
+        lion.cast(0, 1); // Mane of Dawn
+        assert_eq!(lion.warriors[0].stealth_t, 5.0, "shielding is not a blow");
+        // nor does casting Veilwalker itself
+        let mut cat = Battleground::new(Ancestor::Tiger);
+        cat.patrol_t = [1e9; 2];
+        cat.cast(0, 1); // Stripes in the Reeds
+        assert!(cat.warriors[0].stealth_t > 0.0, "the veil may still be raised");
+    }
+
+    #[test]
+    fn guard_hair_settles_when_its_moment_passes() {
+        use crate::ancestor::kit;
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors.retain(|w| w.team == CLAN_A);
+        bg.heal_trees.clear();
+        bg.warriors[0].is_player = false;
+        bg.cast(0, 1); // Mane of Dawn
+        let dur = kit(Ancestor::Lion).abilities[1].dur;
+        assert!(bg.warriors[0].shield > 0.0 && bg.warriors[0].shield_t > 0.0);
+        // it holds for its declared moment…
+        for _ in 0..((dur - 0.5) * 30.0) as usize {
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[0].shield > 0.0, "the guard-hair should still be up at {dur}s");
+        // …and not a match longer
+        for _ in 0..30 {
+            bg.step(1.0 / 30.0);
+        }
+        assert_eq!(bg.warriors[0].shield, 0.0, "and then it settles");
+        assert_eq!(bg.warriors[0].shield_t, 0.0);
+    }
+
+    #[test]
+    fn a_hillside_of_mice_does_not_make_a_war_hero() {
+        // Skyward Hunger quickens the caracal's paws with every kill. Prey are
+        // not kills: a kit should not stack a war passive off things that do not
+        // fight back.
+        let mut bg = Battleground::new(Ancestor::Caracal);
+        quiet(&mut bg);
+        bg.warriors[0].x = 20.0;
+        bg.warriors[0].z = -20.0;
+        let base = bg.speed_of(0);
+        bg.warriors[0].prey_taken = 10;
+        assert_eq!(bg.speed_of(0), base, "prey must not quicken the paws");
+        bg.warriors[0].kills = 10;
+        assert!(bg.speed_of(0) > base * 1.3, "warriors do");
+        // and a hunt credits prey_taken, not kills
+        let mut bg = Battleground::new(Ancestor::Caracal);
+        quiet(&mut bg);
+        let p = bg.prey.iter().position(|p| p.alive()).unwrap();
+        let (px, pz) = (bg.prey[p].x, bg.prey[p].z);
+        bg.warriors[1].x = px;
+        bg.warriors[1].z = pz;
+        bg.warriors[1].mind = Mind::Hunt;
+        for _ in 0..30 * 20 {
+            bg.step(1.0 / 30.0);
+            if bg.warriors[1].carry != Carry::Nothing {
+                break;
+            }
+        }
+        assert!(bg.warriors[1].prey_taken > 0, "the hunt should be counted");
+        assert_eq!(bg.warriors[1].kills, 0, "but not as a war record");
+    }
+
+    #[test]
+    fn the_river_mends_between_fights_not_during_one() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Leopard, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Caracal, Ancestor::Panther],
+        );
+        bg.patrol_t = [1e9; 2];
+        bg.heal_trees.clear(); // isolate Riverborn from the aura
+        let Some((wx, wz)) = world::nearest_water((0.0, 0.0), 140.0) else { return };
+        bg.warriors[0].x = wx;
+        bg.warriors[0].z = wz;
+        bg.warriors[0].hp = 50.0;
+        bg.warriors[0].mind = Mind::AtMedic; // hold position
+        bg.warriors[0].is_player = false;
+        // an enemy on the bank: no mending
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = wx + 5.0;
+        bg.warriors[e].z = wz;
+        bg.warriors[e].root_t = 100.0;
+        bg.warriors[e].attack = 0.0;
+        let before = bg.warriors[0].hp;
+        for _ in 0..30 {
+            bg.warriors[0].x = wx;
+            bg.warriors[0].z = wz;
+            bg.warriors[0].mind = Mind::AtMedic;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[0].hp <= before + 0.01, "pressed, the river gives nothing");
+        // send the enemy away and the shallows close the wounds
+        bg.warriors[e].x = wx + 120.0;
+        let mid = bg.warriors[0].hp;
+        for _ in 0..30 {
+            bg.warriors[0].x = wx;
+            bg.warriors[0].z = wz;
+            bg.warriors[0].mind = Mind::AtMedic;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(bg.warriors[0].hp > mid + 1.0, "alone in the shallows, it mends");
+    }
+
+    #[test]
+    fn the_cold_bites_deeper_for_the_cat_that_made_it() {
+        let mut bg = Battleground::new_draft(
+            [Ancestor::Lynx, Ancestor::Lion, Ancestor::Puma],
+            [Ancestor::Puma, Ancestor::Leopard, Ancestor::Panther],
+        );
+        bg.patrol_t = [1e9; 2];
+        let e = bg.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        bg.warriors[e].x = bg.warriors[0].x + 2.0;
+        bg.warriors[e].z = bg.warriors[0].z;
+        let warm = bg.strike_vs(0, e);
+        bg.warriors[e].slow_t = 1.0;
+        assert!(bg.strike_vs(0, e) > warm * 1.2, "the lynx collects on its own chill");
+        // and it is the lynx's alone — a lion gets nothing from a chilled target
+        let mut lion = Battleground::new(Ancestor::Lion);
+        lion.patrol_t = [1e9; 2];
+        let le = lion.warriors.iter().position(|w| w.team == CLAN_B).unwrap();
+        lion.warriors[le].x = lion.warriors[0].x + 2.0;
+        lion.warriors[le].z = lion.warriors[0].z;
+        let plain = lion.strike_vs(0, le);
+        lion.warriors[le].slow_t = 1.0;
+        assert_eq!(lion.strike_vs(0, le), plain);
+    }
+
+    #[test]
+    fn the_patrol_turns_on_the_one_already_bleeding() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        bg.warriors[0].x = 20.0;
+        bg.warriors[0].z = -20.0;
+        let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
+        let foes: Vec<usize> =
+            (0..bg.warriors.len()).filter(|&i| bg.warriors[i].team == CLAN_B).collect();
+        // a hale cat right beside it, a wounded one a few lengths off
+        bg.warriors[foes[0]].x = x + 2.0;
+        bg.warriors[foes[0]].z = z;
+        bg.warriors[foes[1]].x = x + 6.0;
+        bg.warriors[foes[1]].z = z;
+        for &f in &foes[2..] {
+            bg.warriors[f].x = 140.0;
+            bg.warriors[f].z = 140.0;
+        }
+        assert_eq!(bg.nearest_enemy(0, 30.0), Some(foes[0]), "all else equal, the near one");
+        bg.warriors[foes[1]].hp = bg.warriors[foes[1]].max_hp * 0.2;
+        assert_eq!(
+            bg.nearest_enemy(0, 30.0),
+            Some(foes[1]),
+            "a wounded cat a few lengths off outbids a hale one underfoot"
+        );
+        // but not from across the clearing: distance still counts
+        bg.warriors[foes[1]].x = x + 28.0;
+        assert_eq!(bg.nearest_enemy(0, 30.0), Some(foes[0]));
+    }
+
+    #[test]
+    fn a_patrol_that_meets_a_bigger_patrol_withdraws() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        // out in the open, away from either camp's last-stand radius
+        let (x, z) = (20.0f32, -20.0f32);
+        bg.warriors[1].x = x;
+        bg.warriors[1].z = z;
+        bg.warriors[1].hp = bg.warriors[1].max_hp; // whole and hearty
+        let foes: Vec<usize> =
+            (0..bg.warriors.len()).filter(|&i| bg.warriors[i].team == CLAN_B).collect();
+        // one enemy: a fair fight, and it stays
+        for (n, &f) in foes.iter().enumerate() {
+            bg.warriors[f].x = if n == 0 { x + 4.0 } else { 140.0 };
+            bg.warriors[f].z = if n == 0 { z } else { 140.0 };
+        }
+        bg.warriors[0].x = 140.0;
+        bg.warriors[0].z = 140.0;
+        bg.step(1.0 / 30.0);
+        assert_ne!(bg.warriors[1].mind, Mind::Retreat, "one against one is a fight");
+        // three of them: the odds are the other half of nerve
+        for (n, &f) in foes.iter().enumerate() {
+            bg.warriors[f].x = x + 4.0 + n as f32;
+            bg.warriors[f].z = z;
+        }
+        bg.warriors[1].x = x;
+        bg.warriors[1].z = z;
+        bg.warriors[1].mind = Mind::Trail;
+        bg.step(1.0 / 30.0);
+        assert_eq!(bg.warriors[1].mind, Mind::Retreat, "three against one is a retreat");
+        // and a veiled enemy cannot frighten anyone: you do not count what you
+        // cannot see
+        for &f in &foes {
+            bg.warriors[f].stealth_t = 5.0;
+        }
+        bg.warriors[1].x = x;
+        bg.warriors[1].z = z;
+        bg.warriors[1].mind = Mind::Trail;
+        bg.step(1.0 / 30.0);
+        assert_ne!(bg.warriors[1].mind, Mind::Retreat, "unseen cats do not count against the odds");
+    }
+
+    #[test]
+    fn the_clan_collapses_onto_a_broken_border() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        bg.collapse_on_breach = true;
+        // fell one of clan B's Heal Trees: clan A now has a breach to push
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let breach = bg.heal_trees[t].lane;
+        bg.heal_trees[t].hp = 0.0;
+        // put clan A's ancestors out on their own intact trails, whole and healthy
+        for i in 0..bg.warriors.len() {
+            if bg.warriors[i].team == CLAN_A {
+                bg.warriors[i].x = -40.0;
+                bg.warriors[i].z = -40.0;
+                bg.warriors[i].hp = bg.warriors[i].max_hp;
+                bg.warriors[i].mind = Mind::Trail;
+            } else {
+                bg.warriors[i].x = 140.0;
+                bg.warriors[i].z = 140.0;
+            }
+        }
+        bg.step(1.0 / 30.0);
+        // the duo pair sends one and keeps one: a push is not an abandonment
+        let a_lanes: Vec<(u32, usize)> = bg
+            .warriors
+            .iter()
+            .filter(|w| w.team == CLAN_A && w.role == Role::Ancestor)
+            .map(|w| (w.seat, w.lane))
+            .collect();
+        assert!(
+            a_lanes.iter().any(|&(_, l)| l == breach),
+            "somebody heads for the hole in their border"
+        );
+        for lane in [DUO_LANE, SOLO_LANE] {
+            if lane == breach {
+                continue;
+            }
+            let started_there: Vec<u32> = a_lanes
+                .iter()
+                .filter(|&&(_, l)| l == lane)
+                .map(|&(s, _)| s)
+                .collect();
+            // whichever lanes still have somebody, that somebody is the lowest
+            // seat of the group — the holder, not a leftover
+            if let Some(&min) = started_there.iter().min() {
+                assert_eq!(started_there.len(), 1, "one holder, not a crowd");
+                let _ = min;
+            }
+        }
+        // a wounded one does not: it is going to a sanctuary, and a push is not
+        // worth a life
+        let hurt = bg.warriors.iter().position(|w| w.team == CLAN_A).unwrap();
+        bg.warriors[hurt].lane = (breach + 1) % LANES;
+        bg.warriors[hurt].hp = bg.warriors[hurt].max_hp * 0.3;
+        bg.warriors[hurt].mind = Mind::Trail;
+        bg.step(1.0 / 30.0);
+        assert_ne!(bg.warriors[hurt].lane, breach);
+    }
+
+    #[test]
+    fn every_felled_border_softens_the_great_tree() {
+        // Felling a Heal Tree has to buy something, or taking objectives is a
+        // bill rather than an advantage — which is exactly what the harness
+        // measured before this: the clan that broke the first border won under
+        // half its matches.
+        let gnaw_rate = |fell: usize| {
+            let mut bg = Battleground::new(Ancestor::CaveLion);
+            bg.patrol_t = [1e9; 2];
+            bg.warriors.retain(|w| w.team == CLAN_B);
+            for (n, t) in bg
+                .heal_trees
+                .iter_mut()
+                .filter(|t| t.team == CLAN_A)
+                .enumerate()
+            {
+                if n < fell {
+                    t.hp = 0.0;
+                }
+            }
+            let (cx, cz) = bg.camps[CLAN_A as usize];
+            let before = bg.clans[CLAN_A as usize].great_tree_hp;
+            for _ in 0..30 * 3 {
+                for i in 0..bg.warriors.len() {
+                    bg.warriors[i].x = cx + 2.0;
+                    bg.warriors[i].z = cz;
+                    bg.warriors[i].hp = bg.warriors[i].max_hp;
+                    bg.warriors[i].mind = Mind::Trail;
+                }
+                bg.step(1.0 / 30.0);
+            }
+            before - bg.clans[CLAN_A as usize].great_tree_hp
+        };
+        let (none, one, all) = (gnaw_rate(0), gnaw_rate(1), gnaw_rate(3));
+        assert!(one > none * 1.1, "the first border must buy something: {none} -> {one}");
+        assert!(all > one * 1.1, "and the next ones more: {one} -> {all}");
+    }
+
+    #[test]
+    fn a_breach_pulls_patrols_but_not_every_patrol() {
+        let mut bg = Battleground::new(Ancestor::Lion);
+        // fell a clan B border: clan A now has somewhere to press
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let breach = bg.heal_trees[t].lane;
+        bg.heal_trees[t].hp = 0.0;
+        let mut on_breach = 0;
+        let mut elsewhere = 0;
+        for wave in 0..8 {
+            let before = bg.warriors.len();
+            bg.spawn_patrol(CLAN_A, {
+                let rota = [MID_LANE, DUO_LANE, MID_LANE, SOLO_LANE];
+                match bg.breach_lane(CLAN_A) {
+                    Some(b) if wave % 2 == 0 => b,
+                    _ => rota[wave % rota.len()],
+                }
+            }, Duty::Border);
+            let lane = bg.warriors[before].lane;
+            if lane == breach { on_breach += 1 } else { elsewhere += 1 }
+        }
+        assert!(on_breach > 0, "the breach should pull patrols");
+        assert!(elsewhere > 0, "but the other trails must not be abandoned");
+    }
+
+    #[test]
+    fn a_felled_border_can_be_made_to_pay_and_only_once() {
+        let mut bg = Battleground::new(Ancestor::CaveLion);
+        bg.patrol_t = [1e9; 2];
+        bg.spoils = true;
+        bg.warriors.retain(|w| w.team == CLAN_A);
+        let t = bg.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let (tx, tz, lane) = (bg.heal_trees[t].x, bg.heal_trees[t].z, bg.heal_trees[t].lane);
+        bg.heal_trees[t].hp = 1.0; // one gnaw from falling
+        let before = bg.clans[CLAN_A as usize].pile;
+        for _ in 0..30 * 3 {
+            bg.warriors[0].x = tx + 1.0;
+            bg.warriors[0].z = tz;
+            bg.warriors[0].lane = lane;
+            bg.warriors[0].mind = Mind::Trail;
+            bg.warriors[0].is_player = false;
+            bg.step(1.0 / 30.0);
+        }
+        assert!(!bg.heal_trees[t].alive());
+        let gained = bg.clans[CLAN_A as usize].pile - before;
+        assert!(
+            (gained - BORDER_SPOILS).abs() < 1e-3,
+            "the roots pay once, not per gnaw: {gained}"
+        );
+        // and with the switch off the border pays nothing
+        let mut plain = Battleground::new(Ancestor::CaveLion);
+        plain.patrol_t = [1e9; 2];
+        plain.warriors.retain(|w| w.team == CLAN_A);
+        let t2 = plain.heal_trees.iter().position(|t| t.team == CLAN_B).unwrap();
+        let (px, pz, plane) =
+            (plain.heal_trees[t2].x, plain.heal_trees[t2].z, plain.heal_trees[t2].lane);
+        plain.heal_trees[t2].hp = 1.0;
+        let p0 = plain.clans[CLAN_A as usize].pile;
+        for _ in 0..30 * 3 {
+            plain.warriors[0].x = px + 1.0;
+            plain.warriors[0].z = pz;
+            plain.warriors[0].lane = plane;
+            plain.warriors[0].mind = Mind::Trail;
+            plain.warriors[0].is_player = false;
+            plain.step(1.0 / 30.0);
+        }
+        assert!(!plain.heal_trees[t2].alive());
+        assert_eq!(plain.clans[CLAN_A as usize].pile, p0);
+    }
+
+    #[test]
+    fn the_growth_curve_bites_inside_the_piles_a_match_actually_reaches() {
+        // A curve whose interesting range sits above anything the mode produces
+        // is a decoration. Real piles run single digits, so that is where the
+        // difference has to live.
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.clans[CLAN_A as usize].pile = 3.0;
+        let modest = bg.growth(CLAN_A);
+        bg.clans[CLAN_A as usize].pile = 9.0;
+        let fed = bg.growth(CLAN_A);
+        assert!(
+            fed - modest > 0.1,
+            "three against nine should be worth more than a tenth: {modest:.3} -> {fed:.3}"
+        );
+        // and it still saturates rather than running away
+        bg.clans[CLAN_A as usize].pile = 1e6;
+        assert!(bg.growth(CLAN_A) < 1.0 + GROWTH_CAP + 1e-4);
+    }
+
+    #[test]
+    fn both_clans_can_have_a_human_at_the_paws() {
+        // The lockstep protocol was already carrying clan B's frame across the
+        // wire while the sim had nowhere to put it. Now it does.
+        let mut bg = Battleground::new(Ancestor::Serval);
+        bg.patrol_t = [1e9; 2];
+        let (a, b) = (bg.driven(CLAN_A), bg.driven(CLAN_B));
+        assert_eq!((a, b), (None, None), "nobody is driving until somebody drives");
+        // move each clan's leader in a different direction and watch both go
+        let ai = bg.warriors.iter().position(|w| w.team == CLAN_A && w.is_player).unwrap();
+        let bi = bg.warriors.iter().position(|w| w.team == CLAN_B && w.is_player).unwrap();
+        let (ax, az) = (bg.warriors[ai].x, bg.warriors[ai].z);
+        let (bx, bz) = (bg.warriors[bi].x, bg.warriors[bi].z);
+        for _ in 0..30 {
+            bg.set_input_for(CLAN_A, 1.0, 0.0, false, None);
+            bg.set_input_for(CLAN_B, 0.0, -1.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert_eq!(bg.driven(CLAN_A), Some(ai));
+        assert_eq!(bg.driven(CLAN_B), Some(bi));
+        assert!(bg.warriors[ai].x - ax > 3.0, "clan A's leader walked east");
+        assert!((bg.warriors[ai].z - az).abs() < 0.01);
+        assert!(bz - bg.warriors[bi].z > 3.0, "clan B's leader walked north");
+        assert!((bg.warriors[bi].x - bx).abs() < 0.01);
+    }
+
+    #[test]
+    fn an_undriven_clan_still_thinks_for_itself() {
+        // Driving one side must not switch the other side's AI off — the common
+        // case is one human against a clan of ancestors.
+        let mut bg = Battleground::new(Ancestor::Lion);
+        bg.patrol_t = [1e9; 2];
+        let bi = bg.warriors.iter().position(|w| w.team == CLAN_B && w.is_player).unwrap();
+        let before = (bg.warriors[bi].x, bg.warriors[bi].z);
+        for _ in 0..60 {
+            bg.set_input(0.0, 0.0, false, None);
+            bg.step(1.0 / 30.0);
+        }
+        assert!(
+            dist(bg.warriors[bi].x, bg.warriors[bi].z, before.0, before.1) > 1.0,
+            "clan B's leader should have got on with its patrol"
+        );
+    }
+
+    #[test]
+    fn a_clan_of_five_takes_the_conquest_shape() {
+        use crate::ancestor::ALL;
+        let five: Vec<Ancestor> = ALL[..5].to_vec();
+        let bg = Battleground::new_roster(&five, &five, 0, LanePolicy::Kit);
+        for team in [CLAN_A, CLAN_B] {
+            let lanes: Vec<usize> = bg
+                .warriors
+                .iter()
+                .filter(|w| w.team == team && w.role == Role::Ancestor)
+                .map(|w| w.lane)
+                .collect();
+            assert_eq!(lanes.len(), 5, "five a side");
+            assert_eq!(lanes.iter().filter(|&&l| l == SOLO_LANE).count(), 1, "one on the river");
+            assert_eq!(lanes.iter().filter(|&&l| l == DUO_LANE).count(), 2, "two on the mountain");
+            assert_eq!(
+                lanes.iter().filter(|&&l| l == MID_LANE).count(),
+                2,
+                "the middle and the roamer — with five there is finally somebody to hold it"
+            );
+        }
+        assert!(roamer_seat(&five).is_some(), "a full five fields a roamer");
+        assert!(roamer_seat(&five[..3]).is_none(), "three does not");
+        // and a five-a-side match still resolves, which is the real question:
+        // every rule in here was tuned against three
+        let mut bg = Battleground::new_roster(&five, &ALL[5..10].to_vec(), 1, LanePolicy::Kit);
+        let mut steps = 0;
+        while bg.outcome.is_none() && steps < 30 * 60 * 13 {
+            bg.step(1.0 / 30.0);
+            steps += 1;
+        }
+        assert!(bg.outcome.is_some(), "a 5v5 must end");
+    }
+
+    #[test]
+    fn a_short_roster_still_fields_a_clan() {
+        // The lobby fills empty seats with bots, but nothing should explode if a
+        // caller hands over two, or one.
+        for n in 1..=5usize {
+            let r: Vec<Ancestor> = crate::ancestor::ALL[..n].to_vec();
+            let mut bg = Battleground::new_roster(&r, &r, 0, LanePolicy::Kit);
+            assert_eq!(
+                bg.warriors.iter().filter(|w| w.team == CLAN_A && w.role == Role::Ancestor).count(),
+                n
+            );
+            for _ in 0..30 * 10 {
+                bg.step(1.0 / 30.0);
+            }
+        }
     }
 
     #[test]

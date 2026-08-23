@@ -155,7 +155,7 @@ fn raw_height_raw(x: f32, z: f32) -> f32 {
         let d = (z - x).abs() / std::f32::consts::SQRT_2;   // distance to the camp line
         let along = (x + z) * 0.5;                          // position along it
         let w = 15.0;
-        let ends = (1.0 - ((along.abs() - 110.0) / 20.0).clamp(0.0, 1.0));   // fade past the camps
+        let ends = 1.0 - ((along.abs() - 110.0) / 20.0).clamp(0.0, 1.0);   // fade past the camps
         if d < w { (1.0 - d / w) * 3.4 * ends } else { 0.0 }
     } else { 0.0 };
     // the U course also TILTS the country: the duo side climbs to a mountain

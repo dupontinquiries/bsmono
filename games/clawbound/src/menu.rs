@@ -55,6 +55,12 @@ impl Keybinds {
 
 #[derive(Clone)]
 pub struct Settings {
+    /// Ability guides on the ground: the ring, the disc, the dash line.
+    pub show_guides: bool,
+    /// How a press becomes a cast — see [`crate::castguide::CastMode`].
+    pub cast_mode: crate::castguide::CastMode,
+    /// Camera distance, 0 (close) to 4 (the whole lane).
+    pub camera_zoom: u8,
     pub show_cone: bool,   // debug: draw the AI vision cone
     pub master_volume: f32,
     pub difficulty: u8,    // 0 easy .. 2 hard — scales hunter speed, suspicion, and flush radius
@@ -64,7 +70,15 @@ pub struct Settings {
     pub keybinds: Keybinds,
 }
 impl Default for Settings {
-    fn default() -> Self { Settings { show_cone: false, master_volume: 0.7, difficulty: 1, hires: false, clan_abilities: false, prowl_fixed_wind: false, keybinds: Keybinds::default() } }
+    fn default() -> Self {
+        Settings {
+            show_guides: true,
+            cast_mode: crate::castguide::CastMode::Quick,
+            camera_zoom: 1,
+            show_cone: false, master_volume: 0.7, difficulty: 1, hires: false,
+            clan_abilities: false, prowl_fixed_wind: false, keybinds: Keybinds::default(),
+        }
+    }
 }
 
 /// Map the difficulty setting (0 easy .. 2 hard) to a hunter-aggression multiplier.
@@ -72,12 +86,25 @@ pub fn difficulty_mult(d: u8) -> f32 { match d { 0 => 0.82, 2 => 1.22, _ => 1.0 
 
 /// The game modes the player can launch from the menu.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GameMode { Rendezvous, Survive, Prowl, Capture }
-pub const GAME_MODES: [GameMode; 4] = [GameMode::Rendezvous, GameMode::Survive, GameMode::Prowl, GameMode::Capture];
+pub enum GameMode { Rendezvous, Survive, Prowl, Capture, Battleground }
+pub const GAME_MODES: [GameMode; 5] =
+    [GameMode::Rendezvous, GameMode::Survive, GameMode::Prowl, GameMode::Capture, GameMode::Battleground];
 impl GameMode {
     pub fn name(self) -> &'static str {
-        match self { GameMode::Rendezvous => "Rendezvous (6v1)", GameMode::Survive => "Survive (6v1)", GameMode::Prowl => "Prowl", GameMode::Capture => "Pop Island" }
+        match self {
+            GameMode::Rendezvous => "Rendezvous (6v1)",
+            GameMode::Survive => "Survive (6v1)",
+            GameMode::Prowl => "Prowl",
+            GameMode::Capture => "Pop Island",
+            GameMode::Battleground => "Battleground of the Ancestors",
+        }
     }
+
+    /// Whether this mode picks a **legendary ancestor** rather than a hunter,
+    /// class and clan. The battleground's row set is different because its
+    /// choices are: which of the thirteen you lead with, and nothing else the
+    /// other modes ask about.
+    pub fn picks_ancestor(self) -> bool { self == GameMode::Battleground }
     /// The two 6v1 modes map onto the existing sim; Prowl/Capture are their own sims.
     pub fn is_sim(self) -> bool { matches!(self, GameMode::Rendezvous | GameMode::Survive) }
     pub fn sim_mode(self) -> Mode { if self == GameMode::Survive { Mode::Survive } else { Mode::Rendezvous } }
@@ -91,7 +118,24 @@ pub enum MenuCmd {
     /// `battleground::new_draft`. A distinct variant from `StartMode` rather
     /// than shoehorning ancestor picks through `Class`/`Kind` — Battleground
     /// isn't a 6v1 sim and has nothing to say about hunter kind or class.
-    StartBattleground([Ancestor; 3], [Ancestor; 3]),
+    /// Lead ONE ancestor into a clan war, picked on the Play screen. Its own
+    /// command rather than a `StartMode` because the battleground takes an
+    /// ancestor and nothing else — no hunter, no class, no clan.
+    StartBattleground(Ancestor),
+    /// Open the 5v5 ancestor-select page ([`crate::lobby`]) — the one-press
+    /// route into a match, with the clock doing the deciding.
+    QuickPlay,
+    /// The clan-war draft is confirmed: three picks per side, straight into
+    /// `battleground::new_draft`. A distinct variant from `StartMode` rather
+    /// than shoehorning ancestor picks through `Class`/`Kind` — Battleground
+    /// isn't a 6v1 sim and has nothing to say about hunter kind or class.
+    ///
+    /// TWO ENTRY POINTS, BOTH KEPT. The c8/c9 split produced a one-ancestor
+    /// quick pick (incoming, Play screen) and a full six-pick draft (this side,
+    /// `Screen::Draft`, already wired to app.rs) under the SAME variant name
+    /// with different signatures. They are different journeys, not two attempts
+    /// at one, so the draft took the longer name and both survive.
+    StartBattlegroundDraft([Ancestor; 3], [Ancestor; 3]),
     Multiplayer, Quit, Close,
 }
 
@@ -105,6 +149,8 @@ pub struct Menu {
     pub sel_game: GameMode,
     pub sel_class: Class,
     pub sel_clan: u8,
+    /// Index into [`crate::ancestor::ALL`] — the battleground's only choice.
+    pub sel_ancestor: usize,
     /// The draft's six pick slots: clan A's three, then clan B's three (rows
     /// 0..3 and 3..6 of the Draft screen). Seeded to the roster's first six
     /// distinct ancestors so a player who never touches left/right still
@@ -118,7 +164,7 @@ impl Default for Menu { fn default() -> Self { Self::new() } }
 impl Menu {
     pub fn new() -> Self {
         Menu { open: true, screen: Screen::Title, cursor: 0, settings: Settings::default(),
-               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0,
+               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0, sel_ancestor: 0,
                draft: [ANCESTORS[0], ANCESTORS[1], ANCESTORS[2], ANCESTORS[3], ANCESTORS[4], ANCESTORS[5]],
                rebinding: None }
     }
@@ -126,7 +172,24 @@ impl Menu {
     /// Menu item labels for the current screen (top-to-bottom).
     pub fn items(&self) -> Vec<String> {
         match self.screen {
-            Screen::Title => vec!["Single Player".into(), "Battleground of the Ancestors".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
+            // Quick Play sits at the top because it is the button most players
+            // want: one press, five a side, a clock, a match. Everything below
+            // it is for the player who wants to choose the shape of the evening.
+            // The Battleground row below it is this side's full six-pick draft;
+            // the two are different journeys into the same mode.
+            Screen::Title => vec!["Quick Play (5v5)".into(), "Single Player".into(), "Battleground of the Ancestors".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
+            Screen::Play if self.sel_game.picks_ancestor() => {
+                let a = self.ancestor();
+                let k = crate::ancestor::kit(a);
+                vec![
+                    format!("Game: {}", self.sel_game.name()),
+                    format!("Ancestor: {} ({})", k.name, crate::draft::species(a)),
+                    format!("  {} — {}", k.passive_name, k.passive),
+                    format!("  1 {}   2 {}   3 {}", k.abilities[0].name, k.abilities[1].name, k.ult.name),
+                    "Start".into(),
+                    "Back".into(),
+                ]
+            }
             Screen::Play => vec![
                 format!("Game: {}", self.sel_game.name()),
                 format!("Hunter: {}", self.sel_hunter.params().name),
@@ -144,6 +207,13 @@ impl Menu {
                 v
             }
             Screen::Settings => vec![
+                format!("Ability guides: {}", if self.settings.show_guides { "On" } else { "Off" }),
+                format!("Casting: {}", self.settings.cast_mode.name()),
+                format!(
+                    "Camera: {} ({:.0}m)",
+                    ["Closest", "Close", "Middle", "Wide", "Widest"][self.settings.camera_zoom.min(4) as usize],
+                    crate::castguide::camera_dist(self.settings.camera_zoom)
+                ),
                 format!("Show vision cone: {}", if self.settings.show_cone { "On" } else { "Off" }),
                 format!("Master volume: {:.0}%", self.settings.master_volume * 100.0),
                 format!("Difficulty: {}", ["Easy", "Normal", "Hard"][self.settings.difficulty as usize]),
@@ -163,6 +233,11 @@ impl Menu {
     }
 
     fn len(&self) -> usize { self.items().len() }
+
+    /// The currently highlighted ancestor.
+    pub fn ancestor(&self) -> crate::ancestor::Ancestor {
+        crate::ancestor::ALL[self.sel_ancestor % crate::ancestor::ALL.len()]
+    }
     pub fn up(&mut self) { let n = self.len(); self.cursor = (self.cursor + n - 1) % n; }
     pub fn down(&mut self) { let n = self.len(); self.cursor = (self.cursor + 1) % n; }
 
@@ -212,19 +287,39 @@ impl Menu {
     pub fn adjust(&mut self, dir: i32) {
         match (self.screen, self.cursor) {
             (Screen::Play, 0) => self.next_game(dir),
+            // the battleground's row 1 is its ancestor; rows 2-3 are that
+            // ancestor's own text, and adjusting them means the same thing
+            (Screen::Play, 1..=3) if self.sel_game.picks_ancestor() => {
+                let n = crate::ancestor::ALL.len() as i32;
+                self.sel_ancestor = (self.sel_ancestor as i32 + dir).rem_euclid(n) as usize;
+            }
             (Screen::Play, 1) => self.next_hunter(dir),
             (Screen::Play, 2) => self.next_class(dir),
             (Screen::Play, 3) => self.sel_clan = (self.sel_clan as i32 + dir).rem_euclid(crate::clan::CLAN_COUNT as i32) as u8,
             (Screen::Draft, i) if i < 6 => self.next_draft_pick(i, dir),
-            (Screen::Settings, 0) => self.settings.show_cone = !self.settings.show_cone,
-            (Screen::Settings, 1) => self.settings.master_volume = (self.settings.master_volume + dir as f32 * 0.1).clamp(0.0, 1.0),
+            (Screen::Settings, 0) => self.settings.show_guides = !self.settings.show_guides,
+            (Screen::Settings, 1) => {
+                // one row, cycled either way, because three modes do not deserve
+                // three rows and a player flicking left should not have to wrap
+                self.settings.cast_mode = if dir >= 0 {
+                    self.settings.cast_mode.next()
+                } else {
+                    self.settings.cast_mode.next().next()
+                };
+            }
             (Screen::Settings, 2) => {
+                let z = self.settings.camera_zoom as i32 + dir;
+                self.settings.camera_zoom = z.clamp(0, 4) as u8;
+            }
+            (Screen::Settings, 3) => self.settings.show_cone = !self.settings.show_cone,
+            (Screen::Settings, 4) => self.settings.master_volume = (self.settings.master_volume + dir as f32 * 0.1).clamp(0.0, 1.0),
+            (Screen::Settings, 5) => {
                 let d = self.settings.difficulty as i32 + dir;
                 self.settings.difficulty = d.clamp(0, 2) as u8;
             }
-            (Screen::Settings, 3) => self.settings.hires = !self.settings.hires,
-            (Screen::Settings, 4) => self.settings.clan_abilities = !self.settings.clan_abilities,
-            (Screen::Settings, 5) => self.settings.prowl_fixed_wind = !self.settings.prowl_fixed_wind,
+            (Screen::Settings, 6) => self.settings.hires = !self.settings.hires,
+            (Screen::Settings, 7) => self.settings.clan_abilities = !self.settings.clan_abilities,
+            (Screen::Settings, 8) => self.settings.prowl_fixed_wind = !self.settings.prowl_fixed_wind,
             _ => {}
         }
     }
@@ -233,19 +328,25 @@ impl Menu {
     pub fn activate(&mut self) -> MenuCmd {
         match self.screen {
             Screen::Title => match self.cursor {
-                0 => { self.screen = Screen::Play; self.cursor = 0; MenuCmd::None }
-                1 => { self.screen = Screen::Draft; self.cursor = 0; MenuCmd::None }
-                2 => MenuCmd::Multiplayer,
-                3 => { self.open = false; MenuCmd::StartTutorial }
-                4 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
-                5 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
+                0 => { self.open = false; MenuCmd::QuickPlay }
+                1 => { self.screen = Screen::Play; self.cursor = 0; MenuCmd::None }
+                2 => { self.screen = Screen::Draft; self.cursor = 0; MenuCmd::None }
+                3 => MenuCmd::Multiplayer,
+                4 => { self.open = false; MenuCmd::StartTutorial }
+                5 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
+                6 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::Quit,
             },
             Screen::Play => match self.cursor {
                 4 => {
                     self.open = false;
-                    if self.sel_game.is_sim() { MenuCmd::StartSingle(self.sel_hunter, self.sel_game.sim_mode()) }
-                    else { MenuCmd::StartMode(self.sel_game, self.sel_hunter, self.sel_class) }
+                    if self.sel_game.picks_ancestor() {
+                        MenuCmd::StartBattleground(self.ancestor())
+                    } else if self.sel_game.is_sim() {
+                        MenuCmd::StartSingle(self.sel_hunter, self.sel_game.sim_mode())
+                    } else {
+                        MenuCmd::StartMode(self.sel_game, self.sel_hunter, self.sel_class)
+                    }
                 }
                 5 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::None,   // rows 0..3 are adjusted with left/right
@@ -255,12 +356,16 @@ impl Menu {
                     self.open = false;
                     let a = [self.draft[0], self.draft[1], self.draft[2]];
                     let b = [self.draft[3], self.draft[4], self.draft[5]];
-                    MenuCmd::StartBattleground(a, b)
+                    MenuCmd::StartBattlegroundDraft(a, b)
                 }
                 7 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::None,   // rows 0..5 are adjusted with left/right
             },
-            Screen::Settings => { if self.cursor == 6 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
+            Screen::Settings => {
+                let back = self.items().len() - 1;
+                if self.cursor == back { self.screen = Screen::Title; self.cursor = 0; }
+                MenuCmd::None
+            }
             Screen::Keybinds => {
                 let n = self.settings.keybinds.keys.len();
                 if self.cursor == n { self.screen = Screen::Title; self.cursor = 0; }
@@ -288,6 +393,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_new_graphics_rows_adjust_and_back_still_backs_out() {
+        use crate::castguide::CastMode;
+        let mut m = Menu::new();
+        m.screen = Screen::Settings;
+        // guides toggle
+        m.cursor = 0;
+        assert!(m.settings.show_guides);
+        m.adjust(1);
+        assert!(!m.settings.show_guides);
+        // casting cycles both ways from one row
+        m.cursor = 1;
+        assert_eq!(m.settings.cast_mode, CastMode::Quick);
+        m.adjust(1);
+        assert_eq!(m.settings.cast_mode, CastMode::Normal);
+        m.adjust(-1);
+        assert_eq!(m.settings.cast_mode, CastMode::Quick);
+        // camera clamps rather than wrapping — nobody wants closest after widest
+        m.cursor = 2;
+        for _ in 0..9 { m.adjust(1); }
+        assert_eq!(m.settings.camera_zoom, 4);
+        for _ in 0..9 { m.adjust(-1); }
+        assert_eq!(m.settings.camera_zoom, 0);
+        // the rows that were already there still work, three lower
+        m.cursor = 3;
+        m.adjust(1);
+        assert!(m.settings.show_cone);
+        m.cursor = 6;
+        m.adjust(1);
+        assert!(m.settings.hires);
+        // and Back is wherever the list ends, not a hard-coded 6
+        m.cursor = m.items().len() - 1;
+        m.activate();
+        assert_eq!(m.screen, Screen::Title);
+    }
+
+    #[test]
+    fn quick_play_is_the_first_thing_on_the_title_screen() {
+        let mut m = Menu::new();
+        assert_eq!(m.items()[0], "Quick Play (5v5)");
+        assert_eq!(m.activate(), MenuCmd::QuickPlay);
+        assert!(!m.open, "and it leaves the menu for the select page");
+        // The rows below it still go where they went — but there is one more of
+        // them than the series assumed: this side's six-pick draft row sits at 2,
+        // so everything after it shifts down by one. Both routes into the mode
+        // are asserted here on purpose, since a renumbering is exactly how one
+        // of them would quietly stop being reachable.
+        let mut m = Menu::new();
+        m.cursor = 1;
+        assert_eq!(m.activate(), MenuCmd::None);
+        assert_eq!(m.screen, Screen::Play);
+        let mut m = Menu::new();
+        m.cursor = 2;
+        assert_eq!(m.activate(), MenuCmd::None);
+        assert_eq!(m.screen, Screen::Draft, "the Battleground draft row must still open the draft");
+        let mut m = Menu::new();
+        m.cursor = 3;
+        assert_eq!(m.activate(), MenuCmd::Multiplayer);
+        let mut m = Menu::new();
+        m.cursor = 4;
+        assert_eq!(m.activate(), MenuCmd::StartTutorial);
+        let mut m = Menu::new();
+        m.cursor = 7;
+        assert_eq!(m.activate(), MenuCmd::Quit);
+    }
+
+    #[test]
+    fn the_battleground_is_reachable_and_starts_with_an_ancestor() {
+        // The mode existed, was tested, was playable in a terminal — and could
+        // not be reached from the menu, which is the only door most players use.
+        let mut m = Menu::new();
+        assert!(GAME_MODES.contains(&GameMode::Battleground));
+        m.screen = Screen::Play;
+        m.cursor = 0;
+        while m.sel_game != GameMode::Battleground {
+            m.adjust(1);
+        }
+        // its rows are its own: an ancestor, not a hunter and a clan
+        let items = m.items();
+        assert!(items[1].starts_with("Ancestor:"), "{items:?}");
+        assert!(items[2].contains('—'), "the passive is on screen: {items:?}");
+        assert!(items[3].contains('1') && items[3].contains('3'), "abilities listed: {items:?}");
+        // row 1 walks the roster, and rows 2-3 are the same choice by another name
+        m.cursor = 1;
+        let first = m.ancestor();
+        m.adjust(1);
+        assert_ne!(m.ancestor(), first);
+        m.cursor = 3;
+        m.adjust(-1);
+        assert_eq!(m.ancestor(), first, "the ancestor's own rows adjust the ancestor");
+        // and Start hands the app that ancestor, not a hunter it would ignore
+        m.cursor = 4;
+        assert_eq!(m.activate(), MenuCmd::StartBattleground(first));
+        assert!(!m.open, "starting a match closes the menu");
+    }
+
+    #[test]
+    fn the_other_modes_still_pick_a_hunter_and_a_clan() {
+        // Adding a mode with different rows is the kind of change that quietly
+        // rewires the rows of every other mode.
+        let mut m = Menu::new();
+        m.screen = Screen::Play;
+        m.sel_game = GameMode::Capture;
+        let items = m.items();
+        assert!(items[1].starts_with("Hunter:"), "{items:?}");
+        assert!(items[3].starts_with("Clan:"), "{items:?}");
+        m.cursor = 4;
+        assert!(matches!(m.activate(), MenuCmd::StartMode(GameMode::Capture, _, _)));
+        let mut m = Menu::new();
+        m.screen = Screen::Play;
+        m.sel_game = GameMode::Survive;
+        m.cursor = 4;
+        assert!(matches!(m.activate(), MenuCmd::StartSingle(_, _)));
+    }
+
+    #[test]
     fn navigates_and_wraps() {
         let mut m = Menu::new();
         assert_eq!(m.cursor, 0);
@@ -298,7 +518,7 @@ mod tests {
     #[test]
     fn tutorial_entry_launches_from_the_title_screen() {
         let mut m = Menu::new();
-        m.cursor = 3;   // Tutorial row (0=Single, 1=Battleground, 2=Multiplayer, 3=Tutorial)
+        m.cursor = 4;   // Tutorial row (0=QuickPlay, 1=Single, 2=Battleground, 3=Multiplayer, 4=Tutorial)
         assert_eq!(m.activate(), MenuCmd::StartTutorial);
         assert!(!m.open, "starting the tutorial should close the menu");
     }
@@ -306,6 +526,7 @@ mod tests {
     #[test]
     fn single_player_flow_starts_a_match() {
         let mut m = Menu::new();
+        m.cursor = 1;                                  // Single Player, under Quick Play
         assert_eq!(m.activate(), MenuCmd::None);      // Title → Play screen
         assert_eq!(m.screen, Screen::Play);
         m.cursor = 1; m.adjust(1);                     // change hunter
@@ -317,6 +538,7 @@ mod tests {
     #[test]
     fn play_screen_selects_game_and_class() {
         let mut m = Menu::new();
+        m.cursor = 1;
         m.activate();                                  // Title → Play
         assert_eq!(m.sel_game, GameMode::Rendezvous);
         m.cursor = 0; m.adjust(1); assert_eq!(m.sel_game, GameMode::Survive);
@@ -332,13 +554,15 @@ mod tests {
 
     #[test]
     fn settings_toggle_cone_and_volume() {
+        // rows moved down by three when guides, casting and camera went in at
+        // the top; the behaviour they assert has not changed
         let mut m = Menu::new();
         m.screen = Screen::Settings;
-        m.cursor = 0; let before = m.settings.show_cone; m.adjust(1);
+        m.cursor = 3; let before = m.settings.show_cone; m.adjust(1);
         assert_ne!(before, m.settings.show_cone);
-        m.cursor = 1; m.adjust(-1); m.adjust(-1);
+        m.cursor = 4; m.adjust(-1); m.adjust(-1);
         assert!(m.settings.master_volume < 0.71);
-        m.cursor = 3; let g0 = m.settings.hires; m.adjust(1);
+        m.cursor = 6; let g0 = m.settings.hires; m.adjust(1);
         assert_ne!(g0, m.settings.hires, "the Graphics setting should toggle");
     }
 
@@ -373,7 +597,7 @@ mod tests {
     #[test]
     fn battleground_entry_opens_the_draft_screen() {
         let mut m = Menu::new();
-        m.cursor = 1;   // Battleground row
+        m.cursor = 2;   // Battleground row, one lower since Quick Play took the top
         assert_eq!(m.activate(), MenuCmd::None);
         assert_eq!(m.screen, Screen::Draft);
     }
@@ -410,11 +634,11 @@ mod tests {
         m.screen = Screen::Draft;
         m.cursor = 6; // Start row
         match m.activate() {
-            MenuCmd::StartBattleground(a, b) => {
+            MenuCmd::StartBattlegroundDraft(a, b) => {
                 assert_eq!(a, [expected[0], expected[1], expected[2]]);
                 assert_eq!(b, [expected[3], expected[4], expected[5]]);
             }
-            c => panic!("expected StartBattleground, got {c:?}"),
+            c => panic!("expected StartBattlegroundDraft, got {c:?}"),
         }
         assert!(!m.open, "starting a battleground should close the menu");
     }

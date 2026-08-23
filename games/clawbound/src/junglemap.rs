@@ -82,25 +82,43 @@ fn mirrored<T: Copy, const N: usize>(base: [T; N], flip: impl Fn(T) -> T) -> Vec
 /// fixed points.
 pub fn reflect(x: f32, z: f32) -> (f32, f32) { (-z, -x) }
 
-pub fn thickets() -> Vec<Thicket> {
-    mirrored(THICKETS_BASE, |t| {
-        let (x, z) = reflect(t.x, t.z);
-        Thicket { x, z, r: t.r }
+// The jungle is a constant: the same eight thickets, four walls and two
+// mistfalls for the whole process. It was being rebuilt — three heap
+// allocations — on every call, and the callers are `sees` and `concealment_at`,
+// which run once per warrior pair per tick. Measured: 12,209 sim steps/s before
+// caching. Built once, now.
+static CACHE: std::sync::OnceLock<(Vec<Thicket>, Vec<Wall>, Vec<Mist>)> = std::sync::OnceLock::new();
+
+fn cache() -> &'static (Vec<Thicket>, Vec<Wall>, Vec<Mist>) {
+    CACHE.get_or_init(|| {
+        (
+            mirrored(THICKETS_BASE, |t| {
+                let (x, z) = reflect(t.x, t.z);
+                Thicket { x, z, r: t.r }
+            }),
+            mirrored(WALLS_BASE, |w| {
+                let (ax, az) = reflect(w.ax, w.az);
+                let (bx, bz) = reflect(w.bx, w.bz);
+                Wall { ax, az, bx, bz }
+            }),
+            mirrored(MISTS_BASE, |m| {
+                let (x, z) = reflect(m.x, m.z);
+                Mist { x, z, r: m.r }
+            }),
+        )
     })
 }
-pub fn walls() -> Vec<Wall> {
-    mirrored(WALLS_BASE, |w| {
-        let (ax, az) = reflect(w.ax, w.az);
-        let (bx, bz) = reflect(w.bx, w.bz);
-        Wall { ax, az, bx, bz }
-    })
-}
-pub fn mists() -> Vec<Mist> {
-    mirrored(MISTS_BASE, |m| {
-        let (x, z) = reflect(m.x, m.z);
-        Mist { x, z, r: m.r }
-    })
-}
+
+/// The thickets, mists and walls as slices — the allocation-free path the sim
+/// uses. The `Vec`-returning versions are kept for callers that want ownership
+/// (the renderer, the tests).
+pub fn thickets_ref() -> &'static [Thicket] { &cache().0 }
+pub fn walls_ref() -> &'static [Wall] { &cache().1 }
+pub fn mists_ref() -> &'static [Mist] { &cache().2 }
+
+pub fn thickets() -> Vec<Thicket> { cache().0.clone() }
+pub fn walls() -> Vec<Wall> { cache().1.clone() }
+pub fn mists() -> Vec<Mist> { cache().2.clone() }
 
 fn dist(ax: f32, az: f32, bx: f32, bz: f32) -> f32 { ((ax - bx).powi(2) + (az - bz).powi(2)).sqrt() }
 
@@ -108,11 +126,11 @@ fn dist(ax: f32, az: f32, bx: f32, bz: f32) -> f32 { ((ax - bx).powi(2) + (az - 
 /// thicket count) whose canopy this point is under, if any. Two cats under the
 /// *same* cover see each other; a cat outside sees neither.
 pub fn concealment_at(x: f32, z: f32) -> Option<usize> {
-    let th = thickets();
+    let th = thickets_ref();
     for (i, t) in th.iter().enumerate() {
         if dist(x, z, t.x, t.z) < t.r { return Some(i); }
     }
-    for (i, m) in mists().iter().enumerate() {
+    for (i, m) in mists_ref().iter().enumerate() {
         if dist(x, z, m.x, m.z) < m.r { return Some(th.len() + i); }
     }
     None
@@ -128,7 +146,7 @@ fn seg_t(ax: f32, az: f32, bx: f32, bz: f32, px: f32, pz: f32) -> f32 {
 
 /// Is this point in a wall's scramble footprint (stone underfoot, outside the pass)?
 pub fn on_wall(x: f32, z: f32) -> bool {
-    walls().iter().any(|w| {
+    walls_ref().iter().any(|w| {
         let t = seg_t(w.ax, w.az, w.bx, w.bz, x, z);
         if t > PASS.0 && t < PASS.1 { return false; }   // the pass is open ground
         let (cx, cz) = (w.ax + (w.bx - w.ax) * t, w.az + (w.bz - w.az) * t);
@@ -150,7 +168,7 @@ fn crosses(px: f32, pz: f32, qx: f32, qz: f32, ax: f32, az: f32, bx: f32, bz: f3
 /// Does stone stand between two points? Each wall blocks along its solid spans
 /// (either side of the pass) — sight through the pass itself is clear.
 pub fn wall_between(px: f32, pz: f32, qx: f32, qz: f32) -> bool {
-    walls().iter().any(|w| {
+    walls_ref().iter().any(|w| {
         let at = |t: f32| (w.ax + (w.bx - w.ax) * t, w.az + (w.bz - w.az) * t);
         let spans = [(0.0, PASS.0), (PASS.1, 1.0)];
         spans.iter().any(|&(t0, t1)| {

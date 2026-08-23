@@ -803,14 +803,34 @@ fn build_battle() -> (Mesh, Vec3) {
         m.set_op(1.0);
     }
 
+    // the camera frames whoever the player is leading; falls back to the middle
+    let mut focus_at = (0.0f32, 0.0f32, 0.0f32);
+    // Ground markers are RINGS, not filled discs. They were discs when the
+    // camera sat two hundred units out and they read as gentle washes; zoomed
+    // in to thirty they became opaque slabs across the whole frame, hiding the
+    // ground they were describing. An outline says "this far" and shows what is
+    // inside it.
+    fn ground_ring(m: &mut Mesh, cx: f32, cz: f32, r: f32, w: f32, col: [f32; 3]) {
+        let steps = ((r * 2.5) as usize).clamp(20, 72);
+        for i in 0..steps {
+            let (a0, a1) = (
+                i as f32 / steps as f32 * std::f32::consts::TAU,
+                (i + 1) as f32 / steps as f32 * std::f32::consts::TAU,
+            );
+            let (x0, z0) = (cx + a0.cos() * r, cz + a0.sin() * r);
+            let (x1, z1) = (cx + a1.cos() * r, cz + a1.sin() * r);
+            let (y0, y1) = (world::height_at(x0, z0) + 0.25, world::height_at(x1, z1) + 0.25);
+            m.segment(v3(x0, y0, z0), v3(x1, y1, z1), w, w, 5, col);
+        }
+    }
     let team_col = |t: u8| if t == CLAN_A { rgb(0xd8623c) } else { rgb(0x3d7fd8) };
     // camps: the Great Tree — a mighty trunk and canopy in clan colour — over a pad
     for team in 0..2u8 {
         let (bx, bz) = g.camps[team as usize];
         let gy = world::height_at(bx, bz);
         let col = team_col(team);
-        m.set_op(0.5);
-        m.cone(v3(bx, gy + 0.15, bz), 9.0, 0.3, 22, col);
+        m.set_op(0.8);
+        ground_ring(&mut m, bx, bz, 9.0, 0.4, col);
         m.set_op(1.0);
         m.segment(v3(bx, gy, bz), v3(bx, gy + 14.0, bz), 2.2, 0.9, 8, rgb(0x6b4a32));
         let hp = g.clans[team as usize].great_tree_hp.max(0.0) / 1400.0;
@@ -827,8 +847,8 @@ fn build_battle() -> (Mesh, Vec3) {
             let frac = h.hp / 550.0;
             m.segment(v3(h.x, gy, h.z), v3(h.x, gy + 8.0, h.z), 1.1, 0.5, 7, rgb(0xa8b89a));
             m.cone(v3(h.x, gy + 7.0, h.z), 4.5, 2.5 + 2.5 * frac, 9, shade(team_col(h.team), 0.7));
-            m.set_op(0.35);
-            m.cone(v3(h.x, gy + 0.2, h.z), 14.0, 0.2, 24, rgb(0x9fe08a));   // the healing aura
+            m.set_op(0.6);
+            ground_ring(&mut m, h.x, h.z, 14.0, 0.28, rgb(0x9fe08a));   // the healing aura
             m.set_op(1.0);
         } else {
             m.segment(v3(h.x, gy, h.z), v3(h.x + 3.0, gy + 1.2, h.z), 0.9, 0.7, 6, rgb(0x584838));   // a felled trunk
@@ -841,8 +861,8 @@ fn build_battle() -> (Mesh, Vec3) {
         let col = if p.rich() { rgb(0xffd24a) } else { rgb(0xb0824f) };
         m.cone(v3(p.x, gy + 0.4, p.z), 0.7, 0.9, 6, col);
     }
-    m.set_op(0.3);
-    m.cone(v3(g.contention.0, world::height_at(g.contention.0, g.contention.1) + 0.25, g.contention.1), 20.0, 0.2, 28, rgb(0xffd24a));
+    m.set_op(0.7);
+    ground_ring(&mut m, g.contention.0, g.contention.1, 20.0, 0.35, rgb(0xffd24a));
     m.set_op(1.0);
     // the Skyrock: the ridge lookout — a tall stone spire, ledge, and a beacon in
     // the watching clan's colour (white while unclaimed)
@@ -857,8 +877,8 @@ fn build_battle() -> (Mesh, Vec3) {
             None => rgb(0xece8e0),
         };
         m.segment(v3(sx, gy + 8.0, sz), v3(sx, gy + 12.5, sz), 0.35, 0.1, 5, bcol);
-        m.set_op(0.3);
-        m.cone(v3(sx, gy + 0.25, sz), 14.0, 0.2, 24, rgb(0xece8e0));
+        m.set_op(0.6);
+        ground_ring(&mut m, sx, sz, 14.0, 0.28, rgb(0xece8e0));
         m.set_op(1.0);
     }
     // the fords: pale gravel bars where the east trail crosses the river
@@ -873,6 +893,93 @@ fn build_battle() -> (Mesh, Vec3) {
             m.boxx(v3(fx + a.cos() * d, gy + 0.35, fz + a.sin() * d), v3(0.4, 0.25, 0.4), rgb(0xb0a58c));
         }
     }
+
+    // ── ability guides ──────────────────────────────────────────────────────
+    // Placeholder shapes for what the player's three abilities would do from
+    // where they stand: the ring, the placed disc, the dash line, the cone, the
+    // reticle. Geometry and words both come from `castguide`, so this render and
+    // the app's live one cannot disagree about what an ability reaches.
+    // NOGUIDE=1 mirrors the "Ability guides: Off" settings row, so the same
+    // frame can be rendered with and without them — which is how the sizes below
+    // were chosen, and how the guides were caught not drawing at all once.
+    if std::env::var("NOGUIDE").is_err() {
+    if let Some(me) = g.warriors.iter().find(|w| w.is_player && w.alive()) {
+        use clawbound_rs::castguide::{self, GuideShape};
+        let anc = me.ancestor.unwrap();
+        // aim: straight ahead, the direction the warrior is facing
+        let aim = (me.x + me.heading.cos() * 40.0, me.z + me.heading.sin() * 40.0);
+        let gy = |x: f32, z: f32| world::height_at(x, z) + 0.35;
+        for slot in 0..3 {
+            let gd = castguide::guide(anc, slot, (me.x, me.z), aim, me.cds[slot]);
+            // ready abilities are drawn in the clan's colour; cooling ones grey,
+            // because a range you cannot see is a range you cannot learn
+            let col = if gd.ready {
+                [rgb(0x8ee06a), rgb(0x9fc8e8), rgb(0xffd24a)][slot]
+            } else {
+                rgb(0x6b6f74)
+            };
+            // Outlines, not filled discs. The first version drew each guide as a
+            // flat cone and the ultimate's nine-metre radius became an opaque
+            // yellow slab over the whole screen — a guide has to say "this far"
+            // without hiding the ground it is describing.
+            m.set_op(if gd.ready { 0.95 } else { 0.4 });
+            let ring = |m: &mut Mesh, cx: f32, cz: f32, r: f32, col: [f32; 3], w: f32| {
+                ground_ring(m, cx, cz, r, w, col)
+            };
+            match gd.shape {
+                GuideShape::SelfRing { r } => ring(&mut m, me.x, me.z, r, col, 0.3),
+                GuideShape::Circle { x, z, r, .. } => {
+                    ring(&mut m, x, z, r, col, 0.34);
+                    // a dot at the centre, so a placed disc reads as placed
+                    m.cone(v3(x, gy(x, z), z), 0.5, 0.1, 10, col);
+                }
+                GuideShape::Line { tx, tz, w } => {
+                    m.segment(
+                        v3(me.x, gy(me.x, me.z), me.z),
+                        v3(tx, gy(tx, tz), tz),
+                        w * 0.5,
+                        w * 0.5,
+                        6,
+                        col,
+                    );
+                }
+                GuideShape::Cone { half, r } => {
+                    // a wedge, drawn as a fan of thin spokes: placeholder art,
+                    // but the angle and the reach are the real ones
+                    // two edges and an arc between them: the wedge as an outline
+                    for t in [-1.0f32, 1.0] {
+                        let a = me.heading + t * half;
+                        let (ex, ez) = (me.x + a.cos() * r, me.z + a.sin() * r);
+                        m.segment(v3(me.x, gy(me.x, me.z), me.z), v3(ex, gy(ex, ez), ez), 0.26, 0.26, 5, col);
+                    }
+                    let steps = 14;
+                    for i in 0..steps {
+                        let a0 = me.heading - half + (i as f32 / steps as f32) * half * 2.0;
+                        let a1 = me.heading - half + ((i + 1) as f32 / steps as f32) * half * 2.0;
+                        let (x0, z0) = (me.x + a0.cos() * r, me.z + a0.sin() * r);
+                        let (x1, z1) = (me.x + a1.cos() * r, me.z + a1.sin() * r);
+                        m.segment(v3(x0, gy(x0, z0), z0), v3(x1, gy(x1, z1), z1), 0.26, 0.26, 5, col);
+                    }
+                }
+                GuideShape::Target { x, z, .. } => {
+                    ring(&mut m, x, z, 1.6, col, 0.28);
+                    m.boxx(v3(x, gy(x, z) + 0.9, z), v3(0.1, 0.9, 0.1), col);
+                }
+            }
+            m.set_op(1.0);
+        }
+        // and the words, on stderr where this mode's other report goes — the app
+        // draws these as a tooltip panel
+        focus_at = (me.x, world::height_at(me.x, me.z), me.z);
+        eprintln!("ABILITIES for {}:", clawbound_rs::ancestor::kit(anc).name);
+        for slot in 0..3 {
+            let t = castguide::tooltip(anc, slot);
+            eprintln!("  {}  {:<22} {:<58} {}", slot + 1, t.name, t.desc, t.stats);
+            if let Some(n) = t.note {
+                eprintln!("     passive: {n}");
+            }
+        }
+    } }
 
     // scorched ground still burning; sweet rain still falling
     for z in &g.zones {
@@ -916,7 +1023,9 @@ fn build_battle() -> (Mesh, Vec3) {
             Carry::Nothing => {}
         }
     }
-    (m, v3(0.0, 0.0, 0.0))
+    // the camera frames the player's warrior (set while drawing their guides),
+    // or the middle of the map when there is nobody to follow
+    (m, v3(focus_at.0, focus_at.1, focus_at.2))
 }
 
 #[cfg(feature = "app")]
@@ -1355,7 +1464,12 @@ async fn run() {
         "game" => (focus.add(v3(22.0, 40.0, -22.0)), focus.add(v3(0.0, -3.0, 9.0))),
         "prowl" => (focus.add(v3(20.0, 34.0, -20.0)), focus.add(v3(0.0, -3.0, 8.0))),
         "capture" => (v3(92.0, 104.0, -30.0), v3(-6.0, -10.0, 6.0)),
-        "battle" => (v3(210.0, 205.0, -210.0), v3(-16.0, -26.0, 16.0)),
+        // Zoomed in and following the player, rather than a fixed lane-wide
+        // shot of the whole territory: a clan war is read at a distance, but not
+        // so far that a Heal Tree and the cat gnawing it are the same handful of
+        // pixels — and the ability guides are drawn around the player, so a
+        // framing that does not include them shows none of this work.
+        "battle" => (focus.add(v3(30.0, 36.0, -30.0)), focus.add(v3(0.0, -7.0, 7.0))),
         "open" => (focus.add(v3(17.0, 23.0, -19.0)), focus.add(v3(0.0, -2.0, 6.0))),
         "spirits" => (focus.add(v3(0.0, 4.5, -26.0)), focus.add(v3(0.0, 1.2, 8.0))),
         "wildlife" => (focus.add(v3(0.5, 2.3, -7.5)), focus.add(v3(0.0, 0.9, 3.2))),
