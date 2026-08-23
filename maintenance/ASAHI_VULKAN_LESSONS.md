@@ -145,6 +145,97 @@ shows eframe at 0.28/0.29/0.34/0.35), which is why nothing else hit this. Anythi
 moving to 0.35+ inherits the wgpu-by-default renderer and needs the same override —
 this is the pattern, not a one-off patch.
 
+## 6. `gemm-f16` will not build for aarch64 without an explicit fp16 flag — and the flag is NOT fleet-wide safe
+
+Reported from a fleet build (2026-08-23): beatspace's test run died in a
+dependency, not in beatspace.
+
+```
+error: instruction requires: fullfp16
+   --> gemm-common-0.19.0/src/simd.rs:1978
+        "fmla {0:v}.8h, {1:v}.8h, {2:v}.8h"
+error: could not compile `gemm-f16` (lib) due to 11 previous errors
+```
+
+`gemm-f16` arrives through candle (`gemm 0.19.0` -> `gemm-f16 0.18.2`) and emits
+half-precision SIMD as inline assembly. Asked directly:
+
+```
+$ rustc --print cfg --target aarch64-unknown-linux-gnu | grep target_feature
+target_feature="neon"
+```
+
+That is the whole cause. The baseline `aarch64-unknown-linux-gnu` target enables
+**only `neon`**, so FP16 arithmetic is not available and the assembler refuses
+the instruction. Nothing about Asahi, Mesa or the GPU is involved; it is a
+target-baseline question that any aarch64 box hits.
+
+**The spelling is `fp16`, not `fullfp16`.** LLVM's feature is `fullfp16`, which
+is what appears in the error text, but rustc's name for it is `fp16`:
+
+```
+$ rustc --print target-features --target aarch64-unknown-linux-gnu | grep fp16
+    fp16   - Enable half-precision floating-point data processing.
+    fhm    - Enable FP16 FML instructions.
+```
+
+Copying the name out of the error message gives an unknown-feature warning and
+no fix.
+
+### Why this must NOT go in a committed repo-wide `.cargo/config.toml`
+
+The obvious patch is:
+
+```toml
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+fp16"]
+```
+
+It is correct for the Asahi M2 machines and wrong for this fleet as a whole.
+`+fp16` is a promise about the CPU that will EXECUTE the binary, and a build
+made with it runs on hardware without FP16 arithmetic right up until it reaches
+one of those instructions, at which point it takes SIGILL. Against the targets
+this tree names:
+
+| machine | core | FP16 arithmetic |
+|---|---|---|
+| Asahi M2 | Apple Avalanche/Blizzard (ARMv8.6) | yes |
+| Fairphone (recent Snapdragon) | ARMv8.2+ | yes |
+| **PinePhone** | **Cortex-A53, ARMv8.0-A** | **NO** |
+
+A Cortex-A53 has FP16 *conversion* and not FP16 *arithmetic*, so
+`fmla v0.8h` is an illegal instruction there. Committing the flag would turn a
+loud build failure on one machine into a runtime crash on another, which is the
+worse trade.
+
+### What to do instead
+
+Set it per machine, not per repository — `~/.cargo/config.toml` on the Asahi
+boxes, or `RUSTFLAGS="-C target-feature=+fp16" cargo build` in the invocation:
+
+```toml
+# ~/.cargo/config.toml on an Asahi/M-series machine ONLY
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+fp16"]
+```
+
+`-C target-cpu=apple-m1` (or `native`) implies `+fp16` and is more
+self-documenting on a machine that will only ever build for itself; both
+`apple-m1` and `cortex-a53` are valid `target-cpu` values, so the same mechanism
+expresses "this is a PinePhone" correctly too.
+
+The durable fix is upstream in candle: `gemm-f16` should be behind a feature, or
+its aarch64 path should be runtime-dispatched the way `gpu-gemm` gates its
+subgroup kernel. Until then this is a per-machine setting, and the reason it is
+written down here rather than fixed in-tree is that fixing it in-tree would be
+wrong.
+
+**UNVERIFIED BY COMPILATION.** This sandbox is x86_64 with no aarch64 std
+installed and no rustup to add one, so none of the above was built. What WAS
+run is the two `rustc --print` queries quoted above, which are the parts most
+easily got wrong — the feature name and the baseline feature set. The rest is
+read off the error and the target table.
+
 ## Deferred / not applicable — with reasons
 
 * **`--ncmoe` (n-cpu-moe) plumbing into GenParams**: the llama-cpp-2 Rust binding isn't vendored
