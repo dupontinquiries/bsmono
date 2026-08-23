@@ -16,6 +16,35 @@
 //! See `apps/snapclone-egui` for the front-end built on this, and
 //! `examples/logscope_touch.rs` for the reverse port (logscope's scene gaining
 //! the touch layer).
+//!
+//! ## `SidePanel::default_width` does not set a width
+//!
+//! Worth knowing before writing a port comment that claims it does. Measured on
+//! egui 0.34, laying out a real frame headlessly on a 420-point surface:
+//!
+//! ```text
+//! .resizable(true).default_width(168.0).width_range(110.0..=340.0)  ->  110
+//! .resizable(true).default_width(168.0)                             ->   96
+//! ```
+//!
+//! 110 is the range MINIMUM; 96 is the content width of a one-word label.
+//! Stable across three frames, and confirmed both by `response.rect.width()`
+//! and by the drop in `Context::available_rect()`.
+//!
+//! `default_size` — which `default_width` is a deprecated alias for — only
+//! WIDENS the size range to admit its argument (egui-0.34 `panel.rs:404`). The
+//! panel is content-driven and clamped to that range. So the call is a hint
+//! about permitted extent, not a starting width, and a panel written
+//! `.default_width(300.0)` will be 300 wide only if its contents happen to be.
+//!
+//! Use `exact_width` to pin one, at the cost of the drag handle. That trade is
+//! the reason this is documented rather than mass-corrected: several call sites
+//! in this tree name a width they do not get, and whether each WANTS the pin or
+//! the drag is a per-surface decision.
+//!
+//! Found while checking a voiceterm port comment that cited
+//! `main.qml`'s fixed `width: root.termSidebarWidth` (168) against a
+//! `.default_width(168.0)` that reads like the same statement and is not one.
 
 pub mod desktop;
 pub mod notify;
@@ -207,5 +236,49 @@ mod anim_apply_tests {
         apply_prefs(&ctx, &prefs);
         assert!(ctx.global_style().animation_time > BASE_ANIM_SECS, "heavy lingers");
         assert!(anim_secs(&ctx, 0.25) > 0.25, "carved sheen lengthens under heavy");
+    }
+}
+
+/// The `default_width` measurement in this module's docs, kept honest.
+///
+/// A documented gotcha is only as good as the version it was measured on. If a
+/// future egui makes `default_width` pin the width, this fails and the docs
+/// above are wrong rather than merely stale — which is the outcome worth
+/// catching, since call sites in this tree are written around the current
+/// behaviour.
+#[cfg(test)]
+mod panel_width_behaviour {
+    fn laid_out(build: impl Fn() -> egui::SidePanel) -> f32 {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO, egui::vec2(420.0, 900.0)));
+        let mut w = 0.0;
+        let _ = ctx.run(input, |ctx| {
+            w = build().show(ctx, |ui| { ui.label("x"); }).response.rect.width();
+        });
+        w
+    }
+
+    #[test]
+    fn default_width_is_a_range_hint_not_a_width() {
+        let ranged = laid_out(|| egui::SidePanel::left("a")
+            .resizable(true).default_width(168.0).width_range(110.0..=340.0));
+        assert!((ranged - 110.0).abs() < 1.0,
+            "laid out at {ranged}; the docs above say default_width yields the range MINIMUM \
+(110), not its argument (168). If this now gives 168, egui changed and the module docs need \
+correcting rather than this assertion relaxing.");
+
+        let bare = laid_out(|| egui::SidePanel::left("b").resizable(true).default_width(168.0));
+        assert!(bare < 168.0,
+            "laid out at {bare}; without a range the panel should size to CONTENT, well under \
+the 168 requested.");
+    }
+
+    #[test]
+    fn exact_width_does_pin() {
+        let w = laid_out(|| egui::SidePanel::left("c").resizable(false).exact_width(168.0));
+        assert!((w - 168.0).abs() < 1.0,
+                "exact_width is the documented way to pin a width and gave {w}");
     }
 }
