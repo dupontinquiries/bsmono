@@ -154,6 +154,9 @@ pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan
 #[allow(dead_code)] pub mod convograph; // pure (no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
 #[allow(dead_code)] pub mod spatial; // pure math (no egui) + imported by lean modules → not gui-gated
+// Picking + interaction states for the 3D scene: it had no hit testing at all,
+// so nothing in it could be pointed at. Pure math, same gating as spatial.
+#[allow(dead_code)] pub mod scenepick;
 
 // Four modules that sat in src/ with no `mod` line — never compiled, 22 tests
 // that had never run. Found by maintenance/tools/orphan_check.py; each checked
