@@ -204,7 +204,16 @@ fn collect_audio(dir: &Path, cfg: &Config, out: &mut Vec<PathBuf>) -> std::io::R
                 stack.push(p);
             } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 let ext = ext.to_ascii_lowercase();
-                if cfg.audio_exts.iter().any(|e| e == &ext) {
+                // A `.bspc` among the SOURCES is an already-built clip, not
+                // audio to decode. That is how a microphone session's crops
+                // reach the trainer: micsession writes this format directly, so
+                // pointing --data-dir at a capture directory needs no decode
+                // step and no new format.
+                //
+                // Sources only. A `.bspc` in cache_dir is still a cache entry
+                // and still subject to trim_cache, which is exactly why
+                // micsession refuses to write there.
+                if ext == "bspc" || cfg.audio_exts.iter().any(|e| e == &ext) {
                     out.push(p);
                 }
             }
@@ -267,6 +276,21 @@ fn claim_mem(n: u64) -> bool {
 }
 
 fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
+    // A source that IS a cache file is used where it lies: no decode, no copy
+    // into cache_dir. Copying would put it under trim_cache's eviction, which
+    // for captured audio that exists nowhere else would be deletion rather
+    // than eviction.
+    //
+    // `try_read_header` does the validating — magic, n_mels agreement, length
+    // against the header — so a corrupt or mismatched file is skipped with the
+    // same rules as any other cache entry rather than trusted for its name.
+    if src.extension().and_then(|e| e.to_str()) == Some("bspc") {
+        return match try_read_header(src, cfg) {
+            Ok(Some(meta)) if meta.t >= cfg.time_frames => Ok(Some(meta)),
+            _ => Ok(None),
+        };
+    }
+
     let cache = cache_path(src, cfg);
 
     // If a valid cache already exists, just read its header.

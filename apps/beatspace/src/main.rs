@@ -7,6 +7,7 @@
 //! latent-space explorer that morphs between generated beats.
 
 mod micsample;
+mod micsession;
 mod audio_io;
 mod config;
 mod dataset;
