@@ -56,6 +56,13 @@ pub enum Command {
     /// Show the palette itself, so "open command palette" is sayable.
     ShowPalette,
     ToggleRail,
+    /// Settings had NO route but the session list's gear.
+    ///
+    /// That list now lives inside the tab column, and the column collapses to a
+    /// chevron — so without this, collapsing it stranded settings entirely.
+    /// Added with the collapse rather than after it: a control whose only door
+    /// can be closed is a control you can lose.
+    ToggleSettings,
 }
 
 /// One entry in the vocabulary: what it does, what it is called, and the words
@@ -109,6 +116,8 @@ pub fn vocabulary() -> Vec<Entry> {
     v.push(Entry { command: Command::PrevTab, title: "Previous tab".into(), keywords: &["back"] });
     v.push(Entry { command: Command::ToggleRail, title: "Toggle sidebar".into(),
                    keywords: &["rail", "hide", "collapse"] });
+    v.push(Entry { command: Command::ToggleSettings, title: "Settings".into(),
+                   keywords: &["preferences", "config", "options"] });
     v.push(Entry { command: Command::ShowPalette, title: "Open command palette".into(),
                    keywords: &["commands"] });
     v
@@ -199,6 +208,11 @@ pub fn parse_phrase(phrase: &str) -> Option<Command> {
     if p.contains("sidebar") || p.contains("side bar") {
         return Some(Command::ToggleRail);
     }
+    // Before the view-name scan below: "settings" is not a pane view, and
+    // leaving it to fall through would match nothing at all.
+    if p.contains("settings") || p.contains("preferences") {
+        return Some(Command::ToggleSettings);
+    }
     // A view name anywhere in the sentence. Longest label first, so "mail"
     // inside a longer name cannot win over the name itself.
     let mut named: Vec<PaneView> = PaneView::ALL.to_vec();
@@ -259,6 +273,22 @@ mod tests {
         assert_eq!(parse_phrase("split"), Some(Command::Split { vertical: false }));
         assert_eq!(parse_phrase("close pane"), Some(Command::ClosePane));
         assert_eq!(parse_phrase("next tab"), Some(Command::NextTab));
+        assert_eq!(parse_phrase("hide the sidebar"), Some(Command::ToggleRail));
+    }
+
+    /// Settings must be reachable without the session list.
+    ///
+    /// Its only route was the gear in that list, which now lives inside the tab
+    /// column — and the column collapses. Without a second door, collapsing
+    /// strands settings, and the control that would restore the list is itself
+    /// in the list.
+    #[test]
+    fn settings_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("open settings"), Some(Command::ToggleSettings));
+        assert_eq!(parse_phrase("show me preferences"), Some(Command::ToggleSettings));
+        assert!(vocabulary().iter().any(|e| e.command == Command::ToggleSettings),
+                "settings must appear in the palette list, not only as a phrase");
+        // And it must not have stolen the sidebar phrase.
         assert_eq!(parse_phrase("hide the sidebar"), Some(Command::ToggleRail));
         // "new tab" alone is a tab; with a view it is a placement.
         assert_eq!(parse_phrase("new tab"), Some(Command::NewTab));

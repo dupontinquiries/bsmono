@@ -741,6 +741,7 @@ impl VoicetermApp {
             // ("Toggle sidebar") and the voice phrase ("hide the sidebar") keep
             // working and now move the column that actually holds the tabs.
             Command::ToggleRail => { self.tabbar_open = !self.tabbar_open; }
+            Command::ToggleSettings => { self.settings_open = !self.settings_open; }
         }
     }
 
@@ -1053,23 +1054,12 @@ impl eframe::App for VoicetermApp {
             if !self.chrome.escape() { self.chrome.toggle(); }
         }
         let show_chrome = self.chrome.mode().shows_tab_strip();
-        if show_chrome {
-        egui::SidePanel::left("sidebar").resizable(true).default_width(160.0).width_range(120.0..=320.0).show(ctx, |ui| {
-            if let Some(action) = self.sidebar.ui(ui, &self.colors) {
-                match action {
-                    SidebarAction::SelectSession(_) => {} // on-device: switch the active PTY/session
-                    SidebarAction::New => {} // on-device: spawn a new session
-                    SidebarAction::Graph => {
-                        // The workspaces page. The sidebar's Graph action was
-                        // a no-op with a TODO; this is the page the Qt app
-                        // puts behind it.
-                        self.workspaces_open = !self.workspaces_open;
-                    }
-                    SidebarAction::Settings => self.settings_open = !self.settings_open,
-                }
-            }
-        });
-        }
+        // The session list used to be its own `SidePanel::left("sidebar")` at 160
+        // points, beside the 168-point tab column. It now lives INSIDE that
+        // column — see the tab column below — because `main.qml`'s `vTabBar`
+        // hosts "work tabs (scrollable) + a default fence + system tabs" in one
+        // bar, and two bars for one job is the whole of why this surface read as
+        // heavier than the Qt one.
 
         // toast above the bottom chrome (keycap bar ~76px + margin, the QML bind-to-chrome idea)
         // ui_actions rather than ui: the ingest asks "keep this version?" and
@@ -1632,6 +1622,29 @@ impl eframe::App for VoicetermApp {
                 }
                 return;
             }
+            // SESSIONS AT THE BOTTOM, work tabs above — the QML's own order
+            // ("work tabs (scrollable) + a default fence + system tabs").
+            //
+            // `show_inside` with a bottom panel rather than appending after the
+            // scroll area: the tab list uses `auto_shrink([false, false])` and
+            // takes the whole column, so anything written after it would be
+            // pushed off the bottom. Reserving the space first is the only
+            // order that leaves both visible when there are many tabs.
+            egui::TopBottomPanel::bottom("tab-sessions").show_inside(ui, |ui| {
+                if let Some(action) = self.sidebar.ui(ui, &self.colors) {
+                    match action {
+                        SidebarAction::SelectSession(_) => {} // on-device: switch the active PTY/session
+                        SidebarAction::New => {} // on-device: spawn a new session
+                        SidebarAction::Graph => {
+                            // The workspaces page. The sidebar's Graph action was
+                            // a no-op with a TODO; this is the page the Qt app
+                            // puts behind it.
+                            self.workspaces_open = !self.workspaces_open;
+                        }
+                        SidebarAction::Settings => self.settings_open = !self.settings_open,
+                    }
+                }
+            });
             ui.add_space(4.0);
             let mut apply: Vec<voiceterm_egui::gesture_menus::WsCall> = Vec::new();
             const ROW_PITCH: f32 = 33.0; // QML v0.1.803: 30px row + 3px spacing
