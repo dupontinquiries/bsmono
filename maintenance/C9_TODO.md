@@ -371,6 +371,132 @@ Deliberately outside the repo rather than gitignored inside it: a gitignored
 path can still be `git add -f`'d. **Lost on sandbox reset**; originals are
 read-only under `/mnt/user-data/uploads/`.
 
+## Session 2 — built but not wired
+
+Each of these is a pure, tested decision layer with no caller. They are listed
+together because they share a failure mode: a module that compiles, passes and
+is never reached looks identical in the test count to one that is doing work.
+`orphan_check.py` finds files no `mod` reaches; nothing finds a module reached
+only by its own tests.
+
+- **C9-8a — `logscope-fan::continuation` has no caller.** `verified` (grep).
+  Decides keep-going vs stop from cheap facts, escalating to a small model only
+  when genuinely ambiguous. Wiring means the chat loop firing a synthetic turn
+  on `Decided(continue)` — a change to the send path.
+  OPEN QUESTION, operator's call: should an auto-continuation appear in the
+  transcript as a visible turn, or as an invisible nudge? Visible costs context
+  every time and makes the log honest about why the model kept going; given the
+  reason strings, visible is probably right.
+
+- **C9-8b — `readmark` feeds nothing.** `verified`. Tracks how far the operator
+  has gone past each node plus a watermark. `open_questions` returns the ids to
+  badge and `since_watermark` the unreviewed span, so the graph renderer needs
+  no logic of its own — but nothing supplies scroll fractions and nothing draws
+  the badge. Until it does, `continuation`'s `questions_are_flagged` must stay
+  FALSE, which is the conservative branch.
+
+- **C9-8c — `powerbudget` is not sampled.** `verified`. Nothing reads
+  `/sys/class/power_supply` into `Source`, no mesh lux is routed from the
+  Fairphones via bo-suite/snapclone, and `continuation` does not call
+  `auto_turn_cap`. Three shells reaching three subsystems. The Jackery outlet
+  details and sun-scheduling sit on top of `Reserve`/`forecast_wh`.
+  NOTE the deliberate disagreement with `voiceterm::battery_ok_for_background`,
+  which defaults UNMETERED on a missing `/sys`. Both defaults are right for
+  their caller; do not unify them without deciding which risk each is taking.
+
+- **C9-8d — `scenepick` is not called.** `verified`. The 3D scene still has no
+  pointer plumbed to it and the render pass does not draw the focus ring or the
+  hover lift. This is what the cursor request needs; the cursor now has
+  something to land on but nothing puts it there.
+
+- **C9-8e — `capability::profile` has no caller.** `verified`. The per-worker
+  contract the HiveMind doc makes mandatory. Spawning a worker with it changes
+  the coordinator's dispatch — the file whose own header calls it "the hardest
+  code in the engine to change safely".
+  DEFERRED SUB-ITEM: the doc's `transitions` field is unimplemented, because
+  phase transitions are the coordinator's decision and it is unclear a worker
+  should be told them at all.
+
+- **C9-8f — `sessiontime`'s `TimeContext` renders but is unread by the
+  matrix.** `verified`. It IS wired into the chat prompt (b300aeaa), but the
+  hive-mind modes do not consult it.
+
+## Session 2 — engine work blocked on hardware
+
+- **C9-9a — the dims resizing is unconfirmed.** `read`. Six commits derived the
+  dims cache and ring from the object budget and computed `safe_k` 1 → 11
+  against a requested 4. Whether the clamp stops firing is a hardware fact. The
+  clamp line now prints `N dims + M pool`; `SUBMIT_BY_DIMS_WRAP` climbing
+  sharply means the ring divisor is too tight.
+
+- **C9-9b — `examples/immediates_probe` has not run on the M2.** `verified`
+  here on llvmpipe, where immediates are EMULATED with uniforms — the least
+  demanding possible witness. Its first four lines say whether Honeykrisp grants
+  `Features::IMMEDIATES` and at what size. Thirty seconds of hardware time
+  decides whether the whole dims structure can be DELETED rather than resized.
+
+- **C9-9c — push constants: reachable, not attempted.** `verified` (API read
+  out of the vendored crates). Touches every dispatch site and every WGSL entry
+  point's uniform declaration; the failure mode is a driver silently accepting a
+  wrong offset. A scheduling decision now, not a research question.
+
+- **C9-9d — IQ1_S gibberish is unexplained.** `read`. Every type in that file
+  has a dequantizer and IQ1_S matches llama.cpp line for line. The converting
+  path became the default when native was made opt-in (0af8f77f) — my change,
+  and the new suspect, because it previously panicked in prewarm and may never
+  have completed on a real checkpoint. Two runs would narrow it: a NON-UD IQ1_S
+  file, or the same file with `LOGSCOPE_NO_Q5K_INT8=1`.
+
+- **C9-9e — diffusion-gemma: `expsplit` derives the offsets, nothing routes
+  them.** `verified`. Also unresolved: which half is gate. `Split::GATE_FIRST`
+  records the assumption in one place; wrong means SwiGLU activates the wrong
+  half. Needs a forward pass to settle.
+
+- **C9-9f — gemma4's `inp_gate`/`proj` side path is unidentified.** `read` from
+  the dump. A 256-wide pair per block with no gemma3 counterpart, plus a THIRD
+  post-norm. Wants the HF config rather than the GGUF.
+
+## Session 2 — verification gaps I am aware of
+
+- **C9-10a — six voiceterm commits, none seen.** The left edge went from three
+  panels to one collapsible bar, the tab hold was corrected to the QML's 380ms,
+  and sessions were merged in — all verified by compiler, tests and a panel
+  counter. Headless egui layout tests now assert the widths and the collapse
+  (d155f4de), which is three measured facts where there were none, and still not
+  a screenshot.
+
+- **C9-10b — `default_width` does not pin a width.** `verified` on egui 0.34.
+  Five call sites in this tree name a width they do not get: voiceterm's
+  settings (300), blocks-drawer (340) and tab column (168), and av1tuner's two
+  400s. Documented in `uikit-egui` with a test; whether each wants `exact_width`
+  or the drag is a per-surface decision needing a real screen.
+
+- **C9-10c — `fleet_build.sh` has not run end to end.** `verified` that it
+  fails: a full `logscope` run needs more disk than this box has —
+  `apps/logscope/target` alone reached 4.0 GB. The member skip and the feature
+  table are reasoned and spot-checked, not run. If the
+  `[-p logscope-egui --features wgpu-engine]` line is absent from the output,
+  that is the symptom.
+
+- **C9-10d — the WGSL seam test I wrote is weaker than the one already there.**
+  `verified` by probing. Catching a subtle seam needs comparing each edge texel
+  against its own neighbourhood rather than against the tile's worst step. Not
+  done, and `wrapd` stands as correct by construction rather than verified.
+
+- **C9-10e — three fence parsers, one shared scanner, one adoption.**
+  `verified`. `verdict` migrated; `parse_plan` DECLINED it deliberately (the
+  scanner is CommonMark-correct and that site needs tolerance of a known
+  malformation), and `parse_tools`' brace balance is stronger than any fence
+  rule for its job. One of three is the honest result and the scanner's docs say
+  so. What is NOT done is the strategy doc's actual ask: a single artifact
+  envelope across every consumer.
+
+- **C9-10f — WGSL gates: every crate has one, none shares.** `verified`. Six
+  crates carry a near-identical naga test, deliberately, because the tree runs
+  FOUR naga versions (0.19, 22, 27, 29) that disagree — naga 29 accepts `fn f16`
+  and 22 rejects it. The duplication is load-bearing; recorded here so nobody
+  "fixes" it into a shared kit.
+
 - **C9-7a — snapclone exists TWICE, and one copy absorbed two of my fixes.**
   `measured` · blocked on a decision that is not mine to make.
 
