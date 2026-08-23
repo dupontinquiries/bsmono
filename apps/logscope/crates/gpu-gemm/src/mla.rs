@@ -530,6 +530,154 @@ mod shape_check_tests {
     /// ```text
     /// python3 tools/tiny-variants/gen_glmdsa.py /tmp/tiny-glmdsa.gguf
     /// ```
+
+    /// The prefix-fork path, driven against a REAL loaded model.
+    ///
+    /// `prefill_prefix` computes a shared prompt's KV once and
+    /// `seed_from_prefix` forks it into a session, so N branches over one
+    /// prompt prefill it once instead of N times. `WorkerPool` is built on it
+    /// and `main.rs` calls that in four places, so this is live code — and
+    /// until now nothing tested it, because C9-4c is right that no test drove
+    /// `load_gguf` at all.
+    ///
+    /// It is testable here, which was the surprise. This sandbox has no Vulkan
+    /// ICD and no /dev/dri, and `Gpu::new()` works anyway through Mesa's
+    /// software rasterizer; a supported-architecture fixture loads and
+    /// generates in ~100 ms. The MLA fixture is refused by the architecture
+    /// gate, but qwen3 is supported and `gen3.py` emits one.
+    ///
+    /// The property asserted is EQUIVALENCE, not speed. Forking a prefix must
+    /// produce the same tokens as prefilling the whole prompt — a fork that is
+    /// merely fast is a fork that is wrong, and on a software rasterizer the
+    /// timing would mean nothing anyway.
+    ///
+    /// ## WHAT THIS TEST DOES NOT CATCH, probed rather than assumed
+    ///
+    /// It was sabotaged three ways to find its edges, and it has one:
+    ///
+    /// | sabotage | detected |
+    /// |---|---|
+    /// | seed one row short (`prefix_len - 1`) | **no** |
+    /// | skip the k-cache write entirely | **no** |
+    /// | (prefix influence on output, as a precondition) | yes |
+    ///
+    /// The precondition below proves two different prefixes generate different
+    /// tokens, so the seeded KV does reach the logits — but that influence
+    /// travels through the V cache, whose values are correct in both sabotages.
+    /// Corrupting only K leaves attention SCORES near-uniform, and on a 3-layer,
+    /// 64-wide fixture with random weights the scores are near-uniform anyway,
+    /// so the argmax does not move.
+    ///
+    /// So this pins that the fork path RUNS and produces prefix-dependent output
+    /// matching a full prefill. It does not pin the attention scores. Catching a
+    /// K-cache fault needs a fixture with enough depth or trained enough weights
+    /// for attention to be peaked rather than diffuse — which `gen3.py` does not
+    /// emit and which is the honest next step if this path is ever suspected.
+    ///
+    /// Stated because a test whose limits are unknown gets trusted for more than
+    /// it covers, and this one is the first thing to ever exercise `load_gguf`.
+    #[test]
+    fn a_forked_prefix_generates_what_a_full_prefill_generates() {
+        let path = "/tmp/tiny-qwen3.gguf";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("SKIPPED: {path} absent — sh tools/tiny-variants/gen-all.sh");
+            return;
+        };
+        let gpu = crate::Gpu::new();
+        let m = match gpu.load_gguf_opt(&bytes, false) {
+            Ok(m) => m,
+            Err(e) => {
+                // A supported arch failing to load is a real regression, not a
+                // reason to skip: the whole point is that this one loads.
+                panic!("the qwen3 fixture no longer loads: {e}");
+            }
+        };
+
+        // A shared prompt and two different continuations — the shape a
+        // fan-out has: one prefix, several branches.
+        //
+        // API read out of `KvSession::make_empty` rather than guessed. I
+        // guessed twice first (`new_session`, `generate_from_session`) and the
+        // compiler rejected both; the real trio is `session_new`,
+        // `seed_from_prefix`, `session_prefill`. `make_empty` at lib.rs:16588
+        // is this exact sequence and is what WorkerPool uses.
+        // sample_next is a KvSession method, not an inherent one — the trait
+        // must be in scope. Third API correction in this test; the pattern is
+        // that I keep writing the API I expect instead of the one at the call
+        // site I already read.
+        use crate::KvSession as _;
+        let prefix: Vec<u32> = vec![7, 11, 13, 17, 19, 23];
+        let sp = crate::SamplerParams::default();
+
+        // FIRST, PROVE THE COMPARISON CAN FAIL.
+        //
+        // An equality assertion between two generations is worthless if the
+        // model's output does not depend on the prefix — and this is a
+        // 3-layer, 64-wide fixture with random weights, where it might not.
+        // Found the hard way: the equality below passed with `seed_from_prefix`
+        // deliberately skipping its k-cache write ENTIRELY, which means either
+        // the fork is irrelevant to the output or the test is not testing it.
+        //
+        // So: two DIFFERENT prefixes, same tail. If those agree, the prefix has
+        // no influence on generation here and every equality below is vacuous.
+        // This is the numerical form of "assert the scan found something".
+        let other: Vec<u32> = vec![101, 103, 107, 109, 113, 127];
+        let gen_from = |pfx: &[u32], tail: &[u32]| -> Vec<u32> {
+            let pc = gpu.prefill_prefix(&m, pfx);
+            let mut s = gpu.session_new(&m, 64, 0);
+            gpu.seed_from_prefix(&m, &mut s, &pc, pfx.len());
+            gpu.session_prefill(&m, &mut s, tail);
+            (0..4).map(|_| {
+                let t = s.sample_next(&sp);
+                gpu.session_prefill(&m, &mut s, &[t]);
+                t
+            }).collect()
+        };
+        let probe_tail = vec![29u32, 31];
+        assert_ne!(
+            gen_from(&prefix, &probe_tail), gen_from(&other, &probe_tail),
+            "two different prefixes generated identical tokens, so the seeded KV does \
+not reach the output on this fixture and the equality assertions below cannot fail. \
+Fix the fixture before trusting this test."
+        );
+
+        for tail in [vec![29u32, 31], vec![37, 41]] {
+            // Reference: one session, whole prompt, greedy.
+            let mut whole = prefix.clone();
+            whole.extend_from_slice(&tail);
+            let mut direct_s = gpu.session_new(&m, 64, 0);
+            gpu.session_prefill(&m, &mut direct_s, &whole);
+            let direct: Vec<u32> = (0..4)
+                .map(|_| {
+                    let t = direct_s.sample_next(&sp);
+                    gpu.session_prefill(&m, &mut direct_s, &[t]);
+                    t
+                })
+                .collect();
+
+            // Forked: prefill the prefix ONCE, seed a session from it, feed
+            // only the tail.
+            let pc = gpu.prefill_prefix(&m, &prefix);
+            let mut fork_s = gpu.session_new(&m, 64, 0);
+            gpu.seed_from_prefix(&m, &mut fork_s, &pc, prefix.len());
+            gpu.session_prefill(&m, &mut fork_s, &tail);
+            let forked: Vec<u32> = (0..4)
+                .map(|_| {
+                    let t = fork_s.sample_next(&sp);
+                    gpu.session_prefill(&m, &mut fork_s, &[t]);
+                    t
+                })
+                .collect();
+
+            assert_eq!(
+                direct, forked,
+                "a forked prefix diverged from a full prefill for tail {tail:?} — the KV \
+fork is not reproducing the prefix's state, which makes every WorkerPool branch \
+silently WRONG rather than slow"
+            );
+        }
+    }
+
     #[test]
     fn an_mla_checkpoint_reaches_the_loader_and_stops_where_the_notes_say() {
         let path = "/tmp/tiny-glmdsa.gguf";
