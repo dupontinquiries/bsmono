@@ -74,4 +74,79 @@ mod tests {
         assert!(!ok, "type mismatch should fail validation");
         assert!(!msg.is_empty());
     }
+
+    /// Every shader this crate ships parses and type-checks.
+    ///
+    /// `cargo check` does NOT compile WGSL. A malformed shader is a perfectly
+    /// good `&str` right up to `create_shader_module`, so it surfaces as a
+    /// panic on the first frame that dispatches it — which, for a kernel behind
+    /// a rarely-taken branch, can be a long way from the edit.
+    ///
+    /// This crate has had `validate_wgsl` all along and never pointed it at its
+    /// own shaders: its three tests check the validator, not the payload. Naga
+    /// runs in milliseconds with no GPU, so there is no reason for the gap.
+    ///
+    /// Covers both populations, because they are different risks:
+    ///   * the inline `r#"..."#` consts in lib.rs — what the engine ACTUALLY
+    ///     dispatches today;
+    ///   * `src/kernels/*.wgsl` — the 2026-07-26 extraction, one of which lib.rs
+    ///     already `include_str!`s directly, and the rest of which become live
+    ///     the moment that extraction is completed. A syntax error parked there
+    ///     would surface as a regression in whichever commit finishes the job.
+    #[test]
+    fn every_shader_this_crate_ships_is_valid_wgsl() {
+        let mut checked = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+
+        // ── inline consts in lib.rs ──
+        //
+        // Matched structurally rather than by name: `const NAME: &str = r#"`
+        // through the closing `"#;`. Only sources carrying a shader entry point
+        // are validated — this crate also keeps help text and JSON in raw
+        // strings, and feeding those to naga would report noise as failure.
+        let lib = include_str!("lib.rs");
+        let mut rest = lib;
+        while let Some(i) = rest.find(": &str = r#\"") {
+            let after = &rest[i + 12..];
+            let Some(end) = after.find("\"#;") else { break };
+            let body = &after[..end];
+            // name, for the diagnostic: walk back to `const `
+            let head = &rest[..i];
+            let name = head.rsplit("const ").next().unwrap_or("?").trim().to_string();
+            rest = &after[end..];
+
+            let is_shader = body.contains("@compute") || body.contains("@fragment")
+                || body.contains("@vertex");
+            if !is_shader { continue }
+            checked += 1;
+            if let Err(e) = validate_wgsl(body) {
+                bad.push(format!("lib.rs const {name}:\n{e}"));
+            }
+        }
+        assert!(checked > 20, "only found {checked} inline shaders; the scan regressed");
+
+        // ── the extracted .wgsl files ──
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+        let mut files = 0usize;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("wgsl") { continue }
+                let Ok(src) = std::fs::read_to_string(&path) else { continue };
+                files += 1;
+                if let Err(err) = validate_wgsl(&src) {
+                    bad.push(format!("{}:\n{err}", path.file_name().unwrap().to_string_lossy()));
+                }
+            }
+        }
+        assert!(files > 50, "only found {files} .wgsl files; expected ~90");
+
+        assert!(
+            bad.is_empty(),
+            "{} of {} shader(s) failed naga validation:\n\n{}",
+            bad.len(), checked + files, bad.join("\n\n")
+        );
+        eprintln!("validated {checked} inline + {files} file shaders");
+    }
+
 }
