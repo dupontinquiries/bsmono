@@ -8,6 +8,7 @@
 
 mod micsample;
 mod micsession;
+#[cfg(feature = "app")] mod miclisten;
 mod audio_io;
 mod config;
 mod dataset;
@@ -43,6 +44,14 @@ struct Cli {
 enum Cmd {
     /// Train the GAN on a folder of audio files.
     Train(TrainArgs),
+    /// Listen on the microphone and keep only the interesting moments as
+    /// training crops. Leave it running; train on what it collected.
+    ///
+    /// Writes mel spectrograms, never audio — but mel is NOT anonymised, since
+    /// this crate's Griffin-Lim can turn a crop back into audible sound. Treat
+    /// a session directory as recordings.
+    #[cfg(feature = "app")]
+    Listen(ListenArgs),
     /// Open the realtime latent-space GUI.
     #[cfg(feature = "app")]
     Gui(GuiArgs),
@@ -57,6 +66,29 @@ enum Cmd {
     /// reference. The acceptance test for the wgpu training path.
     #[cfg(feature = "gpu")]
     GpuSelftest,
+}
+
+#[cfg(feature = "app")]
+#[derive(Args, Debug)]
+struct ListenArgs {
+    /// Where session directories are created. Each run gets its own.
+    #[arg(long, default_value = "./captures")]
+    out: std::path::PathBuf,
+    /// Stop after this many hours. 0 means no time limit, which has to be
+    /// asked for: a session that stops when it has collected enough is a
+    /// different promise to the people in the room than one that stops when
+    /// you said it would.
+    #[arg(long, default_value_t = 8.0)]
+    hours: f64,
+    /// Stop after this many kept crops.
+    #[arg(long, default_value_t = 4096)]
+    budget: usize,
+    /// Mel bands, must match what you will train with.
+    #[arg(long)]
+    n_mels: Option<usize>,
+    /// Crop width in frames, must match what you will train with.
+    #[arg(long)]
+    time_frames: Option<usize>,
 }
 
 #[cfg(feature = "gpu")]
@@ -296,6 +328,23 @@ proceeding, but a shape mismatch will now fail inside the loader",
             };
             cfg.ckpt_dir = a.ckpt_dir;
             gui::run(cfg)?;
+        }
+        #[cfg(feature = "app")]
+        Cmd::Listen(a) => {
+            let mut cfg = Config::default();
+            if let Some(v) = a.n_mels { cfg.n_mels = v; }
+            if let Some(v) = a.time_frames { cfg.time_frames = v; }
+            // The same validation the trainer runs, BEFORE a microphone is
+            // opened: a session captured at a shape that cannot build a model
+            // is hours of listening thrown away.
+            if let Err(why) = cfg.validate() {
+                anyhow::bail!("this configuration cannot build a model:\n  - {why}");
+            }
+            let policy = micsession::StopPolicy {
+                max_seconds: if a.hours > 0.0 { Some(a.hours * 3600.0) } else { None },
+                budget: a.budget,
+            };
+            miclisten::listen(&cfg, &a.out, policy)?;
         }
         #[cfg(feature = "gpu")]
         Cmd::Gpu(a) => {

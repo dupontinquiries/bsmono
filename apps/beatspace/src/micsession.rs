@@ -48,6 +48,72 @@ use std::path::{Path, PathBuf};
 /// is what actually holds the two in agreement.
 const MAGIC: &[u8; 4] = b"BSPC";
 
+/// Why a session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// The wall-clock limit was reached.
+    Deadline,
+    /// The crop budget is spent.
+    Budget,
+    /// Someone wrote the STOP file.
+    Asked,
+}
+
+/// When an unattended microphone stops listening.
+///
+/// Pure, and clock-INJECTED: `should_stop` takes elapsed seconds rather than
+/// reading a clock, so a twelve-hour session is a unit test. The shell passes
+/// `start.elapsed().as_secs_f64()`.
+///
+/// ## Why a wall-clock limit exists at all
+///
+/// The crop budget already bounds the OUTPUT, so a duration limit is redundant
+/// for disk. It is not redundant for consent. "Stops when it has collected
+/// enough" and "stops when I said so" are different promises, and only the
+/// second is one you can make to somebody else in the room. A budget-only
+/// session in a quiet house runs until something interesting happens, which
+/// might be the conversation you have when you get home.
+///
+/// So the default is a limit rather than none, and `None` has to be asked for.
+#[derive(Debug, Clone)]
+pub struct StopPolicy {
+    /// Hard wall-clock limit. `None` means "until budget or STOP", which is
+    /// deliberately not the default.
+    pub max_seconds: Option<f64>,
+    /// Stop after this many crops.
+    pub budget: usize,
+}
+
+impl Default for StopPolicy {
+    fn default() -> Self {
+        // Eight hours: a working day out of the house, and short enough that
+        // forgetting the mic is on costs one day rather than indefinitely.
+        StopPolicy { max_seconds: Some(8.0 * 3600.0), budget: 4096 }
+    }
+}
+
+impl StopPolicy {
+    /// `Some(reason)` when the session should end now.
+    ///
+    /// Deadline is checked FIRST. When a session hits both at once the honest
+    /// report is the time limit — that is the promise that was made to the
+    /// room, and reporting "budget" would imply it would have kept going.
+    pub fn should_stop(&self, elapsed_s: f64, kept: usize, asked: bool) -> Option<Stopped> {
+        if let Some(max) = self.max_seconds {
+            if elapsed_s >= max {
+                return Some(Stopped::Deadline);
+            }
+        }
+        if asked {
+            return Some(Stopped::Asked);
+        }
+        if kept >= self.budget {
+            return Some(Stopped::Budget);
+        }
+        None
+    }
+}
+
 pub struct Session {
     dir: PathBuf,
     n_mels: usize,
@@ -251,6 +317,56 @@ spanning two captured sounds");
                    "build_or_load removed or added files in the CAPTURE directory");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+
+    #[test]
+    fn a_session_stops_at_its_deadline_even_with_budget_left() {
+        let p = StopPolicy { max_seconds: Some(100.0), budget: 1000 };
+        assert_eq!(p.should_stop(99.9, 0, false), None);
+        assert_eq!(p.should_stop(100.0, 0, false), Some(Stopped::Deadline));
+    }
+
+    #[test]
+    fn the_budget_stops_it_before_the_deadline_when_the_room_is_busy() {
+        let p = StopPolicy { max_seconds: Some(1e9), budget: 5 };
+        assert_eq!(p.should_stop(10.0, 4, false), None);
+        assert_eq!(p.should_stop(10.0, 5, false), Some(Stopped::Budget));
+    }
+
+    #[test]
+    fn asking_stops_it_immediately() {
+        let p = StopPolicy::default();
+        assert_eq!(p.should_stop(1.0, 0, true), Some(Stopped::Asked));
+    }
+
+    /// When both fire, the reported reason is the DEADLINE.
+    ///
+    /// Not cosmetic. Reporting "budget" for a session that also hit its time
+    /// limit implies it would have carried on listening, which is the opposite
+    /// of the promise the limit represents.
+    #[test]
+    fn the_deadline_is_reported_when_both_conditions_are_met() {
+        let p = StopPolicy { max_seconds: Some(60.0), budget: 5 };
+        assert_eq!(p.should_stop(60.0, 500, false), Some(Stopped::Deadline));
+    }
+
+    #[test]
+    fn the_default_is_bounded_rather_than_open_ended() {
+        // A default of "listen until you have enough" is a different promise
+        // to the people in the room. If this ever becomes None by default it
+        // should be a decision someone made on purpose.
+        let d = StopPolicy::default();
+        assert!(d.max_seconds.is_some(), "the default session must be time-bounded");
+        assert!(d.max_seconds.unwrap() <= 12.0 * 3600.0, "and bounded to a day at most");
+    }
+
+    #[test]
+    fn an_unbounded_session_is_possible_but_must_be_asked_for() {
+        let p = StopPolicy { max_seconds: None, budget: 2 };
+        assert_eq!(p.should_stop(1e9, 0, false), None, "no deadline means no deadline");
+        assert_eq!(p.should_stop(1e9, 2, false), Some(Stopped::Budget),
+                   "the budget is still the backstop");
     }
 
 }
