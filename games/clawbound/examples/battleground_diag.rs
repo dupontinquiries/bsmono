@@ -3,10 +3,23 @@
 use clawbound_rs::ancestor::{self, Ancestor};
 use clawbound_rs::battleground::{Battleground, Mind, Role};
 
+fn pick(name: &str) -> Ancestor {
+    for a in ancestor::ALL {
+        let k = ancestor::kit(a).name.to_lowercase();
+        if k == name.to_lowercase() { return a }
+    }
+    Ancestor::Lion
+}
+
 fn main() {
-    let picks_a = [Ancestor::CaveLion, Ancestor::Puma, Ancestor::Lion];
-    let picks_b = [Ancestor::Caracal, Ancestor::Serval, Ancestor::Leopard];
-    let mut bg = Battleground::new_on(picks_a, picks_b, 7);
+    // profile any kit: `cargo run --example battleground_diag -- Duskstripe Rainspots [seed]`
+    let args: Vec<String> = std::env::args().collect();
+    let lead = args.get(1).map(|s| pick(s)).unwrap_or(Ancestor::CaveLion);
+    let foil = args.get(2).map(|s| pick(s)).unwrap_or(Ancestor::Caracal);
+    let seed: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(7);
+    let picks_a = [lead, Ancestor::Puma, Ancestor::Lion];
+    let picks_b = [foil, Ancestor::Serval, Ancestor::Leopard];
+    let mut bg = Battleground::new_on(picks_a, picks_b, seed);
     let mut time: Vec<[f32; 8]> = vec![[0.0; 8]; 6];
     let mut steps = 0;
     while bg.outcome.is_none() && steps < 30 * 60 * 13 {

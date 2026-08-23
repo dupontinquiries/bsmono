@@ -183,8 +183,24 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] `siege` kit trait (data-driven, budget-costed): heavy kits bite wood harder. Honest
   negative result — it moved Oldroar 33% -> 31% on its own; the retreat loop was the cure.
   Kept because the archetype should have the job, and it is tested.
-- [ ] Remaining spread (Faryowl 61%, Goldenmane 39%) is inside +-6% standard error at
-  n=42..82 games per kit — needs a longer run before anyone touches a number
+- [x] Laning is doctrine now, not draft order: `ancestor::sociability` scores how much of a
+  kit is spent on other cats (heal/rain +3, shield +2, control +1, **stealth -3** — a veil
+  shared is a veil wasted) plus +2 for a thin pelt (under 150 hp needs a bodyguard), and
+  the least sociable of a clan's three walks the river alone. Plus a duo doctrine: only one
+  lane-mate peels off to the economy at a time, because a lane held by nobody is given away.
+- [x] Settled by A/B on **identical drafts and lands** (`LanePolicy::Seat` vs `Kit`, 160
+  games each) rather than by comparing two runs that differed in more than one thing:
+  kit laning is decisively flatter — **sd 4.2 against 6.9**, range 18 against 24. The
+  intermediate result that looked like a regression (spread 36-67) was two non-identical
+  runs being compared, exactly the noise-chasing this switch exists to prevent.
+- [x] The frailty term was itself found by measurement: sorting on ally-facing tools alone
+  sent the 130-hp yowler down the river and cost it 19 points (55% -> 36%) in 168 games.
+- [ ] Faryowl at 61% is the one kit outside +-7 in the winning arm — the next thing to look
+  at, and the first candidate for an actual kit change rather than a doctrine one
+- [ ] Clan A pooled across every run to date is 544/1160 = **46.9% (se 1.5%)**, about 2 SD
+  low. Both A/B arms show it equally, so it is not laning; suspect residual first-contact
+  ordering. Worth a mirror-probe pass that tolerates the first blow and checks what
+  diverges *after* it
 - [x] `--play` wiring: the `app` feature's rustc >= 1.76 requirement (emath 0.28) was the
   blocker in earlier sessions, pinned to a 1.75 sandbox toolchain. Resolved this session
   with a real rustc 1.96 — `cargo check --features app --bin clawbound-rs` compiles clean

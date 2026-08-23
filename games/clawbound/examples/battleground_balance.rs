@@ -23,10 +23,10 @@
 //! Run: cargo run --release --example battleground_balance [rolls]
 
 use clawbound_rs::ancestor::{self, Ancestor};
-use clawbound_rs::battleground::{Battleground, CLAN_A};
+use clawbound_rs::battleground::{Battleground, LanePolicy, CLAN_A};
 
-fn play(a: [Ancestor; 3], b: [Ancestor; 3], seed: u32, wombo: bool) -> Option<u8> {
-    let mut bg = Battleground::new_on(a, b, seed);
+fn play(a: [Ancestor; 3], b: [Ancestor; 3], seed: u32, wombo: bool, policy: LanePolicy) -> Option<u8> {
+    let mut bg = Battleground::new_with(a, b, seed, policy);
     bg.wombo = wombo;
     let mut steps = 0u32;
     while bg.outcome.is_none() && steps < 30 * 60 * 13 {
@@ -49,6 +49,12 @@ fn main() {
     // because two ablations at 168 games each measured it at nothing), so the
     // same drafts on the same land can be played both ways and compared
     let wombo = std::env::args().nth(3).as_deref() == Some("wombo");
+    // arg 4: "seat" plays the old draft-order laning, for A/B against "kit"
+    let policy = if std::env::args().nth(4).as_deref() == Some("seat") {
+        LanePolicy::Seat
+    } else {
+        LanePolicy::Kit
+    };
     let pool = ancestor::ALL;
     let mut wins = vec![0u32; pool.len()];
     let mut games = vec![0u32; pool.len()];
@@ -77,7 +83,7 @@ fn main() {
             let side_b = [pool[picked[3]], pool[picked[4]], pool[picked[5]]];
             for swap in [false, true] {
                 let (x, y) = if swap { (side_b, side_a) } else { (side_a, side_b) };
-                let Some(o) = play(x, y, seed, wombo) else { continue };
+                let Some(o) = play(x, y, seed, wombo, policy) else { continue };
                 total += 1;
                 if o != 2 {
                     fells += 1;
@@ -98,7 +104,11 @@ fn main() {
         eprintln!("roll {} of {rolls} done ({total} games)", roll + 1);
     }
 
-    eprintln!("\n{total} games over {rolls} terrain rolls (wombo {})", if wombo { "on" } else { "off" });
+    eprintln!(
+        "\n{total} games over {rolls} terrain rolls (wombo {}, laning {:?})",
+        if wombo { "on" } else { "off" },
+        policy
+    );
     eprintln!(
         "  clan A took {clan_a_wins} ({:.0}%) — the map claims symmetry, so this wants ~50%",
         clan_a_wins as f64 / total as f64 * 100.0

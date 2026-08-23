@@ -60,9 +60,40 @@ pub const LANES: usize = 3;
 pub const DUO_LANE: usize = 0;
 pub const MID_LANE: usize = 1;
 pub const SOLO_LANE: usize = 2;
-/// Seat -> trail. Seat 0 walks the river alone; seats 1 and 2 climb together.
-pub fn lane_of_seat(seat: usize) -> usize {
-    match seat { 0 => SOLO_LANE, _ => DUO_LANE }
+/// Which of a clan's three ancestors walks the river alone: the least sociable
+/// of them ([`ancestor::sociability`]). A clan does not send its pride-fighter
+/// off alone and its ambusher into a crowd — the shields, heals and auras are
+/// worth nothing on an empty trail, and a veil is worth less with a packmate
+/// blundering alongside. Ties break on pool order, so the choice is
+/// deterministic and identical for both clans.
+pub fn solo_seat(picks: [Ancestor; 3]) -> usize {
+    let mut best = 0usize;
+    for s in 1..3 {
+        let (a, b) = (ancestor::sociability(picks[s]), ancestor::sociability(picks[best]));
+        if a < b { best = s; }
+    }
+    best
+}
+
+/// How a clan decides who walks where.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LanePolicy {
+    /// Draft order decides: seat 0 takes the river. Arbitrary, but it is the
+    /// baseline every balance number before this was measured against.
+    Seat,
+    /// The kit decides ([`solo_seat`]). Better doctrine, and better for the
+    /// ambushers; whether it is better for the *roster* is what the switch is
+    /// here to answer.
+    Kit,
+}
+
+/// Seat -> trail, given who else the clan fielded and how the clan decides.
+pub fn lane_for(seat: usize, picks: [Ancestor; 3], policy: LanePolicy) -> usize {
+    let solo = match policy {
+        LanePolicy::Seat => 0,
+        LanePolicy::Kit => solo_seat(picks),
+    };
+    if seat == solo { SOLO_LANE } else { DUO_LANE }
 }
 
 // structures
@@ -418,6 +449,18 @@ impl Battleground {
     /// jungle layout, over different country. This is what lets a balance run
     /// vary the map instead of replaying one map thirteen times.
     pub fn new_on(picks_a: [Ancestor; 3], picks_b: [Ancestor; 3], seed: u32) -> Battleground {
+        Battleground::new_with(picks_a, picks_b, seed, LanePolicy::Kit)
+    }
+
+    /// As [`new_on`], with the laning doctrine chosen explicitly — so a balance
+    /// run can play both doctrines over the same drafts on the same lands
+    /// instead of comparing two runs that differ in more than one thing.
+    pub fn new_with(
+        picks_a: [Ancestor; 3],
+        picks_b: [Ancestor; 3],
+        seed: u32,
+        policy: LanePolicy,
+    ) -> Battleground {
         let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::set_terrain_pool(Self::MOUNTAIN_BIAS, 1);
         world::set_land_lift(Self::LAND_LIFT);
@@ -491,8 +534,9 @@ impl Battleground {
                 // a 2.8 m break in the mirror before a single step was taken.
                 let d = slot as f32 * 2.0 - 2.0;
                 let (sx, sz) = if team == CLAN_A { (cx + d, cz) } else { (cx, cz - d) };
+                let side = if team == CLAN_A { picks_a } else { picks_b };
                 warriors.push(Warrior {
-                    team, role: Role::Ancestor, ancestor: Some(a), lane: lane_of_seat(slot),
+                    team, role: Role::Ancestor, ancestor: Some(a), lane: lane_for(slot, side, policy),
                     x: sx, z: sz, heading: 0.0,
                     hp: k.hp, max_hp: k.hp, attack: k.attack, speed: k.speed, reach: k.reach,
                     mind: Mind::Trail, carry: Carry::Nothing,
@@ -980,10 +1024,26 @@ impl Battleground {
                 // that over a match, since the economy is what wins them.
                 let hands_off = self.warriors[i].is_player && self.player_driven;
                 if role == Role::Ancestor && !hands_off && carry == Carry::Nothing {
-                    let r = hashf(
-                        self.tick.wrapping_mul(2654435761)
-                            .wrapping_add(self.warriors[i].seat.wrapping_mul(97)),
-                    );
+                    // One at a time. A lane held by nobody is a lane given away,
+                    // so a warrior only peels off to hunt or gather if its
+                    // lane-mate is still on the trail — which is also what keeps
+                    // the duo a duo rather than two cats who happen to share a
+                    // number.
+                    let mate_away = self.warriors.iter().any(|m| {
+                        m.team == team
+                            && m.role == Role::Ancestor
+                            && m.lane == lane
+                            && !std::ptr::eq(m, &self.warriors[i])
+                            && matches!(m.mind, Mind::Hunt | Mind::Gather | Mind::CarryHome)
+                    });
+                    let r = if mate_away {
+                        1.0
+                    } else {
+                        hashf(
+                            self.tick.wrapping_mul(2654435761)
+                                .wrapping_add(self.warriors[i].seat.wrapping_mul(97)),
+                        )
+                    };
                     if r < 0.005 {
                         if r < 0.0015 && self.herb_patches.iter().any(|p| p.ready()) {
                             self.warriors[i].mind = Mind::Gather;
@@ -2236,6 +2296,41 @@ mod tests {
     }
 
     #[test]
+    fn the_loner_takes_the_river_and_the_pride_climbs_together() {
+        // Doctrine, asserted: whoever's kit is worth least beside a packmate
+        // walks the solo lane, whatever seat they were drafted into.
+        let picks = [Ancestor::Lion, Ancestor::Panther, Ancestor::Leopard];
+        assert_eq!(solo_seat(picks), 1, "the shadow-walker walks alone");
+        // and the old doctrine is still reachable, because it is the baseline
+        // every balance number before this was measured against
+        assert_eq!(lane_for(0, picks, LanePolicy::Seat), SOLO_LANE);
+        assert_eq!(lane_for(1, picks, LanePolicy::Seat), DUO_LANE);
+        assert_eq!(lane_for(1, picks, LanePolicy::Kit), SOLO_LANE);
+        let bg = Battleground::new_draft(picks, picks);
+        for team in [CLAN_A, CLAN_B] {
+            let lane_of = |a: Ancestor| {
+                bg.warriors
+                    .iter()
+                    .find(|w| w.team == team && w.ancestor == Some(a))
+                    .map(|w| w.lane)
+                    .unwrap()
+            };
+            assert_eq!(lane_of(Ancestor::Panther), SOLO_LANE);
+            assert_eq!(lane_of(Ancestor::Lion), DUO_LANE);
+            assert_eq!(lane_of(Ancestor::Leopard), DUO_LANE, "the mender goes where the wounded are");
+        }
+        // and with three loners somebody still has to take the river
+        let all_alone = [Ancestor::Panther, Ancestor::Tiger, Ancestor::Smilodon];
+        let bg2 = Battleground::new_draft(all_alone, all_alone);
+        let solo = bg2
+            .warriors
+            .iter()
+            .filter(|w| w.team == CLAN_A && w.role == Role::Ancestor && w.lane == SOLO_LANE)
+            .count();
+        assert_eq!(solo, 1, "exactly one river-walker, always");
+    }
+
+    #[test]
     fn the_clans_lane_like_the_country_is_shaped() {
         // One warrior down the river, two up the mountain, patrols holding the
         // middle. The map spent three commits growing a duo side and a solo
@@ -2249,6 +2344,7 @@ mod tests {
                 .map(|w| w.lane)
                 .collect();
             assert_eq!(lanes.iter().filter(|&&l| l == SOLO_LANE).count(), 1, "one on the river");
+            // (which one is decided by kit, not seat — see the test above)
             assert_eq!(lanes.iter().filter(|&&l| l == DUO_LANE).count(), 2, "two on the mountain");
             assert_eq!(lanes.iter().filter(|&&l| l == MID_LANE).count(), 0, "mid is the patrols'");
         }
@@ -2259,16 +2355,21 @@ mod tests {
         for _ in 0..30 * 20 {
             bg.step(1.0 / 30.0);
         }
-        let duo: Vec<(f32, f32)> = bg
+        // The pair does drift — one of them peels off to hunt or fetch herbs,
+        // which is the economy working. What must hold is the doctrine: never
+        // BOTH at once, or the lane is unheld.
+        let away = bg
             .warriors
             .iter()
-            .filter(|w| w.team == CLAN_A && w.role == Role::Ancestor && w.lane == DUO_LANE && w.alive())
-            .map(|w| (w.x, w.z))
-            .collect();
-        if duo.len() == 2 {
-            let apart = dist(duo[0].0, duo[0].1, duo[1].0, duo[1].1);
-            assert!(apart < 40.0, "the duo should travel as a pair, got {apart:.0}m apart");
-        }
+            .filter(|w| {
+                w.team == CLAN_A
+                    && w.role == Role::Ancestor
+                    && w.lane == DUO_LANE
+                    && w.alive()
+                    && matches!(w.mind, Mind::Hunt | Mind::Gather | Mind::CarryHome)
+            })
+            .count();
+        assert!(away <= 1, "the duo must not both wander off: {away} away");
     }
 
     #[test]
