@@ -1557,6 +1557,31 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                                 eprintln!("[battleground] draft confirmed: A={:?} B={:?} (no live --play wiring yet — see TODO.md)", a, b);
                                                 state.menu.open = true;
                                             }
+                                            MenuCmd::StartBattleground(a) => {
+                                                // The one-ancestor quick pick from the Play screen.
+                                                // Same honest fallback as the draft arm above and for
+                                                // the same reason: the seven steps that would make this
+                                                // render a live match are specified in TODO.md and not
+                                                // written. Starting a Battleground this loop cannot draw
+                                                // would look like a crash to a player.
+                                                //
+                                                // THIS ARM EXISTS BECAUSE THE MERGE NEEDED IT. Both
+                                                // incoming variants arrived from a line pinned to rustc
+                                                // 1.75, where `--features app` could not be compiled at
+                                                // all, so nothing on either side noticed that app.rs's
+                                                // match had stopped being exhaustive. This tree is on
+                                                // 1.96 and the whole winit/wgpu/egui stack does build,
+                                                // which is how it surfaced.
+                                                eprintln!("[battleground] {a:?} picked (no live --play wiring yet — see TODO.md)");
+                                                state.menu.open = true;
+                                            }
+                                            MenuCmd::QuickPlay => {
+                                                // 5v5 select page (lobby.rs). Its logic is headless and
+                                                // tested; what it has no route to is a rendered match,
+                                                // so the same fallback applies until render_battle exists.
+                                                eprintln!("[battleground] quick play requested (no live --play wiring yet — see TODO.md)");
+                                                state.menu.open = true;
+                                            }
                                             MenuCmd::Quit => elwt.exit(),
                                             MenuCmd::Close => state.menu.open = false,
                                             MenuCmd::Multiplayer => {
