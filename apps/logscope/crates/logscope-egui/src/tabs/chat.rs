@@ -1081,6 +1081,14 @@ pub struct Chat {
     show_context: bool, // right sidebar open/closed
     right_page: RightPage, // active sidebar subpage
     coord_mode: crate::coordinator::Mode, // prompting mode (barebones / coordinator / aggressive)
+
+    /// A duration the operator asked for, and when they asked.
+    ///
+    /// Parsed from their message by `sessiontime::parse_work_limit`, so "keep
+    /// working for the next hour" becomes something the model can be told about
+    /// on later turns. `None` means open-ended, which is NOT the same as
+    /// expired — a zero limit would read as "stop now".
+    work_limit: Option<(u64, std::time::Duration)>,
     verify_job: Option<VerifyJob>, // running sandbox build-check of the generated files
     image_job: Option<ImageJob>,   // running :image generation (sd-cli, off-thread)
     replicator: Option<ReplicatorMode>, // :replicate — parallel worker columns over the workspace
@@ -1290,6 +1298,8 @@ impl Default for Chat {
             context: LONG_HORIZON.into(),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
+            // Open-ended until the operator says otherwise.
+            work_limit: None,
             verify_job: None,
             image_job: None,
             replicator: None,
@@ -2123,6 +2133,46 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     }
 
     /// Build the prompt from history `msgs[..upto]` (so regenerate/edit can re-run from a point).
+    /// The time line for the prompt, or nothing.
+    ///
+    /// ## When it is included, and why that default
+    ///
+    /// You asked twice how this should be wired — every turn, or only when a
+    /// limit is live — and said keep working twice, so: BOTH, with a floor.
+    ///
+    /// * a live work limit ("keep working for the next hour") always says so,
+    ///   because that is the instruction the model otherwise cannot read;
+    /// * otherwise the line appears only once the session passes ten minutes.
+    ///
+    /// The floor is the whole argument. Prepending "Time: 40 seconds into this
+    /// session, 2 turns" to every exchange spends context on every turn to say
+    /// nothing, and a line that is usually noise is a line the model learns to
+    /// skip — including on the turn it finally matters. Ten minutes is roughly
+    /// where "how long have I been at this" stops being obvious from the
+    /// transcript length.
+    ///
+    /// THE ALTERNATIVE I DID NOT TAKE: limit-only. It is cheaper and it drops
+    /// the case your transcript actually showed — a long unbounded session
+    /// where the model had no idea it had been running for an hour, which is
+    /// exactly when a wall clock is worth its tokens.
+    fn time_line(&self) -> Option<String> {
+        let first = self.msgs.first()?;
+        let now = wall_now();
+        let limit = self.work_limit;
+        let ctx = logscope_fan::sessiontime::TimeContext {
+            started: first.at, now, turns: self.msgs.len(),
+            limit,
+        };
+        // A clock that went backwards, or a transcript reloaded from a file
+        // written last week: `started` is a stored wall time and nothing
+        // guarantees it precedes `now`. Reporting "0 seconds into this session"
+        // for a resumed chat is better than reporting a negative or an
+        // absurdity, and `elapsed` already saturates — this just declines to
+        // volunteer a figure it cannot stand behind.
+        if limit.is_none() && ctx.elapsed().as_secs() < 600 { return None }
+        Some(ctx.render())
+    }
+
     fn build_prompt_upto(&self, upto: usize, doc: &crate::analysis::Doc) -> String {
         let mut sys = neutralize_markers(&self.full_system(doc));
         if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
@@ -2135,6 +2185,8 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             sys.push_str(logscope::liaison_prompt::LIAISON_NO_OBSERVATIONS);
         }
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
+        // The clock, last so it sits closest to the conversation.
+        if let Some(t) = self.time_line() { sys.push_str("\n\n"); sys.push_str(&t); }
         let sys = sys;
         match self.backend {
             // Read the template LIVE rather than trusting the per-frame copy. The copy is refreshed in
@@ -2175,6 +2227,8 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             sys.push_str(logscope::liaison_prompt::LIAISON_NO_OBSERVATIONS);
         }
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
+        // The clock, last so it sits closest to the conversation.
+        if let Some(t) = self.time_line() { sys.push_str("\n\n"); sys.push_str(&t); }
         let sys = sys;
         let last = self.msgs.len().saturating_sub(1);
         let raw_partial = self.msgs.get(last).map(|m| m.text().to_string()).unwrap_or_default();
@@ -2685,6 +2739,22 @@ reply is framed differently from the turn that produced it.");
         if !self.msgs.is_empty() {
             let preview: String = qt.chars().take(40).collect();
             self.checkpoint(format!("before: {preview}"));
+        }
+        // A WORK LIMIT, if the operator just asked for one.
+        //
+        // "keep working for the next hour" was unreadable to the model: no turn
+        // carried a timestamp, so the phrase could only be pattern-matched and
+        // "keep working" fifty minutes later carried no signal at all. Parsed
+        // here, at the turn that says it, because the deadline runs from when
+        // it was ASKED — "30 more minutes" an hour in means thirty from then,
+        // not thirty from session start.
+        //
+        // Only ever SET, never cleared by a later message: an open-ended "keep
+        // working" after an hour was granted is a continuation of that hour,
+        // not a revocation of it. Clearing needs an explicit act, and there is
+        // not one yet.
+        if let Some(d) = logscope_fan::sessiontime::parse_work_limit(&qt) {
+            self.work_limit = Some((wall_now(), d));
         }
         self.msgs.push(Msg::user(qt));
         let uid = self.msgs.len() - 1;
@@ -9120,5 +9190,71 @@ mod time_stamp_tests {
         // The month shift (March-based) is where a year boundary goes wrong.
         assert_eq!(stamp_utc(1_703_980_800), "2023-12-31 00:00 UTC");
         assert_eq!(stamp_utc(1_704_067_200), "2024-01-01 00:00 UTC");
+    }
+}
+
+#[cfg(test)]
+mod time_line_tests {
+    use super::*;
+
+    fn chat_with(msgs: &[(Role, u64)], limit: Option<(u64, u64)>) -> Chat {
+        let mut c = Chat::default();
+        for (role, at) in msgs {
+            let mut m = if *role == Role::User { Msg::user("x".into()) } else { Msg::assistant() };
+            m.at = *at;
+            c.msgs.push(m);
+        }
+        c.work_limit = limit.map(|(at, d)| (at, std::time::Duration::from_secs(d)));
+        c
+    }
+
+    /// A short unbounded session says nothing.
+    ///
+    /// Prepending "40 seconds into this session, 2 turns" to every exchange
+    /// spends context to say nothing, and a line that is usually noise is one
+    /// the model learns to skip — including on the turn it matters.
+    #[test]
+    fn a_short_session_with_no_limit_adds_no_line() {
+        let now = wall_now();
+        let c = chat_with(&[(Role::User, now - 40), (Role::Assistant, now - 20)], None);
+        assert!(c.time_line().is_none());
+    }
+
+    /// Past the floor it appears, because transcript length stops being a
+    /// usable proxy for elapsed time.
+    #[test]
+    fn a_long_session_reports_elapsed_time() {
+        let now = wall_now();
+        let c = chat_with(&[(Role::User, now - 3600), (Role::Assistant, now - 10)], None);
+        let line = c.time_line().expect("an hour in, the clock is worth saying");
+        assert!(line.contains("1 hour"), "{line}");
+        assert!(line.contains("2 turns"), "{line}");
+    }
+
+    /// A live limit is reported IMMEDIATELY, floor or not — it is the
+    /// instruction the model otherwise cannot read.
+    #[test]
+    fn a_fresh_work_limit_is_reported_even_seconds_in() {
+        let now = wall_now();
+        let c = chat_with(&[(Role::User, now - 5)], Some((now, 3600)));
+        let line = c.time_line().expect("the limit must be stated at once");
+        assert!(line.contains("asked to keep working"), "{line}");
+    }
+
+    /// And when it runs out, it says so rather than going quiet — the case the
+    /// reported transcript would have hit.
+    #[test]
+    fn an_expired_limit_says_so() {
+        let now = wall_now();
+        let c = chat_with(&[(Role::User, now - 4200)], Some((now - 4200, 3600)));
+        let line = c.time_line().unwrap();
+        assert!(line.contains("RUN OUT"), "{line}");
+    }
+
+    /// An empty chat has no first turn to measure from.
+    #[test]
+    fn an_empty_chat_reports_nothing() {
+        let c = chat_with(&[], None);
+        assert!(c.time_line().is_none());
     }
 }
