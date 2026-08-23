@@ -81,7 +81,14 @@ start_tests() {
         cd "$dir" || exit 0
         # --no-fail-fast: one failing crate in a workspace should not hide the
         # rest, which is the same reason this script exists at all.
+        # STDIN CLOSED. These run in PARALLEL in the background, so they all
+        # inherit the operator's terminal: a test that reads stdin would either
+        # eat keystrokes meant for the shell or block forever holding a fleet
+        # slot, and with several running you could not tell which. The same
+        # inheritance made `git gc` consume a previous command's output and
+        # report it as a corrupt pack — see export-bundle.sh.
         CARGO_PROFILE_DEV_DEBUG=0 timeout 900 cargo test -q --no-fail-fast \
+            < /dev/null \
             > "$LOGDIR/$(echo "$label" | tr '/' '-').test.log" 2>&1
         echo "$?" > "$LOGDIR/$(echo "$label" | tr '/' '-').test.rc"
     ) &
@@ -90,7 +97,10 @@ start_tests() {
 
 check() {
     local dir="$1" label="$2" mode="$3"
-    ( cd "$dir" && CARGO_PROFILE_DEV_DEBUG=0 timeout 600 cargo check -q $mode 2>&1 ) >/tmp/fleet.$$ 2>&1
+    # `< /dev/null` for the same reason as the test runs above. This one is in
+    # the foreground so it would only stall rather than steal keystrokes, but a
+    # build script prompting for input is a hang with no output to explain it.
+    ( cd "$dir" && CARGO_PROFILE_DEV_DEBUG=0 timeout 600 cargo check -q $mode < /dev/null 2>&1 ) >/tmp/fleet.$$ 2>&1
     # A missing system toolchain is an ENVIRONMENT gap, not code rot, and
     # reporting it as a failure teaches people to ignore this script. Qt, GTK and
     # OpenAL are all legitimately absent in a headless build.
