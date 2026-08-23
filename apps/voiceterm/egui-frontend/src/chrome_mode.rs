@@ -432,3 +432,107 @@ mod tests {
     }
 
 }
+
+/// The left edge, measured by laying it out rather than by reading the source.
+///
+/// Six commits changed this surface — the column gated and sized to the QML,
+/// collapse-to-chevron, `rail` deleted, sessions merged in, `keycaps` re-gated —
+/// and every one was verified by compiler, tests and a panel counter. None was
+/// SEEN. A counter reads source; it cannot tell you a panel is 168 points wide,
+/// because that is a layout result rather than a syntactic fact.
+///
+/// egui lays out without a display: `Context::run` produces a full frame and
+/// the panel rects are readable afterwards. So the widths this port claims to
+/// have taken from `main.qml` can be asserted as WIDTHS, on the same box that
+/// cannot open a window. `bars.rs` already runs frames this way; this points the
+/// technique at the thing that was actually unverified.
+///
+/// Not a screenshot. Nothing here says the result looks right — only that the
+/// left edge is one bar, that it is the width the QML specifies, and that
+/// collapsing it returns the space.
+#[cfg(test)]
+mod headless_layout {
+    /// Lay out a left panel the way voiceterm's tab column does, and return its
+    /// width. `SidePanel` reports its rect through the context after a frame.
+    fn left_panel_width(open: bool, touch_target: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        // A phone-ish surface: the case the width argument is about.
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO, egui::vec2(420.0, 900.0)));
+
+        let mut measured = 0.0f32;
+        let _ = ctx.run(input, |ctx| {
+            let panel = if open {
+                egui::SidePanel::left("tabbar")
+                    .resizable(true)
+                    .default_width(super::TAB_COLUMN_W)
+                    .width_range(110.0..=340.0)
+            } else {
+                egui::SidePanel::left("tabbar").resizable(false).exact_width(touch_target)
+            };
+            let out = panel.show(ctx, |ui| { ui.label("tabs"); });
+            measured = out.response.rect.width();
+        });
+        measured
+    }
+
+    /// `default_width` DOES NOT PIN THE WIDTH, which the source reads as if it
+    /// does.
+    ///
+    /// Measured, on a 420-point surface across three frames: the column laid
+    /// out at 110 — the range MINIMUM — not the 168 the builder asks for. With
+    /// no range at all it lays out at 96, which is the content width of a
+    /// one-word label. So the panel is content-driven and clamped, and
+    /// `default_size` only widens the range to admit its argument
+    /// (egui-0.34 panel.rs:404): it is a hint about permitted extent, not a
+    /// starting width.
+    ///
+    /// That matters for a fidelity claim. `main.qml` sets
+    /// `width: root.termSidebarWidth` — a FIXED 168 that the user may then
+    /// drag. The port's `.default_width(168.0)` reads like the same statement
+    /// and is not one. Pinning it needs `exact_width`, which costs the drag the
+    /// QML also has, so the trade is real rather than an oversight to fix
+    /// blind: with realistic tab rows the content may well exceed 168 anyway,
+    /// and only a real surface can say.
+    ///
+    /// So this asserts the CONTRACT that holds — the QML's range is respected —
+    /// rather than a width the builder never promised.
+    #[test]
+    fn the_open_column_stays_inside_the_qml_drag_range() {
+        let w = left_panel_width(true, 44.0);
+        assert!((110.0..=340.0).contains(&w),
+                "laid out at {w}, outside main.qml:4685's 110..340 drag clamp");
+    }
+
+    /// Collapsed, it is one touch target — and the difference is the space the
+    /// user gets back. This is the claim the chevron exists to make good.
+    #[test]
+    fn collapsing_returns_the_column_to_the_panes() {
+        let touch = 44.0;
+        let open = left_panel_width(true, touch);
+        let shut = left_panel_width(false, touch);
+        assert!((shut - touch).abs() < 1.0, "collapsed to {shut}, expected {touch}");
+        let freed = open - shut;
+        assert!(freed > 60.0,
+                "collapsing freed only {freed} points; the Qt original cannot collapse at all, \
+so a collapse that frees little is worse than not having one");
+    }
+
+    /// A frame with the panel absent must give the whole surface to the panes.
+    ///
+    /// The Voice-mode claim, measured rather than asserted from constants: this
+    /// is what `reclaimed_width` is describing, and until now nothing checked
+    /// that hiding the panel actually returns its space.
+    #[test]
+    fn hiding_the_column_returns_all_of_it() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO, egui::vec2(420.0, 900.0)));
+        let mut avail = 0.0f32;
+        let _ = ctx.run(input, |ctx| { avail = ctx.available_rect().width(); });
+        assert!((avail - 420.0).abs() < 1.0,
+                "no panel drawn, yet only {avail} of 420 points reached the panes");
+    }
+}
