@@ -101,6 +101,49 @@ when you write a claim about engine state, pair it with a test that fails when
 it stops being true — `archcfg.rs`'s `note_claims` module is the pattern, and
 it now covers markdown as well as registry strings.
 
+## 5b. A test that has never failed has not been tested
+
+**Before trusting a new check, break the thing it checks and confirm it
+notices.** Costs a minute. This session it caught three checks that were
+measuring nothing, and in every case the check was green on arrival, which is
+what made it convincing.
+
+* **Fixture-gated tests.** 28 sites in gpu-gemm read a `/tmp/tiny-*.gguf` and
+  `return` when it is absent. A test that returns early PASSES, so the suite
+  reported 1158 green while the loader, the diffusion path and the MoE routing
+  never executed. Generating the fixtures took the same suite from 5.85 s to
+  20.35 s — same tests, same result line, three and a half times the work.
+* **A validator pointed at nothing.** `wgsl_validate.rs` shipped for months
+  with three tests that exercised the VALIDATOR and never the payload. 187
+  shaders went unchecked while the tool to check them sat in the same file.
+* **An assertion satisfied by the wrong mechanism.** `micsample`'s noise-floor
+  tests asserted `keeps == 0`, and keeps is zero whatever the onset threshold
+  does, because later gates reject repeated room tone regardless. The whole
+  module — 22 tests — passed with the threshold set to 1.02 (fires on
+  everything) and to 40.0 (deaf to anything short of a gunshot).
+
+The shape is the same each time: **the pass was guaranteed by something other
+than the property being claimed.** Reading the test does not reveal that.
+Breaking the code does, immediately.
+
+Three habits fall out of it, in rough order of how often they pay:
+
+1. **Assert on the mechanism you mean.** If the claim is about an onset
+   threshold, count onsets — not keeps, which four other gates also control.
+2. **Assert a RANGE when both directions are failures.** `>= 5` catches one
+   bug; `(2..=5)` catches that bug and its opposite. A floor alone is satisfied
+   by a check that has stopped discriminating.
+3. **Assert the scan found something.** A structural test that greps sources
+   passes every assertion below it when the grep matches nothing. Every scan in
+   this tree asserts a floor on its own match count first, and that is why.
+
+And the corollary, which is harder: **a test that fails when you expected it to
+pass is usually right.** Twice this session the failing test was correct and my
+expectation was the bug — a cosine metric that could not see brightness, and a
+claim about adaptation that was simply false. A test written and then deleted
+because its claim turned out false is a good outcome, not wasted work; say so
+in the commit rather than quietly dropping it.
+
 ## 6. Never trust a bundle's file size
 
 A self-contained bundle carries its whole history, so its size is the
