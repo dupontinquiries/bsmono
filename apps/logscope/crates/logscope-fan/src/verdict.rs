@@ -12,74 +12,41 @@ use std::process::Command;
 
 /// Pull the code to compile from a reply: concatenate every ```fenced``` block (dropping the ```lang line).
 /// Falls back to the whole trimmed text when there are no fences.
-/// Language tags this oracle will compile. A fence with no tag, or one tagged
-/// `text`/`output`/`console`, is not source — it is what the model is SHOWING
-/// you, and concatenating it into the compile unit is why a correct answer
-/// failed.
-fn is_code_tag(tag: &str) -> bool {
-    let t = tag.trim().to_ascii_lowercase();
-    if t.is_empty() { return false }
-    !matches!(t.as_str(),
-        "text" | "output" | "console" | "sh" | "bash" | "shell" | "log" | "json"
-        | "toml" | "yaml" | "yml" | "diff" | "md" | "markdown" | "plain" | "none")
-}
-
+/// Extract the source a worker meant to deliver.
+///
+/// Delegates the SCAN to [`crate::reply::fences`] and keeps only the POLICY:
+/// prefer source blocks, fall back to non-source fenced content, fall back to
+/// the raw reply. The scan used to live here as a hand-rolled next-fence
+/// search, which is how it came to join an output block into the compile unit
+/// and fail correct answers.
+///
+/// Behaviour is unchanged for every case the old parser got right, and one case
+/// it got wrong now works: a four-backtick block containing three-backtick
+/// blocks. CommonMark closes a fence with a run at least as long as the opener,
+/// so ` ````md ` wrapping a ` ```rust ` example is ONE block whose body
+/// contains the inner fence — the old scan cut it at the inner fence and
+/// silently dropped the rest.
 pub fn extract_code(reply: &str) -> String {
-    let mut blocks = Vec::new();
-    // Fences whose tag says "not source". Kept separately rather than dropped:
-    // they are the wrong thing to CONCATENATE with source, and the right thing
-    // to fall back to when there is no source at all.
-    let mut other: Vec<String> = Vec::new();
-    let mut rest = reply;
-    while let Some(start) = rest.find("```") {
-        let after = &rest[start + 3..];
-        let nl = after.find('\n');
-        // The fence's language tag is everything up to the newline.
-        let tag = &after[..nl.unwrap_or(0)];
-        let body_start = nl.map(|i| i + 1).unwrap_or(after.len());
-        let body = &after[body_start..];
-        if let Some(end) = body.find("```") {
-            // ONLY SOURCE FENCES. This joined EVERY fenced block, and the
-            // commonest shape of a model reply is the code followed by a fence
-            // showing what it prints:
-            //
-            //     ```rust
-            //     pub fn f() -> i32 { 1 }
-            //     ```
-            //     Running it prints:
-            //     ```
-            //     1
-            //     ```
-            //
-            // The join produced `pub fn f() -> i32 { 1 }` then a bare `1`,
-            // which does not compile — so the oracle failed the branch for
-            // SHOWING ITS OUTPUT. Measured, not hypothesised.
-            if is_code_tag(tag) {
-                blocks.push(body[..end].to_string());
-            } else {
-                other.push(body[..end].to_string());
-            }
-            rest = &body[end + 3..];
-        } else { break; }
+    let fences = crate::reply::fences(reply);
+
+    // Tier 1: source blocks, joined. A reply legitimately splits across two
+    // ```rust fences and both belong to one compile unit.
+    let src: Vec<&str> = fences.iter().filter(|f| f.is_source()).map(|f| f.body).collect();
+    if !src.is_empty() {
+        return src.join("\n\n");
     }
-    // THREE TIERS, and the middle one exists because skipping non-source fences
-    // introduced a regression I had to go looking for.
-    //
-    // A worker asked to produce a manifest answers with one `toml` fence and
-    // nothing else. With only the source/prose split, that had no source
-    // fences and fell all the way through to the raw reply — handing the
-    // checker the prose AND the ``` markers, which is worse than the bug this
-    // function was just fixed for. `cmd` is caller-supplied, so a non-Rust
-    // checker is an ordinary case rather than a hypothetical.
-    if !blocks.is_empty() {
-        blocks.join("\n\n")
-    } else if !other.is_empty() {
-        // No source, but fenced content exists: it is what the worker meant to
-        // deliver, whatever its tag claims.
-        other.join("\n\n")
-    } else {
-        reply.trim().to_string()
+
+    // Tier 2: fenced content whose tag says it is not source. A worker asked
+    // for a manifest answers with one `toml` fence and nothing else, and `cmd`
+    // is caller-supplied so a non-Rust checker is ordinary. Falling past this
+    // to the raw reply hands the checker the prose AND the fence markers.
+    let other: Vec<&str> = fences.iter().map(|f| f.body).collect();
+    if !other.is_empty() {
+        return other.join("\n\n");
     }
+
+    // Tier 3: no fences at all — some workers answer with bare source.
+    reply.trim().to_string()
 }
 
 /// Compile `code` with shell command `cmd`, returning Pass/Fail (None if the code is empty or the checker
@@ -190,6 +157,32 @@ a correct answer was graded as a compile failure: {code:?}");
         let code = extract_code(reply);
         assert!(code.contains("fn a"));
         assert!(!code.contains("[package]"), "the toml block must not be concatenated: {code:?}");
+    }
+
+/// The case the hand-rolled scan got wrong and the shared one does not.
+    ///
+    /// A worker asked to write documentation answers with a four-backtick
+    /// block wrapping a three-backtick example. CommonMark says that is ONE
+    /// block; the old next-fence search cut it at the inner fence and dropped
+    /// everything after, so the oracle compiled a fragment.
+    #[test]
+    fn a_four_tick_block_is_not_cut_at_its_inner_fence() {
+        let reply = "````rust\n/// Example:\n/// ```\n/// let x = 1;\n/// ```\n\
+pub fn f() -> i32 { 1 }\n````\n";
+        let code = extract_code(reply);
+        assert!(code.contains("pub fn f"), "the source after the inner fence was lost: {code:?}");
+        assert!(code.contains("let x = 1"), "the inner example was lost: {code:?}");
+    }
+
+    /// And the migration must not have changed the tier order.
+    #[test]
+    fn source_still_wins_and_non_source_still_rescues() {
+        // Both present: source only.
+        let both = extract_code("```rust\nfn a() {}\n```\n```\noutput\n```\n");
+        assert!(both.contains("fn a") && !both.contains("output"));
+        // Only non-source: it is the answer, without the prose.
+        let only = extract_code("Here:\n```toml\n[package]\n```\n");
+        assert!(only.contains("[package]") && !only.contains("Here:"));
     }
 
     #[test]
