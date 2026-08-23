@@ -163,8 +163,15 @@ absorbing all of it.
   the other ported crates' `rust,no_run` blocks — they only compile when the
   crate builds standalone, which C9-2c shows is not a given.
 
-- **C9-2c — Sweep for other feature-unification hiders.** `parked` · `verified`
-  (c10). `cargo check -p <each>` is the right test; the two known instances
+- **C9-2c — Sweep for other feature-unification hiders.** `queued` · tool
+  `verified`, sweep NOT RUN (c10). `maintenance/tools/feature_sweep.sh` now
+  exists: 260 packages, one `cargo ailite check` each in its own directory,
+  resumable because the run is hours long. `--report` names what was NOT
+  REACHED so a partial run cannot be read as a clean one. Carries CLAUDE.md
+  §3's native-dep gates, and that table is proven load-bearing — without the
+  beatspace entry the crate goes ok(62s) → FAIL(150s). What remains is
+  literally running it somewhere with the hours; this box cannot.
+  ORIGINAL NOTE (c10, before the tool existed): `cargo check -p <each>` is the right test; the two known instances
   (`snapclone-nat` tokio sync, `scene-kit` — both found in earlier sessions)
   now check clean: fixes were committed. A full cross-repo sweep would take
   hours (50+ workspace members, 30–60 seconds per crate depending on features),
