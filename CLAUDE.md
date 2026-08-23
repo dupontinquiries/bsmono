@@ -14,17 +14,24 @@ build system, [LAYOUT.md](LAYOUT.md) for the taxonomy,
 ## 1. Start every session by arming capture
 
 ```sh
-export CAPTURE_LOG=/tmp/session-capture-$USER.jsonl   # a FIXED path, see below
 source maintenance/tools/session_capture.sh
 ```
 
-**Pin `CAPTURE_LOG` yourself.** The default is `${TMPDIR}/session-capture-$$.jsonl`
-and `$$` is the sourcing shell's pid. An agent harness runs every command in a
-*fresh shell*, so the default opens a new log per invocation, the post-commit
-mark never matches, and each commit gets only its own invocation's commands.
-That is visible in this repo's own history: some notes are two lines long.
+The default log is keyed by (user, repo) — any shell sourcing it in the same
+repo appends to the same log, so a harness that runs every command in a fresh
+`bash -c` still produces complete notes, and a shell's final command is
+recovered from a sidecar file at the next source or commit (with `exit:null`,
+since its status died with the shell). Pinning `CAPTURE_LOG` to a fixed path
+still works and still wins, but is no longer required. The recorder is
+bash-only; if the harness shell is `dash` or another `sh`, wrap the work:
+`bash -c 'source maintenance/tools/session_capture.sh && <commands>'`.
 
-If a clone has never had the hook installed:
+`./maintenance/tools/session_capture.sh --selftest` simulates exactly that
+fresh-shell harness against a scratch repo and must pass; run it if notes
+ever look thin.
+
+If a clone has never had the hook installed (or was installed before the
+sidecar mechanism existed — the hook is generated, rerun is idempotent):
 `./maintenance/tools/session_capture.sh --install`
 
 Notes do **not** travel with `git clone`. Fetch them explicitly:

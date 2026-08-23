@@ -59,10 +59,19 @@ shell recorded. `--install` sets up the hook, `source` starts the recording, and
 the two are separate steps. A session that only ran `--install` produces empty
 notes.
 
-**A new shell.** The trap lives in one shell process. A subshell, a new
-terminal, or a `bash -c` that does not source the script records nothing for
-its own commands. When an agent spawns commands in fresh shells, source it
-inside the same invocation that commits.
+**A new shell that never sources.** The trap lives in one shell process. A
+subshell, a new terminal, or a `bash -c` that does not source the script
+records nothing for its own commands — source it inside each invocation.
+Two failure modes that USED to live here are closed and worth knowing about
+because their fix shapes the records. The default log is keyed by
+(user, repo), not by shell pid, so fresh shells share one log and the
+commit hook sees all of them. And a shell's final command — which
+flush-on-next-command could never write, meaning a one-command-per-shell
+harness recorded nothing — is parked in a `$CAPTURE_LOG.pending.<pid>`
+sidecar when it starts and swept into the log by the next source or commit.
+A swept record carries `"exit":null,"ms":null`: the command ran, its status
+died with its shell, and null means *not recorded* as everywhere else in
+the corpus. `--selftest` proves all of this against a scratch repo.
 
 **Notes do not travel.** They are not fetched or pushed by default:
 

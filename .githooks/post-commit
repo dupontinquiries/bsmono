@@ -1,7 +1,32 @@
 #!/bin/sh
 # Attach the commands run since the previous commit to this one, as a note.
 # Silent and non-fatal by design: a capture failure must never break a commit.
-[ -n "${CAPTURE_LOG:-}" ] || exit 0
+# Compute the same (user, repo)-keyed default as session_capture.sh — keep
+# the two in lockstep. A commit made from a shell that never sourced the
+# recorder (an agent invocation that only commits) still finds the shared log
+# this way. The -f guard below keeps "capture never used" silent as before.
+if [ -z "${CAPTURE_LOG:-}" ]; then
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$PWD
+  CAPTURE_LOG="${TMPDIR:-/tmp}/session-capture-$(id -u)-$(printf '%s' "$root" | cksum | cut -d' ' -f1).jsonl"
+fi
+# Sweep sidecars left by dead shells (their unflushed final commands) into
+# the log before slicing, finalized with exit:null. Keep in lockstep with
+# _capture_sweep in session_capture.sh. The committing shell's own sidecar
+# (this very `git commit`) has a live pid and is left for its own flush.
+for p in "$CAPTURE_LOG".pending.*; do
+  [ -f "$p" ] || continue
+  pid="${p##*.}"
+  case "$pid" in *[!0-9]*|'') continue ;; esac
+  kill -0 "$pid" 2>/dev/null && continue
+  cmdjson=$(sed -n 2p "$p")
+  # Ghost filter — see _capture_sweep in session_capture.sh.
+  if [ -f "$CAPTURE_LOG" ] && tail -n 1 "$CAPTURE_LOG" | grep -qF "\"cmd\":$cmdjson}"; then
+    rm -f "$p"; continue
+  fi
+  printf '%s"exit":null,"ms":null,"cmd":%s}\n' \
+    "$(sed -n 1p "$p")" "$cmdjson" >> "$CAPTURE_LOG"
+  rm -f "$p"
+done
 [ -f "$CAPTURE_LOG" ] || exit 0
 # The mark records BOTH the log it refers to and the position in it. Storing
 # only the position was wrong: each session opens a new log starting at line
