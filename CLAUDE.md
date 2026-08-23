@@ -181,6 +181,47 @@ Two cheap mechanics:
    fences wanted "and what if there are ONLY non-source fences". Bounding a
    region wanted "and what if the region is the whole document".
 
+## 5d. A clean build proves the file compiles, not that your edit is in it
+
+**When an edit and a build run in one command, a failed edit reads as a passing
+build.** The edit script raises, the build runs on the unchanged file, and the
+last line of output says what you hoped to see.
+
+Three times in one session, all the same:
+
+* removing voiceterm's `rail` panel (`264582dd`) — the anchor did not match, nothing was
+  written, `cargo check` said `(empty = compiles)`. It was compiling the file
+  that still had `rail` in it.
+* probing the egui chrome audit (`92d42abb`) — a `str.replace` whose pattern
+  did not match, a success line printed unconditionally, and the unchanged count
+  read as evidence that the TOOL was broken. Worse than a wasted build: it
+  argued for undoing a correct fix.
+* wiring the session clock into logscope (`b300aeaa`) — I anchored a new field on
+  `tabbar_open`, which is VOICETERM's field, in a script editing logscope. The
+  traceback printed above a `(empty = compiles)` and I read the second line.
+
+The scripts already `assert old in s`. The assertion fired every time. What
+failed was reading: a Python traceback and a build result in one output block,
+and the eye goes to the familiar line.
+
+Three mechanics, in order of how much they pay:
+
+1. **Do not chain an edit and a build in one invocation.** Run the edit, read
+   its output, then build. Two commands, and the failure has nowhere to hide.
+2. **Make the edit print what changed** — a line count, the new text, the
+   grepped result — so success has a positive signature rather than an absent
+   error.
+3. **After an edit that should change behaviour, grep for the change** before
+   trusting a build. `grep -n 'new_thing' file` is one command and answers a
+   different question than `cargo check`.
+
+The generalisation is worth stating on its own: **a green result describes
+whatever was actually run, which is not necessarily what you think you changed.**
+The same session had `git gc` reporting a corrupt pack from stale output, a
+target dir serving a cached poisoned rustc probe, and a fleet script writing
+logs to a directory it never created. In each case the output was accurate about
+something other than the question being asked.
+
 ## 6. Never trust a bundle's file size
 
 A self-contained bundle carries its whole history, so its size is the
