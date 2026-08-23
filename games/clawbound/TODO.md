@@ -286,6 +286,22 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   runs cleanly; if a future terrain change (different river course, different seed)
   reintroduces a lopsided lane, this is what will catch it — nothing to fix on the
   current map by this metric. 3 tests.
+- [x] `mapeval::lane_score` — the SAME question answered a second time, from the other
+  side of the split, and kept because it answers more of it. Where `lane_water_report`
+  grades water fairness per clan half, this profiles each trail for height, wet fraction,
+  cover and climb along the walk the patrols actually take, and reports both
+  **distinctness** (are the trails different from each other, or the country was shaped
+  for nothing) and **clan_gap** (are they the same for both clans).
+  `examples/lane_report.rs` prints it per land in about a second.
+  Measured across three lands: clan gap **0.0000** every time (the reflection holds),
+  distinctness 0.35-0.41, and the shape the terrain work aimed at is visible in the
+  numbers — duo sits 3-5 units above solo, solo takes the water and the most climb.
+  This is the standing guard that would have caught the two-symmetry-conventions bug in
+  one call instead of a mirror probe and three commits, and it is a unit test now.
+  MERGE NOTE: both live. They do not collide (`LaneWaterReport` vs `LaneProfile`/
+  `LaneScore`) and they agree on the finding that matters — the map is symmetric — which
+  is a genuine independent confirmation rather than duplication to tidy away. If one
+  should go it is a later decision with both sets of numbers in hand.
 - [x] Ancestor crest colours per-kit in the battle render — `ancestor::crest_color`
   (13 distinct hex colours, one per legend, tested for uniqueness), wired into
   `build_battle`'s ancestor-crest branch in place of the team-colour fallback

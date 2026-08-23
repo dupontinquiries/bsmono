@@ -161,3 +161,165 @@ mod lane_water_tests {
         }
     }
 }
+
+// ── the battleground's own grader ───────────────────────────────────────────
+//
+// `score()` grades the wild land as a place to hunt and be hunted. A clan-war
+// map has to answer a different question: are the three trails *different from
+// each other* (or the country was shaped for nothing) and *the same for both
+// clans* (or the match was decided before it started)? Those pull in opposite
+// directions, and neither is visible in a single number, so they get their own.
+
+/// One trail, measured along its length.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LaneProfile {
+    /// Mean height of the walk, in world units.
+    pub height: f32,
+    /// Fraction of sample points standing in water — the river lane's signature.
+    pub wet: f32,
+    /// Mean foliage density: how much of the trail can be fought in unseen.
+    pub cover: f32,
+    /// Mean absolute slope between samples — how much climbing the walk costs.
+    pub climb: f32,
+}
+
+/// How the three trails compare, and whether both clans get the same three.
+#[derive(Clone, Copy, Debug)]
+pub struct LaneScore {
+    /// Duo, mid, solo — as clan A walks them.
+    pub lanes: [LaneProfile; 3],
+    /// Largest difference between any two lanes, over the profile axes. Near
+    /// zero means three identical trails and a map whose terrain did no work.
+    pub distinctness: f32,
+    /// Largest difference between a lane as clan A walks it and the same lane
+    /// as clan B does. **This is the one that must be ~0**: the clan-swap
+    /// reflection is supposed to make it exactly zero, and this is the number
+    /// that would have caught the two-symmetry-conventions bug in one run
+    /// instead of a mirror probe and three commits.
+    pub clan_gap: f32,
+}
+
+impl LaneScore {
+    /// A map is right when its lanes differ from each other and not between
+    /// clans. Verdict rather than score, because a 0.02 clan gap is not "nearly
+    /// fair", it is a bug with a small number attached.
+    pub fn verdict(&self) -> &'static str {
+        if self.clan_gap > 0.05 {
+            "UNFAIR — the same trail plays differently for the two clans"
+        } else if self.distinctness < 0.15 {
+            "FLAT — the three trails are interchangeable; the terrain did no work"
+        } else {
+            "good — distinct trails, identical for both clans"
+        }
+    }
+}
+
+fn walk(from: (f32, f32), to: (f32, f32), bend: (f32, f32)) -> LaneProfile {
+    const N: usize = 40;
+    let mut p = LaneProfile::default();
+    let mut last_h: Option<f32> = None;
+    let mut wet = 0u32;
+    for k in 0..=N {
+        let t = k as f32 / N as f32;
+        // camp -> bend -> camp, the path the patrols actually walk
+        let (x, z) = if t < 0.5 {
+            let u = t * 2.0;
+            (from.0 + (bend.0 - from.0) * u, from.1 + (bend.1 - from.1) * u)
+        } else {
+            let u = (t - 0.5) * 2.0;
+            (bend.0 + (to.0 - bend.0) * u, bend.1 + (to.1 - bend.1) * u)
+        };
+        let h = world::height_at(x, z);
+        p.height += h;
+        if h < world::WATER_Y {
+            wet += 1;
+        }
+        p.cover += world::biome_at(x, z).tree;
+        if let Some(prev) = last_h {
+            p.climb += (h - prev).abs();
+        }
+        last_h = Some(h);
+    }
+    let n = (N + 1) as f32;
+    p.height /= n;
+    p.cover /= n;
+    p.climb /= n;
+    p.wet = wet as f32 / n;
+    p
+}
+
+/// Grade the battleground's three trails. Assumes the caller has baked the
+/// battleground's terrain (pool, lift, river course, seed) — it reads whatever
+/// world is currently loaded.
+pub fn lane_score(camp_a: (f32, f32), camp_b: (f32, f32), bends: [(f32, f32); 3]) -> LaneScore {
+    let a: Vec<LaneProfile> = bends.iter().map(|&b| walk(camp_a, camp_b, b)).collect();
+    let b: Vec<LaneProfile> = bends.iter().map(|&b| walk(camp_b, camp_a, b)).collect();
+    // axes normalised so one unit of each is roughly one unit of "different"
+    let axes = |p: &LaneProfile| [p.height / 8.0, p.wet, p.cover, p.climb / 2.0];
+    let spread = |x: &LaneProfile, y: &LaneProfile| {
+        axes(x)
+            .iter()
+            .zip(axes(y).iter())
+            .map(|(u, v)| (u - v).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let mut distinctness = 0.0f32;
+    for i in 0..3 {
+        for j in i + 1..3 {
+            distinctness = distinctness.max(spread(&a[i], &a[j]));
+        }
+    }
+    let mut clan_gap = 0.0f32;
+    for i in 0..3 {
+        clan_gap = clan_gap.max(spread(&a[i], &b[i]));
+    }
+    LaneScore {
+        lanes: [a[0], a[1], a[2]],
+        distinctness,
+        clan_gap,
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use crate::battleground::Battleground;
+
+    /// The number that matters: both clans must walk the same three trails.
+    /// This is the cheap standing guard for the symmetry the map spent three
+    /// commits acquiring — a single call, no 168-game run required.
+    #[test]
+    fn the_battlegrounds_lanes_are_distinct_and_clan_fair() {
+        let bg = Battleground::new(crate::ancestor::Ancestor::Lion);
+        let bends = [(-85.0, 85.0), (0.0, 0.0), (85.0, -85.0)];
+        let s = lane_score(bg.camps[0], bg.camps[1], bends);
+        assert!(
+            s.clan_gap < 0.02,
+            "the same trail must play the same for both clans, gap {:.3} ({:?})",
+            s.clan_gap,
+            s.lanes
+        );
+        assert!(
+            s.distinctness > 0.15,
+            "the three trails should not be interchangeable, spread {:.3}",
+            s.distinctness
+        );
+        assert_eq!(s.verdict(), "good — distinct trails, identical for both clans");
+        // and the shape the terrain work aimed at: the duo trail climbs, the
+        // solo trail gets the water
+        let (duo, solo) = (s.lanes[0], s.lanes[2]);
+        assert!(duo.height > solo.height, "duo {:?} should sit above solo {:?}", duo, solo);
+        assert!(solo.wet >= duo.wet, "the river belongs to the solo side");
+    }
+
+    #[test]
+    fn the_grader_can_actually_fail() {
+        // A grader that cannot fail is decoration. Walk three copies of one
+        // trail: distinctness collapses and the verdict says so.
+        let bg = Battleground::new(crate::ancestor::Ancestor::Lion);
+        let flat = [(0.0, 0.0); 3];
+        let s = lane_score(bg.camps[0], bg.camps[1], flat);
+        assert!(s.distinctness < 0.15);
+        assert!(s.verdict().starts_with("FLAT"));
+    }
+}

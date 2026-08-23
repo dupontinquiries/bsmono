@@ -73,7 +73,7 @@ Shared library (`lib.rs`):
 - `objectives` — Reach / Rendezvous / Survive / Forage, placed by terrain
 - `assetpack` — the 17 animal IQMs packed into the monorepo's parts-web format (`games/shared/bsweb`, shared with blackstar): 14-bit per-model quantisation, Morton-ordered vertices, planar varint deltas, zstd. 19.0 MB -> 2.81 MB (6.8x), worst error 0.0031% of a model's span. `Model::load` reads it as the normal path; the source IQMs were removed once it proved itself (`docs/ASSET_ARCHIVE.md` has the restore and rewrite commands)
 - `junglemap` — the battleground's jungle layer: mirrored thickets (one-way ambush concealment), stone walls with passes (sight never crosses stone; off-pass crossing is a slow scramble), and mistfalls — pure `(x,z)` functions, local to the mode
-- `mapeval` — map scoring (openness/flow/cover/verticality → S–F) + hunter-vs-cat fairness
+- `mapeval` — map scoring (openness/flow/cover/verticality → S–F) + hunter-vs-cat fairness, plus `lane_score` for the battleground: are the three trails distinct from each other and identical for both clans?
 - `menu` — screen/cursor/settings UI logic + mode/hunter/class selection (tested)
 - `net` — server-authoritative netcode (≤6 players), snapshot delta encode/apply, wire (de)serialize (fuzz-tested)
 
