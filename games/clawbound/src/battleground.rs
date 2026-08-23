@@ -287,10 +287,19 @@ pub struct Battleground {
     wave_n: [u32; 2],     // per-team wave counter — duty/lane rotation must be symmetric
     tick: u32,
     /// Whether AI ancestors coordinate their crowd control (a controller saving
-    /// its pull for a crowd, an area ult waiting for the gather). Public and
-    /// switchable because it is a behaviour worth *measuring*: a balance run can
-    /// play the same drafts on the same land with it off and read the difference
-    /// rather than trusting that coordination helps.
+    /// its pull for a crowd, an area ult waiting for the gather).
+    ///
+    /// **Defaults off, on the evidence.** Measured twice, 168 games each way on
+    /// identical drafts and lands: before lane pairing existed, clan A 48% off
+    /// against 49% on; after it existed and the duo actually travelled as a
+    /// pair, 47% against 47%. No aggregate effect either time — and the kit the
+    /// coordination is *for* came out worse in both (Riptail 52 -> 49, then
+    /// 56 -> 50). Holding an ability is a cost paid now for a payoff that may
+    /// not arrive, and in fights this short it does not pay.
+    ///
+    /// Kept, switchable, and tested, because the behaviour is not wrong — it is
+    /// waiting on an AI that can promise the follow-up rather than hope for it,
+    /// and on a human player who can. Turn it on to measure that day's version.
     pub wombo: bool,
     player_driven: bool,   // becomes true on the first set_input; until then the player's warrior is AI-driven
     input: Option<(f32, f32, bool, Option<usize>)>,   // move dir, claw, ability index
@@ -503,7 +512,7 @@ impl Battleground {
             camps, medics, contention: (0.0, 0.0), contention_holder: None,
             skyrock: (-92.0, 92.0), skyrock_holder: None,
             time: 0.0, outcome: None, patrol_t: [PATROL_INTERVAL * 0.3; 2], wave_n: [0; 2], tick: 0,
-            wombo: true, player_driven: false, input: None,
+            wombo: false, player_driven: false, input: None,
         }
     }
 
@@ -2144,6 +2153,7 @@ mod tests {
             [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal],
         );
         bg.patrol_t = [1e9; 2];
+        bg.wombo = true;
         bg.warriors[0].is_player = false;
         let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
         bg.warriors[1].x = x + 2.0; // Oldroar, Earthshaker ready
@@ -2175,6 +2185,7 @@ mod tests {
             [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal],
         );
         bg.patrol_t = [1e9; 2];
+        bg.wombo = true;
         bg.warriors[0].is_player = false;
         let (x, z) = (bg.warriors[0].x, bg.warriors[0].z);
         bg.warriors[1].x = x + 2.0; // Riptail beside it, Undertow ready
@@ -2200,6 +2211,7 @@ mod tests {
             [Ancestor::Tiger, Ancestor::Leopard, Ancestor::Caracal],
         );
         solo.patrol_t = [1e9; 2];
+        solo.wombo = true;
         solo.warriors[0].is_player = false;
         let (sx, sz) = (solo.warriors[0].x, solo.warriors[0].z);
         let foes: Vec<usize> = (0..solo.warriors.len())

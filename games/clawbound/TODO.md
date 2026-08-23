@@ -255,8 +255,12 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   partner. Ancestors now lane like the country is shaped — seat 0 walks the river solo,
   seats 1-2 climb the mountain together, the middle is the patrols' with a weighted wave
   rotation. Roster spread went 37-65% -> **42-57%**, flatter than any kit tuning achieved.
-- [ ] Re-run the wombo ablation now that a duo pair actually exists — the null result was
-  measured in a world where the coordination could never trigger
+- [x] Re-ran the wombo ablation with duos in place: still nothing (47% clan A either way,
+  spread 43-58 off against 42-57 on), and Riptail — the kit it exists for — came out worse
+  in *both* ablations (52 -> 49, then 56 -> 50). Two independent runs agreeing on the
+  direction is weak but real evidence that holding an ability costs more than it buys in
+  fights this short, so **`wombo` now defaults off**. The code, the switch and the tests
+  stay: the behaviour wants an AI that can promise the follow-up rather than hope for it.
 - [ ] --play wiring in app.rs: input → `set_input`, ability keys, HUD (pile/herbs/tree hp),
   camera follow; needs the `app` feature stack (winit/wgpu) compiled
 - [x] Player-pick draft UI in menu.rs — `Screen::Draft`, 6 pick slots (3 per

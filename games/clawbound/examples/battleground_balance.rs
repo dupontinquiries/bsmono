@@ -45,9 +45,10 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(13);
-    // arg 3: "nowombo" turns off AI crowd-control coordination, so the same
-    // drafts on the same land can be played both ways and compared
-    let wombo = std::env::args().nth(3).as_deref() != Some("nowombo");
+    // arg 3: "wombo" turns ON AI crowd-control coordination (off by default,
+    // because two ablations at 168 games each measured it at nothing), so the
+    // same drafts on the same land can be played both ways and compared
+    let wombo = std::env::args().nth(3).as_deref() == Some("wombo");
     let pool = ancestor::ALL;
     let mut wins = vec![0u32; pool.len()];
     let mut games = vec![0u32; pool.len()];
