@@ -185,25 +185,66 @@ check() {
 #
 # Entries are `label|features`. A project absent from the table gets its
 # defaults only, which is the status quo and correct for most of them.
-fleet_extra_features() {
+# Keyed on the label the loop ACTUALLY produces, and returning full cargo args
+# rather than a feature list.
+#
+# Both details were forced by the member skip above. `logscope-egui` is a
+# workspace member, so the fleet visits `logscope` and never
+# `logscope/crates/logscope-egui` — an entry under the crate's own name would
+# silently never fire, which is the failure mode this whole table exists to
+# fix. And features are per-package, so a workspace root needs `-p NAME
+# --features X`, not a bare `--features X`.
+fleet_extra_args() {
     case "$1" in
         # The wgpu engine: the speculative-decode reporting path, and nine
         # tests that do not otherwise compile. This is the entry that would
         # have caught the reported breakage.
-        logscope/crates/logscope-egui) echo "wgpu-engine" ;;
+        logscope)  echo "-p logscope-egui --features wgpu-engine" ;;
         # beatspace's GUI (cpal + eframe) and its GPU trainer are separate
         # features and the CLI build exercises neither. `opus-decode` is
-        # deliberately excluded: it needs cmake, which is an environment gap
-        # rather than code rot.
-        beatspace)                     echo "app gpu" ;;
-        *)                             echo "" ;;
+        # deliberately excluded: it needs cmake, an environment gap rather than
+        # code rot.
+        beatspace) echo "--features app,gpu" ;;
+        *)         echo "" ;;
     esac
 }
 
+# SKIP crates their parent workspace already builds.
+#
+# `cd crates/foo && cargo check` on a workspace MEMBER re-runs what the parent's
+# `--all-targets` pass just did. Of the 34 crates the third glob adds, 30 are
+# members: measured, not assumed.
+#
+# The 4 that are not are the reason the glob exists at all, and one of them is
+# the point:
+#
+#   apps/logscope/crates/gpu-gemm       EXCLUDED from the workspace — 1188 tests
+#   apps/hatch/crates/hatch-core        no parent manifest
+#   apps/rusty-board/crates/board-*     parent is not a workspace
+#
+# gpu-gemm is excluded by `exclude = ["crates/gpu-gemm", ...]` precisely so a
+# normal build does not pull wgpu, which means the fleet never built the
+# engine — the crate this session spent most of its time in.
+#
+# My first attempt at this check asked only whether the parent HAS a
+# [workspace] table, which counted gpu-gemm as covered. Membership is what
+# decides it, so the test below reads `members` rather than guessing from
+# structure.
+is_workspace_member() {
+    local crate_dir="$1"
+    local parent; parent="$(dirname "$(dirname "$crate_dir")")/Cargo.toml"
+    [ -f "$parent" ] || return 1
+    grep -q '^\[workspace\]' "$parent" || return 1
+    # `exclude` wins over `members`, and both are lists of "crates/NAME".
+    local name; name="crates/$(basename "$crate_dir")"
+    sed -n '/^\[workspace\]/,/^\[/p' "$parent" | grep -q "exclude.*\"$name\"" && return 1
+    sed -n '/^\[workspace\]/,/^\[/p' "$parent" | grep -q "\"$name\"" 
+}
+
 # NOTE the third glob. `apps/*/crates/*` was missing, so every crate under
-# apps/logscope — gpu-gemm, logscope, logscope-fan, logscope-egui — was outside
-# this script entirely. The three errors reported from a real build were in a
-# directory the fleet never visited.
+# apps/logscope — gpu-gemm above all — was outside this script entirely. The
+# three errors reported from a real build were in a directory the fleet never
+# visited.
 for manifest in "$ROOT"/apps/*/Cargo.toml \
                 "$ROOT"/apps/*/egui-frontend/Cargo.toml \
                 "$ROOT"/apps/*/crates/*/Cargo.toml; do
@@ -211,19 +252,21 @@ for manifest in "$ROOT"/apps/*/Cargo.toml \
     dir="$(dirname "$manifest")"
     label="${dir#"$ROOT"/apps/}"
     [ -n "$FILTER" ] && [[ "$label" != *"$FILTER"* ]] && continue
+    # A member is already covered by its parent's --all-targets pass.
+    if is_workspace_member "$dir"; then continue; fi
     echo "==> $label"
     # --all-targets covers bins, examples and tests in one pass; they rot
     # independently and a lib-only check reports a broken app as healthy.
     check "$dir" "$label" "--all-targets"
     # And again with the features anyone actually ships, when there are any.
-    extra="$(fleet_extra_features "$label")"
+    extra="$(fleet_extra_args "$label")"
     if [ -n "$extra" ]; then
-        echo "==> $label [--features ${extra// /,}]"
+        echo "==> $label [$extra]"
         # Label with a HYPHEN, not a space: the label becomes a log filename
         # via `tr '/' '-'`, and "logscope-egui [features].test.log" broke every
         # redirect that used it. Caught by running the script rather than by
         # reading it.
-        check "$dir" "$label+features" "--all-targets --features ${extra// /,}"
+        check "$dir" "$label+features" "--all-targets $extra"
     fi
 done
 
