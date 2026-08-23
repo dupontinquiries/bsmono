@@ -56,6 +56,9 @@
 // The clock the conversation never had: an operator asked to "keep working for
 // the next hour" and no turn carried a timestamp, so the phrase was unreadable.
 #[allow(dead_code)] pub mod sessiontime;
+// Should the run carry on when the model stops talking? Cheap rules first, a
+// small-model call only when they genuinely cannot tell.
+#[allow(dead_code)] pub mod continuation;
 #[allow(dead_code)] pub mod reply;
 #[allow(dead_code)] pub mod capability;
 #[allow(dead_code)] pub mod liaison_fan;
