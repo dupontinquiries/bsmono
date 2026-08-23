@@ -45,6 +45,14 @@
 
 pub mod buffer;
 pub mod editor;
+/// Multi-cursor: `Selection` becomes `Vec<Selection>` and edits fan out.
+///
+/// Declared late. The file sat in src/ with no `mod` line, so it was never
+/// compiled and its 16 tests never ran — while root TODO.md went on listing
+/// multi-cursor as deferred future work in almost the module's own words
+/// ("`Selection` is already value-based; becomes `Vec<Selection>` + edit
+/// fan-out with offset fixup"). The work was done; nothing reached it.
+pub mod multicursor;
 pub mod gitspace;
 pub mod history;
 pub mod op;

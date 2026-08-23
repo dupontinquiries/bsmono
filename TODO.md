@@ -251,7 +251,7 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   `filesummary.rs` two-tier design (structural digest = instant/
   deterministic; model summary = background/cached). Wired into the palette
   (`Mode::GoToRoute`) with real jump-to-line. 7 tests,
-  `cargo test -p aperture-core --features tree-sitter`: 73/73.
+  `cargo test -p aperture-core --features tree-sitter`: 89/89 (was 73 before multicursor was declared).
   AI tier: `aperture_complete::route_ai` is the request-builder + pending/
   fulfill cache (prompt construction, content-hash-keyed dedup,
   `take_pending`/`fulfill` — the same servicing-seam shape as
@@ -308,8 +308,15 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   project~~ DONE (`project_search.rs`, Ctrl+Shift+F). ~~Go to symbol in
   workspace~~ DONE (`workspace_symbols.rs`, Ctrl+T, name index over every
   file's existing tree-sitter outline — not semantic go-to-def).
-- **Multi-cursor**: `Selection` is already value-based; becomes
-  `Vec<Selection>` + edit fan-out with offset fixup.
+- ~~**Multi-cursor**~~ **DONE, and it had been done for a while.**
+  `aperture-core/src/multicursor.rs` — `Cursors`, `Edit`, `merge_overlaps`,
+  16 tests — implements exactly what this line described, in almost the same
+  words ("milestone 4: `Selection` becomes `Vec<Selection>` and edits fan
+  out"). It had no `mod` declaration, so it was never compiled and its tests
+  never ran, and this entry went on calling it future work. Found by
+  `maintenance/tools/orphan_check.py`; declared 2026-08-22.
+  Still to do: the shell has no keybinding for it, so the capability exists in
+  the core and nothing in the UI reaches it.
 - **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
   need galley-measured x (egui does no full shaping — known engine limit).
 - **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same
