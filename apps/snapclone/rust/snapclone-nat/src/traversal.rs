@@ -9,10 +9,16 @@
 //! ```rust,no_run
 //! use snapclone_nat::{NatTraversal, NatConfig, NatEvent};
 //!
-//! let (mut nat, mut events) = NatTraversal::new(NatConfig::default());
-//! nat.start().await.unwrap();
+//! # async fn example() -> anyhow::Result<()> {
+//! let (nat, mut events) = NatTraversal::new(NatConfig::default());
 //!
-//! while let Some(evt) = events.recv().await {
+//! // `discover` runs STUN on the punch socket and emits events as it goes,
+//! // so drain the receiver alongside it rather than after — the channel is
+//! // bounded at 32 and `discover` awaits its own sends.
+//! let reflexive = nat.discover().await?;
+//! println!("Public address: {}:{}", reflexive.ip, reflexive.port);
+//!
+//! while let Ok(evt) = events.try_recv() {
 //!     match evt {
 //!         NatEvent::ReflexiveAddress { ip, port } => {
 //!             println!("Public address: {}:{}", ip, port);
@@ -26,6 +32,8 @@
 //!         _ => {}
 //!     }
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::cgnat::{AddrClass};

@@ -116,6 +116,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+]
+
+[[package]]
 name = "audiopus"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -353,6 +360,10 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "core-kit"
+version = "0.1.0"
 
 [[package]]
 name = "cpufeatures"
@@ -2592,6 +2603,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 name = "snapclone-audio"
 version = "0.1.0"
 dependencies = [
+ "audio-kit",
  "audiopus",
  "chacha20poly1305",
  "hkdf",

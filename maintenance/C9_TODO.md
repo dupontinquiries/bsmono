@@ -371,6 +371,47 @@ Deliberately outside the repo rather than gitignored inside it: a gitignored
 path can still be `git add -f`'d. **Lost on sandbox reset**; originals are
 read-only under `/mnt/user-data/uploads/`.
 
+- **C9-7a — snapclone exists TWICE, and one copy absorbed two of my fixes.**
+  `measured` · blocked on a decision that is not mine to make.
+
+  ```
+                     files   commits   last commit
+  apps/snapclone       754       165   2026-08-22 ae9f92a3
+  system/snapclone     654         8   2026-08-22 9932142f  (mine)
+  ```
+
+  Content diff: 600 files identical, **52 differ**, 102 exist only in `apps/`
+  (the entire `egui-frontend/`, ~100 files), and 2 only in `system/` — one of
+  which is `log.txt`. So `apps/` is the live tree with the port in it, and
+  `system/` is a stale near-subset.
+
+  **The docs disagree, which is how this persisted.** `LAYOUT.md` names
+  `system/` canonical — "system-tier services that daemonize: snapclone (DHT /
+  identity / relay, the canonical Rust↔C++ FFI)" — while
+  `manifest/projects.toml` points `[apps.snapclone-egui]` at
+  `apps/snapclone/egui-frontend` and marks it `primary = true`. Both are
+  accurate about their own concern and together they are a trap.
+
+  **I fell in it twice.** `cd85b79a` (snapclone-nat) and `9932142f`
+  (snapclone-crypto build.rs) both landed in `system/`, the tree nobody builds.
+  Ported to `apps/` in a later commit, where both bugs were genuinely present —
+  the stale `nat.start()` doctest, and a `build.rs` rewriting a committed
+  header on every build. The tokio `sync` feature turned out to be fixed in
+  `apps/` already, so only two of the three applied.
+
+  **What is NOT decided, deliberately.** Which tree survives, and what happens
+  to the 52 differing files. That is a merge across 42 crates plus C++ headers
+  and CMake, and the two trees have diverged in `src/` (19 files), `rust/` (16)
+  and `include/` (10). Deleting either without reading those 52 is the `iq3`
+  mistake at scale — and unlike `iq3` there is no test suite standing behind
+  the loser.
+
+  The cheap half is already done and worth doing first regardless of the
+  outcome: `maintenance/tools/orphan_check.py` reports the duplicated
+  `camera-bridge/src/shared_frames.rs` in both trees, and the file-level diff
+  above regenerates in seconds
+  (`python3 -c` over both trees hashing every file — see the commit).
+
 - **C9-6a — beatspace GAN smoke test.** `in-progress` — the next task.
   From `beatspace-listeners-analogy.md`: multiple discriminators as simulated
   listeners; tiered models raced scout-and-wolfpack style; hash-to-musical-legend
