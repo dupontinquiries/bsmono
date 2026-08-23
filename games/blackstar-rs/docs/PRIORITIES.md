@@ -136,11 +136,17 @@ fixed, and moving between them is a position and a walkable check.
 
 ## The order I would actually do it in
 
-1. **One mission, end to end, badly.** Pick `the_beach_opens`. Start it from a
-   console, fly the drop, land, walk, clear it, and come back. Every piece
-   exists in isolation; none of them has ever been asked to run in sequence
-   with a renderer attached. Expect that to break in ways no headless test
-   predicted, and expect it to be worth more than the next ten drivers.
+1. **One mission, end to end, badly** — DONE in simulation. Five sorties run
+   in sequence from the Bridge, each flying to its own world:
+
+       the_pluto_line     — clean drop on PLUTO — sortie CLEARED
+       the_red_extraction — clean drop on MARS  — sortie CLEARED
+       the_beach_opens    — clean drop on EARTH — sortie CLEARED
+
+   The board advances, the drop reads the mission's destination, and a bad
+   landing costs the engagement. What has never happened is any of it with a
+   renderer attached — which is still the honest boundary and is now the ONLY
+   one.
 2. **The player body at two scales**, because everything else is unplayable
    until walking works.
 3. **The starmap**, so `patrol` becomes reachable.

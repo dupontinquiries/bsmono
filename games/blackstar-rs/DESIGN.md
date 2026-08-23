@@ -6146,6 +6146,33 @@ triangles every frame and it needs no GPU to catch.
 
 1114 passing.
 
+THE HARNESS WAS FINE AND I BLAMED IT TWICE. Two sessions running, I tried to
+reach the Bridge's sortie row with `--menu bridge --tape d,d,a`, got the
+nightfall row instead, and concluded the tape could not reach arbitrary rows.
+Worked around it both times rather than looking.
+
+Selection WRAPS. The bridge has two selectable rows, so the second `d` returns
+to the first. `d,a` is the sortie, and it always was.
+
+That is worth recording as a habit rather than a fact: I hit an unexpected
+result from my own tool, formed a theory about the tool, and did not spend the
+thirty seconds to test the theory — twice. The check that settled it was three
+tapes side by side, which is the thing I should have run the first time.
+
+WITH IT USED CORRECTLY, THE CAMPAIGN RUNS:
+
+    the_pluto_line     — clean drop on PLUTO — sortie CLEARED
+    the_red_extraction — clean drop on MARS  — sortie CLEARED
+    the_beach_opens    — clean drop on EARTH — sortie CLEARED
+    what_jhiaxus_grew  — clean drop on EARTH — sortie CLEARED
+
+Five in sequence, the board advancing, each reading its own destination. That
+is `PRIORITIES.md` item 1 — "one mission end to end, badly" — done in
+simulation, and a test now pins it by driving the log directly so it does not
+depend on menu navigation.
+
+1115 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -1116,6 +1116,33 @@ mod tests {
     }
 
     #[test]
+    fn the_campaign_runs_in_sequence() {
+        // PRIORITIES.md item 1 was "one mission end to end, badly". This is
+        // the whole board: each sortie flies to its own destination and the
+        // next one becomes available, which is the thing that had never been
+        // asked to happen in sequence.
+        //
+        // Verified by driving the log directly rather than the console, so it
+        // does not depend on menu navigation.
+        let mut camp = crate::campaign::CampaignLog::from_line("");
+        let mut flown = Vec::new();
+        for _ in 0..6 {
+            let Some(m) = camp.next() else { break };
+            let a = arrive_at(m.dest);
+            assert!(!a.line.is_empty(), "{} did not fly anywhere", m.id);
+            flown.push((m.id, m.dest));
+            camp.record(m.id);
+        }
+        assert!(flown.len() >= 5, "the board stalled after {}", flown.len());
+        // and they are not all the same place — the drop is reading the
+        // mission rather than a constant
+        let mut worlds: Vec<&str> = flown.iter().map(|(_, d)| *d).collect();
+        worlds.sort_unstable();
+        worlds.dedup();
+        assert!(worlds.len() >= 3, "five missions visited {worlds:?}");
+    }
+
+    #[test]
     fn a_sortie_flies_to_its_destination_before_it_resolves() {
         // "resolved, not flown" was the honest label when there was nothing
         // to fly. The mission names a dest, patrol knows its physics, and

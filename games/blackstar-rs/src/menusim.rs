@@ -3,6 +3,19 @@
 //!     skydribble --menu                      walk the stations (list)
 //!     skydribble --menu armory               open one console, watch it deploy
 //!     skydribble --menu armory --tape d,d,a  then play an input tape
+//!
+//! ## The tape wraps, and I blamed it twice for that
+//!
+//! `d` down, `u` up, `a` activate. Selection WRAPS at the ends, and a console
+//! with two selectable rows therefore returns to the first on the second `d`.
+//! I ran `d,d,a` on the bridge expecting the sortie, got the nightfall row it
+//! had wrapped back to, and concluded the harness could not reach arbitrary
+//! rows — twice, in two different sessions, working around it both times.
+//!
+//! It reaches them fine. `d,a` is the sortie. Counting the SELECTABLE rows —
+//! headings, gaps and disabled rows are skipped — is the whole trick, and
+//! `--menu <station>` with no tape prints them in order so the count is
+//! there to read.
 //!     skydribble --menu motion               the fx kit's dials, demonstrated
 //!
 //! Every animation in `menufx.rs` is a pure function of time, which
