@@ -40,6 +40,13 @@ FILTER="${1:-}"
 # again. Under /tmp rather than in the repo: these are transient and a stray
 # 4 MB log committed by accident is worse than one that vanishes on reboot.
 LOGDIR="${FLEET_LOGDIR:-/tmp/fleet-logs}"
+# Create it. This was assigned and never created, so the script only worked in a
+# shell where a previous run had left the directory behind — on a clean box, or
+# after anyone cleared /tmp, every test log and the summary silently failed to
+# write and the run reported "0 crates green, 0 tests passed" with the builds
+# perfectly fine. Found by deleting /tmp/fleet-logs before a rerun, which is
+# also the state a fresh machine is in.
+mkdir -p "$LOGDIR" || { echo "cannot create $LOGDIR" >&2; exit 1; }
 FAILED=()
 OK=0
 TESTED=()          # "label PASS 128" / "label FAIL 3"
@@ -163,7 +170,43 @@ check() {
     rm -f /tmp/fleet.$$
 }
 
-for manifest in "$ROOT"/apps/*/Cargo.toml "$ROOT"/apps/*/egui-frontend/Cargo.toml; do
+
+# ── EXTRA FEATURE PASSES ──────────────────────────────────────────────────────
+#
+# This script builds DEFAULT features. That is how three compile errors in
+# logscope-egui reached the operator's machine while every check here was green:
+# they live behind `wgpu-engine`, and the same crate's 988 tests include nine
+# that only exist when it is on. A default-only fleet reports a crate healthy
+# and says nothing about the configuration anyone actually ships.
+#
+# `--all-features` is not the answer — it would pull llamacpp, voice-cuda and
+# voice-metal, none of which build here and two of which are mutually
+# exclusive. So: a table, one line per project, with the reason.
+#
+# Entries are `label|features`. A project absent from the table gets its
+# defaults only, which is the status quo and correct for most of them.
+fleet_extra_features() {
+    case "$1" in
+        # The wgpu engine: the speculative-decode reporting path, and nine
+        # tests that do not otherwise compile. This is the entry that would
+        # have caught the reported breakage.
+        logscope/crates/logscope-egui) echo "wgpu-engine" ;;
+        # beatspace's GUI (cpal + eframe) and its GPU trainer are separate
+        # features and the CLI build exercises neither. `opus-decode` is
+        # deliberately excluded: it needs cmake, which is an environment gap
+        # rather than code rot.
+        beatspace)                     echo "app gpu" ;;
+        *)                             echo "" ;;
+    esac
+}
+
+# NOTE the third glob. `apps/*/crates/*` was missing, so every crate under
+# apps/logscope — gpu-gemm, logscope, logscope-fan, logscope-egui — was outside
+# this script entirely. The three errors reported from a real build were in a
+# directory the fleet never visited.
+for manifest in "$ROOT"/apps/*/Cargo.toml \
+                "$ROOT"/apps/*/egui-frontend/Cargo.toml \
+                "$ROOT"/apps/*/crates/*/Cargo.toml; do
     [ -f "$manifest" ] || continue
     dir="$(dirname "$manifest")"
     label="${dir#"$ROOT"/apps/}"
@@ -172,6 +215,16 @@ for manifest in "$ROOT"/apps/*/Cargo.toml "$ROOT"/apps/*/egui-frontend/Cargo.tom
     # --all-targets covers bins, examples and tests in one pass; they rot
     # independently and a lib-only check reports a broken app as healthy.
     check "$dir" "$label" "--all-targets"
+    # And again with the features anyone actually ships, when there are any.
+    extra="$(fleet_extra_features "$label")"
+    if [ -n "$extra" ]; then
+        echo "==> $label [--features ${extra// /,}]"
+        # Label with a HYPHEN, not a space: the label becomes a log filename
+        # via `tr '/' '-'`, and "logscope-egui [features].test.log" broke every
+        # redirect that used it. Caught by running the script rather than by
+        # reading it.
+        check "$dir" "$label+features" "--all-targets --features ${extra// /,}"
+    fi
 done
 
 # Wait for the last test runs. They were started as their crate finished

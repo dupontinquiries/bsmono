@@ -12,7 +12,9 @@
 //!
 //! Not lines, and not age — the product, summed over unreviewed commits.
 //!
-//!     debt = Σ (lines_changed × days_since_written)
+//! ```text
+//! debt = Σ (lines_changed × days_since_written)
+//! ```
 //!
 //! Five hundred lines reviewed the same day is fine. Fifty lines unreviewed for two months is a
 //! hazard, because reviewability decays: the author's reasoning is gone, the surrounding code has
