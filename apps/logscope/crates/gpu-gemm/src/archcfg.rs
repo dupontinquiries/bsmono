@@ -1101,18 +1101,22 @@ supported: {}", for_arch("qwen2").note);
         // KNOWN ORPHANS, each with the decision that keeps it here. The point
         // of an allowlist rather than a silent skip: a NEW orphan fails
         // immediately, and each existing one has to carry a reason.
+        //
+        // llada2 and quant_mix were here and are gone — declared once it was
+        // checked that neither is a superseded duplicate (llada2 collides with
+        // nothing in this crate; quant_mix's only shared names are generic ones
+        // in unrelated modules) and that both are std-only with no imports at
+        // all. Their 28 tests now run. The entries were removed because THIS
+        // TEST demanded it: the expiry check below failed the moment they were
+        // declared and named them.
         const KNOWN: &[(&str, &str)] = &[
             ("kernels",
-             "the 2026-07-26 shader extraction (90 .wgsl + kernels.rs) was written and never \
-wired. lib.rs still carries 57 inline r#\"...\"# copies and has been edited continuously since, \
-so 13 of 82 comparable shaders have DRIFTED and the inline copy is the live one. Do not fix by \
-declaring it as a module — that silently swaps 13 shaders on real hardware with no GPU here to \
-check, which is what LOGSCOPE_PASS_FUSE did. Regenerate the .wgsl from lib.rs, or delete them."),
-            ("llada2",
-             "LLaDA2.0's layer plan, 12 tests, zero references. archcfg lists llada2 as supported, \
-so whatever implements it is elsewhere; this is a second copy nobody calls."),
-            ("quant_mix",
-             "which checkpoint types survive loading, 16 tests, zero references."),
+             "the 2026-07-26 shader extraction, PARTIALLY adopted — lib.rs include_str!s one of \
+the 90 files directly and carries inline r#\"...\"# consts for 82 more, so kernels.rs itself is the \
+unreachable part. The files and the inline consts now agree (see \
+every_shadowed_shader_matches_the_inline_source_that_runs), so completing the extraction is a \
+mechanical swap. Not done here: it changes which source 13 shaders compile from, on hardware this \
+sandbox cannot run."),
         ];
 
         let roots: Vec<&str> = vec![

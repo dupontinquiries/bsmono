@@ -147,6 +147,15 @@ pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 // used to skip in silence, which is why a green suite could mean the loader
 // never ran.
 #[cfg(test)] mod testfix;
+// Two modules that sat in src/ with no `mod` line — never compiled, 28 tests
+// that had never run. Neither is a superseded duplicate (the iq3 case): llada2
+// collides with nothing in this crate, and quant_mix's only shared names are
+// generic ones in unrelated modules. Both are std-only with no imports at all,
+// which is why declaring them is safe to do without hardware.
+//   llada2    — LLaDA2.0's layer plan; archcfg lists the arch as supported.
+//   quant_mix — what an Unsloth `UD-` dynamic mix actually costs to load.
+#[allow(dead_code)] pub mod llada2;
+#[allow(dead_code)] pub mod quant_mix;
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
 #[allow(dead_code)] pub mod moe;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
 #[allow(dead_code)] pub mod mla;     // Multi-head Latent Attention (DeepSeek/GLM) compressed-KV — CPU reference
