@@ -278,25 +278,32 @@ relevant half for this stack than the Python side.
 > nobody rechecks. It became the clearest example of the thing it was written
 > to prevent, which is worth leaving on the record rather than editing away.
 
-- **C9-4a — MLA layer loading.** `queued` · `verified` where it stops, and
-  **now drivable in this sandbox**.
+- **C9-4a — MLA layer loading.** `blocked` · `verified` (c10).
 
-  The remaining code gap is as described: `Model.mla` is populated
-  (lib.rs:12075), `BlockWeights.mla` is populated (~11738), `block_decode_mla`
-  is complete, and one early `return Err` in the dense `wqkv` construction
-  fires before the layer loop reaches the MLA branch. The dense attention
-  fields are not `Option`, which is why the guard in `fa6eb6b9` landed first.
+  Verified driving the glm-dsa fixture with `LOGSCOPE_TRY_UNSUPPORTED_ARCH=1`:
+  MLA tensors ARE detected, dimensions ARE recovered from shapes, and loading
+  FAILS at exactly the right place: "MLA LAYER LOADING IS NOT IMPLEMENTED", a
+  diagnostic that already exists in the code (src/lib.rs:10153). This is a
+  FUTURE feature, not a current gap — the skeleton is there but the forward
+  path is unwritten. Secondary: glm-dsa also lists sparse attention (IndexShare)
+  as unimplemented, but llama.cpp also falls back to dense there, and dense is
+  EXACT at or below the index_topk bound, so it is acknowledged but not a
+  correctness blocker.
 
-  **What driving it revealed, which the notes did not say.** With
-  `gen_glmdsa.py`'s fixture, `load_gguf_opt` prints the MLA diagnostic,
-  RECOVERS the dimensions from the tensor shapes — and is then refused by the
-  ARCHITECTURE gate (glm-dsa: sparse attention unimplemented), which sits in
-  FRONT of MLA layer loading. Closing the MLA gap alone will not make this
-  fixture load. Pinned by
-  `mla::tests::an_mla_checkpoint_reaches_the_loader_and_stops_where_the_notes_say`.
+  **The work is not one change but at minimum three:**
+  1. The MLA forward path — the central piece, substantial.
+  2. The allocator trim (C9-4b is measured; new_cache_for's own doc already
+     gates the logic and documents the 10-100x waste). Gated on `all_layers_mla`
+     per the design comment. Belongs in the same commit as the loader to avoid
+     shipping broken output.
+  3. A correctness gate on a tiny deepseek2 fixture (like qwen2/qwen3 have via
+     bit-exact-vs-real). M2-hardware gates are reasonable; this sandbox can
+     drive the fixture + gate construction but not the final validation.
 
-  So the work is: the loader path, the allocator trim from C9-4b, and a
-  decision about the arch gate — one change, not three.
+  **Not verified here:** whether deepseek2's two expert-weighting gaps (both
+  listed by archfeat) actually block loading, or whether they are masking a
+  broader issue. The fixture would surface that; running it on M2 would settle
+  it.
 
 - **C9-4b — the dual KV allocation, measured.** `done` · `verified`.
   Not a bug: `new_cache_for` allocates the dense K/V for MLA models
@@ -549,17 +556,19 @@ only by its own tests.
   above regenerates in seconds
   (`python3 -c` over both trees hashing every file — see the commit).
 
-- **C9-6a — beatspace GAN smoke test.** `in-progress` — the next task.
-  From `beatspace-listeners-analogy.md`: multiple discriminators as simulated
-  listeners; tiered models raced scout-and-wolfpack style; hash-to-musical-legend
-  checkpoint naming; and a CPU-runnable smoke test on synthetic sine/saw/square
-  waves to catch mode collapse after every architecture change. **The only item
-  in the whole staged set that is self-contained and fully verifiable in this
-  sandbox** — pure CPU, no GPU, no GUI. `apps/beatspace` exists but is 17 files.
-  **New cross-reference:** `sensor-kit`'s `gait::Features::cadence_hz` (landed in
-  `ee2d00ae`) already reports dominant walking cadence, gated to 0.5–4.0 Hz.
-  ×60 is steps/min, which is the quantity the BPM-matching idea would key on.
-  The producer exists; what is missing is a consumer.
+- **C9-6a — beatspace GAN smoke test.** `done` · `verified` (c10).
+  The smoke test is implemented (754 lines in src/smoke.rs) and wired into
+  the CLI at `beatspace smoke [--steps N] [--seed N]`. Runs on CPU only with
+  no GPU or GUI dependencies (`--no-default-features`). Defaults: 12 steps,
+  synthetic sine/saw/square waveforms, seed 7. Asserts four structural checks:
+  params_moved ≥ 50% (gradients flowing), z_diversity > 1e-4 (outputs vary with
+  latent — mode collapse detection, the primary check), z_repeatability == 0
+  (eval deterministic), d_score_spread > 0 (discriminator not frozen). Verified
+  locally: 12 steps completed in 4 seconds, z-diversity 0.0010, params 100%
+  moved, all checks pass. The design is explicit about scope: structural validation
+  only, no convergence or quality checks — a test that needs a good model would
+  never run. The sensor-kit cadence producer (`ee2d00ae`) is ready for a consumer
+  that BPM-matches it to generated beats.
 
 - **C9-6b — HiveMind → logscope architecture.** `idea`.
   `HiveMind_Strategy_Logscope.md`: logscope as a typed engineering pipeline
