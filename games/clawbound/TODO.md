@@ -601,6 +601,26 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
   flipping `wombo` on a ten-second recording reproduces it exactly, because the clans have
   not met yet. That assertion says so.
 
+- [x] `lockstep.rs` — the deterministic-lockstep **protocol** for two-clan matches, sitting on
+  the determinism `replay.rs` proves every test run: peers exchange inputs (a frame each per
+  tick, a digest each second) rather than state, both run the same sim, nobody is the
+  server. Input delay of 6 ticks (200ms), a tick advances only when both sides' inputs are
+  in, digests compared on arrival, and a quiet peer stalls then loses the match rather than
+  hanging forever. Protocol-then-transport: it knows nothing about sockets or
+  `shared/netcode`, and the tests run a 600-tick match between two in-process peers with no
+  port opened.
+- [x] Writing it caught a genuine protocol bug of the kind that only shows in a real
+  exchange: comparing digests at the moment of *hashing* catches nothing, because the other
+  peer's claim for that tick is still in flight. Whichever half arrives second does the
+  comparing now, and the desync test proves it by nudging one warrior half a length in one
+  peer's world — which is exactly what a real desync looks like from the inside.
+- [ ] Transport: bind `lockstep::Packet` to `shared/netcode`'s multiplayer/session layer, and
+  agree the match setup by exchanging a `replay::Replay` header (it already carries draft,
+  seed and every doctrine switch — a lobby needs nothing else)
+- [ ] Clan B's player frame is carried, exchanged and compared but not yet applied: the
+  battleground drives one warrior from `set_input`. Second driven warrior, then the protocol
+  is complete rather than merely correct
+
 ## Roadmap (multi-turn)
 -29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an
    invisible trail the hunter tracks; it's something you sense and *see*.
