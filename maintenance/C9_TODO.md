@@ -230,6 +230,13 @@ absorbing all of it.
   §3's native-dep gates, and that table is proven load-bearing — without the
   beatspace entry the crate goes ok(62s) → FAIL(150s). What remains is
   literally running it somewhere with the hours; this box cannot.
+  EXTENDED (`b0b9cd8cc`) to check NON-DEFAULT features as well, because the
+  first version would have missed the very bug that justified it — clawbound's
+  `app` feature broke in a merge and no default build could see it. Units are
+  now `path` or `path[feat]`, 260 → 420, one check each so a failure names the
+  single flag. Verified discriminating against that real bug in both
+  directions. Environment-blocked features (gamepad, web/wasm, cuda, metal,
+  opus-decode) are skipped by name.
   ORIGINAL NOTE (c10, before the tool existed): `cargo check -p <each>` is the right test; the two known instances
   (`snapclone-nat` tokio sync, `scene-kit` — both found in earlier sessions)
   now check clean: fixes were committed. A full cross-repo sweep would take
