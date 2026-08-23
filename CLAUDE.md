@@ -144,6 +144,43 @@ claim about adaptation that was simply false. A test written and then deleted
 because its claim turned out false is a good outcome, not wasted work; say so
 in the commit rather than quietly dropping it.
 
+## 5c. Tests written around a fix say nothing about the fix's side effects
+
+The tests you write while fixing something are about the bug. They pass on a
+change that fixes the bug and breaks something else, because nothing in them
+looks there. **Before committing a fix, run the whole crate, and ask who the
+change takes something AWAY from.**
+
+Three times in one session, all the same shape — a fix that excludes or
+redirects a category, and the hole appears wherever that category was the whole
+answer:
+
+* `verdict::extract_code` joined every fenced block, so a reply that showed its
+  own output failed to compile. Fixed by skipping non-source fences. That broke
+  a worker asked to produce a **manifest**, whose only fence is `toml` — it now
+  fell through to the raw reply, prose and fence markers included, worse than
+  the original bug. Five tests written for the fix all passed.
+* The `IQ1_S` native loader path is right about residency — 1.5625 bpw against
+  q4's 4.5 — and wrong about every multi-token forward, because nothing
+  converts for prefill. It panicked inside `prewarm`, during load.
+* `parse_plan` closed at the first fence, losing every step after a quoted
+  snippet. Fixed with `rfind`, whose comment claimed over-reach was harmless. It
+  reached into the following `` ```tool `` blocks and broke two existing tests
+  immediately — tests that were right there and that I had not run.
+
+The habit that catches all three is one question: **what did this change take
+away, and who was relying on it?** For an exclusion, that is "who does the
+excluded case belong to". For a widening, "what else is now inside the net".
+
+Two cheap mechanics:
+
+1. **Run the whole crate, not the filtered test.** `cargo test -q --lib name` is
+   for the edit loop. The commit needs the full suite, and it is where the
+   `rfind` mistake surfaced in seconds.
+2. **When a fix adds a category test, add its complement.** Skipping non-source
+   fences wanted "and what if there are ONLY non-source fences". Bounding a
+   region wanted "and what if the region is the whole document".
+
 ## 6. Never trust a bundle's file size
 
 A self-contained bundle carries its whole history, so its size is the
