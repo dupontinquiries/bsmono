@@ -52,15 +52,54 @@ extra_env() {
   esac
 }
 
-# Every directory holding a real [package]. wip/ and target/ are excluded: the
-# first is staged reference material that is not ours to keep compiling, the
-# second is build output.
+# Features that cannot build in THIS sandbox for environment reasons, so
+# checking them would report noise rather than a finding. Keep in step with
+# CLAUDE.md §3's gate table.
+#   gamepad -> gilrs -> libudev-sys       web/wasm -> needs the wasm32 target
+#   cuda/metal -> vendor toolkits         opus-decode -> libopus via cmake
+SKIP_FEATURES="${SKIP_FEATURES:-gamepad web wasm cuda metal opus-decode}"
+
+# Feature names a package declares, minus `default` and the skip list. Parsed
+# in python because a feature array can span lines and awk would mis-read it.
+feature_names() {
+  python3 - "$1" "$SKIP_FEATURES" <<'PY' 2>/dev/null || true
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+skip = set(sys.argv[2].split())
+m = re.search(r'^\[features\]\s*$(.*?)(?=^\[|\Z)', text, re.M | re.S)
+if not m: raise SystemExit
+for line in m.group(1).splitlines():
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line: continue
+    name = line.split("=", 1)[0].strip().strip('"')
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name): continue
+    if name == "default" or name in skip: continue
+    print(name)
+PY
+}
+
+# Every unit to check. A unit is a package, or a package plus ONE non-default
+# feature written `path[feat]`.
+#
+# The default build is not the whole crate, and this tool learned that the
+# expensive way: `games/clawbound`'s `app` feature stopped compiling when a
+# merge added two menu commands with no `app.rs` arms, and no default-feature
+# build could see it (CLAUDE.md §3). Checking each declared feature on its own
+# rather than `--all-features` keeps the failure attributable to one flag.
+#
+# wip/ and target/ are excluded: the first is staged reference material that is
+# not ours to keep compiling, the second is build output.
 packages() {
   find "$ROOT/apps" "$ROOT/shared" "$ROOT/system" "$ROOT/games" "$ROOT/tools" \
        -name Cargo.toml -not -path '*/target/*' -not -path '*/wip/*' 2>/dev/null \
   | while IFS= read -r f; do
       grep -q '^\[package\]' "$f" || continue          # skip virtual workspaces
-      printf '%s\n' "${f%/Cargo.toml}" | sed "s|^$ROOT/||"
+      rel="$(printf '%s\n' "${f%/Cargo.toml}" | sed "s|^$ROOT/||")"
+      printf '%s\n' "$rel"
+      [ "${DEFAULT_ONLY:-0}" = 1 ] && continue
+      feature_names "$f" | while IFS= read -r feat; do
+        [ -n "$feat" ] && printf '%s[%s]\n' "$rel" "$feat"
+      done
     done | sort -u
 }
 
@@ -106,17 +145,25 @@ todo=$(comm -23 <(packages) <(cut -f1 "$REPORT" | sort -u))
 
 echo "sweep: $(printf '%s\n' "$todo" | wc -l) package(s) left, ${TIMEOUT}s each, report $REPORT"
 fails=0
-while IFS= read -r rel; do
-  [ -n "$rel" ] || continue
+while IFS= read -r unit; do
+  [ -n "$unit" ] || continue
+  # A unit is `path` or `path[feat]`; the feature is checked ON TOP of whatever
+  # the crate's own gate needs, so a crate whose default is blocked still gets
+  # its features exercised.
+  case "$unit" in
+    *\[*\]) rel="${unit%%[*}"; feat="${unit##*[}"; feat="${feat%]}" ;;
+    *)        rel="$unit"; feat="" ;;
+  esac
   dir="$ROOT/$rel"
   flags=$(extra_flags "$rel"); envs=$(extra_env "$rel")
-  printf '%-52s ' "$rel"
+  [ -n "$feat" ] && flags="$flags --features $feat"
+  printf '%-58s ' "$unit"
   start=$(date +%s)
   # Each crate gets its own build dir, deleted immediately: disk is what fails
   # in this sandbox, and a sweep is the longest-running way to discover that.
   rm -rf "$BUILD_DIR"
   if ! cd "$dir" 2>/dev/null; then
-    printf '%s\t%s\t%s\n' "$rel" "SKIP" "0" >> "$REPORT"; echo "SKIP (no dir)"; continue
+    printf '%s\t%s\t%s\n' "$unit" "SKIP" "0" >> "$REPORT"; echo "SKIP (no dir)"; continue
   fi
   # shellcheck disable=SC2086
   env $envs AILITE_BUILD_DIR="$BUILD_DIR" timeout "$TIMEOUT" "$AILITE" check $flags >/dev/null 2>&1
@@ -127,7 +174,7 @@ while IFS= read -r rel; do
     124) st=TIMEOUT ;;
     *)   st=FAIL; fails=$(( fails + 1 )) ;;
   esac
-  printf '%s\t%s\t%s\n' "$rel" "$st" "$el" >> "$REPORT"
+  printf '%s\t%s\t%s\n' "$unit" "$st" "$el" >> "$REPORT"
   echo "$st (${el}s)"
   cd "$ROOT" || exit 1
 done <<< "$todo"
