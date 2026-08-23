@@ -1,0 +1,97 @@
+# PRIORITIES — getting to a game you can play
+
+Written after a playtest that said, correctly: *"the game feels mostly the
+same and still hasn't progressed to the point where I am even walking around
+with a working robot nor in my spaceship being able to land on planets nor
+being able to play campaign missions."*
+
+## The honest accounting
+
+That is right, and it is worth being precise about why rather than
+apologising. Measured, in `main.rs` — the actual game loop:
+
+| module | what it is | references in `main.rs` |
+|---|---|---|
+| `patrol` | the destination list — where you can go | **0** |
+| `procgen` | world generation for those destinations | **0** |
+| `foothold` | landing, approach, taking a site | **0** |
+| `campaign` | missions | 1 |
+| `raid` | raids | 1 |
+
+The campaign stack is **complete, tested, and not plugged in**. It runs
+entirely under `--sim`, `--terrain`, `--arch` and the other headless drivers,
+which is why every session has ended with a number of passing tests and no
+change to what happens when you press play.
+
+I built a lot of things that are verifiable without a screen, and verifiable
+without a screen turns out to correlate almost perfectly with *not in the
+game*. The drivers are real work — the guidance comparison, the depth
+analysis, the archaeology layer — and none of them is a step toward walking
+around.
+
+## What actually blocks each of the three things asked for
+
+### 1. Walking around as a working robot
+
+The transform exists (`xform.rs`), the chassis exist, and the seating bugs are
+fixed. What is missing is that **the player is still a Rocket League car**:
+`physics.rs` has one body with `half_h: 0.19`, tuned around a 38 cm chassis,
+and `scale.rs` says a bot is 8.5 m. `board.rs` measured the consequence — a
+human moves at 0.45 of a bot's pace and the maps are built for neither.
+
+- [ ] Make the player body switch between `Scale::Titan` and `Scale::Human`
+      at runtime, not just in a table. `board.rs::Avatar` is the model; nothing
+      calls it.
+- [ ] Legged locomotion at all. Everything today rolls. `cling.rs` knows about
+      gaits, `cybertronian.rs` names five of them, and the physics has wheels.
+- [ ] Third-person camera for a walking body — `scale::camera_for` computes it
+      and `camera.rs` only reads the near plane from it.
+
+### 2. A ship you can fly and land
+
+- [ ] `patrol::ROUTE` is the destination list and the game loop cannot see it.
+      Wire a starmap that reads it.
+- [ ] `procgen::World::generate(seed)` makes a landable world. It is a
+      *different type* from `world::World`, which is the demo-map sandbox —
+      see `docs/UNWIRING.md`. Something has to bridge or replace.
+- [ ] `foothold::assess` already decides where you can put down and what it
+      costs. It has never been asked at runtime.
+- [ ] `drop.rs` has the descent physics; `--terrain drop` flies it headlessly.
+
+### 3. Campaign missions you can play
+
+- [ ] `content::MISSIONS` has fifteen with sites, beats and gates.
+      `curriculum.rs` asserts each teaches one mechanic exactly once.
+      **None of them can be started from inside the game.**
+- [ ] `stations.rs` gives the ship consoles that plot and resolve — the
+      Chartroom loop works — but resolution is a simulation, not a mission.
+      The renderer is the boundary and always has been.
+
+## The order I would actually do it in
+
+1. **One mission, end to end, badly.** Pick `the_beach_opens`. Start it from a
+   console, fly the drop, land, walk, clear it, and come back. Every piece
+   exists in isolation; none of them has ever been asked to run in sequence
+   with a renderer attached. Expect that to break in ways no headless test
+   predicted, and expect it to be worth more than the next ten drivers.
+2. **The player body at two scales**, because everything else is unplayable
+   until walking works.
+3. **The starmap**, so `patrol` becomes reachable.
+4. **Delete the demo maps** per `docs/UNWIRING.md`, which unblocks the real
+   gravity model and the space map.
+5. Everything else.
+
+## What to stop doing
+
+Adding modules with drivers. There are now thirty-odd `--flags` and the number
+of things you can do by pressing play has not moved. A new system should be
+justified by a mission that needs it, not by being measurable.
+
+## Standing caveats
+
+- Audio needs `libasound2-dev`; `--no-default-features` builds silent.
+- The two visual fixes this session (skipped transform frame, `ride_h`
+  seating) are reasoned from code and pinned with tests on the pure logic.
+  **Not verified on a GPU** — first thing to check on device.
+- Balance numbers throughout are guesses and say so; `--tune guesses` lists
+  the ones with nothing behind them.

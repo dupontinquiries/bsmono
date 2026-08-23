@@ -75,7 +75,17 @@ pub fn run(argv: &[String]) {
     let arg = argv.get(i + 2).map(String::as_str);
 
     match cmd {
-        "map" => map(false),
+        // `--arch map <node>` used to SILENTLY IGNORE the argument and print
+        // the whole map, which reads as the map refusing to filter rather
+        // than as the wrong verb. `why` is the per-node view, so route there
+        // instead of dropping it on the floor.
+        "map" => match arg {
+            None => map(false),
+            Some(node) => {
+                println!("(`map` takes no node — showing `why {node}` instead)\n");
+                why(Some(node));
+            }
+        },
         "strata" => map(true),
         "site" => site(arg),
         "find" => find(arg),

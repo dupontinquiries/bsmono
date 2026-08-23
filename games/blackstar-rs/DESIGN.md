@@ -5910,6 +5910,34 @@ delete the one that is carrying it.
 
 1083 passing, zero dead code in the module.
 
+A PLAYTEST SAID THE GAME FEELS MOSTLY THE SAME, and it is right. No walking
+robot, no landing, no playable mission. Measured in `main.rs` — the actual
+game loop — `patrol` has ZERO references, `procgen` ZERO, `foothold` ZERO. The
+campaign stack is complete, tested, and not plugged in.
+
+The pattern is worth naming: I built what could be verified without a screen,
+and verifiable-without-a-screen turns out to correlate almost perfectly with
+NOT IN THE GAME. Thirty-odd `--flags` now, and the number of things you can do
+by pressing play has not moved. `docs/PRIORITIES.md` is the honest accounting
+and the order to fix it — starting with one mission end to end, badly, because
+every piece exists in isolation and none has ever run in sequence with a
+renderer attached.
+
+TWO BUGS FROM THE PLAYTEST PASTE. `--arch map <node>` silently ignored its
+argument and printed the whole map, which reads as the map refusing to filter
+rather than as the wrong verb; it routes to `why` now and says so. And
+`--gravity` printed "three things wrong" above four of them, left over from
+before the nearest-node finding.
+
+ROCKET LEAGUE ASSETS GONE: `dominus`, `dominus_red`, `vulcan.glb`,
+`xdevil.glb` — 9.4 MB, and a licence question nobody wants in a game with its
+own 1,012-model catalogue. Substituted with procedural chassis rather than
+removed from the list, because `cars.models` is INDEX-ADDRESSED by `cfg car`
+and deleting an entry silently renumbers every car after it along with every
+saved loadout.
+
+1083 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -1,4 +1,4 @@
-//! GRAVITY — triple-checking a formula that has three separate things wrong.
+//! GRAVITY — triple-checking a formula that has four separate things wrong.
 //!
 //! The complaint was that a tiny platform pulls as hard as a planet at close
 //! range. It does, and measuring why turned up two more problems, one of
@@ -178,7 +178,7 @@ pub fn crossover_m(r: f32, ref_r: f32) -> Option<f32> {
 // ------------------------------------------------------------- driver ---
 
 pub fn run() {
-    println!("GRAVITY — three things wrong, measured\n");
+    println!("GRAVITY — four things wrong, measured\n");
 
     println!("  1. SURFACE PULL DOES NOT SCALE WITH THE WORLD\n");
     println!("  {:>8} {:>12} {:>12} {:>10}", "radius", "engine", "uniform sphere", "error");

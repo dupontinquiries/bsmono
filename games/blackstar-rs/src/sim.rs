@@ -5542,7 +5542,7 @@ pub fn run(args: &[String]) {
         // on the other. That is exactly "the right door is misaligned".
         println!();
         println!("{:<12} {:>10} {:>10} {:>10}", "model", "bbox mid", "centroid", "offset");
-        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+        for n in ["backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
             let path = dir.join(n);
             let Ok(d) = gltf::Gltf::open(&path) else { continue };
             let Some(blob) = d.blob.clone() else { continue };
@@ -5589,7 +5589,7 @@ pub fn run(args: &[String]) {
         println!();
         println!("{:<12} {:>8} {:>9} {:>10} {:>11}", "model", "tris", "degen", "open edges", "bbox/p98");
         let mut worst_slack = 0.0f32;
-        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+        for n in ["backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
             let path = dir.join(n);
             let Ok(d) = gltf::Gltf::open(&path) else { continue };
             let Some(blob) = d.blob.clone() else { continue };
@@ -5681,7 +5681,7 @@ pub fn run(args: &[String]) {
         // These models really did arrive on their sides and back-to-front.
         println!();
         println!("{:<12} {:>28} {:>9}", "model", "correction applied", "score");
-        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+        for n in ["backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
             let path = dir.join(n);
             let Ok(d) = gltf::Gltf::open(&path) else { continue };
             let Some(blob) = d.blob.clone() else { continue };
@@ -5719,7 +5719,7 @@ pub fn run(args: &[String]) {
         // and report what it would produce per car.
         println!();
         println!("{:<12} {:>9} {:>10} {:>9}", "model", "corners", "wheel r", "verdict");
-        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+        for n in ["backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
             let path = dir.join(n);
             let Ok(d) = gltf::Gltf::open(&path) else { continue };
             let Some(blob) = d.blob.clone() else { continue };
@@ -5824,7 +5824,7 @@ pub fn run(args: &[String]) {
         // points are really a circle at all.
         println!();
         println!("{:<12} {:>12} {:>12} {:>10}", "model", "median->fit", "residual", "verdict");
-        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+        for n in ["backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
             let path = dir.join(n);
             let Ok(d) = gltf::Gltf::open(&path) else { continue };
             let Some(blob) = d.blob.clone() else { continue };
@@ -5913,7 +5913,7 @@ pub fn run(args: &[String]) {
         // there floats beside the doors instead of sitting on them.
         println!();
         println!("{:<12} {:>11} {:>11} {:>10}", "model", "bbox half", "door flank", "overhang");
-        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "orion.glb"] {
+        for n in ["backfire.glb", "orion.glb"] {
             let path = dir.join(n);
             let Ok(d) = gltf::Gltf::open(&path) else { continue };
             let Some(blob) = d.blob.clone() else { continue };
@@ -5964,7 +5964,7 @@ pub fn run(args: &[String]) {
         }
 
         // ---- node structure: where a misplaced panel would come from ----
-        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb"] {
+        for n in ["backfire.glb"] {
             let path = dir.join(n);
             if let Ok(d) = gltf::Gltf::open(&path) {
                 let scene = d.default_scene().or_else(|| d.scenes().next());
