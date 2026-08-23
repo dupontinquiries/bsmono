@@ -12,15 +12,47 @@ use std::process::Command;
 
 /// Pull the code to compile from a reply: concatenate every ```fenced``` block (dropping the ```lang line).
 /// Falls back to the whole trimmed text when there are no fences.
+/// Language tags this oracle will compile. A fence with no tag, or one tagged
+/// `text`/`output`/`console`, is not source — it is what the model is SHOWING
+/// you, and concatenating it into the compile unit is why a correct answer
+/// failed.
+fn is_code_tag(tag: &str) -> bool {
+    let t = tag.trim().to_ascii_lowercase();
+    if t.is_empty() { return false }
+    !matches!(t.as_str(),
+        "text" | "output" | "console" | "sh" | "bash" | "shell" | "log" | "json"
+        | "toml" | "yaml" | "yml" | "diff" | "md" | "markdown" | "plain" | "none")
+}
+
 pub fn extract_code(reply: &str) -> String {
     let mut blocks = Vec::new();
     let mut rest = reply;
     while let Some(start) = rest.find("```") {
         let after = &rest[start + 3..];
-        let body_start = after.find('\n').map(|i| i + 1).unwrap_or(after.len());
+        let nl = after.find('\n');
+        // The fence's language tag is everything up to the newline.
+        let tag = &after[..nl.unwrap_or(0)];
+        let body_start = nl.map(|i| i + 1).unwrap_or(after.len());
         let body = &after[body_start..];
         if let Some(end) = body.find("```") {
-            blocks.push(body[..end].to_string());
+            // ONLY SOURCE FENCES. This joined EVERY fenced block, and the
+            // commonest shape of a model reply is the code followed by a fence
+            // showing what it prints:
+            //
+            //     ```rust
+            //     pub fn f() -> i32 { 1 }
+            //     ```
+            //     Running it prints:
+            //     ```
+            //     1
+            //     ```
+            //
+            // The join produced `pub fn f() -> i32 { 1 }` then a bare `1`,
+            // which does not compile — so the oracle failed the branch for
+            // SHOWING ITS OUTPUT. Measured, not hypothesised.
+            if is_code_tag(tag) {
+                blocks.push(body[..end].to_string());
+            }
             rest = &body[end + 3..];
         } else { break; }
     }
@@ -76,5 +108,55 @@ mod tests {
         assert_eq!(compile("pub fn add(a:i32,b:i32)->i32{a+b}", DEFAULT_CHECK, None), Verdict::Pass);
         assert_eq!(compile("pub fn add(a:i32,b:i32)->i32{a+}", DEFAULT_CHECK, None), Verdict::Fail);
         assert_eq!(compile("   ", DEFAULT_CHECK, None), Verdict::None, "empty code is not graded");
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    /// The bug: a reply that shows its own output failed to compile.
+    #[test]
+    fn an_output_block_is_not_concatenated_into_the_compile_unit() {
+        let reply = "Here is the function:\n\n```rust\npub fn f() -> i32 { 1 }\n```\n\n\
+Running it prints:\n\n```\n1\n```\n";
+        let code = extract_code(reply);
+        assert!(code.contains("pub fn f"), "the source must survive: {code:?}");
+        assert!(!code.lines().any(|l| l.trim() == "1"),
+                "the untagged output block was concatenated into the compile unit — this is why \
+a correct answer was graded as a compile failure: {code:?}");
+    }
+
+    #[test]
+    fn several_source_blocks_still_join() {
+        let reply = "```rust\nfn a() {}\n```\nand\n```rust\nfn b() {}\n```\n";
+        let code = extract_code(reply);
+        assert!(code.contains("fn a") && code.contains("fn b"),
+                "a reply split across two source fences must still compile as one unit: {code:?}");
+    }
+
+    #[test]
+    fn non_source_tags_are_skipped_by_name() {
+        for tag in ["text", "output", "console", "bash", "json", "toml", "diff"] {
+            let reply = format!("```rust\nfn a() {{}}\n```\n```{tag}\nnot source\n```\n");
+            let code = extract_code(&reply);
+            assert!(!code.contains("not source"), "`{tag}` block leaked into the code: {code:?}");
+        }
+    }
+
+    #[test]
+    fn a_reply_with_no_fences_is_still_treated_as_code() {
+        // Unchanged behaviour: some workers answer with bare source.
+        assert_eq!(extract_code("fn a() {}"), "fn a() {}");
+    }
+
+    /// The regression this could cause: a reply whose ONLY fence is untagged.
+    /// Before, that was the code; now it is skipped, so the fallback must catch
+    /// it rather than handing the compiler an empty string.
+    #[test]
+    fn a_lone_untagged_fence_falls_back_rather_than_compiling_nothing() {
+        let code = extract_code("```\nfn a() {}\n```");
+        assert!(code.contains("fn a"),
+                "an untagged sole fence must not leave the oracle with nothing to compile: {code:?}");
     }
 }
