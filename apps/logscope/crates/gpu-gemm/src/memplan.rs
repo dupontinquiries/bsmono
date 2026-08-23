@@ -2273,4 +2273,40 @@ dropped it, remove it here or every checkpoint carrying it will be silently mark
         assert_eq!(names, vec!["output.scale".to_string()]);
     }
 
+
+    /// The refusal for an unsupported arch must list unread tensors too.
+    ///
+    /// `archfeat::gap_report` lists FEATURES someone has already characterised,
+    /// so a tensor in the file that no path reads is invisible to it by
+    /// construction. gemma4's refusal named two gaps while its dump also showed
+    /// `inp_gate`, `proj` and a third post-norm — anyone reading that list and
+    /// setting LOGSCOPE_TRY_UNSUPPORTED_ARCH=1 would expect two things to be
+    /// wrong.
+    ///
+    /// This checks the LINE the refusal now appends, which is the part that
+    /// carries the extra facts; building a whole GGUF to reach the refusal
+    /// itself would test the `format!` and not the content.
+    #[test]
+    fn the_gemma4_dump_produces_a_line_naming_its_unread_tensors() {
+        let g4 = gguf_of(vec![
+            tensor("blk.0.attn_q.weight", 12, &[1536, 2048]),
+            tensor("blk.0.attn_norm.weight", 0, &[1536]),
+            tensor("blk.0.inp_gate.weight", 12, &[1536, 256]),
+            tensor("blk.0.proj.weight", 12, &[256, 1536]),
+            tensor("blk.0.post_norm.weight", 0, &[1536]),
+            tensor("blk.0.layer_output_scale.weight", 0, &[1]),
+        ]);
+        let line = unread_tensor_line(&g4).expect("gemma4 has unread tensors");
+        for want in ["inp_gate", "proj", "post_norm", "layer_output_scale"] {
+            assert!(line.contains(want), "{want} missing from the refusal line: {line}");
+        }
+        assert!(!line.contains("attn_q"), "a tensor the engine reads must not be listed: {line}");
+        // Heaviest first: inp_gate and proj are 393216 weights each, the scale
+        // is 1. A reader skimming the head of the list should meet the
+        // substantial ones.
+        let ig = line.find("inp_gate").unwrap();
+        let los = line.find("layer_output_scale").unwrap();
+        assert!(ig < los, "the [1] scalar should not lead the list: {line}");
+    }
+
 }

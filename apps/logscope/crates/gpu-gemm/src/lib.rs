@@ -10180,6 +10180,23 @@ not a surprise; coherent output is the evidence that would flip the flag",
                 // the time and "for now.. Use the" is the kind of sloppiness that makes a reader trust
                 // the rest of the message less
                 let detail = detail.trim_end_matches('.').to_string();
+                // AND THE TENSORS NOBODY READS, which `gap_report` cannot know
+                // about: it lists FEATURES someone has already characterised,
+                // so a tensor in the file that no code path touches is invisible
+                // to it by construction.
+                //
+                // gemma4's refusal named two gaps — per-layer head_dim and the
+                // output scale — while its own dump also showed `inp_gate`,
+                // `proj` and a third post-norm, none of them mentioned. Anyone
+                // reading that list and setting LOGSCOPE_TRY_UNSUPPORTED_ARCH=1
+                // would expect two things to be wrong. This is the difference
+                // between a gap list and a complete one, and the flag's own
+                // message promises "coherent output is the evidence that would
+                // flip the flag" — a promise worth less if the list is short.
+                let detail = match crate::memplan::unread_tensor_line(g) {
+                    Some(un) => format!("{detail}. Also {un}"),
+                    None => detail,
+                };
                 return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {detail}. \
                     Use the llama.cpp backend for this model, or set LOGSCOPE_TRY_UNSUPPORTED_ARCH=1 \
 to attempt it anyway — an architecture becomes supported only once it has completed a forward pass on \
