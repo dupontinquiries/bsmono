@@ -302,6 +302,69 @@ fn unexamined(sb: &Shipboard) -> Vec<&'static crate::provenance::Finding> {
         .collect()
 }
 
+/// Fly the descent for a destination, in simulation.
+///
+/// The first time `patrol`, `mapsim` and `drop` run in sequence rather than
+/// in three separate headless drivers. Gravity comes from the destination,
+/// the ground from `ground_for`, and the fall from `drop.rs` — so a low-g
+/// world really does give you longer to correct, and a heavy one really does
+/// hurt on arrival.
+///
+/// Deterministic: the same destination flies the same way every time, because
+/// a console that reports a different outcome each press is telling you about
+/// its RNG rather than about the world.
+/// You do not land on deep space; you dock with something in it.
+///
+/// Three of the eighteen destinations have gravity at or near zero —
+/// `outer_rim` and `shield_edge` are `Terrain::DeepSpace`, `carrion` is an
+/// asteroid field at 0.02g. A drop needs something to fall toward, and
+/// forcing one produces a descent that never terminates: my first version
+/// looped ninety seconds and reported an infinite miss distance, which a test
+/// caught as "outer_rim never landed at all".
+///
+/// That is correct DATA and a wrong assumption on my part, not a bug in the
+/// route table.
+pub const DOCK_BELOW_G: f32 = 0.05;
+
+pub fn is_dock(d: &crate::patrol::Destination) -> bool {
+    d.gravity < DOCK_BELOW_G
+}
+
+fn fly_the_drop(
+    d: &'static crate::patrol::Destination,
+    g: &crate::terrain::Ground,
+) -> crate::drop::Landing {
+    use crate::drop::{Drop, Mode};
+    use glam::Vec3;
+    let mut dr = Drop::new(Vec3::ZERO, d.hostiles != crate::patrol::Faction::None);
+    dr.jump(Vec3::new(0.0, 600.0, 0.0), Vec3::new(18.0, 0.0, 0.0));
+    // a competent drop: fold to the fall gait at a sensible altitude and
+    // steer back toward the mark
+    let dt = 1.0 / 60.0;
+    for step in 0..(60 * 90) {
+        let alt = dr.pos.y;
+        if alt < 120.0 && dr.mode == Mode::Vehicle {
+            dr.transform(alt);
+        }
+        // steer at the landing zone, hardest early when there is time
+        let to = (dr.lz - dr.pos) * Vec3::new(1.0, 0.0, 1.0);
+        let steer = to.normalize_or_zero();
+        if let Some(l) = dr.update(dt, steer, g.g, 0.0) {
+            return l;
+        }
+        let _ = step;
+    }
+    crate::drop::Landing {
+        impact_speed: 0.0,
+        self_dmg: 0.0,
+        shock: 0.0,
+        shock_radius: 0.0,
+        miss_distance: f32::INFINITY,
+        aa_taken: 0.0,
+        hero: false,
+    }
+}
+
 /// Is there a route to this destination yet?
 ///
 /// Uses the same gate vocabulary `archive::gate_open` does — a bare id is a
@@ -653,17 +716,34 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
             if !gate_open_for(d.id, sb) {
                 return Some(Order::Did(format!("{} — no route yet.", d.name)));
             }
-            // HONEST ABOUT WHAT IT DOES. Plotting is not flying, and a console
-            // that pretends otherwise is worse than one that says so: the drop
-            // physics exist (`drop.rs`), the landing decision exists
-            // (`foothold.rs`), and neither is wired to a renderer yet.
+            // AND NOW IT FLIES IT. The chain the campaign has always had in
+            // pieces and never in sequence:
+            //
+            //     patrol::Destination -> mapsim::ground_for -> drop::Drop
+            //
+            // Resolved in simulation, not rendered — which is the same
+            // boundary the missions already sit behind, and honest about it.
             let g = crate::mapsim::ground_for(d);
+            if is_dock(d) {
+                return Some(Order::Did(format!(
+                    "{} — {:?} at {:.2}g. nothing to fall toward: you dock, you \
+                     do not land.",
+                    d.name, d.terrain, d.gravity
+                )));
+            }
+            let land = fly_the_drop(d, &g);
+            let verdict = if land.miss_distance < 40.0 {
+                format!("down at {:.0} m from the mark", land.miss_distance)
+            } else {
+                format!("SCATTERED — {:.0} m wide", land.miss_distance)
+            };
             Some(Order::Did(format!(
-                "course laid for {} — {:.2}g, {:?}, {}. flying it is not wired yet.",
+                "{} {:.2}g: {} at {:.0} m/s{}",
                 d.name,
                 d.gravity,
-                g.material,
-                if d.weather { "weather" } else { "still air" }
+                verdict,
+                land.impact_speed,
+                if land.hero { ", clean fold" } else { "" }
             )))
         }
         Station::Chartroom => {
@@ -1000,6 +1080,67 @@ mod tests {
     }
 
     #[test]
+    fn gravity_actually_changes_the_landing() {
+        // The chain is only worth having if the destination's physics reach
+        // the outcome. A low-gravity world should arrive slower; if every
+        // world lands identically then `ground_for` is decorative and the
+        // three modules are still three modules.
+        use crate::patrol::ROUTE;
+        let fly = |id: &str| {
+            let d = ROUTE.iter().find(|d| d.id == id).expect(id);
+            let g = crate::mapsim::ground_for(d);
+            (d.gravity, fly_the_drop(d, &g))
+        };
+        let (g_earth, earth) = fly("earth");
+        let (g_luna, luna) = fly("luna");
+        assert!(g_luna < g_earth * 0.5, "the fixture worlds are too alike");
+        assert!(
+            luna.impact_speed < earth.impact_speed,
+            "a sixth of a g arrived at {:.0} m/s against Earth's {:.0}",
+            luna.impact_speed,
+            earth.impact_speed
+        );
+        // and everywhere with a surface lands somewhere real
+        for d in ROUTE.iter().filter(|d| !is_dock(d)) {
+            let l = fly_the_drop(d, &crate::mapsim::ground_for(d));
+            assert!(l.miss_distance.is_finite(), "{} never landed at all", d.id);
+            assert!(l.impact_speed >= 0.0 && l.impact_speed < 400.0, "{}: {:?}", d.id, l);
+        }
+    }
+
+    #[test]
+    fn deep_space_is_a_dock_not_a_landing() {
+        // Three destinations have no gravity to fall toward. Forcing a drop
+        // there loops until the timeout and reports an infinite miss, which
+        // is how this was found — the route table is right and my assumption
+        // that every destination has a surface was not.
+        use crate::patrol::ROUTE;
+        let docks: Vec<&str> =
+            ROUTE.iter().filter(|d| is_dock(d)).map(|d| d.id).collect();
+        assert!(docks.len() >= 2, "expected deep-space destinations: {docks:?}");
+        assert!(docks.contains(&"outer_rim"));
+
+        let mut sb = board();
+        sb.camp.record("the_scavenger_king");
+        let out = apply(Station::Starmap, &Event::Pressed("outer_rim"), &mut sb, 0);
+        let Some(Order::Did(line)) = out else { panic!("no report") };
+        assert!(line.contains("dock"), "it tried to land on deep space: {line}");
+        assert!(!line.contains("m/s"), "it reported an impact speed: {line}");
+    }
+
+    #[test]
+    fn the_same_course_flies_the_same_way_twice() {
+        // a console reporting a different outcome each press is telling you
+        // about its RNG rather than about the world
+        let d = crate::patrol::ROUTE.iter().find(|d| d.id == "earth").unwrap();
+        let g = crate::mapsim::ground_for(d);
+        let a = fly_the_drop(d, &g);
+        let b = fly_the_drop(d, &g);
+        assert_eq!(a.impact_speed, b.impact_speed);
+        assert_eq!(a.miss_distance, b.miss_distance);
+    }
+
+    #[test]
     fn unreachable_places_are_greyed_rather_than_hidden() {
         // menu.rs's own note: "why can't I press this" is a better experience
         // than a row that is not there, and a starmap with holes in it is a
@@ -1036,15 +1177,21 @@ mod tests {
     }
 
     #[test]
-    fn plotting_a_course_says_it_is_not_flying_it() {
-        // A console that implies the loop is wired when it is not is worse
-        // than one that says so. This is the honest half of shipping a
-        // half-built feature.
+    fn the_starmap_flies_the_drop_and_reports_the_landing() {
+        // This test used to assert the console said "not wired yet", and it
+        // FAILED when the drop was connected — which is the assertion working.
+        // A claim about what a feature does not do has to be revisited when it
+        // starts doing it, and a test is the only thing that makes that
+        // happen on purpose rather than by somebody noticing.
         let mut sb = board();
         let out = apply(Station::Starmap, &Event::Pressed("earth"), &mut sb, 0);
         let Some(Order::Did(line)) = out else { panic!("no report: {out:?}") };
         assert!(line.contains("EARTH"), "{line}");
-        assert!(line.contains("not wired"), "it claimed more than it does: {line}");
+        assert!(line.contains("m/s"), "no impact speed: {line}");
+        assert!(
+            line.contains("from the mark") || line.contains("SCATTERED"),
+            "no landing verdict: {line}"
+        );
 
         // and an unreachable one refuses rather than pretending
         let out = apply(Station::Starmap, &Event::Pressed("pluto"), &mut sb, 0);

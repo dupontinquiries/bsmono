@@ -15,6 +15,7 @@ apologising. Measured, in `main.rs` — the actual game loop:
 | `patrol` | the destination list — where you can go | **6** ✓ |
 | `procgen` | world generation for those destinations | **0** |
 | `foothold` | landing, approach, taking a site | **0** |
+| `drop` | the descent | reachable via the starmap ✓ |
 | `campaign` | missions | 1 |
 | `raid` | raids | 1 |
 
@@ -57,8 +58,14 @@ human moves at 0.45 of a bot's pace and the maps are built for neither.
       not there. Pressing one says *"course laid for EARTH — 1.00g, Sandstone,
       weather. flying it is not wired yet"*, because a console that implies
       the loop is finished when it is not is worse than one that admits it.
-- [ ] Flying the course. `drop.rs` has the descent physics and
-      `--terrain drop` runs it headlessly; nothing connects the two.
+- [x] **Flying the course, in simulation.** Pressing a destination now runs
+      `patrol::Destination -> mapsim::ground_for -> drop::Drop` in sequence —
+      the first time those three have run together rather than in three
+      separate drivers. Earth reports *"down at 7 m from the mark at 45 m/s"*,
+      and a test asserts a sixth of a g arrives slower, so the destination's
+      physics genuinely reach the outcome.
+- [ ] Flying it with a renderer attached. The sim resolves it; the boundary is
+      the same one the missions have always sat behind.
 - [ ] `procgen::World::generate(seed)` makes a landable world. It is a
       *different type* from `world::World`, which is the demo-map sandbox —
       see `docs/UNWIRING.md`. Something has to bridge or replace.

@@ -5967,6 +5967,31 @@ greying rather than hiding.
 
 1087 passing.
 
+THE STARMAP FLIES THE COURSE NOW, in simulation. Pressing a destination runs
+`patrol::Destination -> mapsim::ground_for -> drop::Drop` in sequence — the
+first time those three have run together rather than as three separate
+headless drivers. Earth: "down at 7 m from the mark at 45 m/s".
+
+A test asserts the destination's physics REACH the outcome — a sixth of a g
+arrives slower than a full one — because otherwise `ground_for` is decorative
+and the three modules are still three modules with a console in front of them.
+
+AND MY OWN TEST FROM LAST SESSION FAILED, CORRECTLY. It asserted the console
+said "flying it is not wired yet". Wiring it broke that, which is the
+assertion doing its job: a claim about what a feature does NOT do has to be
+revisited when it starts doing it, and a test is the only thing that makes
+that happen on purpose rather than by somebody noticing.
+
+DEEP SPACE IS A DOCK, NOT A LANDING. Three of the eighteen destinations have
+gravity at or near zero — `outer_rim` and `shield_edge` are DeepSpace,
+`carrion` is an asteroid field at 0.02g. A drop needs something to fall
+toward, and forcing one loops to the timeout and reports an infinite miss.
+Found by the test that flies every destination: "outer_rim never landed at
+all". The route table is RIGHT and my assumption that every destination has a
+surface was not.
+
+1090 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
