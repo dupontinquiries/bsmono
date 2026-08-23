@@ -251,10 +251,61 @@ verification slot and nothing else.
 
 Defaults today: `LOGSCOPE_SPEC_DRAFT=lookup`, `LOGSCOPE_SPEC_K=4`,
 `LOGSCOPE_SPEC_NGRAM=2` (measured: ng=2 beats 3 and 4 on every corpus). Their
-run used k=7. **Worth re-sweeping k on this hardware for exactly the reason
-above** — a larger k costs almost nothing per forward when submits dominate, so
-the optimum here should sit higher than on a compute-bound card. That is a
-prediction, not a measurement.
+run used k=7.
+
+### The k sweep, now measured (`examples/k_sweep.rs`)
+
+This page previously said re-sweeping k was "a prediction, not a measurement",
+on the reasoning that a larger k is nearly free when submits dominate so the
+optimum should sit higher than on a compute-bound card. Acceptance length
+depends only on the token sequence and the drafter — never on the GPU — so the
+curve was answerable all along, on any machine. 40 files of this tree's own
+Rust, 76k tokens:
+
+```
+   k   PromptLookup(ng=2)      lookupdraft(8..3)
+        emit/pass  accept       emit/pass  accept
+   1       1.264    0.264           1.154    0.154
+   4       1.433    0.433           1.254    0.254
+   7       1.469    0.469           1.274    0.275
+  12       1.487    0.488           1.285    0.285
+```
+
+**The prediction is directionally right and practically almost irrelevant.**
+The curve is monotonic, so on a submit-bound backend a larger k is never worse
+— but k=4 already captures 96% of what k=12 delivers (1.433 against 1.487).
+Raising the default buys under 4%, and it is not where the headroom is.
+
+**Three things this contradicts, all of them written on this page:**
+
+1. *"prompt-lookup should do well on repository reading, where identifiers and
+   paths repeat."* It does better than nothing and not well: 1.43 emitted per
+   pass at the default, a 43% improvement. The vLLM run that prompted all of
+   this had an acceptance length of 3.35. Repository reading is the FAVOURABLE
+   case for this drafter and it still lands less than half way there.
+2. *`lookupdraft`'s longest-match-first argument* — that a longer match is
+   rarer and much likelier to continue correctly. Measured, it is WORSE than
+   the fixed 2-gram at every k (1.254 against 1.433 at k=4). The precision of a
+   long match does not pay for how rarely it fires. `draft_bakeoff.rs` asked
+   this question and this answers it: the wired drafter is the better one.
+3. The framing that k is the lever. It is not. The gap between the two drafters
+   at fixed k (0.18) is larger than the gap across the entire k range for
+   either of them (0.05 and 0.13), and the gap to a model-based drafter is
+   larger still.
+
+**So the honest headroom is the drafter, not the tuning.** Getting from 1.43 to
+anything near 3.35 means a drafter that predicts rather than recalls, and
+`ASAHI_VULKAN_LESSONS.md` already records why the obvious one is out of reach
+here: DFlash2 costs 13.5 GB resident, which is available on a 24 GB card and
+impossible on the 4-8 GB handsets this fleet targets. A small MTP head is the
+shape that fits, and the DavidAU numbers on this page give its break-even —
+50% acceptance, which none of the measurements above approach.
+
+**What is NOT measured, and cannot be here:** what the curve is worth in
+seconds. A larger k costs more verify compute; on a submit-bound backend that
+cost is close to zero and the optimum is wherever acceptance flattens, on a
+compute-bound one it is lower. Same curve, two readings, and only the curve is
+portable.
 
 **The same lever, in the other family.** Block diffusion's threshold commit
 (`LOGSCOPE_DIFFUSION_TAU`) is the identical arithmetic: tokens committed per
