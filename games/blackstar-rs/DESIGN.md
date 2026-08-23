@@ -5938,6 +5938,35 @@ saved loadout.
 
 1083 passing.
 
+THE STARMAP — `patrol` IS REACHABLE FROM INSIDE THE GAME. Taking my own
+priorities doc seriously rather than adding another driver: stations ARE in
+the game loop, the airlock was the one hub room without a console, and
+`patrol::ROUTE` had eighteen destinations that were tested for years and
+invisible while playing.
+
+It lists them all with gravity and surface material, gated on the missions
+that reach them — clearing `the_pluto_line` opens a third. Unreachable ones
+are GREYED RATHER THAN HIDDEN, because `menu.rs` already argues that "why
+can't I press this" beats a row that is not there, and a starmap with holes
+in it is a worse map.
+
+AND IT SAYS WHAT IT DOES NOT DO. Pressing a destination reports "course laid
+for EARTH — 1.00g, Sandstone, weather. flying it is not wired yet." A console
+that implies the loop is finished when it is not is worse than one that
+admits it, and a test asserts the string still says so.
+
+THE WIDTH GUARD PAID FOR ITSELF. My new footer row was 47 characters against
+a 46-character console and the test I added several sessions ago caught it
+before it shipped as a truncation.
+
+Two mistakes of my own along the way: I counted destinations by matching "g "
+in the label, which also matches the "N of M plotted" heading and read
+nineteen out of eighteen; and I reached for `Row::dim` and `Row::note`, which
+do not exist — `disabled()` does, and its doc comment is the argument for
+greying rather than hiding.
+
+1087 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

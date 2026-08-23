@@ -57,6 +57,15 @@ pub enum Station {
     Medbay,
     /// the warden ladder and the seal
     Wardeck,
+    /// THE STARMAP — the destination list, and the first place the campaign
+    /// stack is reachable from inside the game.
+    ///
+    /// `docs/PRIORITIES.md` counted the problem: `patrol` has zero references
+    /// in `main.rs`, so the twenty destinations exist, are tested, and cannot
+    /// be looked at while playing. This is the smallest honest fix — the
+    /// airlock is where you leave from, and it was the one hub room with no
+    /// console on it.
+    Starmap,
     /// THE CHARTROOM -- the archaeological map, and the only place the
     /// carried-back artifacts get looked at properly.
     ///
@@ -68,13 +77,14 @@ pub enum Station {
     Chartroom,
 }
 
-pub const STATIONS: [Station; 6] = [
+pub const STATIONS: [Station; 7] = [
     Station::Bridge,
     Station::Armory,
     Station::Hold,
     Station::Medbay,
     Station::Wardeck,
     Station::Chartroom,
+    Station::Starmap,
 ];
 
 impl Station {
@@ -85,6 +95,7 @@ impl Station {
             Station::Hold => "hold",
             Station::Medbay => "medbay",
             Station::Wardeck => "wardeck",
+            Station::Starmap => "starmap",
             Station::Chartroom => "chartroom",
         }
     }
@@ -95,6 +106,7 @@ impl Station {
             Station::Hold => "THE HOLD",
             Station::Medbay => "THE MEDBAY",
             Station::Wardeck => "THE WARDECK",
+            Station::Starmap => "THE STARMAP",
             Station::Chartroom => "THE CHARTROOM",
         }
     }
@@ -106,6 +118,7 @@ impl Station {
             Station::Hold => "cargo lattice amidships, one chest bolted to the deck",
             Station::Medbay => "seven vats along the hull, one of them yours",
             Station::Wardeck => "the seal chart, nineteen names, some of them crossed",
+            Station::Starmap => "the airlock plot: twenty places, and what each one will do to you",
             Station::Chartroom => "a long table under a hard lamp, and everything you carried home on it",
         }
     }
@@ -117,6 +130,8 @@ impl Station {
             Station::Hold => DeployStyle::stack(),
             Station::Medbay => DeployStyle::glide(),
             Station::Wardeck => DeployStyle::glide(),
+            // the plot unrolls: a chart is a thing you spread out
+            Station::Starmap => DeployStyle::sweep(),
             Station::Chartroom => DeployStyle::sweep(),
         }
     }
@@ -141,6 +156,7 @@ impl Station {
             Station::Hold => "hangar",
             Station::Medbay => "quarters",
             Station::Wardeck => "corridor_aft",
+            Station::Starmap => "airlock",
             Station::Chartroom => "market",
         }
     }
@@ -153,6 +169,7 @@ impl Station {
             Station::Hold => [0.55, 0.80, 0.40],    // cargo strip-lights
             Station::Medbay => [0.45, 0.90, 0.95],  // vat glow, ice-cold
             Station::Wardeck => [0.85, 0.30, 0.30], // the seal, unhappy
+            Station::Starmap => [0.55, 0.62, 0.90], // airlock blue, cold outside
             Station::Chartroom => [0.88, 0.82, 0.62], // one hard lamp, paper-warm
         }
     }
@@ -285,10 +302,70 @@ fn unexamined(sb: &Shipboard) -> Vec<&'static crate::provenance::Finding> {
         .collect()
 }
 
+/// Is there a route to this destination yet?
+///
+/// Uses the same gate vocabulary `archive::gate_open` does — a bare id is a
+/// mission, `warden:<id>` a raid clear — so the starmap and the archaeology
+/// map cannot disagree about where you have been.
+fn gate_open_for(dest: &str, sb: &Shipboard) -> bool {
+    // the first two are always open; the rest follow the missions that reach
+    // them, which is what `content::MISSIONS` already encodes
+    if matches!(dest, "earth" | "outer_rim") {
+        return true;
+    }
+    crate::content::MISSIONS
+        .iter()
+        .filter(|m| m.dest == dest)
+        .any(|m| sb.camp.is_cleared(m.id))
+}
+
 /// Build a station's console from the state.
 pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
     let mut rows: Vec<Row> = Vec::new();
     match st {
+        Station::Starmap => {
+            use crate::patrol::ROUTE;
+            // THE FIRST TIME `patrol` IS READABLE FROM INSIDE THE GAME.
+            // Twenty destinations with real gravity, terrain and weather,
+            // tested for years under `--terrain`, and until now invisible
+            // while playing.
+            let reachable = ROUTE.iter().filter(|d| gate_open_for(d.id, sb)).count();
+            rows.push(Row::heading(&format!(
+                "{reachable} of {} plotted",
+                ROUTE.len()
+            )));
+            rows.push(Row::gap());
+            for d in ROUTE.iter() {
+                let open = gate_open_for(d.id, sb);
+                let g = crate::mapsim::ground_for(d);
+                let label = format!(
+                    "{:<14} {:>4.2}g {:?}",
+                    d.name.chars().take(14).collect::<String>(),
+                    d.gravity,
+                    g.material
+                );
+                if open {
+                    rows.push(
+                        Row::action(d.id, &label).hint(leak(format!(
+                            "{:?} under a {:?} sky, {}, {:?} held",
+                            d.terrain,
+                            d.sky,
+                            if d.weather { "weather" } else { "no air movement" },
+                            d.hostiles
+                        ))),
+                    );
+                } else {
+                    // greyed rather than hidden: the menu's own note says "why can't
+                    // I press this" beats a row that is not there, and a
+                    // starmap with holes in it is a worse map
+                    rows.push(
+                        Row::action(d.id, &format!("{label}   — no route yet")).disabled(),
+                    );
+                }
+            }
+            rows.push(Row::gap());
+            rows.push(Row::heading("plotting is not flying — see PRIORITIES.md"));
+        }
         Station::Chartroom => {
             let a = assay_with(
                 archive::CLAIMS,
@@ -570,6 +647,25 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
     let Event::Pressed(id) = ev else { return None };
     let id = *id;
     match st {
+        Station::Starmap => {
+            use crate::patrol::ROUTE;
+            let Some(d) = ROUTE.iter().find(|d| d.id == id) else { return None };
+            if !gate_open_for(d.id, sb) {
+                return Some(Order::Did(format!("{} — no route yet.", d.name)));
+            }
+            // HONEST ABOUT WHAT IT DOES. Plotting is not flying, and a console
+            // that pretends otherwise is worse than one that says so: the drop
+            // physics exist (`drop.rs`), the landing decision exists
+            // (`foothold.rs`), and neither is wired to a renderer yet.
+            let g = crate::mapsim::ground_for(d);
+            Some(Order::Did(format!(
+                "course laid for {} — {:.2}g, {:?}, {}. flying it is not wired yet.",
+                d.name,
+                d.gravity,
+                g.material,
+                if d.weather { "weather" } else { "still air" }
+            )))
+        }
         Station::Chartroom => {
             // Going through what you brought back IS this room's job, so a
             // press on an unexamined crate records it. A press on a NODE is
@@ -879,6 +975,81 @@ mod tests {
                 "Shipboard loads sv.{field} and never writes it back"
             );
         }
+    }
+
+    #[test]
+    fn the_starmap_makes_patrol_reachable_from_inside_the_game() {
+        // `docs/PRIORITIES.md` counted zero references to `patrol` in
+        // `main.rs`. Stations ARE in the game loop, so this is the smallest
+        // honest fix — and a test that the destinations show up at all,
+        // because "it exists and is tested" was already true and was not
+        // enough.
+        let sb = board();
+        let m = build(Station::Starmap, &sb, 0);
+        let labels: Vec<&str> = m.rows.iter().map(|r| r.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("EARTH")),
+            "the starmap does not list Earth: {labels:?}"
+        );
+        assert!(
+            m.rows.len() >= crate::patrol::ROUTE.len(),
+            "only {} rows for {} destinations",
+            m.rows.len(),
+            crate::patrol::ROUTE.len()
+        );
+    }
+
+    #[test]
+    fn unreachable_places_are_greyed_rather_than_hidden() {
+        // menu.rs's own note: "why can't I press this" is a better experience
+        // than a row that is not there, and a starmap with holes in it is a
+        // worse map
+        let sb = board();
+        let m = build(Station::Starmap, &sb, 0);
+        // count by ID rather than by a substring of the label — "g " also
+        // matches the "N of M plotted" heading, which is how this first read
+        // nineteen destinations out of eighteen
+        let ids: Vec<&str> = m.rows.iter().map(|r| r.id).filter(|i| !i.is_empty()).collect();
+        let shown = crate::patrol::ROUTE.iter().filter(|d| ids.contains(&d.id)).count();
+        let pressable = m.rows.iter().filter(|r| r.enabled).count();
+        assert_eq!(shown, crate::patrol::ROUTE.len(), "some destinations are hidden");
+        assert!(pressable < shown, "everywhere is reachable from a fresh save");
+        assert!(pressable >= 1, "nowhere is reachable at all");
+    }
+
+    #[test]
+    fn clearing_a_mission_opens_its_destination() {
+        let mut sb = board();
+        let before = build(Station::Starmap, &sb, 0)
+            .rows
+            .iter()
+            .filter(|r| r.enabled)
+            .count();
+        // pluto is gated behind the mission that reaches it
+        sb.camp.record("the_pluto_line");
+        let after = build(Station::Starmap, &sb, 0)
+            .rows
+            .iter()
+            .filter(|r| r.enabled)
+            .count();
+        assert!(after > before, "clearing a mission opened nothing: {before} -> {after}");
+    }
+
+    #[test]
+    fn plotting_a_course_says_it_is_not_flying_it() {
+        // A console that implies the loop is wired when it is not is worse
+        // than one that says so. This is the honest half of shipping a
+        // half-built feature.
+        let mut sb = board();
+        let out = apply(Station::Starmap, &Event::Pressed("earth"), &mut sb, 0);
+        let Some(Order::Did(line)) = out else { panic!("no report: {out:?}") };
+        assert!(line.contains("EARTH"), "{line}");
+        assert!(line.contains("not wired"), "it claimed more than it does: {line}");
+
+        // and an unreachable one refuses rather than pretending
+        let out = apply(Station::Starmap, &Event::Pressed("pluto"), &mut sb, 0);
+        let Some(Order::Did(line)) = out else { panic!("no report") };
+        assert!(line.contains("no route"), "{line}");
     }
 
     #[test]

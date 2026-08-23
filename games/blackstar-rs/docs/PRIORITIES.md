@@ -12,7 +12,7 @@ apologising. Measured, in `main.rs` — the actual game loop:
 
 | module | what it is | references in `main.rs` |
 |---|---|---|
-| `patrol` | the destination list — where you can go | **0** |
+| `patrol` | the destination list — where you can go | **6** ✓ |
 | `procgen` | world generation for those destinations | **0** |
 | `foothold` | landing, approach, taking a site | **0** |
 | `campaign` | missions | 1 |
@@ -49,8 +49,16 @@ human moves at 0.45 of a bot's pace and the maps are built for neither.
 
 ### 2. A ship you can fly and land
 
-- [ ] `patrol::ROUTE` is the destination list and the game loop cannot see it.
-      Wire a starmap that reads it.
+- [x] **`patrol::ROUTE` is readable in-game.** `Station::Starmap` sits on the
+      airlock — the one hub room that had no console — and lists all eighteen
+      destinations with their gravity and surface, gated on the missions that
+      reach them. Unreachable ones are GREYED rather than hidden, per
+      `menu.rs`'s own note that "why can't I press this" beats a row that is
+      not there. Pressing one says *"course laid for EARTH — 1.00g, Sandstone,
+      weather. flying it is not wired yet"*, because a console that implies
+      the loop is finished when it is not is worse than one that admits it.
+- [ ] Flying the course. `drop.rs` has the descent physics and
+      `--terrain drop` runs it headlessly; nothing connects the two.
 - [ ] `procgen::World::generate(seed)` makes a landable world. It is a
       *different type* from `world::World`, which is the demo-map sandbox —
       see `docs/UNWIRING.md`. Something has to bridge or replace.
