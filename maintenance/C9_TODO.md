@@ -111,6 +111,42 @@ absorbing all of it.
 - **C9-1e — c4-858-delta.** `queued`. Prerequisite located inside the
   blackstar bundle. Applyable, almost certainly by extraction.
 
+- **C9-1i — blackstar-005 merged (c10, `f47cdb5bb`).** `done` · `verified`.
+  21 commits, all under `games/`, 8 conflict hunks. Both sides had
+  independently fixed the SAME two bugs across the c8/c9 split and the merge
+  had to adjudicate: `Traits::blend` (theirs is endpoint-exact AND monotonic,
+  ours only the former) and `Car::seat_h` vs `Car::stand_h` (byte-identical
+  bodies, two names — kept `stand_h`, since their `every_site_uses_stand_h`
+  greps for open-coded `ride_h > 0.0` and would have failed with both
+  present). Kept from our side: two negative-`ride_h` fallback tests their
+  suite never had. 1143 tests pass.
+
+- **C9-1j — clawbound-02 merged (c10, `92ea51ac1`).** `done` · `verified`.
+  Delivered as bundle + patches + snapshot; the BUNDLE WAS UNUSABLE — incremental,
+  prerequisite `e2bdd70c` absent, the INCOMING_BUNDLE_REBASE.md case again — so
+  the 41-patch series was the route, and `git am -3` failed on most of it because
+  three-way needs pre-image blobs for files that had diverged here. Applied by
+  context, one commit at a time, preserving author/date/message. 1-10 were
+  already here under different hashes; 11-41 are new.
+  FOUR independent rediscoveries, all kept rather than resolved away:
+  `mapeval::lane_score` vs our `lane_water_report`; their headless `draft.rs`
+  vs our `menu.rs` `Screen::Draft`; **`MenuCmd::StartBattleground` under one
+  name with two signatures** (one ancestor vs six drafted picks — different
+  journeys, so the draft became `StartBattlegroundDraft`); and two Title-screen
+  routes, both now asserted by test because a renumbering is how one would
+  quietly stop being reachable.
+  Patch 11 applied CODE ONLY: our `animals.web` is byte-identical (md5
+  ae07dafd) so its 17 MB of binary hunks were a no-op, but its code half
+  replaced an `assets_present()` skip guard that left the test passing while
+  checking nothing. Twice declined their TODO text, which would have
+  reintroduced a rustc >= 1.76 blocker retired here.
+  362 lib + 5 integration tests pass. Their own verification examples
+  reproduce: `lane_report` clan gap 0.0000 on all three lands with
+  distinctness 0.346-0.413 (they claim 0.35-0.41); `side_probe 40` gives
+  A 45% ± 7.9, consistent with their 51%; `mirror_probe` still reports
+  divergence after first contact, which is their own open TODO item, not a
+  merge regression.
+
 ### New, from integrating
 
 - **C9-1f — Two fullscreen app launchers, both `primary = true`.** `blocked`
