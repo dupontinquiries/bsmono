@@ -6,6 +6,7 @@
 //! `train` learns a generator from your own audio; `gui` opens the realtime
 //! latent-space explorer that morphs between generated beats.
 
+mod micsample;
 mod audio_io;
 mod config;
 mod dataset;
