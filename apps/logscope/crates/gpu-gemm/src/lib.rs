@@ -54,7 +54,6 @@ pub mod iq4;
 pub mod iq1m;
 pub mod iqgrids;
 pub mod iq2xxs;
-pub mod iq3;
 /// The commit this engine was built from. A log that does not say which binary produced it cannot
 /// be read against a change — three times a fix has been reported as not working when the binary
 /// predated it, or credited when it was already there.

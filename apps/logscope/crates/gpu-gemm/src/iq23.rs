@@ -333,4 +333,67 @@ mod iq3xxs_properties {
         let v = dequant_iq3_xxs(&block(0, [0xF000_0000; 8], 7), 256).unwrap();
         assert!(v.iter().all(|&x| x == 0.0), "d=0 must give exact zeros");
     }
+
+    // ── ported from iq3.rs, which this module supersedes ────────────────────
+    //
+    // iq3.rs implements the same three formats, has zero callers, and its
+    // dequant_iq3_s/dequant_iq2_s have DRIFTED from the ones gguf.rs actually
+    // dispatches to (here). Its fourteen tests were therefore validating code
+    // the engine does not run — which reads as coverage and is not.
+    //
+    // These are the assertions iq23 did not already make. Most turn out to be
+    // about the SHARED `iqgrids` tables rather than about either decoder, which
+    // is why they were safe to move: a fact about IQ2XXS_GRID is true wherever
+    // it is asserted. The behavioural ones were re-run against THIS module's
+    // decoders rather than copied on faith — see the note on the nibble test.
+
+    /// The grid ENTRY WIDTH, contrasted with the sibling format's.
+    ///
+    /// iq23 already pins `IQ3XXS_GRID`'s length and element size. What it did
+    /// not pin is the contrast that makes the mistake possible: IQ2_XXS's
+    /// entries are 8 bytes and IQ3_XXS's are 4, so reading one as the other
+    /// walks off the table for high indices and returns the neighbour's bytes
+    /// for low ones — a silent wrong-weights failure, not a panic.
+    #[test]
+    fn the_grid_entry_is_four_bytes_where_iq2_xxs_is_eight() {
+        assert_eq!(IQ3XXS_GRID.len(), 256);
+        assert_eq!(std::mem::size_of_val(&IQ3XXS_GRID[0]), 4);
+        assert_eq!(std::mem::size_of_val(&crate::iqgrids::IQ2XXS_GRID[0]), 8,
+                   "the sibling format's entry is 8 bytes; confusing them is silent");
+    }
+
+    /// The sign table is genuinely shared, and that is worth an assertion
+    /// because most things between these two formats are NOT.
+    #[test]
+    fn the_sign_table_is_shared_with_iq2_xxs() {
+        assert_eq!(KSIGNS_IQ2XS.len(), 128, "seven-bit selectors, one shared 128-entry table");
+    }
+
+    /// The two grids differ in SIZE as well as entry width: IQ2_S indexes 1024
+    /// entries with ten bits, IQ2_XXS only 256. iq23 asserted the first; the
+    /// contrast is what stops a ten-bit index being read as eight.
+    #[test]
+    fn the_iq2_s_grid_is_ten_bits_where_iq2_xxs_is_eight() {
+        assert_eq!(crate::iqgrids::IQ2S_GRID.len(), 1024);
+        assert_eq!(crate::iqgrids::IQ2XXS_GRID.len(), 256, "the XXS grid, for contrast");
+    }
+
+    /// IQ2_S packs TWO scales per group — low nibble first, high nibble for the
+    /// second half of the group.
+    ///
+    /// Re-run against this module's `dequant_iq2_s`, not copied: iq3's copy of
+    /// that function has drifted from this one, so a verbatim port would have
+    /// asserted the dead decoder's behaviour. It passes here unchanged, which
+    /// is evidence the drift between them is not in this path.
+    #[test]
+    fn two_scales_per_group_low_nibble_then_high() {
+        let mut raw = vec![0u8; IQ2_S_BLOCK];
+        raw[0] = 0x00; raw[1] = 0x3C;
+        raw[74] = 0x30;                        // low nibble 0, high nibble 3
+        let v = dequant_iq2_s(&raw, 256).unwrap();
+        let g = crate::iqgrids::IQ2S_GRID[0].to_le_bytes();
+        assert_eq!(v[0], 0.5 * 0.25 * g[0] as f32, "first half takes the LOW nibble");
+        assert_eq!(v[16], 3.5 * 0.25 * g[0] as f32, "second half takes the HIGH nibble");
+    }
+
 }
