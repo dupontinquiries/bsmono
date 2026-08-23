@@ -33,6 +33,10 @@ pub mod cpudecode;
 pub mod perfverdict;
 pub mod passfuse;
 pub mod qkvsplit;
+// Splitting a fused ffn_gate_up_exps, the same job qkvsplit does for attn_qkv.
+// diffusion-gemma ships gate and up concatenated per expert, which the
+// separate-name MoE lookup misses entirely.
+pub mod expsplit;
 pub mod prefetch;
 pub mod mladims;
 pub mod rolequant;

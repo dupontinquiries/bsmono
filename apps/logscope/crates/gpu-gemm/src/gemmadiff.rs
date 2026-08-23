@@ -698,9 +698,28 @@ mod tests {
         let lib = include_str!("lib.rs");
         assert!(lib.contains("ffn_gate_exps"),
                 "the separate-expert names are gone — if the loader was rewritten, re-derive this");
-        assert!(!lib.contains("ffn_gate_up_exps"),
-                "lib.rs now mentions ffn_gate_up_exps: if fused experts are handled, DELETE this \
-test and the 'CONTRADICTED' paragraph in the module docs, which both claim they are not");
+        // UPDATED, not deleted, and this is the distinction the original note
+        // asked for. `expsplit` now derives the gate/up offsets from the fused
+        // shape — so the ARITHMETIC exists and is tested — but the loader still
+        // does not call it: MoE detection keys on `ffn_gate_exps` and a
+        // diffusion-gemma block still reads as dense. The gap moved one step
+        // rather than closing, and a test that had been deleted here would have
+        // reported it as closed.
+        // COMMENTS STRIPPED before searching. This tripped twice on text that
+        // is not code: first on `pub mod expsplit;`, then on the COMMENT above
+        // that declaration explaining what it splits. A source-level gap test
+        // that greps raw text reports its own documentation as an
+        // implementation — which is the exact failure it exists to prevent,
+        // pointed at itself.
+        let code: String = lib.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loader_wires_it = code.contains("Split::derive") || code.contains("ffn_gate_up_exps");
+        assert!(!loader_wires_it,
+                "lib.rs now reaches expsplit or names the fused tensor: if the loader really \
+routes 128 experts through it, DELETE this test and the 'CONTRADICTED' paragraph in the module \
+docs, which both still claim it does not");
     }
 
     /// The scale tensors the plan does not account for.
