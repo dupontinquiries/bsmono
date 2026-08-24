@@ -363,3 +363,22 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   repeat of the first?
 - **C11-17d — `git show <hash>` / `git blame <path> <line>`** would answer
   "why is this line here", the natural next question after path-scoped log.
+
+## 18. The hive matrix (docs/11-hive-matrix.md + hive.rs)
+
+- **DONE**: the matrix cell (model x node x KV warmth x busy), place() with
+  warmth-over-speed and hard reach, explain_empty's three causes, and the
+  design doc the dangling HiveMind_Strategy citations now point at.
+- **C11-18a — nobody BUILDS a matrix yet.** hive::place takes `&[Cell]`;
+  assembling it from discovery/clusternode (live nodes) + the engine's own
+  anchor pool (warm_prefix per cell) is the wiring step. The warmth number
+  must come from pick_anchor, not be guessed — the doc says why.
+- **C11-18b — coordinator::Mode should choose HOW MANY cells**, then place()
+  picks which. Today Mode plans workers and place() is unaware of it; the
+  join is small and makes aggressive fan-out warmth-aware.
+- **C11-18c — preemption, if ever**: needs numbers proving interrupting a
+  warm cell beats waiting. Deliberately unbuilt.
+- **C11-18d — the strategy doc itself.** If the original
+  HiveMind_Strategy_Logscope.md still exists outside the repo, diff it
+  against 11-hive-matrix.md; anything it mandates that the code does not do
+  is a gap worth listing rather than silently dropping.
