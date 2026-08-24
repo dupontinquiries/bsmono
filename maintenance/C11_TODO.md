@@ -234,3 +234,19 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   own backtraces before anyone guesses.
 - The engine TODO in the pasted snippet (log prompt head+tail for loop
   introspection) — the prompt diag already prints tail ids; add the head.
+
+## 11. Continuation of §10 (c11, later)
+
+- **C11-11a — rope linear scaling: DONE at loader level** (+ named refusal
+  for unknown/incomplete scaling). Retest deepseek-coder-6.7b on device —
+  the log will now say "linear rope scaling ON" instead of "(inactive)".
+- **C11-11b — qwen3 gibberish still open.** tiny-qwen3 green; head_dim
+  explicit-key handled; linear/yarn now handled-or-refused. Next probe on
+  device: load the real gguf and read the rope line + any refusal; if it
+  loads clean and still gibbers, dump the first-token logits against
+  llama.cpp on the same prompt (the engine has --validate machinery).
+- **C11-11c — Gpu::alloc systemic cap guard: DONE.** Any remaining crash on
+  large repos now names its shape and site.
+- **C11-11d — wire read_harness into backend prompt assembly**: chunking,
+  fences, git log formatting through the budget; the module has no consumer
+  yet. Also feed ModelClass from the engine's real param count.
