@@ -78,8 +78,11 @@ games/ tail and the whole apps/ slice) were not touched this session.
 
 ## 5. The rain thread (unendlich-fullgame)
 
-- **C11-5a — `unendlich-netview` does not compile: unresolved import
-  `netview`.** `verified` (it blocks a plain `cargo check` of the engine).
+- **C11-5a — `unendlich-netview` does not compile.** `DONE` · `verified`
+  end-to-end: the missing shared/netview dep is declared, the engine's
+  default check is green, and the spectator served a live rollback snapshot
+  over TCP in-sandbox. C10-1a's engine sweep FAIL should be RE-RUN — this
+  was almost certainly its root. Was:
   Very likely THE root of C10-1a's engine sweep FAIL, and possibly related to
   the C11-2b orphans — a module that exists on disk but is not declared, or
   was renamed. Untouched by the rain fix; diagnose the import before anything
