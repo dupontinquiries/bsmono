@@ -42,7 +42,15 @@ a rule now:
 """
 import re, sys, pathlib
 
-ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "/home/claude/repo")
+# .resolve() is load-bearing, not tidiness: is_workspace_member() compares a
+# crate's ancestors against ROOT, and with a relative ROOT ("." — the way
+# CLAUDE.md §7 and C11_TODO both spell the invocation) the very first ancestor
+# fails the containment test, so NOTHING is ever recognised as a workspace
+# member and every member crate's vestigial lock is reported stale. That is
+# where C11-2a's "unendlich-engine has not locked audiopus, egui, ..." came
+# from; it is a member of games/unendlich's workspace and its own lock is not
+# the one cargo uses.
+ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "/home/claude/repo").resolve()
 SKIP_PARTS = {"target", "vendor", ".git", "node_modules"}
 
 SECTION = re.compile(r'^\s*\[(?:target\.[^\]]+\.)?(dependencies|dev-dependencies|build-dependencies)\]\s*$')
@@ -80,7 +88,11 @@ def is_workspace_member(crate_dir):
     """True when an ancestor Cargo.toml declares a [workspace] — that root's
     lock is the one cargo uses, and this crate's own lock is vestigial."""
     for anc in list(crate_dir.parents):
-        if not str(anc).startswith(str(ROOT)):
+        # Containment by path parts, not string prefix: "/x/repo2" starts with
+        # "/x/repo" and is not inside it.
+        try:
+            anc.relative_to(ROOT)
+        except ValueError:
             break
         t = anc / "Cargo.toml"
         if t.exists():

@@ -31,13 +31,18 @@ this sandbox, and a checker pointed at nothing reports success
 (`scanned 0 crates`), which is exactly the vacuous-pass shape CLAUDE.md §5b
 warns about. The runs below scanned 254 crates.
 
-- **C11-2a — `lock_check`: `games/unendlich/crates/unendlich-engine` declares
-  but has not locked** audiopus, egui, linkme, netcode, ogg, rayon, rodio,
-  unendlich-ui (and its dash sibling serde_json). `verified` (the checker ran;
-  the cause is not diagnosed). NOTE the same crate is C10-1a's one "looks
-  real" feature-sweep FAIL — a stale lock resolves online and fails offline,
-  which is consistent with an 82 s failure in an offline sandbox. Check the
-  lock BEFORE debugging the crate.
+- **C11-2a — WITHDRAWN (c12): there was no stale lock.** The finding was an
+  artifact of `lock_check.py .` — a RELATIVE root, which is how this file and
+  CLAUDE.md §7 both spell the invocation. `is_workspace_member()` compared a
+  crate's ancestors to ROOT by string prefix, and with `ROOT="."` the first
+  ancestor ("apps/studio/crates") fails `startswith(".")`, so the walk broke
+  immediately and NOTHING was recognised as a workspace member. Every member
+  crate's vestigial lock then read stale. `unendlich-engine` is a member of
+  `games/unendlich`'s workspace; the lock cargo uses is the workspace root's.
+  Fixed by resolving ROOT and testing containment with `relative_to`; the
+  tree now reports 0 stale from any invocation form. **C10-1a's
+  feature-sweep FAIL on the same crate is therefore undiagnosed again** — the
+  stale-lock explanation was the artifact, so do not start there.
 - **C11-2b — `orphan_check`: 7 orphaned .rs files, 0 tests.**
   `games/blackstar-rs/src/rig.rs` (446 lines),
   `games/unendlich-engine`'s `render/bloom.rs`, `render/postfx.rs`,
