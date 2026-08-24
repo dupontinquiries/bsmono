@@ -163,3 +163,17 @@ report's own order, each with the pointer a next session needs.
 - **C11-7d — per-page min_width packing.** fit_cols packs by the WIDEST
   page (conservative, cannot overflow); real per-page packing is a
   refinement with the same test harness.
+
+## 8. The camera thread (desktop webcam)
+
+- **C11-8a — verify on a real desktop.** The plan + fallback chain is tested;
+  frames are not (no camera here). Watch the log: `camera source: trying ...`
+  lines show the chain; a wrong pick on a multi-camera desktop wants the
+  override (`pw_node` config accepts a /dev/video path now).
+- **C11-8b — the egui frontend's camera_source/camera_select decision layer
+  is still not fed by this.** `read`. camera-bridge now enumerates; the
+  frontend's `choose()` (device+format+front-facing) should consume the same
+  v4l2 listing so the viewfinder mirror/rotation decisions apply to the
+  desktop path too. The seam exists on both sides; nobody has joined them.
+- **C11-8c — pipewiresrc parse-validation** needs a machine with the
+  gst-pipewire plugin; here it is string-asserted only, said so in the test.
