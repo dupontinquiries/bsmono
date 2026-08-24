@@ -106,7 +106,8 @@ is the design work; the animation is not.
 
 ## How to work on this
 
-`tools/fastcheck` is a 3-second edit-test loop. `skydribble --help` lists
+`tools/fastcheck` is the fast edit-test loop; `cargo ailite` is vendored at
+`<repo>/tools/cargo-ailite`, so a fresh clone needs no setup. `skydribble --help` lists
 about thirty drivers; each module has one and they are the fastest way to see
 what a system does. The build prints `[ship] ...` to stderr at startup, which
 settles "is the wiring live" in one line.

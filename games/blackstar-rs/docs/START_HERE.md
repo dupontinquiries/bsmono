@@ -21,8 +21,16 @@ ported out of it; `docs/INHERITED_DESIGN.md` harvests the 42 it documented.
 
 ## The one thing to know
 
-**`tools/fastcheck` is a three-second edit-test loop.** Use it. `cargo build`
+**`tools/fastcheck` is the fast edit-test loop.** Use it. `cargo build`
 without it pulls in the renderer and audio and takes minutes.
+
+It calls `cargo ailite`, which is **vendored at `<repo>/tools/cargo-ailite`**
+— see `tools/README.md`. A fresh clone needs no setup; `fastcheck` finds it,
+and falls back to plain `cargo` with a warning if it cannot.
+
+The "3 s" in `fastcheck`'s own comments is the COMPILE side. Unfiltered, the
+suite alone runs ~14 s at opt-0, so the real unfiltered cycle is about that.
+`tools/fastcheck archive::` and friends get back to seconds.
 
 Audio needs `libasound2-dev`; `--no-default-features` builds silent and is
 what fastcheck uses.

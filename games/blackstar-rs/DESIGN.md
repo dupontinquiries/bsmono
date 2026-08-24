@@ -6503,6 +6503,36 @@ the thing it measures does.
 
 1133 passing.
 
+I SHIPPED A BUNDLE WHOSE TEST LOOP DID NOT WORK IN IT.
+
+`tools/fastcheck` shells out to `cargo ailite`, which lived at
+`/home/claude/ailite/` — outside the monorepo, and therefore outside every
+bundle I cut. Somebody cloning one hit `no such subcommand`, and rather than
+bypass the loop they RECONSTRUCTED the tool from the comments in `fastcheck`.
+
+That was the right instinct and the reconstruction could not have been right,
+because the levers are in the tool and the comments are in the caller. It
+missed `debug = 0` and `strip = "debuginfo"` (the actual size and time
+levers), `CARGO_BUILD_JOBS=1` (which caps peak RAM and matters on one vCPU),
+`--test-threads=1`, and `gate` mode entirely. It also ADDED an opt-level knob,
+which the real tool deliberately does not touch — dev inherits 0 and that is
+already the fastest to compile.
+
+Vendored now at `<repo>/tools/cargo-ailite`, with `ailite-cache` and the
+schedule patch beside it and a `tools/README.md` tabulating exactly what the
+reconstruction missed, so the next person to find a gap knows what they are
+comparing against. `fastcheck` prefers `PATH`, falls back to the vendored
+copy, and falls back again to plain `cargo` with a warning — verified by
+running it with the tool hidden.
+
+AND THE "3 SECOND LOOP" IN MY OWN DOCS IS WRONG. That is the COMPILE side. The
+suite alone runs ~14 s at opt-0, so the unfiltered cycle is about that;
+filters get back to seconds. Corrected in `START_HERE.md` — a figure that only
+holds under a filter nobody mentioned is a figure that makes the tool look
+broken.
+
+1133 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
