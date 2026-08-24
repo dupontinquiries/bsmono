@@ -1257,6 +1257,8 @@ pub struct App {
     library_root: std::path::PathBuf,
     library_tree: library::TreeState,
     morph: morph_pad::PadState,
+    bounce_format: morph_pad::BounceFormat,
+    settings_open: bool,
     library_open: bool,
     /// The export dialog's plan while it is open, plus its last refusal —
     /// shown inline so a bad plan is a message, not a closed window.
@@ -1321,6 +1323,7 @@ impl Default for App {
         studio.view.scroll = studio_core::Ticks(ws.scroll_ticks);
         studio.closed_groups = ws.closed_groups.iter()
             .map(|g| studio_core::GroupId(*g)).collect();
+        let bounce_format = morph_pad::BounceFormat::from_token(&ws.bounce_format);
         studio.status = match load_note {
             Some(e) => format!("{e} — started fresh (Ctrl+S will overwrite!)"),
             None => format!("{} — audition: {}", studio.status, sink.describe()),
@@ -1354,7 +1357,9 @@ impl Default for App {
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library_tree,
-              morph: morph_pad::PadState::default(), library_open: true,
+              morph: morph_pad::PadState::default(),
+              bounce_format,
+              settings_open: false, library_open: true,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1525,6 +1530,7 @@ impl eframe::App for App {
                         scroll_ticks: self.studio.view.scroll.0,
                         closed_groups: self.studio.closed_groups.iter()
                             .map(|g| g.0).collect(),
+                        bounce_format: self.bounce_format.token().to_string(),
                     });
                     if self.studio.save_to(&path).is_ok() {
                         // The save happened; history is the extra. A missing
@@ -1559,6 +1565,9 @@ impl eframe::App for App {
                     .on_hover_text("timeline above, rack/program/mixer below — instead of tabs")
                     .clicked() { combined = !combined; }
                 self.studio.combined = combined;
+                if ui.button("settings…").clicked() {
+                    self.settings_open = !self.settings_open;
+                }
                 if ui.button("archive…")
                     .on_hover_text("the whole session — state and audio — as ONE file")
                     .clicked() {
@@ -1578,6 +1587,24 @@ impl eframe::App for App {
                 });
             });
         });
+        if self.settings_open {
+            let mut open = true;
+            egui::Window::new("Settings").open(&mut open).resizable(false)
+                .collapsible(false).show(ctx, |ui| {
+                    ui.label("bounce fidelity — what library-bound renders cost on THIS device:");
+                    let all = morph_pad::BounceFormat::ALL;
+                    let mut ix = all.iter().position(|f| *f == self.bounce_format).unwrap_or(1);
+                    ui.add(egui::Slider::new(&mut ix, 0..=all.len() - 1).show_value(false));
+                    self.bounce_format = all[ix];
+                    ui.label(self.bounce_format.label());
+                    ui.colored_label(egui::Color32::GRAY,
+                        "opus 192k is transparent on most systems at a tenth the size; \
+                         flac is the lossless rung; wav is for whoever insists. \
+                         Saved per device with the workspace — a phone and a desktop \
+                         answer this differently on purpose.");
+                });
+            if !open { self.settings_open = false; }
+        }
         self.archive_window(ctx);
         self.export_dialog_window(ctx);
         self.export_tracker_window(ctx);
@@ -1857,7 +1884,8 @@ impl eframe::App for App {
                                 }
                             }
                             Some(morph_pad::PadAction::Bounce) => {
-                                match morph_pad::bounce(&self.library_root, &self.morph) {
+                                match morph_pad::bounce(&self.library_root, &self.morph,
+                                                        self.bounce_format) {
                                     Ok(p) => {
                                         self.studio.status = format!("bounced {}", p.display());
                                         self.morph.last_bounce = Some(p);

@@ -58,7 +58,7 @@ use studio_collab::file::SaveFile;
 use studio_core::{Op, SourceId};
 
 pub const MAGIC: &[u8; 8] = b"STUARCH1";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// The fidelity presets the save popup's slider walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +115,11 @@ pub enum MediaKind {
     OpusProxy,
     /// The session's original bytes, untouched.
     Original,
-    /// Lossless fallback for audio the session held only as PCM.
+    /// Lossless fallback for audio the session held only as PCM —
+    /// FLAC since v3; the WAV kind remains decodable for completeness
+    /// but nothing writes it anymore.
     Wav,
+    Flac,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,6 +211,15 @@ fn condition_for_opus(a: &SourceAudio) -> SourceAudio {
     SourceAudio { sample_rate: 48_000, channels }
 }
 
+fn flac_bytes(a: &SourceAudio, seed: u64) -> Result<Vec<u8>, String> {
+    // ≤2 channels: FLAC-the-subset and Opus share the cap, and a >2ch
+    // PCM take does not exist in this shell.
+    let capped = SourceAudio { sample_rate: a.sample_rate,
+        channels: a.channels.iter().take(2).cloned().collect() };
+    studio_media::flac::encode_flac(&capped, seed).map_err(|e| format!("flac: {e}"))
+}
+
+#[allow(dead_code)]
 fn wav_bytes(a: &SourceAudio, seed: u64) -> Result<Vec<u8>, String> {
     let ch = a.channels.len().max(1);
     let mut inter = Vec::with_capacity(a.frames() * ch);
@@ -255,8 +267,8 @@ pub fn pack(
                     Some(MediaEntry { source: src.id, kind: MediaKind::Original,
                                       ext: ext.clone(), bytes: bytes.clone() })
                 } else if let Some(a) = audio.get(&src.id) {
-                    Some(MediaEntry { source: src.id, kind: MediaKind::Wav,
-                                      ext: "wav".into(), bytes: wav_bytes(a, src.id.0)? })
+                    Some(MediaEntry { source: src.id, kind: MediaKind::Flac,
+                                      ext: "flac".into(), bytes: flac_bytes(a, src.id.0)? })
                 } else { None }
             }
             Some(bitrate) => {
@@ -267,8 +279,8 @@ pub fn pack(
                             kind: MediaKind::OpusProxy, ext: "opus".into(), bytes }),
                         // A build without the opus feature still archives —
                         // lossless is a bigger file, never a hole.
-                        Err(_) => Some(MediaEntry { source: src.id, kind: MediaKind::Wav,
-                            ext: "wav".into(), bytes: wav_bytes(&cond, src.id.0)? }),
+                        Err(_) => Some(MediaEntry { source: src.id, kind: MediaKind::Flac,
+                            ext: "flac".into(), bytes: flac_bytes(&cond, src.id.0)? }),
                     }
                 } else if let Some((ext, bytes)) = originals.get(&src.id) {
                     // PCM never decoded but the compressed original is held
@@ -324,7 +336,7 @@ pub fn pack(
     for (i, e) in entries.iter().enumerate() {
         o.extend(e.source.0.to_le_bytes());
         o.push(match e.kind { MediaKind::OpusProxy => 0, MediaKind::Original => 1,
-                              MediaKind::Wav => 2 });
+                              MediaKind::Wav => 2, MediaKind::Flac => 3 });
         put_str(&mut o, &e.ext);
         let m = &manifests.iter().find(|(mi, _)| *mi == i).unwrap().1;
         o.extend(m.asset.to_le_bytes());
@@ -368,6 +380,7 @@ pub fn unpack(b: &[u8]) -> Option<Unpacked> {
         let source = SourceId(r.u64()?);
         let kind = match r.u8()? {
             0 => MediaKind::OpusProxy, 1 => MediaKind::Original, 2 => MediaKind::Wav,
+            3 => MediaKind::Flac,
             _ => return None,
         };
         let ext = r.str()?;
@@ -492,8 +505,9 @@ mod tests {
         assert_eq!(s1.kind, MediaKind::Original);
         assert_eq!(s1.bytes, fake_opus, "a .opus stays .opus, byte for byte");
         let s2 = u.media.iter().find(|m| m.source == SourceId(2)).unwrap();
-        assert_eq!(s2.kind, MediaKind::Wav, "PCM the session recorded goes lossless");
-        assert!(studio_media::decode_bytes(s2.bytes.clone(), Some("wav")).is_ok());
+        assert_eq!(s2.kind, MediaKind::Flac,
+                   "PCM the session recorded goes lossless WITHOUT the wav bill");
+        assert!(studio_media::decode_bytes(s2.bytes.clone(), Some("flac")).is_ok());
     }
 
     #[test]

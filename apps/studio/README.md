@@ -1526,3 +1526,22 @@ the reset. The hint line lives on the widget, the tooltip lesson applied
 at birth. Similar-sounds blending stays a hands-on act: the pad judges
 nothing and merges nothing on its own authority — the archive's
 distortion rule, one surface over.
+
+
+**Lossless without the WAV bill.** studio-media grew a real FLAC encoder —
+deliberately the honest subset: fixed predictors (best of orders 0–4 per
+frame) with Rice coding, 16-bit mono/stereo, dithered from f32 by the WAV
+path's own TPDF rule, escape-to-verbatim for pathological frames. Small
+enough to read whole, and validated the only way that proves anything:
+sample-exact round trips through symphonia's independent decoder, with
+multi-byte frame numbers exercised on purpose (the clever coded-number
+writer broke at exactly frame 128; the boring explicit-thresholds version
+replaced it and the test that caught it stays). Library-bound renders now
+ride a per-device fidelity rung — opus 128/192/256, flac, wav — chosen on
+a settings slider and stored in the workspace sidecar, because storage
+constraints ARE per device: opus-192 is the default (transparent on most
+systems at a tenth the size), flac is the lossless rung, wav exists for
+whoever insists and is nobody's default. A build without the opus feature
+falls to flac, bigger but never a hole. The archive's Master-level PCM
+fallback went the same way (v3): a bounce embeds as FLAC, byte-exact
+originals still byte-exact.

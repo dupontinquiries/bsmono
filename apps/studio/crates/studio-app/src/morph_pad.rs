@@ -20,6 +20,52 @@
 use std::path::{Path, PathBuf};
 use studio_audio::SourceAudio;
 
+/// What library-bound renders are encoded as — a PER-DEVICE choice (the
+/// workspace sidecar's), because storage constraints are per device: a
+/// Fairphone and a studio desktop editing one project want different
+/// answers. The slider's rungs ascend in storage; high-quality Opus is
+/// the default because on most systems and most ears it IS the sound,
+/// FLAC is the lossless rung for the rest, and WAV exists at the top for
+/// whoever insists — never as anyone's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BounceFormat {
+    Opus128,
+    Opus192,
+    Opus256,
+    Flac,
+    Wav,
+}
+impl BounceFormat {
+    pub const ALL: [BounceFormat; 5] = [BounceFormat::Opus128, BounceFormat::Opus192,
+                                        BounceFormat::Opus256, BounceFormat::Flac,
+                                        BounceFormat::Wav];
+    pub fn label(self) -> &'static str {
+        match self {
+            BounceFormat::Opus128 => "opus 128k",
+            BounceFormat::Opus192 => "opus 192k",
+            BounceFormat::Opus256 => "opus 256k",
+            BounceFormat::Flac => "flac (lossless)",
+            BounceFormat::Wav => "wav (uncompressed)",
+        }
+    }
+    /// Sidecar round-trip token — stable, label-independent.
+    pub fn token(self) -> &'static str {
+        match self {
+            BounceFormat::Opus128 => "opus-128", BounceFormat::Opus192 => "opus-192",
+            BounceFormat::Opus256 => "opus-256", BounceFormat::Flac => "flac",
+            BounceFormat::Wav => "wav",
+        }
+    }
+    pub fn from_token(t: &str) -> BounceFormat {
+        Self::ALL.iter().copied().find(|f| f.token() == t)
+            .unwrap_or(BounceFormat::Opus192)
+    }
+    pub fn ext(self) -> &'static str {
+        match self { BounceFormat::Flac => "flac", BounceFormat::Wav => "wav",
+                     _ => "opus" }
+    }
+}
+
 /// The pad's whole state, owned by the shell.
 #[derive(Default)]
 pub struct PadState {
@@ -54,7 +100,8 @@ impl PadState {
 /// Render the pad's current sound into `<dir>/morphs/` as a dithered WAV,
 /// never overwriting — the exporter's unique-name rule. Returns the path,
 /// which is also what a reset may need to remove again.
-pub fn bounce(dir: &Path, state: &PadState) -> Result<PathBuf, String> {
+pub fn bounce(dir: &Path, state: &PadState, format: BounceFormat)
+              -> Result<PathBuf, String> {
     let a = state.blend();
     if a.frames() == 0 {
         return Err("the pad is empty — add samples from the library's ⋯ menu".into());
@@ -67,15 +114,32 @@ pub fn bounce(dir: &Path, state: &PadState) -> Result<PathBuf, String> {
         format!("morph-{}", state.anchors.iter()
             .map(|(n, _)| sanitize_stem(n)).collect::<Vec<_>>().join("-"))
     };
-    let mut path = out_dir.join(format!("{stem}.wav"));
+    let ext = format.ext();
+    let mut path = out_dir.join(format!("{stem}.{ext}"));
     let mut n = 1u32;
     while path.exists() {
-        path = out_dir.join(format!("{stem}-{n}.wav"));
+        path = out_dir.join(format!("{stem}-{n}.{ext}"));
         n += 1;
     }
-    let bytes = studio_audio::export::export_wav_dithered_bytes(
-        &a.channels[0], 1, 48_000, path.to_string_lossy().len() as u64)
-        .map_err(|e| format!("wav: {e}"))?;
+    let seed = path.to_string_lossy().len() as u64;
+    let bytes = match format {
+        BounceFormat::Wav => studio_audio::export::export_wav_dithered_bytes(
+            &a.channels[0], 1, 48_000, seed).map_err(|e| format!("wav: {e}"))?,
+        BounceFormat::Flac => studio_media::flac::encode_flac(&a, seed)
+            .map_err(|e| format!("flac: {e}"))?,
+        f => {
+            let bitrate = match f { BounceFormat::Opus128 => 128_000,
+                                    BounceFormat::Opus256 => 256_000,
+                                    _ => 192_000 };
+            match studio_media::encode_opus(&a, bitrate) {
+                Ok(b) => b,
+                // A build without the opus feature falls to the lossless
+                // rung, not to silence — bigger, never a hole.
+                Err(_) => studio_media::flac::encode_flac(&a, seed)
+                    .map_err(|e| format!("flac: {e}"))?,
+            }
+        }
+    };
     std::fs::write(&path, bytes).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
 }
@@ -177,15 +241,27 @@ mod tests {
         pad.push("Snare 1 (Clean)".into(), tone(300.0));
         pad.push("Snare 4".into(), tone(600.0));
         (pad.x, pad.y) = (0.3, 1.0);
-        let first = bounce(&dir, &pad).expect("bounces");
+        let first = bounce(&dir, &pad, BounceFormat::Opus192).expect("bounces");
         assert!(first.starts_with(dir.join("morphs")));
-        let back = studio_media::decode_bytes(std::fs::read(&first).unwrap(), Some("wav"))
+        assert_eq!(first.extension().unwrap(), "opus",
+                   "the default is high-quality opus, not a phone-filling wav");
+        let back = studio_media::decode_bytes(std::fs::read(&first).unwrap(), Some("opus"))
             .expect("the library can decode its own bounce");
         assert_eq!(back.sample_rate, 48_000);
-        assert!(back.frames() >= 24_000);
-        let second = bounce(&dir, &pad).expect("bounces again");
+        assert!(back.frames() >= 20_000);
+        let second = bounce(&dir, &pad, BounceFormat::Opus192).expect("bounces again");
         assert_ne!(first, second, "the exporter's unique-name rule holds here too");
-        assert!(bounce(&dir, &PadState::default()).is_err(), "an empty pad refuses out loud");
+        // The lossless rung: a real FLAC, decoded by symphonia, smaller
+        // than the WAV rung for the same sound.
+        let flac = bounce(&dir, &pad, BounceFormat::Flac).expect("flac bounces");
+        assert!(studio_media::decode_bytes(std::fs::read(&flac).unwrap(),
+                                           Some("flac")).is_ok());
+        let wav = bounce(&dir, &pad, BounceFormat::Wav).expect("wav bounces");
+        assert!(std::fs::metadata(&flac).unwrap().len()
+                < std::fs::metadata(&wav).unwrap().len(),
+                "lossless without the uncompressed bill");
+        assert!(bounce(&dir, &PadState::default(), BounceFormat::Opus192).is_err(),
+                "an empty pad refuses out loud");
     }
 
     #[test]
