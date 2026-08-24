@@ -1583,3 +1583,28 @@ note-off still gates half a step later, and an octave in the roll is an
 octave out of the synth by zero-crossing count. Draw notes on the 808
 channel and it is a bass synth; the glide the hits already had chains
 through the roll the same way.
+
+
+**The mix & master pass, callable from the mixer.** `studio_fx::assistant`
+(findings-first analysis, strength-capped proposals, and the two rules its
+own tests enforce — strength 0 changes nothing, a balanced mix yields NO
+findings) and `studio_copilot::mix_pass` (findings → real ops) both
+existed and neither was reachable: the analysis had no caller, the
+proposal had no button. Now the Mixer — the panel mixing and mastering is
+FOR — has "mix & master…", which measures the actual mixdown (loudest
+power-of-two window, crest, correlation, low-end width from a low-passed
+pair) and opens a window in the assistant's own order: measurements, then
+findings, then a strength dial, then one apply. Two things the caller had
+to get right. `mix_pass` emits each move as a standalone one-effect chain
+because it is pure and cannot see the bus — applied verbatim those would
+delete the user's own effects and then each other, so `mix_assistant::
+compose` folds them onto the existing chain as one `SetBusChain`. And the
+whole pass applies as ONE undo step (`Op::Group`, wire v12, atomic with
+rollback): a mastering pass that takes six presses of `u` to reverse is a
+pass nobody dares try. Pinned: the user's reverb keeps its place at the
+head of the chain, one `u` restores both chain and gain, and a mid-group
+failure leaves nothing behind. One bug found by its own test and worth
+recording: judging silence on the mono SUM skipped analysis on a fully
+out-of-phase mix — precisely the mix most worth warning about — so
+silence is judged per channel and a collapsed sum reads one channel
+instead, letting the correlation finding carry the warning.

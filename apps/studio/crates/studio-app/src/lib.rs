@@ -21,6 +21,7 @@ pub mod export;
 pub mod clip_inspector;
 pub mod library;
 pub mod midi;
+pub mod mix_assistant;
 pub mod mixer_panel;
 pub mod morph_pad;
 pub mod program_panel;
@@ -112,6 +113,11 @@ pub struct Studio {
     /// Compositions folded closed ON THIS DEVICE — view state beside
     /// `combined`, persisted in the workspace sidecar, never an op.
     pub closed_groups: std::collections::BTreeSet<studio_core::GroupId>,
+    /// The mixer asked for a mastering analysis of this bus. The panel
+    /// cannot run it — analysis needs the shell's decoded audio — so it
+    /// leaves the request as a value, the way every other view here
+    /// returns edits rather than performing them.
+    pub mix_pass_request: Option<(studio_core::BusId, String)>,
     /// The bus faders' twin of `mixer_drag`.
     pub bus_drag: Option<(studio_core::BusId, f32)>,
     /// Motions (the Helix keymap) or Playing (the keyboard is a piano).
@@ -159,6 +165,7 @@ impl Studio {
             auto_drag: None,
             combined: false,
             closed_groups: Default::default(),
+            mix_pass_request: None,
             bus_drag: None,
             input_mode: Default::default(),
             octave: 0,
@@ -193,6 +200,37 @@ impl Studio {
     /// Apply an edit through the Doc's op log — stamped, undoable, and
     /// pushed to the outbox — so undo works, peers converge, and the status
     /// line says so.
+    /// Apply several ops as ONE undo step. A partial failure rolls the
+    /// whole group back, the way `History::apply_group` does for the
+    /// collab path: half a mastering pass is worse than none.
+    pub fn edit_group(&mut self, ops: Vec<studio_core::Op>, what: &str) {
+        let mut applied = Vec::new();
+        for op in ops {
+            match self.edit_inner(op) {
+                Ok(inverse) => applied.push(inverse),
+                Err(e) => {
+                    // Undo what landed, in reverse, then say what happened.
+                    for inv in applied.into_iter().rev() {
+                        let _ = self.edit_inner(inv);
+                    }
+                    self.status = format!("{what} refused: {e:?} (nothing applied)");
+                    return;
+                }
+            }
+        }
+        if applied.is_empty() {
+            self.status = format!("{what}: nothing to do");
+            return;
+        }
+        // One group, one undo: the inverses replay newest-first.
+        let count = applied.len();
+        self.undo_stack.push(studio_core::Op::Group {
+            ops: applied.into_iter().rev().collect() });
+        self.redo_stack.clear();
+        self.status = format!("{what} — one undo reverses all {count}");
+        self.arrangement_dirty = true;
+    }
+
     pub fn edit(&mut self, op: studio_core::Op, what: &str) {
         match self.edit_inner(op) {
             Ok(inverse) => {
@@ -1279,6 +1317,10 @@ pub struct App {
     library_tree: library::TreeState,
     morph: morph_pad::PadState,
     bounce_format: morph_pad::BounceFormat,
+    /// The mastering pass's live state: what was measured, what is
+    /// proposed, and at what strength — held between frames so the
+    /// findings can be READ and the dial moved before anything applies.
+    mix_pass: Option<MixPassUi>,
     settings_open: bool,
     library_open: bool,
     /// The export dialog's plan while it is open, plus its last refusal —
@@ -1380,6 +1422,7 @@ impl Default for App {
               carrier, project_path, library_root, library_tree,
               morph: morph_pad::PadState::default(),
               bounce_format,
+              mix_pass: None,
               settings_open: false, library_open: true,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
@@ -1626,6 +1669,26 @@ impl eframe::App for App {
                 });
             if !open { self.settings_open = false; }
         }
+        if let Some((bus, bus_name)) = self.studio.mix_pass_request.take() {
+            // Measure the ACTUAL mixdown — the thing being mastered, not a
+            // guess from the project's shape.
+            let mixed = self.studio.render_arrangement(48_000, &self.audio);
+            match mix_assistant::measure(&mixed, 48_000) {
+                Some((spec, measured)) => {
+                    let strength = studio_fx::assistant::DEFAULT_STRENGTH;
+                    let gain = self.studio.session.doc.project.busses.get(&bus)
+                        .map(|b| b.gain).unwrap_or(1.0);
+                    let proposal = studio_copilot::mix_pass(
+                        &spec, measured.crest_db, measured.correlation,
+                        measured.low_width, bus, gain, strength);
+                    self.mix_pass = Some(MixPassUi { bus, bus_name, spec, measured,
+                                                     strength, proposal });
+                }
+                None => self.studio.status =
+                    "nothing to analyse — the arrangement is silent".into(),
+            }
+        }
+        self.mix_pass_window(ctx);
         self.archive_window(ctx);
         self.export_dialog_window(ctx);
         self.export_tracker_window(ctx);
@@ -2380,6 +2443,39 @@ impl eframe::App for App {
 }
 
 
+/// One proposed move, in words a mixing engineer reads at a glance.
+#[cfg(feature = "app")]
+fn describe_op(op: &studio_core::Op) -> String {
+    match op {
+        studio_core::Op::SetBusChain { chain, .. } => chain.iter().map(|e| {
+            match e.kind.as_str() {
+                "eq" => format!("EQ {:.0} Hz {:+.1} dB (Q {:.1})",
+                    e.params.get("freq0").copied().unwrap_or(0.0),
+                    e.params.get("gain0").copied().unwrap_or(0.0),
+                    e.params.get("q0").copied().unwrap_or(1.0)),
+                "compressor" => format!("compress {:.1} dB at {:.1}:1",
+                    e.params.get("threshold").copied().unwrap_or(0.0),
+                    e.params.get("ratio").copied().unwrap_or(1.0)),
+                other => format!("add {other}"),
+            }
+        }).collect::<Vec<_>>().join(" · "),
+        studio_core::Op::SetBusGain { gain, .. } =>
+            format!("bus gain → {:.2} ({:+.1} dB)", gain, 20.0 * gain.max(1e-6).log10()),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The mastering pass, mid-consideration.
+#[cfg(feature = "app")]
+struct MixPassUi {
+    bus: studio_core::BusId,
+    bus_name: String,
+    spec: studio_fx::analysis::Spectrum,
+    measured: mix_assistant::Measured,
+    strength: f32,
+    proposal: studio_copilot::Proposal,
+}
+
 /// What the workbench's right-hand slot shows.
 #[cfg(feature = "app")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2462,6 +2558,71 @@ impl App {
             self.audio.insert(id, audio);
             self.studio.register_asset(id, &raw);
         }
+    }
+
+    /// The mastering pass window: measurements, findings, the strength
+    /// dial, and one apply. Diagnosis stays readable and the dial stays
+    /// movable BEFORE anything touches the project — the assistant
+    /// module's own thesis, which a UI that applied on click would betray.
+    fn mix_pass_window(&mut self, ctx: &egui::Context) {
+        let Some(mut m) = self.mix_pass.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let mut close = false;
+        egui::Window::new("Mix & master pass").open(&mut open).resizable(false)
+            .collapsible(false).show(ctx, |ui| {
+                ui.label(format!("measured on '{}':", m.bus_name));
+                ui.monospace(format!(
+                    "peak {:+.1} dB · crest {:.1} dB · correlation {:+.2} · low width {:.2}",
+                    m.measured.peak_db, m.measured.crest_db,
+                    m.measured.correlation, m.measured.low_width));
+                ui.separator();
+                ui.label(&m.proposal.summary);
+                if m.proposal.ops.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY,
+                        "nothing proposed — which is a real answer, not a failure");
+                } else {
+                    ui.label(format!("{} move(s), confidence {:.0}%",
+                                     m.proposal.ops.len(), m.proposal.confidence * 100.0));
+                    for op in &m.proposal.ops {
+                        ui.monospace(describe_op(op));
+                    }
+                }
+                ui.separator();
+                let before = m.strength;
+                ui.add(egui::Slider::new(&mut m.strength, 0.0..=1.0).text("strength"));
+                ui.colored_label(egui::Color32::GRAY,
+                    "0 proposes nothing; 0.3 is the default, the middle of the range \
+                     people actually keep");
+                if (m.strength - before).abs() > 1e-4 {
+                    m.proposal = studio_copilot::mix_pass(
+                        &m.spec, m.measured.crest_db, m.measured.correlation,
+                        m.measured.low_width, m.bus,
+                        self.studio.session.doc.project.busses.get(&m.bus)
+                            .map(|b| b.gain).unwrap_or(1.0),
+                        m.strength);
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!m.proposal.ops.is_empty(),
+                                      egui::Button::new("apply as one edit")).clicked() {
+                        apply = true;
+                    }
+                    if ui.button("close").clicked() { close = true; }
+                });
+            });
+        if apply {
+            // Composed onto the bus's CURRENT chain (mix_pass emits
+            // standalone one-effect chains it cannot compose itself), then
+            // applied as one undo group — a mastering pass that takes six
+            // presses of `u` to reverse is a pass nobody dares try.
+            let existing = self.studio.session.doc.project.busses.get(&m.bus)
+                .map(|b| b.chain.clone()).unwrap_or_default();
+            let ops = mix_assistant::compose(&existing, &m.proposal.ops, m.bus);
+            let n = ops.len();
+            self.studio.edit_group(ops, &format!("mix pass on '{}' ({n} move(s))", m.bus_name));
+            return; // the window closes on apply: the proposal is now history
+        }
+        if open && !close { self.mix_pass = Some(m); }
     }
 
     /// The save-archive popup: the fidelity slider, the credits/authorized
@@ -4432,5 +4593,67 @@ mod layer_tests {
         s.rack.patterns[0].rows[ix] = 0b1;
         assert_eq!(s.rack.patterns[0].rows[from], steps_before,
                    "editing the layer never touches the source");
+    }
+}
+
+#[cfg(test)]
+mod mix_pass_tests {
+    use super::*;
+    use studio_core::{Bus, BusId, Effect, Op};
+
+    #[test]
+    fn a_mastering_pass_is_one_undo_and_keeps_the_users_own_effects() {
+        // The whole reason edit_group and compose exist: several proposed
+        // moves must land as ONE step (a pass that takes six presses of u
+        // to reverse is a pass nobody dares try) and must not delete the
+        // reverb the user put on the bus.
+        let mut s = Studio::demo();
+        let bus = BusId(90);
+        let mine = Effect { kind: "reverb".into(), params: Default::default(),
+                            enabled: true };
+        s.edit(Op::AddBus { bus: Bus { id: bus, name: "master".into(), parent: None,
+            gain: 1.0, chain: vec![mine.clone()], sends: vec![], muted: false } }, "bus");
+        let before_gain = s.session.doc.project.busses[&bus].gain;
+
+        let proposed = vec![
+            Op::SetBusChain { id: bus, chain: vec![Effect { kind: "eq".into(),
+                params: [("freq0".to_string(), 250.0)].into_iter().collect(),
+                enabled: true }] },
+            Op::SetBusChain { id: bus, chain: vec![Effect { kind: "compressor".into(),
+                params: [("ratio".to_string(), 2.0)].into_iter().collect(),
+                enabled: true }] },
+            Op::SetBusGain { id: bus, gain: 0.8 },
+        ];
+        let existing = s.session.doc.project.busses[&bus].chain.clone();
+        let ops = mix_assistant::compose(&existing, &proposed, bus);
+        s.edit_group(ops, "mix pass");
+
+        let after = &s.session.doc.project.busses[&bus];
+        assert_eq!(after.chain.len(), 3, "reverb + eq + compressor");
+        assert_eq!(after.chain[0], mine, "the user's effect kept its place");
+        assert!((after.gain - 0.8).abs() < 1e-6);
+
+        // ONE undo reverses the whole pass.
+        s.key(studio_egui::keys::Key::c('u'));
+        let back = &s.session.doc.project.busses[&bus];
+        assert_eq!(back.chain, vec![mine], "one press, the chain is yours again");
+        assert!((back.gain - before_gain).abs() < 1e-6, "and the gain came back too");
+    }
+
+    #[test]
+    fn a_group_that_cannot_apply_leaves_nothing_behind() {
+        // Half a mastering pass is worse than none: a mid-group failure
+        // rolls back what already landed and says so.
+        let mut s = Studio::demo();
+        let bus = BusId(91);
+        s.edit(Op::AddBus { bus: Bus { id: bus, name: "m".into(), parent: None,
+            gain: 1.0, chain: vec![], sends: vec![], muted: false } }, "bus");
+        s.edit_group(vec![
+            Op::SetBusGain { id: bus, gain: 0.5 },
+            Op::SetBusGain { id: BusId(999), gain: 0.5 }, // no such bus
+        ], "mix pass");
+        assert!((s.session.doc.project.busses[&bus].gain - 1.0).abs() < 1e-6,
+                "the first move was rolled back");
+        assert!(s.status.contains("nothing applied"), "{}", s.status);
     }
 }

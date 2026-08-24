@@ -3057,6 +3057,7 @@ dependencies = [
  "rfd",
  "studio-audio",
  "studio-collab",
+ "studio-copilot",
  "studio-core",
  "studio-egui",
  "studio-fx",

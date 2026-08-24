@@ -66,6 +66,27 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
         });
     });
     ui.separator();
+    // The mastering pass lives HERE — on the mixer, beside the busses it
+    // would act on — not in a menu: mixing and mastering is what this
+    // panel is for, and a tool you have to go looking for is a tool that
+    // gets used once. The button only ASKS for the analysis; the window
+    // it opens keeps diagnosis, dial and apply in that order.
+    ui.horizontal(|ui| {
+        let target = s.session.doc.project.busses.iter()
+            .find(|(_, b)| b.parent.is_none())
+            .map(|(id, b)| (*id, b.name.clone()));
+        let enabled = target.is_some();
+        if ui.add_enabled(enabled, egui::Button::new("mix & master…"))
+            .on_hover_text("measure the mix and propose moves — nothing applies until you say so")
+            .on_disabled_hover_text("add a bus feeding master first")
+            .clicked() {
+            if let Some((id, name)) = target {
+                s.mix_pass_request = Some((id, name));
+            }
+        }
+        ui.colored_label(c.text_weak, "analysis reads the current mixdown");
+    });
+    ui.separator();
     // ── inputs, per bus ─────────────────────────────────────────────────
     // Routing could only ever be edited from the SOURCE end (a track's
     // route combo) and, for busses, only at creation. A mixer strip reads

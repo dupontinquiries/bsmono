@@ -37,6 +37,8 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
 ///
+/// v12: `Op::Group`(25) — several ops as one undo step, nested encoding.
+///
 /// v11: `Op` gained the input-side routing and composition set —
 /// `SetBusParent`(22), `SetGroup`(23), `RemoveGroup`(24) — and `GroupId`.
 ///
@@ -74,7 +76,7 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 11;
+pub const WIRE_VERSION: u8 = 12;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -342,6 +344,11 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
             for c in clips { put_u64(o, c.0); }
         }
         Op::RemoveGroup { id } => { put_u8(o, 24); put_u64(o, id.0); }
+        Op::Group { ops } => {
+            put_u8(o, 25);
+            put_u16(o, ops.len().min(u16::MAX as usize) as u16);
+            for inner in ops.iter().take(u16::MAX as usize) { put_op(o, inner); }
+        }
     }
 }
 
@@ -396,6 +403,12 @@ fn get_op(r: &mut R) -> Option<Op> {
             Op::SetGroup { id, name, clips }
         }
         24 => Op::RemoveGroup { id: GroupId(r.u64()?) },
+        25 => {
+            let n = r.u16()? as usize;
+            let mut ops = Vec::with_capacity(n.min(4096));
+            for _ in 0..n { ops.push(get_op(r)?); }
+            Op::Group { ops }
+        }
         _ => return None, // an op kind from a newer build: refuse, don't guess
     })
 }
@@ -1049,7 +1062,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 11, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 12, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

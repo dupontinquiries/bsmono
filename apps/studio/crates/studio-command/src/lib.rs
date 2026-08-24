@@ -101,6 +101,7 @@ impl Command {
                 Op::SetBusParent { .. } => CommandKind::EditSetBusParent,
                 Op::SetGroup { .. } => CommandKind::EditSetGroup,
                 Op::RemoveGroup { .. } => CommandKind::EditRemoveGroup,
+                Op::Group { .. } => CommandKind::EditGroupedOps,
             },
             Command::Transport(t) => match t {
                 TransportCmd::Play => CommandKind::TransportPlay,
@@ -168,6 +169,7 @@ pub enum CommandKind {
     EditSetBusParent,
     EditSetGroup,
     EditRemoveGroup,
+    EditGroupedOps,
     TransportPlay,
     TransportStop,
     TransportSeek,

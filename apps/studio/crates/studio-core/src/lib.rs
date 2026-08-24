@@ -323,6 +323,11 @@ pub enum Op {
     /// Dissolve a composition. Its clips are untouched — ungrouping is an
     /// organizational act, never an edit to the music.
     RemoveGroup { id: GroupId },
+    /// Several ops as ONE step: applied in order, inverted as a whole (the
+    /// inverse is the members' inverses in reverse). A partial application
+    /// rolls back what landed — half an edit is worse than none. This is
+    /// what lets a multi-move mastering pass be a single press of `u`.
+    Group { ops: Vec<Op> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -632,6 +637,22 @@ impl Project {
                 };
                 self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone() });
                 Ok(inv)
+            }
+            Op::Group { ops } => {
+                let mut inverses = Vec::with_capacity(ops.len());
+                for op in ops {
+                    match self.apply(op) {
+                        Ok(inv) => inverses.push(inv),
+                        Err(e) => {
+                            for inv in inverses.into_iter().rev() {
+                                let _ = self.apply(&inv);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                inverses.reverse();
+                Ok(Op::Group { ops: inverses })
             }
             Op::RemoveGroup { id } => {
                 let old = self.groups.remove(id).ok_or(EditError::NoSuchGroup(*id))?;

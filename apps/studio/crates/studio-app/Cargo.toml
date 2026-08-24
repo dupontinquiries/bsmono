@@ -18,6 +18,7 @@ studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
 studio-media = { path = "../studio-media" }
 studio-video = { path = "../studio-video" }
+studio-copilot = { path = "../studio-copilot" }
 analog-kit = { path = "../../../../shared/analog-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
