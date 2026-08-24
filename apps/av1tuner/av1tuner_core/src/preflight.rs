@@ -58,7 +58,40 @@ pub fn run(
     if audio.needs_libopus() {
         checks.push(check_libopus());
     }
+    if matches!(settings.kind, EncoderKind::Vvenc) {
+        checks.push(check_mkvmerge());
+    }
     PreflightReport { checks }
+}
+
+/// VVenC output muxing requires mkvmerge — ffmpeg can't synthesize 
+/// timestamps for raw H.266 streams, but mkvmerge can. Surface the 
+/// dependency at preflight so the user installs it before a long encode 
+/// instead of failing at the very end.
+fn check_mkvmerge() -> PreflightCheck {
+    // VVenC output requires a VVC-aware muxer because ffmpeg's VVC mux
+    // (both MKV and MP4 paths) is broken in current versions. We accept
+    // either MP4Box (GPAC — Fraunhofer's recommended path) or mkvmerge
+    // (mkvtoolnix). Pass if either is present, fail if neither.
+    let mp4box = which::which("MP4Box").ok();
+    let mkvmerge = which::which("mkvmerge").ok();
+    match (mp4box, mkvmerge) {
+        (Some(p), _) => PreflightCheck {
+            name: "vvc muxer".to_string(),
+            status: CheckStatus::Pass,
+            message: format!("found MP4Box: {} (preferred)", p.display()),
+        },
+        (None, Some(p)) => PreflightCheck {
+            name: "vvc muxer".to_string(),
+            status: CheckStatus::Pass,
+            message: format!("found mkvmerge: {}", p.display()),
+        },
+        (None, None) => PreflightCheck {
+            name: "vvc muxer".to_string(),
+            status: CheckStatus::Fail,
+            message: "VVenC output needs a VVC-aware muxer; neither MP4Box                       (GPAC) nor mkvmerge (mkvtoolnix) is on PATH. Install                       one: `sudo dnf install gpac` (Fedora/Asahi, preferred),                       `sudo apt install gpac` (Debian), or the mkvtoolnix                       package alternatively. ffmpeg cannot mux raw VVC                       correctly in current versions.".to_string(),
+        },
+    }
 }
 
 /// Verify ffmpeg has libopus support compiled in. Runs once at 

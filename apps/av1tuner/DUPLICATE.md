@@ -1,36 +1,23 @@
-# av1tuner and av1tuner-m1: which one is live
+# av1tuner-m1: RESOLVED (c11) — merged here, fork retired
 
-`apps/av1tuner-m1` is the **live fork**. `apps/av1tuner` is stale and should be
-retired once someone confirms nothing external references it.
+This file previously declared `apps/av1tuner-m1` the live fork. That was true
+when written and then went stale in the §5 way: two later commits fixed bugs
+in THIS copy only (95a2b66d, 96e35966), so both sides ended up ahead of the
+other. The c11 merge took the union into this tree, under this name:
 
-Five files differ, and **m1 is ahead in every one**:
+* from m1: concat.rs (mkvmerge VVenC muxing — raw H.266 concat has no
+  per-packet timestamps, which is the encode-failure mechanism), preflight's
+  mkvmerge check, app.rs (cache hits verified DECODABLE before acceptance —
+  m1's app.rs was a strict superset of this copy's cache handling),
+  cleanup.rs intermediates, prediction_stats' remainder assertion, scene.rs.
+* from this copy: job.rs — the real derive_state_dir fix
+  (`parent().filter(|p| !p.as_os_str().is_empty())`), which m1 lacked.
 
-| file | m1 adds |
-|---|---|
-| `av1tuner_core/src/concat.rs` | **+297 lines**: VVenC raw H.266 muxing through mkvmerge, because ffmpeg's raw H.266 demuxer does not synthesise per-packet timestamps |
-| `av1tuner_core/src/preflight.rs` | an mkvmerge check for VVenC, so a missing dependency surfaces before a long encode instead of at the very end |
-| `av1tuner_app/src/app.rs` | cache hits are **verified decodable** before being accepted — a cached file can be byte-intact and still not decode |
-| `av1tuner_core/src/cleanup.rs` | `combined.266`, `audio.opus` and friends recognised as intermediates |
-| `av1tuner_core/src/job.rs` | whitespace only |
+Verified at merge: 97 passed / 0 failed across the workspace, matching m1's
+own record. Which binary failed the field AV1 encode was NOT determined —
+the merged tree carries every known fix from both, and the strongest
+mechanism-level candidate is the cache-decodability check (a byte-intact,
+undecodable cached file completes an "encode" with broken output). If AV1
+encodes still fail here, that is a NEW bug, not the duplicate's.
 
-Nothing in the base copy is missing from m1, so consolidating loses nothing.
-
-## Both were broken the same way
-
-`av1tuner_core` **did not compile its tests** in either copy: a test helper in
-`scene.rs` constructs `VideoInfo` without the `audio_streams` field the struct
-gained when audio-encode mode landed.
-
-That is why it went unnoticed — the **library** still built, so the app ran and
-only the tests were dead. Nothing that ran was broken; everything that would
-have *checked* it was.
-
-With the helper fixed, m1's suite runs and found two real defects:
-
-* `derive_state_dir` relied on `Path::parent()` returning `None` for a bare
-  filename. It returns `Some("")`, so the `unwrap_or(".")` branch was **dead
-  code** and the intended `./name` never happened.
-* A test asserted `102400 / 8 + 1` and called it `div_ceil`. 102400 divides by 8
-  exactly, so the answer is 12800 — the **code was right and the test was not**.
-
-m1 is now **97/97**.
+The fork's full history remains in git under `apps/av1tuner-m1/`.

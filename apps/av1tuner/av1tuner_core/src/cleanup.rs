@@ -65,7 +65,8 @@ fn is_intermediate(name: &str) -> bool {
     }
     // Concat/merge scratch.
     matches!(name,
-        "combined.266" | "concat_list.txt" | "merge_list.txt" | "chapters.txt")
+        "combined.266" | "concat_list.txt" | "merge_list.txt" 
+        | "chapters.txt" | "audio.opus" | "combined_timed.mp4")
 }
 
 #[cfg(test)]
@@ -86,6 +87,7 @@ mod tests {
         assert!(is_intermediate("combined.266"));
         assert!(is_intermediate("concat_list.txt"));
         assert!(is_intermediate("chapters.txt"));
+        assert!(is_intermediate("audio.opus"));
         // NOT intermediates:
         assert!(!is_intermediate("myvideo.av1.mkv"));
         assert!(!is_intermediate("job.json"));

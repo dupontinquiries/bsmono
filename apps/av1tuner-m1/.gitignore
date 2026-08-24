@@ -1,6 +1,0 @@
-/target
-Cargo.lock
-*.swp
-.vscode
-.idea
-*.av1tuner/

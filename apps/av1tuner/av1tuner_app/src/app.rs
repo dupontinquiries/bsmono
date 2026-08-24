@@ -1130,32 +1130,51 @@ impl App {
         // requested output (nothing to do).
         if !self.resume_offered {
             if let Some(cached) = self.check_cache(&input) {
-                if cached != output {
-                    match std::fs::copy(&cached, &output) {
-                        Ok(bytes) => {
-                            self.append_log(format!(
-                                "cache HIT: reused prior encode ({}), skipped re-encoding",
-                                format_bytes(bytes)
-                            ));
+                // Verify the cached file is actually decodable before 
+                // accepting the hit. A cached file can be intact at the 
+                // byte level (so the hash check passes) but still have 
+                // broken codec extradata that no decoder can read (this 
+                // is exactly how the old ffmpeg-VVC-MP4 path poisoned 
+                // the cache). Fall through to a real encode on failure.
+                match Self::verify_output_decodable(&cached) {
+                    Ok(()) => {
+                        if cached != output {
+                            match std::fs::copy(&cached, &output) {
+                                Ok(bytes) => {
+                                    self.append_log(format!(
+                                        "cache HIT: reused prior encode ({}), skipped re-encoding",
+                                        format_bytes(bytes)
+                                    ));
+                                    self.final_output = Some(output);
+                                    self.final_output_bytes = Some(bytes);
+                                    self.final_duration_s = Some(0);
+                                    return;
+                                }
+                                Err(e) => {
+                                    self.append_log(format!(
+                                        "cache hit but copy failed ({}); encoding normally", e
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.append_log(
+                                "cache HIT: output already up to date, nothing to do".to_string());
                             self.final_output = Some(output);
-                            self.final_output_bytes = Some(bytes);
-                            self.final_duration_s = Some(0);
+                            self.final_output_bytes = std::fs::metadata(&input).ok().map(|m| m.len());
                             return;
                         }
-                        Err(e) => {
-                            // Copy failed (permissions, disk full) — fall 
-                            // through to a normal encode rather than error.
-                            self.append_log(format!(
-                                "cache hit but copy failed ({}); encoding normally", e
-                            ));
-                        }
                     }
-                } else {
-                    self.append_log(
-                        "cache HIT: output already up to date, nothing to do".to_string());
-                    self.final_output = Some(output);
-                    self.final_output_bytes = std::fs::metadata(&input).ok().map(|m| m.len());
-                    return;
+                    Err(reason) => {
+                        // Cached file is broken (e.g. produced by an older 
+                        // pipeline version with bad VVC mux). Skip the 
+                        // hit and re-encode. The Clear cache button lets 
+                        // the user purge the stale entry from the manifest.
+                        self.append_log(format!(
+                            "cache hit FAILED verification ({}); re-encoding. \
+                             Use Clear cache to remove stale entries.",
+                            reason
+                        ));
+                    }
                 }
             }
         }
@@ -1306,6 +1325,17 @@ impl App {
     fn settings_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Pipeline version. BUMP this whenever the encode or mux chain 
+        // changes in a way that invalidates prior outputs. This is the 
+        // mechanism by which an updated build invalidates cache entries 
+        // produced by older, possibly-broken pipelines. 
+        //
+        // v1 — initial. v2 — VVenC mux switched from broken ffmpeg path 
+        // to MP4Box/mkvmerge (prior VVenC outputs had broken vvcC 
+        // extradata; ffprobe could read the container but decoders 
+        // failed). Cache entries produced under v1 must miss under v2.
+        const PIPELINE_VERSION: u32 = 2;
+        PIPELINE_VERSION.hash(&mut h);
         // Codec + quantizer + preset.
         format!("{:?}", self.settings.kind).hash(&mut h);
         self.settings.quantizer().hash(&mut h);
@@ -1320,6 +1350,41 @@ impl App {
         // Audio mode affects the final mux.
         format!("{:?}", self.audio.mode).hash(&mut h);
         h.finish()
+    }
+    
+    /// Verify the output file is actually decodable, not just a valid
+    /// container. ffprobe's container demuxer accepts files whose video
+    /// streams have broken extradata (as we discovered the hard way with
+    /// ffmpeg's VVC mux); a real check needs the codec parser to read
+    /// the stream's parameter sets without errors.
+    ///
+    /// Runs `ffprobe -v error -show_streams <output>`. If stderr is
+    /// empty, the file is good. If it contains decoder errors (e.g.
+    /// "Failed to parse extradata", "vps_layer_id"), the file is broken
+    /// and should NOT be cached or presented as success.
+    fn verify_output_decodable(output: &std::path::Path) -> Result<(), String> {
+        let ffprobe = match which::which("ffprobe") {
+            Ok(p) => p,
+            // If we can't probe, don't block — just skip verification.
+            Err(_) => return Ok(()),
+        };
+        let result = std::process::Command::new(&ffprobe)
+            .args(["-v", "error", "-show_streams", "-of", "default=noprint_wrappers=1"])
+            .arg(output)
+            .output();
+        match result {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                // ffprobe's -v error only prints actual problems. If
+                // stderr is non-empty, the file failed to parse cleanly.
+                if !stderr.trim().is_empty() {
+                    return Err(stderr.trim().lines().next()
+                        .unwrap_or("unknown decode error").to_string());
+                }
+                Ok(())
+            }
+            Err(_) => Ok(()),  // probe failed for other reasons; don't block
+        }
     }
     
     /// Check the cache before encoding: if this exact source + settings 
@@ -1380,9 +1445,25 @@ impl App {
                     let _ = job.save();
                 }
                 
+                // Verify the output is actually decodable before caching
+                // it. A file can be a valid container with valid 
+                // timestamps but still have broken codec extradata that 
+                // no decoder can read — caching such a file would 
+                // poison future runs with a false cache hit.
+                let verify_result = Self::verify_output_decodable(&output);
+                if let Err(reason) = &verify_result {
+                    self.append_log(format!(
+                        "WARNING: output failed decode verification ({}). \
+                         Skipping cache record so a re-run won't reuse it.",
+                        reason
+                    ));
+                }
+                
                 // Record this successful encode in the cache so a future 
-                // run with the same source + settings can skip it.
-                if self.use_cache {
+                // run with the same source + settings can skip it. Skip 
+                // recording if verification failed (a broken file in 
+                // the cache poisons future runs).
+                if self.use_cache && verify_result.is_ok() {
                     let settings_hash = self.settings_hash();
                     match av1tuner_core::compute_signature(
                         &source, settings_hash, self.cache_mode)
@@ -1882,15 +1963,33 @@ impl App {
             ui.separator();
             
             // Cache + cleanup toggles.
-            ui.checkbox(&mut self.use_cache, "Skip unchanged re-encodes (cache)")
-                .on_hover_text(
-                    "Before encoding, check whether this exact source + \
-                     settings was already encoded and the output is still \
-                     intact. If so, reuse it instead of re-encoding. The \
-                     check verifies the source hasn't changed (size + \
-                     timestamp + sampled content) and the output isn't \
-                     corrupted."
-                );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.use_cache, "Skip unchanged re-encodes (cache)")
+                    .on_hover_text(
+                        "Before encoding, check whether this exact source + \
+                         settings was already encoded and the output is still \
+                         intact. If so, reuse it instead of re-encoding. The \
+                         check verifies the source hasn't changed (size + \
+                         timestamp + sampled content) and the output isn't \
+                         corrupted."
+                    );
+                if ui.button("Clear cache")
+                    .on_hover_text(
+                        "Delete all cache manifest entries. Use this if the \
+                         cache has stale entries pointing at outputs you no \
+                         longer want reused, or if a prior build version \
+                         produced files you don't trust. Outputs themselves \
+                         are NOT deleted — only the manifest entries that \
+                         point at them."
+                    ).clicked()
+                {
+                    let manifest = av1tuner_core::CacheManifest::default();
+                    match manifest.save() {
+                        Ok(()) => self.append_log("cache: manifest cleared".to_string()),
+                        Err(e) => self.append_log(format!("cache: couldn't clear: {}", e)),
+                    }
+                }
+            });
             
             ui.checkbox(&mut self.auto_cleanup, "Auto-clean intermediates after success")
                 .on_hover_text(
