@@ -210,3 +210,27 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
 - **C11-9d — snapshot-cam / beatspace / unendlich-dash on-device smoke** after
   the eframe backend switch (c11-003): glow must actually present on the
   desktop and the phone; nobody has launched them since.
+
+## 10. The logscope field report (large repos, gibberish, git ingestion)
+
+- **C11-10a — the 2.50 GB spec-prefill crash: DONE**, verified on lavapipe
+  with in-tree fixtures (see the commit). The sandbox can now run the FULL
+  gpu-gemm suite: mesa-vulkan-drivers + numpy + tools/tiny-variants/gen-all.sh
+  — 1221 tests, formerly self-skipping without fixtures.
+- **C11-10b — qwen3 + deepseek-coder gibberish.** `narrowed, not fixed`. The
+  tiny-qwen3 fixture tests PASS here, so qwen3's architecture path (qk-norm
+  et al) is sound at small scale — the field gibberish points at real-model
+  metadata instead: deepseek-coder-6.7b ships rope linear scaling (factor 4),
+  and mishandled rope scaling garbles both families. Check the gguf loader
+  for `rope.scaling.type/factor` handling first; a detect-and-refuse with a
+  named message beats silent gibberish if implementing takes longer.
+- **C11-10c — git-history sanitizer.** `not started`. A pure module: git
+  trees/branch names/commit messages are attacker-controlled text headed for
+  a model prompt; fence, strip control chars, cap lengths, mark provenance.
+  Foundation for history ingestion + evidence handling; fully testable here.
+- **C11-10d — summarize-off large-repo crash + file-reading crashes with
+  larger models.** `unreproduced`. The 10a fix removes the known allocator
+  blow-up on that path; retest on device first — remaining crashes get their
+  own backtraces before anyone guesses.
+- The engine TODO in the pasted snippet (log prompt head+tail for loop
+  introspection) — the prompt diag already prints tail ids; add the head.
