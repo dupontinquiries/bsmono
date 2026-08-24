@@ -1276,9 +1276,18 @@ tokens ({:.0}% of the prefill skipped), {} to prefill", self.name, prompt_ids.le
                 // token decode_step. Per-token vs batched differ by ~1e-6, which is enough to tip a
                 // near-tied eos in a long, degenerating context (the "produces once then stops"
                 // failure). Batched suffix keeps reuse within machine precision of a full prefill.
-                let all = self.gpu.verify_forward(&self.model, &s.cache, &prompt_ids[l..], l);
-                let v = self.model.vocab;
-                s.logits = all[all.len() - v..].to_vec();
+                // CHUNKED, not verify_forward. Same batched kernel — prefill_chunked_from
+                // runs block_prefill_ext at offset l, exactly as verify_forward did, so the
+                // precision argument above is untouched — but it projects ONLY the last row.
+                // verify_forward materialises s x vocab logits, so a long divergent suffix
+                // asked for a buffer no device has: the field crash was 6873 x 128256 x 4 =
+                // 3.53 GB against a 2.15 GB cap, reached by :ws on a real repo. c11 fixed
+                // the SPECULATIVE seeded path this way and missed this one, which is the
+                // ordinary streaming path every chat takes — the same defect, twice, because
+                // the first fix chased a backtrace instead of the pattern.
+                let pc = prefill_chunk_for_streaming(self.model.d, self.model.h,
+                    self.model.streams_experts(), self.model.moe_counts());
+                s.logits = self.gpu.prefill_chunked_from(&self.model, &s.cache, &prompt_ids[l..], l, pc);
                 s.pos = prompt_ids.len();
             } else {
                 // O(1)-bandwidth batched prefill of the whole prompt (one [T,d] pass).

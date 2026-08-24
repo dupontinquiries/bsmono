@@ -16196,28 +16196,69 @@ like a bad model rather than a wiring bug.");
         self.activate_model(m);
         let s = tokens.len();
         if s == 0 { return Vec::new(); }
-        // verify_forward materialises s x vocab logits BY DESIGN (speculative
-        // verification wants every drafted position). That design has a size:
-        // past the device buffer max the allocation fails "non-fatally", the
-        // invalid buffer reaches get_mapped_range, and THAT one is fatal — the
-        // field crash. Long suffixes belong to prefill_chunked_from, which
-        // projects only the last row; this assert turns the wrong call into a
-        // one-line diagnosis at the call site instead of a panic in wgpu.
-        let need = (s as u64) * (m.vocab as u64) * 4;
-        let cap = self.device.limits().max_buffer_size;
-        assert!(need <= cap,
-            "verify_forward on {s} tokens x {} vocab needs a {need}-byte logits buffer; this \
-device caps buffers at {cap}. A suffix this long is a PREFILL, not a verification — call \
-prefill_chunked_from (it keeps only the last row).", m.vocab);
-        let mut xh = Vec::with_capacity(s * m.d);
-        for &id in tokens { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
-        let mut x = self.upload(&xh, s, m.d);
-        for li in 0..m.n_layers {
-            x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
-                                       start, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+        // ALL `s` ROWS, WITHOUT AN IMPOSSIBLE BUFFER. The s x vocab logits this
+        // function returns are its contract (speculative verification wants
+        // every drafted position), but the intermediate does not have to exist
+        // at once: rows split into slices whose logits fit the device cap, each
+        // slice running the same block_prefill_ext at its own offset — the KV
+        // math prefill_chunked_from already proves — and the CPU-side Vec is
+        // concatenated as it goes.
+        //
+        // Twice now a caller passed a whole prompt here and died on a 2-3 GB
+        // allocation (c11: the speculative seeded path, then the ORDINARY
+        // streaming reuse path). Both call sites are fixed to use
+        // prefill_chunked_from, which is still the right call when only the
+        // last row is wanted. This makes the failure mode impossible rather
+        // than diagnosable, because a third call site is a matter of time.
+        let max_rows = {
+            let cap = self.device.limits().max_buffer_size;
+            let per_row = (m.vocab as u64) * 4;
+            ((cap / per_row.max(1)) as usize).max(1)
+        };
+        let mut out: Vec<f32> = Vec::with_capacity(s * m.vocab);
+        let mut done = 0usize;
+        while done < s {
+            let take = (s - done).min(max_rows);
+            let block = &tokens[done..done + take];
+            let mut xh = Vec::with_capacity(take * m.d);
+            for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+            let mut x = self.upload(&xh, take, m.d);
+            for li in 0..m.n_layers {
+                x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
+                                           start + done, take, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+            }
+            let xn = self.rmsnorm_t(&x, &m.out_norm, take, m.d, m.eps);
+            out.extend_from_slice(&self.download(&self.logits_out(m, &xn, take)));
+            done += take;
         }
-        let xn = self.rmsnorm_t(&x, &m.out_norm, s, m.d, m.eps);
-        self.download(&self.logits_out(m, &xn, s)) // all `s` rows projected
+        out
+    }
+
+    /// `verify_forward` with the row-slice size forced — the same code path the
+    /// device cap chooses, exposed so a test can prove slicing changes nothing.
+    #[cfg(test)]
+    pub fn verify_forward_sliced(&self, m: &Model, c: &KvCache, tokens: &[u32], start: usize, max_rows: usize) -> Vec<f32> {
+        self.activate_model(m);
+        let s = tokens.len();
+        if s == 0 { return Vec::new(); }
+        let max_rows = max_rows.max(1);
+        let mut out: Vec<f32> = Vec::with_capacity(s * m.vocab);
+        let mut done = 0usize;
+        while done < s {
+            let take = (s - done).min(max_rows);
+            let block = &tokens[done..done + take];
+            let mut xh = Vec::with_capacity(take * m.d);
+            for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+            let mut x = self.upload(&xh, take, m.d);
+            for li in 0..m.n_layers {
+                x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
+                                           start + done, take, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+            }
+            let xn = self.rmsnorm_t(&x, &m.out_norm, take, m.d, m.eps);
+            out.extend_from_slice(&self.download(&self.logits_out(m, &xn, take)));
+            done += take;
+        }
+        out
     }
 
     /// Greedy speculative decode. `draft` proposes `k` tokens; `target` verifies them in ONE
@@ -21705,5 +21746,63 @@ mod vocab_alignment_tests {
         assert_eq!(m.vocab % 256, 0);
         let prompt: Vec<u32> = (0..10u32).map(|i| 1 + (i * 7) % 200).collect();
         assert_eq!(gpu.generate_kv(&m, &prompt, 12), gpu.generate_kv_window(&m, &prompt, 12, 4));
+    }
+}
+
+#[cfg(test)]
+mod verify_slicing_tests {
+    use super::*;
+
+    /// Slicing must be invisible: the same tokens at the same offsets give the
+    /// same logits whether they go through in one pass or several. This is the
+    /// property that lets verify_forward honour its all-rows contract on a
+    /// prompt whose logits cannot exist at once (the 3.53 GB field crash).
+    #[test]
+    fn sliced_verify_forward_equals_the_single_pass() {
+        let gpu = Gpu::new();
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen2.gguf") { Some(b) => b, None => return };
+        let m = gpu.load_gguf_opt(&bytes, false).expect("tiny-qwen2 loads");
+        let prompt: Vec<u32> = (0..14u32).map(|i| 1 + (i * 11) % 120).collect();
+
+        let whole = {
+            let c = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+            gpu.verify_forward_sliced(&m, &c, &prompt, 0, 4096)
+        };
+        for slice in [1usize, 3, 5, 13] {
+            let c = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+            let got = gpu.verify_forward_sliced(&m, &c, &prompt, 0, slice);
+            assert_eq!(got.len(), whole.len(), "slice {slice} changed the row count");
+            let dev = whole.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(dev < 1e-3, "slice {slice} diverged by {dev} from the single pass");
+        }
+    }
+
+    /// And with a non-zero start offset, since that is how every real caller
+    /// uses it (a suffix after a reused prefix).
+    #[test]
+    fn slicing_respects_the_start_offset() {
+        let gpu = Gpu::new();
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen2.gguf") { Some(b) => b, None => return };
+        let m = gpu.load_gguf_opt(&bytes, false).expect("tiny-qwen2 loads");
+        let prompt: Vec<u32> = (0..20u32).map(|i| 1 + (i * 7) % 90).collect();
+        let (head, tail) = prompt.split_at(8);
+
+        let one = {
+            let c = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+            let _ = gpu.prefill_chunked(&m, &c, head, 8);
+            gpu.verify_forward_sliced(&m, &c, tail, head.len(), 4096)
+        };
+        let many = {
+            let c = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+            let _ = gpu.prefill_chunked(&m, &c, head, 8);
+            gpu.verify_forward_sliced(&m, &c, tail, head.len(), 2)
+        };
+        let dev = one.iter().zip(&many).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(dev < 1e-3, "sliced suffix at offset {} diverged by {dev}", head.len());
+        // the last row is the one callers keep — check it explicitly
+        let v = m.vocab;
+        let dev_last = one[one.len() - v..].iter().zip(&many[many.len() - v..])
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(dev_last < 1e-3, "the last row diverged by {dev_last}");
     }
 }
