@@ -172,6 +172,28 @@ fn parse_rational(s: &str) -> Option<f64> {
 /// layer already has an image-decoding dependency; this crate doesn't take
 /// one just to prove its own output is well-formed, though the tests below
 /// do check the PNG magic bytes directly).
+/// One frame at `at` as raw RGB24 at EXACTLY `w`×`h` — aspect preserved by
+/// scale-then-pad, so the caller can hand the bytes straight to a texture
+/// with no image decoder in the loop. Built for the timeline's viewport:
+/// a preview must be a fixed-size buffer, not a PNG to parse per frame.
+pub fn frame_rgb(path: &Path, at: Ticks, w: u32, h: u32) -> Result<Vec<u8>, VideoError> {
+    let path_str = path.to_string_lossy();
+    let seek = format!("{:.6}", at.to_seconds());
+    let vf = format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2");
+    let out = run("ffmpeg", &[
+        "-y", "-ss", &seek, "-i", &path_str,
+        "-frames:v", "1", "-vf", &vf,
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ])?;
+    let want = (w * h * 3) as usize;
+    if out.len() != want {
+        return Err(VideoError::UnexpectedOutput(format!(
+            "frame_rgb: expected {want} bytes for {w}x{h}, got {}", out.len())));
+    }
+    Ok(out)
+}
+
 pub fn thumbnail_png(path: &Path, at: Ticks) -> Result<Vec<u8>, VideoError> {
     let path_str = path.to_string_lossy();
     let seek = format!("{:.6}", at.to_seconds());
@@ -258,6 +280,18 @@ mod tests {
     /// 1 second) via ffmpeg's own `lavfi` test sources — no bundled fixture
     /// file needed, and every test gets an independently-generated file in
     /// a fresh temp path so tests can run concurrently without clashing.
+    #[test]
+    fn a_frame_arrives_as_exactly_the_rgb_buffer_a_texture_wants() {
+        let path = make_test_video(false);
+        let px = frame_rgb(&path, Ticks::from_seconds(0.5), 160, 90)
+            .expect("a frame at half a second");
+        assert_eq!(px.len(), 160 * 90 * 3, "fixed size is the whole contract");
+        // testsrc is colour bars: a real decoded frame is not all one value.
+        let (min, max) = px.iter().fold((255u8, 0u8), |(lo, hi), b| (lo.min(*b), hi.max(*b)));
+        assert!(max > min, "the frame has content, not a flat fill");
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn make_test_video(with_audio: bool) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("studio-video-test-{}-{}.mp4", std::process::id(), rand_suffix()));
         let mut args = vec![

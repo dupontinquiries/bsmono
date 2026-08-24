@@ -3062,6 +3062,7 @@ dependencies = [
  "studio-fx",
  "studio-live",
  "studio-media",
+ "studio-video",
  "studio-voice",
  "uikit-egui",
 ]

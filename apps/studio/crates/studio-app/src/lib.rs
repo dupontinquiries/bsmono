@@ -15,6 +15,7 @@ use studio_core::{Project, Ticks};
 use studio_egui::touch::{Panel, ViewMode};
 use studio_live::transport::Transport;
 
+pub mod archive;
 pub mod audition;
 pub mod export;
 pub mod clip_inspector;
@@ -23,6 +24,7 @@ pub mod midi;
 pub mod mixer_panel;
 pub mod program_panel;
 pub mod project_dir;
+pub mod viewport;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -323,6 +325,75 @@ impl Studio {
     /// where sound comes from. Missing or undecodable files are counted in
     /// the status and their clips stay silent: a beat with one lost sample
     /// still opens.
+    /// Open a single-file archive: all state, all audio, one file that
+    /// opens whole or refuses whole. Embedded media feeds the same
+    /// `incoming_audio` door a peer's does; where [`archive::find_upgrade`]
+    /// locates a higher-quality per-device artifact under the archive's
+    /// search paths, THAT is decoded instead — the proxy is the floor,
+    /// never the ceiling.
+    pub fn open_archive(path: &std::path::Path, site: SiteId, team: Team)
+        -> Result<Studio, String>
+    {
+        let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
+        let u = archive::unpack(&bytes)
+            .ok_or_else(|| format!("{} is not a studio archive (or is damaged)",
+                                   path.display()))?;
+        let mut s = Studio::new(u.save.to_project(), site, team);
+        if let Some(rack) = u.save.rack { s.rack = rack; }
+        let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut upgraded = 0usize;
+        let mut failed = 0usize;
+        for m in u.media {
+            let src_path = s.session.doc.project.sources.get(&m.source)
+                .map(|src| src.path.clone()).unwrap_or_default();
+            let device = archive::find_upgrade(&base, &u.meta.search_paths, &src_path)
+                .and_then(|p| {
+                    let hint = p.extension().and_then(|e| e.to_str())
+                        .map(str::to_owned);
+                    std::fs::read(&p).ok().map(|raw| (raw, hint))
+                });
+            let (raw, hint) = match device {
+                Some((raw, hint)) => { upgraded += 1; (raw, hint) }
+                None => (m.bytes, Some(m.ext)),
+            };
+            match studio_media::decode_bytes(raw.clone(), hint.as_deref()) {
+                Ok(audio) => {
+                    s.incoming_audio.push((m.source, audio));
+                    s.register_asset(m.source, &raw);
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        s.outbox.clear();
+        s.status = format!("opened archive: {} ({} upgraded from device{})",
+            path.display(), upgraded,
+            if failed > 0 { format!(", {failed} failed to decode") } else { String::new() });
+        Ok(s)
+    }
+
+    /// The archive's pack half: state from the live project + rack,
+    /// originals reassembled from the content-addressed chunk store, PCM
+    /// from the caller's decode cache. Returns the bytes and the sources
+    /// the session holds nothing for — said now, not found later.
+    pub fn pack_archive(
+        &self,
+        audio: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+        meta: &archive::ArchiveMeta,
+    ) -> Result<(Vec<u8>, Vec<studio_core::SourceId>), String> {
+        let save = studio_collab::file::SaveFile::from_project(
+            &self.session.doc.project, Vec::new(), Some(self.rack.clone()));
+        let mut originals = std::collections::BTreeMap::new();
+        for (id, manifest) in &self.manifests {
+            if let Ok(bytes) = manifest.assemble(&self.chunk_store) {
+                let ext = self.session.doc.project.sources.get(id)
+                    .and_then(|s| std::path::Path::new(&s.path).extension())
+                    .and_then(|e| e.to_str()).unwrap_or("bin").to_string();
+                originals.insert(*id, (ext, bytes));
+            }
+        }
+        archive::pack(&save, audio, &originals, meta)
+    }
+
     pub fn load_from(path: &std::path::Path, site: SiteId, team: Team)
         -> Result<Studio, String>
     {
@@ -1094,6 +1165,13 @@ pub struct App {
     export_run: Option<export::Run>,
     export_done: Vec<std::path::PathBuf>,
     export_progress: (usize, usize, f32),
+    /// The archive popup's working state while open.
+    archive_ui: Option<ArchiveUi>,
+    /// The workbench's right slot: the viewport (default) or another tool,
+    /// or nothing. The music-video loop is the point: the frame under the
+    /// playhead beside the rack, instead of export → import → watch.
+    side_slot: SideSlot,
+    frame_cache: viewport::FrameCache,
     tune_root: u8,
     tune_mode: studio_fx::retune::Mode,
     /// Velocity source for playing mode. `NullAnalog` today; a Wooting
@@ -1119,9 +1197,12 @@ impl Default for App {
         // demo on the next Ctrl+S would finish what the damage started, so
         // the shell starts demo'd but says exactly why.
         let mut load_note = None;
+        let is_archive = project_path.extension()
+            .and_then(|e| e.to_str()) == Some("studioarch");
         let mut studio = if project_path.exists() {
-            match Studio::load_from(&project_path, SiteId(1),
-                                    Team::from_contacts("solo", &["sc-local".into()])) {
+            let team = Team::from_contacts("solo", &["sc-local".into()]);
+            match if is_archive { Studio::open_archive(&project_path, SiteId(1), team) }
+                  else { Studio::load_from(&project_path, SiteId(1), team) } {
                 Ok(s) => s,
                 Err(e) => { load_note = Some(e); Studio::demo() }
             }
@@ -1161,6 +1242,9 @@ impl Default for App {
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
+              archive_ui: None,
+              side_slot: SideSlot::Viewport,
+              frame_cache: viewport::FrameCache::default(),
               export_dialog: None,
               export_note: String::new(),
               export_run: None,
@@ -1299,6 +1383,11 @@ impl eframe::App for App {
                     .on_hover_text("timeline above, rack/program/mixer below — instead of tabs")
                     .clicked() { combined = !combined; }
                 self.studio.combined = combined;
+                if ui.button("archive…")
+                    .on_hover_text("the whole session — state and audio — as ONE file")
+                    .clicked() {
+                    self.archive_ui = Some(ArchiveUi::default());
+                }
                 if ui.button("export…").clicked() {
                     self.export_dialog = Some(export::Plan::default());
                     self.export_note.clear();
@@ -1313,6 +1402,7 @@ impl eframe::App for App {
                 });
             });
         });
+        self.archive_window(ctx);
         self.export_dialog_window(ctx);
         self.export_tracker_window(ctx);
 
@@ -1631,6 +1721,35 @@ impl eframe::App for App {
             }
         }
 
+        if self.studio.combined && self.side_slot != SideSlot::Off {
+            egui::SidePanel::right("side-slot").resizable(true)
+                .default_width(360.0).show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        for (s, l) in [(SideSlot::Viewport, "viewport"),
+                                       (SideSlot::Mixer, "mixer"),
+                                       (SideSlot::Rack, "rack"),
+                                       (SideSlot::Program, "program"),
+                                       (SideSlot::Off, "off")] {
+                            if ui.add(egui::Button::selectable(self.side_slot == s, l))
+                                .clicked() { self.side_slot = s; }
+                        }
+                    });
+                    ui.separator();
+                    let base = self.project_path.parent()
+                        .map(|p| p.to_path_buf()).unwrap_or_default();
+                    match self.side_slot {
+                        SideSlot::Viewport => viewport::show(
+                            ui, &self.studio.session.doc.project, self.studio.playhead(),
+                            &base, &mut self.frame_cache, &colors),
+                        SideSlot::Mixer => mixer_panel::show(ui, &mut self.studio, &colors),
+                        SideSlot::Rack => rack_panel::show(
+                            ui, &mut self.studio, &colors, playhead_col),
+                        SideSlot::Program => program_panel::show(
+                            ui, &mut self.studio, &colors, playhead_col),
+                        SideSlot::Off => {}
+                    }
+                });
+        }
         if self.studio.combined {
             egui::TopBottomPanel::bottom("workbench").resizable(true)
                 .default_height(300.0).show(ctx, |ui| {
@@ -1785,8 +1904,127 @@ impl eframe::App for App {
 }
 
 
+/// What the workbench's right-hand slot shows.
+#[cfg(feature = "app")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SideSlot { Off, Viewport, Rack, Program, Mixer }
+
+/// The archive popup's fields — the half-typed artist name survives a
+/// frame the same way every other draft state here does.
+#[cfg(feature = "app")]
+#[derive(Default)]
+struct ArchiveUi {
+    level_ix: usize,
+    artists: Vec<String>,
+    artist_input: String,
+    paths: Vec<String>,
+    path_input: String,
+    note: String,
+}
+
 #[cfg(feature = "app")]
 impl App {
+    /// The save-archive popup: the fidelity slider, the credits/authorized
+    /// collaborators, the per-device search paths — then the picker, then
+    /// one file on disk that opens whole or refuses whole.
+    fn archive_window(&mut self, ctx: &egui::Context) {
+        let Some(mut a) = self.archive_ui.take() else { return };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Save archive").open(&mut open).resizable(false)
+            .collapsible(false).show(ctx, |ui| {
+                ui.label("project fidelity — what the embedded audio costs and sounds like:");
+                let levels = archive::Level::ALL;
+                a.level_ix = a.level_ix.min(levels.len() - 1);
+                ui.add(egui::Slider::new(&mut a.level_ix, 0..=levels.len() - 1)
+                    .show_value(false));
+                ui.label(levels[a.level_ix].label());
+                ui.separator();
+                ui.label("artists / authorized collaborators:");
+                let mut remove = None;
+                for (i, name) in a.artists.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(name);
+                        if ui.small_button("✕").clicked() { remove = Some(i); }
+                    });
+                }
+                if let Some(i) = remove { a.artists.remove(i); }
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut a.artist_input);
+                    if ui.button("add").clicked() && !a.artist_input.trim().is_empty() {
+                        a.artists.push(a.artist_input.trim().to_string());
+                        a.artist_input.clear();
+                    }
+                });
+                ui.separator();
+                ui.label("search paths for full-quality per-device artifacts:");
+                let mut remove = None;
+                for (i, p) in a.paths.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(p);
+                        if ui.small_button("✕").clicked() { remove = Some(i); }
+                    });
+                }
+                if let Some(i) = remove { a.paths.remove(i); }
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut a.path_input);
+                    if ui.button("add").clicked() && !a.path_input.trim().is_empty() {
+                        a.paths.push(a.path_input.trim().to_string());
+                        a.path_input.clear();
+                    }
+                });
+                if !a.note.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, &a.note);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("choose destination…").clicked() {
+                        let meta = archive::ArchiveMeta {
+                            artists: a.artists.clone(),
+                            search_paths: a.paths.clone(),
+                            level: levels[a.level_ix],
+                        };
+                        let name = format!("{}.studioarch",
+                            export::sanitize(&self.studio.session.doc.project.name));
+                        let dest = match export::pick_save(&name) {
+                            Some(p) => Some(p),
+                            None if export::PICKER_AVAILABLE => None, // cancelled
+                            None => {
+                                self.studio.status =
+                                    "no native file dialog — archiving to ./exports".into();
+                                Some(std::path::Path::new("exports").join(&name))
+                            }
+                        };
+                        if let Some(dest) = dest {
+                            match self.studio.pack_archive(&self.audio, &meta) {
+                                Ok((bytes, missing)) => {
+                                    if let Some(d) = dest.parent() {
+                                        let _ = std::fs::create_dir_all(d);
+                                    }
+                                    match std::fs::write(&dest, &bytes) {
+                                        Ok(()) => {
+                                            self.studio.status = format!(
+                                                "archived {} ({:.1} MB{})",
+                                                dest.display(),
+                                                bytes.len() as f64 / 1e6,
+                                                if missing.is_empty() { String::new() }
+                                                else { format!(", {} sources have NO audio",
+                                                               missing.len()) });
+                                            close = true;
+                                        }
+                                        Err(e) => a.note = format!("write failed: {e}"),
+                                    }
+                                }
+                                Err(e) => a.note = format!("refused: {e}"),
+                            }
+                        }
+                    }
+                    if ui.button("cancel").clicked() { close = true; }
+                });
+            });
+        if !close && open { self.archive_ui = Some(a); }
+    }
+
     /// The export dialog: the plan's questions, answered as values, then
     /// the native picker, then the run. A refusal (empty selection, all
     /// channels muted) is shown INLINE — a bad plan is a message to fix,
@@ -3420,5 +3658,55 @@ mod automation_shell_tests {
             .iter().map(|v| v.abs()).sum();
         assert!(ridden < loud * 0.001,
                 "a flat zero lane silences the track: {ridden} vs {loud}");
+    }
+}
+
+#[cfg(test)]
+mod archive_shell_tests {
+    use super::*;
+
+    #[test]
+    fn a_session_survives_the_one_file_round_trip_audio_and_all() {
+        // The professional-viability path end to end: bounce a beat, pack
+        // the session at proxy fidelity, reopen the ARCHIVE ALONE from a
+        // bare directory — no takes/, no exports/, nothing beside it — and
+        // the beat is still audible through the reopened session's own
+        // render. This is exactly the situation that loses files in a
+        // folder-of-paths save, pinned as the situation this format ends.
+        let dir = std::env::temp_dir()
+            .join(format!("studio-arch-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        s.register_asset(id, &studio_audio::export::export_wav_dithered_bytes(
+            &audio.channels[0], 1, 48_000, id.0).unwrap());
+        sources.insert(id, audio);
+
+        let meta = archive::ArchiveMeta {
+            artists: vec!["ada".into()],
+            search_paths: vec!["hq".into()],
+            level: archive::Level::Demo,
+        };
+        let (bytes, _missing) = s.pack_archive(&sources, &meta).expect("packs");
+        let path = dir.join("cut.studioarch");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let team = Team::from_contacts("solo", &["sc-local".into()]);
+        let mut back = Studio::open_archive(&path, SiteId(2), team).expect("opens whole");
+        assert_eq!(back.session.doc.project, s.session.doc.project,
+                   "state converged: tracks, clips, busses, automation");
+        assert_eq!(back.rack, s.rack, "patterns and rolls came along");
+        // Embedded media arrives through the incoming door; render proves
+        // it is REAL audio, not entries.
+        let mut opened_sources = std::collections::BTreeMap::new();
+        for (sid, a) in back.incoming_audio.drain(..) {
+            opened_sources.insert(sid, a);
+        }
+        let out = back.render_arrangement(48_000, &opened_sources);
+        let energy: f32 = out[..9600.min(out.len())].iter().map(|v| v.abs()).sum();
+        assert!(energy > 5.0, "the bounced beat plays from the archive alone ({energy})");
     }
 }

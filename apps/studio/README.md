@@ -1392,3 +1392,36 @@ track's implicit master feed drawn explicitly, because a default nobody can
 see is most of why routing reads as confusing. Read-only on purpose: the
 map explains, the rows edit. Layout is pure and pinned, including that a
 foreign file's cycle terminates instead of hanging the frame.
+
+
+**The archive is the professional artifact.** The folder-of-relative-paths
+save loses files eventually — a moved sample, a half-synced directory, a
+session with holes. `.studioarch` is the session as ONE file: all state
+(the SaveFile — mixer, automation, rack with patterns and rolls) and every
+reference recording embedded, opening whole or refusing whole (every-prefix
+truncation sweep, the collab format's discipline; trailing garbage refuses
+too). The save popup's FIDELITY SLIDER decides what the audio costs:
+sketch/demo/standard re-encode each source to Opus proxies at 64/96/160k —
+the musician's proxy workflow, an archive that plays everywhere — while
+master embeds originals byte-for-byte (a `.opus` stays `.opus`) with
+dithered 16-bit WAV for PCM-only takes, never a hole. The popup also holds
+the credits / authorized collaborators and the SEARCH PATHS where each
+device may hold full-quality artifacts: on open, `find_upgrade` checks them
+— exact basename first, then lossless extensions before lossy, because a
+worse file than the proxy is an upgrade in name only — and decodes the
+device's file over the embedded proxy. Pinned end to end: a bounced session
+packed, moved to a bare directory, reopened from the archive ALONE, and the
+beat still renders. `project_dir`'s git history stays as working-folder
+convenience; the archive is what leaves the building.
+
+**The viewport, and the music-video loop.** The workbench grew a
+configurable right slot — viewport (default), mixer, rack, program, or off
+— so the frame under the playhead sits beside the music panels instead of
+an export → import → watch iteration through the filesystem. Clip choice is
+pure and pinned (topmost video track wins, trims honoured, a gap lets the
+lower track show through); frames come from `studio_video::frame_rgb` (raw
+RGB at a fixed size, aspect padded — no image decoder in the loop, tested
+against a real ffmpeg fixture) cached on a half-second key: a scrub
+preview and edit reference at ~2 fps, said on screen, with realtime
+playback named as the streaming decoder's job. Tabs stay the phone layout;
+every strip is resizable or off.
