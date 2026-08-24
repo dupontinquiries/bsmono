@@ -15,6 +15,7 @@ use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, BlockAction, LinkAction, PaneAction};
 use voiceterm_egui::surface::{Surface, Surfaces};
+use voiceterm_egui::overlay;
 use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, settings_panel, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
@@ -748,15 +749,13 @@ impl VoicetermApp {
     }
 
     /// The palette overlay: type to filter, Enter to run, Escape to dismiss.
-    fn palette_ui(&mut self, ctx: &egui::Context) {
+    fn palette_ui(&mut self, ctx: &egui::Context, open_t: f32) {
         let entries = voiceterm_egui::palette::vocabulary();
         let mut chosen = None;
         let mut close = false;
-        egui::Window::new("Commands")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
-            .show(ctx, |ui| {
+        // The QML puts the palette in a right-edge drawer (paletteDrawer,
+        // main.qml:31310), not a floating window; the form table agrees.
+        let out = overlay::show(ctx, Surface::Palette, open_t, |ui| {
                 let resp = ui.text_edit_singleline(&mut self.palette_query);
                 // Focused on open, because a palette you have to click into
                 // costs the keystroke it exists to save.
@@ -769,7 +768,6 @@ impl VoicetermApp {
                 if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                     self.palette_sel = self.palette_sel.saturating_sub(1);
                 }
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
                 egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
                     for (i, e) in hits.iter().enumerate() {
                         if ui.selectable_label(i == self.palette_sel, &e.title).clicked() {
@@ -783,6 +781,7 @@ impl VoicetermApp {
                     }
                 }
             });
+        if out.closed { close = true; } // backdrop click or Esc, via Modal
         if let Some(cmd) = chosen {
             self.run_command(cmd);
             close = true;
@@ -841,11 +840,10 @@ impl eframe::App for VoicetermApp {
         // FAVORITES. Read fresh each draw rather than on open: the QML
         // refreshes on open for the same reason, and "each draw" is strictly
         // fresher for the cost of parsing one small XML file.
-        if self.surfaces.is(Surface::Favorites) {
+        let open_t = overlay::openness(ctx, Surface::Favorites, self.surfaces.is(Surface::Favorites));
+        if open_t > 0.0 {
             let colors = self.colors;
-            egui::Window::new("favorites")
-                .collapsible(false).resizable(false)
-                .show(ctx, |ui| {
+            let out = overlay::show(ctx, Surface::Favorites, open_t, |ui| {
                     use voiceterm_egui::favorites as fv;
                     let home = std::env::var("HOME").unwrap_or_default();
                     let rows = fv::entries(&home, fv::smart_cd::dolphin_favorites());
@@ -861,7 +859,8 @@ impl eframe::App for VoicetermApp {
                             fv::Action::Close => self.surfaces.close(),
                         }
                     }
-                });
+            });
+            if out.closed { self.surfaces.close(); }
         }
 
         // MISSING PACKAGES, right edge as in the QML. A side panel rather
@@ -869,9 +868,10 @@ impl eframe::App for VoicetermApp {
         // command output that produced it. The list itself lives in the
         // detector, which owns dismissal so a package reappearing in a NEW
         // block comes back.
-        if self.surfaces.is(Surface::MissingPkg) {
+        let open_t = overlay::openness(ctx, Surface::MissingPkg, self.surfaces.is(Surface::MissingPkg));
+        if open_t > 0.0 {
             let colors = self.colors;
-            egui::SidePanel::right("missing_pkg").show(ctx, |ui| {
+            let out = overlay::show(ctx, Surface::MissingPkg, open_t, |ui| {
                 use voiceterm_egui::missing_pkg as mp;
                 // Asked fresh each frame. The detector scans blocks as output
                 // arrives, so a list cached on open goes stale while the
@@ -889,13 +889,18 @@ impl eframe::App for VoicetermApp {
                     }
                 }
             });
+            if out.closed { self.surfaces.close(); }
         }
 
-        // THE TOUCH COMMAND HISTORY. A bottom panel rather than a modal: it
-        // is a picker, and the terminal behind it is the context for choosing.
-        if self.surfaces.is(Surface::CmdSheet) {
+        // THE TOUCH COMMAND HISTORY, as the QML has it: a bottom sheet over a
+        // full-screen tap-to-close scrim (cmdHistorySheet's MouseArea,
+        // main.qml:1533). The terminal stays visible through the dim, which
+        // is what "the context for choosing" needs — the old bottom-PANEL
+        // form got that by not being modal at all, and lost exclusivity.
+        let open_t = overlay::openness(ctx, Surface::CmdSheet, self.surfaces.is(Surface::CmdSheet));
+        if open_t > 0.0 {
             let colors = self.colors;
-            egui::TopBottomPanel::bottom("cmd_sheet").show(ctx, |ui| {
+            let out = overlay::show(ctx, Surface::CmdSheet, open_t, |ui| {
                 if let Some(a) = voiceterm_egui::cmd_sheet::cmd_sheet_ui(
                     ui, &mut self.cmd_sheet, &colors)
                 {
@@ -921,6 +926,10 @@ impl eframe::App for VoicetermApp {
                     }
                 }
             });
+            if out.closed {
+                self.surfaces.close();
+                self.cmd_sheet.close(); // scrim/Esc dismissal also clears the drag
+            }
         }
 
         // THE FIND BAR'S FILE RESULTS. Drawn before the modal below, because
@@ -1003,7 +1012,8 @@ impl eframe::App for VoicetermApp {
         // THE WORKSPACES PAGE, as a side panel. Rows come from the sidebar's
         // real session list and the live tabs from the real workspace — a
         // page fed demo rows would sort and filter convincingly over nothing.
-        if self.surfaces.is(Surface::Workspaces) {
+        let open_t = overlay::openness(ctx, Surface::Workspaces, self.surfaces.is(Surface::Workspaces));
+        if open_t > 0.0 {
             use voiceterm_egui::workspaces_view as wv;
             let now_ms = (ctx.input(|i| i.time) * 1000.0) as u64;
             let rows: Vec<wv::WorkspaceRow> = self.sidebar.sessions.iter()
@@ -1023,7 +1033,7 @@ impl eframe::App for VoicetermApp {
                 active_tab: self.workspace.active,
             });
             let colors = self.colors.clone();
-            egui::SidePanel::right("workspaces").show(ctx, |ui| {
+            let out = overlay::show(ctx, Surface::Workspaces, open_t, |ui| {
                 ui.heading("Workspaces");
                 ui.text_edit_singleline(&mut self.workspaces_filter);
                 // The live session only shows at two or more tabs, matching
@@ -1056,6 +1066,7 @@ impl eframe::App for VoicetermApp {
                 }
                 if ui.small_button("close").clicked() { self.surfaces.close(); }
             });
+            if out.closed { self.surfaces.close(); }
         }
 
         // The escape chord, checked before anything draws: if the recogniser
@@ -1433,9 +1444,13 @@ impl eframe::App for VoicetermApp {
         });
         }  // if show_chrome — the keycap and gesture rows
 
-        // the settings screen (QML settings page) as a right panel; edits persist + re-apply live
-        if self.surfaces.is(Surface::Settings) {
-            egui::SidePanel::right("settings").resizable(true).default_width(300.0).show(ctx, |ui| {
+        // the settings screen as the QML has it: settingsPopup (main.qml:27729),
+        // a centered modal popup. Resizability went with the panel form; the
+        // QML popup is fixed at 320 wide, and the form table is where to
+        // change that on device.
+        let open_t = overlay::openness(ctx, Surface::Settings, self.surfaces.is(Surface::Settings));
+        if open_t > 0.0 {
+            let out = overlay::show(ctx, Surface::Settings, open_t, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Settings");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1455,11 +1470,15 @@ impl eframe::App for VoicetermApp {
                     }
                 });
             });
+            if out.closed { self.surfaces.close(); }
         }
 
-        // the blocks drawer slides in at the left edge (QML Drawer, LeftEdge)
-        if self.surfaces.is(Surface::Blocks) {
-            egui::SidePanel::left("blocks-drawer").resizable(true).default_width(340.0).show(ctx, |ui| {
+        // the blocks drawer slides in at the left edge (QML blocksDrawer,
+        // LeftEdge, main.qml:30637) — width now from the form table, not a
+        // resizable panel.
+        let open_t = overlay::openness(ctx, Surface::Blocks, self.surfaces.is(Surface::Blocks));
+        if open_t > 0.0 {
+            let out = overlay::show(ctx, Surface::Blocks, open_t, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Blocks");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1580,6 +1599,7 @@ impl eframe::App for VoicetermApp {
                     }
                 }
             });
+            if out.closed { self.surfaces.close(); }
         }
 
         // THE VERTICAL TAB COLUMN, matched to the QML rather than approximated.
@@ -1783,8 +1803,9 @@ impl eframe::App for VoicetermApp {
             self.palette_query.clear();
             self.palette_sel = 0;
         }
-        if self.surfaces.is(Surface::Palette) {
-            self.palette_ui(ctx);
+        let open_t = overlay::openness(ctx, Surface::Palette, self.surfaces.is(Surface::Palette));
+        if open_t > 0.0 {
+            self.palette_ui(ctx, open_t);
         }
 
         // THE LEFT RAIL: workspace tabs, vertically, collapsible. The Qt app
@@ -2731,9 +2752,22 @@ impl eframe::App for VoicetermApp {
             }
 
             let mut chorded = false;
-            for out in voiceterm_egui::pty_input::drain_egui(
-                ui, voiceterm_egui::pty_input::TermMode::default(),
-                self.workspace.tabs.len() > 1)
+            // THE KEYBOARD HALF OF MODALITY. The backdrop blocks the
+            // pointer, but this loop reads raw ctx.input events, and egui
+            // does not remove events because an open surface's TextEdit
+            // looked at them — so without this gate, typing into any open
+            // surface also typed into the shell. The QML never had the
+            // problem: a modal popup takes focus and the terminal item is
+            // simply not delivered keys. (Esc is doubly safe here:
+            // Modal::should_close CONSUMES it before this runs.)
+            let key_outs = if self.surfaces.captures_input() {
+                Vec::new()
+            } else {
+                voiceterm_egui::pty_input::drain_egui(
+                    ui, voiceterm_egui::pty_input::TermMode::default(),
+                    self.workspace.tabs.len() > 1)
+            };
+            for out in key_outs
             {
                 // THE BYTES, WHICH THIS LOOP USED TO THROW AWAY.
                 //

@@ -564,14 +564,14 @@ so a collapse that frees little is worse than not having one");
         // `tabbar` appears twice: the if/else that picks resizable-vs-exact
         // builds it in both arms and shows it once.
         let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-        let permanent: Vec<&str> = unique.iter().copied()
-            .filter(|id| *id != "blocks-drawer")   // a drawer behind its own toggle
-            .collect();
+        let permanent: Vec<&str> = unique.iter().copied().collect();
         assert_eq!(
             permanent, vec!["tabbar"],
-            "the left edge should be the tab column alone (plus the blocks drawer, which is a \
-toggle). Found {permanent:?} — if a panel was added, put its contents IN the column or give it a \
-toggle, because Qt does this with one bar and the port already carried three."
+            "the left edge should be the tab column alone. Found {permanent:?} — if a panel was \
+added, put its contents IN the column or make it a transient surface (surface.rs + overlay.rs), \
+because Qt does this with one bar and the port already carried three. The blocks drawer used to \
+be excepted here as `SidePanel::left(\"blocks-drawer\")`; it is an overlay drawer now, so ANY \
+second left panel is a regression."
         );
     }
 

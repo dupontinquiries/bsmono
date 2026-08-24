@@ -228,6 +228,7 @@ pub mod setup_wizard;
 pub mod action_compass;
 pub mod shell;
 pub mod surface;   // which transient surface is up — the QML's modality, as state (C10-0a)
+pub mod overlay;   // how each surface draws — the QML's modal forms (drawer/sheet/popup)
 pub mod gesture_menus;
 
 /// voiceterm's tab + pane model, shared with the QML frontend rather than

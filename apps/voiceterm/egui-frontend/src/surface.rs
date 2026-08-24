@@ -31,7 +31,7 @@
 
 /// The transient surfaces. The persistent tab column (`tabbar`) is chrome,
 /// not a surface — it has no entry here and `tabbar_open` stays a plain flag.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Surface {
     /// Command blocks (QML blocksDrawer, left edge).
     Blocks,
@@ -95,6 +95,17 @@ impl Surfaces {
     /// Close whatever is up. Idempotent.
     pub fn close(&mut self) {
         self.active = None;
+    }
+
+    /// The keyboard half of modality: while any surface is up, key events
+    /// must not reach the PTY. The backdrop cannot do this — the terminal
+    /// reads raw `ctx.input` events, and egui does not remove events because
+    /// a widget looked at them — so the `drain_egui` call site gates on this.
+    /// Without it, typing into the palette also types into the shell (the
+    /// double-input path existed in code before this model; found by reading,
+    /// not observed on device).
+    pub fn captures_input(&self) -> bool {
+        self.active.is_some()
     }
 
     /// Close `s` if — and only if — it is the active surface.
@@ -244,5 +255,24 @@ mod tests {
                  through `self.surfaces` (see surface.rs)."
             );
         }
+        // Every transient right panel became an overlay drawer; a
+        // `SidePanel::right` reappearing means a surface bypassed both the
+        // model and its QML form.
+        assert_eq!(
+            src.matches("egui::SidePanel::right(").count(),
+            0,
+            "a right SidePanel is back — transient surfaces render via \
+             overlay::show, not standing panels (C10-0a)."
+        );
+        // The keyboard half of modality: the PTY drain must consult the
+        // model. Without this, typing into an open surface also types into
+        // the shell (raw ctx.input readers see every event).
+        assert_eq!(
+            src.matches("if self.surfaces.captures_input()").count(),
+            1,
+            "the drain gate is gone — pty_input::drain_egui must be skipped \
+             while a surface is up, or keys reach the shell through the \
+             backdrop."
+        );
     }
 }
