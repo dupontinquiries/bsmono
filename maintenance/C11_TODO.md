@@ -416,3 +416,27 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   say which is which in its first line to stop the next reader conflating
   them; consider renaming to 11-placement-matrix.md and giving the prompt
   creator its own chapter once 19b's spec exists.
+
+## 20. Queen / Worker Bees (docs/12-queen-and-workers.md, queen.rs)
+
+- **DONE**: WorkerSpec (parse + validate + identity_prompt), QUEEN_PROMPT,
+  liaison_announcement, and the design doc reasoning from the operator's
+  ChatGPT sketch. This is the "hive" the operator meant (worker-bee live
+  prompt creation), distinct from 11-hive-matrix.md (placement).
+- **C11-20a — THE EXPERIMENT THAT DECIDES THE THESIS.** Same 1B, same task,
+  with and without a lane + two-tool whitelist. Measure: files touched
+  outside the lane, turns to completion, refusals-with-a-reason. Everything
+  in doc 12 is speculation until this number exists. Runnable on device today
+  with line_calls + read_harness already wired.
+- **C11-20b — Delegator + roster**: reuse-before-create needs a roster to
+  reuse FROM. A worker is a spec file plus a memory dir; the roster is that
+  directory listed. Smallest useful version: seed workers (reader,
+  test-runner, patcher) shipped so a cold system is not all Queen calls.
+- **C11-20c — worker memory store**: append-only, provenance-tagged
+  (observation | decision | inference), sanitized+fenced on the way back IN
+  (doc 12 argues why: memory is model-authored text re-entering a prompt).
+- **C11-20d — capability.rs vs queen.rs overlap.** capability::profile renders
+  a contract from Duty+Ctx; WorkerSpec::identity_prompt renders one from a
+  spec. These will collide. Decide which owns prompt composition BEFORE both
+  grow consumers — and if the missing HiveMind_Strategy_Logscope.md
+  resurfaces, diff it against both (C11-19b).
