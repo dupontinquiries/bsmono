@@ -1316,6 +1316,10 @@ pub struct App {
     /// phone's flash is how battery dies.
     library_root: std::path::PathBuf,
     library_tree: library::TreeState,
+    /// Per-project sample triage — pinned floats, demoted sinks. Lives in
+    /// the workspace sidecar, not the op log: a pin is how one person
+    /// keeps their head straight, not a fact about the music.
+    library_prefs: library::Prefs,
     morph: morph_pad::PadState,
     bounce_format: morph_pad::BounceFormat,
     /// The mastering pass's live state: what was measured, what is
@@ -1391,6 +1395,10 @@ impl Default for App {
         studio.closed_groups = ws.closed_groups.iter()
             .map(|g| studio_core::GroupId(*g)).collect();
         let bounce_format = morph_pad::BounceFormat::from_token(&ws.bounce_format);
+        let library_prefs = library::Prefs {
+            pinned: ws.pinned.iter().map(std::path::PathBuf::from).collect(),
+            demoted: ws.demoted.iter().map(std::path::PathBuf::from).collect(),
+        };
         studio.status = match load_note {
             Some(e) => format!("{e} — started fresh (Ctrl+S will overwrite!)"),
             None => format!("{} — audition: {}", studio.status, sink.describe()),
@@ -1423,7 +1431,7 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
-              carrier, project_path, library_root, library_tree,
+              carrier, project_path, library_root, library_tree, library_prefs,
               morph: morph_pad::PadState::default(),
               bounce_format,
               mix_pass: None,
@@ -1612,6 +1620,10 @@ impl eframe::App for App {
                         closed_groups: self.studio.closed_groups.iter()
                             .map(|g| g.0).collect(),
                         bounce_format: self.bounce_format.token().to_string(),
+                        pinned: self.library_prefs.pinned.iter()
+                            .map(|p| p.display().to_string()).collect(),
+                        demoted: self.library_prefs.demoted.iter()
+                            .map(|p| p.display().to_string()).collect(),
                     });
                     if self.studio.save_to(&path).is_ok() {
                         // The save happened; history is the extra. A missing
@@ -2058,7 +2070,8 @@ impl eframe::App for App {
                 ui.separator();
                 lib_action = library::show_tree(
                     ui, &self.library_root, &mut self.library_tree,
-                    &self.studio.rack, &self.studio.session.doc.project, &colors);
+                    &self.studio.rack, &self.studio.session.doc.project,
+                    &self.library_prefs, &colors);
             });
         }
         if let Some(action) = lib_action {
@@ -2067,6 +2080,22 @@ impl eframe::App for App {
             let (path, to_rack) = match action {
                 library::LibraryAction::ToRack(p) => (p, true),
                 library::LibraryAction::ToTimeline(p) => (p, false),
+                library::LibraryAction::Pin(p) => {
+                    self.library_prefs.pin(&p);
+                    self.studio.status = format!("{} {}",
+                        if self.library_prefs.rank(&p) < 0 { "pinned" } else { "unpinned" },
+                        p.file_name().map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default());
+                    return;
+                }
+                library::LibraryAction::Demote(p) => {
+                    self.library_prefs.demote(&p);
+                    self.studio.status = format!("{} {}",
+                        if self.library_prefs.rank(&p) > 0 { "demoted" } else { "restored" },
+                        p.file_name().map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default());
+                    return;
+                }
                 library::LibraryAction::ToMorphSet(paths) => {
                     self.morph.anchors.clear();
                     let mut loaded = 0;

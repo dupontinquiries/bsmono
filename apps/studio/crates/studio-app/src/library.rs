@@ -26,6 +26,11 @@ pub struct LibraryEntry {
     /// reads as the folder structure the user built.
     pub label: String,
     pub path: PathBuf,
+    /// Bytes, from the same `read_dir` pass that found the file — the
+    /// weight heuristic's only input besides the extension, because
+    /// probing 23,000 files for a real bitrate is not a browse, it is a
+    /// batch job.
+    pub bytes: u64,
 }
 
 /// One level of the library: subdirectories and audio files, each sorted.
@@ -56,7 +61,8 @@ pub fn scan_dir(dir: &Path) -> DirListing {
         if p.is_dir() {
             out.dirs.push((name, p));
         } else if is_audio(&p) {
-            out.files.push(LibraryEntry { label: name, path: p });
+            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+            out.files.push(LibraryEntry { label: name, path: p, bytes });
         }
     }
     out.dirs.sort();
@@ -78,7 +84,7 @@ pub fn search(root: &Path, needle: &str, cap: usize) -> Vec<LibraryEntry> {
             if f.label.to_lowercase().contains(&needle) {
                 let label = f.path.strip_prefix(root).unwrap_or(&f.path)
                     .display().to_string();
-                out.push(LibraryEntry { label, path: f.path });
+                out.push(LibraryEntry { label, path: f.path, bytes: f.bytes });
                 if out.len() >= cap { break; }
             }
         }
@@ -236,6 +242,148 @@ pub fn similar_in_dir(path: &Path, cap: usize) -> Vec<PathBuf> {
         .collect()
 }
 
+// ── narrow-display presentation ─────────────────────────────────────────
+
+/// The identicon's text: first four and last four characters of the stem,
+/// elided in the middle, plus the extension — so
+/// `Vox_Dry_Waduwap_high_A#.opus` reads as `Vox_…h_A#` on a phone where
+/// the full name would push every button off the screen. Short stems are
+/// shown whole rather than padded: eliding a six-character name to save
+/// two is theatre.
+pub fn identicon(label: &str) -> (String, String) {
+    let path = Path::new(label);
+    let stem: String = path.file_stem().map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let chars: Vec<char> = stem.chars().collect();
+    let short = if chars.len() <= 9 {
+        stem
+    } else {
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}…{tail}")
+    };
+    (short, ext)
+}
+
+/// Bytes per second above which a file is "heavy" for a phone-first
+/// library. Sits deliberately between the two cases this was specified
+/// against: a 219 kb/s Opus (~27 kB/s) is light; a 6144 kb/s 96 kHz float
+/// WAV (~768 kB/s) is heavy. 96 kB/s ≈ 768 kb/s — comfortably above any
+/// transparent lossy file, comfortably below any lossless one.
+pub const HEAVY_BYTES_PER_SEC: u64 = 96_000;
+
+/// A rough duration for a sample file, from bytes and format — enough to
+/// turn a size into a rate. Deliberately crude: this decides whether to
+/// draw a small icon, not what to encode.
+fn assumed_bytes_per_sec(ext: &str, bytes: u64) -> u64 {
+    match ext {
+        // Uncompressed and legacy formats are heavy by KIND, and their
+        // rate is knowable without opening them: 16-bit stereo 48k is
+        // ~192 kB/s, and anything float or 96 kHz is multiples of that.
+        "wav" | "aiff" | "aif" => 192_000,
+        "mp3" => 40_000, // not heavy by rate — heavy by being mp3, below
+        // Compressed: a rate cannot be inferred from size without a
+        // duration, so size stands in. A big FLAC is a big file whatever
+        // its rate; a 200 kB opus loop is not.
+        _ => {
+            if bytes > 12_000_000 { HEAVY_BYTES_PER_SEC + 1 } else { 1 }
+        }
+    }
+}
+
+/// Should this file wear the anvil? Heavy means "this costs real storage
+/// and real decode on a Fairphone": uncompressed by kind (`wav`, `aiff`),
+/// legacy (`mp3` — kept in the pack for compatibility, never the file you
+/// want), or simply large. Everything transparent-and-small — an Opus
+/// one-shot, a short FLAC — stays unmarked, which is the point: the mark
+/// has to be rare to mean anything.
+pub fn is_heavy(path: &Path, bytes: u64) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if matches!(ext.as_str(), "wav" | "aiff" | "aif" | "mp3") { return true; }
+    assumed_bytes_per_sec(&ext, bytes) > HEAVY_BYTES_PER_SEC
+}
+
+/// Per-project sample preferences: what floats to the top, what sinks.
+/// Swiped, not clicked (see [`Swipe`]) — the gesture is the point, since
+/// this is triage done at speed while listening, not configuration.
+///
+/// These live in the project's workspace sidecar, NOT in the project's op
+/// log: a pin is how one person keeps their head straight in one session,
+/// not a fact about the music, and pushing it over the wire would mean a
+/// collaborator's triage rearranges yours mid-take. Said plainly rather
+/// than discovered: your pins are yours.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Prefs {
+    pub pinned: std::collections::BTreeSet<PathBuf>,
+    pub demoted: std::collections::BTreeSet<PathBuf>,
+}
+
+impl Prefs {
+    /// Pin and demote are opposites, so setting one clears the other —
+    /// a sample cannot be both a favourite and buried, and making the
+    /// user un-demote before pinning would be pure ceremony.
+    pub fn pin(&mut self, p: &Path) {
+        self.demoted.remove(p);
+        if !self.pinned.insert(p.to_path_buf()) { self.pinned.remove(p); }
+    }
+    pub fn demote(&mut self, p: &Path) {
+        self.pinned.remove(p);
+        if !self.demoted.insert(p.to_path_buf()) { self.demoted.remove(p); }
+    }
+    pub fn rank(&self, p: &Path) -> i8 {
+        if self.pinned.contains(p) { -1 }
+        else if self.demoted.contains(p) { 1 }
+        else { 0 }
+    }
+}
+
+/// Order a listing by preference: pinned first, demoted last, everything
+/// else in the order it arrived (alphabetical from the scan). Stable, so
+/// a pin moves ONE row and nothing else jumps.
+pub fn arrange(entries: &[LibraryEntry], prefs: &Prefs) -> Vec<LibraryEntry> {
+    let mut out = entries.to_vec();
+    out.sort_by_key(|e| prefs.rank(&e.path));
+    out
+}
+
+/// Group a flat result list under folder headers, so a search across a
+/// deep library shows `zaytoven/808s & Kicks` ONCE with bare filenames
+/// under it, instead of repeating the folder on every row and forcing the
+/// sidebar wide enough for the longest path in the pack.
+pub fn sections(entries: &[LibraryEntry]) -> Vec<(String, Vec<LibraryEntry>)> {
+    let mut out: Vec<(String, Vec<LibraryEntry>)> = Vec::new();
+    for e in entries {
+        let (dir, file) = match e.label.rsplit_once('/') {
+            Some((d, f)) => (d.to_string(), f.to_string()),
+            None => (String::new(), e.label.clone()),
+        };
+        let short = LibraryEntry { label: file, ..e.clone() };
+        match out.last_mut() {
+            Some((h, list)) if *h == dir => list.push(short),
+            _ => out.push((dir, vec![short])),
+        }
+    }
+    out
+}
+
+/// A horizontal drag on a row, resolved to an intent. Right pins, left
+/// demotes — the direction matches the result (up the list / down it) the
+/// way a phone user already expects, and the threshold keeps a shaky
+/// scroll from re-ranking a library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swipe { Pin, Demote }
+
+pub const SWIPE_PX: f32 = 36.0;
+
+pub fn swipe_of(dx: f32) -> Option<Swipe> {
+    if dx >= SWIPE_PX { Some(Swipe::Pin) }
+    else if dx <= -SWIPE_PX { Some(Swipe::Demote) }
+    else { None }
+}
+
 /// What the sidebar asked the shell to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibraryAction {
@@ -248,6 +396,11 @@ pub enum LibraryAction {
     /// Load the pad WHOLE: this sample plus its proposed neighbours —
     /// the breakout's opening move, taken only because it was clicked.
     ToMorphSet(Vec<PathBuf>),
+    /// Swiped right (or chosen from ⋯): float this sample to the top of
+    /// its listing for this project. Toggles.
+    Pin(PathBuf),
+    /// Swiped left: sink it. Toggles.
+    Demote(PathBuf),
     ToNewTrackBus(PathBuf, Option<studio_core::BusId>),
 }
 
@@ -277,75 +430,132 @@ impl TreeState {
     }
 }
 
-fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry,
+/// One row: identicon on the LEFT, name in the middle, every button on
+/// the RIGHT — so the buttons line up in a single column the eye can
+/// track instead of wandering with each name's length, and a narrow
+/// sidebar clips the name rather than the controls.
+fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
               rack: &studio_live::Rack, project: &studio_core::Project,
+              prefs: &Prefs, c: &uikit_egui::PaletteColors,
               action: &mut Option<LibraryAction>) {
-    ui.horizontal(|ui| {
-        if ui.small_button("▶").on_hover_text("preview").clicked() {
-            *action = Some(LibraryAction::Preview(e.path.clone()));
-        }
-        ui.label(&e.label);
-        // The ⋯ menu is the smart-offer surface: replacement targets, the
-        // bus choice, the better-encoded variants. (The voiceterm
-        // hover-drag selector is the intended upgrade for this menu once
-        // that widget lives in shared/; a plain menu teaches the same
-        // offers today.)
-        ui.menu_button("⋯", |ui| {
-            let kind = classify(&e.label);
-            for s in suggest(kind, rack, project) {
-                if ui.button(&s.label).clicked() {
-                    *action = Some(match s.act {
-                        SuggestAct::ReplaceChannel(i) =>
-                            LibraryAction::ReplaceChannel(i, e.path.clone()),
-                        SuggestAct::NewChannel => LibraryAction::ToRack(e.path.clone()),
-                        SuggestAct::ClipAtPlayhead =>
-                            LibraryAction::ToTimeline(e.path.clone()),
-                        SuggestAct::ClipToBus(b) =>
-                            LibraryAction::ToNewTrackBus(e.path.clone(), b),
-                    });
-                    ui.close();
-                }
+    let resp = ui.horizontal(|ui| {
+        // ── left: the identicon ─────────────────────────────────────────
+        let (short, ext) = identicon(&e.label);
+        let tint = match ext.as_str() {
+            "opus" | "ogg" => c.success,
+            "flac" => c.accent,
+            "wav" | "aiff" | "aif" => c.warning,
+            _ => c.text_weak,
+        };
+        let heavy = is_heavy(&e.path, e.bytes);
+        let rank = prefs.rank(&e.path);
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if rank < 0 { ui.colored_label(c.accent, "★"); }
+            ui.colored_label(tint, format!("{}", ext.to_uppercase()))
+                .on_hover_text(format!("{} · {:.1} MB", e.label, e.bytes as f64 / 1e6));
+            // The anvil: heavy on a phone. Rare on purpose — a mark
+            // everything wears is a mark nobody reads.
+            if heavy {
+                ui.colored_label(c.warning, "⚒")
+                    .on_hover_text("large or uncompressed — costs real storage and decode");
             }
-            if ui.button("add to morph pad").clicked() {
-                *action = Some(LibraryAction::ToMorph(e.path.clone()));
-                ui.close();
-            }
-            let kin = similar_in_dir(&e.path, 3);
-            if !kin.is_empty() {
-                if ui.button(format!("pad: load with {} similar", kin.len())).clicked() {
-                    let mut set = vec![e.path.clone()];
-                    set.extend(kin);
-                    *action = Some(LibraryAction::ToMorphSet(set));
-                    ui.close();
-                }
-            }
-            let alts = variants(&e.path);
-            if !alts.is_empty() {
-                ui.separator();
-                for v in alts.iter().take(4) {
-                    let ext = v.extension().and_then(|x| x.to_str()).unwrap_or("?");
-                    if ui.button(format!("use the .{ext} encoding")).clicked() {
-                        *action = Some(LibraryAction::Preview(v.clone()));
+        });
+        // ── middle: the name, elided on narrow displays ────────────────
+        let name = if compact { short } else { e.label.clone() };
+        let faded = if rank > 0 { c.text_weak } else { c.text };
+        ui.colored_label(faded, name).on_hover_text(&e.label);
+        // ── right: every button, in one column ─────────────────────────
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("⋯", |ui| {
+                let kind = classify(&e.label);
+                for s in suggest(kind, rack, project) {
+                    if ui.button(&s.label).clicked() {
+                        *action = Some(match s.act {
+                            SuggestAct::ReplaceChannel(i) =>
+                                LibraryAction::ReplaceChannel(i, e.path.clone()),
+                            SuggestAct::NewChannel => LibraryAction::ToRack(e.path.clone()),
+                            SuggestAct::ClipAtPlayhead =>
+                                LibraryAction::ToTimeline(e.path.clone()),
+                            SuggestAct::ClipToBus(b) =>
+                                LibraryAction::ToNewTrackBus(e.path.clone(), b),
+                        });
                         ui.close();
                     }
                 }
+                if ui.button("add to morph pad").clicked() {
+                    *action = Some(LibraryAction::ToMorph(e.path.clone()));
+                    ui.close();
+                }
+                let kin = similar_in_dir(&e.path, 3);
+                if !kin.is_empty() {
+                    if ui.button(format!("pad: load with {} similar", kin.len())).clicked() {
+                        let mut set = vec![e.path.clone()];
+                        set.extend(kin);
+                        *action = Some(LibraryAction::ToMorphSet(set));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button(if prefs.rank(&e.path) < 0 { "unpin" } else { "pin" }).clicked() {
+                    *action = Some(LibraryAction::Pin(e.path.clone()));
+                    ui.close();
+                }
+                if ui.button(if prefs.rank(&e.path) > 0 { "restore" } else { "demote" }).clicked() {
+                    *action = Some(LibraryAction::Demote(e.path.clone()));
+                    ui.close();
+                }
+                let alts = variants(&e.path);
+                if !alts.is_empty() {
+                    ui.separator();
+                    for v in alts.iter().take(4) {
+                        let vext = v.extension().and_then(|x| x.to_str()).unwrap_or("?");
+                        if ui.button(format!("use the .{vext} encoding")).clicked() {
+                            *action = Some(LibraryAction::Preview(v.clone()));
+                            ui.close();
+                        }
+                    }
+                }
+            });
+            if !compact {
+                if ui.small_button("clip").on_hover_text("place at the playhead").clicked() {
+                    *action = Some(LibraryAction::ToTimeline(e.path.clone()));
+                }
+                if ui.small_button("rack").on_hover_text("add as a sampler channel").clicked() {
+                    *action = Some(LibraryAction::ToRack(e.path.clone()));
+                }
+            }
+            if ui.small_button("▶").on_hover_text("preview").clicked() {
+                *action = Some(LibraryAction::Preview(e.path.clone()));
             }
         });
-        if ui.small_button("rack").on_hover_text("add as a sampler channel").clicked() {
-            *action = Some(LibraryAction::ToRack(e.path.clone()));
+    }).response;
+
+    // The swipe: triage at listening speed. Resolved on RELEASE from the
+    // total drag, so a slow scroll that wanders sideways never re-ranks
+    // the library — and the same intents exist in the ⋯ menu, because a
+    // gesture nobody discovers is a feature nobody has.
+    let dragged = ui.interact(resp.rect, resp.id.with("swipe"), egui::Sense::drag());
+    if dragged.drag_stopped() {
+        if let Some(sw) = swipe_of(dragged.drag_delta().x) {
+            *action = Some(match sw {
+                Swipe::Pin => LibraryAction::Pin(e.path.clone()),
+                Swipe::Demote => LibraryAction::Demote(e.path.clone()),
+            });
         }
-        if ui.small_button("clip").on_hover_text("place at the playhead").clicked() {
-            *action = Some(LibraryAction::ToTimeline(e.path.clone()));
-        }
-    });
+    }
 }
 
 /// Draw the sidebar: a filter box, then either search results or the lazy
 /// tree. Returns at most one action.
 pub fn show_tree(ui: &mut egui::Ui, root: &Path, state: &mut TreeState,
                  rack: &studio_live::Rack, project: &studio_core::Project,
-                 c: &uikit_egui::PaletteColors) -> Option<LibraryAction> {
+                 prefs: &Prefs, c: &uikit_egui::PaletteColors) -> Option<LibraryAction> {
     let mut action = None;
+    // Below this the row cannot hold long names AND its buttons, so the
+    // name elides to its identicon and the two word-buttons fold into ⋯ —
+    // the controls survive, which is the right thing to keep.
+    let compact = ui.available_width() < 260.0;
     ui.label(format!("library — {}", root.display()));
     ui.horizontal(|ui| {
         ui.label("find:");
@@ -364,15 +574,26 @@ pub fn show_tree(ui: &mut egui::Ui, root: &Path, state: &mut TreeState,
             if state.results.len() == 500 {
                 ui.colored_label(c.text_weak, "first 500 matches — narrow the search");
             }
-            let results = state.results.clone();
-            for e in &results {
-                sample_row(ui, e, rack, project, &mut action);
+            // Search results carry their folder in the label, which is
+            // what made this sidebar so wide. Grouped under one header
+            // each, the rows only need the filename.
+            let results = arrange(&state.results.clone(), prefs);
+            for (header, list) in sections(&results) {
+                if !header.is_empty() {
+                    ui.add_space(2.0);
+                    ui.colored_label(c.text_weak, header);
+                }
+                for e in &list {
+                    sample_row(ui, e, compact, rack, project, prefs, c, &mut action);
+                }
             }
             return;
         }
+        #[allow(clippy::too_many_arguments)]
         fn walk(ui: &mut egui::Ui, dir: &Path, depth: usize, state: &mut TreeState,
                 rack: &studio_live::Rack, project: &studio_core::Project,
-                c: &uikit_egui::PaletteColors, action: &mut Option<LibraryAction>) {
+                prefs: &Prefs, compact: bool, c: &uikit_egui::PaletteColors,
+                action: &mut Option<LibraryAction>) {
             let listing = state.listing(dir);
             for (name, sub) in &listing.dirs {
                 let open = state.expanded.contains(sub);
@@ -383,12 +604,13 @@ pub fn show_tree(ui: &mut egui::Ui, root: &Path, state: &mut TreeState,
                 }
                 if open && depth < 12 {
                     ui.indent(sub, |ui| {
-                        walk(ui, sub, depth + 1, state, rack, project, c, action);
+                        walk(ui, sub, depth + 1, state, rack, project, prefs,
+                             compact, c, action);
                     });
                 }
             }
-            for e in &listing.files {
-                sample_row(ui, e, rack, project, action);
+            for e in &arrange(&listing.files, prefs) {
+                sample_row(ui, e, compact, rack, project, prefs, c, action);
             }
         }
         let top = state.listing(root);
@@ -396,7 +618,7 @@ pub fn show_tree(ui: &mut egui::Ui, root: &Path, state: &mut TreeState,
             ui.colored_label(c.text_weak,
                 "empty. Set STUDIO_LIBRARY or put samples in ./library");
         }
-        walk(ui, root, 0, state, rack, project, c, &mut action);
+        walk(ui, root, 0, state, rack, project, prefs, compact, c, &mut action);
     });
     action
 }
@@ -510,6 +732,86 @@ mod tests {
         assert!(!kin.iter().any(|p| p.to_string_lossy().contains("FFaudio")),
                 "a format variant of the same sound is not a neighbour");
         assert!(similar_in_dir(&root.join("Read_Me.pdf"), 3).is_empty());
+    }
+
+    #[test]
+    fn the_identicon_elides_the_middle_and_keeps_the_extension() {
+        // Real names from the library this was specified against.
+        let (short, ext) = identicon("Vox_Dry_Waduwap_high_A#.opus");
+        assert_eq!(short, "Vox_…h_A#");
+        assert_eq!(ext, "opus");
+        // Short names are shown whole: eliding six characters to save two
+        // is theatre.
+        assert_eq!(identicon("Hat 2.wav"), ("Hat 2".into(), "wav".into()));
+        assert_eq!(identicon("808 1 (LAYER WITH KICK 1).flac").0, "808 …K 1)");
+    }
+
+    #[test]
+    fn the_anvil_marks_the_two_cases_it_was_specified_against() {
+        // '96000 Hz, 2 channels, flt, 6144 kb/s' — a float WAV, heavy by
+        // KIND, whatever its size.
+        assert!(is_heavy(Path::new("Vox_Dry_Ya_A.wav"), 500_000));
+        // 'bitrate: 219 kb/s 48k' opus — light, and must STAY light at any
+        // plausible one-shot size, or the mark means nothing.
+        assert!(!is_heavy(Path::new("Vox_Dry_Ya_A.opus"), 6_000));
+        assert!(!is_heavy(Path::new("Melody_1_Memories_G_126bpm_FULL.opus"), 900_000));
+        // FLAC is light until it is simply big.
+        assert!(!is_heavy(Path::new("Snare 3.flac"), 400_000));
+        assert!(is_heavy(Path::new("Melody long.flac"), 40_000_000));
+        // mp3 is marked by kind: kept for compatibility, never the file
+        // you want on a phone.
+        assert!(is_heavy(Path::new("zaytoven_808_1.mp3"), 100_000));
+    }
+
+    #[test]
+    fn pinning_floats_demoting_sinks_and_they_are_opposites() {
+        let mk = |name: &str| LibraryEntry { label: name.into(),
+            path: PathBuf::from(name), bytes: 1 };
+        let list = vec![mk("a.opus"), mk("b.opus"), mk("c.opus"), mk("d.opus")];
+        let mut p = Prefs::default();
+        p.pin(Path::new("c.opus"));
+        p.demote(Path::new("a.opus"));
+        let order: Vec<String> = arrange(&list, &p).iter().map(|e| e.label.clone()).collect();
+        assert_eq!(order, vec!["c.opus", "b.opus", "d.opus", "a.opus"],
+                   "pinned first, demoted last, the rest undisturbed");
+        // Pinning something demoted lifts it rather than making it both.
+        p.pin(Path::new("a.opus"));
+        assert_eq!(p.rank(Path::new("a.opus")), -1);
+        assert!(!p.demoted.contains(Path::new("a.opus")));
+        // And both toggle.
+        p.pin(Path::new("a.opus"));
+        assert_eq!(p.rank(Path::new("a.opus")), 0);
+    }
+
+    #[test]
+    fn sections_lift_the_folder_out_of_every_row() {
+        // The width problem stated plainly: three hits in one deep folder
+        // repeated its path three times. One header, three bare names.
+        let mk = |label: &str| LibraryEntry { label: label.into(),
+            path: PathBuf::from(label), bytes: 1 };
+        let flat = vec![
+            mk("zaytoven/808s & Kicks/808 1.wav"),
+            mk("zaytoven/808s & Kicks/808 5.wav"),
+            mk("Vox - Clean/FFaudioConverter/Vox_Dry_Ya_A.opus"),
+            mk("loose.opus"),
+        ];
+        let s = sections(&flat);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].0, "zaytoven/808s & Kicks");
+        assert_eq!(s[0].1.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
+                   vec!["808 1.wav", "808 5.wav"], "rows carry only the filename");
+        assert_eq!(s[2].0, "", "a root-level file needs no header");
+        assert_eq!(s[0].1[0].path, PathBuf::from("zaytoven/808s & Kicks/808 1.wav"),
+                   "the path survives the shortening — actions still work");
+    }
+
+    #[test]
+    fn a_swipe_needs_real_travel_in_a_clear_direction() {
+        assert_eq!(swipe_of(SWIPE_PX + 1.0), Some(Swipe::Pin));
+        assert_eq!(swipe_of(-SWIPE_PX - 1.0), Some(Swipe::Demote));
+        // A scroll that wanders sideways must not re-rank the library.
+        assert_eq!(swipe_of(12.0), None);
+        assert_eq!(swipe_of(-12.0), None);
     }
 
     #[test]

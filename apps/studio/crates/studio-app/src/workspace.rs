@@ -31,6 +31,12 @@ pub struct WorkspaceState {
     /// Library-bound render format token (see `morph_pad::BounceFormat`)
     /// — per device, because storage constraints are.
     pub bounce_format: String,
+    /// Sample triage for THIS project: pinned floats to the top of its
+    /// listing, demoted sinks. Stored here rather than in the op log
+    /// because a pin is a person's working memory, not a fact about the
+    /// music — a collaborator's triage must not rearrange yours mid-take.
+    pub pinned: Vec<String>,
+    pub demoted: Vec<String>,
 }
 
 impl Default for WorkspaceState {
@@ -39,19 +45,25 @@ impl Default for WorkspaceState {
                          side_slot: "viewport".into(),
                          px_per_sec: 100.0, scroll_ticks: 0,
                          closed_groups: Vec::new(),
-                         bounce_format: "opus-192".into() }
+                         bounce_format: "opus-192".into(),
+                         pinned: Vec::new(), demoted: Vec::new() }
     }
 }
 
 impl WorkspaceState {
     pub fn encode(&self) -> String {
         format!("# per-device layout; safe to delete, never load-bearing\n\
-                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\n",
+                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\n",
                 self.combined, self.panel, self.side_slot,
                 self.px_per_sec, self.scroll_ticks,
                 self.closed_groups.iter().map(|g| g.to_string())
                     .collect::<Vec<_>>().join(","),
-                self.bounce_format)
+                self.bounce_format,
+                // Tab-joined: a sample path may contain a comma (real
+                // packs do), and losing a pin to punctuation would be a
+                // silent, confusing failure.
+                self.pinned.join("\t"),
+                self.demoted.join("\t"))
     }
     /// Parse leniently: defaults underneath, known keys on top, everything
     /// else ignored. There is no error case ON PURPOSE.
@@ -74,6 +86,10 @@ impl WorkspaceState {
                 "closed_groups" => w.closed_groups = v.trim().split(',')
                     .filter_map(|x| x.trim().parse().ok()).collect(),
                 "bounce_format" => w.bounce_format = v.trim().to_string(),
+                "pinned" => w.pinned = v.split('\t')
+                    .filter(|x| !x.trim().is_empty()).map(str::to_string).collect(),
+                "demoted" => w.demoted = v.split('\t')
+                    .filter(|x| !x.trim().is_empty()).map(str::to_string).collect(),
                 _ => {} // a newer build's key, not our business
             }
         }
@@ -105,7 +121,8 @@ mod tests {
     fn the_layout_round_trips_and_garbage_means_defaults_never_failure() {
         let w = WorkspaceState { combined: true, panel: "Rack".into(),
             side_slot: "mixer".into(), px_per_sec: 250.0, scroll_ticks: 12345,
-            closed_groups: vec![3, 9], bounce_format: "flac".into() };
+            closed_groups: vec![3, 9], bounce_format: "flac".into(),
+            pinned: vec!["kicks/808, big.wav".into()], demoted: vec!["hats/tick.opus".into()] };
         assert_eq!(WorkspaceState::decode(&w.encode()), w);
         // A newer build's key rides along harmlessly; garbage lines too.
         let with_future = format!("{}\nfuture_key=whatever\n<<<garbage", w.encode());

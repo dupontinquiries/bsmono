@@ -1628,3 +1628,29 @@ a test asserts every claimed key is one the keymap or the shell's
 interception actually handles. And a completed path applies through
 `edit_group`, so a two-op command is one press of `u`. While the palette
 is open it owns the keyboard: typing `d` is a search, not a delete.
+
+
+**The library sidebar, narrowed.** Search results used to repeat the folder
+on every row, which is what forced the sidebar as wide as the longest path
+in the pack; they group under one folder header now and the rows carry
+only the filename (the full path survives underneath, so every action
+still works). Every button moved to the RIGHT in one column the eye can
+track, the identicon to the LEFT: extension tag, tinted by format, plus an
+ANVIL when the file is heavy for a phone. Heaviness is judged from
+extension and size — the only inputs available without probing 23,000
+files — and pinned against the two cases it was specified against: a
+96 kHz float WAV at 6144 kb/s wears the anvil (heavy by KIND, whatever its
+size), a 219 kb/s Opus never does at any plausible one-shot size, FLAC is
+light until it is simply big, and mp3 is marked by kind. The mark has to
+be rare to mean anything. Below ~260 px the row goes compact: the name
+elides to first-four…last-four (`Vox_Dry_Waduwap_high_A#.opus` →
+`Vox_…h_A#`), short names shown whole, and the two word-buttons fold into
+⋯ — the controls survive, which is the right thing to keep. Finally,
+triage against rack overload: SWIPE right to pin a sample to the top of
+its listing, left to demote it to the bottom, both toggling, both also in
+the ⋯ menu because a gesture nobody discovers is a feature nobody has. A
+swipe needs real travel (36 px) so a wandering scroll never re-ranks the
+library. Pins are per project, stored in the workspace sidecar rather than
+the op log: a pin is how one person keeps their head straight in one
+session, not a fact about the music, and a collaborator's triage must not
+rearrange yours mid-take.
