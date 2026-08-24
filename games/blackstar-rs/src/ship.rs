@@ -456,6 +456,10 @@ pub fn arrival_from_index(i: usize) -> Arrival {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Same as loot.rs: `menu::Item` is a test-only name here since the
+    // c5blackstar-008 import sweep. NOT `gear::Item`, which rustc also
+    // suggests and which is a different enum — `Row::item` is a menu Item.
+    use crate::menu::Item;
 
     #[test]
     fn size_decides_what_a_ship_can_do() {

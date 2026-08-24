@@ -1238,6 +1238,11 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     // verts move into the gpu below and the indices have to line up with
     // `prims`, so this is the one moment both exist
     let mut prim_pts: Vec<Vec<Vec3>> = Vec::new();
+    // Every vertex of every prim, in prim order, kept because the settle
+    // search below wants the whole body and the loop hands each prim's
+    // `verts` to the GPU (a move). Gathered here rather than re-read from
+    // `raws` afterwards, which does not compile — see the settle site.
+    let mut all_verts: Vec<Vertex> = Vec::new();
     for r in raws {
         let tex_id = r.tex_uri.as_ref().map(|uri| {
             *tex_cache.entry(uri.clone()).or_insert_with(|| {
@@ -1274,6 +1279,7 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
             mine.push(p);
         }
         prim_pts.push(mine);
+        all_verts.extend_from_slice(&r.verts);
         let mesh_id = gpu.add_mesh(&MeshData { verts: r.verts, idx: r.idx });
         prims.push(Prim { mesh_id, tex_id, color: r.color, tag: r.tag, pivot });
     }
@@ -1290,8 +1296,11 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     // search again on the ORIENTED points: an answer other than identity
     // means this pose stands along its own axis.
     let settle = {
-        let vs: Vec<Vertex> = raws.iter().flat_map(|r| r.verts.iter().copied()).collect();
-        if vs.is_empty() { Quat::IDENTITY } else { find_orientation(&vs) }
+        // `raws` was consumed by the loop above (each prim's `verts` moved
+        // into `add_mesh`), so this reads the copy gathered on the way past.
+        // Same vertices, same order as `raws.iter().flat_map(..)` would have
+        // produced.
+        if all_verts.is_empty() { Quat::IDENTITY } else { find_orientation(&all_verts) }
     };
     let (tuck, pack) = {
         let sk = crate::skeleton::skeletonize(&refs);

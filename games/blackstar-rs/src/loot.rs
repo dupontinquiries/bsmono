@@ -168,6 +168,10 @@ pub fn improves(d: &Drop, current: &[Mod], body: Body) -> bool {
 mod tests {
     use super::*;
     use crate::sun::StarClass;
+    // `BodyFit` is used only by the tests below; the c5blackstar-008
+    // unused-import sweep removed it from the file header, which is right
+    // for the normal build and left the test target uncompilable.
+    use crate::loadout::BodyFit;
 
     const MACHINE: [Body; 1] = [Body::Cybertronian];
     const MIXED: [Body; 2] = [Body::Cybertronian, Body::HumanSuited];

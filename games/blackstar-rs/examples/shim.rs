@@ -19,12 +19,28 @@
 // to compile against this shim at all until these two were added: the
 // shim's own doc comment had gone stale the same way the botpack test
 // fixtures had, and nobody had run a harness since either landed.
+// And four more since THAT comment was written, all arriving with the
+// animation-layers work: `model.rs` now calls `crate::turret::find`,
+// `crate::massfilter`, `crate::cockpit` and `crate::skeleton`. Same
+// treatment and for the same reason — each is self-contained (`glam::Vec3`
+// and nothing else), so they are pulled in for real rather than stubbed.
+// Discovered the same way as last time: every harness failed to compile
+// against this shim, `cannot find 'turret' in 'crate'`, because the
+// harnesses are not part of the fast edit loop that produced them.
 #[path = "../src/meshgen.rs"]
 pub mod meshgen;
 #[path = "../src/botpack.rs"]
 pub mod botpack;
 #[path = "../src/compact.rs"]
 pub mod compact;
+#[path = "../src/turret.rs"]
+pub mod turret;
+#[path = "../src/massfilter.rs"]
+pub mod massfilter;
+#[path = "../src/cockpit.rs"]
+pub mod cockpit;
+#[path = "../src/skeleton.rs"]
+pub mod skeleton;
 #[path = "../src/model.rs"]
 pub mod model;
 
