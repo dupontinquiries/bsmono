@@ -440,3 +440,28 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   spec. These will collide. Decide which owns prompt composition BEFORE both
   grow consumers — and if the missing HiveMind_Strategy_Logscope.md
   resurfaces, diff it against both (C11-19b).
+
+## 21. Perf hunt (from the c11 field profiles)
+
+- **C11-21a — THE OPEN LEAD, with arithmetic.** Both field runs logged
+  "windowed sampling ON (k=4)", which predicts 0.25 readbacks/token and 0.25
+  submits/token. Both measured ~0.45 readbacks/token at **1.0 submits/token**
+  (Llama-1B: 2241 downloads / 5033 tokens; Qwen3-14B: 22 / 41). The window is
+  not batching. generate_kv_window_sampled downloads once per window BY
+  CONSTRUCTION (src/lib.rs, `let win = self.download_u32(&o)` after the j
+  loop), so something inside the loop forces a flush per token. Suspects, in
+  order: (1) `embed_t.gather_row` or `sample_at` doing an implicit
+  download/map; (2) the per-window `self.upload(&us, 1, w)` staging copy
+  forcing a submit; (3) dims-wrap (the causes line shows 276 and 9) ending
+  frames early. Instrument by counting SUBMIT_BY_DOWNLOAD deltas across one
+  window, on device — this sandbox has lavapipe and CAN reproduce it with a
+  tiny model, which is the cheap first move.
+  Payoff if fixed: the profile is 95% sync (12735ms of 13404ms), 1 submit/tok
+  at 3 tok/s — cutting submits 4x is the single biggest lever visible.
+- **C11-21b — verdict MoE gating: DONE.** Also worth auditing the other arms
+  for the same shape: an arm that asserts an architecture instead of reading
+  one. `--gate-perf`'s advice lines deserve the same pass.
+- **C11-21c — the readbacks-per-token vs 1/k check the new dense arm tells
+  the reader to do should be COMPUTED by the verdict**, not left to arithmetic
+  by hand: the profile already has downloads and tokens; k is knowable. Then
+  the headline can say "the window is flushing early" outright.
