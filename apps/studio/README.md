@@ -1608,3 +1608,23 @@ recording: judging silence on the mono SUM skipped analysis on a fully
 out-of-phase mix — precisely the mix most worth warning about — so
 silence is judged per channel and a collapsed sum reads one channel
 instead, letting the correlation finding carry the warning.
+
+
+**The command palette (`C-p`), built as paths rather than a list.** Type a
+few letters, pick a verb, and if the verb needs a target the palette asks
+for that too: "route" → which track → which bus, *or* "new bus", which
+creates and routes in ONE group so changing your mind never leaves an
+orphan bus. That step structure is the design, not decoration — because a
+command is a path of choices resolved by matching text,
+`Palette::resolve(project, &["route", "vocals", "drums"])` returns the
+finished act with no UI at all. That is the seam voice mode plugs into
+later: no second implementation of the wizard, no second registry of
+verbs. Three properties are pinned. Fuzzy ranking is a subsequence match
+with word-start and run bonuses, so "rtb" finds "route track to bus" and
+"undo" beats longer matches. Every entry that has a keybinding CARRIES
+that key (`Act::Key`) rather than reimplementing the verb, shows it
+right-aligned — a palette that teaches its way out of being needed — and
+a test asserts every claimed key is one the keymap or the shell's
+interception actually handles. And a completed path applies through
+`edit_group`, so a two-op command is one press of `u`. While the palette
+is open it owns the keyboard: typing `d` is a search, not a delete.

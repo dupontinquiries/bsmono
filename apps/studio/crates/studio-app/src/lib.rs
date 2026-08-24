@@ -25,6 +25,7 @@ pub mod mix_assistant;
 pub mod mixer_panel;
 pub mod morph_pad;
 pub mod program_panel;
+pub mod palette;
 pub mod project_dir;
 pub mod viewport;
 pub mod workspace;
@@ -1321,6 +1322,9 @@ pub struct App {
     /// proposed, and at what strength — held between frames so the
     /// findings can be READ and the dial moved before anything applies.
     mix_pass: Option<MixPassUi>,
+    /// The command palette, open when `Some`. C-p opens it; it holds the
+    /// wizard's position and the current query between frames.
+    palette: Option<palette::Palette>,
     settings_open: bool,
     library_open: bool,
     /// The export dialog's plan while it is open, plus its last refusal —
@@ -1423,6 +1427,7 @@ impl Default for App {
               morph: morph_pad::PadState::default(),
               bounce_format,
               mix_pass: None,
+              palette: None,
               settings_open: false, library_open: true,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
@@ -1456,6 +1461,18 @@ impl eframe::App for App {
             egui::Event::Text(t) => t.chars().collect::<Vec<_>>(),
             _ => Vec::new(),
         }).collect());
+        // C-p, read from the key events rather than the text stream: a
+        // modified chord never arrives as Event::Text. Consumed here so no
+        // widget with focus can eat it.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            self.palette = match self.palette {
+                Some(_) => None, // C-p again closes: a toggle, not a stack
+                None => Some(palette::Palette::open()),
+            };
+        }
+        // While the palette is open it owns the keyboard — typing 'd' is a
+        // search, not a delete.
+        let typed: Vec<char> = if self.palette.is_some() { Vec::new() } else { typed };
         for ch in typed {
             // The alignment keys, intercepted before the Helix keymap —
             // they need `self.audio` (the keymap cannot) and their chars
@@ -1688,6 +1705,7 @@ impl eframe::App for App {
                     "nothing to analyse — the arrangement is silent".into(),
             }
         }
+        self.palette_window(ctx);
         self.mix_pass_window(ctx);
         self.archive_window(ctx);
         self.export_dialog_window(ctx);
@@ -2557,6 +2575,128 @@ impl App {
             self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
             self.audio.insert(id, audio);
             self.studio.register_asset(id, &raw);
+        }
+    }
+
+    /// The command palette: a query box, ranked choices, and the wizard's
+    /// breadcrumb. Enter takes the top choice, arrows move, Escape backs
+    /// out one step (and out of the palette at the root) — the keyboard
+    /// never has to reach for the mouse, which is the entire point.
+    fn palette_window(&mut self, ctx: &egui::Context) {
+        let Some(mut p) = self.palette.take() else { return };
+        let project = self.studio.session.doc.project.clone();
+        let choices = p.choices(&project);
+        let mut chosen: Option<palette::Choice> = None;
+        let mut close = false;
+        let mut open = true;
+
+        // Keys first: the list is drawn from the query, so navigation must
+        // resolve before the widgets read it.
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                if p.pending.is_some() {
+                    p.pending = None;
+                    p.path.clear();
+                    p.query.clear();
+                    p.selected = 0;
+                } else { close = true; }
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) { p.selected += 1; }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                p.selected = p.selected.saturating_sub(1);
+            }
+        });
+        let ranked = palette::filter(&choices, &p.query);
+        if p.selected >= ranked.len() { p.selected = ranked.len().saturating_sub(1); }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+            chosen = ranked.get(p.selected).map(|c| (*c).clone());
+        }
+
+        egui::Window::new("Command palette").open(&mut open).resizable(false)
+            .collapsible(false).default_width(420.0)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
+            .show(ctx, |ui| {
+                if !p.path.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, p.path.join(" › "));
+                }
+                let edit = ui.add(egui::TextEdit::singleline(&mut p.query)
+                    .hint_text(match p.pending {
+                        None => "type a command…",
+                        Some(_) => "pick a target…",
+                    }).desired_width(f32::INFINITY));
+                edit.request_focus();
+                ui.separator();
+                if ranked.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, "nothing matches");
+                }
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (i, c) in ranked.iter().enumerate() {
+                        let row = ui.horizontal(|ui| {
+                            let hit = ui.selectable_label(i == p.selected, &c.label);
+                            if let Some(h) = &c.hint {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| { ui.weak(h); });
+                            }
+                            hit
+                        }).inner;
+                        if row.clicked() { chosen = Some((*c).clone()); }
+                    }
+                });
+                ui.separator();
+                ui.weak("enter: choose · esc: back · C-p: close");
+            });
+
+        if let Some(c) = chosen {
+            match p.choose(&c) {
+                Some(act) => { self.run_palette_act(act); close = true; }
+                None => {} // descended into the next question
+            }
+        }
+        if !close && open { self.palette = Some(p); }
+    }
+
+    /// Execute a completed palette path. Ops go through `edit_group` — a
+    /// palette command is ONE undo even when it is two ops (create a bus
+    /// and route into it), so a mistake never leaves half of itself.
+    fn run_palette_act(&mut self, act: palette::Act) {
+        match act {
+            palette::Act::Ops(ops) => {
+                let what = if ops.len() > 1 { "palette command" } else { "palette edit" };
+                self.studio.edit_group(ops, what);
+            }
+            // Delegating to the keymap rather than duplicating the verb is
+            // why the palette cannot drift from the keyboard.
+            palette::Act::Key(ch) => { self.studio.key(studio_egui::keys::Key::c(ch)); }
+            palette::Act::Panel(panel) => {
+                self.studio.panel = panel;
+                self.studio.status = format!("{}", panel.label());
+            }
+            palette::Act::Shell(v) => match v {
+                palette::ShellVerb::MixMaster => {
+                    let target = self.studio.session.doc.project.busses.iter()
+                        .find(|(_, b)| b.parent.is_none())
+                        .map(|(id, b)| (*id, b.name.clone()));
+                    match target {
+                        Some(t) => self.studio.mix_pass_request = Some(t),
+                        None => self.studio.status =
+                            "no bus feeding master to analyse".into(),
+                    }
+                }
+                palette::ShellVerb::ArchiveDialog => {
+                    self.archive_ui = Some(ArchiveUi::default());
+                }
+                palette::ShellVerb::ExportDialog => {
+                    self.export_dialog = Some(Default::default());
+                }
+                palette::ShellVerb::Settings => { self.settings_open = true; }
+                palette::ShellVerb::ToggleWorkbench => {
+                    self.studio.combined = !self.studio.combined;
+                }
+                palette::ShellVerb::ToggleLibrary => {
+                    self.library_open = !self.library_open;
+                }
+            },
         }
     }
 
@@ -4593,6 +4733,36 @@ mod layer_tests {
         s.rack.patterns[0].rows[ix] = 0b1;
         assert_eq!(s.rack.patterns[0].rows[from], steps_before,
                    "editing the layer never touches the source");
+    }
+}
+
+#[cfg(test)]
+mod palette_shell_tests {
+    use super::*;
+
+    #[test]
+    fn a_palette_path_applies_as_one_edit_through_the_same_ops_the_keyboard_uses() {
+        // "route the bass to a new bus" is two ops — create and route —
+        // and must be ONE undo, or the palette leaves orphan busses
+        // behind every time someone changes their mind.
+        let mut s = Studio::demo();
+        let track = s.session.doc.project.tracks.iter()
+            .find(|t| t.kind == studio_core::TrackKind::Audio).unwrap().clone();
+        let busses_before = s.session.doc.project.busses.len();
+        let act = palette::Palette::resolve(&s.session.doc.project,
+                                            &["route", &track.name, "new bus"])
+            .expect("the wizard resolves");
+        let palette::Act::Ops(ops) = act else { panic!("expected ops") };
+        s.edit_group(ops, "palette command");
+        assert_eq!(s.session.doc.project.busses.len(), busses_before + 1);
+        let routed = s.session.doc.project.tracks.iter()
+            .find(|t| t.id == track.id).unwrap().route;
+        assert!(routed.is_some(), "the track went into the new bus");
+        s.key(studio_egui::keys::Key::c('u'));
+        assert_eq!(s.session.doc.project.busses.len(), busses_before,
+                   "one undo, no orphan bus");
+        assert_eq!(s.session.doc.project.tracks.iter()
+                       .find(|t| t.id == track.id).unwrap().route, track.route);
     }
 }
 
