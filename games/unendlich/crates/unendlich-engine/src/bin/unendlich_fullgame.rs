@@ -2697,6 +2697,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     if graze_gate_enabled {
         log::info!("[graze_gate] ENABLED — food-ring scan gated by motion + cadence, target remembered");
     }
+    // rain-through-ceilings fix: gate + persistent column-top memo (see the
+    // r492 precipitation block for the clear policy and why not SurfaceCache).
+    let rain_cull_enabled: bool = std::env::var("UNENDLICH_RAIN_CULL")
+        .map(|v| v != "0").unwrap_or(true);
+    if rain_cull_enabled {
+        log::info!("[rain_cull] ENABLED — precipitation culled below each column's terrain surface");
+    }
+    let mut rain_surf_memo: std::collections::HashMap<(i32, i32), Option<i32>> =
+        std::collections::HashMap::new();
+    let mut rain_cull_cell: (i32, i32) = (i32::MIN, i32::MIN);
+    let mut rain_cull_frame: u32 = 0;
     const GRAZE_SCAN_INTERVAL: u32 = 6;
     const BREED_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
     const PROFILE_DUMP_SECS: f32 = 5.0;
@@ -12285,9 +12296,47 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     ((220.0 + 700.0 * inten) as usize, 14.0_f32, 0.04_f32,
                      [0.02_f32, 0.20, 0.02], [0.60_f32, 0.69, 0.85])
                 };
-                let drops = unendlich_engine::sim::precipitation::field(
+                let mut drops = unendlich_engine::sim::precipitation::field(
                     [pp.x, pp.y, pp.z], pt, count, 16.0, 18.0, fall_speed, [pwx, pwz], sway,
                 );
+                // Rain must not fall through cave ceilings: keep a drop only
+                // at/above its column's terrain surface. surface_y_at is the
+                // AUTHORITATIVE surface (r583: resident voxels corrected, else
+                // the analytic prediction — which itself accounts for caves).
+                //
+                // COST DISCIPLINE, because r294 measured this exact query
+                // dominating a loop at ~90ms when called per-probe: columns
+                // are quantized to 2x2 blocks (a streak's dripline does not
+                // need block precision), and the memo PERSISTS across frames
+                // — cleared when the player crosses a 2-block cell or every
+                // 128 frames — so a steady rain costs ~0 queries per frame
+                // after the first. A dedicated memo, NOT the r294
+                // SurfaceCache: that one holds the ANALYTIC scan under the
+                // same (x,z) keys, and mixing corrected results in would
+                // poison the roamers' entries.
+                // UNENDLICH_RAIN_CULL=1 (default ON; "0" reverts to rain
+                // through ceilings).
+                if rain_cull_enabled {
+                    let pcell = ((pp.x.floor() as i32) >> 1, (pp.z.floor() as i32) >> 1);
+                    rain_cull_frame = rain_cull_frame.wrapping_add(1);
+                    if pcell != rain_cull_cell || rain_cull_frame % 128 == 0 {
+                        rain_cull_cell = pcell;
+                        rain_surf_memo.clear();
+                    }
+                    let drops_kept = unendlich_engine::sim::precipitation::cull_covered(
+                        drops,
+                        |x, z| {
+                            let key = ((x.floor() as i32) >> 1, (z.floor() as i32) >> 1);
+                            *rain_surf_memo.entry(key).or_insert_with(|| {
+                                chunk_manager.surface_y_at(
+                                    (key.0 << 1) + 1, (key.1 << 1) + 1,
+                                    probe_y_min, probe_y_max,
+                                )
+                            })
+                        },
+                    );
+                    drops = drops_kept;
+                }
                 let (hx, hy, hz) = (half[0], half[1], half[2]);
                 for d in &drops {
                     let base = everts.len() as u32;
