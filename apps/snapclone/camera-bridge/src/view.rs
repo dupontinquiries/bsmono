@@ -672,6 +672,32 @@ fn main() -> Result<()> {
             .with_title(&window_title)
             .with_min_inner_size([320.0, 240.0]),
         vsync: true,
+        // This crate keeps the wgpu backend deliberately (see Cargo.toml),
+        // which means IT owns the device request. Left at `..Default`,
+        // egui-wgpu asks for `wgpu::Limits::default()` — 8 color attachments
+        // — without clamping to the adapter, and snapshot-cam died at startup
+        // with exactly that on a phone GPU that allows 5 (logscope's manifest
+        // records the same crash on Asahi). `device_limits` below requests
+        // what this app needs and is pinned by tests against that profile.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                // without_display_handle(): WgpuSetupCreateNew has no Default
+                // (it holds boxed handles), and eframe fills the display
+                // handle itself when this is left empty — the constructor
+                // docs say so explicitly. Only the device request is ours.
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    device_descriptor: std::sync::Arc::new(|adapter| {
+                        eframe::wgpu::DeviceDescriptor {
+                            label: Some("camera-bridge device (clamped limits)"),
+                            required_limits: device_limits(&adapter.limits()),
+                            ..Default::default()
+                        }
+                    }),
+                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+                },
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -686,4 +712,63 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow!("eframe error: {e}"))?;
 
     Ok(())
+}
+
+/// What this app actually requests from the GPU, given what the adapter has.
+///
+/// Pure, so the device profile that killed snapshot-cam is a unit test here
+/// instead of a field report. Base is `downlevel_defaults` (4 color
+/// attachments — egui renders with one; the camera texture is one more), and
+/// the only limit raised above it is the 2D texture dimension, up to
+/// egui-wgpu's own 4k-display figure but never past the adapter.
+fn device_limits(adapter: &eframe::wgpu::Limits) -> eframe::wgpu::Limits {
+    let mut l = eframe::wgpu::Limits::downlevel_defaults();
+    l.max_texture_dimension_2d = adapter.max_texture_dimension_2d.min(8192);
+    l
+}
+
+#[cfg(test)]
+mod device_limit_tests {
+    use super::device_limits;
+    use eframe::wgpu::Limits;
+
+    /// The profile that produced
+    /// `LimitsExceeded(FailedLimit { name: "max_color_attachments",
+    /// requested: 8, allowed: 5 })` on device. `check_limits` is wgpu's own
+    /// every-field comparison, so a new limit we start exceeding fails here
+    /// too, not only the one we know about.
+    #[test]
+    fn fits_the_phone_gpu_that_rejected_the_default_request() {
+        let phone = Limits {
+            max_color_attachments: 5,
+            max_texture_dimension_2d: 4096,
+            ..Limits::default()
+        };
+        let asked = device_limits(&phone);
+        assert!(
+            asked.check_limits(&phone),
+            "requested limits exceed the adapter: {asked:#?}"
+        );
+        assert_eq!(asked.max_texture_dimension_2d, 4096, "clamped to the adapter");
+    }
+
+    /// The floor itself must fit: an adapter that offers exactly
+    /// downlevel_defaults gets a request it can satisfy.
+    #[test]
+    fn fits_a_bare_downlevel_adapter() {
+        let floor = Limits::downlevel_defaults();
+        assert!(device_limits(&floor).check_limits(&floor));
+    }
+
+    #[test]
+    fn desktop_adapters_get_the_4k_texture_size_and_nothing_extra() {
+        let desktop = Limits::default(); // tex2d 8192, attachments 8
+        let asked = device_limits(&desktop);
+        assert_eq!(asked.max_texture_dimension_2d, 8192);
+        assert!(
+            asked.max_color_attachments <= Limits::downlevel_defaults().max_color_attachments,
+            "nothing should quietly creep above the downlevel floor except \
+             the texture size this fn raises on purpose"
+        );
+    }
 }
