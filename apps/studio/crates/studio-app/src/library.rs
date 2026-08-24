@@ -18,6 +18,43 @@ use std::path::{Path, PathBuf};
 /// Extensions studio-media can decode. The sniffing decoder would accept
 /// more, but a browser that lists files it cannot open teaches mistrust.
 pub const AUDIO_EXTS: &[&str] = &["opus", "wav", "flac", "ogg", "mp3", "m4a", "aac"];
+/// What `STUDIO_VIDEO_LIB` is scanned for. A video file is a legitimate
+/// SOUND source too — the take under a clip, a line of dialogue, a room
+/// tone — which is why the rack and the program tab can reach these at
+/// all rather than the timeline hoarding them.
+pub const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
+
+/// Which library a file came from, and therefore what it is FOR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Media { Audio, Video }
+
+/// What the person is looking at, which decides what a search should put
+/// first. The same query means different things on different tabs: on the
+/// timeline "kick" might be a drum hit or the shot of a kick drum; in the
+/// rack it is a sample and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Timeline,
+    Rack,
+    Program,
+}
+
+impl Focus {
+    /// May this kind appear at all, and how early? Lower sorts first.
+    /// Video is never HIDDEN from the rack — a sampler can absolutely
+    /// take its material from a video's audio, and refusing that would be
+    /// the tool telling a musician what a sound is allowed to come from —
+    /// it just stops outranking actual samples.
+    pub fn rank(self, m: Media) -> u8 {
+        match (self, m) {
+            (Focus::Timeline, Media::Video) => 0,
+            (Focus::Timeline, Media::Audio) => 0,
+            (_, Media::Audio) => 0,
+            (_, Media::Video) => 1,
+        }
+    }
+}
 
 /// One listed sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +63,7 @@ pub struct LibraryEntry {
     /// reads as the folder structure the user built.
     pub label: String,
     pub path: PathBuf,
+    pub media: Media,
     /// Bytes, from the same `read_dir` pass that found the file — the
     /// weight heuristic's only input besides the extension, because
     /// probing 23,000 files for a real bitrate is not a browse, it is a
@@ -43,10 +81,11 @@ pub struct DirListing {
     pub files: Vec<LibraryEntry>,
 }
 
-fn is_audio(p: &Path) -> bool {
-    p.extension().and_then(|e| e.to_str())
-        .map(|e| AUDIO_EXTS.iter().any(|a| e.eq_ignore_ascii_case(a)))
-        .unwrap_or(false)
+fn media_of(p: &Path) -> Option<Media> {
+    let e = p.extension().and_then(|e| e.to_str())?;
+    if AUDIO_EXTS.iter().any(|a| e.eq_ignore_ascii_case(a)) { return Some(Media::Audio); }
+    if VIDEO_EXTS.iter().any(|a| e.eq_ignore_ascii_case(a)) { return Some(Media::Video); }
+    None
 }
 fn hidden(name: &str) -> bool { name.starts_with('.') }
 
@@ -60,9 +99,9 @@ pub fn scan_dir(dir: &Path) -> DirListing {
         if hidden(&name) { continue; }
         if p.is_dir() {
             out.dirs.push((name, p));
-        } else if is_audio(&p) {
+        } else if let Some(media) = media_of(&p) {
             let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
-            out.files.push(LibraryEntry { label: name, path: p, bytes });
+            out.files.push(LibraryEntry { label: name, path: p, media, bytes });
         }
     }
     out.dirs.sort();
@@ -84,7 +123,8 @@ pub fn search(root: &Path, needle: &str, cap: usize) -> Vec<LibraryEntry> {
             if f.label.to_lowercase().contains(&needle) {
                 let label = f.path.strip_prefix(root).unwrap_or(&f.path)
                     .display().to_string();
-                out.push(LibraryEntry { label, path: f.path, bytes: f.bytes });
+                out.push(LibraryEntry { label, path: f.path, media: f.media,
+                                        bytes: f.bytes });
                 if out.len() >= cap { break; }
             }
         }
@@ -96,6 +136,44 @@ pub fn search(root: &Path, needle: &str, cap: usize) -> Vec<LibraryEntry> {
     }
     out.sort_by(|a, b| a.label.cmp(&b.label));
     out
+}
+
+/// The libraries: samples always, footage when `STUDIO_VIDEO_LIB` names
+/// one. Two roots rather than one tree because they are usually on
+/// different disks and always on different schedules — a sample pack is
+/// installed once, footage arrives per shoot.
+#[derive(Debug, Clone, Default)]
+pub struct Roots {
+    pub audio: PathBuf,
+    pub video: Option<PathBuf>,
+}
+
+impl Roots {
+    pub fn from_env(audio: PathBuf) -> Roots {
+        let video = std::env::var("STUDIO_VIDEO_LIB").ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        Roots { audio, video }
+    }
+}
+
+/// Search both libraries for `focus`, best-suited kind first. Each root is
+/// searched with the same bounded walk, and the merge is STABLE within a
+/// rank so alphabetical order survives — a search that reshuffles on every
+/// keystroke is unusable regardless of how good its ranking is.
+pub fn search_for(roots: &Roots, needle: &str, focus: Focus, cap: usize)
+                  -> Vec<LibraryEntry> {
+    let mut hits = search(&roots.audio, needle, cap);
+    if let Some(v) = &roots.video {
+        // The video root is searched for EVERY focus; what changes is
+        // where its results land, not whether they exist.
+        hits.extend(search(v, needle, cap));
+    }
+    hits.sort_by(|a, b| focus.rank(a.media).cmp(&focus.rank(b.media))
+        .then(a.label.cmp(&b.label)));
+    hits.truncate(cap);
+    hits
 }
 
 /// Other encodings of THIS sample: same stem, different audio extension, in
@@ -444,11 +522,14 @@ pub struct TreeState {
     pub filter: String,
     results: Vec<LibraryEntry>,
     last_filter: String,
+    /// Results are ordered FOR a tab, so switching tabs re-ranks them.
+    last_focus: Option<Focus>,
 }
 impl TreeState {
     pub fn refresh(&mut self) {
         self.cache.clear();
         self.last_filter.clear();
+        self.last_focus = None;
         self.results.clear();
     }
     fn listing(&mut self, dir: &Path) -> DirListing {
@@ -483,6 +564,10 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
         ui.set_min_height(TOUCH_PX);
         // ── left: the identicon ─────────────────────────────────────────
         let (short, ext) = identicon(&e.label);
+        if e.media == Media::Video {
+            ui.colored_label(c.accent, "▣")
+                .on_hover_text("footage — its audio can be sampled too");
+        }
         let tint = match ext.as_str() {
             "opus" | "ogg" => c.success,
             "flac" => c.accent,
@@ -618,15 +703,25 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
 
 /// Draw the sidebar: a filter box, then either search results or the lazy
 /// tree. Returns at most one action.
-pub fn show_tree(ui: &mut egui::Ui, root: &Path, state: &mut TreeState,
+#[allow(clippy::too_many_arguments)]
+pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
                  rack: &studio_live::Rack, project: &studio_core::Project,
-                 prefs: &Prefs, c: &uikit_egui::PaletteColors) -> Option<LibraryAction> {
+                 prefs: &Prefs, focus: Focus,
+                 c: &uikit_egui::PaletteColors) -> Option<LibraryAction> {
+    let root = &roots.audio;
     let mut action = None;
     // Derived from the row's real control budget, not a magic number: a
     // row goes compact exactly when its full set of touch-sized buttons
     // plus a readable name no longer fits.
     let compact = wants_compact(ui.available_width());
     ui.label(format!("library — {}", root.display()));
+    if let Some(v) = &roots.video {
+        // Said, so a search that turns up footage is not a surprise.
+        ui.colored_label(c.text_weak, match focus {
+            Focus::Timeline => format!("+ footage: {}", v.display()),
+            _ => format!("+ footage (after samples): {}", v.display()),
+        });
+    }
     ui.horizontal(|ui| {
         ui.label("find:");
         ui.text_edit_singleline(&mut state.filter);
@@ -634,9 +729,14 @@ pub fn show_tree(ui: &mut egui::Ui, root: &Path, state: &mut TreeState,
     });
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         if !state.filter.trim().is_empty() {
-            if state.filter != state.last_filter {
-                state.results = search(root, state.filter.trim(), 500);
+            if state.filter != state.last_filter || state.last_focus != Some(focus) {
+                // Both libraries, ordered for where you are: the timeline
+                // treats footage as a first-class hit, the rack and the
+                // program tab put samples first and keep footage reachable
+                // underneath (its audio is still material).
+                state.results = search_for(roots, state.filter.trim(), focus, 500);
                 state.last_filter = state.filter.clone();
+                state.last_focus = Some(focus);
             }
             if state.results.is_empty() {
                 ui.colored_label(c.text_weak, "nothing matches");
@@ -836,7 +936,7 @@ mod tests {
     #[test]
     fn pinning_floats_demoting_sinks_and_they_are_opposites() {
         let mk = |name: &str| LibraryEntry { label: name.into(),
-            path: PathBuf::from(name), bytes: 1 };
+            path: PathBuf::from(name), media: Media::Audio, bytes: 1 };
         let list = vec![mk("a.opus"), mk("b.opus"), mk("c.opus"), mk("d.opus")];
         let mut p = Prefs::default();
         p.pin(Path::new("c.opus"));
@@ -858,7 +958,7 @@ mod tests {
         // The width problem stated plainly: three hits in one deep folder
         // repeated its path three times. One header, three bare names.
         let mk = |label: &str| LibraryEntry { label: label.into(),
-            path: PathBuf::from(label), bytes: 1 };
+            path: PathBuf::from(label), media: Media::Audio, bytes: 1 };
         let flat = vec![
             mk("zaytoven/808s & Kicks/808 1.wav"),
             mk("zaytoven/808s & Kicks/808 5.wav"),
@@ -904,6 +1004,42 @@ mod tests {
         assert!(TOUCH_PX >= 32.0);
         assert!(COMPACT_BUTTONS < FULL_BUTTONS,
                 "folding must actually remove controls from the row");
+    }
+
+    #[test]
+    fn the_two_libraries_merge_and_the_tab_decides_the_order() {
+        let root = fixture();
+        // A SIBLING directory: the footage library is its own root, on its
+        // own disk in real life. (The first draft nested it inside the
+        // audio root, where the audio-only search found it anyway and the
+        // fixture proved nothing.)
+        let vroot = std::env::temp_dir()
+            .join(format!("studio-footage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&vroot);
+        std::fs::create_dir_all(&vroot).unwrap();
+        std::fs::write(vroot.join("kick drum closeup.mp4"), b"x").unwrap();
+        std::fs::write(root.join("zaytoven/808s & Kicks/Kick 9.wav"), b"x").unwrap();
+        let roots = Roots { audio: root.clone(), video: Some(vroot) };
+
+        // On the timeline, footage is a first-class hit.
+        let t = search_for(&roots, "kick", Focus::Timeline, 50);
+        assert!(t.iter().any(|e| e.media == Media::Video), "footage is searchable: {t:?}");
+        assert!(t.iter().any(|e| e.media == Media::Audio));
+
+        // In the rack, samples come FIRST — but the footage is still
+        // there, because a sampler can take its material from a video's
+        // audio and refusing that would be the tool deciding what a sound
+        // may come from.
+        let r = search_for(&roots, "kick", Focus::Rack, 50);
+        assert_eq!(r.first().unwrap().media, Media::Audio, "samples lead in the rack");
+        assert!(r.iter().any(|e| e.media == Media::Video), "footage stays reachable");
+        assert_eq!(Focus::Program.rank(Media::Audio), 0);
+        assert!(Focus::Program.rank(Media::Video) > Focus::Program.rank(Media::Audio));
+
+        // No video root configured: audio only, and nothing breaks.
+        let audio_only = Roots { audio: root, video: None };
+        let a = search_for(&audio_only, "kick", Focus::Timeline, 50);
+        assert!(a.iter().all(|e| e.media == Media::Audio));
     }
 
     #[test]

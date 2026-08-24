@@ -1814,3 +1814,28 @@ nobody would put in a menu because nothing was listening: asking the room
 a question, acting on everything except one thing, starting a take on a
 count. The recognizer itself is not in this repo; `App::voice_utterance`
 is the one call a backend needs.
+
+
+**Two libraries, one search, ordered by where you are.** `STUDIO_VIDEO_LIB`
+names a footage root beside `STUDIO_LIBRARY`'s sample root — two roots
+rather than one tree because they live on different disks and arrive on
+different schedules (a pack is installed once, footage arrives per shoot).
+Search now covers both, and the ACTIVE TAB decides the order: on the
+timeline footage is a first-class hit; in the rack and the program tab
+samples come first and footage stays reachable underneath, because a
+sampler can absolutely take its material from a video's audio and refusing
+that would be the tool deciding what a sound is allowed to come from.
+Footage rows carry a ▣ so a video turning up in a sample search is never a
+surprise, and switching tabs re-ranks the results rather than serving
+stale ones.
+
+**The video sampler's headless half.** `studio_video::audio_segment` pulls
+the audio between two points out of a video as WAV bytes any decoder here
+reads — trimming inside ffmpeg (`-ss` before `-i`, `-t` for the span) so
+taking two seconds out of a forty-minute rush costs two seconds of work.
+A backwards or empty span is refused, and a video with no audio is
+`NoAudioStream` — a named fact rather than an empty buffer that would look
+like silence — in both shapes ffmpeg reports it. Tested end to end against
+a generated fixture: half a second asked for, half a second of real tone
+back. The UI is deliberately NOT wired: the plugin's shape is the open
+question, and this is the part that will be true whatever shape it takes.

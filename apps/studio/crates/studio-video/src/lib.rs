@@ -64,6 +64,8 @@ pub enum VideoError {
     /// `probe`/`thumbnail_png` of something that is, per `ffprobe` itself,
     /// not a video.
     NoVideoStream,
+    /// Asked for the sound of something that has none.
+    NoAudioStream,
     Decode(studio_media::DecodeError),
 }
 
@@ -75,6 +77,7 @@ impl std::fmt::Display for VideoError {
             VideoError::CommandFailed { program, stderr } => write!(f, "{program} failed: {}", stderr.trim()),
             VideoError::UnexpectedOutput(msg) => write!(f, "unexpected ffprobe output: {msg}"),
             VideoError::NoVideoStream => write!(f, "no video stream in this file"),
+            VideoError::NoAudioStream => write!(f, "no audio stream in this file"),
             VideoError::Decode(e) => write!(f, "decoding the extracted audio track failed: {e}"),
         }
     }
@@ -172,6 +175,42 @@ fn parse_rational(s: &str) -> Option<f64> {
 /// layer already has an image-decoding dependency; this crate doesn't take
 /// one just to prove its own output is well-formed, though the tests below
 /// do check the PNG magic bytes directly).
+/// The audio between `from` and `to` of a video, as WAV bytes any decoder
+/// in this repo reads. The headless half of "sample a video": a shot's
+/// dialogue, a room tone, the thump of something falling — material that
+/// lives in the footage library and belongs in the rack.
+///
+/// Trimming happens in ffmpeg (`-ss` before `-i` to seek, `-t` for the
+/// span) rather than after decoding, so pulling two seconds out of a
+/// forty-minute rush costs two seconds of work. A video with no audio
+/// stream is [`VideoError::NoAudioStream`] — a named fact, not an empty
+/// buffer that would look like silence.
+pub fn audio_segment(path: &Path, from: Ticks, to: Ticks) -> Result<Vec<u8>, VideoError> {
+    let path_str = path.to_string_lossy();
+    let start = format!("{:.6}", from.to_seconds().max(0.0));
+    let span = (to.to_seconds() - from.to_seconds()).max(0.0);
+    if span <= 0.0 {
+        return Err(VideoError::UnexpectedOutput(
+            "audio_segment: the out point is not after the in point".into()));
+    }
+    let dur = format!("{span:.6}");
+    let out = match run("ffmpeg", &[
+        "-y", "-ss", &start, "-i", &path_str, "-t", &dur,
+        "-vn", "-map", "a:0?", "-f", "wav", "-acodec", "pcm_s16le", "-",
+    ]) {
+        Ok(bytes) => bytes,
+        // With no audio stream ffmpeg may either write a bare header or
+        // fail outright depending on build and container; both mean the
+        // same thing to a caller, and "which stream is missing" is more
+        // useful than the raw stderr.
+        Err(VideoError::CommandFailed { .. }) => return Err(VideoError::NoAudioStream),
+        Err(e) => return Err(e),
+    };
+    // A bare 44-byte header is the other shape of the same fact.
+    if out.len() <= 64 { return Err(VideoError::NoAudioStream); }
+    Ok(out)
+}
+
 /// One frame at `at` as raw RGB24 at EXACTLY `w`×`h` — aspect preserved by
 /// scale-then-pad, so the caller can hand the bytes straight to a texture
 /// with no image decoder in the loop. Built for the timeline's viewport:
@@ -280,6 +319,31 @@ mod tests {
     /// 1 second) via ffmpeg's own `lavfi` test sources — no bundled fixture
     /// file needed, and every test gets an independently-generated file in
     /// a fresh temp path so tests can run concurrently without clashing.
+    #[test]
+    fn a_video_can_be_sampled_for_its_sound_and_trimmed_while_it_is_read() {
+        // The sampler's headless half: half a second out of the middle of
+        // a one-second clip, decoded back to prove it is real audio and
+        // really that long.
+        let path = make_test_video(true);
+        let wav = audio_segment(&path, Ticks::from_seconds(0.25),
+                                Ticks::from_seconds(0.75)).expect("a segment");
+        let back = studio_media::decode_bytes(wav, Some("wav")).expect("decodes");
+        let secs = back.frames() as f64 / back.sample_rate as f64;
+        assert!((secs - 0.5).abs() < 0.05, "trimmed to the ask, got {secs}s");
+        let energy: f32 = back.channels[0].iter().map(|s| s.abs()).sum();
+        assert!(energy > 1.0, "a 440 Hz tone is in there ({energy})");
+        // Backwards or empty spans are refused rather than returning
+        // nothing that looks like silence.
+        assert!(audio_segment(&path, Ticks::from_seconds(0.5),
+                              Ticks::from_seconds(0.5)).is_err());
+        // A video with no audio says which thing is missing.
+        let silent = make_test_video(false);
+        assert!(matches!(audio_segment(&silent, Ticks::ZERO, Ticks::from_seconds(0.5)),
+                         Err(VideoError::NoAudioStream)));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&silent);
+    }
+
     #[test]
     fn a_frame_arrives_as_exactly_the_rgb_buffer_a_texture_wants() {
         let path = make_test_video(false);

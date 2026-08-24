@@ -1323,6 +1323,7 @@ pub struct App {
     /// refresh button), not per frame: a directory walk per frame on a
     /// phone's flash is how battery dies.
     library_root: std::path::PathBuf,
+    library_roots: library::Roots,
     library_tree: library::TreeState,
     /// Per-project sample triage — pinned floats, demoted sinks. Lives in
     /// the workspace sidecar, not the op log: a pin is how one person
@@ -1457,7 +1458,8 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
-              carrier, project_path, library_root, library_tree, library_prefs,
+              carrier, project_path, library_roots: library::Roots::from_env(library_root.clone()),
+              library_root, library_tree, library_prefs,
               morph: morph_pad::PadState::default(),
               bounce_format,
               mix_pass: None,
@@ -2152,10 +2154,18 @@ impl eframe::App for App {
                         }
                     });
                 ui.separator();
+                // What the sidebar searches follows what you are looking
+                // at — the timeline wants footage among its results, the
+                // rack and program tabs want samples first.
+                let focus = match self.studio.panel {
+                    studio_egui::touch::Panel::Rack => library::Focus::Rack,
+                    studio_egui::touch::Panel::Program => library::Focus::Program,
+                    _ => library::Focus::Timeline,
+                };
                 lib_action = library::show_tree(
-                    ui, &self.library_root, &mut self.library_tree,
+                    ui, &self.library_roots, &mut self.library_tree,
                     &self.studio.rack, &self.studio.session.doc.project,
-                    &self.library_prefs, &colors);
+                    &self.library_prefs, focus, &colors);
             });
         }
         if let Some(action) = lib_action {
