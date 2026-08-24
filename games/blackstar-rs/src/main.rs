@@ -2902,12 +2902,28 @@ impl Game {
                 let strip = &self.cars.chassis[cid].strip;
                 let veh_len = self.cars.models[strip[0]].half_len;
                 let bot_len = self.cars.models[*strip.last().unwrap()].half_len;
+                // THE TWO TRANSFORMS WERE FIGHTING, and this is where.
+                //
+                // `redistribute_length_to_height` stretches the blended
+                // half-extents — the overflow from a mid-fold body that is
+                // momentarily too long gets folded into HEIGHT. The drop to
+                // the lowest point was passed through untouched, so during
+                // every blended frame `half_h` grew while `ride_h` did not,
+                // and the body was seated by a ride height that belonged to
+                // a shorter body than the one on screen. The static path has
+                // no redistribution, which is exactly why the old static
+                // pose sits on the ground and the blended one does not.
+                //
+                // Same stretch, same number: whatever the redistribution
+                // does to height, it does to the ride.
+                let raw_y = hb.y.max(1e-4);
                 let hb = xform::redistribute_length_to_height(hb, veh_len, bot_len, t);
+                let stretch = (hb.y / raw_y).clamp(0.5, 3.0);
                 let h = hb * self.cfg.car.size;
                 self.car.half_w = h.x.max(0.12);
                 self.car.half_h = h.y.max(0.10);
                 self.car.half_len = h.z.max(0.10);
-                self.car.ride_h = (drop * self.cfg.car.size).max(0.10);
+                self.car.ride_h = (drop * stretch * self.cfg.car.size).max(0.10);
             }
         } else {
             // FALLBACK: no morph built, step the strip as before
