@@ -28,6 +28,7 @@ pub mod log_gestures;
 pub mod chat_layout;
 pub mod backend;
 pub mod read_harness; // params-adaptive evidence harness + the injection-safe git/file sanitizer (c11)
+pub mod line_calls;   // one-line tool grammar + refusal ladder for fence-incapable models (c11)
 pub mod enginestrip;
 #[allow(dead_code)] pub mod fabric;
 pub mod genguard;

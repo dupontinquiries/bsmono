@@ -1235,6 +1235,7 @@ fn observation(results: &[(Tool, ToolResult)]) -> String {
 fn step_turn(
     text: &str, prompt: &mut String, ws: &mut Workspace, cfg: &AgentConfig,
     plan: &mut Plan, verified: &mut bool, step: usize, guard: &mut crate::repetition::LoopGuard,
+    ladder: &mut crate::line_calls::RefusalLadder,
 ) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
     // AUTHORISE BEFORE PARSING. Everything below reads `text` for tool calls, so the gate must run
     // first or a quoted call is already through. With ToolGate::Open this is a pass-through, which
@@ -1260,7 +1261,21 @@ fn step_turn(
     // was no way to know whether the model emitted nothing, or emitted something this parser
     // refused. Those need opposite fixes — a better prompt against a better model — and guessing
     // between them is what a whole session of "maybe the tooling is missing" was.
-    let (tools, rejected) = parse_tools_reported(text);
+    let (mut tools, rejected) = parse_tools_reported(text);
+    // THE LINE GRAMMAR (line_calls): models that cannot balance fences get
+    // their calls per line — `!<nonce> read_range path a b`. Fences first
+    // (they carry writes); lines fill in when the fences produced nothing,
+    // which is exactly the 1B field case: prose inside the fence, refused,
+    // while the intended call is recoverable from a single line. The nonce
+    // check inside keeps taint's channel property unchanged.
+    let mut line_rejects = Vec::new();
+    if tools.is_empty() {
+        if let crate::taint::ToolGate::Required(n) = &cfg.gate {
+            let (lt, lr) = crate::line_calls::parse_line_calls(text, n.as_str());
+            tools = lt;
+            line_rejects = lr;
+        }
+    }
     if !rejected.is_empty() {
         let why: Vec<String> = rejected.iter().map(|r| match r {
             Rejected::NoToolKey => "prose inside the fence".to_string(),
@@ -1288,6 +1303,30 @@ the model attempted a call and it was discarded, which is not the same as the mo
     } else {
         tools.iter().map(|t| t.summary()).collect::<Vec<_>>().join(";")
     };
+    // The refusal ladder: distinct from the repetition guard below (which keys
+    // on repeated ACTIONS) — refusals can vary in shape every turn and still
+    // be one failure. Before this, a refused turn fed back NOTHING (the
+    // diagnosis above went to the log, not the model), so a 1B re-emitted the
+    // same garbage: the six-turns-zero-files field report. Now the first
+    // refusals earn the exact one-line template with the live nonce, and the
+    // cap earns a stop that names the failure.
+    if let crate::taint::ToolGate::Required(n) = &cfg.gate {
+        let tried_and_failed = tools.is_empty()
+            && (!rejected.is_empty() || !line_rejects.is_empty() || !text.contains(DONE_MARKER));
+        let last_reason = rejected.last().map(|r| format!("{r:?}"))
+            .or_else(|| line_rejects.last().map(|r| format!("{r:?}")))
+            .unwrap_or_else(|| "no call shape at all".into());
+        match ladder.observe(!tools.is_empty() || text.contains(DONE_MARKER), n.as_str(), &last_reason) {
+            Some(crate::line_calls::LadderStep::Abort(v)) if tried_and_failed => {
+                crate::diag!("wgpu-engine: agent stopped by the refusal ladder — {v}");
+                return (Vec::new(), Some(Stop::Stalled));
+            }
+            Some(crate::line_calls::LadderStep::Correct(msg)) if tried_and_failed => {
+                prompt.push_str(&format!("\n\n({msg})\n"));
+            }
+            _ => {}
+        }
+    }
     match guard.observe(text, &action_sig) {
         crate::repetition::LoopAction::Abort => return (Vec::new(), Some(Stop::Stalled)),
         crate::repetition::LoopAction::Nudge(msg) => {
@@ -1445,13 +1484,14 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
     let has_verifier = !cfg.verify_cmd.is_empty();
     let mut verified = !has_verifier;
     let mut guard = crate::repetition::LoopGuard::default();
+    let mut ladder = crate::line_calls::RefusalLadder::new(4);
 
     for step in 0..cfg.max_steps {
         let text = match llm.generate(&prompt) {
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier },
         };
-        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard);
+        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder);
         turns.push(Turn { model_text: text, results });
         if let Some(stop) = stop {
             return Session { turns, stop, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
@@ -1491,6 +1531,7 @@ pub struct AgentRun {
     step: usize,
     turns: usize,
     guard: crate::repetition::LoopGuard,
+    ladder: crate::line_calls::RefusalLadder,
 }
 
 impl AgentRun {
@@ -1504,6 +1545,7 @@ impl AgentRun {
             ws: Workspace::new(work_dir), prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
             guard: crate::repetition::LoopGuard::default(),
+            ladder: crate::line_calls::RefusalLadder::new(4),
             // Mirrors the Session field: a run with no verifier must not read as one that passed.
             had_verifier,
         };
@@ -1516,7 +1558,7 @@ impl AgentRun {
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
-        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard);
+        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder);
         self.turns += 1;
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
