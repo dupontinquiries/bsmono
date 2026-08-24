@@ -443,7 +443,15 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
 
 ## 21. Perf hunt (from the c11 field profiles)
 
-- **C11-21a — THE OPEN LEAD, with arithmetic.** Both field runs logged
+- **C11-21a — PARTLY CLOSED.** The windowed generators prefilled the prompt
+  one token at a time (decode_step per prompt token, each a readback); fixed
+  with prefill_chunked, measured on lavapipe: readbacks went from
+  `windows + prompt_len - 1` to `windows + 1`, output bit-identical. Two
+  regression tests remain in the suite. STILL OPEN: whether this is the field
+  profile's 1 submit/token — the engine's streaming path prefills chunked
+  already, so these functions may not be on it. Next: run the same
+  submit-cause counting around generate_kv_stream (the path the field
+  actually takes) with a tiny model; the harness now exists. Original lead: Both field runs logged
   "windowed sampling ON (k=4)", which predicts 0.25 readbacks/token and 0.25
   submits/token. Both measured ~0.45 readbacks/token at **1.0 submits/token**
   (Llama-1B: 2241 downloads / 5033 tokens; Qwen3-14B: 22 / 41). The window is
