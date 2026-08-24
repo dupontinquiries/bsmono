@@ -42,6 +42,10 @@ pub enum Act {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellVerb {
     RecordTake,
+    /// Show or hide the out-of-key dimming in the piano roll.
+    ToggleKeyGuide,
+    MarkerHere,
+    GotoMarker(studio_core::Ticks),
     GotoStart,
     GotoEnd,
     MixMaster,
@@ -74,6 +78,13 @@ pub enum Then {
 /// to enumerate its candidates from the project — no verb invents targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
+    /// Which root, then which scale — the two-step the key needs.
+    KeyRoot,
+    KeyScale(u8),
+    /// Which marker to jump to.
+    JumpMarker,
+    /// Which track to hide (mute is the model's own word for it).
+    MuteTrack2,
     /// Which track's gain to change, and by how many dB.
     TrackGain(i8),
     /// Which track to route…
@@ -97,6 +108,17 @@ pub fn root() -> Vec<Choice> {
         label: label.into(), hint: hint.map(str::to_owned), then };
     vec![
         c("play / pause", Some("space"), Then::Do(Act::Key(' '))),
+        // Key and scale — the data flow the roll's guide reads.
+        c("set project key", None, Then::Ask(Ask::KeyRoot)),
+        c("toggle out-of-key dimming", None,
+          Then::Do(Act::Shell(ShellVerb::ToggleKeyGuide))),
+        // Markers: the one request both the FL Studio and kdenlive
+        // communities make in the same words.
+        c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("jump to marker", None, Then::Ask(Ask::JumpMarker)),
+        c("delete all markers", None, Then::Do(Act::Ops(vec![Op::ClearMarkers]))),
+        c("hide (mute) a track", None, Then::Ask(Ask::MuteTrack2)),
+        c("split every clip at the playhead", Some("s"), Then::Do(Act::Key('s'))),
         c("record a take (microphone)", Some("C-r"),
           Then::Do(Act::Shell(ShellVerb::RecordTake))),
         c("playhead to start", Some("g g"), Then::Do(Act::Shell(ShellVerb::GotoStart))),
@@ -136,6 +158,24 @@ pub fn root() -> Vec<Choice> {
 pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
     let plain = |label: String, then: Then| Choice { label, hint: None, then };
     match ask {
+        Ask::KeyRoot => studio_core::PITCH_NAMES.iter().enumerate()
+            .map(|(i, n)| plain((*n).to_string(), Then::Ask(Ask::KeyScale(i as u8))))
+            .collect(),
+        Ask::KeyScale(root) => [studio_core::Scale::Major, studio_core::Scale::Minor,
+                                studio_core::Scale::Dorian, studio_core::Scale::Mixolydian,
+                                studio_core::Scale::Chromatic].iter()
+            .map(|s| plain(s.name().to_string(), Then::Do(Act::Ops(vec![
+                Op::SetKey { key: Some(studio_core::Key { root, scale: *s }) }]))))
+            .collect(),
+        Ask::JumpMarker => project.markers.iter()
+            .map(|m| plain(format!("{} ({:.1}s)", m.name, m.at.to_seconds()),
+                           Then::Do(Act::Shell(ShellVerb::GotoMarker(m.at)))))
+            .collect(),
+        Ask::MuteTrack2 => project.tracks.iter().map(|t| {
+            plain(format!("{}{}", t.name, if t.muted { " (hidden)" } else { "" }),
+                  Then::Do(Act::Ops(vec![
+                      Op::SetTrackFlags { id: t.id, muted: !t.muted, locked: t.locked }])))
+        }).collect(),
         Ask::TrackGain(delta) => project.tracks.iter().map(|t| {
             plain(t.name.clone(), Then::Do(Act::Ops(vec![
                 Op::SetTrackGain { id: t.id, gain: db(t.gain, delta) }])))

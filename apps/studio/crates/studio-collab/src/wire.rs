@@ -37,6 +37,9 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
 ///
+/// v13: the key and the markers — `SetKey`(26), `SetMarker`(27),
+/// `RemoveMarker`(28), `ClearMarkers`(29).
+///
 /// v12: `Op::Group`(25) — several ops as one undo step, nested encoding.
 ///
 /// v11: `Op` gained the input-side routing and composition set —
@@ -76,7 +79,7 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 12;
+pub const WIRE_VERSION: u8 = 13;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -344,6 +347,24 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
             for c in clips { put_u64(o, c.0); }
         }
         Op::RemoveGroup { id } => { put_u8(o, 24); put_u64(o, id.0); }
+        Op::SetKey { key } => {
+            put_u8(o, 26);
+            match key {
+                None => put_u8(o, 0),
+                Some(k) => {
+                    put_u8(o, 1);
+                    put_u8(o, k.root);
+                    put_u8(o, match k.scale {
+                        studio_core::Scale::Major => 0, studio_core::Scale::Minor => 1,
+                        studio_core::Scale::Dorian => 2, studio_core::Scale::Mixolydian => 3,
+                        studio_core::Scale::Chromatic => 4,
+                    });
+                }
+            }
+        }
+        Op::SetMarker { at, name } => { put_u8(o, 27); put_ticks(o, *at); put_str(o, name); }
+        Op::RemoveMarker { name } => { put_u8(o, 28); put_str(o, name); }
+        Op::ClearMarkers => put_u8(o, 29),
         Op::Group { ops } => {
             put_u8(o, 25);
             put_u16(o, ops.len().min(u16::MAX as usize) as u16);
@@ -403,6 +424,20 @@ fn get_op(r: &mut R) -> Option<Op> {
             Op::SetGroup { id, name, clips }
         }
         24 => Op::RemoveGroup { id: GroupId(r.u64()?) },
+        26 => Op::SetKey { key: match r.u8()? {
+            0 => None,
+            1 => Some(studio_core::Key {
+                root: r.u8()?,
+                scale: match r.u8()? {
+                    0 => studio_core::Scale::Major, 1 => studio_core::Scale::Minor,
+                    2 => studio_core::Scale::Dorian, 3 => studio_core::Scale::Mixolydian,
+                    4 => studio_core::Scale::Chromatic, _ => return None,
+                } }),
+            _ => return None,
+        } },
+        27 => Op::SetMarker { at: Ticks(r.i64()?), name: r.str()? },
+        28 => Op::RemoveMarker { name: r.str()? },
+        29 => Op::ClearMarkers,
         25 => {
             let n = r.u16()? as usize;
             let mut ops = Vec::with_capacity(n.min(4096));
@@ -1062,7 +1097,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 12, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 13, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

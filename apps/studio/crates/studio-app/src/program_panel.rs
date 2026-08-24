@@ -56,7 +56,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
     let mut edits = Vec::new();
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         edits = roll::roll(ui, &pattern, channel, TOP, ROWS,
-                           &mut s.roll_drag, playhead, c);
+                           &mut s.roll_drag, playhead,
+                           s.session.doc.project.key,
+                           if s.key_guide { roll::KeyView::Dim }
+                           else { roll::KeyView::Off },
+                           c);
         // The velocity lane sits under the roll, sharing its columns the
         // way `lanes` sits under the grid — one dynamic per start column,
         // because a chord is one gesture (`Pattern::set_start_vel`).

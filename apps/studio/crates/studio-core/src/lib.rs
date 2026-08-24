@@ -206,6 +206,84 @@ pub struct Project {
     /// undo could not restore.
     #[serde(default)]
     pub groups: BTreeMap<GroupId, Group>,
+    /// The song's key, when the writer has decided one. `None` means "no
+    /// opinion" and every note is in key — a project must never be told
+    /// its notes are wrong because nobody set a field.
+    #[serde(default)]
+    pub key: Option<Key>,
+    /// Named points on the timeline — the one feature both the FL Studio
+    /// and kdenlive communities ask for in the same words ("markers",
+    /// "jump to", "delete all"). Sorted by position on read, so the
+    /// keyboard's next/previous is just a scan.
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+}
+
+/// A key: a root pitch class (0 = C) and a scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Key {
+    pub root: u8,
+    pub scale: Scale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Scale { Major, Minor, Dorian, Mixolydian, Chromatic }
+
+impl Scale {
+    /// Semitone offsets from the root.
+    pub fn degrees(self) -> &'static [u8] {
+        match self {
+            Scale::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Scale::Minor => &[0, 2, 3, 5, 7, 8, 10],
+            Scale::Dorian => &[0, 2, 3, 5, 7, 9, 10],
+            Scale::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
+            Scale::Chromatic => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Scale::Major => "major", Scale::Minor => "minor",
+            Scale::Dorian => "dorian", Scale::Mixolydian => "mixolydian",
+            Scale::Chromatic => "chromatic",
+        }
+    }
+}
+
+/// The twelve names, sharps — the spelling a piano roll uses.
+pub const PITCH_NAMES: [&str; 12] =
+    ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+/// A roll key's MIDI number. Key 0 is A1 (55 Hz, MIDI 33) — the rack's
+/// own `sub_freq` reference, so a label and a pitch cannot disagree.
+pub const KEY_ZERO_MIDI: i32 = 33;
+
+pub fn key_midi(key: i8) -> i32 { KEY_ZERO_MIDI + key as i32 }
+
+/// The label a piano roll shows: `A1` for key 0, `C#4`, `A5`.
+pub fn note_label(key: i8) -> String {
+    let m = key_midi(key);
+    let pc = m.rem_euclid(12) as usize;
+    let octave = m.div_euclid(12) - 1;
+    format!("{}{}", PITCH_NAMES[pc], octave)
+}
+
+impl Key {
+    /// Is this roll key in the scale? A `None` key (no opinion) is handled
+    /// by the caller — everything is in key when nothing was chosen.
+    pub fn contains(&self, key: i8) -> bool {
+        let pc = (key_midi(key) - self.root as i32).rem_euclid(12) as u8;
+        self.scale.degrees().contains(&pc)
+    }
+    pub fn name(&self) -> String {
+        format!("{} {}", PITCH_NAMES[(self.root % 12) as usize], self.scale.name())
+    }
+}
+
+/// A named point on the timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub at: Ticks,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,6 +423,19 @@ pub enum Op {
     /// Dissolve a composition. Its clips are untouched — ungrouping is an
     /// organizational act, never an edit to the music.
     RemoveGroup { id: GroupId },
+    /// Set (or clear) the song's key. Absolute, like every other setting
+    /// here, so two writers converge on the last word rather than on a
+    /// sum of transpositions.
+    SetKey { key: Option<Key> },
+    /// Add or move a named marker. Absolute by NAME: setting a marker
+    /// that already exists moves it, which is what "set the chorus here"
+    /// means when you meant it the second time.
+    SetMarker { at: Ticks, name: String },
+    RemoveMarker { name: String },
+    /// Both communities ask for this by name ("Delete All Timeline
+    /// Markers"). One op, one undo — a hundred RemoveMarkers would be a
+    /// hundred presses of `u`.
+    ClearMarkers,
     /// Several ops as ONE step: applied in order, inverted as a whole (the
     /// inverse is the members' inverses in reverse). A partial application
     /// rolls back what landed — half an edit is worse than none. This is
@@ -359,6 +450,9 @@ pub enum EditError {
     NoSuchAutoPoint,
     /// A `SetGroup` with no members.
     EmptyGroup,
+    /// A marker must have a name — an unnamed one cannot be jumped to.
+    EmptyMarker,
+    NoSuchMarker(String),
     NoSuchGroup(GroupId),
     NoSuchTrack(TrackId),
     TrackLocked(TrackId),
@@ -659,6 +753,37 @@ impl Project {
                 };
                 self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone() });
                 Ok(inv)
+            }
+            Op::SetKey { key } => {
+                let inv = Op::SetKey { key: self.key };
+                self.key = *key;
+                Ok(inv)
+            }
+            Op::SetMarker { at, name } => {
+                if name.trim().is_empty() { return Err(EditError::EmptyMarker); }
+                let inv = match self.markers.iter().find(|m| m.name == *name) {
+                    Some(old) => Op::SetMarker { at: old.at, name: old.name.clone() },
+                    None => Op::RemoveMarker { name: name.clone() },
+                };
+                self.markers.retain(|m| m.name != *name);
+                self.markers.push(Marker { at: *at, name: name.clone() });
+                self.markers.sort_by_key(|m| m.at);
+                Ok(inv)
+            }
+            Op::RemoveMarker { name } => {
+                let Some(i) = self.markers.iter().position(|m| m.name == *name) else {
+                    return Err(EditError::NoSuchMarker(name.clone()));
+                };
+                let old = self.markers.remove(i);
+                Ok(Op::SetMarker { at: old.at, name: old.name })
+            }
+            Op::ClearMarkers => {
+                if self.markers.is_empty() { return Err(EditError::NoSuchMarker("any".into())); }
+                let all = std::mem::take(&mut self.markers);
+                // The inverse of clearing many is a GROUP that puts each
+                // one back — one undo, as promised.
+                Ok(Op::Group { ops: all.into_iter()
+                    .map(|m| Op::SetMarker { at: m.at, name: m.name }).collect() })
             }
             Op::Group { ops } => {
                 let mut inverses = Vec::with_capacity(ops.len());
@@ -1638,5 +1763,77 @@ mod lane_cursor_tests {
         assert_eq!(eval_lane_cursor(&[], Ticks::from_seconds(1.0), &mut c2), 1.0);
         let far = Ticks::from_seconds(1000.0);
         assert_eq!(eval_lane_cursor(&points, far, &mut c2), eval_lane(&points, far));
+    }
+}
+
+#[cfg(test)]
+mod key_and_marker_tests {
+    use super::*;
+
+    #[test]
+    fn note_labels_agree_with_the_synths_own_pitch_reference() {
+        // Key 0 is A1 because sub_freq's reference is 55 Hz — a label that
+        // disagreed with the sound would be worse than no label.
+        assert_eq!(note_label(0), "A1");
+        assert_eq!(note_label(3), "C2");
+        assert_eq!(note_label(12), "A2");
+        assert_eq!(note_label(-1), "G#1");
+        assert_eq!(note_label(-9), "C1");
+        assert_eq!(note_label(4), "C#2");
+        assert_eq!(note_label(51), "C6", "midi 84 — the octave boundary, not a sharp");
+        assert_eq!(note_label(52), "C#6");
+        assert_eq!(note_label(48), "A5");
+    }
+
+    #[test]
+    fn a_key_knows_its_own_notes_and_no_key_judges_nothing() {
+        let c_major = Key { root: 0, scale: Scale::Major };
+        // C2 is key 3; D2 is 5; C#2 (key 4) is not in C major.
+        assert!(c_major.contains(3));
+        assert!(c_major.contains(5));
+        assert!(!c_major.contains(4));
+        assert_eq!(c_major.name(), "C major");
+        // A minor shares C major's notes — the classic check.
+        let a_minor = Key { root: 9, scale: Scale::Minor };
+        for k in 0..24 { assert_eq!(a_minor.contains(k), c_major.contains(k), "key {k}"); }
+        // Chromatic accepts everything, which is how "no opinion" is said
+        // when someone HAS chosen it deliberately.
+        let chrom = Key { root: 7, scale: Scale::Chromatic };
+        assert!((0..12).all(|k| chrom.contains(k)));
+    }
+
+    #[test]
+    fn markers_move_by_name_and_clearing_them_all_is_one_undo() {
+        let mut p = Project::default();
+        p.apply(&Op::SetMarker { at: Ticks::from_seconds(4.0), name: "chorus".into() }).unwrap();
+        p.apply(&Op::SetMarker { at: Ticks::from_seconds(1.0), name: "intro".into() }).unwrap();
+        assert_eq!(p.markers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                   vec!["intro", "chorus"], "kept in time order for next/previous");
+        // Setting an existing name MOVES it rather than duplicating: "no,
+        // the chorus is here".
+        let inv = p.apply(&Op::SetMarker { at: Ticks::from_seconds(8.0),
+                                           name: "chorus".into() }).unwrap();
+        assert_eq!(p.markers.len(), 2);
+        assert_eq!(p.markers[1].at, Ticks::from_seconds(8.0));
+        p.apply(&inv).unwrap();
+        assert_eq!(p.markers[1].at, Ticks::from_seconds(4.0), "undo puts it back");
+        assert!(matches!(p.apply(&Op::SetMarker { at: Ticks::ZERO, name: "  ".into() }),
+                         Err(EditError::EmptyMarker)));
+        // Clear all, then ONE undo restores every one.
+        let inv = p.apply(&Op::ClearMarkers).unwrap();
+        assert!(p.markers.is_empty());
+        p.apply(&inv).unwrap();
+        assert_eq!(p.markers.len(), 2, "one undo, every marker back");
+        assert!(matches!(p.apply(&Op::RemoveMarker { name: "nope".into() }),
+                         Err(EditError::NoSuchMarker(_))));
+    }
+
+    #[test]
+    fn the_key_is_absolute_and_undoable() {
+        let mut p = Project::default();
+        let inv = p.apply(&Op::SetKey { key: Some(Key { root: 2, scale: Scale::Dorian }) }).unwrap();
+        assert_eq!(p.key.unwrap().name(), "D dorian");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.key, None, "back to having no opinion");
     }
 }

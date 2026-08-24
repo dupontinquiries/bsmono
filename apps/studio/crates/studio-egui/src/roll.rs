@@ -175,9 +175,24 @@ pub fn hit(rel: egui::Vec2, pattern: &Pattern, channel: usize, top: i8, rows: us
 /// `top`/`rows` pick the visible key range (the host scrolls by moving
 /// `top`); `playhead` is the loop column the transport reports, drawn the
 /// same way the grid draws it — an outline, never a fill.
+/// How the roll treats the project's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyView {
+    /// Every row drawn the same — the honest default when no key is set.
+    #[default]
+    Off,
+    /// Out-of-key rows dimmed and their labels faded: guidance you can
+    /// see past. Notes there still PLAY and still edit — a scale is
+    /// advice, and a tool that silently refused the blue note would be
+    /// wrong about music.
+    Dim,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
             top: i8, rows: usize, drag: &mut Option<NoteDrag>,
-            playhead: Option<u32>, c: &uikit_egui::PaletteColors) -> Vec<RollEdit> {
+            playhead: Option<u32>, song_key: Option<studio_core::Key>, view: KeyView,
+            c: &uikit_egui::PaletteColors) -> Vec<RollEdit> {
     let mut edits = Vec::new();
     if pattern.steps == 0 || rows == 0 {
         ui.colored_label(c.text_weak, "No pattern loaded.");
@@ -194,6 +209,10 @@ pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
     for row in 0..rows {
         let key = key_of(row, top);
         let y = rect.top() + row as f32 * KEY_H;
+        let out_of_key = match (song_key, view) {
+            (Some(k), KeyView::Dim) => !k.contains(key),
+            _ => false,
+        };
         for s in 0..pattern.steps {
             let x = rect.left() + LABEL_W + s as f32 * CELL;
             let cr = egui::Rect::from_min_size(egui::pos2(x + 0.5, y + 0.5),
@@ -201,9 +220,11 @@ pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
             // Black-key rows sit darker; beat columns lift lighter rows the
             // way the grid does — both are rulers, and without them a roll
             // is an undifferentiated field you lose your place in.
-            let fill = if is_black(key) { c.bg_base }
+            let mut fill = if is_black(key) { c.bg_base }
                        else if crate::grid::is_beat(s) { c.bg_raised }
                        else { c.bg_base.gamma_multiply(1.4) };
+            // Out of key: dimmed, never disabled.
+            if out_of_key { fill = fill.gamma_multiply(0.55); }
             painter.rect_filled(cr, 1.0, fill);
         }
         // The octave line at each ±12 boundary, and the channel's own pitch
@@ -214,11 +235,19 @@ pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
             painter.line_segment([egui::pos2(rect.left() + LABEL_W, y),
                                   egui::pos2(rect.right(), y)],
                                  egui::Stroke::new(w, c.text_weak));
-            let label = if key == 0 { "0".to_string() } else { format!("{key:+}") };
-            painter.text(egui::pos2(rect.left() + 4.0, y + KEY_H * 0.5),
-                         egui::Align2::LEFT_CENTER, label,
-                         egui::FontId::proportional(10.0), c.text_weak);
         }
+        // EVERY row names itself — A5, C#4 — instead of only the octave
+        // boundaries carrying a signed offset from the channel's pitch.
+        // "+7" is arithmetic; "E4" is music, and the label is exact
+        // because studio_core::note_label reads the same reference pitch
+        // the synth does.
+        let name = studio_core::note_label(key);
+        let strong = key == 0 || name.starts_with('C');
+        let col = if out_of_key { c.text_weak.gamma_multiply(0.6) }
+                  else if strong { c.text } else { c.text_weak };
+        painter.text(egui::pos2(rect.left() + 4.0, y + KEY_H * 0.5),
+                     egui::Align2::LEFT_CENTER, name,
+                     egui::FontId::proportional(if strong { 10.0 } else { 9.0 }), col);
     }
 
     // ── notes ───────────────────────────────────────────────────────────

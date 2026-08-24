@@ -29,6 +29,7 @@ pub mod program_panel;
 pub mod palette;
 pub mod project_dir;
 pub mod viewport;
+pub mod voice;
 pub mod workspace;
 pub mod rack_panel;
 
@@ -115,6 +116,10 @@ pub struct Studio {
     /// Compositions folded closed ON THIS DEVICE — view state beside
     /// `combined`, persisted in the workspace sidecar, never an op.
     pub closed_groups: std::collections::BTreeSet<studio_core::GroupId>,
+    /// Out-of-key dimming in the roll — a VIEW preference (the key itself
+    /// is the project's), so it rides in the sidecar like every other
+    /// per-device choice.
+    pub key_guide: bool,
     /// The mixer asked for a mastering analysis of this bus. The panel
     /// cannot run it — analysis needs the shell's decoded audio — so it
     /// leaves the request as a value, the way every other view here
@@ -167,6 +172,7 @@ impl Studio {
             auto_drag: None,
             combined: false,
             closed_groups: Default::default(),
+            key_guide: true,
             mix_pass_request: None,
             bus_drag: None,
             input_mode: Default::default(),
@@ -1331,6 +1337,10 @@ pub struct App {
     /// The command palette, open when `Some`. C-p opens it; it holds the
     /// wizard's position and the current query between frames.
     palette: Option<palette::Palette>,
+    /// The voice dialog. Present when voice is engaged; the popup renders
+    /// from its state, and utterances run through the SAME palette acts
+    /// the keyboard uses — no second command system.
+    voice: Option<voice::Dialog>,
     mic: Box<dyn capture::Capture>,
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
@@ -1452,6 +1462,7 @@ impl Default for App {
               bounce_format,
               mix_pass: None,
               palette: None,
+              voice: None,
               mic: capture::open_capture(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: true,
@@ -1778,6 +1789,17 @@ impl eframe::App for App {
                 None => self.studio.status =
                     "nothing to analyse — the arrangement is silent".into(),
             }
+        }
+        // Voice is engaged with C-space and shows voiceterm's popup. The
+        // recognizer itself is not in this repo; `voice_utterance` is the
+        // seam it feeds, and the palette walk behind it is fully tested
+        // headless, so wiring a backend is one call and no new verbs.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Space)) {
+            self.voice = match self.voice { Some(_) => None,
+                                            None => Some(voice::Dialog::default()) };
+        }
+        if let Some(d) = &self.voice {
+            voice::feedback_popup(ctx, d, &colors);
         }
         self.palette_window(ctx);
         self.mix_pass_window(ctx);
@@ -2782,6 +2804,23 @@ impl App {
         if !close && open { self.palette = Some(p); }
     }
 
+    /// Feed one recognized utterance to the voice dialog and run whatever
+    /// it decides. The seam a speech backend calls — deliberately the
+    /// only thing such a backend needs to know about this app.
+    pub fn voice_utterance(&mut self, text: &str) {
+        // The dialog is taken out for the turn: it borrows nothing from
+        // the shell while `run_palette_act` mutates it, and goes back
+        // afterwards carrying its state.
+        let mut d = self.voice.take().unwrap_or_default();
+        let project = self.studio.session.doc.project.clone();
+        let act = d.hear(text, &project);
+        if let voice::State::Failed { why, .. } = &d.state {
+            self.studio.status = format!("voice: {why}");
+        }
+        self.voice = Some(d);
+        if let Some(act) = act { self.run_palette_act(act); }
+    }
+
     /// Execute a completed palette path. Ops go through `edit_group` — a
     /// palette command is ONE undo even when it is two ops (create a bus
     /// and route into it), so a mistake never leaves half of itself.
@@ -2800,6 +2839,21 @@ impl App {
             }
             palette::Act::Shell(v) => match v {
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
+                palette::ShellVerb::ToggleKeyGuide => {
+                    self.studio.key_guide = !self.studio.key_guide;
+                    self.studio.status = format!("out-of-key dimming {}",
+                        if self.studio.key_guide { "on" } else { "off" });
+                }
+                palette::ShellVerb::MarkerHere => {
+                    let at = self.studio.playhead();
+                    let n = self.studio.session.doc.project.markers.len() + 1;
+                    self.studio.edit(studio_core::Op::SetMarker {
+                        at, name: format!("mark {n}") }, "marker");
+                }
+                palette::ShellVerb::GotoMarker(at) => {
+                    self.studio.transport.set_position(at);
+                    self.studio.status = format!("at {:.1}s", at.to_seconds());
+                }
                 palette::ShellVerb::GotoStart => {
                     self.studio.transport.set_position(studio_core::Ticks::ZERO);
                     self.studio.status = "playhead at start".into();

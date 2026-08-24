@@ -1768,3 +1768,49 @@ defaults to a projects ROOT with a per-project subdirectory, which is the
 `_data` folder for the single-file `.aup3` after years of users moving the
 folder and breaking sessions — the same argument that makes `.studioarch`
 the thing you send while this directory stays the working copy.
+
+
+**Note names, a project key, and the guide that reads it.** Every piano
+roll row now names itself — `A1`, `C#4`, `A5` — instead of only the octave
+lines carrying a signed offset. The labels come from `studio_core::
+note_label`, which reads the SAME reference pitch the synth does (key 0 is
+A1, 55 Hz, `sub_freq`'s own reference), so a label and a sound cannot
+disagree; that is pinned. The project gained a `key` (root + scale: major,
+minor, dorian, mixolydian, chromatic) as an absolute, undoable op, and the
+roll dims out-of-key rows when the guide is on — dimmed, never disabled: a
+scale is advice, and a tool that silently refused the blue note would be
+wrong about music. `None` key means no opinion and nothing is dimmed. The
+palette carries "set project key" (root, then scale) and "toggle
+out-of-key dimming".
+
+**Markers, and the wishes behind them.** Reading the FL Studio and
+kdenlive communities, the same request appears in both vocabularies:
+named markers, jump-to, and "Delete All Timeline Markers" (kdenlive
+26.04 literally shipped that action; FL's Alt+T marker naming is a
+top-of-list wish; Premiere users ask for marker-based selection). So:
+`SetMarker` is absolute BY NAME (setting an existing name moves it — "no,
+the chorus is here"), `ClearMarkers` inverts to a single `Group` so one
+`u` restores every one, and the palette gains "drop a marker here", "jump
+to marker" (a wizard over the project's own markers), "delete all
+markers", "hide (mute) a track" (the other repeated ask), and "split
+every clip at the playhead".
+
+**One voice framework, no second command system.** `voice.rs` is the
+dialog handler and the port of voiceterm-qt's feedback popup, built on the
+seam the palette already had: a command is a path of choices resolved by
+matching text, so speech needs no verbs of its own. Three pure pieces.
+`normalize` closes the gap a recognizer leaves — "eight oh eight" → `808`,
+"see sharp" → `C#`, "b flat" → `A#` (flats spoken, sharps stored),
+connectives and filler dropped so they cannot dilute a score. `policy`
+decides what one utterance may do: destructive or wide acts are said back
+and wait for a leading, unambiguous "yes" — the first draft searched the
+whole reply for an affirmative and took "no, go to the mixer" as consent,
+which is worse than no confirmation and is now pinned against. `Dialog`
+walks the palette consuming the longest matching prefix at each step, so a
+whole command fits in one breath ("route vocals drum bus") or arrives word
+by word, with the popup listing what can be said next — the reason
+voiceterm showed a popup at all. `EXTRA_SPOKEN` collects the phrasings
+nobody would put in a menu because nothing was listening: asking the room
+a question, acting on everything except one thing, starting a take on a
+count. The recognizer itself is not in this repo; `App::voice_utterance`
+is the one call a backend needs.

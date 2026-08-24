@@ -118,6 +118,12 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
     // dangled (every member deleted) has an unappliable op, so it is
     // filtered to the members that still exist — and dropped entirely when
     // none do, the same fate the timeline already gives it visually.
+    if project.key.is_some() {
+        ops.push(Op::SetKey { key: project.key });
+    }
+    for m in &project.markers {
+        ops.push(Op::SetMarker { at: m.at, name: m.name.clone() });
+    }
     for (id, g) in &project.groups {
         let clips: Vec<_> = g.clips.iter().copied()
             .filter(|c| project.clips.contains_key(c)).collect();
