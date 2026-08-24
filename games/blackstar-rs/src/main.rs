@@ -101,6 +101,7 @@ mod menusim;
 mod cockpit;
 mod dropship;
 mod locomotion;
+mod massfilter;
 mod raidflow;
 mod raidforge;
 mod shots;

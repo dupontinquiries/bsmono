@@ -102,6 +102,30 @@ fn guess_for(pose_dir: &Path) -> Option<(orient::Guess, Vec<crate::meshgen::Vert
         return None;
     }
     let raws = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::model::load_raw_unoriented(pose_dir))).ok()?;
+    // SAY WHAT THE FILTER DID, on real assets, where my synthetic fixtures
+    // cannot reach. `massfilter`'s thresholds are reasoned rather than
+    // fitted, so the only way to judge them is to print what they reject
+    // per pose and look — which is what this driver is for.
+    {
+        let pts: Vec<Vec<glam::Vec3>> = raws
+            .iter()
+            .map(|r| r.verts.iter().map(|v| glam::Vec3::from_array(v.pos)).collect())
+            .collect();
+        let refs: Vec<&[glam::Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+        let m = crate::massfilter::classify(&refs);
+        if m.dropped > 0 {
+            println!("       {}", m.report());
+            if let (Some(a), Some(b)) = (
+                crate::massfilter::bounds(&refs, &vec![true; refs.len()]),
+                crate::massfilter::bounds(&refs, &m.keep),
+            ) {
+                println!(
+                    "       ride_h {:.2} -> {:.2}, half.y {:.2} -> {:.2}",
+                    a.1, b.1, a.0.y, b.0.y
+                );
+            }
+        }
+    }
     let verts = orient::all_verts(&raws);
     if verts.is_empty() {
         return None;

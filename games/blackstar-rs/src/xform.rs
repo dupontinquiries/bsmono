@@ -324,17 +324,29 @@ impl Morph {
     /// `t` is the expensive part and doing it twice to get two numbers out of
     /// one bounding box would double the cost of every frame that folds.
     pub fn bounds_at(&mut self, t: f32) -> (Vec3, f32) {
-        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        // THE SAME MEASUREMENT THE STATIC LOAD MAKES. This used absolute
+        // min/max over every blended vertex while `model::load_raw_at`
+        // measures the MASS (`massfilter`), so a fold handed physics a
+        // ride height computed one way and a spawn handed it one computed
+        // the other — debris made them disagree by metres, and the body
+        // sank or floated the moment a morph started. Two answers to one
+        // question; now one.
+        let mut pts: Vec<Vec<Vec3>> = Vec::with_capacity(self.prims());
         for p in 0..self.prims() {
             let m = self.sample(p, t);
-            for v in &m.verts {
-                let q = Vec3::from_array(v.pos);
-                lo = lo.min(q);
-                hi = hi.max(q);
-            }
+            pts.push(m.verts.iter().map(|v| Vec3::from_array(v.pos)).collect());
             self.scratch = m.verts;
         }
-        ((hi - lo) * 0.5, -lo.y)
+        let refs: Vec<&[Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+        let mass = crate::massfilter::classify(&refs);
+        crate::massfilter::bounds(&refs, &mass.keep).unwrap_or_else(|| {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for v in refs.iter().flat_map(|p| p.iter()) {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+            ((hi - lo) * 0.5, -lo.y)
+        })
     }
 }
 

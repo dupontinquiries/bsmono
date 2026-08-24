@@ -848,6 +848,25 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
         //     { "up": [0,1,0], "forward": [0,0,-1] }
         //
         // Absent, nothing changes and the search runs as before.
+        // DEBRIS FIRST. `find_orientation` scores candidate frames over
+        // every vertex, so a mis-parented panel flung off the body drags
+        // the up/forward guess with it and the pose arrives lying down or
+        // facing backwards — one of the three symptoms that share this
+        // cause (see `massfilter`). Rejecting before the search means the
+        // frame is chosen from the body, and rejecting HERE rather than
+        // after means the same prims are gone for the bounds below too.
+        {
+            let pts: Vec<Vec<Vec3>> = raws
+                .iter()
+                .map(|r| r.verts.iter().map(|v| Vec3::from_array(v.pos)).collect())
+                .collect();
+            let refs: Vec<&[Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+            let mass = crate::massfilter::classify(&refs);
+            if mass.dropped > 0 {
+                let mut keep = mass.keep.iter();
+                raws.retain(|_| keep.next().copied().unwrap_or(true));
+            }
+        }
         let q = match declared_orientation(dir) {
             Some(q) => q,
             None => {
@@ -893,15 +912,32 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
     // [0.66 2.10 1.27] for geometry that measures [0.66 1.27 2.10] — a body
     // lying down being described as standing up. The blackstar bot poses had
     // width and height swapped the same way.
-    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    for r in raws.iter() {
-        for v in r.verts.iter() {
-            let p = Vec3::from_array(v.pos);
-            lo = lo.min(p);
-            hi = hi.max(p);
+    // MEASURE THE MASS, not every stray vertex. The debris pass above
+    // already dropped what it was sure about; this second call catches
+    // what survived it (a prim that is far but not slight enough to
+    // delete still should not define the hitbox) WITHOUT removing
+    // geometry — bounds and rendering are allowed to disagree, and this
+    // is the one place where they should.
+    let pts: Vec<Vec<Vec3>> = raws
+        .iter()
+        .map(|r| r.verts.iter().map(|v| Vec3::from_array(v.pos)).collect())
+        .collect();
+    let refs: Vec<&[Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+    let mass = crate::massfilter::classify(&refs);
+    let (half, ride_h) = match crate::massfilter::bounds(&refs, &mass.keep) {
+        Some(b) => b,
+        None => {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for r in raws.iter() {
+                for v in r.verts.iter() {
+                    let p = Vec3::from_array(v.pos);
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+            }
+            bounds_from_extent(lo, hi, ext * s * 0.5)
         }
-    }
-    let (half, ride_h) = bounds_from_extent(lo, hi, ext * s * 0.5);
+    };
     (raws, half, center, s, ride_h)
 }
 
@@ -932,6 +968,31 @@ fn bounds_from_extent(lo: Vec3, hi: Vec3, ext_half: Vec3) -> (Vec3, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE BUG THE MASS FILTER FIXES, as a unit: one panel flung below a
+    /// body used to define `ride_h`, so physics seated the chassis on
+    /// debris and the visible body hung in the air (or, when the stray
+    /// went sideways, the hitbox doubled and the body caught on nothing).
+    /// `bounds_from_extent` still exists and still measures a box; what
+    /// changed is WHICH points reach it.
+    #[test]
+    fn a_flung_panel_no_longer_sets_the_ride_height() {
+        let body: Vec<Vec3> = (0..300)
+            .map(|i| {
+                let t = i as f32 * 0.7;
+                Vec3::new(t.sin() * 0.8, (t * 1.3).cos() * 1.2, (t * 0.6).sin() * 2.0)
+            })
+            .collect();
+        let junk: Vec<Vec3> = (0..6).map(|i| Vec3::new(0.1 * i as f32, -18.0, 0.0)).collect();
+        let refs: Vec<&[Vec3]> = vec![&body, &junk];
+        let m = crate::massfilter::classify(&refs);
+        let (_, ride) = crate::massfilter::bounds(&refs, &m.keep).expect("a body was measured");
+        assert!(ride < 2.0, "debris still owns the ride height: {ride}");
+        // and the naive measurement is what it used to be, so the fixture
+        // is proving a difference rather than an absence
+        let (_, naive) = crate::massfilter::bounds(&refs, &[true, true]).unwrap();
+        assert!(naive > 17.0, "the fixture does not reproduce the old behaviour");
+    }
 
     #[test]
     fn the_drop_matches_half_only_when_the_box_is_centred() {
