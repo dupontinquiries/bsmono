@@ -46,6 +46,7 @@ pub enum ShellVerb {
     ToggleKeyGuide,
     MarkerHere,
     VoiceVocab(u8),
+    Find(u8),
     GotoMarker(studio_core::Ticks),
     GotoStart,
     GotoEnd,
@@ -86,6 +87,8 @@ pub enum Ask {
     JumpMarker,
     /// Which genre vocabulary the voice fastpath should listen with.
     VoiceVocab,
+    /// How to search the timeline.
+    FindHow,
     /// Which track to hide (mute is the model's own word for it).
     MuteTrack2,
     /// Which track's gain to change, and by how many dB.
@@ -119,6 +122,7 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("find in the timeline", None, Then::Ask(Ask::FindHow)),
         c("jump to marker", None, Then::Ask(Ask::JumpMarker)),
         c("delete all markers", None, Then::Do(Act::Ops(vec![Op::ClearMarkers]))),
         c("hide (mute) a track", None, Then::Ask(Ask::MuteTrack2)),
@@ -171,6 +175,13 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             .map(|s| plain(s.name().to_string(), Then::Do(Act::Ops(vec![
                 Op::SetKey { key: Some(studio_core::Key { root, scale: *s }) }]))))
             .collect(),
+        Ask::FindHow => vec![
+            plain("by name".into(), Then::Do(Act::Shell(ShellVerb::Find(0)))),
+            plain("by sound (fingerprint, then verify)".into(),
+                  Then::Do(Act::Shell(ShellVerb::Find(1)))),
+            plain("silent tracks and clips".into(),
+                  Then::Do(Act::Shell(ShellVerb::Find(2)))),
+        ],
         Ask::VoiceVocab => crate::voice::Domain::ALL.iter().enumerate()
             .map(|(i, d)| plain(d.label().to_string(),
                                 Then::Do(Act::Shell(ShellVerb::VoiceVocab(i as u8)))))

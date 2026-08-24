@@ -1864,3 +1864,37 @@ nothing. Unknown words always pass through, `common` cannot be switched
 off, and the chosen domains ride in the workspace sidecar because the ears
 follow the room, not the song. Pick them from the palette: "voice
 vocabulary (genre words)".
+
+
+**Find in the timeline — voiceterm's lever, not a second implementation.**
+Searching a session of takes for a spoken word is the case where a real
+recognizer is correct and far too slow to type into. voiceterm already
+solved it and its own notes name the mechanism: the fingerprint DB
+short-circuits whisper on most utterances. So the pure half of that —
+`phonetic.rs`'s MFCC pipeline and `acoustic_index.rs`'s 39-dimensional
+mean/std/delta fingerprint with its cosine metric — was lifted VERBATIM
+into `shared/voiceprint-kit`, where a second app can use it without a
+second implementation drifting from the first. voiceterm's exemplar
+database, promotion policy and whisper pool stay in voiceterm, which is
+where that policy belongs.
+
+`find.rs` layers the search: a NAME match first because it is free and
+certain (and never invents a distance it did not measure); then the
+fingerprint prescreen over every candidate clip — 39 floats and a cosine,
+microseconds each — which orders the field without deciding it; then
+verification on the survivors only, through a `Verifier` trait whose
+intended implementation is voiceterm's whisper pool. With no verifier
+present, results are returned as a RANKING and labelled as such: the panel
+shows "name", "sound ~0.14", or "heard: …" so a cheap guess can never be
+mistaken for something a recognizer read. A verifier that runs and
+disagrees demotes the hit — heard-but-wrong is weaker evidence than
+never-heard, because something did listen. And the gate answers the other
+question: search everything, only tracks carrying audio, or ONLY the
+silent ones ("why can I not hear track twelve" — a track with no clips at
+all and a clip below the floor are both reported, while media that never
+arrived is neither, because that is a different problem). One fixture
+lesson recorded in the kit: steady synthetic tones are degenerate for a
+mean/std/delta statistic — two thirds of its dimensions are variance and
+frame-to-frame delta, which for a constant tone hold only rounding noise,
+so the first test ranked a 5 Hz shift as farther than a whole different
+vowel. Moving formants are what speech is.

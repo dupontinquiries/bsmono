@@ -20,6 +20,7 @@ pub mod audition;
 pub mod capture;
 pub mod export;
 pub mod clip_inspector;
+pub mod find;
 pub mod library;
 pub mod midi;
 pub mod mix_assistant;
@@ -1346,6 +1347,8 @@ pub struct App {
     /// in the Dialog) so a dialog can be opened and closed without
     /// forgetting which genres this device works in.
     lexicon: voice::Lexicon,
+    /// The find panel: how to search, what was typed, and what came back.
+    find_ui: Option<FindUi>,
     mic: Box<dyn capture::Capture>,
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
@@ -1471,6 +1474,7 @@ impl Default for App {
               palette: None,
               voice: None,
               lexicon,
+              find_ui: None,
               mic: capture::open_capture(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: true,
@@ -1814,6 +1818,7 @@ impl eframe::App for App {
             voice::feedback_popup(ctx, d, &colors);
         }
         self.palette_window(ctx);
+        self.find_window(ctx);
         self.mix_pass_window(ctx);
         self.archive_window(ctx);
         self.export_dialog_window(ctx);
@@ -2651,6 +2656,16 @@ fn describe_op(op: &studio_core::Op) -> String {
     }
 }
 
+/// The find panel's state between frames.
+#[cfg(feature = "app")]
+struct FindUi {
+    gate: find::Gate,
+    by_sound: bool,
+    query: String,
+    hits: Vec<find::Hit>,
+    ran: bool,
+}
+
 /// The mastering pass, mid-consideration.
 #[cfg(feature = "app")]
 struct MixPassUi {
@@ -2865,6 +2880,18 @@ impl App {
                     self.studio.status = format!("out-of-key dimming {}",
                         if self.studio.key_guide { "on" } else { "off" });
                 }
+                palette::ShellVerb::Find(mode) => {
+                    self.find_ui = Some(FindUi {
+                        gate: match mode { 2 => find::Gate::Silent,
+                                           1 => find::Gate::WithAudio,
+                                           _ => find::Gate::Everything },
+                        by_sound: mode == 1,
+                        query: String::new(),
+                        hits: Vec::new(),
+                        ran: mode == 2, // the silence gate needs no keyword
+                    });
+                    if mode == 2 { self.run_find(); }
+                }
                 palette::ShellVerb::VoiceVocab(i) => {
                     if let Some(d) = voice::Domain::ALL.get(i as usize).copied() {
                         self.lexicon.toggle(d);
@@ -2974,6 +3001,82 @@ impl App {
                 Err(e) => self.studio.status = e,
             }
         }
+    }
+
+    /// Run the search with what the panel currently holds.
+    fn run_find(&mut self) {
+        let Some(ui) = &self.find_ui else { return };
+        // No TTS in this build: the acoustic pass needs a rendering of the
+        // keyword and says so rather than pretending a name search was a
+        // sound search. voiceterm's synthesis (or a recorded example) is
+        // what fills this in.
+        let spoken: Option<studio_audio::SourceAudio> = None;
+        let hits = find::find(&self.studio.session.doc.project, &self.audio,
+                              &ui.query, spoken.as_ref(), ui.gate,
+                              &find::NoVerifier, 24);
+        let sound_wanted = ui.by_sound;
+        if let Some(ui) = &mut self.find_ui {
+            ui.hits = hits;
+            ui.ran = true;
+        }
+        if sound_wanted && spoken.is_none() {
+            self.studio.status =
+                "searched by name — the sound pass needs a spoken example \
+                 (no synthesis in this build)".into();
+        }
+    }
+
+    /// The find panel: a query, a gate, and results that jump the playhead.
+    fn find_window(&mut self, ctx: &egui::Context) {
+        let Some(mut ui_state) = self.find_ui.take() else { return };
+        let mut open = true;
+        let mut run = false;
+        let mut goto: Option<studio_core::Ticks> = None;
+        egui::Window::new("Find in the timeline").open(&mut open).resizable(false)
+            .default_width(460.0).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let r = ui.text_edit_singleline(&mut ui_state.query);
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        run = true;
+                    }
+                    if ui.button("find").clicked() { run = true; }
+                });
+                ui.horizontal(|ui| {
+                    for (g, label) in [(find::Gate::Everything, "everything"),
+                                       (find::Gate::WithAudio, "only tracks with audio"),
+                                       (find::Gate::Silent, "silent only")] {
+                        if ui.add(egui::Button::selectable(ui_state.gate == g, label))
+                            .clicked() { ui_state.gate = g; run = true; }
+                    }
+                });
+                ui.separator();
+                if ui_state.ran && ui_state.hits.is_empty() {
+                    ui.colored_label(egui::Color32::GRAY, "nothing found");
+                }
+                for h in &ui_state.hits {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("→").on_hover_text("go there").clicked() {
+                            goto = Some(h.at);
+                        }
+                        // The provenance of every hit is on the row: a
+                        // name match, a cheap acoustic guess, or something
+                        // a recognizer actually read.
+                        let tag = match (h.why, &h.verified) {
+                            (find::Why::Name, _) => "name".to_string(),
+                            (find::Why::Silence, _) => "silent".to_string(),
+                            (find::Why::Sound, Some(t)) => format!("heard: {t}"),
+                            (find::Why::Sound, None) =>
+                                format!("sound ~{:.2}", h.distance.unwrap_or(0.0)),
+                        };
+                        ui.weak(tag);
+                        ui.label(&h.label);
+                        ui.weak(format!("{:.1}s", h.at.to_seconds()));
+                    });
+                }
+            });
+        if run { self.find_ui = Some(ui_state); self.run_find(); }
+        else if open { self.find_ui = Some(ui_state); }
+        if let Some(at) = goto { self.studio.transport.set_position(at); }
     }
 
     /// The mastering pass window: measurements, findings, the strength
