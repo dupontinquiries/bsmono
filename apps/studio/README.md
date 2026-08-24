@@ -1504,3 +1504,25 @@ classifier case in the tests is a verbatim filename from the library this
 was asked against; a wrong guess costs one wrong suggestion, never a
 wrong action. (The voiceterm hover-drag selector is the named upgrade for
 that menu once the widget lives in shared/.)
+
+
+**The morph pad.** logscope has its matrix, beatspace its latent pad; the
+sample library now has the same gesture: load one to four SIMILAR sounds
+onto the field's corners from a sample's ⋯ menu and the puck blends them
+(renormalizing bilinear weights — two anchors degrade to a clean one-axis
+crossfade, pinned), or with one sound loaded the puck reshapes it: X is
+spectral tilt (a crossfade toward a one-pole low/high split whose halves
+sum back to the original by construction), Y is decay (the roll's gate
+rule, driven by a knob). Neutral is pinned to be the IDENTITY — a pad that
+colours the sound at rest cannot be trusted anywhere else — and blending
+is rate-agnostic (a 44.1k anchor beside a 48k one, pinned by
+zero-crossing). The pad's output enters the workflow through the
+library's own door: right-click bounces the current sound to
+`<library>/morphs/` as a WAV the tree, classifier and rack/clip buttons
+treat like any other sample (unique names, the exporter's rule); double
+right-click resets the puck AND un-bounces the file the double's first
+click just wrote — a reset that leaves junk behind teaches people to fear
+the reset. The hint line lives on the widget, the tooltip lesson applied
+at birth. Similar-sounds blending stays a hands-on act: the pad judges
+nothing and merges nothing on its own authority — the archive's
+distortion rule, one surface over.

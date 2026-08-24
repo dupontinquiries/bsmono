@@ -1834,3 +1834,191 @@ mod align_tests {
                                    &envelope_ms(&z, 48_000), 100), 0);
     }
 }
+
+// ── the morph pad ───────────────────────────────────────────────────────
+
+/// Bilinear corner weights for a puck at (x, y) over up to four anchors,
+/// corner order TL, TR, BL, BR (y up). Fewer anchors take the first
+/// corners and the weights RENORMALIZE over what is present — with two
+/// anchors on the top edge the pad degrades to a clean one-axis
+/// crossfade, x alone deciding, which is exactly what a two-sound blend
+/// should feel like.
+pub fn morph_weights(n: usize, x: f32, y: f32) -> Vec<f32> {
+    let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    let corners = [(1.0 - x) * y, x * y, (1.0 - x) * (1.0 - y), x * (1.0 - y)];
+    let mut w: Vec<f32> = corners[..n.clamp(1, 4)].to_vec();
+    let sum: f32 = w.iter().sum();
+    if sum <= 1e-9 {
+        // The puck parked exactly opposite every present anchor: nearest
+        // wins outright rather than dividing by nothing.
+        let mut z = vec![0.0; w.len()];
+        z[0] = 1.0;
+        return z;
+    }
+    for v in &mut w { *v /= sum; }
+    w
+}
+
+fn morph_mono_48k(a: &SourceAudio) -> Vec<f32> {
+    let ratio = a.sample_rate as f64 / 48_000.0;
+    let out_len = (a.frames() as f64 / ratio).max(1.0) as usize;
+    (0..out_len).map(|i| {
+        let pos = i as f64 * ratio;
+        let i0 = pos as usize;
+        let frac = (pos - i0 as f64) as f32;
+        let s0 = a.mono(i0.min(a.frames().saturating_sub(1)));
+        let s1 = a.mono((i0 + 1).min(a.frames().saturating_sub(1)));
+        s0 * (1.0 - frac) + s1 * frac
+    }).collect()
+}
+
+/// One sound, reshaped by the puck: X is spectral TILT (left dark, right
+/// bright, centre untouched — a crossfade toward a one-pole low- or
+/// high-passed copy), Y is DECAY (1.0 untouched, lower fades the tail
+/// earlier — a drum's most-reached-for knob). Neutral is (0.5, 1.0), and
+/// neutral is pinned to be the identity: a pad that colours the sound at
+/// rest cannot be trusted anywhere else.
+pub fn tone_map(a: &SourceAudio, x: f32, y: f32) -> SourceAudio {
+    let src = morph_mono_48k(a);
+    let x = x.clamp(0.0, 1.0);
+    let y = y.clamp(0.0, 1.0);
+    let mut out = src.clone();
+    if (x - 0.5).abs() > 1e-3 {
+        // One-pole low-pass at ~800 Hz; the high-pass is its residue, so
+        // the two halves sum back to the original by construction.
+        let k = 1.0 - (-2.0 * std::f32::consts::PI * 800.0 / 48_000.0).exp();
+        let mut lp_state = 0.0f32;
+        for (i, s) in src.iter().enumerate() {
+            lp_state += k * (s - lp_state);
+            let hp = s - lp_state;
+            out[i] = if x < 0.5 {
+                let t = (0.5 - x) * 2.0; // toward dark
+                s * (1.0 - t) + lp_state * t
+            } else {
+                let t = (x - 0.5) * 2.0; // toward bright
+                s * (1.0 - t) + hp * t
+            };
+        }
+    }
+    if y < 1.0 - 1e-3 {
+        // The tail fades over the first y of the length and is silent
+        // after — the roll's gate rule, driven by a knob.
+        let gate = ((out.len() as f32) * y.max(0.02)) as usize;
+        let fade = (gate / 8).max(48).min(gate);
+        for i in 0..out.len() {
+            if i >= gate { out[i] = 0.0; }
+            else if i >= gate - fade {
+                out[i] *= (gate - i) as f32 / fade as f32;
+            }
+        }
+    }
+    SourceAudio { sample_rate: 48_000, channels: vec![out] }
+}
+
+/// The pad's sound at (x, y): one anchor is [`tone_map`], several blend by
+/// [`morph_weights`] — resampled to 48k mono, padded to the longest, the
+/// weighted sum. Similar sounds blended sit BETWEEN them; dissimilar
+/// sounds layer, which is also a sound — the pad judges nothing.
+pub fn morph_blend(anchors: &[&SourceAudio], x: f32, y: f32) -> SourceAudio {
+    match anchors {
+        [] => SourceAudio { sample_rate: 48_000, channels: vec![vec![]] },
+        [one] => tone_map(one, x, y),
+        many => {
+            let w = morph_weights(many.len(), x, y);
+            let monos: Vec<Vec<f32>> = many.iter().map(|a| morph_mono_48k(a)).collect();
+            let len = monos.iter().map(Vec::len).max().unwrap_or(0);
+            let mut out = vec![0.0f32; len];
+            for (mono, wt) in monos.iter().zip(&w) {
+                for (i, s) in mono.iter().enumerate() {
+                    out[i] += s * wt;
+                }
+            }
+            SourceAudio { sample_rate: 48_000, channels: vec![out] }
+        }
+    }
+}
+
+#[cfg(test)]
+mod morph_tests {
+    use super::*;
+
+    fn tone(hz: f32, secs: f32, rate: u32) -> SourceAudio {
+        let n = (rate as f32 * secs) as usize;
+        SourceAudio { sample_rate: rate, channels: vec![
+            (0..n).map(|i| (i as f32 / rate as f32 * hz * std::f32::consts::TAU).sin() * 0.5)
+                .collect()] }
+    }
+    fn energy(b: &[f32], from: usize, to: usize) -> f32 {
+        b[from.min(b.len())..to.min(b.len())].iter().map(|s| s * s).sum()
+    }
+
+    #[test]
+    fn weights_renormalize_and_two_anchors_are_a_clean_crossfade() {
+        for (n, x, y) in [(4, 0.3, 0.7), (3, 0.9, 0.1), (2, 0.5, 0.2), (1, 0.0, 0.0)] {
+            let w = morph_weights(n, x, y);
+            assert_eq!(w.len(), n);
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{n} anchors at ({x},{y})");
+        }
+        // Two anchors share the top edge: y must cancel out entirely.
+        let a = morph_weights(2, 0.25, 0.9);
+        let b = morph_weights(2, 0.25, 0.2);
+        assert!((a[0] - b[0]).abs() < 1e-5, "a two-sound blend is x alone: {a:?} vs {b:?}");
+        assert!((a[0] - 0.75).abs() < 1e-5);
+        // Bottom-left puck over top-edge anchors: nearest wins, no NaN.
+        let z = morph_weights(2, 0.0, 0.0);
+        assert!(z.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn neutral_is_the_identity_and_the_axes_do_what_their_labels_say() {
+        let a = tone(200.0, 0.5, 48_000);
+        let neutral = tone_map(&a, 0.5, 1.0);
+        for (i, s) in neutral.channels[0].iter().enumerate() {
+            assert!((s - a.channels[0][i]).abs() < 1e-5,
+                    "a pad that colours the sound at rest cannot be trusted: sample {i}");
+        }
+        // X right on a dull+bright mix: the high band's share must rise.
+        let mut mix = tone(150.0, 0.5, 48_000);
+        let hi = tone(4000.0, 0.5, 48_000);
+        for (i, s) in mix.channels[0].iter_mut().enumerate() {
+            *s = *s * 0.5 + hi.channels[0][i] * 0.5;
+        }
+        let hi_share = |a: &SourceAudio| {
+            let bright = tone_map(a, 0.5, 1.0); // identity, but through the same path
+            let hp: f32 = {
+                // crude residue: sample-to-sample difference energy tracks
+                // high-frequency content well enough to order two sounds
+                let b = &bright.channels[0];
+                b.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>()
+            };
+            hp / energy(&bright.channels[0], 0, usize::MAX).max(1e-9)
+        };
+        let dark = tone_map(&mix, 0.1, 1.0);
+        let bright = tone_map(&mix, 0.9, 1.0);
+        assert!(hi_share(&bright) > hi_share(&dark) * 2.0,
+                "right is brighter than left by any honest measure");
+        // Y down: the tail dies where the knob says.
+        let short = tone_map(&a, 0.5, 0.4);
+        let n = short.channels[0].len();
+        assert!(energy(&short.channels[0], n * 6 / 10, n) < 1e-6,
+                "past the gate is silence");
+        assert!(energy(&short.channels[0], 0, n / 4) > 0.1, "before it, the sound");
+    }
+
+    #[test]
+    fn a_blend_at_the_corners_is_the_corner_and_rates_do_not_matter() {
+        let a = tone(200.0, 0.25, 48_000);
+        let b = tone(500.0, 0.25, 44_100); // different rate ON PURPOSE
+        let left = morph_blend(&[&a, &b], 0.0, 1.0);
+        let right = morph_blend(&[&a, &b], 1.0, 1.0);
+        for (i, s) in left.channels[0].iter().enumerate().take(4_000) {
+            assert!((s - a.channels[0][i]).abs() < 1e-4, "x=0 is anchor A alone");
+        }
+        // x=1 is B alone, resampled to 48k: same pitch, verified by
+        // zero-crossing count over the shared quarter second.
+        let zc = |v: &[f32]| v.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        let want = zc(&morph_blend(&[&b], 0.5, 1.0).channels[0]);
+        assert!((zc(&right.channels[0]) as i64 - want as i64).abs() <= 2,
+                "x=1 is anchor B, at the pad's 48k");
+    }
+}

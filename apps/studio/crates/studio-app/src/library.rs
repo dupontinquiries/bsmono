@@ -225,6 +225,8 @@ pub enum LibraryAction {
     ToTimeline(PathBuf),
     Preview(PathBuf),
     ReplaceChannel(usize, PathBuf),
+    /// Send this sample to the morph pad's next corner.
+    ToMorph(PathBuf),
     ToNewTrackBus(PathBuf, Option<studio_core::BusId>),
 }
 
@@ -282,6 +284,10 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry,
                     });
                     ui.close();
                 }
+            }
+            if ui.button("add to morph pad").clicked() {
+                *action = Some(LibraryAction::ToMorph(e.path.clone()));
+                ui.close();
             }
             let alts = variants(&e.path);
             if !alts.is_empty() {

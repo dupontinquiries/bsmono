@@ -22,6 +22,7 @@ pub mod clip_inspector;
 pub mod library;
 pub mod midi;
 pub mod mixer_panel;
+pub mod morph_pad;
 pub mod program_panel;
 pub mod project_dir;
 pub mod viewport;
@@ -1255,6 +1256,7 @@ pub struct App {
     /// phone's flash is how battery dies.
     library_root: std::path::PathBuf,
     library_tree: library::TreeState,
+    morph: morph_pad::PadState,
     library_open: bool,
     /// The export dialog's plan while it is open, plus its last refusal —
     /// shown inline so a bad plan is a message, not a closed window.
@@ -1351,7 +1353,8 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
-              carrier, project_path, library_root, library_tree, library_open: true,
+              carrier, project_path, library_root, library_tree,
+              morph: morph_pad::PadState::default(), library_open: true,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1841,6 +1844,50 @@ impl eframe::App for App {
                         self.library_open = false;
                     }
                 });
+                let pad_open = !self.morph.anchors.is_empty();
+                egui::CollapsingHeader::new("morph pad").default_open(pad_open)
+                    .show(ui, |ui| {
+                        match morph_pad::show(ui, &mut self.morph, &colors) {
+                            Some(morph_pad::PadAction::Preview) => {
+                                let a = self.morph.blend();
+                                let n = a.frames().min(self.sink.rate() as usize * 4);
+                                if n > 0 {
+                                    let mono: Vec<f32> = (0..n).map(|i| a.mono(i)).collect();
+                                    self.sink.trigger(std::sync::Arc::new(mono));
+                                }
+                            }
+                            Some(morph_pad::PadAction::Bounce) => {
+                                match morph_pad::bounce(&self.library_root, &self.morph) {
+                                    Ok(p) => {
+                                        self.studio.status = format!("bounced {}", p.display());
+                                        self.morph.last_bounce = Some(p);
+                                        self.library_tree.refresh();
+                                    }
+                                    Err(e) => self.studio.status = e,
+                                }
+                            }
+                            Some(morph_pad::PadAction::Reset) => {
+                                (self.morph.x, self.morph.y) = morph_pad::PadState::neutral();
+                                // The double's first click bounced a frame
+                                // ago; a reset that leaves that junk behind
+                                // teaches people to fear the reset.
+                                if let Some(p) = self.morph.last_bounce.take() {
+                                    let _ = std::fs::remove_file(&p);
+                                    self.library_tree.refresh();
+                                    self.studio.status = "morph pad reset (and un-bounced)".into();
+                                } else {
+                                    self.studio.status = "morph pad reset".into();
+                                }
+                            }
+                            Some(morph_pad::PadAction::Remove(i)) => {
+                                if i < self.morph.anchors.len() {
+                                    self.morph.anchors.remove(i);
+                                }
+                            }
+                            None => {}
+                        }
+                    });
+                ui.separator();
                 lib_action = library::show_tree(
                     ui, &self.library_root, &mut self.library_tree,
                     &self.studio.rack, &self.studio.session.doc.project, &colors);
@@ -1852,6 +1899,22 @@ impl eframe::App for App {
             let (path, to_rack) = match action {
                 library::LibraryAction::ToRack(p) => (p, true),
                 library::LibraryAction::ToTimeline(p) => (p, false),
+                library::LibraryAction::ToMorph(p) => {
+                    match std::fs::read(&p).ok().and_then(|raw| {
+                        let hint = p.extension().and_then(|e| e.to_str()).map(str::to_owned);
+                        studio_media::decode_bytes(raw, hint.as_deref()).ok()
+                    }) {
+                        Some(audio) => {
+                            let name = p.file_stem().and_then(|x| x.to_str())
+                                .unwrap_or("sound").to_owned();
+                            self.morph.push(name.clone(), audio);
+                            self.studio.status = format!(
+                                "'{name}' on the morph pad ({} of 4)", self.morph.anchors.len());
+                        }
+                        None => self.studio.status = format!("could not decode {}", p.display()),
+                    }
+                    return;
+                }
                 library::LibraryAction::ReplaceChannel(i, p) => {
                     // Swap the sample under an existing channel, keeping
                     // its steps and rolls — "try this snare in the pattern
