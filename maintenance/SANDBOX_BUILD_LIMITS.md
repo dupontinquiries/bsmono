@@ -115,3 +115,7 @@ libgstreamer-plugins-base1.0-dev` installed cleanly (c11; unblocked
 camera-bridge compilation). Before adding a feature-gate escape for a new
 native dep (CLAUDE.md §3), spend the thirty seconds checking whether apt has
 it. GTK4/libadwaita/Qt6 remain absent from what has been tried.
+
+Also confirmed installable (c11): `cmake` and `xorg-dev` — which unblocks
+glfw-sys and unendlich's `window` feature. The CLAUDE.md §3 "missing:
+cmake" entry predates this; prefer apt over feature-gating for cmake now.

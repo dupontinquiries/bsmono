@@ -75,3 +75,22 @@ games/ tail and the whole apps/ slice) were not touched this session.
 - gstreamer dev headers ARE installable here (`apt-get update` first — the
   baked lists are stale and 404). That is what made camera-bridge verifiable;
   noted in SANDBOX_BUILD_LIMITS.md.
+
+## 5. The rain thread (unendlich-fullgame)
+
+- **C11-5a — `unendlich-netview` does not compile: unresolved import
+  `netview`.** `verified` (it blocks a plain `cargo check` of the engine).
+  Very likely THE root of C10-1a's engine sweep FAIL, and possibly related to
+  the C11-2b orphans — a module that exists on disk but is not declared, or
+  was renamed. Untouched by the rain fix; diagnose the import before anything
+  else in that crate.
+- **C11-5b — the rain dripline is unverified by eye.** The cull tests pin the
+  geometry; whether it READS right (streak pop at the boundary, snow drift at
+  cave mouths) is the on-device pass. `UNENDLICH_RAIN_CULL=0` reverts live.
+- **C11-5c — the r156 fire-shelter check scans only 1..=3 blocks up**
+  (`fullgame` ~5783), so a fire in a tall cave counts as unsheltered and rain
+  can douse it through 40 blocks of rock. `read`, not fixed — same bug family
+  as the rain, different mechanic; wants the same per-column surface query.
+- cmake and xorg-dev install via apt here (after `apt-get update`), which
+  makes glfw — and therefore the fullgame bin's window feature — buildable in
+  the sandbox. Added to SANDBOX_BUILD_LIMITS.md alongside the gstreamer note.
