@@ -101,7 +101,11 @@ Fixed this session: the live-grid-in-a-strip bug and the 3x3 menu's dead
 Split/Close/NewTab arm (see the commit). Everything below is open, in the
 report's own order, each with the pointer a next session needs.
 
-- **C11-6a — input routing is one-grid-per-app, not per-pane.** `read`.
+- **C11-6a — input routing is one-grid-per-app, not per-pane.** `DONE` ·
+  `verified` (see the pane_host commit; 1110 tests). The session follows its
+  pane; a fresh split starts fresh (the inline swap's inheritance hole is
+  fixed for pane_apps too). REMAINS on-device: per-pane REAL ptys — one
+  byte-stream per pane to an actual shell; the state model is ready. Was:
   `self.app` (block log) swaps per focus; `self.grid` (the live VT screen,
   where typed bytes actually land) is a singleton now painted in the focused
   rect. Correct next step: a `HashMap<pane_id, TermGrid>` swapped exactly
@@ -177,3 +181,29 @@ report's own order, each with the pointer a next session needs.
   desktop path too. The seam exists on both sides; nobody has joined them.
 - **C11-8c — pipewiresrc parse-validation** needs a machine with the
   gst-pipewire plugin; here it is string-asserted only, said so in the test.
+
+## 9. Sweep: everything not yet attended to, so nothing is lost
+
+Cross-checked against the whole c11 conversation. Already recorded above:
+picker cascade (6b), palette key (6c), voice dialog (6d), graph view (6e),
+uikit double-draw (6f), pager adoption + snapclone settings scroll (7a/7b),
+gesture-constant diff (7c), per-page packing (7d), camera verify + frontend
+seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
+
+- **C11-9a — rusty-board dictation against a real microphone.** The voice
+  feature compiles now (c11-009); nobody has spoken into it. Also verify the
+  GTK build still compiles with the `super::` paths — it should by
+  construction (same module tree), but it was NOT built here (GTK4 absent).
+- **C11-9b — voiceterm on-device recheck list for the next field session:**
+  the strip's disappearance (grid-in-pane), 3x3 new-tab/split/close, surface
+  modality feel + form-table tuning, the session-follows-pane behavior, and
+  whether the palette key came back (6c's suspects stand).
+- **C11-9c — the C10 §0 parity items untouched by c11:** C10-0b
+  (snapclone-egui fullscreen/overlays), C10-0c (fao-codec inventory — still
+  the suggested first), C10-0d's keyboard parity inventory. And C10-1a's
+  feature-sweep apps/ slice has still never run — it would have caught
+  rusty-board's voice-feature breakage (c11-009) years of sessions ago,
+  which is now the concrete argument for spending the hours.
+- **C11-9d — snapshot-cam / beatspace / unendlich-dash on-device smoke** after
+  the eframe backend switch (c11-003): glow must actually present on the
+  desktop and the phone; nobody has launched them since.
