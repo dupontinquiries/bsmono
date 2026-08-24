@@ -343,3 +343,23 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   file. The budget field exists and is still unused by the read tools.
 - **C11-16d — `Tool::GitLog` for a PATH** (`git log -- <path>`): "what
   happened to this file" is the question a repo-reading agent actually asks.
+
+## 17. Read-harness, second wiring pass (16a-d done)
+
+- **DONE**: chat turns carry a workspace block (the field symptom's source);
+  read_range clamps to the class with a continuation hint; ModelClass prefers
+  the engine's param count; git log takes a pathspec; the line grammar takes
+  `log <path> <count>`.
+- **C11-17a — nobody CALLS with_model_params yet.** The field exists and is
+  tested; the chat/agent construction sites still pass only the label. Thread
+  the engine's real count from Evt::Loaded (the loader prints d/layers/vocab,
+  so the number is already computed somewhere).
+- **C11-17b — Tool::ReadFile is still unbudgeted**: a whole-file read into a
+  Small context is the one remaining unclamped path. Either route it through
+  read_range's clamp or give it the same treatment.
+- **C11-17c — on-device: does the 1B now read?** The whole thread's value
+  rests on this single observation. Watch for: does it call read_range/log
+  at all, and does the continuation hint produce a SECOND call rather than a
+  repeat of the first?
+- **C11-17d — `git show <hash>` / `git blame <path> <line>`** would answer
+  "why is this line here", the natural next question after path-scoped log.
