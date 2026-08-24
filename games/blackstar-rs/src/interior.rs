@@ -130,6 +130,8 @@ pub struct Link {
 /// camera about ships or wrapping the world in a refcount.
 #[derive(Clone)]
 pub struct Interior {
+    /// the fitted exterior, built on first use (`hullform::Profile::fit`)
+    prof: std::cell::OnceCell<crate::hullform::Profile>,
     /// the body this hull was sized for. Kept rather than re-derived, because
     /// two places computing `length / HULL_HEIGHTS` is the duplication
     /// `--parity` exists to find.
@@ -284,7 +286,16 @@ impl Interior {
             ),
             None => Airlock::new(Vec3::ZERO, Vec3::ONE, Gauge::Personnel),
         };
-        Interior { occupant_h: occupant, cells, links, hull_half, deck_y, drive_clearance, lock }
+        Interior {
+            prof: std::cell::OnceCell::new(),
+            occupant_h: occupant,
+            cells,
+            links,
+            hull_half,
+            deck_y,
+            drive_clearance,
+            lock,
+        }
     }
 
     fn box_sdf(p: Vec3, c: Vec3, h: Vec3) -> f32 {
@@ -297,9 +308,25 @@ impl Interior {
     /// Solid hull, minus every room and corridor. Same `max(hull, -void)`
     /// carve `BigBody` already does for the hangar bay, eight-plus times, so
     /// nothing downstream needs to learn a new shape.
+    /// The fitted exterior, built once and kept. `OnceCell` rather than a
+    /// field set in the constructor because the doors move: a ship whose
+    /// links open and shut must not refit its skin every frame, and the
+    /// skin does not depend on the doors anyway.
+    pub fn profile(&self) -> &crate::hullform::Profile {
+        self.prof
+            .get_or_init(|| crate::hullform::Profile::fit(&self.cells, self.hull_half))
+    }
+
     pub fn sdf_local(&self, p: Vec3) -> f32 {
-        let q = p.abs() - self.hull_half;
-        let mut d = q.max(Vec3::ZERO).length() + q.max_element().min(0.0);
+        // THE SKIN IS THE SHIP'S OWN SHAPE, not its bounding box. The
+        // profile is lofted to fit these very rooms (`hullform`), and the
+        // mesh is built from the same `Profile::at`, so the thing you see
+        // and the thing you hit cannot drift apart — which is the failure
+        // that had you bouncing off an unrendered hull. Cached because
+        // fitting walks every room at every station and this is called per
+        // sample by the marcher.
+        let hull = self.profile();
+        let mut d = hull.sdf(p);
         for c in &self.cells {
             d = d.max(-Self::box_sdf(p, c.centre, c.half));
         }

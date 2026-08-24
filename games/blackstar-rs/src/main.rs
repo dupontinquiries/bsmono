@@ -70,6 +70,7 @@ mod joints;
 mod lift;
 mod loadout;
 mod loot;
+mod hullform;
 mod interior;
 mod menu;
 mod meshgen;

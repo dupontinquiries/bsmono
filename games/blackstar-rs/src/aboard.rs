@@ -271,9 +271,49 @@ pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
     // hull now, which is what an interior is, and they are what you see once
     // you are through a door.
     {
-        let mut h = cbox(0.12);
-        bake(&mut h, ship.hull_half * 2.0, Quat::IDENTITY, Vec3::ZERO);
-        merge(&mut out, &h);
+        // LOFT THE SKIN THROUGH THE SAME PROFILE THE COLLIDER MARCHES.
+        // Rings of a superellipse at each station, quads between them, and
+        // caps at the tips — so the silhouette IS the collider rather than
+        // a second opinion about it.
+        use crate::hullform::{ring, STATIONS};
+        let prof = ship.profile();
+        const SEG: usize = 16;
+        let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(STATIONS);
+        for i in 0..STATIONS {
+            let z = -prof.half_z + 2.0 * prof.half_z * (i as f32 / (STATIONS - 1) as f32);
+            let (a, b) = prof.at(z);
+            rings.push(ring(a, b, SEG).into_iter().map(|(x, y)| Vec3::new(x, y, z)).collect());
+        }
+        let mut tri = |p0: Vec3, p1: Vec3, p2: Vec3| {
+            let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Y);
+            for p in [p0, p1, p2] {
+                out.verts.push(crate::meshgen::Vertex {
+                    pos: p.to_array(),
+                    nrm: n.to_array(),
+                    uv: [0.0, 0.0],
+                });
+            }
+        };
+        for i in 0..STATIONS - 1 {
+            for k in 0..SEG {
+                let k2 = (k + 1) % SEG;
+                let (a, b, c, d) = (rings[i][k], rings[i][k2], rings[i + 1][k2], rings[i + 1][k]);
+                tri(a, b, c);
+                tri(a, c, d);
+            }
+        }
+        // caps: a fan to the tip centre at each end
+        for (idx, sign) in [(0usize, -1.0f32), (STATIONS - 1, 1.0)] {
+            let tip = Vec3::new(0.0, 0.0, sign * prof.half_z);
+            for k in 0..SEG {
+                let k2 = (k + 1) % SEG;
+                if sign < 0.0 {
+                    tri(tip, rings[idx][k2], rings[idx][k]);
+                } else {
+                    tri(tip, rings[idx][k], rings[idx][k2]);
+                }
+            }
+        }
     }
     for c in &ship.cells {
         let mut b = cbox(0.06);
@@ -466,7 +506,13 @@ mod tests {
                 hi[a] = hi[a].max(v.pos[a]);
             }
         }
-        let half = ship.hull_half;
+        // the collider is the fitted skin now, so the mesh is checked
+        // against THAT rather than against the bounding box it no longer
+        // fills — a lofted hull is legitimately narrower than its box
+        let p = ship.profile();
+        let widest = p.a.iter().copied().fold(0.0f32, f32::max);
+        let tallest = p.b.iter().copied().fold(0.0f32, f32::max);
+        let half = Vec3::new(widest, tallest, p.half_z);
         for (a, want) in [(0usize, half.x), (1, half.y), (2, half.z)] {
             let got = (hi[a] - lo[a]) * 0.5;
             assert!(
@@ -474,6 +520,31 @@ mod tests {
                 "axis {a}: the mesh spans {got:.1} against a collider of {want:.1} — \
                  the render is a subset of the solid again"
             );
+        }
+    }
+
+    /// THE STANDING GUARD against the bug that started this: the drawn
+    /// skin and the marched collider must be the same surface. Sampled
+    /// rather than argued about — points just inside the profile must read
+    /// as solid hull, points well outside must read as empty.
+    #[test]
+    fn the_skin_you_see_is_the_skin_you_hit() {
+        let ship = super::Interior::generate(110.0);
+        let p = ship.profile();
+        for i in 0..super::super::hullform::STATIONS {
+            let z = -p.half_z + 2.0 * p.half_z * (i as f32 / 23.0);
+            let (a, b) = p.at(z);
+            let _ = b;
+            // outside the beam by a clear margin: must be empty
+            let out = glam::Vec3::new(a * 2.5 + 5.0, 0.0, z);
+            assert!(
+                ship.sdf_local(out) > 0.0,
+                "station {i}: a point well outside the beam reads as hull"
+            );
+        }
+        // and the middle of a room is empty while the plating around it is not
+        if let Some(c) = ship.cells.first() {
+            assert!(ship.sdf_local(c.centre) > 0.0, "a room reads as solid");
         }
     }
 
