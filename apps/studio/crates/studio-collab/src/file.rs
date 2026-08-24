@@ -114,6 +114,17 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
             ops.push(Op::SetAutoPoint { target: *target, at: *at, value: *value });
         }
     }
+    // Compositions rebuild after their clips exist; a group whose clips all
+    // dangled (every member deleted) has an unappliable op, so it is
+    // filtered to the members that still exist — and dropped entirely when
+    // none do, the same fate the timeline already gives it visually.
+    for (id, g) in &project.groups {
+        let clips: Vec<_> = g.clips.iter().copied()
+            .filter(|c| project.clips.contains_key(c)).collect();
+        if !clips.is_empty() {
+            ops.push(Op::SetGroup { id: *id, name: g.name.clone(), clips });
+        }
+    }
     ops.extend(relock);
     ops
 }

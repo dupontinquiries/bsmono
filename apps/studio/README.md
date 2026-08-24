@@ -1477,3 +1477,30 @@ of this exist for a user: hovering a clip shows its name and the tool list
 intercepted key must appear in the tooltip and stay unbound in the Helix
 keymap, so the shortcuts, the keymap, and what the clip teaches cannot
 drift apart. A shortcut nobody can see is a shortcut nobody uses.
+
+
+**The mixer grew its input side, the timeline grew compositions, the
+library grew eyes.** Routing could only ever be edited from the SOURCE end
+— a track's combo, a bus's parent fixed at creation. `SetBusParent` (wire
+v11) makes reparenting an op with the same cycle refusal `AddBus` had, and
+the Mixer's "bus inputs" section reads the graph the way a console does:
+each bus lists what feeds it, ✕ returns a feeder to master, "+ input" adds
+a track or bus from the receiving side. Compositions are kdenlive's
+pre-batched groups as the smallest honest model: `SetGroup`/`RemoveGroup`
+(absolute membership, refused empty, dissolving never touches a clip),
+folded on the timeline as one chevroned block — `g` groups a selection
+(born closed, because the fold is the point), the ▸ opens it, clicking the
+block selects its members so nudge/quantize/align/delete act on the
+composition as one thing, and open-or-closed is per-device sidecar state,
+never an op. The viewfinder collapses when no video clip exists — a music
+project gets its width back. And the library finally fits a real one
+(23,000 files deep): a LAZY tree (one readdir per opened folder, cached),
+a bounded deep search, batch-converter variant detection (the `.wav`
+beside its `FFaudioConverter/*.opus` — lossless offered first), and a
+filename classifier feeding the ⋯ menu's smart offers: "replace channel
+'Snare'" when the rack has one, "clip on a new track → bus 'Drums'" for
+drum material with the bus found by name or made on the spot. Every
+classifier case in the tests is a verbatim filename from the library this
+was asked against; a wrong guess costs one wrong suggestion, never a
+wrong action. (The voiceterm hover-drag selector is the named upgrade for
+that menu once the widget lives in shared/.)

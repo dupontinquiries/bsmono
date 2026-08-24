@@ -257,6 +257,11 @@ pub fn move_target(
 /// What one timeline frame produced for the host.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TimelineResponse {
+    /// A composition's fold chevron was clicked: flip its open/closed.
+    pub toggled_group: Option<studio_core::GroupId>,
+    /// A closed composition's block was clicked: the host selects its
+    /// members, so the keyboard works on the composition as one thing.
+    pub clicked_group: Option<studio_core::GroupId>,
     /// A clip was clicked (selection is the host's business).
     pub clicked: Option<ClipId>,
     /// A drag ended: move this clip here. An op-shaped fact, not a mutation.
@@ -323,7 +328,33 @@ pub fn timeline(
     // must never gate editing.
     peaks: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
     trim_side: TrimSide,
+    // Compositions folded CLOSED on this device — view state, passed in
+    // because open-or-closed is the workspace sidecar's business while
+    // membership is the project's.
+    closed_groups: &std::collections::BTreeSet<studio_core::GroupId>,
 ) -> TimelineResponse {
+    // Closed compositions: which clips are folded away, and each fold's
+    // hull. Computed FIRST so drawing (skip members, draw the block) and
+    // click routing (a click on the block is the group's, not a member's)
+    // agree on what is folded — one truth, two consumers.
+    let mut folded: std::collections::BTreeSet<studio_core::ClipId> = Default::default();
+    let mut hulls: Vec<(studio_core::GroupId, String, Ticks, Ticks, usize, usize)> = Vec::new();
+    {
+        let row_of = |t: studio_core::TrackId|
+            doc.project.tracks.iter().position(|x| x.id == t).unwrap_or(0);
+        for (gid, g) in &doc.project.groups {
+            if !closed_groups.contains(gid) { continue; }
+            let live: Vec<_> = g.clips.iter()
+                .filter_map(|c| doc.project.clips.get(c)).collect();
+            if live.is_empty() { continue; } // every member deleted: nothing folds
+            let from = live.iter().map(|c| c.pos).min().unwrap();
+            let to = live.iter().map(|c| c.end()).max().unwrap();
+            let top = live.iter().map(|c| row_of(c.track)).min().unwrap();
+            let bot = live.iter().map(|c| row_of(c.track)).max().unwrap();
+            for c in &live { folded.insert(c.id); }
+            hulls.push((*gid, g.name.clone(), from, to, top, bot));
+        }
+    }
     let rows = track_rows(&doc.project);
     let height = RULER_H + rows.len().max(1) as f32 * view.track_h;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
@@ -369,6 +400,7 @@ pub fn timeline(
                      if track.locked { colors.text_weak } else { colors.text });
 
         for clip in doc.project.track_clips(*tid) {
+            if folded.contains(&clip.id) { continue; } // drawn as its fold's block
             let r = view.clip_rect(clip.pos, clip.len, row, origin);
             if r.max.x < origin.x + view.gutter || r.min.x > rect.max.x { continue; }
             let selected = selection.contains(&clip.id);
@@ -504,9 +536,55 @@ pub fn timeline(
             view.drag = None;
         }
     }
-    out.clicked = resp.interact_pointer_pos()
-        .filter(|_| resp.clicked())
-        .and_then(|p| hit_test(&doc.project, view, p, origin));
+    // Fold blocks over the hulls, chevron first — kdenlive's pre-batched
+    // group, After Effects' precomp, drawn as one openable thing. Open
+    // groups get only the ▾ tab above their first member, so an unfolded
+    // composition costs almost no pixels.
+    let mut fold_rects: Vec<(studio_core::GroupId, Rect, Rect)> = Vec::new();
+    for (gid, name, from, to, top, bot) in &hulls {
+        let a = view.clip_rect(*from, Ticks(to.0 - from.0), *top, origin);
+        let b = view.clip_rect(*from, Ticks(to.0 - from.0), *bot, origin);
+        let r = a.union(b);
+        if r.max.x < origin.x + view.gutter || r.min.x > rect.max.x { continue; }
+        painter.rect_filled(r, 4.0, colors.bg_raised.gamma_multiply(0.95));
+        painter.rect_stroke(r, 4.0, Stroke::new(1.5, colors.accent), egui::StrokeKind::Inside);
+        let chev = Rect::from_min_size(r.min, egui::vec2(18.0, r.height().min(18.0)));
+        painter.text(chev.center(), egui::Align2::CENTER_CENTER, "▸",
+                     egui::FontId::proportional(12.0), colors.accent);
+        painter.text(Pos2::new(chev.max.x + 2.0, r.min.y + 9.0),
+                     egui::Align2::LEFT_CENTER, name,
+                     egui::FontId::proportional(11.0), colors.text);
+        fold_rects.push((*gid, r, chev));
+    }
+    for (gid, g) in &doc.project.groups {
+        if closed_groups.contains(gid) { continue; }
+        let live: Vec<_> = g.clips.iter().filter_map(|c| doc.project.clips.get(c)).collect();
+        let Some(first) = live.iter().min_by_key(|c| c.pos) else { continue };
+        let row = doc.project.tracks.iter().position(|t| t.id == first.track).unwrap_or(0);
+        let r = view.clip_rect(first.pos, first.len, row, origin);
+        let tab = Rect::from_min_size(Pos2::new(r.min.x, r.min.y - 12.0),
+                                      egui::vec2(60.0, 12.0));
+        painter.rect_filled(tab, 2.0, colors.bg_raised);
+        painter.text(tab.left_center() + egui::vec2(2.0, 0.0), egui::Align2::LEFT_CENTER,
+                     format!("▾ {}", g.name), egui::FontId::proportional(9.0), colors.text_weak);
+        fold_rects.push((*gid, Rect::NOTHING, tab));
+    }
+    if let Some(p) = resp.interact_pointer_pos() {
+        if resp.clicked() {
+            for (gid, body, chev) in &fold_rects {
+                if chev.contains(p) { out.toggled_group = Some(*gid); break; }
+                if body.contains(p) { out.clicked_group = Some(*gid); break; }
+            }
+        }
+    }
+    out.clicked = if out.toggled_group.is_some() || out.clicked_group.is_some() {
+        None // the fold owns this click; a folded member must not be reachable
+    } else {
+        resp.interact_pointer_pos()
+            .filter(|_| resp.clicked())
+            .and_then(|p| hit_test(&doc.project, view, p, origin))
+            .filter(|id| !folded.contains(id))
+    };
     // The tooltip is where the tools become learnable: a shortcut nobody
     // can see is a shortcut nobody uses — across every editor ever
     // shipped. Hovering a clip shows its name and the alignment tools;
@@ -534,6 +612,7 @@ pub const CLIP_HINTS: &[&str] = &[
     "A: align 2nd selected clip to 1st (vocal double → lead)",
     "Q: quantize selected clip starts to the beat grid",
     ", / . : nudge selected by one step · < / > : by 1 ms",
+    "g: group selection into a composition · G: ungroup",
 ];
 
 /// A stable, well-separated colour per site id. Deterministic so the same peer

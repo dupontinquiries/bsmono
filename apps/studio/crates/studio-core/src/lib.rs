@@ -76,6 +76,7 @@ id_type!(ClipId, "A clip's stable identity. Never reused, never an index — thi
 id_type!(TrackId, "A track's stable identity.");
 id_type!(SourceId, "A media source (Audacity's sequence/blocks, kdenlive's bin clip). The timeline references samples; it never owns them.");
 id_type!(BusId, "A bus's stable identity. Busses form a routing graph (parent hierarchy plus sends), not a flat list, which is why they get ids rather than being addressed by position.");
+id_type!(GroupId, "A composition's stable identity: a named set of clips the timeline folds to one block — kdenlive's pre-batched group, After Effects' precomp, as the smallest model that supports the gesture. Membership is a PROJECT fact (a collaborator sees your composition); folded open or closed is view state in the device's workspace sidecar, the solo rule.");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackKind { Video, Audio }
@@ -199,6 +200,18 @@ pub struct Project {
     /// `serde(default)` so any pre-automation serialization still loads.
     #[serde(default)]
     pub automation: BTreeMap<AutoTarget, Vec<(Ticks, f32)>>,
+    /// Compositions (see [`GroupId`]). A clip may sit in several groups; a
+    /// removed clip may dangle in one — the automation rule again:
+    /// harmless, filtered at draw time, cheaper than a second cleanup
+    /// undo could not restore.
+    #[serde(default)]
+    pub groups: BTreeMap<GroupId, Group>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    pub name: String,
+    pub clips: Vec<ClipId>,
 }
 
 /// What an automation lane drives. Track and bus gain first — the volume
@@ -298,6 +311,18 @@ pub enum Op {
     SetBusSends { id: BusId, sends: Vec<Send> },
     /// `bus: None` routes the track straight to master.
     SetRoute { track: TrackId, bus: Option<BusId> },
+    /// Re-parent a bus — the INPUT side of the graph, so a mixer strip can
+    /// say "this feeds me" instead of routing only ever being edited from
+    /// the source end and only at creation. `None` is master. Refused when
+    /// the new parent chain reaches back to `id`: a bus cannot feed itself.
+    SetBusParent { id: BusId, parent: Option<BusId> },
+    /// Create or restate a composition, absolutely — name and full
+    /// membership every time, the LWW-friendly shape. Refused empty: a
+    /// group of nothing folds to nothing.
+    SetGroup { id: GroupId, name: String, clips: Vec<ClipId> },
+    /// Dissolve a composition. Its clips are untouched — ungrouping is an
+    /// organizational act, never an edit to the music.
+    RemoveGroup { id: GroupId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,6 +330,9 @@ pub enum EditError {
     NoSuchClip(ClipId),
     /// A `RemoveAutoPoint` aimed at a point that is not there.
     NoSuchAutoPoint,
+    /// A `SetGroup` with no members.
+    EmptyGroup,
+    NoSuchGroup(GroupId),
     NoSuchTrack(TrackId),
     TrackLocked(TrackId),
     /// Refused because clips are still on this track — see `Op::RemoveTrack`.
@@ -568,6 +596,46 @@ impl Project {
                 let inv = Op::SetRoute { track: *track, bus: t.route };
                 t.route = *bus;
                 Ok(inv)
+            }
+            Op::SetBusParent { id, parent } => {
+                let Some(b) = self.busses.get(id) else {
+                    return Err(EditError::NoSuchBus(*id));
+                };
+                if let Some(p) = parent {
+                    if !self.busses.contains_key(p) {
+                        return Err(EditError::NoSuchBus(*p));
+                    }
+                    // Walk the proposed parent's chain; reaching `id` means
+                    // the graph would feed itself. Capped at the bus count
+                    // so even a corrupt project terminates.
+                    let mut at = *p;
+                    for _ in 0..=self.busses.len() {
+                        if at == *id { return Err(EditError::BusCycle { id: *id }); }
+                        match self.busses.get(&at).and_then(|b| b.parent) {
+                            Some(next) => at = next,
+                            None => break,
+                        }
+                    }
+                }
+                let inv = Op::SetBusParent { id: *id, parent: b.parent };
+                self.busses.get_mut(id).unwrap().parent = *parent;
+                Ok(inv)
+            }
+            Op::SetGroup { id, name, clips } => {
+                if clips.is_empty() {
+                    return Err(EditError::EmptyGroup);
+                }
+                let inv = match self.groups.get(id) {
+                    Some(old) => Op::SetGroup { id: *id, name: old.name.clone(),
+                                                clips: old.clips.clone() },
+                    None => Op::RemoveGroup { id: *id },
+                };
+                self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone() });
+                Ok(inv)
+            }
+            Op::RemoveGroup { id } => {
+                let old = self.groups.remove(id).ok_or(EditError::NoSuchGroup(*id))?;
+                Ok(Op::SetGroup { id: *id, name: old.name, clips: old.clips })
             }
         }
     }
@@ -1433,5 +1501,63 @@ mod automation_tests {
         assert_eq!(eval_lane(&[], Ticks(0)), 1.0, "no lane is a transparent ride");
         // A negative value never reaches the mix as a phase flip.
         assert_eq!(eval_lane(&[(Ticks(0), -2.0)], Ticks(5)), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod group_and_bus_input_tests {
+    use super::*;
+
+    fn project() -> Project {
+        let mut p = Project::default();
+        for id in [1u64, 2, 3] {
+            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: format!("B{id}"),
+                parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn reparenting_a_bus_is_undoable_and_a_cycle_is_refused_by_name() {
+        let mut p = project();
+        // Chain: 3 → 2 → 1 → master, built from the INPUT side.
+        p.apply(&Op::SetBusParent { id: BusId(2), parent: Some(BusId(1)) }).unwrap();
+        let inv = p.apply(&Op::SetBusParent { id: BusId(3), parent: Some(BusId(2)) }).unwrap();
+        assert_eq!(p.busses[&BusId(3)].parent, Some(BusId(2)));
+        // 1 ← 3 would make the chain feed itself: refused, said which bus.
+        assert!(matches!(p.apply(&Op::SetBusParent { id: BusId(1), parent: Some(BusId(3)) }),
+                         Err(EditError::BusCycle { id: BusId(1) })));
+        assert!(matches!(p.apply(&Op::SetBusParent { id: BusId(1), parent: Some(BusId(1)) }),
+                         Err(EditError::BusCycle { .. })), "self-feeding is the shortest cycle");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.busses[&BusId(3)].parent, None, "undo puts the input back");
+    }
+
+    #[test]
+    fn a_group_restates_absolutely_and_dissolving_touches_no_clip() {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A".into(), muted: false, locked: false, gain: 1.0, route: None },
+            at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        for id in [1u64, 2] {
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1),
+                track: TrackId(1), pos: Ticks::from_seconds(id as f64 * 2.0),
+                src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0),
+                gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        assert!(matches!(p.apply(&Op::SetGroup { id: GroupId(1), name: "hook".into(),
+                                                  clips: vec![] }),
+                         Err(EditError::EmptyGroup)));
+        let inv = p.apply(&Op::SetGroup { id: GroupId(1), name: "hook".into(),
+                                          clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+        assert!(matches!(inv, Op::RemoveGroup { .. }), "undo of a new group dissolves it");
+        let clips_before = p.clips.clone();
+        let inv2 = p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
+        assert_eq!(p.clips, clips_before, "ungrouping is organizational, never musical");
+        p.apply(&inv2).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].name, "hook");
     }
 }

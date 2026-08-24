@@ -108,6 +108,9 @@ pub struct Studio {
     /// full-screen tabs. The tabs remain the phone's layout; this is the
     /// desktop's "shown together".
     pub combined: bool,
+    /// Compositions folded closed ON THIS DEVICE — view state beside
+    /// `combined`, persisted in the workspace sidecar, never an op.
+    pub closed_groups: std::collections::BTreeSet<studio_core::GroupId>,
     /// The bus faders' twin of `mixer_drag`.
     pub bus_drag: Option<(studio_core::BusId, f32)>,
     /// Motions (the Helix keymap) or Playing (the keyboard is a piano).
@@ -154,6 +157,7 @@ impl Studio {
             auto_target: None,
             auto_drag: None,
             combined: false,
+            closed_groups: Default::default(),
             bus_drag: None,
             input_mode: Default::default(),
             octave: 0,
@@ -1250,7 +1254,7 @@ pub struct App {
     /// refresh button), not per frame: a directory walk per frame on a
     /// phone's flash is how battery dies.
     library_root: std::path::PathBuf,
-    library: Vec<library::LibraryEntry>,
+    library_tree: library::TreeState,
     library_open: bool,
     /// The export dialog's plan while it is open, plus its last refusal —
     /// shown inline so a bad plan is a message, not a closed window.
@@ -1313,6 +1317,8 @@ impl Default for App {
             .find(|p| p.label() == ws.panel) { studio.panel = *p; }
         studio.view.px_per_sec = ws.px_per_sec;
         studio.view.scroll = studio_core::Ticks(ws.scroll_ticks);
+        studio.closed_groups = ws.closed_groups.iter()
+            .map(|g| studio_core::GroupId(*g)).collect();
         studio.status = match load_note {
             Some(e) => format!("{e} — started fresh (Ctrl+S will overwrite!)"),
             None => format!("{} — audition: {}", studio.status, sink.describe()),
@@ -1337,7 +1343,7 @@ impl Default for App {
         let library_root = std::env::var("STUDIO_LIBRARY")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| "library".into());
-        let library = library::scan(&library_root);
+        let library_tree = library::TreeState::default();
         let midi = midi::MidiIn::open(std::env::var("STUDIO_MIDI").ok().as_deref()).ok();
         let analog = WootingAnalog::default();
         studio.status = format!("{} — {}", studio.status, analog.0.describe());
@@ -1345,7 +1351,7 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
-              carrier, project_path, library_root, library, library_open: true,
+              carrier, project_path, library_root, library_tree, library_open: true,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1393,6 +1399,32 @@ impl eframe::App for App {
                 '.' => { self.studio.nudge_selected(step); continue; }
                 '<' => { self.studio.nudge_selected(studio_core::Ticks(-ms.0)); continue; }
                 '>' => { self.studio.nudge_selected(ms); continue; }
+                'g' if self.studio.selection.len() >= 2 => {
+                    let id = studio_core::GroupId(
+                        self.studio.session.doc.project.groups.keys()
+                            .map(|x| x.0).max().unwrap_or(0) + 1);
+                    let n = self.studio.session.doc.project.groups.len() + 1;
+                    self.studio.edit(studio_core::Op::SetGroup {
+                        id, name: format!("comp {n}"),
+                        clips: self.studio.selection.clone() }, "grouped");
+                    // Born CLOSED: the point of grouping is the fold.
+                    self.studio.closed_groups.insert(id);
+                    continue;
+                }
+                'G' => {
+                    let selected: Vec<_> = self.studio.session.doc.project.groups.iter()
+                        .filter(|(_, g)| g.clips.iter()
+                            .any(|c| self.studio.selection.contains(c)))
+                        .map(|(id, _)| *id).collect();
+                    if selected.is_empty() {
+                        self.studio.status = "ungroup: select a composition's clips first".into();
+                    }
+                    for id in selected {
+                        self.studio.edit(studio_core::Op::RemoveGroup { id }, "ungrouped");
+                        self.studio.closed_groups.remove(&id);
+                    }
+                    continue;
+                }
                 _ => {}
             }
             self.studio.key(studio_egui::keys::Key::c(ch));
@@ -1488,6 +1520,8 @@ impl eframe::App for App {
                         }.to_string(),
                         px_per_sec: self.studio.view.px_per_sec,
                         scroll_ticks: self.studio.view.scroll.0,
+                        closed_groups: self.studio.closed_groups.iter()
+                            .map(|g| g.0).collect(),
                     });
                     if self.studio.save_to(&path).is_ok() {
                         // The save happened; history is the extra. A missing
@@ -1801,13 +1835,15 @@ impl eframe::App for App {
             egui::SidePanel::left("library").default_width(210.0).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.small_button("⟳").on_hover_text("rescan").clicked() {
-                        self.library = library::scan(&self.library_root);
+                        self.library_tree.refresh();
                     }
                     if ui.small_button("hide").clicked() {
                         self.library_open = false;
                     }
                 });
-                lib_action = library::show(ui, &self.library_root, &self.library, &colors);
+                lib_action = library::show_tree(
+                    ui, &self.library_root, &mut self.library_tree,
+                    &self.studio.rack, &self.studio.session.doc.project, &colors);
             });
         }
         if let Some(action) = lib_action {
@@ -1816,6 +1852,112 @@ impl eframe::App for App {
             let (path, to_rack) = match action {
                 library::LibraryAction::ToRack(p) => (p, true),
                 library::LibraryAction::ToTimeline(p) => (p, false),
+                library::LibraryAction::ReplaceChannel(i, p) => {
+                    // Swap the sample under an existing channel, keeping
+                    // its steps and rolls — "try this snare in the pattern
+                    // I already have", the offer the classifier makes.
+                    // import_audio adds a fresh channel (its contract for
+                    // the plain rack door); replacement moves that new
+                    // kind onto the old channel and drops the extra.
+                    match std::fs::read(&p).ok().and_then(|raw| {
+                        let hint = p.extension().and_then(|e| e.to_str())
+                            .map(str::to_owned);
+                        studio_media::decode_bytes(raw.clone(), hint.as_deref())
+                            .ok().map(|a| (raw, a))
+                    }) {
+                        Some((raw, audio)) => {
+                            let name = p.file_stem().and_then(|x| x.to_str())
+                                .unwrap_or("sample").to_owned();
+                            let id = self.studio.import_audio(
+                                &name, &p.display().to_string(), &audio);
+                            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                            self.audio.insert(id, audio);
+                            self.studio.register_asset(id, &raw);
+                            let added = self.studio.rack.channels.len().saturating_sub(1);
+                            if i < added {
+                                self.studio.rack.channels[i].kind =
+                                    studio_live::SynthKind::Sampler { source: id };
+                                self.studio.rack.channels[i].name = name.clone();
+                                self.studio.rack.channels.truncate(added);
+                                self.studio.selected_channel = i;
+                                self.studio.loop_dirty = true;
+                                self.studio.status = format!("channel {} is now '{name}'", i + 1);
+                            }
+                        }
+                        None => self.studio.status =
+                            format!("could not decode {}", p.display()),
+                    }
+                    return;
+                }
+                library::LibraryAction::ToNewTrackBus(p, bus) => {
+                    // The smart bus choice: an existing drum bus by name,
+                    // or a new 'Drums' bus made on the spot; then a new
+                    // audio track routed into it, and the clip at the
+                    // playhead on that track — every step an ordinary op.
+                    let bus_id = match bus {
+                        Some(b) => b,
+                        None => {
+                            let b = studio_core::BusId(
+                                self.studio.session.doc.project.busses.keys()
+                                    .map(|x| x.0).max().unwrap_or(0) + 1);
+                            self.studio.edit(studio_core::Op::AddBus {
+                                bus: studio_core::Bus { id: b, name: "Drums".into(),
+                                    parent: None, gain: 1.0, chain: vec![],
+                                    sends: vec![], muted: false } }, "drum bus");
+                            b
+                        }
+                    };
+                    let name = p.file_stem().and_then(|x| x.to_str())
+                        .unwrap_or("drum").to_owned();
+                    let track = studio_core::TrackId(
+                        self.studio.session.doc.project.tracks.iter()
+                            .map(|t| t.id.0).max().unwrap_or(0) + 1);
+                    let at = self.studio.session.doc.project.tracks.len();
+                    self.studio.edit(studio_core::Op::AddTrack {
+                        track: studio_core::Track { id: track,
+                            kind: studio_core::TrackKind::Audio, name: name.clone(),
+                            muted: false, locked: false, gain: 1.0,
+                            route: Some(bus_id) }, at }, "drum track");
+                    // import_clip lands at the playhead on the FIRST audio
+                    // track with room; a purpose-built track wants the clip
+                    // on ITSELF, so place it directly.
+                    match std::fs::read(&p).ok().and_then(|raw| {
+                        let hint = p.extension().and_then(|e| e.to_str())
+                            .map(str::to_owned);
+                        studio_media::decode_bytes(raw.clone(), hint.as_deref())
+                            .ok().map(|a| (raw, a))
+                    }) {
+                        Some((raw, audio)) => {
+                            let sid = studio_core::SourceId(
+                                self.studio.session.doc.project.sources.keys()
+                                    .map(|x| x.0).max().unwrap_or(0) + 1);
+                            let len = studio_core::Ticks::from_samples(
+                                audio.frames() as i64, audio.sample_rate);
+                            self.studio.edit(studio_core::Op::AddSource {
+                                source: studio_core::Source { id: sid,
+                                    path: p.display().to_string(), len,
+                                    sample_rate: audio.sample_rate,
+                                    channels: audio.channels.len() as u16,
+                                    has_video: false } }, "sample");
+                            let cid = studio_core::ClipId(
+                                self.studio.session.doc.project.clips.keys()
+                                    .map(|x| x.0).max().unwrap_or(0) + 1);
+                            self.studio.edit(studio_core::Op::AddClip {
+                                clip: studio_core::Clip { id: cid, source: sid,
+                                    track, pos: self.studio.playhead(),
+                                    src_in: studio_core::Ticks::ZERO, len,
+                                    gain: 1.0, effects: vec![] } }, "placed");
+                            self.peaks.insert(sid, studio_audio::Peaks::build(&audio, 256, 256));
+                            self.audio.insert(sid, audio);
+                            self.studio.register_asset(sid, &raw);
+                            self.studio.status = format!(
+                                "'{name}' on its own track into the drum bus");
+                        }
+                        None => self.studio.status =
+                            format!("could not decode {}", p.display()),
+                    }
+                    return;
+                }
                 library::LibraryAction::Preview(p) => {
                     match studio_media::decode_file(&p) {
                         Ok(a) => {
@@ -1860,7 +2002,16 @@ impl eframe::App for App {
             }
         }
 
-        if self.studio.combined && self.side_slot != SideSlot::Off {
+        let has_video = self.studio.session.doc.project.clips.values().any(|c| {
+            self.studio.session.doc.project.tracks.iter()
+                .any(|t| t.id == c.track && t.kind == studio_core::TrackKind::Video)
+        });
+        // The viewfinder collapses when there is no video to find: a music
+        // project gets the full width back instead of a panel explaining
+        // its own emptiness.
+        let slot_visible = self.side_slot != SideSlot::Off
+            && !(self.side_slot == SideSlot::Viewport && !has_video);
+        if self.studio.combined && slot_visible {
             egui::SidePanel::right("side-slot").resizable(true)
                 .default_width(360.0).show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -1938,7 +2089,25 @@ impl eframe::App for App {
                     let tr = studio_egui::timeline(ui, &self.studio.session.doc,
                                                    &mut self.studio.view,
                                                    &colors, ph, &sel, &self.peaks,
-                                                   self.studio.trim_side);
+                                                   self.studio.trim_side,
+                                                   &self.studio.closed_groups);
+                    if let Some(g) = tr.toggled_group {
+                        if !self.studio.closed_groups.remove(&g) {
+                            self.studio.closed_groups.insert(g);
+                        }
+                    }
+                    if let Some(g) = tr.clicked_group {
+                        // Selecting the fold selects its members: nudge,
+                        // quantize, align and delete then act on the
+                        // composition as one thing — the keyboard already
+                        // works on selections, so the fold needs no verbs
+                        // of its own.
+                        if let Some(grp) = self.studio.session.doc.project.groups.get(&g) {
+                            self.studio.selection = grp.clips.iter().copied()
+                                .filter(|c| self.studio.session.doc.project.clips.contains_key(c))
+                                .collect();
+                        }
+                    }
                     if let Some(id) = tr.clicked {
                         // Click selects; shift-click toggles membership — the
                         // return the shell used to throw away, which made

@@ -25,22 +25,28 @@ pub struct WorkspaceState {
     pub side_slot: String,
     pub px_per_sec: f32,
     pub scroll_ticks: i64,
+    /// Compositions folded closed, as ids — per device, like everything
+    /// else here: your fold is not your collaborator's fold.
+    pub closed_groups: Vec<u64>,
 }
 
 impl Default for WorkspaceState {
     fn default() -> Self {
         WorkspaceState { combined: false, panel: "Timeline".into(),
                          side_slot: "viewport".into(),
-                         px_per_sec: 100.0, scroll_ticks: 0 }
+                         px_per_sec: 100.0, scroll_ticks: 0,
+                         closed_groups: Vec::new() }
     }
 }
 
 impl WorkspaceState {
     pub fn encode(&self) -> String {
         format!("# per-device layout; safe to delete, never load-bearing\n\
-                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\n",
+                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\n",
                 self.combined, self.panel, self.side_slot,
-                self.px_per_sec, self.scroll_ticks)
+                self.px_per_sec, self.scroll_ticks,
+                self.closed_groups.iter().map(|g| g.to_string())
+                    .collect::<Vec<_>>().join(","))
     }
     /// Parse leniently: defaults underneath, known keys on top, everything
     /// else ignored. There is no error case ON PURPOSE.
@@ -60,6 +66,8 @@ impl WorkspaceState {
                 "scroll_ticks" => if let Ok(t) = v.trim().parse::<i64>() {
                     if t >= 0 { w.scroll_ticks = t; }
                 },
+                "closed_groups" => w.closed_groups = v.trim().split(',')
+                    .filter_map(|x| x.trim().parse().ok()).collect(),
                 _ => {} // a newer build's key, not our business
             }
         }
@@ -90,7 +98,8 @@ mod tests {
     #[test]
     fn the_layout_round_trips_and_garbage_means_defaults_never_failure() {
         let w = WorkspaceState { combined: true, panel: "Rack".into(),
-            side_slot: "mixer".into(), px_per_sec: 250.0, scroll_ticks: 12345 };
+            side_slot: "mixer".into(), px_per_sec: 250.0, scroll_ticks: 12345,
+            closed_groups: vec![3, 9] };
         assert_eq!(WorkspaceState::decode(&w.encode()), w);
         // A newer build's key rides along harmlessly; garbage lines too.
         let with_future = format!("{}\nfuture_key=whatever\n<<<garbage", w.encode());

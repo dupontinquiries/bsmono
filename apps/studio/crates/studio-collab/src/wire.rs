@@ -31,11 +31,14 @@
 //! can be receiving live edits while the catch-up is still arriving.
 
 use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
-use studio_core::{AutoTarget, Bus, BusId, Clip, ClipId, Effect, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+use studio_core::{AutoTarget, Bus, BusId, Clip, ClipId, Effect, GroupId, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
 use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
+///
+/// v11: `Op` gained the input-side routing and composition set —
+/// `SetBusParent`(22), `SetGroup`(23), `RemoveGroup`(24) — and `GroupId`.
 ///
 /// v10: `Op` gained the automation pair — `SetAutoPoint`(20) /
 /// `RemoveAutoPoint`(21) — and with them the `AutoTarget` encoding
@@ -71,7 +74,7 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 10;
+pub const WIRE_VERSION: u8 = 11;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -326,6 +329,19 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::RemoveAutoPoint { target, at } => {
             put_u8(o, 21); put_auto_target(o, *target); put_ticks(o, *at);
         }
+        Op::SetBusParent { id, parent } => {
+            put_u8(o, 22); put_u64(o, id.0);
+            match parent {
+                Some(p) => { put_u8(o, 1); put_u64(o, p.0); }
+                None => put_u8(o, 0),
+            }
+        }
+        Op::SetGroup { id, name, clips } => {
+            put_u8(o, 23); put_u64(o, id.0); put_str(o, name);
+            put_u16(o, clips.len().min(u16::MAX as usize) as u16);
+            for c in clips { put_u64(o, c.0); }
+        }
+        Op::RemoveGroup { id } => { put_u8(o, 24); put_u64(o, id.0); }
     }
 }
 
@@ -367,6 +383,19 @@ fn get_op(r: &mut R) -> Option<Op> {
         19 => Op::SetTrackGain { id: TrackId(r.u64()?), gain: r.f32()? },
         20 => Op::SetAutoPoint { target: get_auto_target(r)?, at: r.ticks()?, value: r.f32()? },
         21 => Op::RemoveAutoPoint { target: get_auto_target(r)?, at: r.ticks()? },
+        22 => Op::SetBusParent {
+            id: BusId(r.u64()?),
+            parent: match r.u8()? { 0 => None, 1 => Some(BusId(r.u64()?)), _ => return None },
+        },
+        23 => {
+            let id = GroupId(r.u64()?);
+            let name = r.str()?;
+            let n = r.u16()? as usize;
+            let mut clips = Vec::with_capacity(n.min(4096));
+            for _ in 0..n { clips.push(ClipId(r.u64()?)); }
+            Op::SetGroup { id, name, clips }
+        }
+        24 => Op::RemoveGroup { id: GroupId(r.u64()?) },
         _ => return None, // an op kind from a newer build: refuse, don't guess
     })
 }
@@ -1020,7 +1049,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 10, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 11, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1112,6 +1141,26 @@ mod automation_wire_tests {
                                   at: Ticks(705_600_000) },
         ] {
             let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 7, site: SiteId(2) }, op });
+            assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_wire_tests {
+    use super::*;
+    use studio_core::GroupId;
+
+    #[test]
+    fn the_v11_ops_survive_the_wire_exactly() {
+        for op in [
+            Op::SetBusParent { id: BusId(3), parent: Some(BusId(9)) },
+            Op::SetBusParent { id: BusId(3), parent: None },
+            Op::SetGroup { id: GroupId(7), name: "hook".into(),
+                           clips: vec![ClipId(1), ClipId(5)] },
+            Op::RemoveGroup { id: GroupId(7) },
+        ] {
+            let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 3, site: SiteId(1) }, op });
             assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
         }
     }
