@@ -324,3 +324,22 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   should chunk", grep every caller of the primitive BEFORE committing. Two
   sessions were spent on one defect because the first fix stopped at the
   backtrace it was handed.
+
+## 16. Read-harness wiring (C11-14c/14d closed; what is left)
+
+- **DONE**: agent_context builds from read_harness at the model's class;
+  Tool::GitLog + `!<nonce> log N` + protocol note; Workspace carries a model
+  label. End-to-end test against a real repo with a hostile subject/branch.
+- **C11-16a — the CHAT prompt (not just the agent) still hand-rolls its file
+  context.** agent_context covers agent/fan runs; a plain `:ws` chat turn
+  (the field transcript where the 1B said "we would need to see the full
+  definition") goes through a different assembly. Find it and give it the
+  same treatment — this is the exact field symptom.
+- **C11-16b — feed ModelClass from the engine's PARAM COUNT, not the label.**
+  resolve() already prefers Some(params); nobody passes it. The engine knows
+  its own tensor-derived size; thread it to chat/workspace.
+- **C11-16c — read_range through the harness**: line-numbered chunks at
+  budget.chunk_lines, so a Small model gets 60 lines rather than a whole
+  file. The budget field exists and is still unused by the read tools.
+- **C11-16d — `Tool::GitLog` for a PATH** (`git log -- <path>`): "what
+  happened to this file" is the question a repo-reading agent actually asks.
