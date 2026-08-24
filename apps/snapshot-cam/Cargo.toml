@@ -17,5 +17,14 @@ default = ["app"]
 app = ["dep:eframe", "dep:egui"]
 
 [dependencies]
-eframe = { version = "0.34", optional = true }
+# default-features = false + glow, the fleet pattern (see voiceterm-egui's
+# manifest for the build-size half of the reason). The runtime half was
+# learned HERE: eframe 0.34's default features include wgpu but not glow, so
+# Renderer::default() picked wgpu, and egui-wgpu's default device descriptor
+# requests wgpu::Limits::default() — max_color_attachments: 8 — without
+# clamping to the adapter. On a phone GPU that allows 5, the app died at
+# startup with Wgpu(RequestDeviceError(LimitsExceeded)). glow never requests
+# device limits; it is also what every other 0.34 app here ships.
+# maintenance/tools/eframe_backend_check.py enforces the pattern tree-wide.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 egui = { version = "0.34", optional = true }

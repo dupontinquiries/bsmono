@@ -31,7 +31,12 @@ candle-core = "0.11"
 candle-nn   = "0.11"
 
 # --- GUI ---
-eframe = { version = "0.34", default-features = true, optional = true }
+# default-features = false + glow: eframe 0.34's defaults enable wgpu and NOT
+# glow, and egui-wgpu's default device request (Limits::default, 8 color
+# attachments, unclamped) crashed snapshot-cam at startup on a phone GPU that
+# allows 5. glow is what the rest of the fleet ships; eframe_backend_check.py
+# enforces it.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 # 0.34, matching the other thirteen egui apps and uikit-egui. beatspace was the
 # only crate on 0.35, which meant the kit's Ui and this app's Ui were different
 # types and no shared widget could cross — another manifest in this tree already
