@@ -7623,6 +7623,19 @@ impl Game {
                 Some(t) if *t != Vec3::ZERO => base * Mat4::from_translation(*t),
                 _ => base,
             };
+            // DETECTED WHEELS SPIN TOO. `split_wheels` tags wheels it
+            // recognises and the match below turns those; an imported bot
+            // whose wheels are not at tidy corners got no tags, so nothing
+            // turned. `fittings.rollers` is the fallback, spun on the same
+            // `wheel_spin` the tagged ones use so they cannot drift apart.
+            let base = match active.fittings.rollers.iter().find(|(i, _)| *i == pi) {
+                Some((_, pivot)) if matches!(prim.tag, model::Tag::Body) => {
+                    base * Mat4::from_translation(*pivot)
+                        * Mat4::from_rotation_x(-wheel_spin)
+                        * Mat4::from_translation(-*pivot)
+                }
+                _ => base,
+            };
             let base = match (&turret_q, active.fittings.turret.contains(&pi)) {
                 (Some(q), true) => {
                     let r = active.fittings.ring;

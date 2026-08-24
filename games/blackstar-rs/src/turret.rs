@@ -47,6 +47,11 @@ pub struct Fittings {
     pub ring: Vec3,
     /// prim indices that read as treads (detected, not yet animated)
     pub treads: Vec<usize>,
+    /// round low outboard prims with their spin pivots, for hulls whose
+    /// wheels `model::split_wheels` never found. Imported bots mostly fall
+    /// in that gap: their wheels are not at tidy corners with a shared
+    /// radius, so nothing was tagged and nothing turned.
+    pub rollers: Vec<(usize, Vec3)>,
 }
 
 impl Fittings {
@@ -141,6 +146,77 @@ pub fn find(prims: &[&[Vec3]]) -> Fittings {
         }
     }
 
+    // GROW THE TURRET INTO ITS OWN ASSEMBLY.
+    //
+    // The seed test finds prims above the shoulder line, and on a real
+    // tank that is often just the BARREL — long, thin, high — while the
+    // turret body it swings from sits lower and fails "above the
+    // shoulder". Rotating the seed alone is exactly the reported symptom:
+    // the barrel moves and the turret does not follow. So the seed is
+    // grown outward to anything overlapping its box, once, which picks up
+    // the mantlet, the basket and the cupola without walking down the
+    // hull.
+    if !out.turret.is_empty() {
+        let (mut tlo, mut thi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for i in &out.turret {
+            for v in prims[*i].iter() {
+                tlo = tlo.min(*v);
+                thi = thi.max(*v);
+            }
+        }
+        // a little slack, so a part touching the ring counts as attached
+        let grow = ((thi - tlo) * 0.22).max(Vec3::splat(1e-3));
+        let (glo, ghi) = (tlo - grow, thi + grow);
+        for (i, p) in prims.iter().enumerate() {
+            if out.turret.contains(&i) || out.treads.contains(&i) || p.len() < 6 {
+                continue;
+            }
+            let (mut plo, mut phi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for v in p.iter() {
+                plo = plo.min(*v);
+                phi = phi.max(*v);
+            }
+            // must OVERLAP the turret box and sit at or above its base:
+            // a part hanging below the ring is hull, not turret
+            let overlaps = plo.x <= ghi.x && phi.x >= glo.x && plo.z <= ghi.z && phi.z >= glo.z;
+            let high_enough = phi.y > tlo.y;
+            // and it must not be most of the body: that is the hull
+            let big = (phi - plo).max_element() > (thi - tlo).max_element() * 2.0;
+            if overlaps && high_enough && !big {
+                out.turret.push(i);
+            }
+        }
+    }
+
+    // ROLLERS: round, low, outboard prims — the wheels `split_wheels` did
+    // not tag because they are not at tidy corners with a matched radius.
+    // Detected here so the draw path has something to spin; the pivot is
+    // the prim's own centre, which is where a wheel turns.
+    for (i, p) in prims.iter().enumerate() {
+        if out.turret.contains(&i) || out.treads.contains(&i) || p.len() < 12 {
+            continue;
+        }
+        let (mut plo, mut phi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        let mut sum = Vec3::ZERO;
+        for v in p.iter() {
+            plo = plo.min(*v);
+            phi = phi.max(*v);
+            sum += *v;
+        }
+        let c = sum / p.len() as f32;
+        let e = (phi - plo) * 0.5;
+        // round in the side view: height and length within a quarter of
+        // each other, and narrow across the hull
+        let round = (e.y - e.z).abs() < e.y.max(e.z) * 0.28;
+        let narrow = e.x < e.y.max(e.z) * 0.9;
+        let low = (c.y - mid.y) / half.y < -0.1;
+        let outboard = (c.x - mid.x).abs() / half.x > 0.25;
+        let small = e.max_element() < half.max_element() * 0.5;
+        if round && narrow && low && outboard && small {
+            out.rollers.push((i, c));
+        }
+    }
+
     // A turret is a thing, not a scattering: a "turret" made of a dozen
     // separate small prims is more likely to be roof detail, and rotating
     // roof detail away from the hull it belongs to looks far worse than
@@ -206,6 +282,43 @@ mod tests {
         // through the hull; the ring has to be down on the deck
         assert!(f.ring.y < 0.75, "the pivot is up in the turret's mass: {:?}", f.ring);
         assert!((f.ring.x - 0.0).abs() < 0.5, "the ring drifted off the hull: {:?}", f.ring);
+    }
+
+    #[test]
+    fn the_whole_turret_follows_the_barrel() {
+        // the reported symptom: only the barrel turned. The barrel is what
+        // clears the shoulder test; the turret body it swings from sits
+        // lower and has to be grown into.
+        let mut t = tank();
+        // a low, wide turret body under a high thin barrel
+        t.push(slab(Vec3::new(0.0, 0.55, -0.2), Vec3::new(0.8, 0.18, 0.9), 300));
+        t.push(slab(Vec3::new(0.0, 0.8, 1.1), Vec3::new(0.07, 0.07, 1.3), 120));
+        let refs: Vec<&[Vec3]> = t.iter().map(|v| v.as_slice()).collect();
+        let f = find(&refs);
+        assert!(f.turret.contains(&5), "the barrel is not in the turret: {}", f.report());
+        assert!(
+            f.turret.contains(&4),
+            "the barrel turns but the turret body does not follow: {}",
+            f.report()
+        );
+        assert!(!f.turret.contains(&0), "the hull was swept into the turret: {}", f.report());
+    }
+
+    #[test]
+    fn wheels_that_split_wheels_would_miss_are_still_found() {
+        // round, low, outboard, narrow: spinnable even when they are not
+        // at tidy corners with a matched radius
+        let mut all = vec![slab(Vec3::ZERO, Vec3::new(0.9, 0.5, 2.2), 500)];
+        for (x, z) in [(-1.0f32, -1.4f32), (1.0, -1.4), (-1.0, 1.5), (1.0, 1.5)] {
+            all.push(slab(Vec3::new(x, -0.42, z), Vec3::new(0.09, 0.32, 0.32), 90));
+        }
+        let refs: Vec<&[Vec3]> = all.iter().map(|v| v.as_slice()).collect();
+        let f = find(&refs);
+        assert_eq!(f.rollers.len(), 4, "found {} rollers: {}", f.rollers.len(), f.report());
+        for (i, pivot) in &f.rollers {
+            assert!(*i > 0, "the hull was called a wheel");
+            assert!(pivot.y < 0.0, "the spin pivot is not at the wheel: {pivot:?}");
+        }
     }
 
     #[test]

@@ -126,6 +126,41 @@ fn guess_for(pose_dir: &Path) -> Option<(orient::Guess, Vec<crate::meshgen::Vert
             }
         }
     }
+    // WHAT THE BODY WILL ACTUALLY SIT ON. Two rounds of guessing at the
+    // feet have now cost more than measuring would have, so this reports
+    // the seating numbers per pose: the loader's `ride_h` (how far the
+    // lowest point hangs below the origin), `half_h`, and the gap between
+    // them — which is exactly how far a body sinks when a clearance is
+    // taken from the box instead of from where it stands.
+    {
+        let pts: Vec<Vec<glam::Vec3>> = raws
+            .iter()
+            .map(|r| r.verts.iter().map(|v| glam::Vec3::from_array(v.pos)).collect())
+            .collect();
+        let refs: Vec<&[glam::Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+        let mass = crate::massfilter::classify(&refs);
+        if let Some((half, ride)) = crate::massfilter::bounds(&refs, &mass.keep) {
+            let sink = ride - half.y;
+            println!(
+                "       seat: ride_h {:.2}  half_h {:.2}  {}",
+                ride,
+                half.y,
+                if sink.abs() < 0.02 {
+                    "centred (box clearance would be right by luck)".to_string()
+                } else if sink > 0.0 {
+                    format!("origin is {sink:.2} ABOVE centre — a box clearance buries the feet by that much")
+                } else {
+                    format!("origin is {:.2} below centre — a box clearance floats it", -sink)
+                }
+            );
+        }
+        let sk = crate::skeleton::skeletonize(&refs);
+        println!("       {}", sk.report());
+        let f = crate::turret::find(&refs);
+        if f.has_turret() || f.tracked() || !f.rollers.is_empty() {
+            println!("       {}, {} rollers", f.report(), f.rollers.len());
+        }
+    }
     let verts = orient::all_verts(&raws);
     if verts.is_empty() {
         return None;
