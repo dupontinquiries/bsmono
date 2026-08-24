@@ -7609,6 +7609,25 @@ impl Game {
             None
         };
         let robot = self.xf.is_robot();
+        // STAND THE DESTINATION UP WITHOUT BENDING THE JOURNEY.
+        //
+        // The fold is coherent — the animation lines up from vehicle into
+        // robot — so the shared chassis frame is right and must not be
+        // touched. What is wrong is where it ENDS: an artist may author the
+        // robot standing along a different axis from the one the vehicle
+        // drives along, and a correct interpolation carries it there. So
+        // the leftover uprighting (`Model::settle`) is applied RAMPED by
+        // fold progress: identity while driving, full at the end, smooth
+        // in between. The animation is untouched; only its destination
+        // moves.
+        let settle_q = {
+            let t = self.xf.eased().clamp(0.0, 1.0);
+            if active.settle == Quat::IDENTITY || t <= 0.0 {
+                None
+            } else {
+                Some(Quat::IDENTITY.slerp(active.settle, t))
+            }
+        };
         for (pi, prim) in active.prims.iter().enumerate() {
             if !wheels && !matches!(prim.tag, model::Tag::Body) {
                 continue;
@@ -7635,6 +7654,10 @@ impl Game {
             // vehicle mode contains them inside the hull envelope so the
             // fold reads as a solid object rather than a skeleton in a box
             // (`contain`). Both are zero for a body that never needed it.
+            let base = match &settle_q {
+                Some(q) => base * Mat4::from_quat(*q),
+                None => base,
+            };
             let shift = if robot { active.tuck.get(pi) } else { active.pack.get(pi) };
             let base = match shift {
                 Some(t) if *t != Vec3::ZERO => base * Mat4::from_translation(*t),

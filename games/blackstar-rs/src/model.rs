@@ -68,6 +68,18 @@ pub struct Model {
     /// (`skeleton::compact`). Zero for a body with nothing sticking out,
     /// and applied only when folded to robot — a vehicle's wings are the
     /// right size for a vehicle.
+    /// UPRIGHTING FOR THIS POSE, on top of the chassis frame.
+    ///
+    /// The chassis frame has to be shared by every pose or the fold
+    /// tumbles — and the fold is visibly coherent, so that rule is right.
+    /// But a coherent fold can still END sideways: an artist may author the
+    /// robot standing along a different axis from the one the vehicle
+    /// drives along, and the interpolation carries it there smoothly and
+    /// correctly. One frame cannot fix that without breaking the fold.
+    /// This is the leftover rotation that stands THIS pose up, applied
+    /// ramped by fold progress so the animation stays continuous and only
+    /// the destination moves.
+    pub settle: Quat,
     pub tuck: Vec<Vec3>,
     /// per-prim pull-in for VEHICLE MODE: what it takes to get each limb
     /// inside the hull envelope, so a folded body reads as a solid object
@@ -1274,6 +1286,13 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     // the appendages; `compact` shortens each overhanging one along its
     // own axis to half its reach, which is the number that keeps a jet's
     // wings from being the whole silhouette when it stands up.
+    // What is still not upright after the chassis frame? Ask the same
+    // search again on the ORIENTED points: an answer other than identity
+    // means this pose stands along its own axis.
+    let settle = {
+        let vs: Vec<Vertex> = raws.iter().flat_map(|r| r.verts.iter().copied()).collect();
+        if vs.is_empty() { Quat::IDENTITY } else { find_orientation(&vs) }
+    };
     let (tuck, pack) = {
         let sk = crate::skeleton::skeletonize(&refs);
         (
@@ -1296,7 +1315,7 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, drive: Drive::Combustion, hover: None, tuck, pack, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
+    Model { prims, drive: Drive::Combustion, hover: None, settle, tuck, pack, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
             half_len: half.z, half_h: half.y, half_w: half.x, wheel_r,
             // Same sign convention as xform::Morph::bounds_at: -lo.y, the
             // distance from the origin to the pose's actual lowest point,
