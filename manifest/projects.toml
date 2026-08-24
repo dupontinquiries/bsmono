@@ -100,9 +100,9 @@ flatpak = true
 runtime = "tbd"          # GUI toolkit not yet confirmed
 targets = ["desktop"]
 notes = "AV1 encoding GUI; per-segment isolation/resume; runtime TBD"
-# STALE DUPLICATE: apps/av1tuner-m1 is the live fork and is ahead in all five
-# differing files (VVenC mkvmerge muxing, preflight check, verified cache hits).
-# See apps/av1tuner/DUPLICATE.md. Retire this entry once nothing references it.
+# RESOLVED (c11): av1tuner-m1 merged into apps/av1tuner (union of both sides'
+# fixes) and retired. This entry is the survivor. apps/av1tuner/DUPLICATE.md
+# has the full ledger; the fork's history remains in git.
 
 [apps.ambient-learner]
 path = "apps/ambient-learner"
@@ -563,16 +563,6 @@ flatpak = false
 runtime = "none"
 targets = ["desktop"]
 notes = "a Rust port of the kBM3 mel-spectrogram GAN. A tool rather than a shipped app. NOTE: needs libasound2-dev — `cargo check` fails in alsa-sys's build script without it, which is a host requirement rather than a code fault. Registered anyway so the dependency is discoverable from here instead of on first build."
-
-[apps.av1tuner-m1]
-path = "apps/av1tuner-m1"
-kind = "cargo"
-role = "tool"
-daemon = false
-flatpak = false
-runtime = "none"
-targets = ["desktop"]
-notes = "the M1 variant of av1tuner. Registered alongside av1tuner, which was already listed — the pair had drifted, with only one of them known to the build."
 
 [apps.echelon]
 path = "games/echelon"
