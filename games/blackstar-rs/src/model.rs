@@ -63,6 +63,12 @@ pub struct Model {
     pub drive: Drive,
     /// hover chassis, if this is a hovercar rather than a wheeled one
     pub hover: Option<crate::physics::Hover>,
+    /// per-prim pull-in for ROBOT MODE: how far each prim moves toward
+    /// the body to stop a wingspan from swallowing the bot
+    /// (`skeleton::compact`). Zero for a body with nothing sticking out,
+    /// and applied only when folded to robot — a vehicle's wings are the
+    /// right size for a vehicle.
+    pub tuck: Vec<Vec3>,
     /// what this hull carries: a turret to aim and treads to roll
     /// (`turret::find`). Indices are into `prims`, so the draw path can
     /// give the turret its own rotation without a second model.
@@ -1219,9 +1225,15 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
 
     // WHAT THIS HULL CARRIES. Measured in the oriented frame, so "on top"
     // and "along the side" mean what they say (`turret::find`).
-    let fittings = {
-        let refs: Vec<&[Vec3]> = prim_pts.iter().map(|v| v.as_slice()).collect();
-        crate::turret::find(&refs)
+    let refs: Vec<&[Vec3]> = prim_pts.iter().map(|v| v.as_slice()).collect();
+    let fittings = crate::turret::find(&refs);
+    // AND HOW MUCH OF IT IS IN THE WAY. The skeleton finds the core and
+    // the appendages; `compact` shortens each overhanging one along its
+    // own axis to half its reach, which is the number that keeps a jet's
+    // wings from being the whole silhouette when it stands up.
+    let tuck = {
+        let sk = crate::skeleton::skeletonize(&refs);
+        crate::skeleton::compact(&sk, refs.len(), 0.5)
     };
 
     let wheel_r = if wheel_bottom < wheel_top {
@@ -1235,7 +1247,7 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, drive: Drive::Combustion, hover: None, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
+    Model { prims, drive: Drive::Combustion, hover: None, tuck, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
             half_len: half.z, half_h: half.y, half_w: half.x, wheel_r,
             // Same sign convention as xform::Morph::bounds_at: -lo.y, the
             // distance from the origin to the pose's actual lowest point,

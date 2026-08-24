@@ -107,6 +107,7 @@ mod turret;
 mod raidflow;
 mod raidforge;
 mod shots;
+mod skeleton;
 mod sortie;
 mod stations;
 mod stealth;
@@ -3213,6 +3214,32 @@ impl Game {
         let vert = self.car.vel.dot(up);
         let horiz = (self.car.vel - up * vert).length();
         let boosting = self.car.flight || self.action_down(Action::Boost);
+        // HOW BADLY IS IT DOING, AND IS THERE ANYTHING TO LEAN ON.
+        // `limp()` is already 0..1 across the section damage, which is
+        // exactly the input the gait machine wants — no second damage
+        // model. The wall is probed with the SDF the physics already
+        // trusts: sample left and right at shoulder height and take the
+        // nearer, so a body only hugs a surface that is really there.
+        let hurt = self.body.limp();
+        let wall = if hurt > anim::CROUCH_HURT {
+            let side = self.car.rot * Vec3::X;
+            let at = self.car.pos + up * (self.car.half_h * 0.5);
+            let reach = self.car.half_w * 3.0 + 1.0;
+            let (l, r) = (
+                self.world.sdf(at - side * reach),
+                self.world.sdf(at + side * reach),
+            );
+            if l.min(r) > reach * 0.9 {
+                0.0 // open ground both sides
+            } else if l < r {
+                -1.0
+            } else {
+                1.0
+            }
+        } else {
+            0.0
+        };
+        self.loco.condition(hurt, wall);
         self.loco_pose = self
             .loco
             .update(dt, horiz, vert, self.car.on_ground, boosting);
@@ -7581,6 +7608,16 @@ impl Game {
             // everything moves together reads as one wobbling object.
             // the turret's own transform rides inside the hull's: rotate
             // about the ring in MODEL space, before the hull matrix
+            // ROBOT MODE PULLS ITS APPENDAGES IN. A wing is correct at
+            // vehicle scale and absurd on a standing bot, and the fold
+            // cannot fix it because it interpolates vertices and the wing
+            // is where the artist left it (`skeleton::compact`).
+            let base = match active.tuck.get(pi) {
+                Some(t) if *t != Vec3::ZERO && self.xf.is_robot() => {
+                    base * Mat4::from_translation(*t)
+                }
+                _ => base,
+            };
             let base = match (&turret_q, active.fittings.turret.contains(&pi)) {
                 (Some(q), true) => {
                     let r = active.fittings.ring;
