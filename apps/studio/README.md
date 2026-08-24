@@ -1671,3 +1671,18 @@ name and buttons share a centre line, and the compact threshold is derived
 from the actual control budget (`wants_compact`) rather than a guessed
 pixel count. Folding to compact removes buttons from the row but never
 verbs: both fold into ⋯.
+
+
+**The playhead can be moved now.** `g g` and `g e` always reset it to the
+start and end — but nothing on screen said so and the ruler did nothing,
+which meant a new user had no way back to the start at all. Three fixes,
+each at its own layer: the ruler band takes clicks AND drags and reports
+`sought` every frame of the drag, so scrubbing follows the finger (clamped
+at zero, since a negative playhead is not a position, and strictly above
+the tracks, since selecting a clip must never scrub); ⏮ and ⏭ sit in the
+top bar with their key bindings in the tooltip; and the palette carries
+"playhead to start / to end" with the same hints. The seek is a transport
+move, not a model edit — moving the playhead is not something a
+collaborator should undo. Pinned headlessly: the band seeks through the
+same transform the ruler labels use, the strip below it does not, and the
+gutter column is not time.

@@ -270,6 +270,10 @@ pub struct TimelineResponse {
     /// len)`. A left trim changes all three, which is why this is not just
     /// a length.
     pub trimmed: Option<(ClipId, Ticks, Ticks, Ticks)>,
+    /// The ruler was clicked or dragged: put the playhead here. Reported
+    /// every frame OF the drag, not just at its end — scrubbing is only
+    /// useful if it follows the finger.
+    pub sought: Option<Ticks>,
 }
 
 pub fn hit_test(project: &Project, view: &View, at: Pos2, origin: Pos2) -> Option<ClipId> {
@@ -577,7 +581,23 @@ pub fn timeline(
             }
         }
     }
-    out.clicked = if out.toggled_group.is_some() || out.clicked_group.is_some() {
+    // ── the ruler seeks ────────────────────────────────────────────────
+    // Until now the playhead could only be moved by `g g` / `g e`, which
+    // is invisible: a timeline whose ruler does nothing gives a new user
+    // no way to get back to the start at all. The ruler band takes clicks
+    // AND drags, reporting every frame so scrubbing follows the finger,
+    // and clamps at zero because a negative playhead is not a position.
+    let ruler_band = Rect::from_min_max(
+        Pos2::new(rect.left() + view.gutter, rect.top()),
+        Pos2::new(rect.right(), rect.top() + RULER_H));
+    if let Some(p) = resp.interact_pointer_pos() {
+        if (resp.clicked() || resp.dragged()) && ruler_band.contains(p) {
+            let t = view.x_to_time(p.x, origin.x);
+            out.sought = Some(Ticks(t.0.max(0)));
+        }
+    }
+    out.clicked = if out.sought.is_some()
+        || out.toggled_group.is_some() || out.clicked_group.is_some() {
         None // the fold owns this click; a folded member must not be reachable
     } else {
         resp.interact_pointer_pos()
@@ -634,6 +654,45 @@ pub fn format_timecode(t: Ticks) -> String {
     let (h, m, s, ms) = (total_ms / 3_600_000, total_ms / 60_000 % 60,
                          total_ms / 1000 % 60, total_ms % 1000);
     format!("{}{h}:{m:02}:{s:02}.{ms:03}", if neg { "-" } else { "" })
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    /// The ruler band's own arithmetic, stated once so the widget and this
+    /// test cannot disagree: the strip is RULER_H tall, starts after the
+    /// gutter, and maps x to time through the same view transform every
+    /// clip uses.
+    fn seek_at(view: &View, origin: Pos2, x: f32, y: f32) -> Option<Ticks> {
+        let in_band = y >= origin.y && y < origin.y + RULER_H
+            && x >= origin.x + view.gutter;
+        if !in_band { return None; }
+        Some(Ticks(view.x_to_time(x, origin.x).0.max(0)))
+    }
+
+    #[test]
+    fn the_ruler_seeks_and_the_tracks_below_it_do_not() {
+        let view = View::default();
+        let origin = Pos2::new(10.0, 20.0);
+        // A click 300px into the ruler lands where the ruler's own label
+        // arithmetic says it should — same transform, so they agree by
+        // construction rather than by tuning.
+        let x = origin.x + view.gutter + 300.0;
+        let t = seek_at(&view, origin, x, origin.y + 4.0).expect("the band seeks");
+        assert_eq!(t, view.x_to_time(x, origin.x));
+        // Below the band is clip territory: a click there must never move
+        // the playhead, or selecting a clip would scrub.
+        assert!(seek_at(&view, origin, x, origin.y + RULER_H + 1.0).is_none());
+        // Left of the gutter is the track-name column, not time.
+        assert!(seek_at(&view, origin, origin.x + 2.0, origin.y + 4.0).is_none());
+        // Scrolled back past zero, a seek clamps: a negative playhead is
+        // not a position.
+        let mut scrolled = View::default();
+        scrolled.scroll = Ticks::ZERO;
+        let left_edge = scrolled.gutter + origin.x;
+        assert_eq!(seek_at(&scrolled, origin, left_edge, origin.y + 2.0), Some(Ticks(0)));
+    }
 }
 
 #[cfg(test)]

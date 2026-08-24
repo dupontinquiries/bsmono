@@ -41,6 +41,8 @@ pub enum Act {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellVerb {
+    GotoStart,
+    GotoEnd,
     MixMaster,
     ArchiveDialog,
     ExportDialog,
@@ -94,6 +96,8 @@ pub fn root() -> Vec<Choice> {
         label: label.into(), hint: hint.map(str::to_owned), then };
     vec![
         c("play / pause", Some("space"), Then::Do(Act::Key(' '))),
+        c("playhead to start", Some("g g"), Then::Do(Act::Shell(ShellVerb::GotoStart))),
+        c("playhead to end", Some("g e"), Then::Do(Act::Shell(ShellVerb::GotoEnd))),
         c("undo", Some("u"), Then::Do(Act::Key('u'))),
         c("redo", Some("U"), Then::Do(Act::Key('U'))),
         c("track volume up 3 dB", None, Then::Ask(Ask::TrackGain(3))),
@@ -338,6 +342,10 @@ mod tests {
             assert_eq!(c.then, Then::Do(Act::Key(key)));
             assert!(c.hint.is_some(), "'{label}' has a key and must show it");
         }
+        // Multi-key hints ("g g") name a keymap SEQUENCE and are checked
+        // by the keymap's own tests, not here; this loop covers the
+        // single-key delegations, which are the ones that could silently
+        // diverge from the keyboard.
         // And every hint that exists must be a key the keymap or the
         // shell's own interception actually handles — one source of truth.
         let intercepted = ['A', 'Q', ',', '.', '<', '>', 'g', 'G'];

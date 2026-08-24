@@ -1658,6 +1658,18 @@ impl eframe::App for App {
                     .on_hover_text("timeline above, rack/program/mixer below — instead of tabs")
                     .clicked() { combined = !combined; }
                 self.studio.combined = combined;
+                // The playhead's visible controls. `g g` and `g e` have
+                // always done this; nothing on screen said so, which
+                // meant a new user had no way back to the start at all.
+                if ui.button("⏮").on_hover_text("playhead to start (g g)").clicked() {
+                    self.studio.transport.set_position(studio_core::Ticks::ZERO);
+                    self.studio.status = "playhead at start".into();
+                }
+                if ui.button("⏭").on_hover_text("playhead to end (g e)").clicked() {
+                    let d = self.studio.session.doc.project.duration();
+                    self.studio.transport.set_position(d);
+                    self.studio.status = "playhead at end".into();
+                }
                 if ui.button("settings…").clicked() {
                     self.settings_open = !self.settings_open;
                 }
@@ -2369,6 +2381,12 @@ impl eframe::App for App {
                                                    &colors, ph, &sel, &self.peaks,
                                                    self.studio.trim_side,
                                                    &self.studio.closed_groups);
+                    if let Some(t) = tr.sought {
+                        // Scrub. The transport owns position, so this is a
+                        // seek and not a model edit — moving the playhead
+                        // is not something a collaborator should undo.
+                        self.studio.transport.set_position(t);
+                    }
                     if let Some(g) = tr.toggled_group {
                         if !self.studio.closed_groups.remove(&g) {
                             self.studio.closed_groups.insert(g);
@@ -2702,6 +2720,15 @@ impl App {
                 self.studio.status = format!("{}", panel.label());
             }
             palette::Act::Shell(v) => match v {
+                palette::ShellVerb::GotoStart => {
+                    self.studio.transport.set_position(studio_core::Ticks::ZERO);
+                    self.studio.status = "playhead at start".into();
+                }
+                palette::ShellVerb::GotoEnd => {
+                    let d = self.studio.session.doc.project.duration();
+                    self.studio.transport.set_position(d);
+                    self.studio.status = "playhead at end".into();
+                }
                 palette::ShellVerb::MixMaster => {
                     let target = self.studio.session.doc.project.busses.iter()
                         .find(|(_, b)| b.parent.is_none())
