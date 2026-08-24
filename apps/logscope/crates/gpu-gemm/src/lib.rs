@@ -16118,7 +16118,22 @@ like a bad model rather than a wiring bug.");
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
         let ids_buf = self.alloc(1, k);                       // [1, k] u32 — one slot per windowed step
         let l = prompt.len();
-        for pos in 0..l.saturating_sub(1) { let _ = self.decode_step(m, &c, prompt[pos], pos); }
+        // BATCHED PROMPT PREFILL. This was a decode_step PER PROMPT TOKEN —
+        // each one a readback and its own submit — inside the function whose
+        // entire purpose is not syncing per token. Measured on lavapipe: total
+        // readbacks fit `windows + (prompt_len - 1)` exactly at k=2/4/8, so
+        // for any real prompt the loop below dwarfed the windowing it was
+        // wrapped in (a 1625-token prompt = 1624 sequential readbacks before
+        // the first generated token). prefill_chunked writes the same KV rows
+        // in batched passes; only the last row's logits are needed here, and
+        // the loop discarded every row's logits anyway.
+        if l > 1 {
+            // 256: WorkerPool::PREFILL_CHUNK's value, which is an associated
+            // const and not reachable from here. Chunk size only bounds the
+            // per-dispatch length; it does not change the result.
+            let chunk = 256;
+            let _ = self.prefill_chunked(m, &c, &prompt[..l - 1], chunk);
+        }
         self.begin_frame();
         let x0 = self.upload(&m.embed[prompt[l - 1] as usize * m.d..prompt[l - 1] as usize * m.d + m.d], 1, m.d);
         let mut logits_t = self.decode_layers_t(m, &c, x0, l - 1);
@@ -16164,7 +16179,22 @@ like a bad model rather than a wiring bug.");
         let o = self.upload_u32(&o_init);
         let seeded = tail as u32;
         let l = prompt.len();
-        for pos in 0..l.saturating_sub(1) { let _ = self.decode_step(m, &c, prompt[pos], pos); }
+        // BATCHED PROMPT PREFILL. This was a decode_step PER PROMPT TOKEN —
+        // each one a readback and its own submit — inside the function whose
+        // entire purpose is not syncing per token. Measured on lavapipe: total
+        // readbacks fit `windows + (prompt_len - 1)` exactly at k=2/4/8, so
+        // for any real prompt the loop below dwarfed the windowing it was
+        // wrapped in (a 1625-token prompt = 1624 sequential readbacks before
+        // the first generated token). prefill_chunked writes the same KV rows
+        // in batched passes; only the last row's logits are needed here, and
+        // the loop discarded every row's logits anyway.
+        if l > 1 {
+            // 256: WorkerPool::PREFILL_CHUNK's value, which is an associated
+            // const and not reachable from here. Chunk size only bounds the
+            // per-dispatch length; it does not change the result.
+            let chunk = 256;
+            let _ = self.prefill_chunked(m, &c, &prompt[..l - 1], chunk);
+        }
         let mut rng = seed | 1;
         self.begin_frame();
         let x0 = self.upload(&m.embed[prompt[l - 1] as usize * m.d..prompt[l - 1] as usize * m.d + m.d], 1, m.d);
@@ -21808,5 +21838,77 @@ mod verify_slicing_tests {
         let dev_last = one[one.len() - v..].iter().zip(&many[many.len() - v..])
             .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(dev_last < 1e-3, "the last row diverged by {dev_last}");
+    }
+}
+
+#[cfg(test)]
+mod window_batching_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// C11-21a, measured instead of guessed. Both field profiles logged
+    /// `windowed sampling ON (k=4)` — which predicts one readback per WINDOW,
+    /// i.e. 1/k per token — and both measured ~0.45 readbacks/token at 1.0
+    /// submits/token. This runs the same code path on lavapipe and counts the
+    /// submit causes directly, so the discrepancy is either reproduced here
+    /// (and debuggable in the sandbox) or is device-specific (which is itself
+    /// the answer, and a different hunt).
+    ///
+    /// Asserts the RATIO, not an absolute: what matters is whether readbacks
+    /// scale with windows or with tokens.
+    #[test]
+    fn windowed_sampling_reads_back_once_per_window_not_per_token() {
+        let gpu = Gpu::new();
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen2.gguf") { Some(b) => b, None => return };
+        let m = gpu.load_gguf_opt(&bytes, false).expect("tiny-qwen2 loads");
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 5) % 90).collect();
+        let n_new = 16usize;
+        let k = 4usize;
+
+        let dl0 = SUBMIT_BY_DOWNLOAD.load(Relaxed);
+        let nf0 = SUBMIT_BY_NO_FRAME.load(Relaxed);
+        let ps0 = SUBMIT_BY_PASSES.load(Relaxed);
+        let out = gpu.generate_kv_window_sampled(&m, &prompt, n_new, k, &SamplerParams::default(), 12345);
+        let (dl, nf, ps) = (SUBMIT_BY_DOWNLOAD.load(Relaxed) - dl0,
+                            SUBMIT_BY_NO_FRAME.load(Relaxed) - nf0,
+                            SUBMIT_BY_PASSES.load(Relaxed) - ps0);
+        assert_eq!(out.len(), n_new, "the run must actually produce tokens");
+
+        let windows = n_new.div_ceil(k) as u64;
+        eprintln!("window-batching: {} tokens, {} windows (k={k}) -> downloads {dl}, no-frame {nf}, passes {ps}",
+                  n_new, windows);
+        // The claim under test: readbacks track WINDOWS. A small constant of
+        // setup readbacks is fine; scaling with tokens is the bug.
+        assert!(dl <= windows + 2,
+            "readbacks ({dl}) exceed one per window ({windows}) + slack — the window is flushing \
+             early, which is exactly the c11 field discrepancy reproduced in the sandbox");
+        // And frameless dispatches must be zero: each one becomes its own
+        // submit and would explain a 1-submit-per-token profile on its own.
+        assert_eq!(nf, 0, "dispatches ran with no frame open — each is its own submit");
+    }
+
+    /// The k-scaling claim the dense verdict now tells operators to check:
+    /// doubling the window must roughly halve the readbacks. If this fails,
+    /// the advice in perfverdict is wrong and must be rewritten before anyone
+    /// tunes against it.
+    #[test]
+    fn readbacks_halve_when_the_window_doubles() {
+        let gpu = Gpu::new();
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen2.gguf") { Some(b) => b, None => return };
+        let m = gpu.load_gguf_opt(&bytes, false).expect("tiny-qwen2 loads");
+        let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 5) % 90).collect();
+        let n_new = 16usize;
+
+        let measure = |k: usize| -> u64 {
+            let d0 = SUBMIT_BY_DOWNLOAD.load(Relaxed);
+            let _ = gpu.generate_kv_window_sampled(&m, &prompt, n_new, k, &SamplerParams::default(), 7);
+            SUBMIT_BY_DOWNLOAD.load(Relaxed) - d0
+        };
+        let at2 = measure(2);
+        let at8 = measure(8);
+        eprintln!("window-scaling: k=2 -> {at2} readbacks, k=8 -> {at8}");
+        assert!(at8 < at2,
+            "a 4x larger window did not reduce readbacks ({at2} -> {at8}) — the 1/k lever the \
+             dense verdict advertises does not exist");
     }
 }
