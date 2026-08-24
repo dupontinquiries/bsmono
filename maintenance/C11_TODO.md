@@ -240,7 +240,15 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
 - **C11-11a — rope linear scaling: DONE at loader level** (+ named refusal
   for unknown/incomplete scaling). Retest deepseek-coder-6.7b on device —
   the log will now say "linear rope scaling ON" instead of "(inactive)".
-- **C11-11b — qwen3 gibberish still open.** tiny-qwen3 green; head_dim
+- **C11-11b — qwen3 gibberish: NARROWED to the vocab-alignment hypothesis**
+  (151936 % 256 = 128, the fleet's only misaligned vocab; field transcript
+  shows index-ramp logits). Harness landed (vocab_alignment_tests), aligned
+  control green; BLOCKED on gen3.py honouring VOCAB for qwen3 (tokenizer
+  array overrides it — extend the list to VOCAB entries, regenerate
+  /tmp/tiny-qwen3-oddvocab.gguf via /tmp/gen3_odd.py's edit, rerun). If the
+  misaligned run diverges: hunt argmax_at / sample_at / logits projection /
+  int8 embed-table stride with the failing case in hand. If it agrees:
+  hypothesis dead, fall back to real-gguf metadata probes. Previously: tiny-qwen3 green; head_dim
   explicit-key handled; linear/yarn now handled-or-refused. Next probe on
   device: load the real gguf and read the rope line + any refusal; if it
   loads clean and still gibbers, dump the first-token logits against
