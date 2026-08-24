@@ -2492,6 +2492,17 @@ reply is framed differently from the turn that produced it.");
     fn full_system(&self, doc: &crate::analysis::Doc) -> String {
         let mut s = self.sys().to_string();
         if let Some(b) = self.log_block(doc) { s.push_str("\n\n"); s.push_str(&b); }
+        // THE WORKSPACE, IN A PLAIN CHAT TURN. `:ws` mounted a repository and
+        // nothing in this prompt said so: the field transcript is a model
+        // answering "we would need to see the full definition of
+        // guidance::Target" while that definition sat one read away. The agent
+        // path had context all along (agent_context); a chat turn did not, and
+        // a chat turn is what people actually type into.
+        //
+        // Budgeted by the same class as everywhere else, so a 1B gets a short
+        // tree and a nudge, not a repository dump — the point is that it KNOWS
+        // and can ask, not that it reads everything up front.
+        if let Some(b) = self.workspace_block() { s.push_str("\n\n"); s.push_str(&b); }
         if self.fix_mode { s.push_str("\n\n"); s.push_str(FIX_MODE); }
         // Task posture: classify the latest user turn so a maintenance-tuned identity prompt doesn't refuse
         // a legitimate greenfield build. The posture reframes minimal-edit as "build the smallest working
@@ -3028,6 +3039,40 @@ them to", patches.len());
             format!("patch mode: {applied} applied, {} refused — see the log; nothing was force-fitted",
                     refused.len())
         };
+    }
+
+    /// The mounted workspace as chat-turn context: what is open, an
+    /// orientation tree, and — the part that matters — a plain statement that
+    /// the contents are READABLE and how to ask.
+    ///
+    /// Deliberately smaller than `agent_context`: an agent run is committed to
+    /// working the repo, while a chat turn may be about anything, so this
+    /// buys awareness rather than evidence. History is one line (the newest
+    /// subject) for the same reason — enough to know it exists.
+    fn workspace_block(&self) -> Option<String> {
+        let sess = self.gitmind_session.as_ref()?;
+        let root = sess.work_dir();
+        let class = self.read_class();
+        let b = crate::read_harness::budget(class);
+        let tree_cap = match class {
+            crate::read_harness::ModelClass::Small => 40,
+            crate::read_harness::ModelClass::Mid => 120,
+            crate::read_harness::ModelClass::Large => 400,
+            crate::read_harness::ModelClass::Sota => 1200,
+        };
+        let tree = crate::workspace_exec::repo_tree(root, tree_cap);
+        let mut out = format!(
+            "A workspace is OPEN at {}. Its files are readable — when a question turns on what \
+the code actually says, read the file instead of reasoning from the error text alone, and say \
+which file you read.\n\n",
+            root.display());
+        out.push_str(&crate::read_harness::fence("repository tree", &root.display().to_string(), &tree, &b, None));
+        if let Some(c) = crate::read_harness::read_git_log(root, 1).first() {
+            out.push_str(&crate::read_harness::fence(
+                "most recent commit", "git log -n 1",
+                &format!("{} {}", c.short, c.subject), &b, None));
+        }
+        Some(out)
     }
 
     /// The model's capability class, from the engine's own label. Everything

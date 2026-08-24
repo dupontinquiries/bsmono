@@ -567,9 +567,22 @@ mod git_tests {
 /// `n` bounds the request at the source, so a 200k-commit repo does not get
 /// serialized just to be truncated afterwards.
 pub fn read_git_log(root: &std::path::Path, n: usize) -> Vec<Commit> {
-    let out = std::process::Command::new("git")
-        .args(["-C", &root.display().to_string(), "log", GIT_LOG_FORMAT, "-n", &n.to_string()])
-        .output();
+    read_git_log_path(root, n, "")
+}
+
+/// `read_git_log` scoped to one path — "what happened to this file", which is
+/// the history question a repository-reading agent actually asks. The path is
+/// passed after `--`, so a file named like a flag (or like an option
+/// injection: `--upload-pack=…`) is a pathspec and nothing else.
+pub fn read_git_log_path(root: &std::path::Path, n: usize, path: &str) -> Vec<Commit> {
+    let root_s = root.display().to_string();
+    let n_s = n.to_string();
+    let mut args: Vec<&str> = vec!["-C", &root_s, "log", GIT_LOG_FORMAT, "-n", &n_s];
+    if !path.trim().is_empty() {
+        args.push("--");
+        args.push(path);
+    }
+    let out = std::process::Command::new("git").args(&args).output();
     match out {
         Ok(o) if o.status.success() => parse_git_log(&String::from_utf8_lossy(&o.stdout)),
         _ => Vec::new(),

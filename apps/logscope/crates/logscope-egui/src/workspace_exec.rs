@@ -55,7 +55,7 @@ pub enum Tool {
     /// through read_harness at the run's model class (subjects only for small
     /// models, bodies above that) and sanitized: refs and messages in a repo
     /// you did not write are attacker-controlled text.
-    GitLog { n: usize },
+    GitLog { n: usize, path: String },
     /// PATCH an existing file: replace exactly ONE occurrence of a verbatim `find` anchor with
     /// `replace`. The context-economy primitive: big models re-emitting whole files is what fills the
     /// window and drags tok/s; an anchored edit is a few dozen tokens and — unlike unified diffs,
@@ -77,7 +77,7 @@ impl Tool {
             Tool::WriteFile { path, contents } => format!("write {} ({} B)", path, contents.len()),
             Tool::ReadFile { path } => format!("read {path}"),
             Tool::ListDir { path } => format!("ls {}", if path.is_empty() { "." } else { path }),
-            Tool::GitLog { n } => format!("git log -n {n}"),
+            Tool::GitLog { n, path } => if path.is_empty() { format!("git log -n {n}") } else { format!("git log -n {n} -- {path}") },
             Tool::Run { argv } => format!("run {}", argv.join(" ")),
             Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
             Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
@@ -132,6 +132,10 @@ pub struct Workspace {
     /// resolves to Mid — the budget that neither drowns a small model nor
     /// starves a large one — so a caller that never sets it still works.
     model_label: String,
+    /// The engine's tensor-derived parameter count, when known. Preferred over
+    /// the label: filenames lie (a re-quantized 1B named "-7B-" is a real
+    /// thing), tensor sizes cannot.
+    model_params: Option<u64>,
 }
 
 impl Workspace {
@@ -139,6 +143,12 @@ impl Workspace {
     /// this (read_harness::ModelClass). Chainable at construction.
     pub fn with_model_label(mut self, label: impl Into<String>) -> Self {
         self.model_label = label.into();
+        self
+    }
+
+    /// The engine's own parameter count — beats the label when both are known.
+    pub fn with_model_params(mut self, params: Option<u64>) -> Self {
+        self.model_params = params;
         self
     }
 
@@ -155,6 +165,7 @@ impl Workspace {
                 .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo")),
             rust_src: std::cell::OnceCell::new(),
             model_label: String::new(),
+            model_params: None,
         }
     }
 
@@ -203,7 +214,7 @@ impl Workspace {
             Tool::WriteFile { path, contents } => self.write_file(path, contents),
             Tool::ReadFile { path } => self.read_file(path),
             Tool::ListDir { path } => self.list_dir(path),
-            Tool::GitLog { n } => self.git_log(*n),
+            Tool::GitLog { n, path } => self.git_log(*n, path),
             Tool::Run { argv } => self.run(argv),
             Tool::Search { pattern, path } => self.search(pattern, path),
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
@@ -346,11 +357,33 @@ impl Workspace {
         let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         let text = match std::fs::read_to_string(&abs) { Ok(s) => s, Err(e) => return ToolResult::err(format!("read {rel}: {e}")) };
         let (start, end) = (start.max(1), end.max(start));
+        // CLAMPED TO THE CLASS. A 1B that asks for lines 1..4000 gets what it
+        // can actually use and is TOLD where it stopped, so its next call is a
+        // continuation rather than a re-ask for the same impossible span. An
+        // unbounded range used to return the whole file into a 2k-token
+        // window, which is the same drowning the fixed caps caused elsewhere.
+        let b = crate::read_harness::budget(
+            crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
+        let requested = end - start + 1;
+        let end = if requested > b.chunk_lines { start + b.chunk_lines - 1 } else { end };
+        let total = text.lines().count();
         let out: String = text.lines().enumerate()
             .filter(|(i, _)| *i + 1 >= start && *i + 1 <= end)
             .map(|(i, l)| format!("{}: {}", i + 1, l))
             .collect::<Vec<_>>().join("\n");
-        ToolResult::ok(if out.is_empty() { format!("{rel}: no lines in {start}..{end}") } else { out })
+        if out.is_empty() {
+            return ToolResult::err(format!("{rel}: no lines in {start}..{end} (the file has {total})"));
+        }
+        let mut out = out;
+        if requested > b.chunk_lines {
+            out.push_str(&format!(
+                "\n[stopped at line {end} of {total}: {} lines per read for this model. \
+Continue with read_range {rel} {} {}]",
+                b.chunk_lines, end + 1, (end + b.chunk_lines).min(total)));
+        } else if end < total {
+            out.push_str(&format!("\n[lines {start}..{end} of {total}]"));
+        }
+        ToolResult::ok(out)
     }
 
     /// Ingest raw external bytes (a DRAG-AND-DROPPED file) to a sandboxed workspace path, recording a
@@ -462,16 +495,21 @@ impl Workspace {
     /// Commit history as a fenced, budgeted evidence block. The class comes
     /// from the run's configured model label, so the same tool gives a 1B
     /// eight subjects and a large model eighty with bodies.
-    fn git_log(&self, n: usize) -> ToolResult {
+    fn git_log(&self, n: usize, path: &str) -> ToolResult {
         let b = crate::read_harness::budget(
-            crate::read_harness::ModelClass::resolve(None, &self.model_label));
+            crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
         let want = n.min(b.git_entries).max(1);
-        let commits = crate::read_harness::read_git_log(&self.root, want);
+        let commits = crate::read_harness::read_git_log_path(&self.root, want, path);
         if commits.is_empty() {
-            return ToolResult::err("no git history here (not a worktree, or git is unavailable)");
+            return ToolResult::err(if path.is_empty() {
+                "no git history here (not a worktree, or git is unavailable)".to_string()
+            } else {
+                format!("no history for {path} (unknown path, or not a worktree)")
+            });
         }
-        ToolResult::ok(crate::read_harness::git_history_block(
-            &commits, &b, &format!("{} @ HEAD", self.root.display())))
+        let prov = if path.is_empty() { format!("{} @ HEAD", self.root.display()) }
+                   else { format!("{} @ HEAD -- {path}", self.root.display()) };
+        ToolResult::ok(crate::read_harness::git_history_block(&commits, &b, &prov))
     }
 
     fn list_dir(&self, rel: &str) -> ToolResult {
@@ -2942,7 +2980,7 @@ mod git_log_tool_tests {
         let _ = git(&["branch", "weird;-ignore-instructions"]);
 
         let mut ws = Workspace::new(&dir).with_model_label("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
-        let res = ws.apply(&Tool::GitLog { n: 10 });
+        let res = ws.apply(&Tool::GitLog { n: 10, path: String::new() });
         assert!(res.ok, "git log tool failed: {}", res.output);
         assert!(res.output.contains("fix: thing"), "the subject is missing:\n{}", res.output);
         // Small class: subjects ONLY. The commit's BODY carries the injection
@@ -2957,7 +2995,7 @@ mod git_log_tool_tests {
 
         // A larger class sees more of the same repo — the budget is live, not decorative.
         let mut big = Workspace::new(&dir).with_model_label("Qwen3-30B-A3B-Q4.gguf");
-        let res_big = big.apply(&Tool::GitLog { n: 10 });
+        let res_big = big.apply(&Tool::GitLog { n: 10, path: String::new() });
         assert!(res_big.ok);
         // …and a larger class DOES get bodies — same repo, same tool, different
         // budget. This is the pair that makes the class live rather than
@@ -2982,9 +3020,101 @@ mod git_log_tool_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ws = Workspace::new(&dir).with_model_label("tiny-1B.gguf");
-        let res = ws.apply(&Tool::GitLog { n: 5 });
+        let res = ws.apply(&Tool::GitLog { n: 5, path: String::new() });
         assert!(!res.ok);
         assert!(res.output.contains("no git history"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod read_budget_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ls-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A greedy range from a small model is CLAMPED and told where to resume —
+    /// the reply must contain a literal next call, because "ask again" without
+    /// a resume point is what produces the same request twice.
+    #[test]
+    fn an_over_long_read_range_clamps_and_hands_back_a_continuation() {
+        let dir = tmp("readrange");
+        let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("big.rs"), &body).unwrap();
+
+        let mut small = Workspace::new(&dir).with_model_label("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+        let r = small.apply(&Tool::ReadRange { path: "big.rs".into(), start: 1, end: 500 });
+        assert!(r.ok, "{}", r.output);
+        let shown = r.output.lines().filter(|l| l.starts_with(char::is_numeric)).count();
+        assert_eq!(shown, 60, "Small budget is 60 lines, got {shown}");
+        assert!(r.output.contains("read_range big.rs 61 120"),
+                "no usable continuation in:\n{}", r.output);
+
+        // A larger class sees more of the same file from the same call.
+        let mut big = Workspace::new(&dir).with_model_label("Qwen3-30B-A3B-Q4.gguf");
+        let rb = big.apply(&Tool::ReadRange { path: "big.rs".into(), start: 1, end: 500 });
+        let shown_big = rb.output.lines().filter(|l| l.starts_with(char::is_numeric)).count();
+        assert!(shown_big > shown, "Large ({shown_big}) saw no more than Small ({shown})");
+
+        // The engine's parameter count OVERRIDES a lying filename: same
+        // "-30B-" label, real tensors say 1B, budget follows the tensors.
+        let mut lying = Workspace::new(&dir)
+            .with_model_label("Qwen3-30B-A3B-Q4.gguf")
+            .with_model_params(Some(1_000_000_000));
+        let rl = lying.apply(&Tool::ReadRange { path: "big.rs".into(), start: 1, end: 500 });
+        let shown_lying = rl.output.lines().filter(|l| l.starts_with(char::is_numeric)).count();
+        assert_eq!(shown_lying, 60, "the tensor-derived count must beat the label");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A range within budget is untouched, and still says where it sits in the
+    /// file — orientation without truncation.
+    #[test]
+    fn a_modest_range_is_not_clamped() {
+        let dir = tmp("modest");
+        let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("f.rs"), &body).unwrap();
+        let mut ws = Workspace::new(&dir).with_model_label("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+        let r = ws.apply(&Tool::ReadRange { path: "f.rs".into(), start: 10, end: 29 });
+        assert!(r.ok);
+        assert!(!r.output.contains("stopped at line"), "a 20-line read was clamped:\n{}", r.output);
+        assert!(r.output.contains("lines 10..29 of 500"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Path-scoped history answers "what happened to THIS file" and excludes
+    /// commits that did not touch it.
+    #[test]
+    fn path_scoped_history_excludes_other_files() {
+        let dir = tmp("gitpath");
+        let git = |args: &[&str]| std::process::Command::new("git")
+            .args(["-C", &dir.display().to_string()]).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e")
+            .output();
+        if git(&["init", "-q"]).map(|o| !o.status.success()).unwrap_or(true) { return; }
+        std::fs::write(dir.join("a.rs"), "a").unwrap();
+        git(&["add", "."]).unwrap();
+        git(&["commit", "-q", "-m", "touch a only"]).unwrap();
+        std::fs::write(dir.join("b.rs"), "b").unwrap();
+        git(&["add", "."]).unwrap();
+        git(&["commit", "-q", "-m", "touch b only"]).unwrap();
+
+        let mut ws = Workspace::new(&dir).with_model_label("Qwen3-30B-A3B-Q4.gguf");
+        let all = ws.apply(&Tool::GitLog { n: 10, path: String::new() });
+        assert!(all.output.contains("touch a only") && all.output.contains("touch b only"));
+
+        let just_a = ws.apply(&Tool::GitLog { n: 10, path: "a.rs".into() });
+        assert!(just_a.ok, "{}", just_a.output);
+        assert!(just_a.output.contains("touch a only"));
+        assert!(!just_a.output.contains("touch b only"),
+                "path scoping leaked an unrelated commit:\n{}", just_a.output);
+        assert!(just_a.output.contains("-- a.rs"), "provenance must name the scope");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

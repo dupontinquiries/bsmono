@@ -61,10 +61,17 @@ pub fn parse_line_calls(text: &str, nonce: &str) -> (Vec<Tool>, Vec<LineReject>)
             }
             // History is READ-side evidence, so it belongs in the small-model
             // grammar too: `!<nonce> log` or `!<nonce> log 20`.
-            "log" if args.is_empty() => out.push(Tool::GitLog { n: 10 }),
+            "log" if args.is_empty() => out.push(Tool::GitLog { n: 10, path: String::new() }),
+            // `log 20`, or `log src/lib.rs` — a count or a path, whichever it
+            // parses as. Small models write both and should not need to know
+            // which slot they filled.
             "log" if args.len() == 1 => match args[0].parse::<usize>() {
-                Ok(n) => out.push(Tool::GitLog { n }),
-                Err(_) => bad.push(LineReject::BadArgs { verb: "log".into(), want: "log <count>" }),
+                Ok(n) => out.push(Tool::GitLog { n, path: String::new() }),
+                Err(_) => out.push(Tool::GitLog { n: 10, path: args[0].into() }),
+            },
+            "log" if args.len() == 2 => match args[1].parse::<usize>() {
+                Ok(n) => out.push(Tool::GitLog { n, path: args[0].into() }),
+                Err(_) => bad.push(LineReject::BadArgs { verb: "log".into(), want: "log <path> <count>" }),
             },
             "read_file" | "read_range" => bad.push(LineReject::BadArgs {
                 verb: verb.into(),
@@ -177,13 +184,16 @@ mod tests {
     #[test]
     fn the_log_verb_reaches_git_history() {
         let (t, b) = parse_line_calls(&format!("!{N} log"), N);
-        assert_eq!(t, vec![Tool::GitLog { n: 10 }]);
+        assert_eq!(t, vec![Tool::GitLog { n: 10, path: String::new() }]);
         assert!(b.is_empty());
         let (t, _) = parse_line_calls(&format!("!{N} log 25"), N);
-        assert_eq!(t, vec![Tool::GitLog { n: 25 }]);
-        let (t, b) = parse_line_calls(&format!("!{N} log lots"), N);
-        assert!(t.is_empty());
-        assert!(matches!(&b[0], LineReject::BadArgs { verb, .. } if verb == "log"));
+        assert_eq!(t, vec![Tool::GitLog { n: 25, path: String::new() }]);
+        // a non-numeric single argument is a PATH, not a mistake
+        let (t, b) = parse_line_calls(&format!("!{N} log src/lib.rs"), N);
+        assert_eq!(t, vec![Tool::GitLog { n: 10, path: "src/lib.rs".into() }]);
+        assert!(b.is_empty());
+        let (t, _) = parse_line_calls(&format!("!{N} log src/lib.rs 5"), N);
+        assert_eq!(t, vec![Tool::GitLog { n: 5, path: "src/lib.rs".into() }]);
     }
 
     #[test]
