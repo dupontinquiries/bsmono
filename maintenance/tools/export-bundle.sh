@@ -15,7 +15,11 @@
 set -euo pipefail
 
 SUMMARY="${1:?usage: export-bundle.sh <summary-slug> [repo]}"
-REPO="${2:-/home/claude/repo}"
+# Default to the repo THIS SCRIPT lives in. The old default was a hardcoded
+# /home/claude/repo, which does not exist when the clone lands elsewhere —
+# and the same trap made lock_check/orphan_check report success on scanning
+# nothing (see C11_TODO §2). A tool inside the repo already knows where it is.
+REPO="${2:-$(cd "$(dirname "$0")/../.." && pwd)}"
 OUT="${OUT_DIR:-/mnt/user-data/outputs}"
 SERIES="${SERIES:-c9}"
 LIMIT_MIB="${LIMIT_MIB:-500}"
