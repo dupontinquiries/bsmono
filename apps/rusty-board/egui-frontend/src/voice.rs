@@ -173,3 +173,39 @@ mod service_tests {
         assert!(s.release().is_none(), "a cancelled utterance has nothing to commit");
     }
 }
+
+
+#[cfg(test)]
+mod mount_tests {
+    /// The voice tree is mounted by `#[path]` into two crates, so a
+    /// `crate::voice::` path inside it resolves in the GTK crate and dangles
+    /// here — which is exactly how the voice feature silently stopped
+    /// compiling in this crate while the GTK build stayed green. Shared
+    /// files use `super::` for siblings under voice/, and `crate::` only
+    /// for root modules BOTH crates expose (config, util). This runs in
+    /// every config, whisper or not.
+    #[test]
+    fn shared_voice_sources_carry_no_crate_voice_paths() {
+        let sources = [
+            ("service.rs", include_str!("../../src/voice/service.rs")),
+            ("recorder.rs", include_str!("../../src/voice/recorder.rs")),
+            ("transcriber.rs", include_str!("../../src/voice/transcriber.rs")),
+            ("hallucination.rs", include_str!("../../src/voice/hallucination.rs")),
+            ("mod.rs", include_str!("../../src/voice/mod.rs")),
+        ];
+        assert_eq!(sources.len(), 5, "the scan has files to scan");
+        for (name, src) in sources {
+            // Comments may cite the GTK-side path; code must not. Strip
+            // line comments before matching.
+            let code: String = src
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("crate::voice::"),
+                "{name} uses a crate::voice:: path — dangling under the                  egui mount; use super:: (see lib.rs's config mount note)"
+            );
+        }
+    }
+}

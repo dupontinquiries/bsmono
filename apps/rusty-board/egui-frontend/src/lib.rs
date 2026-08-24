@@ -28,6 +28,15 @@ pub mod voice;
 pub mod settings;
 // config/mod.rs refers to `crate::util`, so the port re-exports it at the root.
 pub use settings::util;
+// …and the shared voice tree refers to `crate::config::VoiceConfig`, so the
+// port mounts config at the root too — the half of the job the util
+// re-export above prepared for and nobody finished, which is why the voice
+// feature never compiled in this crate (c11 field report). Shared files may
+// use `crate::`-paths ONLY for modules both crates expose at the same root;
+// anything under voice/ itself uses `super::` (voice::tests pins this).
+#[cfg(feature = "voice")]
+#[path = "../../src/config/mod.rs"]
+pub mod config;
 pub mod swipe;
 #[cfg(feature = "app")]
 pub mod demo_app;

@@ -1,8 +1,8 @@
 //! `VoiceService` — owns a recorder + transcriber, exposes start/stop/state.
 
 use crate::config::VoiceConfig;
-use crate::voice::recorder::{resample_to_16k, AudioRecorder};
-use crate::voice::transcriber::{find_default_model, Transcriber};
+use super::recorder::{resample_to_16k, AudioRecorder};
+use super::transcriber::{find_default_model, Transcriber};
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -278,7 +278,7 @@ impl VoiceService {
     /// Returns the sample rate of the LAST start_recording call;
     /// returns 16000 (the assumed default) if recording has never
     /// been started.
-    pub fn audio_snapshot_handle(&self) -> (crate::voice::recorder::AudioRing, u32) {
+    pub fn audio_snapshot_handle(&self) -> (super::recorder::AudioRing, u32) {
         let rec = self.recorder.lock();
         (rec.ring(), rec.input_sample_rate())
     }
