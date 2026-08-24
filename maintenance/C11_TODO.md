@@ -139,3 +139,27 @@ report's own order, each with the pointer a next session needs.
   `tab_row` cites the QML row shape and both apps consume the kit. Diff one
   widget's paint path for a double `rect_filled`/galley emit under
   animation; a structural test can pin single-paint once found.
+
+## 7. The responsive-pager thread (uikit-egui::pager landed; adoption open)
+
+- **C11-7a — wire ambient-learner-egui onto the pager.** `not started`; the
+  motivating app. Sketch: its `Page` enum (main.rs:18) becomes the metas
+  (min_width ~360 to match the phone screenshot); the tab strip keeps
+  working by setting `pager.active`; the body renders through
+  `pager.ui(ui, gutter, |ui, id| match id { ... })`. The centered-on-small /
+  dashboard-on-large behavior then arrives with zero app-side layout code —
+  which is the point; if it needs app-side code, the abstraction is wrong,
+  push back on the kit instead.
+- **C11-7b — snapclone-egui onto the same pager**, replacing its bespoke page
+  navigation, so qt/egui swipe finally share one implementation. While
+  there: **the settings submenus don't overflow on scroll gracefully like
+  the qt counterpart** (field report) — a separate bug in its settings
+  scroll containment; reproduce against the qt behavior first.
+- **C11-7c — GestureConfig::for_page_size vs SwipeNavigator's constants.**
+  `read`. The kit's TwoTierGesture has its own thresholds; nobody has
+  diffed them against kCommitFraction=0.22 and the 340ms settle. If they
+  disagree, the kit should adopt the Qt numbers (they are the documented
+  reference) — pager.rs exports them as pure fns already, tested.
+- **C11-7d — per-page min_width packing.** fit_cols packs by the WIDEST
+  page (conservative, cannot overflow); real per-page packing is a
+  refinement with the same test harness.
