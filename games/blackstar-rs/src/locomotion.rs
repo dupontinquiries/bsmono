@@ -107,6 +107,22 @@ const AFT_AT: f32 = 0.15;
 /// Kept separate from the cloud pass below so the decision is testable
 /// with hand-written inputs — the counts come from `partdetect`, and this
 /// is the part that turns them into a physics mode.
+/// Treads are running gear. A tracked hull has no round things at the
+/// corners, so `split_wheels` finds nothing and the skirt test would call
+/// a tank a hovercraft — which is how a tank ends up floating. `turret`
+/// detects the treads; this is where that answer has to arrive, and it
+/// arrives as WHEELS because grip-on-the-ground is what treads are to
+/// this physics.
+pub fn decide_tracked(tracked: bool, wheels: usize, thrusters: usize, legs: usize, skirt: f32, aft: f32) -> Decision {
+    if tracked {
+        let mut d = decide(ROLLS_AT.max(wheels), thrusters, legs, skirt, aft);
+        d.mode = Mode::Wheeled;
+        d.why = "treads: it grips the ground";
+        return d;
+    }
+    decide(wheels, thrusters, legs, skirt, aft)
+}
+
 pub fn decide(wheels: usize, thrusters: usize, legs: usize, skirt: f32, thrust_aft: f32) -> Decision {
     let d = |mode, why| Decision { mode, wheels, thrusters, legs, skirt, thrust_aft, why };
     // WHEELS WIN. Something with a full set of them rolls, whatever else
@@ -323,6 +339,17 @@ mod tests {
         assert_eq!(decide(0, 4, 0, 0.1, 0.0).mode, Mode::Wheeled);
         // a walker with a jetpack still walks
         assert_eq!(decide(0, 3, 2, 0.1, 0.9).mode, Mode::Wheeled);
+    }
+
+    #[test]
+    fn treads_grip_rather_than_float() {
+        // the tank bug: a flat wide underside with no round corners reads
+        // as a skirt, so a tank hovers
+        let skirted = decide(0, 0, 0, 0.9, 0.0);
+        assert_eq!(skirted.mode, Mode::Hover, "the fixture does not reproduce the bug");
+        let tracked = decide_tracked(true, 0, 0, 0, 0.9, 0.0);
+        assert_eq!(tracked.mode, Mode::Wheeled, "a tank still floats: {tracked:?}");
+        assert!(tracked.why.contains("treads"));
     }
 
     #[test]

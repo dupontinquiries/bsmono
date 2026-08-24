@@ -142,6 +142,25 @@ fn check(bot: &str) {
         return;
     }
     println!("{bot}: {} poses", ps.len());
+    // WHAT THE LOADER WILL ACTUALLY DO. The per-pose lines below are
+    // `orient::guess` — a second opinion, useful for seeing disagreement,
+    // but not the frame the game applies. The game takes ONE frame per
+    // chassis (declared sidecar, else `model::strip_guess` from the
+    // vehicle pose) and rotates every pose by it, so a printout that only
+    // showed the per-pose guesses could look broken when the loader was
+    // fine, or fine when it was broken.
+    match crate::model::loader_frame(&ps[0]) {
+        Some((q, src)) => {
+            let up = q.inverse() * glam::Vec3::Y;
+            let fwd = q.inverse() * glam::Vec3::NEG_Z;
+            println!(
+                "  LOADER applies one frame to all poses ({src}): asset up={} fwd={}",
+                orient::axis_name(up),
+                orient::axis_name(fwd)
+            );
+        }
+        None => println!("  LOADER falls back to a per-pose guess (not a strip)"),
+    }
     for p in &ps {
         let name = p.file_name().unwrap().to_string_lossy();
         match guess_for(p) {

@@ -63,6 +63,10 @@ pub struct Model {
     pub drive: Drive,
     /// hover chassis, if this is a hovercar rather than a wheeled one
     pub hover: Option<crate::physics::Hover>,
+    /// what this hull carries: a turret to aim and treads to roll
+    /// (`turret::find`). Indices are into `prims`, so the draw path can
+    /// give the turret its own rotation without a second model.
+    pub fittings: crate::turret::Fittings,
     /// downsampled surface points (final meters) for the reflection SDF bake
     pub cloud: Vec<Vec3>,
     /// outward normal for each cloud point — this is what makes the baked
@@ -574,6 +578,118 @@ fn strip_orientation_text(pose_dir: &Path) -> Option<String> {
 /// Returns the rotation that carries the asset's declared frame onto the
 /// engine's: +Y up, nose at -Z. Malformed or degenerate files are ignored
 /// rather than fatal — a bad sidecar should cost the guess, not the load.
+/// The GUESSED orientation for a whole strip, decided once.
+///
+/// `declared_orientation` already enforces "orientation is a chassis
+/// property, not a pose property" for chassis whose sidecars say so. The
+/// GUESS never got the same rule: `find_orientation` ran per pose, so a
+/// five-pose strip got up to five different frames and the body tumbled as
+/// it folded. That is what "the bot is sideways in robot mode but fine as a
+/// vehicle" is — not a robot-pose bug, a DISAGREEMENT between poses.
+///
+/// Measured on `truck_barrage_aka_m270_multiple_launch_rocket_system`:
+/// f00 guesses up=+Y, f01/f03/f04 guess up=-Z, f02 guesses up=-Y. One body,
+/// three answers, and the fold walks between them.
+///
+/// The answer is taken from the VEHICLE pose, for the reason the search's
+/// own comment gives: `wheel_score` is a car heuristic, and a mid-fold or
+/// standing robot gives it nothing to find, so it "picks whatever reads
+/// most car-like, which is the robot lying on its side". The first pose is
+/// the vehicle by the strip's own naming (f00), which is the same pose
+/// `strip_orientation_text` falls back to.
+///
+/// Memoised per chassis: without it, loading a five-pose strip would read
+/// the vehicle pose five extra times.
+fn strip_guess(pose_dir: &Path) -> Option<Quat> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEMO: OnceLock<Mutex<HashMap<std::path::PathBuf, Option<Quat>>>> = OnceLock::new();
+
+    let chassis = pose_dir.parent()?.to_path_buf();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = memo.lock().ok().and_then(|m| m.get(&chassis).copied()) {
+        return hit;
+    }
+    let mut poses: Vec<std::path::PathBuf> = std::fs::read_dir(&chassis)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && (p.join("scene.gltf").is_file() || p.with_extension("glb").is_file()))
+        .collect();
+    if poses.len() < 2 {
+        // not a strip: the caller guesses from the pose in hand, as before
+        if let Ok(mut m) = memo.lock() {
+            m.insert(chassis, None);
+        }
+        return None;
+    }
+    poses.sort();
+    let ans = (|| {
+        let raws = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_raw_unoriented(&poses[0])
+        }))
+        .ok()?;
+        // the same debris rejection the caller does, for the same reason:
+        // a flung panel drags the frame search with it
+        let pts: Vec<Vec<Vec3>> = raws
+            .iter()
+            .map(|r| r.verts.iter().map(|v| Vec3::from_array(v.pos)).collect())
+            .collect();
+        let refs: Vec<&[Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+        let mass = crate::massfilter::classify(&refs);
+        let all: Vec<Vertex> = raws
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mass.keep.get(*i).copied().unwrap_or(true))
+            .flat_map(|(_, r)| r.verts.iter().copied())
+            .collect();
+        if all.is_empty() {
+            return None;
+        }
+        Some(nose_corrected(find_orientation(&all), &all))
+    })();
+    if let Ok(mut m) = memo.lock() {
+        m.insert(chassis, ans);
+    }
+    ans
+}
+
+/// A SECOND, INDEPENDENT VOTE ON WHICH END IS THE FRONT.
+///
+/// `wheel_score`'s fore/aft term is one heuristic — "a car is lower at the
+/// front" — and it is a coin flip on anything that is not shaped like a
+/// car. An M270 carries a tall cab and a low stowed launcher, which is the
+/// heuristic exactly backwards, and the truck arrives with its cab facing
+/// the camera.
+///
+/// `cockpit::signed_forward` answers the same question from a different
+/// measurement: where the crew sits. On a truck that is the cab; on a jet
+/// the canopy. When it is confident and it disagrees, it wins — and when it
+/// is not, nothing changes and the old heuristic stands.
+fn nose_corrected(q: Quat, verts: &[Vertex]) -> Quat {
+    let cloud: Vec<Vec3> = verts.iter().map(|v| q * Vec3::from_array(v.pos)).collect();
+    // in the canonical frame the body is Y-up and faces -Z
+    let g = crate::cockpit::signed_forward(&cloud, Vec3::Y, Vec3::NEG_Z);
+    if g.confident && g.forward.z > 0.0 {
+        // the cab is at +Z: the frame is backwards, yaw it round
+        Quat::from_rotation_y(std::f32::consts::PI) * q
+    } else {
+        q
+    }
+}
+
+/// The frame the LOADER will apply to this chassis, and where it came
+/// from. Exposed for the `--orient check` driver, which used to print only
+/// `orient::guess`'s per-pose second opinion — a different function from
+/// the one the game runs, so a disagreeing printout proved nothing either
+/// way.
+pub fn loader_frame(pose_dir: &Path) -> Option<(Quat, &'static str)> {
+    if let Some(q) = declared_orientation(pose_dir) {
+        return Some((q, "declared sidecar"));
+    }
+    strip_guess(pose_dir).map(|q| (q, "guessed from the vehicle pose"))
+}
+
 fn declared_orientation(dir: &Path) -> Option<Quat> {
     // ORIENTATION IS A CHASSIS PROPERTY, NOT A POSE PROPERTY.
     //
@@ -867,12 +983,20 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
                 raws.retain(|_| keep.next().copied().unwrap_or(true));
             }
         }
+        // ONE FRAME PER CHASSIS, whether it was declared or guessed. The
+        // declared path has enforced that since the sidecars landed; the
+        // guessed path did not, and a strip that guesses per pose tumbles
+        // as it folds (see `strip_guess`).
         let q = match declared_orientation(dir) {
             Some(q) => q,
-            None => {
-                let all: Vec<Vertex> = raws.iter().flat_map(|r| r.verts.iter().copied()).collect();
-                find_orientation(&all)
-            }
+            None => match strip_guess(dir) {
+                Some(q) => q,
+                None => {
+                    let all: Vec<Vertex> =
+                        raws.iter().flat_map(|r| r.verts.iter().copied()).collect();
+                    nose_corrected(find_orientation(&all), &all)
+                }
+            },
         };
         if q != Quat::IDENTITY {
             for r in raws.iter_mut() {
@@ -1049,6 +1173,10 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let mut cloud_nrm: Vec<Vec3> = Vec::new();
     let mut wheel_bottom = f32::MAX;
     let mut wheel_top = f32::MIN;
+    // per-prim points, kept only long enough to find the fittings: the
+    // verts move into the gpu below and the indices have to line up with
+    // `prims`, so this is the one moment both exist
+    let mut prim_pts: Vec<Vec<Vec3>> = Vec::new();
     for r in raws {
         let tex_id = r.tex_uri.as_ref().map(|uri| {
             *tex_cache.entry(uri.clone()).or_insert_with(|| {
@@ -1077,13 +1205,24 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
                 pivot = (ax - center) * s;
             }
         }
+        let mut mine: Vec<Vec3> = Vec::with_capacity(r.verts.len());
         for v in &r.verts {
-            cloud_all.push(Vec3::from_array(v.pos));
+            let p = Vec3::from_array(v.pos);
+            cloud_all.push(p);
             cloud_nrm.push(Vec3::from_array(v.nrm).normalize_or(Vec3::Y));
+            mine.push(p);
         }
+        prim_pts.push(mine);
         let mesh_id = gpu.add_mesh(&MeshData { verts: r.verts, idx: r.idx });
         prims.push(Prim { mesh_id, tex_id, color: r.color, tag: r.tag, pivot });
     }
+
+    // WHAT THIS HULL CARRIES. Measured in the oriented frame, so "on top"
+    // and "along the side" mean what they say (`turret::find`).
+    let fittings = {
+        let refs: Vec<&[Vec3]> = prim_pts.iter().map(|v| v.as_slice()).collect();
+        crate::turret::find(&refs)
+    };
 
     let wheel_r = if wheel_bottom < wheel_top {
         (wheel_top - wheel_bottom) * 0.5
@@ -1096,7 +1235,7 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, drive: Drive::Combustion, hover: None, cloud, cloud_n, sdf_half: Vec3::ZERO,
+    Model { prims, drive: Drive::Combustion, hover: None, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
             half_len: half.z, half_h: half.y, half_w: half.x, wheel_r,
             // Same sign convention as xform::Morph::bounds_at: -lo.y, the
             // distance from the origin to the pose's actual lowest point,

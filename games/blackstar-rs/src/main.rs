@@ -102,6 +102,7 @@ mod cockpit;
 mod dropship;
 mod locomotion;
 mod massfilter;
+mod turret;
 mod raidflow;
 mod raidforge;
 mod shots;
@@ -2632,8 +2633,17 @@ impl Game {
             } else {
                 None
             };
-            let measured =
-                locomotion::from_cloud(&mdl.cloud, Vec3::Y, cg.forward, mdl.half_h);
+            let measured = {
+                let m = locomotion::from_cloud(&mdl.cloud, Vec3::Y, cg.forward, mdl.half_h);
+                locomotion::decide_tracked(
+                    mdl.fittings.tracked(),
+                    m.wheels,
+                    m.thrusters,
+                    m.legs,
+                    m.skirt,
+                    m.thrust_aft,
+                )
+            };
             locomotion::decide_with_override(declared, measured)
         };
         self.switch_car(m);
@@ -7493,7 +7503,40 @@ impl Game {
         let base = Mat4::from_translation(pos) * Mat4::from_quat(rot) * flip_m
             * Mat4::from_scale(Vec3::splat(scale));
         let active = &self.cars.models[model_i];
-        for prim in active.prims.iter() {
+        // THE TURRET TRACKS THE LOOK, not the hull. Two orientations on one
+        // body is what makes armour read as armour: the hull goes where you
+        // steer and the gun goes where you are aiming. Yaw only, about the
+        // RING rather than the turret's mass (`turret::find`) — a gun that
+        // pivots on its own centroid swings its breech through the hull.
+        // Elevation is deliberately absent: pitching a turret needs the
+        // mantlet's own axis, which is a second detection and not this one.
+        let turret_q = if active.fittings.has_turret() {
+            // where the EYE is looking, taken from the camera's own
+            // geometry rather than a euler it does not keep: the vector
+            // from the eye to what it is framing, flattened.
+            let view = (self.cam.look - self.cam.pos) * Vec3::new(1.0, 0.0, 1.0);
+            let want = if view.length_squared() > 1e-4 {
+                view.x.atan2(-view.z)
+            } else {
+                let f = rot * Vec3::NEG_Z;
+                f.x.atan2(-f.z)
+            };
+            let hull = {
+                let f = rot * Vec3::NEG_Z;
+                f.x.atan2(-f.z)
+            };
+            let mut d = want - hull;
+            while d > std::f32::consts::PI {
+                d -= std::f32::consts::TAU;
+            }
+            while d < -std::f32::consts::PI {
+                d += std::f32::consts::TAU;
+            }
+            Some(Quat::from_rotation_y(d))
+        } else {
+            None
+        };
+        for (pi, prim) in active.prims.iter().enumerate() {
             if !wheels && !matches!(prim.tag, model::Tag::Body) {
                 continue;
             }
@@ -7508,6 +7551,17 @@ impl Game {
             // its own phase from its position, so panels move out of step
             // with one another the way real machinery does — a car where
             // everything moves together reads as one wobbling object.
+            // the turret's own transform rides inside the hull's: rotate
+            // about the ring in MODEL space, before the hull matrix
+            let base = match (&turret_q, active.fittings.turret.contains(&pi)) {
+                (Some(q), true) => {
+                    let r = active.fittings.ring;
+                    base * Mat4::from_translation(r)
+                        * Mat4::from_quat(*q)
+                        * Mat4::from_translation(-r)
+                }
+                _ => base,
+            };
             let base = if rig > 0 {
                 let seed = prim.pivot.x * 3.1 + prim.pivot.z * 2.3 + prim.mesh_id as f32 * 0.37;
                 let t = self.time;

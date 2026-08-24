@@ -93,6 +93,7 @@ impl Mech {
 /// names the world you reach them from); the deep sites are bridge-only,
 /// per the plan — "raid locations will be scattered ... very far outside
 /// the solar system", reached by space bridge rather than cruise.
+#[derive(Debug)]
 pub struct Arena {
     pub id: &'static str,
     pub name: &'static str,
@@ -163,6 +164,7 @@ pub fn arena(id: &str) -> Option<&'static Arena> {
 /// from; `relic` is the codex entry a clear unlocks (original terse prose in
 /// the style of the C engine's lore.c); `shard` is what this machine was
 /// FOR — the memory-shard line that feeds the Seal's hidden campaign.
+#[derive(Debug)]
 pub struct Boss {
     pub id: &'static str,
     pub name: &'static str,
