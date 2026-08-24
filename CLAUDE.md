@@ -275,6 +275,7 @@ python3 maintenance/tools/lock_check.py    # committed locks vs their manifests
 python3 maintenance/tools/orphan_check.py  # .rs files no `mod` declaration reaches
 python3 maintenance/tools/archive_check.py # maintenance/archive/ provenance headers
 python3 maintenance/tools/aarch64_flags_check.py  # committed CPU flags vs the weakest target
+python3 maintenance/tools/eframe_backend_check.py . # eframe backends chosen, not inherited (glow, or wgpu with visible intent)
 ```
 
 `lock_check.py` exists because three stale lockfiles were found by tripping

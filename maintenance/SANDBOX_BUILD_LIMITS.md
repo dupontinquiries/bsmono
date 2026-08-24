@@ -106,3 +106,12 @@ the same idea (`CARGO_SCHEDULE_FIRST` boosts named packages' unit cost, and
 cargo's existing priority formula propagates the boost down the dependency
 chain). It is unbuilt — it needs a cargo fork — and given the warm-tree result
 above there is no measured reason to carry it here.
+
+## apt works for some "missing" native deps — after an update
+
+The baked package lists are stale: a bare `apt-get install` 404s on pool
+URLs. `apt-get update` first, then `libgstreamer1.0-dev
+libgstreamer-plugins-base1.0-dev` installed cleanly (c11; unblocked
+camera-bridge compilation). Before adding a feature-gate escape for a new
+native dep (CLAUDE.md §3), spend the thirty seconds checking whether apt has
+it. GTK4/libadwaita/Qt6 remain absent from what has been tried.

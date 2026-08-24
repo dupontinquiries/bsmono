@@ -58,3 +58,20 @@ warns about. The runs below scanned 254 crates.
 The rest of C10_TODO §0 (C10-0b snapclone-egui, C10-0c fao-codec inventory,
 C10-0d rusty-board keyboard parity inventory) and §1 (the feature sweep's
 games/ tail and the whole apps/ slice) were not touched this session.
+
+## 4. The eframe backend thread (snapshot-cam's on-device crash)
+
+- **C11-4a — `camera-client` does not compile.** `verified` pre-existing (by
+  stash): `PinningVerifier` lacks `Debug` where something formats it. Nothing
+  to do with the limits fix in the same crate; undiagnosed beyond that.
+- **C11-4b — road-warrior's wgpu limits are unclamped.** `read`. It passes
+  `eframe_backend_check.py` via an explicit `Renderer::Wgpu`, so the choice
+  is deliberate — but it inherits egui-wgpu 0.27's default device request,
+  the same over-ask that killed snapshot-cam. Old eframe, different API;
+  wants the camera-bridge treatment when someone is in there.
+- **C11-4c — beatspace's app feature and unendlich-dash are unverified by
+  compilation.** Graphs resolve with the new explicit features; cpal blocks
+  beatspace's GUI here (§3) and dash is the known sweep-timeout unit.
+- gstreamer dev headers ARE installable here (`apt-get update` first — the
+  baked lists are stale and 404). That is what made camera-bridge verifiable;
+  noted in SANDBOX_BUILD_LIMITS.md.
