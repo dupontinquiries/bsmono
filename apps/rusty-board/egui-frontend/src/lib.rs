@@ -511,7 +511,13 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
         let path_id = id.with("hairpin");
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
-                ui.ctx().data_mut(|d| d.insert_temp(path_id, vec![(p.x, p.y, 0u32)]));
+                // Stamp the start with the SAME clock the drag samples use.
+                // This was a literal 0 while every later point carried
+                // `time * 1000` (ms since app start), so rebasing on it left
+                // the duration equal to the app's uptime and the hairpin arm —
+                // capitalisation — went dead 600 ms after launch.
+                let t = (ui.input(|i| i.time) * 1000.0) as u32;
+                ui.ctx().data_mut(|d| d.insert_temp(path_id, vec![(p.x, p.y, t)]));
             }
         }
         if resp.dragged() {
@@ -531,11 +537,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
                 ui.ctx().data_mut(|d| d.get_temp(path_id).unwrap_or_default());
             ui.ctx().data_mut(|d| d.remove::<Vec<(f32, f32, u32)>>(path_id));
             if pts.len() >= 3 {
-                let path: Vec<cardinal_gesture::SwipePoint> = pts.iter()
-                    .map(|(x, y, t)| cardinal_gesture::SwipePoint {
-                        x: *x as f64, y: *y as f64, t_ms: *t - pts[0].2,
-                    })
-                    .collect();
+                let path = cardinal_gesture::path_from_samples(&pts);
                 let th = cardinal_gesture::CardinalThresholds::default();
                 if let cardinal_gesture::CardinalGesture::Hairpin(d) =
                     cardinal_gesture::classify(&path, &th)

@@ -189,6 +189,36 @@ pub fn analyze_rotation(path: &[SwipePoint], threshold_deg: f64) -> Option<Rotat
     Some(if steps > 0 { Rotation::Ccw } else { Rotation::Cw })
 }
 
+/// Build a path from UI samples of `(x, y, absolute_ms)`, rebasing time onto
+/// the first sample.
+///
+/// Pulled out of the widget so it can be tested, because this is where the
+/// capitalisation bug lived. The caller stamped the drag-start point with a
+/// literal `0` and every later point with `ui.input().time * 1000`, which is
+/// milliseconds since the app started. Subtracting `pts[0]` then rebased
+/// nothing: `duration` came out as the app's whole uptime, and since the
+/// hairpin arm requires `duration < hairpin_max_ms` (600), the hairpin — which
+/// IS capitalisation in the cardinal layout — stopped being recognisable 600 ms
+/// after launch. Animations and direction were unaffected, because the widget
+/// owns those and never looks at time, which is exactly why it presented as
+/// "display right, logic wrong".
+///
+/// Rebasing here rather than at the call site means a caller cannot get it
+/// wrong again by stamping the first point differently from the rest.
+pub fn path_from_samples(pts: &[(f32, f32, u32)]) -> Vec<SwipePoint> {
+    let Some(&(_, _, t0)) = pts.first() else { return Vec::new() };
+    pts.iter()
+        .map(|&(x, y, t)| SwipePoint {
+            x: x as f64,
+            y: y as f64,
+            // saturating: samples are pushed in frame order, but a clock that
+            // stepped backwards should flatten to 0 rather than wrap to ~4e9
+            // and make every gesture look impossibly long.
+            t_ms: t.saturating_sub(t0),
+        })
+        .collect()
+}
+
 /// Classify a path. The order is the algorithm — see the module docs.
 pub fn classify(path: &[SwipePoint], t: &CardinalThresholds) -> CardinalGesture {
     let (Some(first), Some(last)) = (path.first(), path.last()) else {
@@ -425,5 +455,54 @@ mod tests {
         for d in Direction::ALL {
             assert!(seen.contains(&d), "{d:?} is unreachable");
         }
+    }
+
+    #[test]
+    fn a_hairpin_still_capitalises_after_the_app_has_been_running() {
+        // THE BUG THE CALLER HAD. Drag samples are stamped with
+        // `ui.input().time * 1000` — milliseconds since the app STARTED, not
+        // since the gesture started. The widget stamped its first point with a
+        // literal 0 and then "rebased" on it, so `duration` came out as the
+        // whole uptime, and the hairpin arm (`duration < hairpin_max_ms`, 600)
+        // could never fire again after the first 600 ms of a session.
+        //
+        // Capitalisation IS the hairpin in the cardinal layout, so the symptom
+        // was a keyboard that drew the gesture correctly and refused to produce
+        // a capital letter — display right, logic wrong.
+        //
+        // The same north hairpin as the ordering test above, offset by an hour
+        // of uptime. It must classify identically: a gesture cannot depend on
+        // how long the program has been open.
+        const UPTIME_MS: u32 = 3_600_000;
+        let samples = [
+            (100.0f32, 200.0f32, UPTIME_MS),
+            (100.0, 150.0, UPTIME_MS + 60),
+            (100.0, 120.0, UPTIME_MS + 120),
+            (100.0, 160.0, UPTIME_MS + 200),
+            (100.0, 205.0, UPTIME_MS + 280),
+        ];
+        let path = path_from_samples(&samples);
+        assert_eq!(path[0].t_ms, 0, "the first sample must define t=0");
+        assert_eq!(path[4].t_ms, 280, "later samples must be relative to it");
+        match classify(&path, &CardinalThresholds::default()) {
+            CardinalGesture::Hairpin(Direction::N) => {}
+            other => panic!("a hairpin an hour in must still capitalise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_clock_that_steps_backwards_does_not_become_a_four_billion_ms_gesture() {
+        // t_ms is unsigned, so a plain subtraction would wrap and every
+        // duration-gated arm would silently stop matching — the same failure as
+        // the uptime bug, but intermittent and far harder to attribute.
+        let samples = [(0.0f32, 0.0f32, 500u32), (10.0, 0.0, 400), (20.0, 0.0, 600)];
+        let path = path_from_samples(&samples);
+        assert_eq!(path[1].t_ms, 0, "a backwards step must flatten, not wrap");
+        assert_eq!(path[2].t_ms, 100);
+    }
+
+    #[test]
+    fn an_empty_sample_list_yields_an_empty_path() {
+        assert!(path_from_samples(&[]).is_empty());
     }
 }
