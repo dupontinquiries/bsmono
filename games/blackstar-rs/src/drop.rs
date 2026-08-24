@@ -136,6 +136,13 @@ impl Drop {
         }
     }
 
+    /// Anti-air absorbed so far this descent. Exposed so the caller can
+    /// charge it to a real body AS IT LANDS rather than as a lump in the
+    /// report — the total still rides `Landing.aa_taken` for the debrief.
+    pub fn aa_so_far(&self) -> f32 {
+        self.aa_taken
+    }
+
     /// CAN YOU GO? Refuses with a reason, because a jump button that does
     /// nothing over a hot LZ is the worst possible moment for silence.
     ///

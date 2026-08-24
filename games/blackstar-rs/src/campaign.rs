@@ -209,12 +209,26 @@ impl MissionRun {
             carried: None,
             breather: 0.0,
             t: 0.0,
-            struct_hp: 320.0 + 90.0 * film,
-            asset_hp: 420.0 + 110.0 * film,
+            struct_hp: Self::struct_total(film),
+            asset_hp: Self::asset_total(film),
             hold_pct: 0.0,
-            survive_left: 75.0 + 15.0 * film,
+            survive_left: Self::survive_total(film),
             outcome: None,
         }
+    }
+
+    // The objective totals, as functions rather than literals in the
+    // constructor, because the HUD's progress meter needs the same numbers
+    // — and a total written twice is the two-answers-to-one-question
+    // mistake `--parity` exists to find, one layer up from metres.
+    fn struct_total(film: f32) -> f32 {
+        320.0 + 90.0 * film
+    }
+    fn asset_total(film: f32) -> f32 {
+        420.0 + 110.0 * film
+    }
+    fn survive_total(film: f32) -> f32 {
+        75.0 + 15.0 * film
     }
 
     /// Nightfall dress: an element burn and, some weeks, no field repair.
@@ -247,6 +261,62 @@ impl MissionRun {
             (_, Some(s)) => s.alive(),
             _ => self.squad_ids.len(),
         }
+    }
+    /// The wave on stage (1-based), clamped so the breather after a clear
+    /// does not briefly advertise a wave that has not mustered.
+    pub fn wave_now(&self) -> usize {
+        (self.wave_i + 1).min(self.waves.len().max(1))
+    }
+    pub fn foes_alive(&self) -> usize {
+        self.fight.as_ref().map(|f| f.b.alive()).unwrap_or(0)
+    }
+
+    /// Objective progress for a HUD, as (label, 0..1). One meter per
+    /// objective — Protect's asset health IS its meter, because the mission
+    /// is lost the moment it dies and a bar that can only fall says so.
+    pub fn meter(&self) -> (&'static str, f32) {
+        let film = self.mission.film as f32;
+        match self.mission.objective {
+            Objective::Eliminate => {
+                ("cleared", self.wave_i as f32 / self.waves.len().max(1) as f32)
+            }
+            Objective::Survive => {
+                ("outlived", 1.0 - (self.survive_left / Self::survive_total(film)).clamp(0.0, 1.0))
+            }
+            Objective::Breach => {
+                ("breached", 1.0 - (self.struct_hp / Self::struct_total(film)).clamp(0.0, 1.0))
+            }
+            Objective::Control => ("held", self.hold_pct / 100.0),
+            Objective::Protect => {
+                ("asset", (self.asset_hp / Self::asset_total(film)).clamp(0.0, 1.0))
+            }
+        }
+    }
+
+    /// The element on the hostile leading the line, for the shooter's
+    /// advantage arithmetic — the same `Element::advantage` the volleys
+    /// use, computed by the caller who knows what fired.
+    pub fn lead_foe_element(&self) -> Option<Element> {
+        self.fight
+            .as_ref()?
+            .b
+            .fighters
+            .iter()
+            .find(|t| t.alive())
+            .map(|t| t.troop.element)
+    }
+
+    /// The player's fire, landed on the hostile leading the line through
+    /// `Fight::external_on_b` — the elemental shield, corrupted evasion and
+    /// the ring multiplier all apply, so a shot into the engagement obeys
+    /// the same rules as everyone else's. External kills are safe against
+    /// double-counting: `Fight::step` only emits a casualty for a death ITS
+    /// OWN volley caused (the `was && !alive` transition), so a fighter
+    /// felled here is reported here and nowhere else, and the wave still
+    /// clears on `alive() == 0` like any other.
+    pub fn player_strike(&mut self, dmg: f32, ring: f32) -> Option<CampEvent> {
+        let f = self.fight.as_mut()?;
+        f.external_on_b(dmg, ring).map(|i| CampEvent::EnemyDown { wave_slot: i })
     }
 
     fn spawn_wave(&mut self, ev: &mut Vec<CampEvent>) {

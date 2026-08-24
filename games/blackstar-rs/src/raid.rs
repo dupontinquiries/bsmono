@@ -86,8 +86,24 @@ pub struct Run {
 /// learn an encounter.
 pub fn window_s(orbit: &Orbit, w: Weather) -> f32 {
     match w {
-        Weather::Clear => f32::INFINITY,
+        // the flare is the one window that needs the sky: warning time is
+        // orbital distance
         Weather::FlareFront => flare_warning_s(orbit, true),
+        _ => window_base_s(w),
+    }
+}
+
+/// The windows that do not depend on an orbit — everything but a flare.
+/// Split out so the mission sorties (`sortie.rs`), which have a
+/// destination but no `Orbit`, ask the SAME numbers a raid does instead of
+/// growing their own copy. The flare entry is a conservative floor for a
+/// caller with no orbit to offer; raids never hit it (they route through
+/// `window_s` above), and mission weather does not currently include
+/// flares — it is here so the match is total, and it is a GUESS.
+pub fn window_base_s(w: Weather) -> f32 {
+    match w {
+        Weather::Clear => f32::INFINITY,
+        Weather::FlareFront => 300.0,
         Weather::ThermalFront => 900.0,
         Weather::DustStorm => 1_500.0,
         Weather::GiantWave => 600.0,
@@ -104,13 +120,22 @@ pub fn window_s(orbit: &Orbit, w: Weather) -> f32 {
 /// leaves it on the deck for the whole raid, so the longer you are down
 /// there the more it wears. The cost lands on the NEXT voyage, which is the
 /// kind of consequence worth having.
+/// Hull wear per second of sitting pinned on a hostile deck, normalized
+/// and capped. ONE formula: `ship_exposure` below prices a raid with it,
+/// and the flown sortie (`sortie::commit`) prices an LZ engagement with
+/// it — a pinned ship that wears differently depending on which planner
+/// asked would be the two-answers-to-one-question mistake.
+pub fn lz_wear(secs: f32) -> f32 {
+    (secs / 240.0).clamp(0.2, 4.0)
+}
+
 pub fn ship_exposure(r: &Run, raid: &Raid) -> f32 {
     match r.approach {
         Some(Approach::ClearLz) => {
             // proportional to how long the raid ran, which the encounter
             // times already describe
             let secs: f32 = raid.encounters.iter().sum::<f32>().max(60.0);
-            (secs / 240.0).clamp(0.2, 4.0)
+            lz_wear(secs)
         }
         _ => 0.0,
     }

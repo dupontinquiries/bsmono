@@ -109,7 +109,10 @@ impl Deck {
                 self.walk_to(*st);
                 None
             }
-            Some(Order::Sortie(_)) | Some(Order::Nightfall(_)) => order,
+            // a raid passes through for the same reason a sortie does:
+            // flying it needs the shell, the gpu, and a run of fresh maps
+            Some(Order::Sortie(_)) | Some(Order::Nightfall(_)) | Some(Order::Raid(_)) => order,
+            Some(Order::Forge(_)) | Some(Order::Echo(_)) => order,
             None => None,
         }
     }

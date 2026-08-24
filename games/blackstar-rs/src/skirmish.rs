@@ -208,6 +208,25 @@ impl Squad {
     }
 }
 
+impl Fight {
+    /// External fire — the player's — landed on the hostile leading side
+    /// B's line, through `Fighter::hit` like any volley: the elemental
+    /// shield melts or shrugs by `ring`, corrupted evasion applies, and a
+    /// raw-hp bypass cannot creep back in because this is the only door.
+    /// Returns the slot if the hit was the kill, for the caller's event
+    /// stream — `step` will not double-report it, since it only emits
+    /// casualties for deaths its own volley caused.
+    pub fn external_on_b(&mut self, dmg: f32, ring: f32) -> Option<usize> {
+        let (i, t) = self.b.fighters.iter_mut().enumerate().find(|(_, t)| t.alive())?;
+        t.hit(dmg, ring);
+        if !t.alive() {
+            Some(i)
+        } else {
+            None
+        }
+    }
+}
+
 // --------------------------------------------------------------- fight ---
 
 /// Who a fighter shoots, per doctrine: aggression focuses the weakest

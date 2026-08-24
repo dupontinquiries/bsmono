@@ -19,6 +19,13 @@ gamepad = ["dep:gilrs"]
 analog = ["dep:libloading"]
 
 [dependencies]
+# THE FORGE'S MOUTH (src/raidforge.rs): aperture's completion engine, which is
+# logscope-fan's dependency-free ollama client grown a Provider trait — raw
+# TcpStream HTTP/1.1, std-only, zero transitive deps, blocking by design so it
+# lives on a plain worker thread with no runtime in the tree. Path dep into
+# the monorepo's own apps; the game asks it for llama3 completions and parses
+# the answer leniently.
+aperture-complete = { path = "../../apps/aperture/crates/aperture-complete" }
 # Inflate for bots.pack (see src/botpack.rs). Already in Cargo.lock via flate2's
 # tree, so declaring it directly costs no new download — and miniz_oxide rather
 # than flate2 because this only ever DECOMPRESSES, and flate2 pulls a C zlib
