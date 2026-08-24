@@ -10,13 +10,19 @@ found and did not get to.
 
 ---
 
-## 1. C10-0a's remainder — appearance, on hardware
+## 1. C10-0a's remainder — tuning, on hardware
 
-The unified-surface STATE model is done and verified; see the C10-0a entry in
-`C10_TODO.md` for the split. The open questions all need a display: true
-modality (scrim + input capture, which is what would make Esc-to-close safe),
-and settings-as-popup vs settings-as-right-panel. `surface.rs`'s module docs
-carry the reasoning so the on-device session does not re-derive it.
+REVISED mid-session on the user's call: appearance work gets DEMOED in the
+codebase and tuned on device, not deferred to it. So the forms now exist:
+every transient surface renders through egui's Modal (scrim, click-outside,
+Esc consumed) in its QML form, and the PTY key drain is gated while a surface
+is up — see the second c11 commit. What remains on-device is TUNING, not
+implementation: every knob is in `overlay.rs`'s `form()` table (QML line
+cited per row) and the two constants under it. Known open judgments for the
+device pass: settings is centered rather than QML's nav-anchored position;
+the cmd sheet's radius-20 top corners were not ported; workspaces' right-
+drawer form has no QML counterpart and was chosen. Appearance is UNVERIFIED
+here — no display.
 
 ## 2. Checker findings, all pre-existing, none fixed
 
