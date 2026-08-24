@@ -105,6 +105,15 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
     for c in project.clips.values() {
         ops.push(Op::AddClip { clip: c.clone() });
     }
+    // Automation lanes, as the ops that place their points — before the
+    // relock, because a locked track refuses its lane the way it refuses
+    // its fader, and a save that silently dropped a locked track's ride
+    // would be the same class of bug as the one relock itself fixes.
+    for (target, lane) in &project.automation {
+        for (at, value) in lane {
+            ops.push(Op::SetAutoPoint { target: *target, at: *at, value: *value });
+        }
+    }
     ops.extend(relock);
     ops
 }
@@ -415,5 +424,34 @@ mod rack_section_tests {
         let bytes = SaveFile::from_project(&p, Vec::new(), Some(studio_live::Rack::trap_kit()))
             .encode();
         assert!(SaveFile::decode(&bytes[..bytes.len() - 4]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod automation_file_tests {
+    use super::*;
+    use studio_core::{AutoTarget, Project, Ticks, Track, TrackId, TrackKind};
+
+    #[test]
+    fn a_saved_projects_lanes_survive_the_round_trip() {
+        // A file is the ops that rebuild the project; a lane that snapshot()
+        // forgot would silently vanish on every save — the exact bug class
+        // the locked-track relock already guards one field over. Locked
+        // track included ON PURPOSE: its lane must land before the relock.
+        let mut p = Project { name: "ride".into(), ..Default::default() };
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "vox".into(), muted: false, locked: false, gain: 0.8, route: None }, at: 0 }).unwrap();
+        let t = AutoTarget::TrackGain(TrackId(1));
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks(100), value: 0.2 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks(900), value: 1.0 }).unwrap();
+        p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
+
+        let file = SaveFile::from_project(&p, Vec::new(), None);
+        let back = SaveFile::decode(&file.encode()).expect("decodes");
+        let mut rebuilt = Project { name: back.name.clone(), ..Default::default() };
+        for op in &back.snapshot {
+            rebuilt.apply(op).expect("every snapshot op applies cleanly");
+        }
+        assert_eq!(rebuilt, p, "lanes, lock state and all");
     }
 }

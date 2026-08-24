@@ -31,11 +31,15 @@
 //! can be receiving live edits while the catch-up is still arriving.
 
 use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
-use studio_core::{Bus, BusId, Clip, ClipId, Effect, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+use studio_core::{AutoTarget, Bus, BusId, Clip, ClipId, Effect, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
 use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
+///
+/// v10: `Op` gained the automation pair — `SetAutoPoint`(20) /
+/// `RemoveAutoPoint`(21) — and with them the `AutoTarget` encoding
+/// (kind byte + id).
 ///
 /// v9: `Pattern` gained `rolls` — the piano roll's held notes, per channel.
 /// A rack shape change, so it moves both `Packet::Rack` and the file
@@ -67,7 +71,7 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 9;
+pub const WIRE_VERSION: u8 = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -237,6 +241,20 @@ fn get_bus(r: &mut R) -> Option<Bus> {
     })
 }
 
+fn put_auto_target(o: &mut Vec<u8>, t: AutoTarget) {
+    match t {
+        AutoTarget::TrackGain(id) => { put_u8(o, 0); put_u64(o, id.0); }
+        AutoTarget::BusGain(id) => { put_u8(o, 1); put_u64(o, id.0); }
+    }
+}
+fn get_auto_target(r: &mut R) -> Option<AutoTarget> {
+    match r.u8()? {
+        0 => Some(AutoTarget::TrackGain(TrackId(r.u64()?))),
+        1 => Some(AutoTarget::BusGain(BusId(r.u64()?))),
+        _ => None, // an unknown target refuses the packet, like an unknown op
+    }
+}
+
 fn put_track(o: &mut Vec<u8>, t: &Track) {
     put_u64(o, t.id.0);
     put_u8(o, matches!(t.kind, TrackKind::Audio) as u8);
@@ -302,6 +320,12 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
         Op::RemoveSource { id } => { put_u8(o, 18); put_u64(o, id.0); }
         Op::SetTrackGain { id, gain } => { put_u8(o, 19); put_u64(o, id.0); put_f32(o, *gain); }
+        Op::SetAutoPoint { target, at, value } => {
+            put_u8(o, 20); put_auto_target(o, *target); put_ticks(o, *at); put_f32(o, *value);
+        }
+        Op::RemoveAutoPoint { target, at } => {
+            put_u8(o, 21); put_auto_target(o, *target); put_ticks(o, *at);
+        }
     }
 }
 
@@ -341,6 +365,8 @@ fn get_op(r: &mut R) -> Option<Op> {
         16 => Op::SetRoute { track: TrackId(r.u64()?), bus: get_opt_bus_id(r)? },
         18 => Op::RemoveSource { id: SourceId(r.u64()?) },
         19 => Op::SetTrackGain { id: TrackId(r.u64()?), gain: r.f32()? },
+        20 => Op::SetAutoPoint { target: get_auto_target(r)?, at: r.ticks()?, value: r.f32()? },
+        21 => Op::RemoveAutoPoint { target: get_auto_target(r)?, at: r.ticks()? },
         _ => return None, // an op kind from a newer build: refuse, don't guess
     })
 }
@@ -994,7 +1020,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 9, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 10, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1067,5 +1093,26 @@ mod tests {
         let again = host.catchup_for(0);
         joiner.receive(Packet::decode(&again.encode()).unwrap());
         assert_eq!(joiner.project, host.project, "replaying everything changes nothing");
+    }
+}
+
+#[cfg(test)]
+mod automation_wire_tests {
+    use super::*;
+    use studio_core::AutoTarget;
+
+    #[test]
+    fn the_automation_ops_survive_the_wire_exactly() {
+        for op in [
+            Op::SetAutoPoint { target: AutoTarget::TrackGain(TrackId(3)),
+                               at: Ticks(705_600_000), value: 0.25 },
+            Op::SetAutoPoint { target: AutoTarget::BusGain(BusId(9)),
+                               at: Ticks(0), value: 1.5 },
+            Op::RemoveAutoPoint { target: AutoTarget::TrackGain(TrackId(3)),
+                                  at: Ticks(705_600_000) },
+        ] {
+            let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 7, site: SiteId(2) }, op });
+            assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
+        }
     }
 }

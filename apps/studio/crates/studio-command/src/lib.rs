@@ -96,6 +96,8 @@ impl Command {
                 Op::SetBusChain { .. } => CommandKind::EditSetBusChain,
                 Op::SetBusSends { .. } => CommandKind::EditSetBusSends,
                 Op::SetRoute { .. } => CommandKind::EditSetRoute,
+                Op::SetAutoPoint { .. } => CommandKind::EditSetAutoPoint,
+                Op::RemoveAutoPoint { .. } => CommandKind::EditRemoveAutoPoint,
             },
             Command::Transport(t) => match t {
                 TransportCmd::Play => CommandKind::TransportPlay,
@@ -158,6 +160,8 @@ pub enum CommandKind {
     EditSetBusChain,
     EditSetBusSends,
     EditSetRoute,
+    EditSetAutoPoint,
+    EditRemoveAutoPoint,
     TransportPlay,
     TransportStop,
     TransportSeek,

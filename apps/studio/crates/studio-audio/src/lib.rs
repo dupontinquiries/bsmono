@@ -30,7 +30,7 @@ pub mod block;
 pub mod destructive;
 
 use std::collections::BTreeMap;
-use studio_core::{Project, SourceId, Ticks, TrackKind};
+use studio_core::{eval_lane, AutoTarget, Project, SourceId, Ticks, TrackKind};
 
 pub mod export;
 pub mod repitch;
@@ -593,7 +593,16 @@ pub fn mixdown_into(
                 // fractional position, linear interpolation; a same-rate
                 // source takes the exact integer path untouched.
                 let src_t = clip.src_in.saturating_add(into_clip);
-                let g = clip.gain * track.gain * fade.gain_at(into_clip, clip.len);
+                // The lane RIDES the fader — multiplied, not substituted —
+                // so the fader stays a trim (see `Project::automation`'s
+                // docs). Per-sample evaluation at the `at` this loop
+                // already computes: automation that stepped per buffer
+                // would zipper on any ramp steeper than gentle.
+                let auto = match project.automation.get(&AutoTarget::TrackGain(track.id)) {
+                    Some(lane) => eval_lane(lane, at),
+                    None => 1.0,
+                };
+                let g = clip.gain * track.gain * auto * fade.gain_at(into_clip, clip.len);
                 let oi = (out_off + i) * 2;
                 if oi + 1 >= dest.len() { break; }
                 let read = |c: &[f32], pos: f64| -> Option<f32> {
@@ -694,7 +703,21 @@ pub fn mixdown_into(
         }
         zero_resize(&mut scratch.pre, buf.len());
         scratch.pre.copy_from_slice(&buf);
-        for s in buf.iter_mut() { *s *= bus.gain; }
+        match project.automation.get(&AutoTarget::BusGain(id)) {
+            Some(lane) => {
+                // The bus fader's ride, per interleaved frame — L and R of
+                // one instant share one lane value, or a ramp would tilt
+                // the image sideways.
+                let from_s = from.to_samples(rate);
+                for (fi, pair) in buf.chunks_exact_mut(2).enumerate() {
+                    let at = Ticks::from_samples(from_s + fi as i64, rate);
+                    let g = bus.gain * eval_lane(lane, at);
+                    pair[0] *= g;
+                    pair[1] *= g;
+                }
+            }
+            None => for s in buf.iter_mut() { *s *= bus.gain; },
+        }
 
         for send in &bus.sends {
             let tap: &[f32] = if send.pre_fader { &scratch.pre } else { &buf };
@@ -1620,5 +1643,94 @@ mod source_rate_tests {
         // the source lasts the whole second at pitch.
         let late_l = out[(47_990) * 2];
         assert!(late_l > 0.95, "the source fills its true duration, got {late_l}");
+    }
+}
+
+#[cfg(test)]
+mod automation_render_tests {
+    use super::*;
+    use studio_core::{AutoTarget, Bus, BusId, Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn one_clip_project() -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![vec![0.5; 48_000]] });
+        (p, audio)
+    }
+    fn render(p: &Project, a: &BTreeMap<SourceId, SourceAudio>) -> Vec<f32> {
+        mixdown(p, a, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(1.0), 48_000, &[], &[])
+    }
+
+    #[test]
+    fn a_gain_ramp_is_a_fade_the_render_actually_follows() {
+        // 0→1 across the second: the first sample near silent, the midpoint
+        // near half, the end at the fader's own level — per-sample linear,
+        // not stepped per buffer.
+        let (mut p, audio) = one_clip_project();
+        let t = AutoTarget::TrackGain(TrackId(1));
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks::ZERO, value: 0.0 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks::from_seconds(1.0), value: 1.0 }).unwrap();
+        let out = render(&p, &audio);
+        assert!(out[0].abs() < 1e-3, "the ramp starts at silence, got {}", out[0]);
+        let mid = out[out.len() / 2];
+        assert!((mid - 0.25).abs() < 0.01, "midpoint is half the ride on a 0.5 source: {mid}");
+        let last = out[out.len() - 2];
+        assert!((last - 0.5).abs() < 0.01, "the end reaches the full source level: {last}");
+    }
+
+    #[test]
+    fn no_lane_renders_bit_identically_to_a_pre_automation_project() {
+        // The property that makes automation safe to land: a project that
+        // never touched it cannot sound different.
+        let (p, audio) = one_clip_project();
+        let mut with_empty_map = p.clone();
+        with_empty_map.automation.clear();
+        assert_eq!(render(&p, &audio), render(&with_empty_map, &audio));
+    }
+
+    #[test]
+    fn the_lane_rides_the_fader_rather_than_replacing_it() {
+        // Fader 0.5 × lane 0.5 = a quarter of the source — the documented
+        // multiply, pinned so "automation ate my fader" can never ship.
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::SetTrackGain { id: TrackId(1), gain: 0.5 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: AutoTarget::TrackGain(TrackId(1)),
+                                    at: Ticks::ZERO, value: 0.5 }).unwrap();
+        let out = render(&p, &audio);
+        let mid = out[out.len() / 2];
+        assert!((mid - 0.125).abs() < 1e-3, "0.5 source × 0.5 fader × 0.5 lane: {mid}");
+    }
+
+    #[test]
+    fn a_bus_lane_rides_the_bus_fader_over_time() {
+        // Route the track through a bus and ramp the BUS down: the mix ends
+        // quieter than it starts, and a flat lane at unity changes nothing.
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0,
+            muted: false, chain: vec![], sends: vec![], parent: None } }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let b = AutoTarget::BusGain(BusId(1));
+        let mut ramped = p.clone();
+        ramped.apply(&Op::SetAutoPoint { target: b, at: Ticks::ZERO, value: 1.0 }).unwrap();
+        ramped.apply(&Op::SetAutoPoint { target: b, at: Ticks::from_seconds(1.0), value: 0.0 }).unwrap();
+        let out = render(&ramped, &audio);
+        let head = out[..2400].iter().map(|s| s.abs()).sum::<f32>();
+        let tail = out[out.len() - 2400..].iter().map(|s| s.abs()).sum::<f32>();
+        assert!(head > tail * 20.0, "the ride pulled the bus down: head {head}, tail {tail}");
+
+        let mut flat = p.clone();
+        flat.apply(&Op::SetAutoPoint { target: b, at: Ticks::ZERO, value: 1.0 }).unwrap();
+        let plain = render(&p, &audio);
+        let unity = render(&flat, &audio);
+        for i in 0..plain.len() {
+            assert!((plain[i] - unity[i]).abs() < 1e-6, "a unity lane is transparent at {i}");
+        }
     }
 }

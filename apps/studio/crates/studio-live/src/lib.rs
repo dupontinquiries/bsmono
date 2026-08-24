@@ -785,7 +785,6 @@ pub fn render_pattern(
     // a single interleaved pass would be adding tails it hasn't yet learned
     // are cut.
     struct Placed {
-        ch_i: usize,
         at: usize,
         kind: SynthKind,
         amp: f32,
@@ -844,7 +843,6 @@ pub fn render_pattern(
         for r in 0..ratchet {
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
             placed.push(Placed {
-                ch_i,
                 at: step_i as usize * step + swing + r * sub_step,
                 kind: this_kind,
                 amp: ch.gain * m.vel,
@@ -876,7 +874,6 @@ pub fn render_pattern(
             let swing = tempo.swing_delay_samples(n.start, rate);
             let pitch = if matches!(ch.kind, SynthKind::Sampler { .. }) { n.key } else { 0 };
             placed.push(Placed {
-                ch_i,
                 at: n.start as usize * step + swing,
                 kind,
                 amp: ch.gain * n.vel.clamp(0.0, 1.0),

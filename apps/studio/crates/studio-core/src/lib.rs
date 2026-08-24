@@ -188,6 +188,42 @@ pub struct Project {
     /// existed at all.
     pub busses: BTreeMap<BusId, Bus>,
     pub name: String,
+    /// Automation lanes: points per target, each lane sorted by time. A
+    /// lane RIDES its fader (the render multiplies the two), it does not
+    /// replace it — the fader stays a trim you can grab without fighting
+    /// the curve, and a project with no lanes renders bit-identically to
+    /// one from before lanes existed. Sparse: an emptied lane drops its
+    /// entry, and a target that was removed may leave a dangling lane —
+    /// harmless (the render skips unknown targets) and cheaper than making
+    /// `RemoveTrack` responsible for a second cleanup undo can't restore.
+    /// `serde(default)` so any pre-automation serialization still loads.
+    #[serde(default)]
+    pub automation: BTreeMap<AutoTarget, Vec<(Ticks, f32)>>,
+}
+
+/// What an automation lane drives. Track and bus gain first — the volume
+/// ride is the automation everyone reaches for — with the enum here so a
+/// clip-gain or effect-parameter target is a variant away, not a redesign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AutoTarget {
+    TrackGain(TrackId),
+    BusGain(BusId),
+}
+
+/// A lane's value at `at`: linear between points, held flat before the
+/// first and after the last (the ends are what the automation last said,
+/// not a cliff back to unity), and 1.0 — a transparent ride — for a lane
+/// with no points at all.
+pub fn eval_lane(points: &[(Ticks, f32)], at: Ticks) -> f32 {
+    if points.is_empty() { return 1.0; }
+    let i = points.partition_point(|(t, _)| *t <= at);
+    if i == 0 { return points[0].1.max(0.0); }
+    if i == points.len() { return points[i - 1].1.max(0.0); }
+    let (t0, v0) = points[i - 1];
+    let (t1, v1) = points[i];
+    let span = (t1.0 - t0.0).max(1) as f64;
+    let frac = ((at.0 - t0.0) as f64 / span) as f32;
+    (v0 + (v1 - v0) * frac).max(0.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +249,16 @@ pub enum Op {
     /// edit, not the lock toggle; `SetTrackFlags` stays the only edit a
     /// locked track accepts, because something has to be able to unlock it.
     SetTrackGain { id: TrackId, gain: f32 },
+    /// Place (or move, or restate) one automation point: absolute (time,
+    /// value), so two peers editing the same lane converge per-point the
+    /// way clips converge per-field — a point at the same tick is the same
+    /// point, and the last writer's value wins on every replica. Refused on
+    /// a locked track for `SetTrackGain`'s reason: a ride is a mix edit.
+    SetAutoPoint { target: AutoTarget, at: Ticks, value: f32 },
+    /// Remove the point at exactly (target, at). Refused when there is no
+    /// such point — the inverse an undo needs (`SetAutoPoint` of the old
+    /// value) would otherwise have nothing to restore.
+    RemoveAutoPoint { target: AutoTarget, at: Ticks },
     AddClip { clip: Clip },
     RemoveClip { id: ClipId },
     /// Absolute placement, not a delta — see the module docs on convergence.
@@ -257,6 +303,8 @@ pub enum Op {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditError {
     NoSuchClip(ClipId),
+    /// A `RemoveAutoPoint` aimed at a point that is not there.
+    NoSuchAutoPoint,
     NoSuchTrack(TrackId),
     TrackLocked(TrackId),
     /// Refused because clips are still on this track — see `Op::RemoveTrack`.
@@ -285,6 +333,17 @@ impl Project {
     /// The inverse is computed from the state BEFORE the change, which is what
     /// makes undo exact rather than approximate — and it is also why undo and
     /// collaboration share one mechanism: both are just ops.
+    /// An automation target must exist to be ridden, and a locked track
+    /// refuses its lane the way it refuses its fader.
+    fn check_auto_target(&self, target: AutoTarget) -> Result<(), EditError> {
+        match target {
+            AutoTarget::TrackGain(id) => self.check_track(id),
+            AutoTarget::BusGain(id) => {
+                if self.busses.contains_key(&id) { Ok(()) } else { Err(EditError::NoSuchBus(id)) }
+            }
+        }
+    }
+
     pub fn apply(&mut self, op: &Op) -> Result<Op, EditError> {
         match op {
             Op::AddTrack { track, at } => {
@@ -327,6 +386,36 @@ impl Project {
                 let inv = Op::SetTrackGain { id: *id, gain: t.gain };
                 t.gain = *gain;
                 Ok(inv)
+            }
+            Op::SetAutoPoint { target, at, value } => {
+                self.check_auto_target(*target)?;
+                let lane = self.automation.entry(*target).or_default();
+                match lane.iter_mut().find(|(t, _)| t == at) {
+                    Some(p) => {
+                        // Restating a point at its own tick is a value
+                        // change; the inverse restores the old value.
+                        let inv = Op::SetAutoPoint { target: *target, at: *at, value: p.1 };
+                        p.1 = *value;
+                        Ok(inv)
+                    }
+                    None => {
+                        lane.push((*at, *value));
+                        lane.sort_by_key(|(t, _)| *t);
+                        Ok(Op::RemoveAutoPoint { target: *target, at: *at })
+                    }
+                }
+            }
+            Op::RemoveAutoPoint { target, at } => {
+                self.check_auto_target(*target)?;
+                let lane = self.automation.get_mut(target)
+                    .ok_or(EditError::NoSuchAutoPoint)?;
+                let i = lane.iter().position(|(t, _)| t == at)
+                    .ok_or(EditError::NoSuchAutoPoint)?;
+                let (_, old) = lane.remove(i);
+                // An emptied lane drops its entry — sparse, the same rule
+                // `Pattern::set_mod` follows one crate over.
+                if lane.is_empty() { self.automation.remove(target); }
+                Ok(Op::SetAutoPoint { target: *target, at: *at, value: old })
             }
             Op::AddClip { clip } => {
                 self.check_track(clip.track)?;
@@ -1253,5 +1342,96 @@ mod track_gain_tests {
         let old = r#"{"id":3,"kind":"Audio","name":"A1","muted":false,"locked":false,"route":null}"#;
         let t: Track = serde_json::from_str(old).expect("pre-fader track loads");
         assert_eq!(t.gain, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+
+    fn project() -> Project {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p
+    }
+    fn tg() -> AutoTarget { AutoTarget::TrackGain(TrackId(1)) }
+
+    #[test]
+    fn a_point_lands_sorted_and_its_inverse_removes_it() {
+        let mut p = project();
+        p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(200), value: 0.5 }).unwrap();
+        let inv = p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.8 }).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.8), (Ticks(200), 0.5)],
+                   "sorted by time regardless of edit order");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(200), 0.5)], "the inverse is a removal");
+    }
+
+    #[test]
+    fn restating_a_points_tick_changes_its_value_and_undoes_to_the_old_one() {
+        let mut p = project();
+        p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.8 }).unwrap();
+        let inv = p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.2 }).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.2)], "same tick is the same point");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.8)]);
+    }
+
+    #[test]
+    fn removing_the_last_point_drops_the_lane_and_undo_restores_it() {
+        let mut p = project();
+        p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.8 }).unwrap();
+        let inv = p.apply(&Op::RemoveAutoPoint { target: tg(), at: Ticks(100) }).unwrap();
+        assert!(p.automation.is_empty(), "an emptied lane keeps the map sparse");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.8)]);
+    }
+
+    #[test]
+    fn removing_a_point_that_is_not_there_is_refused_out_loud() {
+        let mut p = project();
+        assert!(matches!(p.apply(&Op::RemoveAutoPoint { target: tg(), at: Ticks(9) }),
+                         Err(EditError::NoSuchAutoPoint)),
+                "an inverse with nothing to restore must never be minted");
+    }
+
+    #[test]
+    fn a_locked_track_refuses_its_lane_like_it_refuses_its_fader() {
+        let mut p = project();
+        p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
+        assert!(matches!(p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(0), value: 0.5 }),
+                         Err(EditError::TrackLocked(_))));
+        assert!(matches!(p.apply(&Op::SetAutoPoint {
+            target: AutoTarget::BusGain(BusId(7)), at: Ticks(0), value: 0.5 }),
+                         Err(EditError::NoSuchBus(_))),
+                "and a lane cannot be aimed at a bus that does not exist");
+    }
+
+    #[test]
+    fn concurrent_lane_edits_converge_in_either_order() {
+        // Two peers, two different points on one lane: absolute (time,
+        // value) means both survive and both replicas agree — the same
+        // property clips get from absolute positions.
+        let a = Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.2 };
+        let b = Op::SetAutoPoint { target: tg(), at: Ticks(300), value: 0.9 };
+        let mut ab = project();
+        ab.apply(&a).unwrap(); ab.apply(&b).unwrap();
+        let mut ba = project();
+        ba.apply(&b).unwrap(); ba.apply(&a).unwrap();
+        assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn eval_is_linear_inside_held_at_the_ends_and_unity_when_empty() {
+        let lane = vec![(Ticks(100), 0.0), (Ticks(300), 1.0)];
+        assert_eq!(eval_lane(&lane, Ticks(0)), 0.0, "held flat before the first point");
+        assert_eq!(eval_lane(&lane, Ticks(100)), 0.0);
+        assert!((eval_lane(&lane, Ticks(200)) - 0.5).abs() < 1e-6, "linear between");
+        assert_eq!(eval_lane(&lane, Ticks(300)), 1.0);
+        assert_eq!(eval_lane(&lane, Ticks(9999)), 1.0, "held flat after the last");
+        assert_eq!(eval_lane(&[], Ticks(0)), 1.0, "no lane is a transparent ride");
+        // A negative value never reaches the mix as a phase flip.
+        assert_eq!(eval_lane(&[(Ticks(0), -2.0)], Ticks(5)), 0.0);
     }
 }
