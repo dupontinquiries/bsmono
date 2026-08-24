@@ -80,6 +80,49 @@ for different operator actions:
 * **the partner's node has no free cell** — a co-residency squeeze that adding remote machines
   cannot fix.
 
+## Assembling the matrix
+
+`place` takes a matrix; `assemble` builds one from what the hive can already
+observe:
+
+```text
+  discovery peers  ─┐
+  (id, Route)       ├─→  assemble()  ─→  Vec<Cell>  ─→  place() / place_fan()
+  NodeReport per    ┘
+  machine
+```
+
+A `NodeReport` is what one machine can say about itself without inventing
+anything: its decode speed, and for each resident model, how much of *this
+prompt* its KV pool already covers plus whether it is busy. That warmth number
+comes from the engine's own `pick_anchor` against the prompt under
+consideration — measured, never predicted.
+
+Two rules in `assemble` are load-bearing enough to have break-checked tests:
+
+* **Latency comes from `rendezvous::Route::typical_rtt_ms`,** not from a table
+  in `hive.rs`. Two copies of a latency estimate drift, and the routing layer
+  is the one that knows what a relay costs (0 / 5 / 40 / 120 ms for
+  loopback / LAN / last-known / relay).
+* **A peer that reported nothing contributes no cells.** An unreachable or
+  silent machine is *absent* from the matrix, not a cell that might work.
+  Inventing a placeholder cell is how a scheduler sends a job into a hole.
+
+## Mode decides how many; placement decides which
+
+`coordinator::Mode` plans the breadth of a run — barebones is one worker,
+aggressive fans out with best-of-K — and until now it had no idea which
+machines existed. `place_fan(job, matrix, n)` closes that: it takes `n`
+distinct cells, warmest first, and never books one twice.
+
+Greedy in warmth order is correct here rather than merely convenient. Fan-out
+branches are independent, so whichever branch receives the warmest cell saves
+the same prefill; the only real constraint is that no cell is double-booked.
+
+A fan may come back **shorter than asked**. An aggressive mode on a two-cell
+hive is a two-branch fan, not a failure, and the caller sees the shortfall in
+the length rather than being handed duplicate cells to make up the count.
+
 ## What is deliberately not here
 
 * **No live topology.** `hive.rs` takes a matrix; building it from `discovery`/`clusternode`
@@ -93,8 +136,9 @@ for different operator actions:
 
 ## Where to look
 
-* `crates/logscope-fan/src/hive.rs` — the matrix and `place`, with the tests that pin the
-  warmth and reach rules (both break-checked: removing either rule fails two assertions).
+* `crates/logscope-fan/src/hive.rs` — the matrix, `assemble`, `place` and `place_fan`, with
+  the tests that pin the warmth, reach, silent-peer and double-booking rules (all four
+  break-checked: removing any one of them fails two assertions).
 * `crates/logscope-fan/src/workerkit.rs` — the latency arithmetic, in full.
 * `crates/logscope-fan/src/capability.rs` — the per-worker contract.
 * `docs/08-kv-cache.md` — what a KV cache is and how the prefix tree reuses one.

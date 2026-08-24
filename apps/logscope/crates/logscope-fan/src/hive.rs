@@ -267,3 +267,163 @@ mod tests {
         assert!(e.contains("co-resident") && e.contains("PER TOKEN"), "{e}");
     }
 }
+
+// ── assembling the matrix ────────────────────────────────────────────────────
+
+/// What one machine reports about itself: which models it holds resident, how
+/// fast it decodes, and — the axis that matters — how much of a given prompt
+/// each of its KV pool entries already covers.
+///
+/// This is the shape a node's own engine can fill without inventing anything:
+/// `warm` comes from the prefix tree's `pick_anchor` against the prompt under
+/// consideration, never from a guess about conversation shape (see
+/// `docs/11-hive-matrix.md` on why a wrong prediction is worse than a cold
+/// cell — the schedule commits to it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeReport {
+    pub id: String,
+    pub tok_s: f32,
+    /// (model label, warm prefix tokens for THIS prompt, busy)
+    pub residents: Vec<(String, usize, bool)>,
+}
+
+/// Build the matrix from live topology plus each node's report.
+///
+/// Latency comes from `rendezvous::Route::typical_rtt_ms` rather than a second
+/// table in this module: two copies of a latency estimate drift, and the
+/// routing layer is the one that knows what a relay costs. A peer that
+/// reported nothing contributes no cells — an unreachable or silent machine is
+/// absent from the matrix, not a cell that might work.
+pub fn assemble(
+    local: Option<&NodeReport>,
+    peers: &[(String, crate::rendezvous::Route)],
+    reports: &[NodeReport],
+) -> Vec<Cell> {
+    let mut out = Vec::new();
+    let mut push = |r: &NodeReport, rtt: u32| {
+        for (model, warm, busy) in &r.residents {
+            out.push(Cell {
+                node: Node { id: r.id.clone(), rtt_ms: rtt, tok_s: r.tok_s },
+                model: model.clone(),
+                warm_prefix: *warm,
+                busy: *busy,
+            });
+        }
+    };
+    if let Some(l) = local {
+        push(l, 0);
+    }
+    for (id, route) in peers {
+        if local.map(|l| &l.id == id).unwrap_or(false) {
+            continue; // the local node is not also a peer of itself
+        }
+        if let Some(r) = reports.iter().find(|r| &r.id == id) {
+            push(r, route.typical_rtt_ms());
+        }
+    }
+    out
+}
+
+/// Place a whole fan-out: `n` jobs across the matrix, no cell twice.
+///
+/// `coordinator::Mode` decides HOW MANY cells to light up; this decides WHICH,
+/// and the two were unaware of each other. Greedy in warmth order is right
+/// here rather than merely convenient: the branches are independent, so
+/// assigning the warmest cell to any one of them saves the same prefill, and
+/// the only question is that no cell is double-booked.
+///
+/// Returns as many placements as the matrix can serve, which may be fewer than
+/// asked — an aggressive mode on a two-cell hive is a two-branch fan, not a
+/// failure, and the caller can see the shortfall in the length.
+pub fn place_fan(job: &Job, matrix: &[Cell], n: usize) -> Vec<Placement> {
+    let mut remaining: Vec<Cell> = matrix.to_vec();
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let Some(p) = place(job, &remaining) else { break };
+        // take that cell out of circulation, matching on node+model
+        if let Some(i) = remaining.iter().position(|c| c.node.id == p.cell.node.id && c.model == p.cell.model) {
+            remaining.remove(i);
+        }
+        out.push(p);
+    }
+    out
+}
+
+#[cfg(test)]
+mod assembly_tests {
+    use super::*;
+    use crate::rendezvous::Route;
+
+    fn report(id: &str, tok_s: f32, residents: &[(&str, usize, bool)]) -> NodeReport {
+        NodeReport {
+            id: id.into(),
+            tok_s,
+            residents: residents.iter().map(|(m, w, b)| (m.to_string(), *w, *b)).collect(),
+        }
+    }
+
+    /// Assembly takes latency from the ROUTING layer, so a relayed peer is
+    /// priced as a relay without this module holding its own opinion about
+    /// what a relay costs.
+    #[test]
+    fn latency_comes_from_the_route_not_from_here() {
+        let local = report("here", 40.0, &[("Qwen3-14B", 0, false)]);
+        let reports = vec![report("lan-box", 20.0, &[("Qwen3-14B", 0, false)]),
+                           report("far", 90.0, &[("Qwen3-14B", 0, false)])];
+        let peers = vec![("lan-box".to_string(), Route::Lan), ("far".to_string(), Route::Relay)];
+        let m = assemble(Some(&local), &peers, &reports);
+        assert_eq!(m.len(), 3);
+        let rtt = |id: &str| m.iter().find(|c| c.node.id == id).unwrap().node.rtt_ms;
+        assert_eq!(rtt("here"), 0);
+        assert_eq!(rtt("lan-box"), Route::Lan.typical_rtt_ms());
+        assert_eq!(rtt("far"), Route::Relay.typical_rtt_ms());
+    }
+
+    /// A peer that reported nothing is ABSENT, not an empty-but-usable node.
+    /// The local node is also not duplicated as a peer of itself.
+    #[test]
+    fn silent_peers_contribute_no_cells() {
+        let local = report("here", 40.0, &[("m", 0, false)]);
+        let peers = vec![("ghost".to_string(), Route::Lan), ("here".to_string(), Route::Loopback)];
+        let m = assemble(Some(&local), &peers, &[local.clone()]);
+        assert_eq!(m.len(), 1, "{m:#?}");
+        assert_eq!(m[0].node.id, "here");
+    }
+
+    /// The end-to-end join: topology in, placement out, and the warm remote
+    /// cell wins over the cold local one — the cross-machine case that had no
+    /// mechanism before.
+    #[test]
+    fn a_warm_remote_cell_beats_a_cold_local_one() {
+        let local = report("here", 60.0, &[("Qwen3-14B", 0, false)]);
+        let reports = vec![report("mini", 20.0, &[("Qwen3-14B", 1600, false)])];
+        let peers = vec![("mini".to_string(), Route::Lan)];
+        let m = assemble(Some(&local), &peers, &reports);
+        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1700, models: vec![] };
+        let p = place(&job, &m).unwrap();
+        assert_eq!(p.cell.node.id, "mini", "{}", p.reason);
+        assert_eq!(p.saved_prefill, 1600);
+    }
+
+    /// A fan takes distinct cells, warmest first, and stops at what the matrix
+    /// can serve rather than returning duplicates to fill the count.
+    #[test]
+    fn a_fan_never_double_books_a_cell() {
+        let local = report("a", 30.0, &[("m", 900, false), ("m", 0, false)]);
+        let reports = vec![report("b", 30.0, &[("m", 400, false)])];
+        let peers = vec![("b".to_string(), Route::Lan)];
+        let m = assemble(Some(&local), &peers, &reports);
+        assert_eq!(m.len(), 3);
+
+        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1000, models: vec![] };
+        let fan = place_fan(&job, &m, 3);
+        assert_eq!(fan.len(), 3);
+        assert_eq!(fan[0].saved_prefill, 900, "warmest first");
+        assert_eq!(fan[1].saved_prefill, 400);
+        assert_eq!(fan[2].saved_prefill, 0);
+
+        // asking for more than the matrix holds is a shorter fan, not a repeat
+        let over = place_fan(&job, &m, 8);
+        assert_eq!(over.len(), 3, "the fan invented cells to fill the count");
+    }
+}
