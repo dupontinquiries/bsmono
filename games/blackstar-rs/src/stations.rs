@@ -30,7 +30,7 @@ use crate::chi::Chi;
 use crate::content::MISSIONS;
 use crate::energon;
 use crate::gear::{Gear, Item, Rail};
-use crate::menu::{Event, Menu, Row, Value};
+use crate::menu::{Event, Menu, Row};
 use crate::menufx::DeployStyle;
 use crate::nightfall::{self, NightfallLog};
 use crate::raidcon::BOSSES;
@@ -42,7 +42,7 @@ use crate::archive;
 use crate::curriculum;
 use crate::provenance::{assay_with, Bearing, Dig, Ladder, Medium};
 use crate::hotbar::Hotbar;
-use crate::watch::{self, Watch, NATIVE, PHOTON};
+use crate::watch::{Watch, NATIVE, PHOTON};
 
 /// The rooms with consoles in them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

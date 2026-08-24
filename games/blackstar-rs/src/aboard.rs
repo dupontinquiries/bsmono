@@ -76,6 +76,33 @@ pub struct Aboard {
 pub const HULL_HEIGHTS: f32 = 160.0;
 
 /// The hull length for a given occupant.
+/// THE FLEET, as hull classes. No ship MODEL exists yet — the hull is
+/// generated (`interior::generate`) from one number, and that number is
+/// the only thing that distinguishes a lander from a carrier. So the
+/// roster is that number plus a name and a line of what it is like to be
+/// inside, which is what a ship is to the player today: eight rooms at a
+/// scale.
+///
+/// Lengths are in OCCUPANT HEIGHTS, per the repo convention, and go
+/// through `hull_for` like every other hull — a Transformer's cutter is
+/// not a person's cutter.
+pub const FLEET: &[(&str, f32, &str)] = &[
+    ("cutter", 9.0, "one deck, everything within shouting distance"),
+    ("lander", 14.0, "the default: cramped, honest, gets there"),
+    ("runner", 20.0, "a corridor with rooms bolted to it"),
+    ("hauler", 30.0, "the hangar is the point; the rest is corridor"),
+    ("carrier", 46.0, "you will get lost in this one"),
+];
+
+/// The default hull class, by index into `FLEET`.
+pub const FLEET_DEFAULT: usize = 1;
+
+/// A ship from the roster, sized for the body that flies it.
+pub fn fleet_ship(i: usize, body_h_m: f32) -> Interior {
+    let (_, heights, _) = FLEET[i.min(FLEET.len() - 1)];
+    Interior::generate(heights * body_h_m)
+}
+
 pub fn hull_for(body_h_m: f32) -> f32 {
     body_h_m * HULL_HEIGHTS
 }
@@ -228,6 +255,26 @@ pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
     use glam::Quat;
 
     let mut out = MeshData::new();
+    // THE HULL ITSELF, which was never drawn.
+    //
+    // `world::sdf` collides the parked ship with `Interior::sdf_local`, which
+    // is the OUTER HULL BOX minus the rooms — so the solid is the shell, and
+    // the rooms are the holes in it. This mesh drew only the rooms and links,
+    // i.e. exactly the empty space, and nothing at all where the collision
+    // actually is. On screen that reads as a small cluster of boxes you
+    // bounce off well before reaching, because you are hitting a hull nobody
+    // rendered: the render was a SUBSET of the collision and the two had no
+    // shared source.
+    //
+    // Same `hull_half` the SDF uses, so silhouette and solid come from one
+    // number. The rooms stay in the mesh below — they are inside an opaque
+    // hull now, which is what an interior is, and they are what you see once
+    // you are through a door.
+    {
+        let mut h = cbox(0.12);
+        bake(&mut h, ship.hull_half * 2.0, Quat::IDENTITY, Vec3::ZERO);
+        merge(&mut out, &h);
+    }
     for c in &ship.cells {
         let mut b = cbox(0.06);
         bake(&mut b, c.half * 2.0, Quat::IDENTITY, c.centre);
@@ -403,6 +450,58 @@ pub fn run(argv: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    /// THE BUG THIS GUARDS: the mesh drew only the rooms and links while
+    /// `world::sdf` collided `Interior::sdf_local`, which is the outer
+    /// hull box minus those rooms. Render was a strict SUBSET of collision
+    /// — you bounced off a hull nobody had drawn. Both now come from
+    /// `hull_half`, so the check is that the mesh actually reaches it.
+    #[test]
+    fn the_drawn_hull_reaches_the_volume_that_collides() {
+        let ship = super::Interior::generate(90.0);
+        let m = super::hull_mesh(&ship);
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for v in &m.verts {
+            for a in 0..3 {
+                lo[a] = lo[a].min(v.pos[a]);
+                hi[a] = hi[a].max(v.pos[a]);
+            }
+        }
+        let half = ship.hull_half;
+        for (a, want) in [(0usize, half.x), (1, half.y), (2, half.z)] {
+            let got = (hi[a] - lo[a]) * 0.5;
+            assert!(
+                got > want * 0.9,
+                "axis {a}: the mesh spans {got:.1} against a collider of {want:.1} — \
+                 the render is a subset of the solid again"
+            );
+        }
+    }
+
+    /// Every hull class must produce a ship whose rooms are inside it and
+    /// whose bridge is reachable — cycling with `{`/`}` regenerates at a
+    /// new length, and a class that carves a broken ship would strand the
+    /// player in structure.
+    #[test]
+    fn every_hull_class_in_the_fleet_is_a_walkable_ship() {
+        for (i, (name, heights, _)) in super::FLEET.iter().enumerate() {
+            let mut ship = super::fleet_ship(i, 8.0);
+            ship.unseal();
+            assert!(*heights > 0.0, "{name} has no length");
+            assert!(!ship.cells.is_empty(), "{name} carved no rooms");
+            for c in &ship.cells {
+                let out = (c.centre.abs() + c.half) - ship.hull_half;
+                assert!(
+                    out.max_element() <= 0.5,
+                    "{name}: room {} pokes {:.1} out of the hull",
+                    c.id,
+                    out.max_element()
+                );
+            }
+            let open = ship.reachable_from("bridge");
+            assert!(open.len() > 1, "{name}: nothing is reachable from the bridge");
+        }
+    }
+
     use super::*;
 
     #[test]

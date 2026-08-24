@@ -866,7 +866,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     // jump buffering: remember a press for a beat so hitting jump a frame
     // before touchdown still hops the instant wheels touch (the "getting my
     // jump back is slow" fix — the press used to be eaten mid-air)
-    if (c.jump_pressed && car.hover.is_none()) {
+    if c.jump_pressed && car.hover.is_none() {
         car.jbuf = 0.09;
     } else {
         car.jbuf = (car.jbuf - dt).max(0.0);

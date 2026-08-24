@@ -38,6 +38,7 @@ use crate::raidcon::{Arena, Boss, Mech, ARENAS, BOSSES};
 use crate::raidgen::{strhash, EncKind, EncSpec, PhaseSpec, RaidPlan};
 
 /// A parsed echo: everything needed to rebuild a `RaidPlan` on demand.
+#[derive(Debug)]
 pub struct EchoRaid {
     pub name: String,
     pub resembles: &'static Boss,

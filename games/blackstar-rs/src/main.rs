@@ -100,6 +100,7 @@ mod mapsim;
 mod menusim;
 mod cockpit;
 mod dropship;
+mod locomotion;
 mod raidflow;
 mod raidforge;
 mod shots;
@@ -850,6 +851,13 @@ struct Game {
     ambient: ballistics::Ambient,
     /// this world's surface gravity for the shot pool, m/s²
     world_g: f32,
+    /// which hull class is parked, indexing `aboard::FLEET`. Cycled with
+    /// the shifted brackets.
+    ship_class: usize,
+    /// how the active chassis moves, and why (`locomotion`). Held so the
+    /// HUD and the catalogue can show the reasoning rather than the
+    /// verdict alone.
+    loco_mode: locomotion::Decision,
     /// seconds left in the blade swing; 0 = idle. Drives the pose's arm
     /// channel and lands the arc at mid-swing.
     swing: f32,
@@ -1975,6 +1983,8 @@ fn main() {
         raid: None,
         forge_rx: None,
         shots: shots::Shots::default(),
+        ship_class: aboard::FLEET_DEFAULT,
+        loco_mode: locomotion::decide(4, 0, 0, 0.0, 0.0),
         ambient: ballistics::Ambient::earthlike(),
         world_g: 9.81,
         swing: 0.0,
@@ -2003,9 +2013,10 @@ fn main() {
     // Upload the ship's hull once. `Aboard::upload_hull` needs `&mut Gpu`, so
     // it happens here rather than in the struct literal — Game owns the gpu.
     {
-        let mut ab = std::mem::replace(&mut game.aboard, aboard::Aboard::new(1.0));
-        ab.upload_hull(&mut game.gpu);
-        game.aboard = ab;
+        // The replace/restore dance this used to do existed to get two
+        // &mut out of `game` at once; `upload_ship_hull` is a method, so
+        // disjoint-field borrows handle it and the swap can go.
+        game.upload_ship_hull();
         // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
         // one object is how a hull you can see and a hull you can hit end up
         // in different places, so both read `ground_lift` — and this is the
@@ -2112,15 +2123,25 @@ fn main() {
                                     _ => "",
                                 };
                                 let phys = event.physical_key;
-                                let dir = if ch == "[" || phys == PhysicalKey::Code(KeyCode::BracketLeft) {
+                                let dir = if ch == "[" || ch == "{" || phys == PhysicalKey::Code(KeyCode::BracketLeft) {
                                     -1
-                                } else if ch == "]" || phys == PhysicalKey::Code(KeyCode::BracketRight) {
+                                } else if ch == "]" || ch == "}" || phys == PhysicalKey::Code(KeyCode::BracketRight) {
                                     1
                                 } else {
                                     0
                                 };
                                 if dir != 0 {
-                                    game.cycle_car(dir);
+                                    // SHIFTED BRACKETS CYCLE THE SHIP. Read the
+                                    // CHARACTER for the shift, not a modifier
+                                    // state: `{` is what the keyboard sends and
+                                    // it survives every layout that moves the
+                                    // bracket keys, which is the same reason
+                                    // the physical fallback above exists.
+                                    if ch == "{" || ch == "}" {
+                                        game.cycle_ship(dir);
+                                    } else {
+                                        game.cycle_car(dir);
+                                    }
                                 }
                             }
                             // ALREADY-HELD GUARD, not just !event.repeat: an
@@ -2282,6 +2303,9 @@ fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.wheel_r = (m.wheel_r * size).max(0.05);
     car.drive = m.drive;
     car.hover = m.hover;
+    // `flight` and a DETECTED cushion are applied by the caller
+    // (`set_car_model`) through `locomotion`, because they depend on the
+    // decision rather than on the model's own fields.
     // The other half of da831f98: that fix updated ride_h every frame
     // during a smooth-morph blend (xform::Morph::bounds_at) but never
     // here, in the static per-pose path every chassis switch runs
@@ -2578,14 +2602,68 @@ impl Game {
     /// resting on. Same lift `cycle_car` does — factored out because the
     /// transform needs it on every frame of the fold, not just once.
     fn set_car_model(&mut self, m: usize) {
-        // COCKPIT DETECTION for the nose camera: the model's own point
-        // cloud names the bow (`cockpit.rs`); a hull too symmetric to
-        // call keeps the fixed-fraction anchor via None.
-        self.cam.cockpit_local = {
-            let g = cockpit::signed_forward(&self.cars.models[m].cloud, Vec3::Y, Vec3::NEG_Z);
-            if g.confident { Some(g.pos) } else { None }
+        // THE MOVEMENT PIPELINE, run once per chassis switch:
+        //
+        //   cloud -> cockpit (which end is the bow)
+        //         -> locomotion::decide (wheels? thrust? skirt?)
+        //         -> physics (Car::hover / Car::flight)
+        //
+        // Until now only the five hand-written hovercars ever set a mode,
+        // so every pose-strip chassis drove on invisible wheels — a
+        // hovertank sank onto its skirt and a jet drove. The chassis
+        // manifest still wins where it speaks (`declared`); detection
+        // covers everything nobody will hand-tune.
+        let cg = cockpit::signed_forward(&self.cars.models[m].cloud, Vec3::Y, Vec3::NEG_Z);
+        self.cam.cockpit_local = if cg.confident { Some(cg.pos) } else { None };
+        self.loco_mode = {
+            let mdl = &self.cars.models[m];
+            let declared = if mdl.hover.is_some() {
+                Some(locomotion::Mode::Hover)
+            } else if self
+                .cars
+                .xform
+                .get(&m)
+                .and_then(|(ci, _)| self.cars.chassis.get(*ci))
+                .map(|c| c.flight)
+                .unwrap_or(false)
+            {
+                Some(locomotion::Mode::Flight)
+            } else {
+                None
+            };
+            let measured =
+                locomotion::from_cloud(&mdl.cloud, Vec3::Y, cg.forward, mdl.half_h);
+            locomotion::decide_with_override(declared, measured)
         };
         self.switch_car(m);
+        // THE DECISION REACHES THE PHYSICS. `switch_car` -> `apply_car_dims`
+        // copies the model's own `hover`; this is where a DETECTED mode
+        // lands, and where flight stops being a field nobody assigned.
+        match self.loco_mode.mode {
+            locomotion::Mode::Wheeled => {
+                self.car.flight = false;
+                // a declared cushion survives; a detected wheeled chassis
+                // must not keep one from the model it replaced
+                if self.cars.models[m].hover.is_none() {
+                    self.car.hover = None;
+                }
+            }
+            locomotion::Mode::Hover => {
+                self.car.flight = false;
+                if self.car.hover.is_none() {
+                    self.car.hover =
+                        Some(locomotion::cushion_for(self.car.half_h, self.car.half_len));
+                }
+            }
+            locomotion::Mode::Flight => {
+                self.car.flight = true;
+                self.car.hover = None; // a flyer is not a cushion
+            }
+        }
+        self.toastf(&format!(
+            "{}: {:?} — {}",
+            self.cars.names[m], self.loco_mode.mode, self.loco_mode.why
+        ));
         let d = self.world.sdf(self.car.pos);
         // THE GUARD HAS TO USE THE SAME NUMBER AS THE CORRECTION.
         //
@@ -6723,6 +6801,52 @@ impl Game {
         // an orphan arena breathes: earthlike until arenas carry a sky
         self.ambient = ballistics::Ambient::earthlike();
         self.world_g = 9.81 * 0.8;
+    }
+
+    /// Step through the hull classes (`aboard::FLEET`). A ship is one
+    /// number today — the hull length the eight rooms are laid out in — so
+    /// cycling is regenerate, repark, re-upload, and put the player
+    /// OUTSIDE: rebuilding the hull around somebody standing in it would
+    /// leave them inside solid structure, which the seating guard would
+    /// then shove somewhere arbitrary.
+    fn cycle_ship(&mut self, dir: i32) {
+        let n = aboard::FLEET.len() as i32;
+        self.ship_class = (((self.ship_class as i32 + dir) % n + n) % n) as usize;
+        let (name, heights, note) = aboard::FLEET[self.ship_class];
+        let body_h = self.car.half_h * 2.0;
+        self.aboard.ship = aboard::fleet_ship(self.ship_class, body_h.max(0.5));
+        self.aboard.ship.unseal(); // a ship at rest has its doors open
+        self.repark();
+        self.aboard.hull_slot = None; // force a fresh upload at the new size
+        self.upload_ship_hull();
+        self.step_outside();
+        self.toastf(&format!(
+            "{name} — {:.0} m hull ({:.0} heights): {note}",
+            self.aboard.ship.hull_half.z * 2.0,
+            heights
+        ));
+    }
+
+    /// Put the player down clear of the parked hull, on the ground, facing
+    /// it. Used when the ship changes shape underneath them.
+    fn step_outside(&mut self) {
+        let Some((origin, ship)) = self.world.parked.as_ref() else { return };
+        let (origin, half) = (*origin, ship.hull_half);
+        let out = origin + Vec3::new(half.x + 6.0 + self.car.half_len * 2.0, 0.0, 0.0);
+        let gy = self.world.ground_h(out.x, out.z);
+        self.car.pos = Vec3::new(out.x, gy + self.car.stand_h() + 0.2, out.z);
+        self.car.vel = Vec3::ZERO;
+        // look back at what you just changed
+        let to = (origin - self.car.pos) * Vec3::new(1.0, 0.0, 1.0);
+        self.car.rot = Quat::from_rotation_arc(Vec3::NEG_Z, to.normalize_or(Vec3::NEG_Z));
+        self.last_room = None;
+        self.cam.indoors = None;
+    }
+
+    /// Upload (or replace) the parked hull's mesh. One path, so a ship
+    /// that changed shape cannot leave a stale silhouette on screen.
+    fn upload_ship_hull(&mut self) {
+        self.aboard.upload_hull(&mut self.gpu);
     }
 
     fn repark(&mut self) {
