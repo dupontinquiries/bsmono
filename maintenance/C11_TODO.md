@@ -369,7 +369,16 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
 - **DONE**: the matrix cell (model x node x KV warmth x busy), place() with
   warmth-over-speed and hard reach, explain_empty's three causes, and the
   design doc the dangling HiveMind_Strategy citations now point at.
-- **C11-18a — nobody BUILDS a matrix yet.** hive::place takes `&[Cell]`;
+- **C11-18a — assemble() DONE** (topology + NodeReport -> Vec<Cell>, latency
+  from Route, silent peers excluded). What remains is the I/O either side:
+  the ENGINE must fill a NodeReport (it already computes every number — decode
+  tok/s from the profile line, warm prefix from pick_anchor, busy from the
+  session) and the FABRIC must ask peers for theirs over the existing
+  announce/enlist path. Neither is pure, which is why neither is in hive.rs.
+- **C11-18b — place_fan() DONE**: Mode's breadth now meets placement's choice.
+  Wiring: coordinator's consumers should call place_fan(plan.workers.len())
+  instead of assuming local execution.
+- was C11-18a: hive::place takes `&[Cell]`;
   assembling it from discovery/clusternode (live nodes) + the engine's own
   anchor pool (warm_prefix per cell) is the wiring step. The warmth number
   must come from pick_anchor, not be guessed — the doc says why.
