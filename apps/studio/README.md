@@ -1719,3 +1719,23 @@ asset is stored FLAC-encoded, so a phone session's takes cost what they
 should. `C-r`, not `r`: the palette's drift test refused `r` the moment
 this tried to take it, because the keymap already owns it — the guard
 doing exactly its job.
+
+
+**Microphone: negotiate, don't assume.** The first capture build failed on
+a real Linux stack with `snd_pcm_hw_params` → ENOENT, which is ALSA's way
+of saying "not that combination, and I will not tell you which" — because
+cpal's `default_input_config()` reports a configuration the device then
+refuses. Opening now walks what the device actually enumerates: `attempts`
+builds the try-order (48 kHz first, the project rate with no resample,
+then 44.1, then the range's own bounds; mono before stereo, since a vocal
+take is mono and mono opens where stereo sometimes will not; backend
+buffer before a pinned 1024-frame period, because ALSA plug devices reject
+one or the other and which varies by machine), rates outside the device's
+enumerated range are never proposed, and nothing is tried twice. Both
+stages must pass — `build_input_stream` succeeding is not enough, since
+hw_params can still refuse at `play()`. If the default device refuses
+every attempt the open falls through to every other input device on the
+host, and total failure reports how many configurations were tried plus
+the last error, rather than repeating one opaque backend string. The
+negotiated device and rate land in the status line, because "recording" at
+a rate nobody chose is how a take ends up the wrong length.

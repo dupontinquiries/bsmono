@@ -2833,7 +2833,8 @@ impl App {
             self.take_from = self.studio.playhead();
             match self.mic.start() {
                 Ok(()) => self.studio.status =
-                    format!("recording from {}…", self.mic.device_name()),
+                    format!("recording from {} at {} Hz…",
+                            self.mic.device_name(), self.mic.rate()),
                 Err(e) => self.studio.status = e,
             }
         }

@@ -21,6 +21,68 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// One thing to try when opening a device: a rate, a channel count and a
+/// buffer choice. Kept as data so the ORDER of attempts is pure and
+/// testable — the part that actually decides whether a Fairphone's ALSA
+/// stack cooperates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Attempt {
+    pub rate: u32,
+    pub channels: u16,
+    /// `None` lets the backend choose; `Some(n)` pins the period. ALSA
+    /// plug devices frequently reject one and accept the other, and which
+    /// one varies by machine — so both are tried rather than guessed.
+    pub buffer: Option<u32>,
+}
+
+/// What a device says it supports: one range from cpal's enumeration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub min_rate: u32,
+    pub max_rate: u32,
+    pub channels: u16,
+}
+
+/// Build the attempt list for a device, best first.
+///
+/// This exists because `default_input_config()` lies on a real Linux
+/// audio stack: it reports a configuration that `snd_pcm_hw_params` then
+/// refuses with ENOENT ("No such file or directory"), which is ALSA's way
+/// of saying "not that combination, and I will not tell you which". The
+/// cure is to negotiate rather than assume — walk what the device
+/// enumerates, prefer the rates this app actually wants, and try both
+/// buffer strategies before giving up.
+///
+/// Order: 48 kHz first (the project rate — no resample), then 44.1, then
+/// whatever the range's own bounds are; mono before stereo, since a vocal
+/// take is mono and a mono open often succeeds where stereo does not.
+pub fn attempts(ranges: &[Range]) -> Vec<Attempt> {
+    let mut out: Vec<Attempt> = Vec::new();
+    let push = |a: Attempt, out: &mut Vec<Attempt>| {
+        if !out.contains(&a) { out.push(a); }
+    };
+    // Mono first across every range, then stereo — a channel count the
+    // device cannot do is skipped rather than attempted.
+    for want_ch in [1u16, 2] {
+        for r in ranges {
+            if r.channels < want_ch { continue; }
+            let ch = want_ch;
+            let mut rates = vec![48_000u32, 44_100];
+            rates.push(r.min_rate);
+            rates.push(r.max_rate);
+            for rate in rates {
+                if rate < r.min_rate || rate > r.max_rate { continue; }
+                // Backend's choice first: it is right more often, and a
+                // pinned period is the fallback for the stacks where it
+                // is not.
+                push(Attempt { rate, channels: ch, buffer: None }, &mut out);
+                push(Attempt { rate, channels: ch, buffer: Some(1024) }, &mut out);
+            }
+        }
+    }
+    out
+}
+
 /// What a finished take carries back.
 pub struct Take {
     pub audio: studio_audio::SourceAudio,
@@ -44,6 +106,9 @@ pub trait Capture {
     /// Seconds captured so far — the UI's counter.
     fn elapsed(&self) -> f32;
     fn device_name(&self) -> &str;
+    /// The rate actually negotiated — reported because "recording" at a
+    /// rate nobody chose is how a take ends up the wrong length.
+    fn rate(&self) -> u32;
 }
 
 /// No microphone: every call succeeds shallowly and records silence, so
@@ -61,17 +126,23 @@ impl Capture for NullCapture {
     fn recording(&self) -> bool { self.on }
     fn elapsed(&self) -> f32 { 0.0 }
     fn device_name(&self) -> &str { "none" }
+    fn rate(&self) -> u32 { 0 }
 }
 
 #[cfg(feature = "audio")]
 pub struct CpalCapture {
     shared: Arc<Shared>,
+    /// The rate and channel count actually NEGOTIATED, set when a stream
+    /// opens — not what a default config claimed before anything was
+    /// tried.
     rate: u32,
     channels: usize,
     name: String,
     stream: Option<cpal::Stream>,
     device: cpal::Device,
-    config: cpal::SupportedStreamConfig,
+    /// Every device on the host, so a failing default falls through to a
+    /// working USB interface instead of ending the attempt.
+    others: Vec<cpal::Device>,
 }
 
 #[cfg(feature = "audio")]
@@ -80,14 +151,28 @@ impl CpalCapture {
         use cpal::traits::{DeviceTrait, HostTrait};
         let host = cpal::default_host();
         let device = host.default_input_device()?;
-        let config = device.default_input_config().ok()?;
         let name = device.name().unwrap_or_else(|_| "input".into());
+        // Enumerated now, used only if the default device refuses every
+        // attempt: on a phone the default is often a plug device that
+        // cannot actually be opened while a real one sits behind it.
+        let others: Vec<cpal::Device> = host.input_devices()
+            .map(|d| d.collect()).unwrap_or_default();
         Some(CpalCapture {
             shared: Arc::new(Shared::default()),
-            rate: config.sample_rate().0,
-            channels: config.channels() as usize,
-            name, stream: None, device, config,
+            // Placeholders until a stream is actually negotiated — never
+            // reported as the take's rate, because nothing has opened yet.
+            rate: 48_000, channels: 1,
+            name, stream: None, device, others,
         })
+    }
+
+    fn ranges_of(device: &cpal::Device) -> Vec<Range> {
+        use cpal::traits::DeviceTrait;
+        device.supported_input_configs().map(|it| it.map(|c| Range {
+            min_rate: c.min_sample_rate().0,
+            max_rate: c.max_sample_rate().0,
+            channels: c.channels(),
+        }).collect()).unwrap_or_default()
     }
 }
 
@@ -129,21 +214,81 @@ impl Capture for CpalCapture {
             )
         }
 
-        let cfg: cpal::StreamConfig = self.config.clone().into();
-        let stream = match self.config.sample_format() {
-            cpal::SampleFormat::F32 =>
-                build::<f32>(&self.device, &cfg, self.shared.clone(), self.channels, |s| s),
-            cpal::SampleFormat::I16 =>
-                build::<i16>(&self.device, &cfg, self.shared.clone(), self.channels,
-                             |s| s as f32 / 32768.0),
-            cpal::SampleFormat::U16 =>
-                build::<u16>(&self.device, &cfg, self.shared.clone(), self.channels,
-                             |s| (s as f32 - 32768.0) / 32768.0),
-            other => return Err(format!("unsupported input format {other:?}")),
-        }.map_err(|e| format!("could not open the microphone: {e}"))?;
-        stream.play().map_err(|e| format!("could not start capture: {e}"))?;
-        self.stream = Some(stream);
-        Ok(())
+        // Negotiate. Each (device, attempt, format) pair is tried until
+        // one opens AND plays — `build_input_stream` succeeding is not
+        // enough on ALSA, where hw_params can still refuse at play().
+        // Failures are collected so a total failure can say what was
+        // tried instead of repeating one backend string.
+        let mut devices: Vec<cpal::Device> = vec![self.device.clone()];
+        for d in &self.others {
+            let same = d.name().ok() == Some(self.name.clone());
+            if !same { devices.push(d.clone()); }
+        }
+        let mut tried = 0usize;
+        let mut last_err = String::new();
+        for device in devices {
+            let dname = device.name().unwrap_or_else(|_| "input".into());
+            let ranges = Self::ranges_of(&device);
+            // A device that enumerates nothing still gets one honest try
+            // at the project rate rather than being skipped.
+            let plan = if ranges.is_empty() {
+                vec![Attempt { rate: 48_000, channels: 1, buffer: None }]
+            } else { attempts(&ranges) };
+            let formats = device.supported_input_configs()
+                .map(|it| it.map(|c| c.sample_format()).collect::<Vec<_>>())
+                .unwrap_or_else(|_| vec![cpal::SampleFormat::F32]);
+            for a in plan {
+                for fmt in formats.iter().copied() {
+                    tried += 1;
+                    let cfg = cpal::StreamConfig {
+                        channels: a.channels,
+                        sample_rate: cpal::SampleRate(a.rate),
+                        buffer_size: match a.buffer {
+                            Some(n) => cpal::BufferSize::Fixed(n),
+                            None => cpal::BufferSize::Default,
+                        },
+                    };
+                    let chans = a.channels as usize;
+                    let built = match fmt {
+                        cpal::SampleFormat::F32 =>
+                            build::<f32>(&device, &cfg, self.shared.clone(), chans, |s| s),
+                        cpal::SampleFormat::I16 =>
+                            build::<i16>(&device, &cfg, self.shared.clone(), chans,
+                                         |s| s as f32 / 32768.0),
+                        cpal::SampleFormat::U16 =>
+                            build::<u16>(&device, &cfg, self.shared.clone(), chans,
+                                         |s| (s as f32 - 32768.0) / 32768.0),
+                        other => { last_err = format!("format {other:?} unsupported"); continue; }
+                    };
+                    // build succeeding is not enough on ALSA: hw_params
+                    // can still refuse at play(), which is exactly the
+                    // ENOENT this whole negotiation exists for. Both
+                    // stages must pass before the attempt counts.
+                    let opened = match built {
+                        Ok(s) => match s.play() {
+                            Ok(()) => Ok(s),
+                            Err(e) => { last_err = e.to_string(); continue; }
+                        },
+                        Err(e) => Err(e),
+                    };
+                    match opened {
+                        Ok(stream) => {
+                            self.rate = a.rate;
+                            self.channels = chans;
+                            self.name = dname.clone();
+                            self.stream = Some(stream);
+                            return Ok(());
+                        }
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "no microphone configuration worked ({tried} tried across every input \
+             device). Last error: {last_err}. On Linux this is usually ALSA \
+             refusing the default config — check `arecord -l`, and if the device \
+             is busy, whatever else is holding it."))
     }
 
     fn stop(&mut self) -> Option<Take> {
@@ -162,6 +307,7 @@ impl Capture for CpalCapture {
         self.shared.buf.lock().map(|b| b.len() as f32 / self.rate as f32).unwrap_or(0.0)
     }
     fn device_name(&self) -> &str { &self.name }
+    fn rate(&self) -> u32 { self.rate }
 }
 
 /// The microphone, or an honest stand-in for one.
@@ -230,6 +376,34 @@ mod tests {
         let a = studio_audio::SourceAudio { sample_rate: 48_000,
             channels: vec![vec![0.0; 48_000]] };
         assert_eq!(trim_silence(&a, 0.01, 50.0).frames(), 48_000);
+    }
+
+    #[test]
+    fn the_attempt_order_negotiates_instead_of_trusting_the_default() {
+        // The bug this exists for: cpal's default_input_config() reported
+        // a configuration ALSA then refused with ENOENT from
+        // snd_pcm_hw_params. Rather than assume, walk what the device
+        // actually enumerates.
+        let ranges = vec![Range { min_rate: 44_100, max_rate: 48_000, channels: 2 }];
+        let a = attempts(&ranges);
+        // 48k first (the project rate, no resample), mono before stereo (a
+        // vocal take is mono, and mono opens where stereo sometimes does
+        // not), backend buffer before a pinned one.
+        assert_eq!(a[0], Attempt { rate: 48_000, channels: 1, buffer: None });
+        assert_eq!(a[1], Attempt { rate: 48_000, channels: 1, buffer: Some(1024) });
+        assert_eq!(a[2].rate, 44_100);
+        assert!(a.iter().any(|x| x.channels == 2), "stereo is still tried, later");
+        // A rate outside the device's range is never proposed — proposing
+        // one is how you get ENOENT in the first place.
+        assert!(a.iter().all(|x| x.rate >= 44_100 && x.rate <= 48_000));
+        // A mono-only device is never asked for stereo.
+        let mono = attempts(&[Range { min_rate: 16_000, max_rate: 16_000, channels: 1 }]);
+        assert!(mono.iter().all(|x| x.channels == 1));
+        assert_eq!(mono[0].rate, 16_000, "a device that only does 16k is asked for 16k");
+        // No duplicates: every attempt costs a device round trip.
+        let mut seen = std::collections::BTreeSet::new();
+        for x in &a { assert!(seen.insert((x.rate, x.channels, x.buffer)), "duplicate {x:?}"); }
+        assert!(attempts(&[]).is_empty(), "nothing enumerated, nothing invented");
     }
 
     #[test]
