@@ -99,6 +99,7 @@ mod menufx;
 mod mapsim;
 mod menusim;
 mod cockpit;
+mod driveline;
 mod dropship;
 mod locomotion;
 mod massfilter;
@@ -2671,9 +2672,36 @@ impl Game {
                 self.car.hover = None; // a flyer is not a cushion
             }
         }
+        // AND WHAT IT IS LIKE TO DRIVE. Everything `driveline` needs was
+        // measured on the way here: the hull's extents and wheel radius
+        // from the model, treads from `turret`, wheels/thrusters and the
+        // mode from `locomotion`. One more step, no new measurement.
+        self.car.hand = driveline::derive(driveline::Shape {
+            half_len: self.car.half_len,
+            half_w: self.car.half_w,
+            half_h: self.car.half_h,
+            wheel_r: self.car.wheel_r,
+            wheels: self.loco_mode.wheels,
+            tracked: self.cars.models[m].fittings.tracked(),
+            hovering: self.car.hover.is_some(),
+            flying: self.car.flight,
+            thrusters: self.loco_mode.thrusters,
+        });
+        let h = self.car.hand;
         self.toastf(&format!(
-            "{}: {:?} — {}",
-            self.cars.names[m], self.loco_mode.mode, self.loco_mode.why
+            "{}: {:?} — {} · {:.1} t, accel x{:.2} top x{:.2} grip x{:.2}{}",
+            self.cars.names[m],
+            self.loco_mode.mode,
+            self.loco_mode.why,
+            h.mass_t,
+            h.accel,
+            h.top_speed,
+            h.grip,
+            if h.stall_ms > 0.0 {
+                format!(" · stall {:.0} m/s, T/W {:.2}", h.stall_ms, h.twr)
+            } else {
+                String::new()
+            }
         ));
         let d = self.world.sdf(self.car.pos);
         // THE GUARD HAS TO USE THE SAME NUMBER AS THE CORRECTION.

@@ -79,6 +79,30 @@ impl Lift {
         }
     }
 
+    /// As `lift_accel`, but with THIS HULL'S stall speed rather than the
+    /// one constant every wing used to share.
+    ///
+    /// `STALL_MS` was a single number for every aircraft in the game,
+    /// which is the flight-model half of "every chassis handles the same".
+    /// A stall speed is not a constant: it is
+    /// `sqrt(2W / (rho·S·CLmax))`, so it falls out of the hull's mass and
+    /// wing area — which `driveline::derive` now computes from geometry.
+    /// Passing 0 keeps the old constant, so anything unmeasured is
+    /// unchanged.
+    pub fn lift_accel_at(self, stall_ms: f32, airspeed: f32, throttle: f32, air: f32, g: f32) -> f32 {
+        if matches!(self, Lift::Wing) && stall_ms > 0.0 && airspeed < stall_ms {
+            return 0.0;
+        }
+        if matches!(self, Lift::Wing) && stall_ms > 0.0 {
+            // above ITS stall, scale the wing's output by how far past it
+            // this hull is, on the same v² the model already uses
+            let base = self.lift_accel(airspeed.max(STALL_MS + 0.01), throttle, air, g);
+            let over = (airspeed / stall_ms).clamp(0.0, 3.0);
+            return base * (over * over / ((airspeed / STALL_MS).max(0.01)).powi(2)).clamp(0.2, 3.0);
+        }
+        self.lift_accel(airspeed, throttle, air, g)
+    }
+
     /// Upward acceleration available, in m/s².
     ///
     /// `air` is atmospheric density relative to Earth's, so 0 is vacuum and
@@ -188,6 +212,30 @@ mod tests {
         assert_eq!(Lift::Wing.lift_accel(0.0, 1.0, EARTH_AIR, G), 0.0);
         // and a rotor holds its own weight
         assert!(Lift::Rotor.lift_accel(0.0, 1.0, EARTH_AIR, G) > G);
+    }
+
+    #[test]
+    fn a_heavy_hull_stalls_where_a_light_one_still_flies() {
+        // the point of the per-hull number: one constant meant a loaded
+        // gunship and a paper glider fell out of the sky at the same speed
+        let heavy = 95.0f32;
+        let light = 35.0f32;
+        let at = 60.0f32;
+        assert_eq!(
+            Lift::Wing.lift_accel_at(heavy, at, 1.0, 1.0, 9.81),
+            0.0,
+            "a heavy hull flew below its own stall"
+        );
+        assert!(
+            Lift::Wing.lift_accel_at(light, at, 1.0, 1.0, 9.81) > 0.0,
+            "a light hull stalled well above its own stall speed"
+        );
+        // and zero keeps the old behaviour exactly
+        assert_eq!(
+            Lift::Wing.lift_accel_at(0.0, at, 1.0, 1.0, 9.81),
+            Lift::Wing.lift_accel(at, 1.0, 1.0, 9.81),
+            "an unmeasured hull did not fall back to the constant"
+        );
     }
 
     #[test]

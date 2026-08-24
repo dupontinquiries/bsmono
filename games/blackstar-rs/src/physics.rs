@@ -81,6 +81,11 @@ pub struct Car {
     /// grounded — which is precisely the state the aerial control block
     /// already handles. Setting this is most of what "flying" means here.
     pub flight: bool,
+    /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
+    /// the player's `CarCfg`, so tuning stays the player's and character
+    /// stays the vehicle's. `Default` is all 1.0 — a chassis nobody
+    /// measured drives exactly as it did before this existed.
+    pub hand: crate::driveline::Handling,
     /// how this hull stays up. None means the flat legacy behaviour.
     pub lift: Option<crate::lift::Lift>,
     /// local atmosphere, 0 = vacuum. A wing and a rotor both need it.
@@ -226,6 +231,7 @@ impl Car {
             drive: crate::model::Drive::Combustion,
             hover: None,
             flight: false,
+            hand: crate::driveline::Handling::default(),
             lift: None,
             air: 1.0,
             robot: false,
@@ -949,14 +955,27 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         let up = match car.lift {
             Some(l) => {
                 let airspeed = (car.vel - gdir * car.vel.dot(gdir)).length();
-                l.lift_accel(airspeed, t.min(1.0), car.air, g_here)
+                // this hull's stall speed, from its own wing loading
+                l.lift_accel_at(car.hand.stall_ms, airspeed, t.min(1.0), car.air, g_here)
             }
             None => g_here * 0.92,
         };
         car.vel -= gdir * up * dt;
-        car.vel += car.forward() * t * THRUST * dt;
+        // THRUST IS THE HULL'S, not a constant. `driveline` derives
+        // thrust-to-weight from nozzle count over a mass taken from the
+        // volume, which is the ratio that decides how an aircraft feels
+        // more than any other — so a four-nozzle interceptor and a
+        // single-engine hauler stop climbing identically.
+        //
+        // The LIFT side is deliberately untouched: `car.lift` is already a
+        // real model that knows about airspeed, air density and rotors,
+        // and `Handling::stall_ms` is the same aerodynamics computed for
+        // reporting. Two implementations of lift would be two answers to
+        // one question; the derived stall speed is there to be shown and
+        // to inform tuning, not to fight the model that exists.
+        car.vel += car.forward() * t * THRUST * car.hand.accel * dt;
         // a rotor is slow: it bleeds speed harder than a wing or a rocket
-        let top = car.lift.map_or(1.0, |l| l.top_speed_frac());
+        let top = car.lift.map_or(1.0, |l| l.top_speed_frac()) * car.hand.top_speed;
         car.vel *= 1.0 - (DRAG / top.max(0.2) * dt).min(0.9);
     }
     // FLOODWATER: a flooded tube's current owns you — strong downstream
@@ -979,8 +998,10 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         _ => {}
     }
 
-    let top = CAR_MAX * cfg.car.top_speed * car.drive.top();
-    let drive_max = DRIVE_MAX * cfg.car.top_speed;
+    // the hull's own character multiplies the player's setting, never
+    // replaces it
+    let top = CAR_MAX * cfg.car.top_speed * car.hand.top_speed * car.drive.top();
+    let drive_max = DRIVE_MAX * cfg.car.top_speed * car.hand.top_speed;
 
     if grounded {
         car.dodge_window = 1.45;
@@ -1031,19 +1052,19 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // This is the whole character difference — an EV wins the first two
         // car-lengths off a kickoff and gives it back on a long straight.
         let speed_frac = (vf.abs() / drive_max.max(1.0)).clamp(0.0, 1.0);
-        let acc = 16.5 * cfg.car.accel * car.drive.torque(speed_frac);
+        let acc = 16.5 * cfg.car.accel * car.hand.accel * car.drive.torque(speed_frac);
         let mut a = 0.0;
         if c.throttle > 0.05 {
-            a = if vf < -0.3 { 35.0 * cfg.car.accel } else if vf < drive_max { acc * c.throttle } else { 0.0 };
+            a = if vf < -0.3 { 35.0 * cfg.car.accel * car.hand.accel } else if vf < drive_max { acc * c.throttle } else { 0.0 };
         } else if c.throttle < -0.05 {
-            a = if vf > 0.3 { -35.0 * cfg.car.accel } else if vf > -drive_max * 0.8 { acc * c.throttle } else { 0.0 };
+            a = if vf > 0.3 { -35.0 * cfg.car.accel * car.hand.accel } else if vf > -drive_max * 0.8 { acc * c.throttle } else { 0.0 };
         } else if sp > 0.1 {
             a = -5.25 * vf.signum();
         }
         car.vel += f_t * a * dt;
 
         // lateral grip (loosened by powerslide)
-        let grip_k = cfg.car.grip * cfg.arena.friction;
+        let grip_k = cfg.car.grip * car.hand.grip * cfg.arena.friction;
         // slide grip near-zero so the rear swings: hairpins on a dime
         // A HOVERCAR BARELY HOLDS: it keeps its momentum while the nose
         // points elsewhere, so you steer by pointing and thrusting.
