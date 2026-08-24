@@ -17,14 +17,20 @@ These came in near the end of c10 and only the fourth was touched. They are the
 top of the queue.
 
 - **C10-0a — `voiceterm-egui`: multiple conflicting sidebars → one unified
-  sidebar, like the Qt version.** `not started`.
-  Nothing was read. The tractable, headlessly-verifiable core is a single
-  sidebar STATE MODEL — which panel is showing, what is mutually exclusive with
-  what, what a given action does to the rest — with the competing sidebars
-  collapsed onto it and pinned by tests. The layout itself cannot be judged in
-  the sandbox (no display), so the split is: model here, appearance on hardware.
-  Read the Qt version first and treat it as the specification, since the request
-  names it as the target shape.
+  sidebar, like the Qt version.** `in-progress` · the state model is DONE and
+  `verified` (`2e9a9695`); the appearance pass is not.
+  What was actually conflicting: the left edge was already one column
+  (`73213ebc`), but every transient surface carried its own bool — settings,
+  workspaces and missing_pkg were three right SidePanels that could be open at
+  once. The QML gets exclusivity from modality (every such surface is
+  `modal: true; dim: true`); egui has none, so `surface.rs` now IS the
+  modality as state: zero or one active, all 29 mutation sites routed through
+  it, pinned by behavioral tests plus a structural test that bans the old
+  flags from the binary. Both checks were broken on purpose and caught it.
+  REMAINS (on-device, needs a display): whether these surfaces should be truly
+  modal (scrim + input capture, then Esc-to-close becomes safe — see the
+  module docs for why it is NOT safe non-modally), and whether settings should
+  match the QML's centered popup rather than a right panel.
 
 - **C10-0b — `snapclone-egui`: no camera fullscreen; missing popups/slide-ups
   for voice calls and group snaps.** `not started`.
