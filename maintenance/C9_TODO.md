@@ -236,7 +236,22 @@ absorbing all of it.
   now `path` or `path[feat]`, 260 → 420, one check each so a failure names the
   single flag. Verified discriminating against that real bug in both
   directions. Environment-blocked features (gamepad, web/wasm, cuda, metal,
-  opus-decode) are skipped by name.
+  opus-decode) are skipped by name. Also gained `--only <prefix>` so a slice can
+  be run honestly rather than by pre-filling the report with `ok` rows.
+  **FIRST REAL RUN (c10, `a576dec7e`): shared/ complete, 56 of 56 units, TWO
+  failures, both genuine and both invisible to any default build.**
+  `shared/gpu-kit[wgpu29]` did not compile against the wgpu it pins —
+  `request_adapter` returns `Result` in 29 not `Option`, and `request_device`
+  lost its trace-path argument, both wgpu <= 27 shapes. The crate advertises "a
+  feature-gated context builder for a pinned wgpu version" and was pinned to one
+  it had never been built against.
+  `shared/uikit/crates/uikit-egui[demo]` could not build on ANY Linux: eframe
+  taken with `default-features = false, features = ["glow"]` leaves winit with
+  no backend and it fails its own cfg check. scene-kit, krapper and voiceterm's
+  frontend all already say glow + wayland + x11.
+  So the class is real and the tool earns its cost: 56 units found two dead
+  configurations. **games/ (76 units) and apps/ are still unrun** — that is
+  where the next ones will be.
   ORIGINAL NOTE (c10, before the tool existed): `cargo check -p <each>` is the right test; the two known instances
   (`snapclone-nat` tokio sync, `scene-kit` — both found in earlier sessions)
   now check clean: fixes were committed. A full cross-repo sweep would take
