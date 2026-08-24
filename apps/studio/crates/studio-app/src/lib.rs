@@ -20,6 +20,7 @@ pub mod clip_inspector;
 pub mod library;
 pub mod midi;
 pub mod mixer_panel;
+pub mod program_panel;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -87,6 +88,9 @@ pub struct Studio {
     pub mixer_drag: Option<(studio_core::TrackId, f32)>,
     /// The clip inspector's fader mid-drag, same commit-on-release rule.
     pub clip_gain_drag: Option<(studio_core::ClipId, f32)>,
+    /// The piano roll's resize-in-progress (a fresh note being drawn out,
+    /// or an existing one grabbed by its edge).
+    pub roll_drag: Option<studio_egui::roll::NoteDrag>,
     /// The bus faders' twin of `mixer_drag`.
     pub bus_drag: Option<(studio_core::BusId, f32)>,
     /// Motions (the Helix keymap) or Playing (the keyboard is a piano).
@@ -129,6 +133,7 @@ impl Studio {
             solo: Vec::new(),
             mixer_drag: None,
             clip_gain_drag: None,
+            roll_drag: None,
             bus_drag: None,
             input_mode: Default::default(),
             octave: 0,
@@ -1599,9 +1604,7 @@ impl eframe::App for App {
                     mixer_panel::show(ui, &mut self.studio, &colors);
                 }
                 Panel::Program => {
-                    // Honest placeholder beats a silent no-op: a tab that
-                    // switches to nothing reads as a broken tab.
-                    ui.colored_label(colors.text_weak, "Program — not built yet.");
+                    program_panel::show(ui, &mut self.studio, &colors, playhead_col);
                 }
                 Panel::Timeline => {
                     // The inspector sits above the arrangement rather than

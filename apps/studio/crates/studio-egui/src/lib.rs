@@ -19,6 +19,7 @@ pub mod spectrum;
 
 /// The step-sequencer surface for studio-live.
 pub mod grid;
+pub mod roll;
 pub mod lanes;
 
 /// Time-range selection — the audio editor's unit, distinct from clip picking.

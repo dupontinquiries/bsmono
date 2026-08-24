@@ -32,10 +32,14 @@
 
 use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
 use studio_core::{Bus, BusId, Clip, ClipId, Effect, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
-use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
+use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
+///
+/// v9: `Pattern` gained `rolls` — the piano roll's held notes, per channel.
+/// A rack shape change, so it moves both `Packet::Rack` and the file
+/// format's mandatory rack section (which shares this codec).
 ///
 /// v2: `Track` gained `route: Option<BusId>`, and `Op` gained the bus-graph
 /// variants (`AddBus`/`RemoveBus`/`SetBusGain`/`SetBusChain`/`SetBusSends`/
@@ -63,7 +67,7 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 8;
+pub const WIRE_VERSION: u8 = 9;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -477,6 +481,20 @@ fn put_pattern(o: &mut Vec<u8>, pat: &Pattern) {
         put_u32(o, *step);
         put_stepmod(o, m);
     }
+    // v9: the piano roll. BTreeMap iteration and add_note's sorted lists
+    // keep the encoding canonical — the same roll is always the same bytes.
+    put_u16(o, pat.rolls.len().min(u16::MAX as usize) as u16);
+    for (ch, notes) in &pat.rolls {
+        put_u16(o, *ch as u16);
+        put_u16(o, notes.len().min(u16::MAX as usize) as u16);
+        for n in notes {
+            put_u8(o, n.key as u8);
+            put_u32(o, n.start);
+            put_u32(o, n.len);
+            put_f32(o, n.vel);
+            put_u8(o, n.slide as u8);
+        }
+    }
 }
 fn get_pattern(r: &mut R) -> Option<Pattern> {
     let name = r.str()?;
@@ -492,7 +510,24 @@ fn get_pattern(r: &mut R) -> Option<Pattern> {
         let m = get_stepmod(r)?;
         mods.insert((ch, step), m);
     }
-    Some(Pattern { name, steps, rows, mods })
+    let rn = r.u16()? as usize;
+    let mut rolls = std::collections::BTreeMap::new();
+    for _ in 0..rn {
+        let ch = r.u16()? as usize;
+        let nn = r.u16()? as usize;
+        let mut notes = Vec::with_capacity(nn.min(4096));
+        for _ in 0..nn {
+            notes.push(Note {
+                key: r.u8()? as i8,
+                start: r.u32()?,
+                len: r.u32()?,
+                vel: r.f32()?,
+                slide: r.u8()? != 0,
+            });
+        }
+        rolls.insert(ch, notes);
+    }
+    Some(Pattern { name, steps, rows, mods, rolls })
 }
 
 fn put_rack(o: &mut Vec<u8>, rack: &Rack) {
@@ -819,6 +854,11 @@ mod tests {
         pattern.toggle(0, 0);
         pattern.toggle(1, 4);
         pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)) });
+        // v9: a roll with the awkward parts — a negative key, a chord, and
+        // a slide — so every rack round trip exercises the note codec.
+        pattern.add_note(1, Note { key: -12, start: 0, len: 4, vel: 0.9, slide: false });
+        pattern.add_note(1, Note { key: 7, start: 0, len: 2, vel: 0.5, slide: false });
+        pattern.add_note(1, Note { key: 3, start: 6, len: 1, vel: 1.0, slide: true });
         Rack {
             channels: vec![
                 Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2) },
@@ -954,7 +994,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 8, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 9, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

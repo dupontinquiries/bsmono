@@ -202,6 +202,12 @@ pub struct Pattern {
     /// straightforward beat (most steps use none of this) cheap to store and
     /// cheap to send, the same reasoning that made `rows` a bitmask.
     pub mods: BTreeMap<(usize, u32), StepMod>,
+    /// The piano roll: held notes per channel, sorted by (start, key).
+    /// Sparse for the same reason `mods` is — most channels are drums and
+    /// never grow one. `serde(default)` so a rack saved before the roll
+    /// existed still loads, with the empty roll it effectively had.
+    #[serde(default)]
+    pub rolls: BTreeMap<usize, Vec<Note>>,
 }
 
 /// Per-step trap-rack modifiers, layered on top of the plain on/off bitmask.
@@ -220,9 +226,12 @@ pub struct StepMod {
     /// than making a bounce fail over one bad byte.
     pub ratchet: u8,
     /// Semitone offset from the channel's own note/pitch. Meaningful for
-    /// [`SynthKind::Sub`] (added to `note`) and [`SynthKind::Sine`] (scales
-    /// `hz`); a no-op for `Sampler` and `Beatspace`, which have no pitch
-    /// parameter to offset.
+    /// [`SynthKind::Sub`] (added to `note`), [`SynthKind::Sine`] (scales
+    /// `hz`) and [`SynthKind::Drum`]; for `Sampler` — which has no pitch
+    /// parameter of its own — [`render_pattern`] repitches the rendered
+    /// voice instead, so a chopped one-shot plays melodies. Only
+    /// `Beatspace` remains a no-op: a latent position has no defined
+    /// semitone.
     pub tune: i8,
     /// Glide from whatever note this channel last played, instead of
     /// starting at this hit's own pitch directly. If this is the channel's
@@ -246,9 +255,41 @@ impl Default for StepMod {
     }
 }
 
+/// One held note in a pattern's piano roll.
+///
+/// The step grid answers "which steps fire"; it cannot say "hold this for a
+/// bar", and its per-step retune is one pitch per (channel, step) — no
+/// chords. `Note` is the other half: a pitch held for a length, polyphonic
+/// because a channel's roll is simply a list. A roll note renders through
+/// the same placement pass as a step hit, so choke, swing, the bounce and
+/// the collab rack sync all treat it as what it is — more pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    /// Semitone offset, the same convention as [`SynthKind::Sub`]'s `note`
+    /// and [`StepMod::tune`]: 0 is the channel's own pitch.
+    pub key: i8,
+    /// Step index the note starts on. A note starting at or past
+    /// [`Pattern::steps`] is hidden, not deleted — the same rule the rows'
+    /// bitmask follows, so shorten-then-lengthen round-trips.
+    pub start: u32,
+    /// Length in steps, >= 1. The note's END is its gate: the voice is cut
+    /// there with a short fade, and a voice whose own envelope dies earlier
+    /// (a short-decay 808 under a long note) simply ends earlier — the note
+    /// bounds the ring, it does not stretch it.
+    pub len: u32,
+    /// 0..=1, scales the channel's gain for this note, like [`StepMod::vel`].
+    pub vel: f32,
+    /// Glide from the previous roll note on this channel (by start order)
+    /// instead of starting at `key` directly — the 808 slide as a note
+    /// property, which is where FL puts it. A channel's first roll note
+    /// ignores it, same as [`StepMod::slide`].
+    pub slide: bool,
+}
+
 impl Pattern {
     pub fn new(name: &str, steps: u32, channels: usize) -> Pattern {
-        Pattern { name: name.into(), steps: steps.min(64), rows: vec![0; channels], mods: BTreeMap::new() }
+        Pattern { name: name.into(), steps: steps.min(64), rows: vec![0; channels],
+                  mods: BTreeMap::new(), rolls: BTreeMap::new() }
     }
     pub fn is_set(&self, ch: usize, step: u32) -> bool {
         step < self.steps && self.rows.get(ch).map(|r| r >> step & 1 == 1).unwrap_or(false)
@@ -277,6 +318,56 @@ impl Pattern {
             self.mods.remove(&(ch, step));
         } else {
             self.mods.insert((ch, step), m);
+        }
+    }
+    /// This channel's roll notes, sorted by (start, key). Empty for the
+    /// common (drum) case.
+    pub fn roll(&self, ch: usize) -> &[Note] {
+        self.rolls.get(&ch).map(Vec::as_slice).unwrap_or(&[])
+    }
+    /// The roll note at (ch, key) covering `step`, if any — "is there ink
+    /// under this cell", which is what a click on the roll needs to know.
+    pub fn note_at(&self, ch: usize, key: i8, step: u32) -> Option<Note> {
+        self.roll(ch).iter().copied()
+            .find(|n| n.key == key && n.start <= step && step < n.start + n.len.max(1))
+    }
+    /// Add a note. A note with the same (start, key) is REPLACED, not
+    /// duplicated — two identical placements are one intention, and a
+    /// second add is how a velocity or length gets re-stated. `len` is
+    /// clamped to >= 1 and the list stays sorted, which keeps the codec's
+    /// output canonical: the same roll always encodes to the same bytes.
+    pub fn add_note(&mut self, ch: usize, mut n: Note) {
+        n.len = n.len.max(1);
+        let notes = self.rolls.entry(ch).or_default();
+        notes.retain(|m| !(m.start == n.start && m.key == n.key));
+        notes.push(n);
+        notes.sort_by_key(|m| (m.start, m.key));
+    }
+    /// Remove the note at (start, key). Returns whether one was there. An
+    /// emptied channel drops its map entry, keeping `rolls` sparse the way
+    /// `set_mod` keeps `mods` sparse.
+    pub fn remove_note(&mut self, ch: usize, start: u32, key: i8) -> bool {
+        let Some(notes) = self.rolls.get_mut(&ch) else { return false };
+        let before = notes.len();
+        notes.retain(|m| !(m.start == start && m.key == key));
+        let removed = notes.len() != before;
+        if notes.is_empty() { self.rolls.remove(&ch); }
+        removed
+    }
+    /// Set the length of the note at (start, key), clamped to >= 1.
+    pub fn resize_note(&mut self, ch: usize, start: u32, key: i8, len: u32) {
+        if let Some(notes) = self.rolls.get_mut(&ch) {
+            if let Some(n) = notes.iter_mut().find(|m| m.start == start && m.key == key) {
+                n.len = len.max(1);
+            }
+        }
+    }
+    /// Flip the slide flag of the note at (start, key).
+    pub fn toggle_note_slide(&mut self, ch: usize, start: u32, key: i8) {
+        if let Some(notes) = self.rolls.get_mut(&ch) {
+            if let Some(n) = notes.iter_mut().find(|m| m.start == start && m.key == key) {
+                n.slide = !n.slide;
+            }
         }
     }
     /// Every (channel, step) that fires, in step order — what a renderer walks.
@@ -637,8 +728,10 @@ pub fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> S
             tune: tune.saturating_add(m.tune),
         },
         // Sampler and Beatspace have no pitch parameter `tune` or `slide`
-        // could act on — left untouched rather than pretending to apply
-        // something that has no defined meaning for them.
+        // could act on — left untouched here. The sampler is not a no-op
+        // overall, though: [`render_pattern`] repitches its RENDERED voice
+        // by the step's tune (see `Placed::pitch`), which is where a pitch
+        // has to live for a synth whose kind carries none.
         other => other.clone(),
     }
 }
@@ -682,7 +775,6 @@ pub fn render_pattern(
     // A hit may ring past its step — up to four steps — so hits overlap the way
     // they do on a real rack instead of being truncated at the grid.
     let voice_len = (step * 4).min(total.max(step));
-    let mut scratch = vec![0.0f32; voice_len];
     // The note each channel most recently played, in step order — local to
     // this render, not the synth's business. See `apply_step_mod`'s docs.
     let mut last_note: BTreeMap<usize, i8> = BTreeMap::new();
@@ -698,6 +790,19 @@ pub fn render_pattern(
         kind: SynthKind,
         amp: f32,
         group: Option<u8>,
+        /// The voice's natural render window: `voice_len` for a step hit,
+        /// the note's own length for a roll note. Choke may still shorten it.
+        window: usize,
+        /// A gated voice (a roll note) always fades over its window's last
+        /// ~2ms — its end is a musical decision, and a decision must not
+        /// click. A hit only fades when choke actually cut it.
+        gate: bool,
+        /// Semitone repitch applied to the RENDERED voice — nonzero only for
+        /// [`SynthKind::Sampler`], which has no pitch parameter of its own
+        /// for `apply_step_mod` to act on. The kinds that understand `tune`
+        /// pitch themselves; the sampler's output is resampled here instead,
+        /// with the same linear quality stance the rate-mismatch path takes.
+        pitch: i8,
     }
     let mut placed: Vec<Placed> = Vec::new();
     for (ch_i, step_i) in pattern.hits() {
@@ -731,6 +836,11 @@ pub fn render_pattern(
         // their (possibly swung) parent step rather than being re-swung
         // individually — a roll is one gesture, not four independent notes.
         let swing = tempo.swing_delay_samples(step_i, rate);
+        // A sampler has no pitch field for `apply_step_mod` to offset, so the
+        // Tune lane's value rides to the render as a repitch of the voice's
+        // output — the grid's pitch lane stops being a documented no-op for
+        // sample channels.
+        let pitch = if matches!(ch.kind, SynthKind::Sampler { .. }) { m.tune } else { 0 };
         for r in 0..ratchet {
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
             placed.push(Placed {
@@ -739,9 +849,53 @@ pub fn render_pattern(
                 kind: this_kind,
                 amp: ch.gain * m.vel,
                 group: ch.choke_group,
+                window: voice_len,
+                gate: false,
+                pitch,
             });
         }
     }
+
+    // ── pass 1b: place the roll ─────────────────────────────────────────
+    // Held notes join the same placement list as hits: swing moves them by
+    // the same off-step rule, choke groups see them, and the bounce renders
+    // them — a roll note is more pattern, not a second engine.
+    for (&ch_i, notes) in &pattern.rolls {
+        let Some(ch) = rack.channels.get(ch_i) else { continue };
+        if ch.muted { continue; }
+        // Glide chains through the channel's roll in start order (the list's
+        // own order). Within a chord — several notes sharing a start — the
+        // chain passes through its members in key order; sliding INTO a
+        // chord is well-defined, sliding within one is not attempted.
+        let mut prev: Option<i8> = None;
+        for n in notes {
+            if n.start >= pattern.steps { continue; } // hidden by a shortened pattern
+            let m = StepMod { vel: n.vel, tune: n.key, slide: n.slide, ..StepMod::default() };
+            let kind = apply_step_mod(&ch.kind, &m, prev);
+            if let SynthKind::Sub { note, .. } = &kind { prev = Some(*note); }
+            let swing = tempo.swing_delay_samples(n.start, rate);
+            let pitch = if matches!(ch.kind, SynthKind::Sampler { .. }) { n.key } else { 0 };
+            placed.push(Placed {
+                ch_i,
+                at: n.start as usize * step + swing,
+                kind,
+                amp: ch.gain * n.vel.clamp(0.0, 1.0),
+                group: ch.choke_group,
+                // The note's end is its gate; a note cannot outlast the
+                // pattern it lives in, which also bounds the scratch below.
+                window: (n.len.max(1).min(pattern.steps.max(1)) as usize) * step,
+                gate: true,
+                pitch,
+            });
+        }
+    }
+
+    // Scratch sized to the longest placed voice — a held note can want more
+    // than a hit's four steps. Allocated after placement because only
+    // placement knows the answer.
+    let scratch_len = placed.iter().map(|p| p.window).max().unwrap_or(voice_len).max(1);
+    let mut scratch = vec![0.0f32; scratch_len];
+    let mut pitched = vec![0.0f32; scratch_len];
 
     // Every group's hit-start list, sorted, so "when does the group fire
     // next" is a partition-point lookup per voice.
@@ -765,7 +919,7 @@ pub fn render_pattern(
         // to the buffer they're given, so "render into fewer samples" is a
         // different, faster sound than "render fully, cut at add time" — and
         // add-time cutting is what the pre-choke renderer did.
-        let natural = voice_len.min(out.len() - p.at);
+        let natural = p.window.min(out.len() - p.at);
         let mut allowed = natural;
         if let Some(starts) = p.group.and_then(|g| group_starts.get(&g)) {
             // First group start STRICTLY after this one — simultaneous group
@@ -777,13 +931,37 @@ pub fn render_pattern(
             }
         }
         if allowed == 0 { continue; }
-        scratch.fill(0.0);
-        synth.render(&p.kind, rate, &mut scratch);
+        // Render into the voice's OWN window, not the shared scratch's full
+        // length: Sine shapes its envelope to the buffer it is given, so a
+        // held sine note decays across the note rather than across whatever
+        // the longest voice in the pattern happened to be.
+        let sw = p.window.min(scratch.len());
+        scratch[..sw].fill(0.0);
+        synth.render(&p.kind, rate, &mut scratch[..sw]);
+        let voice: &[f32] = if p.pitch != 0 {
+            // Repitch by reading the rendered voice at a fractional rate —
+            // up consumes the material sooner (silence after), down means
+            // the gate cuts what no longer fits. Linear interpolation, the
+            // same stance the sampler's rate-mismatch path already takes.
+            let ratio = 2f64.powf(p.pitch as f64 / 12.0);
+            for (i, dst) in pitched[..sw].iter_mut().enumerate() {
+                let pos = i as f64 * ratio;
+                let i0 = pos as usize;
+                *dst = if i0 + 1 >= sw { 0.0 } else {
+                    let frac = (pos - i0 as f64) as f32;
+                    scratch[i0] * (1.0 - frac) + scratch[i0 + 1] * frac
+                };
+            }
+            &pitched[..sw]
+        } else {
+            &scratch[..sw]
+        };
         let choked = allowed < natural;
-        for (i, v) in scratch[..allowed.min(scratch.len())].iter().enumerate() {
+        for (i, v) in voice[..allowed.min(sw)].iter().enumerate() {
             let mut v = *v;
-            if choked && allowed >= fade && i >= allowed - fade {
-                // Linear ramp over the last ~2ms before the cut.
+            if (choked || p.gate) && allowed >= fade && i >= allowed - fade {
+                // Linear ramp over the last ~2ms before the cut: choke's cut
+                // and a note's gate must not click.
                 v *= (allowed - i) as f32 / fade as f32;
             }
             out[p.at + i] += v * p.amp;
@@ -1907,6 +2085,249 @@ mod choke_tests {
         let (free, _) = render(&rack, &solo);
         let e = |b: &[f32]| b[step * 3..step * 4].iter().map(|s| s.abs()).sum::<f32>();
         assert!(e(&out) > e(&free) * 0.9, "no group, no cut");
+    }
+}
+
+#[cfg(test)]
+mod roll_tests {
+    use super::*;
+
+    fn sub_rack(decay_ms: f32, glide_ms: f32) -> Rack {
+        Rack {
+            channels: vec![Channel {
+                name: "808".into(),
+                kind: SynthKind::Sub { note: 12, glide_from: None, glide_ms, drive: 0.0, decay_ms },
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            }],
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0,
+        }
+    }
+
+    fn render(rack: &Rack, p: &Pattern) -> (Vec<f32>, usize) {
+        let t = rack.tempo();
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let out = render_pattern(p, rack, &mut synth, &t, 48_000, 0);
+        (out, t.step_len().to_samples(48_000) as usize)
+    }
+
+    fn energy(b: &[f32], from: usize, to: usize) -> f32 {
+        b[from.min(b.len())..to.min(b.len())].iter().map(|s| s.abs()).sum()
+    }
+
+    fn crossings(b: &[f32]) -> usize {
+        b.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count()
+    }
+
+    #[test]
+    fn a_note_sounds_for_its_length_and_gates_at_its_end() {
+        // The note's end is a musical decision: a 2-step note on a 2-second
+        // 808 must stop at 2 steps, faded, not ring out its whole decay.
+        let rack = sub_rack(2000.0, 0.0);
+        let mut p = Pattern::new("A", 6, 1);
+        p.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        let (out, step) = render(&rack, &p);
+        let sounding = energy(&out, 0, step);
+        let after = energy(&out, step * 3, step * 4);
+        assert!(sounding > 10.0, "the note is audible in its window ({sounding})");
+        assert!(after < sounding * 0.01, "and silent past its gate: {after} vs {sounding}");
+    }
+
+    #[test]
+    fn a_held_note_outlasts_a_step_hits_four_step_window() {
+        // The whole reason the roll exists beside the grid: a step hit's ring
+        // is capped at four steps, a note holds for as long as it says. This
+        // also pins the scratch buffer actually growing past `voice_len`.
+        let rack = sub_rack(2000.0, 0.0);
+        let mut held = Pattern::new("held", 8, 1);
+        held.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false });
+        let mut hit = Pattern::new("hit", 8, 1);
+        hit.set(0, 0, true);
+        let (held_out, step) = render(&rack, &held);
+        let (hit_out, _) = render(&rack, &hit);
+        let held_late = energy(&held_out, step * 5, step * 6);
+        let hit_late = energy(&hit_out, step * 5, step * 6);
+        assert!(held_late > 1.0, "the held note still rings at step 5 ({held_late})");
+        assert!(hit_late < held_late * 0.01,
+                "the step hit died at its window: {hit_late} vs held {held_late}");
+    }
+
+    #[test]
+    fn a_chord_is_exactly_the_sum_of_its_notes() {
+        // Placements are additive and independent; two notes sharing a start
+        // must layer, not interact. Compared sample-for-sample, not by energy.
+        let rack = sub_rack(400.0, 0.0);
+        let mut chord = Pattern::new("chord", 4, 1);
+        chord.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        chord.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false });
+        let mut root = Pattern::new("root", 4, 1);
+        root.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        let mut fifth = Pattern::new("fifth", 4, 1);
+        fifth.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false });
+        let (c, _) = render(&rack, &chord);
+        let (r, _) = render(&rack, &root);
+        let (f, _) = render(&rack, &fifth);
+        for i in 0..c.len() {
+            assert!((c[i] - (r[i] + f[i])).abs() < 1e-5,
+                    "sample {i}: chord {} vs sum {}", c[i], r[i] + f[i]);
+        }
+    }
+
+    #[test]
+    fn slide_glides_from_the_previous_roll_note() {
+        // An octave jump with slide spends its glide sweeping up from the
+        // previous note's pitch, so its early window oscillates SLOWER than
+        // the same note without slide. Measured by zero crossings — the same
+        // instrument-blind yardstick the realtune tests use.
+        let rack = sub_rack(2000.0, 200.0);
+        let mut slid = Pattern::new("slide", 4, 1);
+        slid.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        slid.add_note(0, Note { key: 12, start: 2, len: 2, vel: 1.0, slide: true });
+        let mut plain = slid.clone();
+        plain.toggle_note_slide(0, 2, 12);
+        let (s, step) = render(&rack, &slid);
+        let (p, _) = render(&rack, &plain);
+        let early = |b: &[f32]| crossings(&b[step * 2..step * 2 + 4800]); // first 100ms of note 2
+        let (cs, cp) = (early(&s), early(&p));
+        assert!(cs < cp * 8 / 10,
+                "the slide's early window is still climbing: {cs} crossings vs {cp} straight");
+    }
+
+    #[test]
+    fn a_roll_note_is_cut_by_its_choke_group() {
+        // A held note is a citizen of the same rack rules as a hit: a group
+        // hit landing mid-note cuts it, fade and all.
+        let mut rack = sub_rack(2000.0, 0.0);
+        rack.channels[0].choke_group = Some(1);
+        rack.channels.push(Channel {
+            name: "hat".into(),
+            kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5, decay_ms: 80.0, tune: 0 },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: Some(1),
+        });
+        let mut cut = Pattern::new("cut", 8, 2);
+        cut.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false });
+        cut.set(1, 2, true);
+        let mut free = cut.clone();
+        free.set(1, 2, false);
+        let (c, step) = render(&rack, &cut);
+        let (f, _) = render(&rack, &free);
+        let late_cut = energy(&c, step * 5, step * 6);
+        let late_free = energy(&f, step * 5, step * 6);
+        assert!(late_free > 1.0, "unchoked, the note still rings ({late_free})");
+        assert!(late_cut < late_free * 0.05,
+                "the group hit cut the note: {late_cut} vs free {late_free}");
+    }
+
+    #[test]
+    fn shortening_the_pattern_hides_notes_without_eating_them() {
+        // The rows' rule, extended: a note past the new length falls silent
+        // but survives, so shorten-then-lengthen round-trips.
+        let rack = sub_rack(400.0, 0.0);
+        let mut p = Pattern::new("A", 16, 1);
+        p.add_note(0, Note { key: 0, start: 12, len: 2, vel: 1.0, slide: false });
+        p.steps = 8;
+        let (short, _) = render(&rack, &p);
+        assert!(short.iter().all(|s| s.abs() < 1e-6), "a hidden note renders nothing");
+        p.steps = 16;
+        let (long, step) = render(&rack, &p);
+        assert!(energy(&long, step * 12, step * 13) > 10.0, "and it is back at full length");
+        assert!(p.note_at(0, 0, 12).is_some(), "the note itself never left");
+    }
+
+    #[test]
+    fn adding_at_the_same_start_and_key_replaces_rather_than_stacks() {
+        let mut p = Pattern::new("A", 16, 1);
+        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 4, vel: 0.5, slide: false });
+        assert_eq!(p.roll(0).len(), 1, "one intention, one note");
+        assert_eq!(p.roll(0)[0].len, 4);
+        assert!((p.roll(0)[0].vel - 0.5).abs() < 1e-6);
+        // A different key at the same start is a chord, not a replacement.
+        p.add_note(0, Note { key: 7, start: 0, len: 1, vel: 1.0, slide: false });
+        assert_eq!(p.roll(0).len(), 2);
+        // And removing the last note drops the channel's entry entirely,
+        // keeping `rolls` sparse the way `set_mod` keeps `mods` sparse.
+        assert!(p.remove_note(0, 0, 0));
+        assert!(p.remove_note(0, 0, 7));
+        assert!(p.rolls.is_empty());
+    }
+
+    #[test]
+    fn a_pattern_saved_before_the_roll_existed_still_loads() {
+        // serde(default): a pre-roll pattern deserializes with the empty
+        // roll it effectively had, rather than refusing the whole rack.
+        let p = Pattern::new("old", 16, 2);
+        let mut v = serde_json::to_value(&p).expect("serializes");
+        v.as_object_mut().expect("a map").remove("rolls").expect("the field exists to strip");
+        let back: Pattern = serde_json::from_value(v).expect("a roll-less pattern still loads");
+        assert!(back.rolls.is_empty());
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn a_sampler_roll_note_plays_the_chop_at_pitch() {
+        // +12 semitones reads the rendered voice twice as fast — roughly
+        // double the zero crossings in the note window. This is what makes
+        // a one-shot chop a melodic instrument, FL's oldest trick.
+        let sine: Vec<f32> = (0..24_000)
+            .map(|i| (i as f32 / 48_000.0 * 100.0 * std::f32::consts::TAU).sin())
+            .collect();
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(studio_core::SourceId(1),
+                       SourceAudio { sample_rate: 48_000, channels: vec![sine] });
+        let rack = Rack {
+            channels: vec![Channel {
+                name: "chop".into(),
+                kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            }],
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0,
+        };
+        let t = rack.tempo();
+        let mut up = Pattern::new("up", 4, 1);
+        up.add_note(0, Note { key: 12, start: 0, len: 2, vel: 1.0, slide: false });
+        let mut flat = Pattern::new("flat", 4, 1);
+        flat.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        let mut synth = BuiltinSynth { sources: &sources };
+        let u = render_pattern(&up, &rack, &mut synth, &t, 48_000, 0);
+        let f = render_pattern(&flat, &rack, &mut synth, &t, 48_000, 0);
+        let step = t.step_len().to_samples(48_000) as usize;
+        let (cu, cf) = (crossings(&u[..step]), crossings(&f[..step]));
+        assert!(cu > cf * 18 / 10 && cu < cf * 22 / 10,
+                "+12 doubles the rate: {cu} crossings vs {cf}");
+    }
+
+    #[test]
+    fn the_tune_lane_pitches_a_sampler_step_hit_too() {
+        // The same repitch serves the grid: StepMod::tune on a sample channel
+        // was a documented no-op, and now it means what it says everywhere.
+        let sine: Vec<f32> = (0..24_000)
+            .map(|i| (i as f32 / 48_000.0 * 100.0 * std::f32::consts::TAU).sin())
+            .collect();
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(studio_core::SourceId(1),
+                       SourceAudio { sample_rate: 48_000, channels: vec![sine] });
+        let rack = Rack {
+            channels: vec![Channel {
+                name: "chop".into(),
+                kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            }],
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0,
+        };
+        let t = rack.tempo();
+        let mut up = Pattern::new("up", 4, 1);
+        up.set(0, 0, true);
+        up.set_mod(0, 0, StepMod { tune: 12, ..StepMod::default() });
+        let mut flat = Pattern::new("flat", 4, 1);
+        flat.set(0, 0, true);
+        let mut synth = BuiltinSynth { sources: &sources };
+        let u = render_pattern(&up, &rack, &mut synth, &t, 48_000, 0);
+        let f = render_pattern(&flat, &rack, &mut synth, &t, 48_000, 0);
+        let step = t.step_len().to_samples(48_000) as usize;
+        let (cu, cf) = (crossings(&u[..step]), crossings(&f[..step]));
+        assert!(cu > cf * 18 / 10 && cu < cf * 22 / 10,
+                "+12 doubles the rate on a hit as well: {cu} vs {cf}");
     }
 }
 

@@ -57,7 +57,16 @@ impl Lane {
     pub fn applies_to(self, kind: &SynthKind) -> bool {
         match self {
             Lane::Vel | Lane::Ratchet | Lane::Prob => true,
-            Lane::Tune | Lane::Slide => matches!(
+            // Tune reaches samplers too now: render_pattern repitches a
+            // sampler voice's output (Placed::pitch), so the lane stopped
+            // being a documented no-op there. Slide stays where glide is
+            // defined — a sampler has no pitch trajectory to glide along.
+            Lane::Tune => matches!(
+                kind,
+                SynthKind::Sub { .. } | SynthKind::Sine { .. } | SynthKind::Drum { .. }
+                    | SynthKind::Sampler { .. }
+            ),
+            Lane::Slide => matches!(
                 kind,
                 SynthKind::Sub { .. } | SynthKind::Sine { .. } | SynthKind::Drum { .. }
             ),
@@ -263,7 +272,7 @@ mod tests {
         // studio-live defines tune/slide as no-ops for Sampler and Beatspace;
         // a lane that edits a no-op teaches a lie.
         let sampler = SynthKind::Sampler { source: studio_core::SourceId(1) };
-        assert!(!Lane::Tune.applies_to(&sampler));
+        assert!(Lane::Tune.applies_to(&sampler), "samplers pitch at render time now");
         assert!(!Lane::Slide.applies_to(&sampler));
         assert!(Lane::Vel.applies_to(&sampler));
         let sub = SynthKind::Sub { note: 0, glide_from: None, glide_ms: 50.0, drive: 0.0, decay_ms: 300.0 };
