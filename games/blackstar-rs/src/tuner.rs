@@ -34,7 +34,7 @@
 //! Fixed seeds throughout, as the C tool is. A tuner whose answer moves
 //! between runs cannot be argued with, and the argument is the point.
 
-use crate::brain::{Brain, Fsm, Posture, Signals, Snapshot, Unit, Verb, ZONE_ALL};
+use crate::brain::{Brain, Fsm, Posture, Signals, Snapshot, Unit, Verb};
 use glam::Vec3;
 
 /// What a run of the abstract engagement produced.

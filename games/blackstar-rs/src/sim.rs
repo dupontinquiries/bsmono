@@ -434,6 +434,8 @@ pub fn run(args: &[String]) {
         // a stand-in model with known proportions (length >> width > height)
         let mut m = crate::model::Model {
             hover: None,
+            tuck: Vec::new(),
+            fittings: crate::turret::Fittings::default(),
             prims: Vec::new(),
             drive: crate::model::Drive::Combustion,
             cloud: Vec::new(),
