@@ -168,19 +168,19 @@ impl VoicetermApp {
                                 let mut p = params.split(';');
                                 let row = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
                                 let col = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
-                                self.grid.move_to(col.saturating_sub(1), row.saturating_sub(1));
+                                self.session.grid.move_to(col.saturating_sub(1), row.saturating_sub(1));
                             }
-                            Some('J') => self.grid.clear(),
-                            Some('K') => self.grid.erase_to_eol(),
+                            Some('J') => self.session.grid.clear(),
+                            Some('K') => self.session.grid.erase_to_eol(),
                             Some('m') => {
                                 for part in params.split(';') {
-                                    if let Ok(v) = part.parse::<u16>() { self.grid.sgr(v); }
+                                    if let Ok(v) = part.parse::<u16>() { self.session.grid.sgr(v); }
                                 }
-                                if params.is_empty() { self.grid.sgr(0); }
+                                if params.is_empty() { self.session.grid.sgr(0); }
                             }
                             // Cursor moves. Clamped by the grid, not here.
                             Some('A') | Some('B') | Some('C') | Some('D') => {
-                                let (x, y) = self.grid.cursor();
+                                let (x, y) = self.session.grid.cursor();
                                 let d = n(1);
                                 let (nx, ny) = match final_byte {
                                     Some('A') => (x, y.saturating_sub(d)),
@@ -188,27 +188,27 @@ impl VoicetermApp {
                                     Some('C') => (x + d, y),
                                     _ => (x.saturating_sub(d), y),
                                 };
-                                self.grid.move_to(nx, ny);
+                                self.session.grid.move_to(nx, ny);
                             }
                             _ => {}
                         }
                     }
                     // A bare ESC or an unrecognised introducer: dropped.
                 }
-                '\r' => self.grid.carriage_return(),
-                '\n' => self.grid.newline(),
+                '\r' => self.session.grid.carriage_return(),
+                '\n' => self.session.grid.newline(),
                 '\t' => {
                     // Next 8-column stop. Printing spaces rather than moving,
                     // so erase_to_eol still clears what a tab covered.
-                    let (x, _) = self.grid.cursor();
-                    for _ in 0..(8 - (x % 8)) { self.grid.print(' '); }
+                    let (x, _) = self.session.grid.cursor();
+                    for _ in 0..(8 - (x % 8)) { self.session.grid.print(' '); }
                 }
                 '\x08' => {
-                    let (x, y) = self.grid.cursor();
-                    self.grid.move_to(x.saturating_sub(1), y);
+                    let (x, y) = self.session.grid.cursor();
+                    self.session.grid.move_to(x.saturating_sub(1), y);
                 }
                 c if (c as u32) < 0x20 => {}   // other C0: ignored, not drawn
-                c => self.grid.print(c),
+                c => self.session.grid.print(c),
             }
         }
     }
@@ -461,7 +461,6 @@ struct VoicetermApp {
     /// line. The demo has no PTY, so they accumulate here rather than being
     /// dropped — which is what was happening before, and why Ctrl-C did
     /// nothing while ordinary typing worked.
-    pty_out: Vec<u8>,
     sidebar: Sidebar,
     /// Touch chrome or voice chrome. On a phone the tab sidebar and the button
     /// rows spend scarce width and height on affordances a voice user has
@@ -505,18 +504,18 @@ struct VoicetermApp {
     /// return path, so nothing rendered what came back. uikit_term::blocks
     /// models a command/output LOG, which is a different thing: it cannot show
     /// a cursor, a redraw, or anything that repaints in place.
-    grid: voiceterm_egui::term_grid::TermGrid,
-    /// How much of `pty_out` has already been echoed to the screen.
-    pty_echoed: usize,
-    /// Which grid rows changed, fed from the grid's own dirty range.
-    row_dirty: voiceterm_egui::row_cache::RowCache,
+    // grid/pty_echoed/row_dirty/row_galleys/pty_out moved INTO `session`:
+    // the typed history must FOLLOW ITS PANE (C11-6a), so everything it is
+    // travels as one PaneSession, swapped with focus exactly like pane_apps.
+    session: voiceterm_egui::pane_host::PaneSession,
+    /// Parked sessions for the panes not holding focus.
+    pane_sessions: std::collections::HashMap<u64, voiceterm_egui::pane_host::PaneSession>,
     /// Shaped galleys, one per row, reused while the row is unchanged.
     ///
     /// This caches TEXT LAYOUT, not painting. Immediate mode repaints every
     /// visible row every frame by definition — skipping the paint is not
     /// available and row_render's docs say so. Shaping a row into a galley is
     /// what costs, and it is what this keeps.
-    row_galleys: voiceterm_egui::row_render::RowLayoutCache<String>,
     /// The reading-mode corpus tape. Fed by an audio callback on a device with
     /// a microphone; here only its POLICY runs — start, bound, keep-or-discard.
     tape: voiceterm_egui::corpus_tape::Tape,
@@ -823,7 +822,7 @@ impl eframe::App for VoicetermApp {
                 self.last_memlog_s = now;
                 let h = memlog::Holders {
                     terminals: 1,
-                    scrollback_rows: self.grid.rows,
+                    scrollback_rows: self.session.grid.rows,
                     // self.workspace (singular) holds the tabs; self.workspaces
                     // is the VIEW over saved ones and has no count.
                     workspaces: self.workspace.tabs.len(),
@@ -852,7 +851,7 @@ impl eframe::App for VoicetermApp {
                             // Typed, not run — consistent with every other
                             // surface in this app that produces a command.
                             fv::Action::Cd(path) => {
-                                self.pty_out.extend_from_slice(
+                                self.session.pty_out.extend_from_slice(
                                     format!("cd {path:?}").as_bytes());
                                 self.surfaces.close();
                             }
@@ -910,7 +909,7 @@ impl eframe::App for VoicetermApp {
                         // these are commands you already ran once, often the
                         // one just before something went wrong.
                         A::Drop(cmd) => {
-                            self.pty_out.extend_from_slice(cmd.as_bytes());
+                            self.session.pty_out.extend_from_slice(cmd.as_bytes());
                             self.surfaces.close();
                             self.cmd_sheet.close(); // clears the in-flight drag
                         }
@@ -950,7 +949,7 @@ impl eframe::App for VoicetermApp {
                     // clicking a search result is a navigation gesture, and
                     // spawning an editor from one is a surprise.
                     let cmd = format!("${{EDITOR:-vi}} +{} {}", hit.line, hit.path);
-                    self.pty_out.extend_from_slice(cmd.as_bytes());
+                    self.session.pty_out.extend_from_slice(cmd.as_bytes());
                     self.fs_search.cancel();
                 }
             });
@@ -990,8 +989,8 @@ impl eframe::App for VoicetermApp {
                 Outcome::Confirmed => {
                     let cmd = cmd.clone();
                     self.pending_confirm = None;
-                    self.pty_out.extend_from_slice(cmd.as_bytes());
-                    self.pty_out.push(b'\r');
+                    self.session.pty_out.extend_from_slice(cmd.as_bytes());
+                    self.session.pty_out.push(b'\r');
                 }
                 // Cancelled and timed-out both drop the command. The line is
                 // NOT restored to the input: it was already audited as
@@ -1347,7 +1346,7 @@ impl eframe::App for VoicetermApp {
                             self.editor_pending = Some(a);
                         }
                         Some(a) => {
-                            self.pty_out.extend_from_slice(a.keys.as_bytes());
+                            self.session.pty_out.extend_from_slice(a.keys.as_bytes());
                             self.editor_phrase.clear();
                         }
                         // Unrecognised phrases are NOT sent as literal text. A
@@ -1418,7 +1417,7 @@ impl eframe::App for VoicetermApp {
                 ui.horizontal(|ui| {
                     ui.colored_label(self.colors.warning, "this discards changes:");
                     if ui.button("send").clicked() {
-                        self.pty_out.extend_from_slice(a.keys.as_bytes());
+                        self.session.pty_out.extend_from_slice(a.keys.as_bytes());
                         self.editor_pending = None;
                         self.editor_phrase.clear();
                     }
@@ -2419,8 +2418,8 @@ impl eframe::App for VoicetermApp {
                         // is to see what would leave, and a preview that only
                         // appears once the feature ships is a preview nobody
                         // checks.
-                        let ctx: String = (0..self.grid.rows)
-                            .map(|y| self.grid.row_text(y))
+                        let ctx: String = (0..self.session.grid.rows)
+                            .map(|y| self.session.grid.row_text(y))
                             .collect::<Vec<_>>()
                             .join("\n");
                         let total = ctx.lines().count();
@@ -2557,11 +2556,11 @@ impl eframe::App for VoicetermApp {
                                 // Typed, not run — same rule as a clicked
                                 // search hit: the operator presses Enter.
                                 P::Stage(body) => {
-                                    self.pty_out.extend_from_slice(body.as_bytes());
+                                    self.session.pty_out.extend_from_slice(body.as_bytes());
                                     self.deck.clear_selection();
                                 }
                                 P::OpenSource(url) => {
-                                    self.pty_out.extend_from_slice(
+                                    self.session.pty_out.extend_from_slice(
                                         format!("xdg-open {url}").as_bytes());
                                     self.deck.clear_selection();
                                 }
@@ -2785,7 +2784,7 @@ impl eframe::App for VoicetermApp {
                 // the same bytes both reach a future PTY and appear on screen,
                 // through one path rather than two that can disagree.
                 if !out.bytes.is_empty() {
-                    self.pty_out.extend_from_slice(&out.bytes);
+                    self.session.pty_out.extend_from_slice(&out.bytes);
                 }
                 // `out.snap_to_bottom` is deliberately not consumed. This view
                 // draws a fixed grid with no scrollback, so it is always
@@ -2845,7 +2844,7 @@ impl eframe::App for VoicetermApp {
                 &voiceterm_egui::password_prompt::TermState {
                     alt_screen: false,
                     foreground: None,
-                    visible: Some(&self.grid.row_text(self.grid.cursor().1)),
+                    visible: Some(&self.session.grid.row_text(self.session.grid.cursor().1)),
                 });
             if self.password_mode {
                 // SAID OUT LOUD. A terminal that silently stops echoing looks
@@ -2855,7 +2854,7 @@ impl eframe::App for VoicetermApp {
             }
             let submitted = if chorded { None } else { self.app.handle_input(ui) };
             let key_bytes = self.app.take_pending_bytes();
-            self.pty_out.extend_from_slice(&key_bytes);
+            self.session.pty_out.extend_from_slice(&key_bytes);
             // THE SCREEN. Drawn only when there is something on it, so a fresh
             // session shows the block log rather than 24 blank rows.
             if let Some(line) = submitted {
@@ -2903,8 +2902,8 @@ impl eframe::App for VoicetermApp {
                     // A PTY does not distinguish "the user typed a command"
                     // from "the user typed bytes", and having two paths is how
                     // they drift.
-                    self.pty_out.extend_from_slice(line.as_bytes());
-                    self.pty_out.push(b'\r');
+                    self.session.pty_out.extend_from_slice(line.as_bytes());
+                    self.session.pty_out.push(b'\r');
                 }
             }
             // LOCAL ECHO INTO THE SCREEN, since there is no PTY here.
@@ -2920,22 +2919,22 @@ impl eframe::App for VoicetermApp {
             // queue this consumes, so it still holds everything sent — feeding
             // all of it each frame would reprint the whole session sixty times
             // a second. The high-water mark is what makes this idempotent.
-            if self.pty_out.len() > self.pty_echoed {
-                let fresh = self.pty_out[self.pty_echoed..].to_vec();
+            if self.session.pty_out.len() > self.session.pty_echoed {
+                let fresh = self.session.pty_out[self.session.pty_echoed..].to_vec();
                 self.feed_pty(&fresh);
-                self.pty_echoed = self.pty_out.len();
+                self.session.pty_echoed = self.session.pty_out.len();
             }
             // The demo has no PTY to write to. Rather than dropping the bytes
             // again, they are kept on the app where a host can drain them, and
             // capped so a long session cannot grow without bound.
             const PTY_OUT_CAP: usize = 64 * 1024;
-            if self.pty_out.len() > PTY_OUT_CAP {
-                let drop = self.pty_out.len() - PTY_OUT_CAP;
-                self.pty_out.drain(..drop);
+            if self.session.pty_out.len() > PTY_OUT_CAP {
+                let drop = self.session.pty_out.len() - PTY_OUT_CAP;
+                self.session.pty_out.drain(..drop);
                 // The cap drains from the FRONT, so the mark has to move with
                 // it or the next frame re-echoes everything the drain shifted
                 // down. Saturating because a large drain can pass the mark.
-                self.pty_echoed = self.pty_echoed.saturating_sub(drop);
+                self.session.pty_echoed = self.session.pty_echoed.saturating_sub(drop);
             }
             let area = ui.available_rect_before_wrap();
             let colors = self.colors; // PaletteColors is Copy — keeps the borrows below simple
@@ -2945,13 +2944,20 @@ impl eframe::App for VoicetermApp {
             // whole app being reworked around a map — so each pane keeps its own scrollback
             // and selection, and every existing `self.app` call site is untouched.
             let focus_now = self.workspace.focused_pane();
-            if focus_now != self.pane_focus {
-                if let Some(next) = self.pane_apps.remove(&focus_now) {
-                    let prev = std::mem::replace(&mut self.app, next);
-                    self.pane_apps.insert(self.pane_focus, prev);
-                }
-                self.pane_focus = focus_now;
-            }
+            // Both the block-log app AND the live session travel with focus,
+            // through pane_host::swap_focus — which also closes the old
+            // inline swap's hole: a fresh pane now starts FRESH instead of
+            // inheriting the previous pane's state (and losing it for the
+            // previous pane). pane_host::tests pins both properties.
+            voiceterm_egui::pane_host::swap_focus(
+                &mut self.app, &mut self.pane_apps,
+                self.pane_focus, focus_now,
+                || uikit_term::App::new(80, 24));
+            voiceterm_egui::pane_host::swap_focus(
+                &mut self.session, &mut self.pane_sessions,
+                self.pane_focus, focus_now,
+                voiceterm_egui::pane_host::PaneSession::new);
+            self.pane_focus = focus_now;
             // Reconcile hosts against the model: a split wants one more terminal, a closed
             // pane's terminal is dropped (and with it its pty, on device).
             let hosted: Vec<u64> = self
@@ -2963,9 +2969,12 @@ impl eframe::App for VoicetermApp {
             let diff = self.workspace.host_diff(&hosted);
             for id in &diff.spawn {
                 self.pane_apps.insert(*id, uikit_term::App::new(80, 24));
+                self.pane_sessions.insert(*id, voiceterm_egui::pane_host::PaneSession::new());
             }
             for id in &diff.retire {
                 self.pane_apps.remove(id);
+                // the session goes with the pane — and with it its pty, on device
+                self.pane_sessions.remove(id);
             }
 
             // THE PANE GRID. A tab can hold several panes now, so the terminal no longer owns
@@ -3116,15 +3125,15 @@ impl eframe::App for VoicetermApp {
             ui.scope_builder(
                 egui::UiBuilder::new().max_rect(term_rect.shrink(8.0)),
                 |ui| {
-            if self.grid.is_dirty() || self.grid.cursor() != (0, 0) {
-                let (cx, cy) = self.grid.cursor();
+            if self.session.grid.is_dirty() || self.session.grid.cursor() != (0, 0) {
+                let (cx, cy) = self.session.grid.cursor();
                 // The grid reports WHICH rows changed; RowCache turns that into
                 // the minimal set to re-shape. take_dirty rather than
                 // dirty_rows, so the range is consumed once — reading it
                 // without clearing would mark the same rows every frame and
                 // the cache would never hit.
-                if let Some((lo, hi)) = self.grid.take_dirty() {
-                    self.row_dirty.mark_range(lo, hi);
+                if let Some((lo, hi)) = self.session.grid.take_dirty() {
+                    self.session.row_dirty.mark_range(lo, hi);
                 }
                 let width = ui.available_width(); // the child ui below term_rect's border
                 // frame_plan flushes the dirty set and INVALIDATES those
@@ -3133,14 +3142,14 @@ impl eframe::App for VoicetermApp {
                 // building exactly the invalidated rows and reusing the rest.
                 // Calling it for its effect is the point.
                 let _plan = voiceterm_egui::row_render::frame_plan(
-                    &mut self.row_dirty, &mut self.row_galleys, width);
+                    &mut self.session.row_dirty, &mut self.session.row_galleys, width);
                 egui::Frame::NONE.show(ui, |ui| {
                     for y in 0..24 {
                         // A hit returns the cached string; a miss shapes it
                         // once. row_text is the expensive part on a wide grid,
                         // and the closure means an unchanged row never calls it.
-                        let Some(row) = self.row_galleys
-                            .get_or_build(y, || self.grid.row_text(y)) else { continue };
+                        let Some(row) = self.session.row_galleys
+                            .get_or_build(y, || self.session.grid.row_text(y)) else { continue };
                         if row.trim().is_empty() && y > cy { continue; }
                         // The cursor row is marked rather than drawn as a
                         // block: this is a monospace label, not a canvas, and a
@@ -3328,7 +3337,6 @@ fn main() -> eframe::Result<()> {
                     vec!["old.bak".into(), "51200".into(), "08:03".into()],
                 ],
                 chrome: Default::default(),
-                pty_out: Vec::new(),
                 app,
                 sidebar,
                 compass: ActionCompass::default(),
@@ -3343,10 +3351,8 @@ fn main() -> eframe::Result<()> {
                 cmd_hits: Vec::new(),
                 // 80x24 until a resize: the classic default, and every program
                 // that queries COLUMNS gets a plausible answer rather than 0.
-                grid: voiceterm_egui::term_grid::TermGrid::new(80, 24),
-                pty_echoed: 0,
-                row_dirty: voiceterm_egui::row_cache::RowCache::new(24),
-                row_galleys: voiceterm_egui::row_render::RowLayoutCache::new(),
+                session: voiceterm_egui::pane_host::PaneSession::new(),
+                pane_sessions: std::collections::HashMap::new(),
                 tape: Default::default(),
                 tape_reference: String::new(),
                 tape_note: String::new(),
