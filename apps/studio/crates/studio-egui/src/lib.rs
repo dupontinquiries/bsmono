@@ -18,6 +18,7 @@ pub mod playkeys;
 pub mod spectrum;
 
 /// The step-sequencer surface for studio-live.
+pub mod auto;
 pub mod grid;
 pub mod roll;
 pub mod lanes;

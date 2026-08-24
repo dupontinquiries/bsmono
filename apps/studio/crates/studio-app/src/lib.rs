@@ -91,6 +91,13 @@ pub struct Studio {
     /// The piano roll's resize-in-progress (a fresh note being drawn out,
     /// or an existing one grabbed by its edge).
     pub roll_drag: Option<studio_egui::roll::NoteDrag>,
+    /// Which lane the automation strip under the timeline shows, or `None`
+    /// for no strip. Local monitoring-adjacent state like `solo`: what you
+    /// are LOOKING at is not a project fact.
+    pub auto_target: Option<studio_core::AutoTarget>,
+    /// The strip's point mid-drag — ghost until release, ops on release,
+    /// the fader rule.
+    pub auto_drag: Option<studio_egui::auto::PointDrag>,
     /// The bus faders' twin of `mixer_drag`.
     pub bus_drag: Option<(studio_core::BusId, f32)>,
     /// Motions (the Helix keymap) or Playing (the keyboard is a piano).
@@ -134,6 +141,8 @@ impl Studio {
             mixer_drag: None,
             clip_gain_drag: None,
             roll_drag: None,
+            auto_target: None,
+            auto_drag: None,
             bus_drag: None,
             input_mode: Default::default(),
             octave: 0,
@@ -1660,6 +1669,61 @@ impl eframe::App for App {
                         self.studio.edit(
                             studio_core::Op::MoveClip { id, pos, track }, "moved");
                     }
+
+                    // ── the automation strip ─────────────────────────────
+                    // A target whose track or bus has been removed clears
+                    // itself rather than offering a strip every edit on
+                    // which would be refused.
+                    if let Some(t) = self.studio.auto_target {
+                        let p = &self.studio.session.doc.project;
+                        let alive = match t {
+                            studio_core::AutoTarget::TrackGain(id) =>
+                                p.tracks.iter().any(|tr| tr.id == id),
+                            studio_core::AutoTarget::BusGain(id) =>
+                                p.busses.contains_key(&id),
+                        };
+                        if !alive { self.studio.auto_target = None; }
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("automate:");
+                        let mut target = self.studio.auto_target;
+                        if ui.add(egui::Button::selectable(target.is_none(), "off")).clicked() {
+                            target = None;
+                        }
+                        for t in &self.studio.session.doc.project.tracks {
+                            let this = Some(studio_core::AutoTarget::TrackGain(t.id));
+                            if ui.add(egui::Button::selectable(target == this, &t.name)).clicked() {
+                                target = this;
+                            }
+                        }
+                        for b in self.studio.session.doc.project.busses.values() {
+                            let this = Some(studio_core::AutoTarget::BusGain(b.id));
+                            if ui.add(egui::Button::selectable(target == this,
+                                                               format!("bus: {}", b.name))).clicked() {
+                                target = this;
+                            }
+                        }
+                        self.studio.auto_target = target;
+                    });
+                    if let Some(target) = self.studio.auto_target {
+                        let points = self.studio.session.doc.project.automation
+                            .get(&target).cloned().unwrap_or_default();
+                        let mut drag = self.studio.auto_drag;
+                        let edits = studio_egui::auto::strip(
+                            ui, &points, &self.studio.view, &mut drag, Some(ph), &colors);
+                        self.studio.auto_drag = drag;
+                        for e in edits {
+                            match e {
+                                studio_egui::auto::AutoEdit::Set { at, value } => self.studio.edit(
+                                    studio_core::Op::SetAutoPoint { target, at, value },
+                                    "automation point"),
+                                studio_egui::auto::AutoEdit::Remove { at } => self.studio.edit(
+                                    studio_core::Op::RemoveAutoPoint { target, at },
+                                    "automation point removed"),
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -3057,5 +3121,64 @@ mod clip_fx_tests {
         assert!(e(&quiet) < e(&loud), "the fader moved the clip");
         s.key(studio_egui::keys::Key::c('u'));
         assert_eq!(s.render_arrangement(48_000, &sources), loud, "one gesture, one undo");
+    }
+}
+
+#[cfg(test)]
+mod automation_shell_tests {
+    use super::*;
+    use studio_core::{AutoTarget, Op, Ticks};
+    use studio_egui::keys::Key;
+
+    #[test]
+    fn an_automation_edit_is_undoable_and_stales_the_render() {
+        let mut s = Studio::demo();
+        let track = s.session.doc.project.tracks[0].id;
+        let target = AutoTarget::TrackGain(track);
+        s.arrangement_dirty = false;
+        s.edit(Op::SetAutoPoint { target, at: Ticks(100), value: 0.5 }, "automation point");
+        assert!(s.session.doc.project.automation.get(&target).is_some(), "the point landed");
+        assert!(s.arrangement_dirty, "a ride changes what the transport must play");
+        s.key(Key::c('u'));
+        assert!(s.session.doc.project.automation.get(&target).is_none(),
+                "undo removed the point through the op-log door like any edit");
+    }
+
+    #[test]
+    fn a_refused_automation_edit_says_so_instead_of_vanishing() {
+        // The strip can be aimed at a lane whose removal already happened on
+        // a peer; the refusal must reach the status line, not the void.
+        let mut s = Studio::demo();
+        let track = s.session.doc.project.tracks[0].id;
+        s.edit(Op::RemoveAutoPoint { target: AutoTarget::TrackGain(track), at: Ticks(9) },
+               "automation point removed");
+        assert!(s.status.contains("refused"), "status was: {}", s.status);
+    }
+
+    #[test]
+    fn the_lane_reaches_the_arrangement_the_shell_actually_renders() {
+        // End to end through the SHELL's own render path: a bounce is
+        // audible, then a flat zero lane on its track silences it — the
+        // strip edits the same mix the play button plays.
+        let mut s = Studio::demo();
+        let mut sources = std::collections::BTreeMap::new();
+        let (id, audio) = s.bounce_current_pattern(48_000, &sources).expect("bounced");
+        sources.insert(id, audio);
+        let loud: f32 = s.render_arrangement(48_000, &sources)[..9600]
+            .iter().map(|v| v.abs()).sum();
+        assert!(loud > 10.0, "the bounce is audible before the ride ({loud})");
+
+        // The demo seeds six clips of its own; the ride must land on the
+        // track the BOUNCE landed on, found by its source — grabbing "the
+        // first clip" automated a silent demo track and proved nothing
+        // (which is exactly how this test's first draft failed).
+        let track = s.session.doc.project.clips.values()
+            .find(|c| c.source == id).expect("the bounce placed a clip").track;
+        s.edit(Op::SetAutoPoint { target: AutoTarget::TrackGain(track),
+                                  at: Ticks::ZERO, value: 0.0 }, "automation point");
+        let ridden: f32 = s.render_arrangement(48_000, &sources)[..9600]
+            .iter().map(|v| v.abs()).sum();
+        assert!(ridden < loud * 0.001,
+                "a flat zero lane silences the track: {ridden} vs {loud}");
     }
 }
