@@ -7592,6 +7592,7 @@ impl Game {
         } else {
             None
         };
+        let robot = self.xf.is_robot();
         for (pi, prim) in active.prims.iter().enumerate() {
             if !wheels && !matches!(prim.tag, model::Tag::Body) {
                 continue;
@@ -7618,7 +7619,6 @@ impl Game {
             // vehicle mode contains them inside the hull envelope so the
             // fold reads as a solid object rather than a skeleton in a box
             // (`contain`). Both are zero for a body that never needed it.
-            let robot = self.xf.is_robot();
             let shift = if robot { active.tuck.get(pi) } else { active.pack.get(pi) };
             let base = match shift {
                 Some(t) if *t != Vec3::ZERO => base * Mat4::from_translation(*t),
@@ -7629,8 +7629,16 @@ impl Game {
             // whose wheels are not at tidy corners got no tags, so nothing
             // turned. `fittings.rollers` is the fallback, spun on the same
             // `wheel_spin` the tagged ones use so they cannot drift apart.
+            // ROLLERS ONLY ROLL WHEN THE BODY IS A VEHICLE. The detector
+            // runs on every pose in the strip, and a robot pose has plenty
+            // of round low outboard prims — knees, shoulders, heel blocks.
+            // Spinning those is the reported "body parts rolling like
+            // wheels in bot mode". The tagged wheels below have the same
+            // problem in principle, but they are tagged from the vehicle
+            // pose and the fold hides them; these are detected per pose
+            // and are not hidden, so the guard goes here.
             let base = match active.fittings.rollers.iter().find(|(i, _)| *i == pi) {
-                Some((_, pivot)) if matches!(prim.tag, model::Tag::Body) => {
+                Some((_, pivot)) if !robot && matches!(prim.tag, model::Tag::Body) => {
                     base * Mat4::from_translation(*pivot)
                         * Mat4::from_rotation_x(-wheel_spin)
                         * Mat4::from_translation(-*pivot)
