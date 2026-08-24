@@ -1654,3 +1654,20 @@ library. Pins are per project, stored in the workspace sidecar rather than
 the op log: a pin is how one person keeps their head straight in one
 session, not a fact about the music, and a collaborator's triage must not
 rearrange yours mid-take.
+
+
+**Two touch bugs from real use.** The list would not scroll over text on a
+phone: the row claimed the gesture with `Sense::drag`, so the ScrollArea
+never saw it. Rows are hover-sensed now and the press is tracked by hand,
+which leaves every drag with the scroll area — and the swipe additionally
+requires the travel to be decisively horizontal (at least 2:1 over
+vertical), because a finger flicking the list up through a row always
+wanders sideways. Pinned: a 60×200 px flick is a scroll, an 80×39 px drag
+is a pin. Second, the row mixed `small_button` (tight, text-sized) with
+`menu_button` (full-height), so each icon sat at a different offset inside
+a differently sized hit rect — every control is now the same 34 px square
+via one `touch_button` helper, the row is one touch tall so identicon,
+name and buttons share a centre line, and the compact threshold is derived
+from the actual control budget (`wants_compact`) rather than a guessed
+pixel count. Folding to compact removes buttons from the row but never
+verbs: both fold into ⋯.

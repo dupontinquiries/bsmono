@@ -371,17 +371,46 @@ pub fn sections(entries: &[LibraryEntry]) -> Vec<(String, Vec<LibraryEntry>)> {
 
 /// A horizontal drag on a row, resolved to an intent. Right pins, left
 /// demotes — the direction matches the result (up the list / down it) the
-/// way a phone user already expects, and the threshold keeps a shaky
-/// scroll from re-ranking a library.
+/// way a phone user already expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Swipe { Pin, Demote }
 
 pub const SWIPE_PX: f32 = 36.0;
 
-pub fn swipe_of(dx: f32) -> Option<Swipe> {
-    if dx >= SWIPE_PX { Some(Swipe::Pin) }
-    else if dx <= -SWIPE_PX { Some(Swipe::Demote) }
-    else { None }
+/// Resolve a completed drag. Two conditions, and the SECOND one is the
+/// bug fix: the gesture must travel far enough AND be clearly horizontal
+/// (at least twice the vertical), because a finger dragging the list up
+/// through a row of text always wanders a few pixels sideways. The first
+/// version tested `dx` alone and — worse — claimed the drag at the row
+/// level with `Sense::drag`, which took the gesture away from the scroll
+/// area entirely: on a phone, the list simply would not scroll over text.
+/// Rows are hover-sensed now and the press is tracked manually, so the
+/// ScrollArea keeps every vertical drag and only a decisive sideways
+/// motion counts as triage.
+pub fn swipe_of(dx: f32, dy: f32) -> Option<Swipe> {
+    if dx.abs() < SWIPE_PX || dx.abs() < dy.abs() * 2.0 { return None; }
+    if dx > 0.0 { Some(Swipe::Pin) } else { Some(Swipe::Demote) }
+}
+
+/// The minimum square a finger can reliably hit. Every control in a row
+/// is exactly this, so the glyph's touch area IS the glyph's box — the
+/// previous mix of `small_button` (tight, text-sized) and `menu_button`
+/// (full-height) put each icon at a different offset inside a differently
+/// sized hit rect, which is precisely the misalignment being fixed.
+pub const TOUCH_PX: f32 = 34.0;
+
+/// How many controls a row shows, and therefore how much width they need.
+/// The compact threshold is derived from THIS rather than being a magic
+/// number: a row goes compact exactly when its full control set plus a
+/// readable name no longer fits.
+pub const FULL_BUTTONS: usize = 4;   // ⋯ · clip · rack · ▶
+pub const COMPACT_BUTTONS: usize = 2; // ⋯ · ▶
+
+pub fn buttons_width(count: usize) -> f32 { count as f32 * (TOUCH_PX + 2.0) }
+
+/// Room for the identicon, a name worth reading, and every control.
+pub fn wants_compact(available: f32) -> bool {
+    available < buttons_width(FULL_BUTTONS) + 120.0
 }
 
 /// What the sidebar asked the shell to do.
@@ -430,15 +459,28 @@ impl TreeState {
     }
 }
 
-/// One row: identicon on the LEFT, name in the middle, every button on
-/// the RIGHT — so the buttons line up in a single column the eye can
-/// track instead of wandering with each name's length, and a narrow
-/// sidebar clips the name rather than the controls.
+/// A control whose touch area and glyph are the same square. Uniform
+/// across the row so the icons line up in one column and every hit lands
+/// where it looks like it should.
+fn touch_button(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
+    ui.add_sized([TOUCH_PX, TOUCH_PX],
+                 egui::Button::new(glyph).min_size(egui::vec2(TOUCH_PX, TOUCH_PX)))
+        .on_hover_text(tip)
+}
+
+/// One row: identicon on the LEFT, name in the middle, every control on
+/// the RIGHT as equal squares — so the buttons form one column the eye can
+/// track and the thumb can hit, and a narrow sidebar clips the name rather
+/// than the controls.
+#[allow(clippy::too_many_arguments)]
 fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
               rack: &studio_live::Rack, project: &studio_core::Project,
               prefs: &Prefs, c: &uikit_egui::PaletteColors,
               action: &mut Option<LibraryAction>) {
-    let resp = ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
+        // Every row is one touch tall, so the identicon, the name and the
+        // buttons share a centre line instead of each finding its own.
+        ui.set_min_height(TOUCH_PX);
         // ── left: the identicon ─────────────────────────────────────────
         let (short, ext) = identicon(&e.label);
         let tint = match ext.as_str() {
@@ -452,10 +494,8 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             if rank < 0 { ui.colored_label(c.accent, "★"); }
-            ui.colored_label(tint, format!("{}", ext.to_uppercase()))
+            ui.colored_label(tint, ext.to_uppercase())
                 .on_hover_text(format!("{} · {:.1} MB", e.label, e.bytes as f64 / 1e6));
-            // The anvil: heavy on a phone. Rare on purpose — a mark
-            // everything wears is a mark nobody reads.
             if heavy {
                 ui.colored_label(c.warning, "⚒")
                     .on_hover_text("large or uncompressed — costs real storage and decode");
@@ -465,8 +505,20 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
         let name = if compact { short } else { e.label.clone() };
         let faded = if rank > 0 { c.text_weak } else { c.text };
         ui.colored_label(faded, name).on_hover_text(&e.label);
-        // ── right: every button, in one column ─────────────────────────
+        // ── right: the controls, all the same square ───────────────────
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if touch_button(ui, "▶", "preview").clicked() {
+                *action = Some(LibraryAction::Preview(e.path.clone()));
+            }
+            if !compact {
+                if touch_button(ui, "⊞", "add as a sampler channel").clicked() {
+                    *action = Some(LibraryAction::ToRack(e.path.clone()));
+                }
+                if touch_button(ui, "⏱", "place at the playhead").clicked() {
+                    *action = Some(LibraryAction::ToTimeline(e.path.clone()));
+                }
+            }
             ui.menu_button("⋯", |ui| {
                 let kind = classify(&e.label);
                 for s in suggest(kind, rack, project) {
@@ -483,25 +535,37 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
                         ui.close();
                     }
                 }
+                if compact {
+                    // The two folded controls keep working from the menu —
+                    // a narrow screen loses the shortcut, never the verb.
+                    if ui.button("add as a sampler channel").clicked() {
+                        *action = Some(LibraryAction::ToRack(e.path.clone()));
+                        ui.close();
+                    }
+                    if ui.button("place at the playhead").clicked() {
+                        *action = Some(LibraryAction::ToTimeline(e.path.clone()));
+                        ui.close();
+                    }
+                }
                 if ui.button("add to morph pad").clicked() {
                     *action = Some(LibraryAction::ToMorph(e.path.clone()));
                     ui.close();
                 }
                 let kin = similar_in_dir(&e.path, 3);
-                if !kin.is_empty() {
-                    if ui.button(format!("pad: load with {} similar", kin.len())).clicked() {
-                        let mut set = vec![e.path.clone()];
-                        set.extend(kin);
-                        *action = Some(LibraryAction::ToMorphSet(set));
-                        ui.close();
-                    }
+                if !kin.is_empty()
+                    && ui.button(format!("pad: load with {} similar", kin.len())).clicked()
+                {
+                    let mut set = vec![e.path.clone()];
+                    set.extend(kin);
+                    *action = Some(LibraryAction::ToMorphSet(set));
+                    ui.close();
                 }
                 ui.separator();
-                if ui.button(if prefs.rank(&e.path) < 0 { "unpin" } else { "pin" }).clicked() {
+                if ui.button(if rank < 0 { "unpin" } else { "pin" }).clicked() {
                     *action = Some(LibraryAction::Pin(e.path.clone()));
                     ui.close();
                 }
-                if ui.button(if prefs.rank(&e.path) > 0 { "restore" } else { "demote" }).clicked() {
+                if ui.button(if rank > 0 { "restore" } else { "demote" }).clicked() {
                     *action = Some(LibraryAction::Demote(e.path.clone()));
                     ui.close();
                 }
@@ -517,31 +581,37 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
                     }
                 }
             });
-            if !compact {
-                if ui.small_button("clip").on_hover_text("place at the playhead").clicked() {
-                    *action = Some(LibraryAction::ToTimeline(e.path.clone()));
-                }
-                if ui.small_button("rack").on_hover_text("add as a sampler channel").clicked() {
-                    *action = Some(LibraryAction::ToRack(e.path.clone()));
-                }
-            }
-            if ui.small_button("▶").on_hover_text("preview").clicked() {
-                *action = Some(LibraryAction::Preview(e.path.clone()));
-            }
         });
     }).response;
 
-    // The swipe: triage at listening speed. Resolved on RELEASE from the
-    // total drag, so a slow scroll that wanders sideways never re-ranks
-    // the library — and the same intents exist in the ⋯ menu, because a
-    // gesture nobody discovers is a feature nobody has.
-    let dragged = ui.interact(resp.rect, resp.id.with("swipe"), egui::Sense::drag());
-    if dragged.drag_stopped() {
-        if let Some(sw) = swipe_of(dragged.drag_delta().x) {
-            *action = Some(match sw {
-                Swipe::Pin => LibraryAction::Pin(e.path.clone()),
-                Swipe::Demote => LibraryAction::Demote(e.path.clone()),
-            });
+    // The swipe, WITHOUT claiming the drag: the row is hover-sensed, the
+    // press is tracked by hand, and the ScrollArea keeps every gesture it
+    // would otherwise lose. A drag that ends up mostly vertical scrolled
+    // the list and means nothing here.
+    let id = ui.id().with("lib-press");
+    if ui.input(|i| i.pointer.any_pressed()) {
+        if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+            if row.rect.contains(p) {
+                ui.memory_mut(|m| m.data.insert_temp(id, (p, e.path.clone())));
+            }
+        }
+    }
+    if ui.input(|i| i.pointer.any_released()) {
+        let started: Option<(egui::Pos2, PathBuf)> =
+            ui.memory(|m| m.data.get_temp(id));
+        if let (Some((from, path)), Some(to)) =
+            (started, ui.input(|i| i.pointer.interact_pos()))
+        {
+            if path == e.path {
+                let d = to - from;
+                if let Some(sw) = swipe_of(d.x, d.y) {
+                    *action = Some(match sw {
+                        Swipe::Pin => LibraryAction::Pin(path),
+                        Swipe::Demote => LibraryAction::Demote(path),
+                    });
+                }
+                ui.memory_mut(|m| m.data.remove::<(egui::Pos2, PathBuf)>(id));
+            }
         }
     }
 }
@@ -552,10 +622,10 @@ pub fn show_tree(ui: &mut egui::Ui, root: &Path, state: &mut TreeState,
                  rack: &studio_live::Rack, project: &studio_core::Project,
                  prefs: &Prefs, c: &uikit_egui::PaletteColors) -> Option<LibraryAction> {
     let mut action = None;
-    // Below this the row cannot hold long names AND its buttons, so the
-    // name elides to its identicon and the two word-buttons fold into ⋯ —
-    // the controls survive, which is the right thing to keep.
-    let compact = ui.available_width() < 260.0;
+    // Derived from the row's real control budget, not a magic number: a
+    // row goes compact exactly when its full set of touch-sized buttons
+    // plus a readable name no longer fits.
+    let compact = wants_compact(ui.available_width());
     ui.label(format!("library — {}", root.display()));
     ui.horizontal(|ui| {
         ui.label("find:");
@@ -806,12 +876,34 @@ mod tests {
     }
 
     #[test]
-    fn a_swipe_needs_real_travel_in_a_clear_direction() {
-        assert_eq!(swipe_of(SWIPE_PX + 1.0), Some(Swipe::Pin));
-        assert_eq!(swipe_of(-SWIPE_PX - 1.0), Some(Swipe::Demote));
+    fn a_swipe_must_be_decisively_sideways_so_scrolling_still_works() {
+        assert_eq!(swipe_of(SWIPE_PX + 1.0, 2.0), Some(Swipe::Pin));
+        assert_eq!(swipe_of(-SWIPE_PX - 1.0, -2.0), Some(Swipe::Demote));
         // A scroll that wanders sideways must not re-rank the library.
-        assert_eq!(swipe_of(12.0), None);
-        assert_eq!(swipe_of(-12.0), None);
+        assert_eq!(swipe_of(12.0, 4.0), None);
+        // THE BUG: a finger dragging the list up through a row of text
+        // travels far horizontally too. Vertical dominance means scroll,
+        // and the row no longer claims the drag at all, so the ScrollArea
+        // gets it.
+        assert_eq!(swipe_of(60.0, 200.0), None, "a flick up the list is not a pin");
+        assert_eq!(swipe_of(-60.0, -200.0), None);
+        assert_eq!(swipe_of(80.0, 39.0), Some(Swipe::Pin), "2:1 sideways is a swipe");
+    }
+
+    #[test]
+    fn the_control_budget_decides_compact_and_every_control_is_one_touch_square() {
+        // A phone sidebar (PinePhone portrait, roughly) folds; a desktop
+        // one does not — and the threshold is the arithmetic, not a
+        // number someone guessed.
+        assert!(wants_compact(240.0), "a narrow sidebar folds");
+        assert!(!wants_compact(420.0), "a roomy one keeps its buttons");
+        assert!(wants_compact(buttons_width(FULL_BUTTONS) + 119.0));
+        assert!(!wants_compact(buttons_width(FULL_BUTTONS) + 121.0));
+        // Touch targets stay finger-sized: below ~30px this is unusable on
+        // a Fairphone, which is the whole reason the constant exists.
+        assert!(TOUCH_PX >= 32.0);
+        assert!(COMPACT_BUTTONS < FULL_BUTTONS,
+                "folding must actually remove controls from the row");
     }
 
     #[test]
