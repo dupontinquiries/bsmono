@@ -37,6 +37,9 @@ pub struct WorkspaceState {
     /// music — a collaborator's triage must not rearrange yours mid-take.
     pub pinned: Vec<String>,
     pub demoted: Vec<String>,
+    /// Genre vocabularies the voice fastpath listens with — per device,
+    /// because the ears follow the room, not the song.
+    pub voice_domains: String,
 }
 
 impl Default for WorkspaceState {
@@ -46,14 +49,15 @@ impl Default for WorkspaceState {
                          px_per_sec: 100.0, scroll_ticks: 0,
                          closed_groups: Vec::new(),
                          bounce_format: "opus-192".into(),
-                         pinned: Vec::new(), demoted: Vec::new() }
+                         pinned: Vec::new(), demoted: Vec::new(),
+                         voice_domains: "common,instruments".into() }
     }
 }
 
 impl WorkspaceState {
     pub fn encode(&self) -> String {
         format!("# per-device layout; safe to delete, never load-bearing\n\
-                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\n",
+                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\n",
                 self.combined, self.panel, self.side_slot,
                 self.px_per_sec, self.scroll_ticks,
                 self.closed_groups.iter().map(|g| g.to_string())
@@ -63,7 +67,8 @@ impl WorkspaceState {
                 // packs do), and losing a pin to punctuation would be a
                 // silent, confusing failure.
                 self.pinned.join("\t"),
-                self.demoted.join("\t"))
+                self.demoted.join("\t"),
+                self.voice_domains)
     }
     /// Parse leniently: defaults underneath, known keys on top, everything
     /// else ignored. There is no error case ON PURPOSE.
@@ -90,6 +95,7 @@ impl WorkspaceState {
                     .filter(|x| !x.trim().is_empty()).map(str::to_string).collect(),
                 "demoted" => w.demoted = v.split('\t')
                     .filter(|x| !x.trim().is_empty()).map(str::to_string).collect(),
+                "voice_domains" => w.voice_domains = v.trim().to_string(),
                 _ => {} // a newer build's key, not our business
             }
         }
@@ -122,7 +128,8 @@ mod tests {
         let w = WorkspaceState { combined: true, panel: "Rack".into(),
             side_slot: "mixer".into(), px_per_sec: 250.0, scroll_ticks: 12345,
             closed_groups: vec![3, 9], bounce_format: "flac".into(),
-            pinned: vec!["kicks/808, big.wav".into()], demoted: vec!["hats/tick.opus".into()] };
+            pinned: vec!["kicks/808, big.wav".into()], demoted: vec!["hats/tick.opus".into()],
+            voice_domains: "trap,film".into() };
         assert_eq!(WorkspaceState::decode(&w.encode()), w);
         // A newer build's key rides along harmlessly; garbage lines too.
         let with_future = format!("{}\nfuture_key=whatever\n<<<garbage", w.encode());

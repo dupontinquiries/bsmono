@@ -45,6 +45,7 @@ pub enum ShellVerb {
     /// Show or hide the out-of-key dimming in the piano roll.
     ToggleKeyGuide,
     MarkerHere,
+    VoiceVocab(u8),
     GotoMarker(studio_core::Ticks),
     GotoStart,
     GotoEnd,
@@ -83,6 +84,8 @@ pub enum Ask {
     KeyScale(u8),
     /// Which marker to jump to.
     JumpMarker,
+    /// Which genre vocabulary the voice fastpath should listen with.
+    VoiceVocab,
     /// Which track to hide (mute is the model's own word for it).
     MuteTrack2,
     /// Which track's gain to change, and by how many dB.
@@ -110,6 +113,7 @@ pub fn root() -> Vec<Choice> {
         c("play / pause", Some("space"), Then::Do(Act::Key(' '))),
         // Key and scale — the data flow the roll's guide reads.
         c("set project key", None, Then::Ask(Ask::KeyRoot)),
+        c("voice vocabulary (genre words)", None, Then::Ask(Ask::VoiceVocab)),
         c("toggle out-of-key dimming", None,
           Then::Do(Act::Shell(ShellVerb::ToggleKeyGuide))),
         // Markers: the one request both the FL Studio and kdenlive
@@ -166,6 +170,10 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                                 studio_core::Scale::Chromatic].iter()
             .map(|s| plain(s.name().to_string(), Then::Do(Act::Ops(vec![
                 Op::SetKey { key: Some(studio_core::Key { root, scale: *s }) }]))))
+            .collect(),
+        Ask::VoiceVocab => crate::voice::Domain::ALL.iter().enumerate()
+            .map(|(i, d)| plain(d.label().to_string(),
+                                Then::Do(Act::Shell(ShellVerb::VoiceVocab(i as u8)))))
             .collect(),
         Ask::JumpMarker => project.markers.iter()
             .map(|m| plain(format!("{} ({:.1}s)", m.name, m.at.to_seconds()),

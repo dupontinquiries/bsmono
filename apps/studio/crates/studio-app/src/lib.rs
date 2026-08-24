@@ -1342,6 +1342,10 @@ pub struct App {
     /// from its state, and utterances run through the SAME palette acts
     /// the keyboard uses — no second command system.
     voice: Option<voice::Dialog>,
+    /// The vocabularies the fastpath listens with — kept on the App (not
+    /// in the Dialog) so a dialog can be opened and closed without
+    /// forgetting which genres this device works in.
+    lexicon: voice::Lexicon,
     mic: Box<dyn capture::Capture>,
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
@@ -1422,6 +1426,7 @@ impl Default for App {
         studio.closed_groups = ws.closed_groups.iter()
             .map(|g| studio_core::GroupId(*g)).collect();
         let bounce_format = morph_pad::BounceFormat::from_token(&ws.bounce_format);
+        let lexicon = voice::Lexicon::from_tokens(&ws.voice_domains);
         let library_prefs = library::Prefs {
             pinned: ws.pinned.iter().map(std::path::PathBuf::from).collect(),
             demoted: ws.demoted.iter().map(std::path::PathBuf::from).collect(),
@@ -1465,6 +1470,7 @@ impl Default for App {
               mix_pass: None,
               palette: None,
               voice: None,
+              lexicon,
               mic: capture::open_capture(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: true,
@@ -1657,6 +1663,7 @@ impl eframe::App for App {
                         closed_groups: self.studio.closed_groups.iter()
                             .map(|g| g.0).collect(),
                         bounce_format: self.bounce_format.token().to_string(),
+                        voice_domains: self.lexicon.to_tokens(),
                         pinned: self.library_prefs.pinned.iter()
                             .map(|p| p.display().to_string()).collect(),
                         demoted: self.library_prefs.demoted.iter()
@@ -1797,8 +1804,11 @@ impl eframe::App for App {
         // seam it feeds, and the palette walk behind it is fully tested
         // headless, so wiring a backend is one call and no new verbs.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Space)) {
-            self.voice = match self.voice { Some(_) => None,
-                                            None => Some(voice::Dialog::default()) };
+            self.voice = match self.voice {
+                Some(_) => None,
+                None => Some(voice::Dialog { lexicon: self.lexicon.clone(),
+                                             ..Default::default() }),
+            };
         }
         if let Some(d) = &self.voice {
             voice::feedback_popup(ctx, d, &colors);
@@ -2821,7 +2831,8 @@ impl App {
         // The dialog is taken out for the turn: it borrows nothing from
         // the shell while `run_palette_act` mutates it, and goes back
         // afterwards carrying its state.
-        let mut d = self.voice.take().unwrap_or_default();
+        let mut d = self.voice.take().unwrap_or_else(|| voice::Dialog {
+            lexicon: self.lexicon.clone(), ..Default::default() });
         let project = self.studio.session.doc.project.clone();
         let act = d.hear(text, &project);
         if let voice::State::Failed { why, .. } = &d.state {
@@ -2853,6 +2864,15 @@ impl App {
                     self.studio.key_guide = !self.studio.key_guide;
                     self.studio.status = format!("out-of-key dimming {}",
                         if self.studio.key_guide { "on" } else { "off" });
+                }
+                palette::ShellVerb::VoiceVocab(i) => {
+                    if let Some(d) = voice::Domain::ALL.get(i as usize).copied() {
+                        self.lexicon.toggle(d);
+                        if let Some(v) = &mut self.voice { v.lexicon = self.lexicon.clone(); }
+                        self.studio.status = format!("voice vocabulary: {}",
+                            if self.lexicon.to_tokens().is_empty() { "common only".into() }
+                            else { self.lexicon.to_tokens() });
+                    }
                 }
                 palette::ShellVerb::MarkerHere => {
                     let at = self.studio.playhead();

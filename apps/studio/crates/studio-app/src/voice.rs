@@ -35,6 +35,203 @@ use studio_core::Project;
 
 use crate::palette::{self, Act};
 
+// ── genre lexicons ──────────────────────────────────────────────────────
+
+/// A vocabulary the fastpath can be taught. Genres name the same sounds
+/// differently — a trap producer says "eight oh eight", a film composer
+/// says "braams", a country session says "fiddle" — and none of those
+/// words appear in a filename or a channel name. Each domain is a small
+/// table of spoken phrases mapped to the words the LIBRARY actually uses,
+/// so the alias closes a naming gap and never invents a concept.
+///
+/// These are deliberately STARTER dictionaries: a few dozen entries each,
+/// chosen to be the terms a person says in the first minute, not an
+/// attempt at a genre's whole language. They are data, so growing one is
+/// a line, and the drift test below keeps every target honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Domain {
+    /// Always on: the words every session uses regardless of genre.
+    Common,
+    Trap,
+    HipHop,
+    Classical,
+    FilmScore,
+    Country,
+    /// Instrument names, which cut across genres and are the single
+    /// biggest source of "it heard me and matched nothing".
+    Instruments,
+}
+
+impl Domain {
+    pub const ALL: [Domain; 7] = [Domain::Common, Domain::Trap, Domain::HipHop,
+                                  Domain::Classical, Domain::FilmScore,
+                                  Domain::Country, Domain::Instruments];
+    pub fn token(self) -> &'static str {
+        match self {
+            Domain::Common => "common", Domain::Trap => "trap",
+            Domain::HipHop => "hiphop", Domain::Classical => "classical",
+            Domain::FilmScore => "film", Domain::Country => "country",
+            Domain::Instruments => "instruments",
+        }
+    }
+    pub fn from_token(t: &str) -> Option<Domain> {
+        Domain::ALL.iter().copied().find(|d| d.token() == t)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Domain::Common => "common (always on)", Domain::Trap => "trap",
+            Domain::HipHop => "hip hop", Domain::Classical => "classical",
+            Domain::FilmScore => "film score", Domain::Country => "country",
+            Domain::Instruments => "instrument names",
+        }
+    }
+
+    /// `(spoken phrase, what the library calls it)`. Phrases may be
+    /// several words; the longest match wins, so "hi hat" never lands as
+    /// "hi" plus "hat".
+    pub fn entries(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Domain::Common => &[
+                ("high hat", "hat"), ("hi hat", "hat"), ("hihat", "hat"),
+                ("bass drum", "kick"), ("kick drum", "kick"),
+                ("snare drum", "snare"), ("hand clap", "clap"),
+                ("vocal", "vox"), ("vocals", "vox"), ("voice", "vox"),
+                ("sound effect", "fx"), ("effect", "fx"),
+                ("loop it", "loop"), ("beat", "drums"),
+            ],
+            Domain::Trap => &[
+                // The genre's own names for its furniture.
+                ("eight oh eight", "808"), ("eight o eight", "808"),
+                ("sub bass", "808"), ("sub", "808"),
+                ("hat roll", "hat"), ("rolling hats", "hat"),
+                ("triplet hats", "hat"), ("open hat", "hat"),
+                ("ad lib", "vox"), ("adlib", "vox"),
+                ("riser", "fx"), ("stomp", "fx"),
+                ("bell melody", "bell"), ("plucks", "melody"),
+            ],
+            Domain::HipHop => &[
+                ("boom bap", "kick"), ("break beat", "loop"), ("breakbeat", "loop"),
+                ("acapella", "vox"), ("a capella", "vox"),
+                ("scratch", "fx"), ("chop", "loop"), ("chops", "loop"),
+                ("rim shot", "rim"), ("dusty drums", "drums"),
+                ("sample flip", "loop"),
+            ],
+            Domain::Classical => &[
+                ("pizzicato", "pizz"), ("arco", "strings"),
+                ("string section", "strings"), ("strings section", "strings"),
+                ("timpani", "tom"), ("kettle drum", "tom"),
+                ("choir", "vox"), ("chorale", "vox"),
+                ("harpsichord", "keys"), ("piano forte", "piano"),
+            ],
+            Domain::FilmScore => &[
+                // The words a composer says that no file is ever named.
+                ("braams", "brass"), ("braam", "brass"), ("brass hit", "brass"),
+                ("swell", "riser"), ("rise", "riser"), ("whoosh", "riser"),
+                ("boom", "impact"), ("hit", "impact"), ("stinger", "impact"),
+                ("drone", "pad"), ("bed", "pad"), ("texture", "pad"),
+                ("ostinato", "loop"), ("pulse", "loop"),
+            ],
+            Domain::Country => &[
+                ("fiddle", "violin"), ("pedal steel", "steel"),
+                ("steel guitar", "steel"), ("dobro", "steel"),
+                ("banjo roll", "banjo"), ("train beat", "drums"),
+                ("brush kit", "drums"), ("brushes", "drums"),
+                ("upright", "bass"), ("stand up bass", "bass"),
+            ],
+            Domain::Instruments => &[
+                ("electric guitar", "guitar"), ("acoustic guitar", "guitar"),
+                ("french horn", "horn"), ("double bass", "bass"),
+                ("electric piano", "keys"), ("rhodes", "keys"),
+                ("synthesizer", "synth"), ("organ", "keys"),
+                ("cello", "cello"), ("viola", "viola"), ("violin", "violin"),
+                ("trumpet", "trumpet"), ("sax", "sax"), ("saxophone", "sax"),
+                ("flute", "flute"), ("clarinet", "clarinet"),
+                ("mandolin", "mandolin"), ("harp", "harp"),
+            ],
+        }
+    }
+}
+
+/// The active vocabularies. `Common` is always consulted; the rest are a
+/// person's choice, kept per device in the workspace sidecar — a trap
+/// session and a scoring session want different ears, and neither should
+/// have to disable the other's words to be understood.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lexicon {
+    pub domains: Vec<Domain>,
+}
+
+impl Default for Lexicon {
+    fn default() -> Self { Lexicon { domains: vec![Domain::Common, Domain::Instruments] } }
+}
+
+impl Lexicon {
+    pub fn enabled(&self, d: Domain) -> bool {
+        d == Domain::Common || self.domains.contains(&d)
+    }
+    pub fn toggle(&mut self, d: Domain) {
+        if d == Domain::Common { return; } // always on; toggling it is a no-op, said here
+        if let Some(i) = self.domains.iter().position(|x| *x == d) {
+            self.domains.remove(i);
+        } else {
+            self.domains.push(d);
+            self.domains.sort();
+        }
+    }
+    pub fn to_tokens(&self) -> String {
+        self.domains.iter().map(|d| d.token()).collect::<Vec<_>>().join(",")
+    }
+    pub fn from_tokens(s: &str) -> Lexicon {
+        let domains: Vec<Domain> = s.split(',').filter_map(|t| Domain::from_token(t.trim()))
+            .collect();
+        if domains.is_empty() { Lexicon::default() } else { Lexicon { domains } }
+    }
+
+    /// Rewrite spoken words into library words, longest phrase first so a
+    /// two-word term is never split into two useless ones. Unknown words
+    /// pass through untouched — a lexicon that swallowed what it did not
+    /// know would make every unlisted sample unreachable by voice.
+    ///
+    /// The result is a SECOND READING, never a replacement: a caller must
+    /// try the raw words too, because an alias can destroy a match that
+    /// already worked (a track literally named "vocals" stops matching
+    /// once "vocals" has become "vox"). [`Dialog::hear`] tries the
+    /// aliased reading first and the literal one after, so the lexicon
+    /// can only ever add understanding.
+    pub fn apply(&self, words: &[String]) -> Vec<String> {
+        let mut table: Vec<(Vec<String>, &'static str)> = Vec::new();
+        for d in Domain::ALL {
+            if !self.enabled(d) { continue; }
+            for (spoken, canon) in d.entries() {
+                table.push((spoken.split(' ').map(str::to_string).collect(), canon));
+            }
+        }
+        // Longest first: "hi hat" must beat any single-word entry, and a
+        // domain added later must not be able to shadow a longer phrase
+        // just by being earlier in the list.
+        table.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        let mut out: Vec<String> = Vec::with_capacity(words.len());
+        let mut i = 0usize;
+        'outer: while i < words.len() {
+            for (phrase, canon) in &table {
+                let n = phrase.len();
+                if i + n <= words.len() && words[i..i + n] == phrase[..] {
+                    // Don't repeat a word the previous alias already
+                    // produced ("kick drum" then "drums" → one "kick").
+                    if out.last().map(String::as_str) != Some(*canon) {
+                        out.push((*canon).to_string());
+                    }
+                    i += n;
+                    continue 'outer;
+                }
+            }
+            out.push(words[i].clone());
+            i += 1;
+        }
+        out
+    }
+}
+
 /// Spoken text to tokens the palette can match. Lowercases, expands the
 /// number and note-name words a recognizer emits, and drops the filler
 /// ("please", "uh", "can you") that would otherwise weaken every score.
@@ -166,6 +363,38 @@ pub const EXTRA_SPOKEN: &[(&str, &[&str])] = &[
     ("go to the chorus", &["jump to marker", "chorus"]),
 ];
 
+/// The outcome of walking one reading of an utterance.
+enum Walk {
+    /// Reached a leaf: here is the act.
+    Did(Act),
+    /// Consumed everything and landed mid-wizard — the popup asks.
+    Partial,
+    /// Could not match the remaining words; carries them, so the popup
+    /// can say WHICH part failed rather than "no".
+    Stuck(String),
+}
+
+/// Consume the longest matching prefix at each step until the words run
+/// out or nothing matches.
+fn walk(pal: &mut palette::Palette, words: &[String], project: &Project) -> Walk {
+    let mut rest = words;
+    while !rest.is_empty() {
+        let choices = pal.choices(project);
+        let mut chosen: Option<(palette::Choice, usize)> = None;
+        for len in (1..=rest.len()).rev() {
+            let phrase = rest[..len].join(" ");
+            if let Some(best) = palette::filter(&choices, &phrase).first() {
+                chosen = Some(((*best).clone(), len));
+                break;
+            }
+        }
+        let Some((best, took)) = chosen else { return Walk::Stuck(rest.join(" ")) };
+        rest = &rest[took..];
+        if let Some(a) = pal.choose(&best) { return Walk::Did(a); }
+    }
+    Walk::Partial
+}
+
 /// One turn of the conversation, and one frame of the popup.
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
@@ -189,10 +418,17 @@ pub enum State {
 pub struct Dialog {
     pub state: State,
     pub pal: palette::Palette,
+    /// The active vocabularies — see [`Lexicon`]. Applied to every
+    /// utterance before the palette sees it, which is why no command
+    /// carries genre aliases of its own.
+    pub lexicon: Lexicon,
 }
 
 impl Default for Dialog {
-    fn default() -> Self { Dialog { state: State::Listening, pal: palette::Palette::open() } }
+    fn default() -> Self {
+        Dialog { state: State::Listening, pal: palette::Palette::open(),
+                 lexicon: Lexicon::default() }
+    }
 }
 
 impl Dialog {
@@ -219,11 +455,16 @@ impl Dialog {
                          else { State::Listening };
             return if yes { Some(act) } else { None };
         }
-        let words = normalize(&heard);
-        if words.is_empty() {
+        let raw = normalize(&heard);
+        if raw.is_empty() {
             self.state = State::Failed { heard, why: "nothing but filler".into() };
             return None;
         }
+        // Two readings, aliased first: the lexicon widens what can be
+        // understood and must never narrow it.
+        let aliased = self.lexicon.apply(&raw);
+        let readings: Vec<Vec<String>> =
+            if aliased == raw { vec![raw] } else { vec![aliased, raw] };
         // Walk the palette, consuming the LONGEST prefix that matches at
         // each step: "route vocals drum bus" is one utterance and three
         // steps, so a command can be said in one breath — and the same
@@ -232,28 +473,24 @@ impl Dialog {
         // (The first draft joined the whole utterance into a single
         // phrase and treated a miss as fatal; a five-word sentence then
         // matched nothing at all.)
+        let start = self.pal.clone();
         let mut act = None;
-        let mut rest: &[String] = &words;
-        while !rest.is_empty() {
-            let choices = self.pal.choices(project);
-            let mut took = 0usize;
-            let mut chosen: Option<palette::Choice> = None;
-            for len in (1..=rest.len()).rev() {
-                let phrase = rest[..len].join(" ");
-                if let Some(best) = palette::filter(&choices, &phrase).first() {
-                    chosen = Some((*best).clone());
-                    took = len;
-                    break;
-                }
+        let mut missed: Option<String> = None;
+        let mut walked = false;
+        for words in &readings {
+            self.pal = start.clone();
+            match walk(&mut self.pal, words, project) {
+                Walk::Did(a) => { act = Some(a); walked = true; break; }
+                Walk::Partial => { walked = true; break; }
+                Walk::Stuck(what) => { missed.get_or_insert(what); }
             }
-            let Some(best) = chosen else {
-                self.state = State::Failed { heard,
-                    why: format!("nothing here matches '{}'", rest.join(" ")) };
-                self.pal = palette::Palette::open();
-                return None;
-            };
-            rest = &rest[took..];
-            if let Some(a) = self.pal.choose(&best) { act = Some(a); break; }
+        }
+        if !walked {
+            self.state = State::Failed { heard,
+                why: format!("nothing here matches '{}'",
+                             missed.unwrap_or_else(|| "that".into())) };
+            self.pal = palette::Palette::open();
+            return None;
         }
         match act {
             Some(a) => {
@@ -382,6 +619,85 @@ mod tests {
         // A failed walk resets rather than leaving a half-open wizard the
         // next utterance would fall into.
         assert!(d.pal.pending.is_none());
+    }
+
+    #[test]
+    fn a_genre_word_finds_the_file_a_genre_never_names() {
+        // The gap these tables close: a recognizer emits what a person
+        // says, and nobody names a file "braams" or "hi hat".
+        let lex = Lexicon { domains: vec![Domain::Common, Domain::Trap,
+                                          Domain::FilmScore] };
+        let say = |s: &str| lex.apply(&normalize(s));
+        assert_eq!(say("hi hat"), vec!["hat"], "two words, one sound");
+        assert_eq!(say("hat roll"), vec!["hat"], "trap's own phrase, one token");
+        // "high hat" consumes first (longest match at position 0), and the
+        // leftover word passes through rather than being forced into a
+        // second alias — harmless, and honest about what was matched.
+        assert_eq!(say("high hat roll"), vec!["hat", "roll"]);
+        assert_eq!(say("kick drum and the bass drum"), vec!["kick", "and", "kick"],
+                   "each phrase resolves where it stands");
+        assert_eq!(say("sub bass"), vec!["808"]);
+        assert_eq!(say("braams"), vec!["brass"]);
+        assert_eq!(say("add a whoosh"), vec!["add", "riser"],
+                   "'a' is filler, 'add' is a word the person meant");
+        // Unknown words survive: a lexicon that ate what it did not know
+        // would make every unlisted sample unreachable by voice.
+        assert_eq!(say("zaytoven"), vec!["zaytoven"]);
+        // A domain that is off does not fire; Common always does.
+        let off = Lexicon { domains: vec![] };
+        assert_eq!(off.apply(&normalize("braams")), vec!["braams"]);
+        assert_eq!(off.apply(&normalize("hi hat")), vec!["hat"], "common is always on");
+        assert!(!off.enabled(Domain::Trap));
+        assert!(off.enabled(Domain::Common));
+    }
+
+    #[test]
+    fn an_alias_can_only_widen_what_is_understood_never_narrow_it() {
+        // THE bug this design exists to prevent: 'vocals' aliases to
+        // 'vox', which stops matching a track literally named "vocals".
+        // The aliased reading is tried first and the literal one after,
+        // so both spellings work.
+        let p = project();
+        let mut d = Dialog::default();
+        assert!(d.hear("route vocals to the drum bus", &p).is_some(),
+                "the literal name still resolves: {:?}", d.state);
+        let mut d = Dialog::default();
+        d.lexicon = Lexicon { domains: vec![Domain::Common, Domain::Trap] };
+        assert!(d.hear("route vocals to the drum bus", &p).is_some(),
+                "and it still resolves with more vocabularies loaded");
+    }
+
+    #[test]
+    fn every_alias_points_at_a_word_the_libraries_actually_use() {
+        // The drift guard: an alias whose target appears in no filename
+        // and no channel name is a rewrite into nothing — it would make
+        // the spoken word WORSE than useless, since the raw word at least
+        // had a chance. Targets must be a classifier token, an instrument
+        // name, or a plain lowercase word with no spaces.
+        for d in Domain::ALL {
+            for (spoken, canon) in d.entries() {
+                assert!(!canon.is_empty(), "{d:?}: '{spoken}' maps to nothing");
+                assert_eq!(*canon, canon.to_lowercase(),
+                           "{d:?}: '{canon}' must be lowercase to match");
+                assert!(!canon.contains(' '),
+                        "{d:?}: '{canon}' is a phrase, not a searchable token");
+                assert!(!spoken.is_empty() && *spoken == spoken.to_lowercase(),
+                        "{d:?}: '{spoken}' must be lowercase to ever match");
+                // And the spoken side must survive normalization, or it
+                // can never be said.
+                assert!(!normalize(spoken).is_empty(),
+                        "{d:?}: '{spoken}' vanishes when normalized");
+            }
+        }
+        // Tokens round-trip through the sidecar.
+        let lex = Lexicon { domains: vec![Domain::Trap, Domain::Country] };
+        assert_eq!(Lexicon::from_tokens(&lex.to_tokens()), lex);
+        assert_eq!(Lexicon::from_tokens("nonsense"), Lexicon::default(),
+                   "garbage means the default ears, not deaf ones");
+        // Common cannot be switched off — it is the shared vocabulary.
+        let mut l = Lexicon::default();
+        l.toggle(Domain::Common);
+        assert!(l.enabled(Domain::Common));
     }
 
     #[test]

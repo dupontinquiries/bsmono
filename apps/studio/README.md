@@ -1839,3 +1839,28 @@ like silence — in both shapes ffmpeg reports it. Tested end to end against
 a generated fixture: half a second asked for, half a second of real tone
 back. The UI is deliberately NOT wired: the plugin's shape is the open
 question, and this is the part that will be true whatever shape it takes.
+
+
+**Genre vocabularies for the voice fastpath.** A recognizer emits what a
+person SAYS, and nobody names a file "braams" or "hi hat" — so the
+fastpath gained starter dictionaries: common, trap, hip hop, classical,
+film score, country, and instrument names. Each is a small table mapping a
+spoken phrase to the word the library actually uses ("sub bass" → 808,
+"pedal steel" → steel, "pizzicato" → pizz, "whoosh" → riser), applied
+longest-phrase-first so a two-word term never splits into two useless
+ones. Deliberately STARTER-sized: the terms someone says in the first
+minute, not an attempt at a genre's whole language — they are data, so
+growing one is a line.
+
+The design rule that matters: **an alias may only widen what can be
+understood, never narrow it.** Aliasing "vocals" to "vox" stops a track
+literally named *vocals* from matching — so the aliased words are a second
+READING, tried first, with the literal utterance tried after. That bug
+appeared immediately in the tests and is now pinned both ways. A drift
+guard checks every entry in every table: targets lowercase, single-token,
+non-empty, and spoken sides that survive normalization — an alias pointing
+at a word no file uses would leave the spoken term worse off than saying
+nothing. Unknown words always pass through, `common` cannot be switched
+off, and the chosen domains ride in the workspace sidecar because the ears
+follow the room, not the song. Pick them from the palette: "voice
+vocabulary (genre words)".
