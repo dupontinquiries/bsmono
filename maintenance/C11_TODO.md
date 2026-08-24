@@ -94,3 +94,48 @@ games/ tail and the whole apps/ slice) were not touched this session.
 - cmake and xorg-dev install via apt here (after `apt-get update`), which
   makes glfw — and therefore the fullgame bin's window feature — buildable in
   the sandbox. Added to SANDBOX_BUILD_LIMITS.md alongside the gstreamer note.
+
+## 6. The device-test batch (voiceterm-egui field report, three screenshots)
+
+Fixed this session: the live-grid-in-a-strip bug and the 3x3 menu's dead
+Split/Close/NewTab arm (see the commit). Everything below is open, in the
+report's own order, each with the pointer a next session needs.
+
+- **C11-6a — input routing is one-grid-per-app, not per-pane.** `read`.
+  `self.app` (block log) swaps per focus; `self.grid` (the live VT screen,
+  where typed bytes actually land) is a singleton now painted in the focused
+  rect. Correct next step: a `HashMap<pane_id, TermGrid>` swapped exactly
+  like `pane_apps`, plus per-pane `pty_out`/`pty_echoed`, so a session stays
+  with its pane. The swap pattern to copy is at the PER-PANE TERMINALS
+  comment (~2990); the routing itself is headlessly testable.
+- **C11-6b — the file picker: right-edge popout, macOS-style cascading
+  columns, cap 3, like the Qt original.** `not started`. The QML's own
+  comment (main.qml:17117) says the single drawer was interim and names the
+  cascade as the intended evolution (TODO_v68_deferred.md #1). Shape: a
+  headless miller-column model first (current path, per-column selection,
+  eviction beyond 3 columns — all testable), then a `Surface::FilePicker`
+  row in overlay.rs's form table (RightDrawer; widen per column up to the
+  QML's columnWidth math at main.qml:17173).
+- **C11-6c — the command palette KEY is dead on device.** `not reproduced
+  here`. Ctrl+P handling reads `i.modifiers.command && key_pressed(P)` and
+  toggles `Surface::Palette`; tests pass headlessly. Suspects, in order: the
+  keyboard gate (a stuck `captures_input` would eat the whole keyboard —
+  check whether ANY surface is open when it fails), P reaching the PTY as
+  0x10 and something swallowing the press first, or device-side modifier
+  mapping. Needs a device with a log line on the toggle.
+- **C11-6d — the voice dialog is not ported.** `not started`, and NOT small:
+  the Qt version's voice path runs through voiced + the recogniser; the egui
+  crate has `voice_routing.rs` and `repl_voice_glow.rs` as parts. Inventory
+  first (C10-0c style): enumerate what the QML voice dialog DOES before
+  porting widgets.
+- **C11-6e — the graph view is not ported.** `read`. `graph_view.rs`,
+  `connections_graph.rs`, `layered_graph.rs` exist in the crate;
+  `SidebarAction::Graph` was deliberately repointed at the workspaces page
+  (comment at the sidebar action site). Likely wiring, not writing: check
+  what graph_view renders and give it a Surface row + a route.
+- **C11-6f — sidebar double-draw, ALSO SEEN IN BEATSPACE.** `read`. Two
+  apps, one symptom (a tab painted twice, offset — screenshots 2 and 3) —
+  the shared suspect is uikit-egui's tab/button rendering; voiceterm's
+  `tab_row` cites the QML row shape and both apps consume the kit. Diff one
+  widget's paint path for a double `rect_filled`/galley emit under
+  animation; a structural test can pin single-paint once found.
