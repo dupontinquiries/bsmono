@@ -2251,7 +2251,6 @@ mod reset_tests {
         Car { half_h: 0.9, ride_h: 1.5, half_len: 0.6, half_w: 0.5, ..Car::new() }
     }
 
-    #[test]
     /// The meta-test above checks nobody re-derives `ride_h > 0` by hand.
     /// It could not see the OTHER shape of the same bug: a site that reads
     /// `car.half_h` as a ground clearance and never mentions `ride_h` at
@@ -2262,11 +2261,20 @@ mod reset_tests {
     fn no_ground_clearance_is_measured_from_half_h() {
         let src = include_str!("physics.rs");
         let mut bad = Vec::new();
-        for (i, line) in src.lines().enumerate() {
+        // Stop at the test module. Everything below is test code, and the
+        // needles below are themselves string literals in this function —
+        // scanning past here makes the test match ITSELF and fail on a file
+        // with no offending site in it at all, which is what it did on
+        // arrival (c5blackstar-008 never ran it; the test binary did not
+        // compile on that branch).
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut scanned = 0usize;
+        for (i, line) in prod.lines().enumerate() {
             let l = line.trim();
             if l.starts_with("//") {
                 continue;
             }
+            scanned += 1;
             // a clearance is a radius compared against an sdf distance;
             // these are the two idioms that do it
             let clearance_ish = l.contains("let r = car.half_h")
@@ -2276,6 +2284,11 @@ mod reset_tests {
                 bad.push(format!("physics.rs:{}: {}", i + 1, l));
             }
         }
+        // §5b: a scan that matches nothing passes every assertion below it.
+        // The production half of this file is thousands of lines; if the
+        // split ever leaves us with a handful, the scan has stopped looking.
+        assert!(scanned > 1000, "the production scan found only {scanned} lines — \
+            the #[cfg(test)] split is wrong and this test is checking nothing");
         assert!(
             bad.is_empty(),
             "ground clearance measured from the bounding box, not from where \
