@@ -265,3 +265,17 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   shapes to every model; read_harness::ModelClass should choose — Small gets
   the line grammar FIRST and the fence form omitted entirely (one shape to
   hold is the point), Large keeps fences primary.
+
+## 13. Reverse generation + the tofu sweep
+
+- **C11-13a — the reverse experiment is runnable**: gpu-gemm::reverse on any
+  loaded model. First plays on device: shortlist from the prompt's own
+  vocabulary (prompt-lookup's table, reversed), walk a reply back 10 tokens
+  and read what the model reconstructs; score a suspected loop's return
+  step. The primitive is proven; the ideas are the point.
+- **C11-13b — the ⧉ sweep**: chat.rs done; remaining hardcoded ⧉/icon chars
+  in logscope's other tabs, voiceterm shell.rs, and any app with copy
+  buttons → uikit_egui::icons::copy_label / glyph_or. Mechanical; grep ⧉.
+- **C11-13c — consider a kit-installed icon font** (one embedded subset with
+  the handful of UI glyphs the fleet uses) so the probe's fallback branch
+  becomes rare instead of machine-dependent. Weigh binary size on device.
