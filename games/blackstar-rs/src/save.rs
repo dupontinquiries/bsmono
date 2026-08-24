@@ -41,6 +41,9 @@ pub struct Save {
     pub missions: String,
     /// nightfall weeks cleared, comma-separated week numbers (see nightfall.rs)
     pub nightfalls: String,
+    /// accumulated hull wear from LZ-pinned sorties (see sortie.rs /
+    /// raid::lz_wear); cleared by yard time at a dock
+    pub shipwear: f32,
     /// the watch-bearer's elemental attunement, `elem:points` pairs (see chi.rs)
     pub chi: String,
     /// the three weapon rails, item codes or `-` (see gear.rs)
@@ -87,6 +90,7 @@ impl Default for Save {
             wardens: String::new(),
             missions: String::new(),
             nightfalls: String::new(),
+            shipwear: 0.0,
             chi: String::new(),
             armed: String::new(),
             worn: String::new(),
@@ -137,6 +141,7 @@ pub fn parse(text: &str) -> (Save, Bindings, Config) {
             "wardens" => s.wardens = v.to_string(),
             "missions" => s.missions = v.to_string(),
             "nightfalls" => s.nightfalls = v.to_string(),
+            "shipwear" => s.shipwear = v.parse().unwrap_or(s.shipwear),
             "chi" => s.chi = v.to_string(),
             "armed" => s.armed = v.to_string(),
             "worn" => s.worn = v.to_string(),
@@ -210,6 +215,9 @@ pub fn render(s: &Save, b: &Bindings, cfg: &Config) -> String {
     if !s.nightfalls.is_empty() {
         let _ = writeln!(out, "nightfalls {}", s.nightfalls);
     }
+    if s.shipwear > 0.0 {
+        let _ = writeln!(out, "shipwear {:.2}", s.shipwear);
+    }
     for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("bag", &s.bag), ("vault", &s.vault), ("finds", &s.finds), ("case", &s.case), ("watch", &s.watch), ("hotbar", &s.hotbar)] {
         if !v.is_empty() {
             let _ = writeln!(out, "{k} {v}");
@@ -269,6 +277,7 @@ mod tests {
             wardens: "judgementor".into(),
             missions: "the_beach_opens".into(),
             nightfalls: "7".into(),
+            shipwear: 1.75,
             chi: "rock:15".into(),
             armed: "w:beam:ice".into(),
             worn: "plating".into(),
@@ -315,6 +324,7 @@ mod tests {
         assert_eq!(got.wardens, want.wardens, "wardens");
         assert_eq!(got.missions, want.missions, "missions");
         assert_eq!(got.nightfalls, want.nightfalls, "nightfalls");
+        assert!((got.shipwear - want.shipwear).abs() < 0.01, "shipwear");
         assert_eq!(got.chi, want.chi, "chi");
         assert_eq!(got.armed, want.armed, "armed");
         assert_eq!(got.worn, want.worn, "worn");

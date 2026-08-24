@@ -182,6 +182,12 @@ pub fn assemble(
         prims,
         drive,
         hover: None,
+        // a parts-built car has no measured skeleton or fittings: it is
+        // assembled from known pieces rather than read off an import
+        settle: glam::Quat::IDENTITY,
+        tuck: Vec::new(),
+        pack: Vec::new(),
+        fittings: crate::turret::Fittings::default(),
         cloud: Vec::new(),
         cloud_n: Vec::new(),
         sdf_half: Vec3::ZERO,

@@ -49,6 +49,31 @@ export AILITE_INCREMENTAL="${AILITE_INCREMENTAL:-1}"
 export CARGO_PROFILE_AILITE_OPT_LEVEL="${CARGO_PROFILE_AILITE_OPT_LEVEL:-0}"
 export AILITE_QUIET="${AILITE_QUIET:-1}"
 
+# FIND `cargo-ailite`, INCLUDING IN A FRESH CLONE. It used to be assumed on
+# PATH, which is fine on the box it was written on and a dead end anywhere
+# else: somebody cloning the bundle got "no such subcommand" and had to
+# reconstruct the tool from the comments in this file. They did, and the
+# reconstruction missed the levers that matter — `debug = 0`, `strip`,
+# `CARGO_BUILD_JOBS=1`, `--test-threads=1` — because those are in the tool,
+# not in here.
+#
+# It is vendored at `<repo>/tools/cargo-ailite` now. This prefers whatever is
+# on PATH, so a newer local copy still wins.
+if ! command -v cargo-ailite >/dev/null 2>&1; then
+  repo=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+  if [ -n "$repo" ] && [ -x "$repo/tools/cargo-ailite" ]; then
+    PATH="$repo/tools:$PATH"
+    export PATH
+  else
+    echo "fastcheck: cargo-ailite not found on PATH or at <repo>/tools/" >&2
+    echo "fastcheck: falling back to plain cargo — slower, same results" >&2
+    start=$(date +%s)
+    cargo "$MODE" --no-default-features --offline --bin skydribble "$@" || rc=$?
+    echo "fastcheck: ${MODE} in $(( $(date +%s) - start ))s (no ailite)" >&2
+    exit "${rc:-0}"
+  fi
+fi
+
 start=$(date +%s)
 cargo ailite "$MODE" --no-default-features --offline --bin skydribble "$@" || rc=$?
 echo "fastcheck: ${MODE} in $(( $(date +%s) - start ))s" >&2

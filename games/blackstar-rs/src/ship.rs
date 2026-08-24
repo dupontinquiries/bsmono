@@ -25,7 +25,7 @@ use glam::Vec3;
 
 use crate::bigbody::{BigBody, Drive, Shape};
 use crate::campaign::CampaignLog;
-use crate::menu::{Fmt, Item, Menu, Row};
+use crate::menu::{Fmt, Menu, Row};
 use crate::patrol;
 
 /// How you get onto the ground at the far end. Straight from `hub_plan.h`'s

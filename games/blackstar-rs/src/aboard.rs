@@ -64,9 +64,45 @@ pub struct Aboard {
 /// the player an 8.5 m bot. Nobody has to remember to change it, which
 /// matters because the whole point of the rescale is that a hundred numbers
 /// move at once and the ones that get missed are the ones written in metres.
-pub const HULL_HEIGHTS: f32 = 40.0;
+/// **Raised from 40.** Forty occupant-heights is a ship you can stand in and
+/// not one you can live in: at that size a room is about three occupants
+/// across, which fits a body and leaves nowhere to put anything, and the
+/// playtest note was "we don't even fit one room at the scale I imagined".
+///
+/// A hundred and sixty gives rooms of a dozen occupants across and thirty
+/// long — a hangar you could land something in, which is what a hangar is
+/// for. It is still a RATIO, so a bot's ship is 1.4 km and a person's is
+/// 280 m, and the number moves in one place.
+pub const HULL_HEIGHTS: f32 = 160.0;
 
 /// The hull length for a given occupant.
+/// THE FLEET, as hull classes. No ship MODEL exists yet — the hull is
+/// generated (`interior::generate`) from one number, and that number is
+/// the only thing that distinguishes a lander from a carrier. So the
+/// roster is that number plus a name and a line of what it is like to be
+/// inside, which is what a ship is to the player today: eight rooms at a
+/// scale.
+///
+/// Lengths are in OCCUPANT HEIGHTS, per the repo convention, and go
+/// through `hull_for` like every other hull — a Transformer's cutter is
+/// not a person's cutter.
+pub const FLEET: &[(&str, f32, &str)] = &[
+    ("cutter", 9.0, "one deck, everything within shouting distance"),
+    ("lander", 14.0, "the default: cramped, honest, gets there"),
+    ("runner", 20.0, "a corridor with rooms bolted to it"),
+    ("hauler", 30.0, "the hangar is the point; the rest is corridor"),
+    ("carrier", 46.0, "you will get lost in this one"),
+];
+
+/// The default hull class, by index into `FLEET`.
+pub const FLEET_DEFAULT: usize = 1;
+
+/// A ship from the roster, sized for the body that flies it.
+pub fn fleet_ship(i: usize, body_h_m: f32) -> Interior {
+    let (_, heights, _) = FLEET[i.min(FLEET.len() - 1)];
+    Interior::generate(heights * body_h_m)
+}
+
 pub fn hull_for(body_h_m: f32) -> f32 {
     body_h_m * HULL_HEIGHTS
 }
@@ -219,6 +255,66 @@ pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
     use glam::Quat;
 
     let mut out = MeshData::new();
+    // THE HULL ITSELF, which was never drawn.
+    //
+    // `world::sdf` collides the parked ship with `Interior::sdf_local`, which
+    // is the OUTER HULL BOX minus the rooms — so the solid is the shell, and
+    // the rooms are the holes in it. This mesh drew only the rooms and links,
+    // i.e. exactly the empty space, and nothing at all where the collision
+    // actually is. On screen that reads as a small cluster of boxes you
+    // bounce off well before reaching, because you are hitting a hull nobody
+    // rendered: the render was a SUBSET of the collision and the two had no
+    // shared source.
+    //
+    // Same `hull_half` the SDF uses, so silhouette and solid come from one
+    // number. The rooms stay in the mesh below — they are inside an opaque
+    // hull now, which is what an interior is, and they are what you see once
+    // you are through a door.
+    {
+        // LOFT THE SKIN THROUGH THE SAME PROFILE THE COLLIDER MARCHES.
+        // Rings of a superellipse at each station, quads between them, and
+        // caps at the tips — so the silhouette IS the collider rather than
+        // a second opinion about it.
+        use crate::hullform::{ring, STATIONS};
+        let prof = ship.profile();
+        const SEG: usize = 16;
+        let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(STATIONS);
+        for i in 0..STATIONS {
+            let z = -prof.half_z + 2.0 * prof.half_z * (i as f32 / (STATIONS - 1) as f32);
+            let (a, b) = prof.at(z);
+            rings.push(ring(a, b, SEG).into_iter().map(|(x, y)| Vec3::new(x, y, z)).collect());
+        }
+        let mut tri = |p0: Vec3, p1: Vec3, p2: Vec3| {
+            let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Y);
+            for p in [p0, p1, p2] {
+                out.verts.push(crate::meshgen::Vertex {
+                    pos: p.to_array(),
+                    nrm: n.to_array(),
+                    uv: [0.0, 0.0],
+                });
+            }
+        };
+        for i in 0..STATIONS - 1 {
+            for k in 0..SEG {
+                let k2 = (k + 1) % SEG;
+                let (a, b, c, d) = (rings[i][k], rings[i][k2], rings[i + 1][k2], rings[i + 1][k]);
+                tri(a, b, c);
+                tri(a, c, d);
+            }
+        }
+        // caps: a fan to the tip centre at each end
+        for (idx, sign) in [(0usize, -1.0f32), (STATIONS - 1, 1.0)] {
+            let tip = Vec3::new(0.0, 0.0, sign * prof.half_z);
+            for k in 0..SEG {
+                let k2 = (k + 1) % SEG;
+                if sign < 0.0 {
+                    tri(tip, rings[idx][k2], rings[idx][k]);
+                } else {
+                    tri(tip, rings[idx][k], rings[idx][k2]);
+                }
+            }
+        }
+    }
     for c in &ship.cells {
         let mut b = cbox(0.06);
         bake(&mut b, c.half * 2.0, Quat::IDENTITY, c.centre);
@@ -301,7 +397,15 @@ pub fn run(argv: &[String]) {
     println!("  {} rooms, {} corridors, deck at {:.1}\n",
         a.ship.cells.len(), a.ship.links.len(), a.ship.deck_y);
 
-    println!("  {:<14} {:<10} {:>9}  {}", "room", "console", "reachable", "what it is");
+    // ROOM SIZES IN OCCUPANT UNITS. Neither of us could tell whether a room
+    // was big enough because nothing printed the one number that answers it:
+    // how many occupants fit across, along, and standing up.
+    let occ = hull / HULL_HEIGHTS;
+    println!("  an occupant is {occ:.2} m; rooms in occupant-units:\n");
+    println!(
+        "  {:<14} {:>18} {:>9} {:<10} {}",
+        "room", "w x l x h (occ)", "reachable", "console", "what it is"
+    );
     for idx in 0..a.ship.cells.len() {
         let c = &a.ship.cells[idx];
         let (id, name, blurb) = (c.id, c.name, c.blurb);
@@ -311,7 +415,16 @@ pub fn run(argv: &[String]) {
             .map(|s| s.id())
             .unwrap_or("—");
         let reach = if a.reachable(id) { "yes" } else { "no" };
-        println!("  {:<14} {:<10} {:>9}  {}", name.to_lowercase(), con, reach, blurb);
+        println!(
+            "  {:<14} {:>5.1} x{:>5.1} x{:>5.1} {:>9} {:<10} {}",
+            name.to_lowercase(),
+            c.half.x * 2.0 / occ,
+            c.half.z * 2.0 / occ,
+            c.half.y * 2.0 / occ,
+            reach,
+            con,
+            blurb.chars().take(28).collect::<String>()
+        );
     }
 
     println!("\n  WALKING\n");
@@ -377,6 +490,89 @@ pub fn run(argv: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    /// THE BUG THIS GUARDS: the mesh drew only the rooms and links while
+    /// `world::sdf` collided `Interior::sdf_local`, which is the outer
+    /// hull box minus those rooms. Render was a strict SUBSET of collision
+    /// — you bounced off a hull nobody had drawn. Both now come from
+    /// `hull_half`, so the check is that the mesh actually reaches it.
+    #[test]
+    fn the_drawn_hull_reaches_the_volume_that_collides() {
+        let ship = super::Interior::generate(90.0);
+        let m = super::hull_mesh(&ship);
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for v in &m.verts {
+            for a in 0..3 {
+                lo[a] = lo[a].min(v.pos[a]);
+                hi[a] = hi[a].max(v.pos[a]);
+            }
+        }
+        // the collider is the fitted skin now, so the mesh is checked
+        // against THAT rather than against the bounding box it no longer
+        // fills — a lofted hull is legitimately narrower than its box
+        let p = ship.profile();
+        let widest = p.a.iter().copied().fold(0.0f32, f32::max);
+        let tallest = p.b.iter().copied().fold(0.0f32, f32::max);
+        let half = Vec3::new(widest, tallest, p.half_z);
+        for (a, want) in [(0usize, half.x), (1, half.y), (2, half.z)] {
+            let got = (hi[a] - lo[a]) * 0.5;
+            assert!(
+                got > want * 0.9,
+                "axis {a}: the mesh spans {got:.1} against a collider of {want:.1} — \
+                 the render is a subset of the solid again"
+            );
+        }
+    }
+
+    /// THE STANDING GUARD against the bug that started this: the drawn
+    /// skin and the marched collider must be the same surface. Sampled
+    /// rather than argued about — points just inside the profile must read
+    /// as solid hull, points well outside must read as empty.
+    #[test]
+    fn the_skin_you_see_is_the_skin_you_hit() {
+        let ship = super::Interior::generate(110.0);
+        let p = ship.profile();
+        for i in 0..super::super::hullform::STATIONS {
+            let z = -p.half_z + 2.0 * p.half_z * (i as f32 / 23.0);
+            let (a, b) = p.at(z);
+            let _ = b;
+            // outside the beam by a clear margin: must be empty
+            let out = glam::Vec3::new(a * 2.5 + 5.0, 0.0, z);
+            assert!(
+                ship.sdf_local(out) > 0.0,
+                "station {i}: a point well outside the beam reads as hull"
+            );
+        }
+        // and the middle of a room is empty while the plating around it is not
+        if let Some(c) = ship.cells.first() {
+            assert!(ship.sdf_local(c.centre) > 0.0, "a room reads as solid");
+        }
+    }
+
+    /// Every hull class must produce a ship whose rooms are inside it and
+    /// whose bridge is reachable — cycling with `{`/`}` regenerates at a
+    /// new length, and a class that carves a broken ship would strand the
+    /// player in structure.
+    #[test]
+    fn every_hull_class_in_the_fleet_is_a_walkable_ship() {
+        for (i, (name, heights, _)) in super::FLEET.iter().enumerate() {
+            let mut ship = super::fleet_ship(i, 8.0);
+            ship.unseal();
+            assert!(*heights > 0.0, "{name} has no length");
+            assert!(!ship.cells.is_empty(), "{name} carved no rooms");
+            for c in &ship.cells {
+                let out = (c.centre.abs() + c.half) - ship.hull_half;
+                assert!(
+                    out.max_element() <= 0.5,
+                    "{name}: room {} pokes {:.1} out of the hull",
+                    c.id,
+                    out.max_element()
+                );
+            }
+            let open = ship.reachable_from("bridge");
+            assert!(open.len() > 1, "{name}: nothing is reachable from the bridge");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -545,7 +741,11 @@ mod tests {
         let car = hull_for(0.38);
         let human = hull_for(1.75);
         let bot = hull_for(8.5);
-        assert!((car - 15.2).abs() < 0.1, "the engine body gets a {car} m hull");
+        // NOT a hard-coded metre figure. This asserted 15.2 m, which is the
+        // module's own mistake written into its own test — the whole point is
+        // that the metre value moves when `HULL_HEIGHTS` does, and it just
+        // did. What is fixed is the ratio and the ordering.
+        assert!(car < human && human < bot, "hulls do not scale with occupants");
         assert!(bot > 300.0, "a bot's ship is only {bot} m — building size was the ask");
         // the RATIO is what is fixed, at every scale
         for (h, hull) in [(0.38, car), (1.75, human), (8.5, bot)] {

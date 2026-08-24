@@ -155,6 +155,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aperture-complete"
+version = "0.1.0"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1980,6 +1984,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 name = "skydribble"
 version = "1.117.0"
 dependencies = [
+ "aperture-complete",
  "bytemuck",
  "cpal",
  "env_logger",

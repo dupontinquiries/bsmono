@@ -371,6 +371,11 @@ impl<'a> RaidRun<'a> {
     pub fn phase_run(&mut self) -> Option<&mut PhaseRun<'a>> {
         self.current.as_mut()
     }
+    /// The live phase, read-only — for HUDs and tests that want to look
+    /// without being handed the keys.
+    pub fn phase_ref(&self) -> Option<&PhaseRun<'a>> {
+        self.current.as_ref()
+    }
     /// Call when the live phase reports cleared. Advances, or ends the
     /// raid with the boss down.
     pub fn advance(&mut self) -> bool {

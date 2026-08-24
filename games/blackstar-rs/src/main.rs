@@ -70,6 +70,7 @@ mod joints;
 mod lift;
 mod loadout;
 mod loot;
+mod hullform;
 mod interior;
 mod menu;
 mod meshgen;
@@ -98,6 +99,17 @@ mod gearsim;
 mod menufx;
 mod mapsim;
 mod menusim;
+mod cockpit;
+mod driveline;
+mod dropship;
+mod locomotion;
+mod massfilter;
+mod turret;
+mod raidflow;
+mod raidforge;
+mod shots;
+mod skeleton;
+mod sortie;
 mod stations;
 mod stealth;
 mod vault;
@@ -823,6 +835,37 @@ struct Game {
     /// assumed Cruise phase — the phase gate is real and tested in
     /// `deck.rs`; wiring a hull into the loop is its own seam.
     deck: Option<deck::Deck>,
+    /// a mission being FLOWN — brief, drop, engagement, debrief. The
+    /// consoles accept the order; this is what happens instead of
+    /// `run_order`'s instant resolve when the destination can be dropped
+    /// on. See `sortie.rs` for what is wired and what is still canned.
+    sortie: Option<sortie::Sortie>,
+    /// a warden raid being FLOWN — the Wardeck's order, walked phase by
+    /// phase, each with its own arena, brief, and drop. Mutually exclusive
+    /// with `sortie`: the shell flies one thing at a time.
+    raid: Option<raidflow::RaidFlow>,
+    /// the forge, when lit: a worker thread mid-call to the model, its
+    /// answer due on this channel. Polled with `try_recv` in the update —
+    /// the frame never waits on the network (`raidforge`).
+    forge_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// live projectiles — the thrown-mass and launched-charge verbs fly
+    /// through `shots.rs` now instead of resolving in the trigger pull
+    shots: shots::Shots,
+    /// what the shots fly through, set with the map: vacuum carries,
+    /// air drags. Subsea is the named next medium (needs the sea level).
+    ambient: ballistics::Ambient,
+    /// this world's surface gravity for the shot pool, m/s²
+    world_g: f32,
+    /// which hull class is parked, indexing `aboard::FLEET`. Cycled with
+    /// the shifted brackets.
+    ship_class: usize,
+    /// how the active chassis moves, and why (`locomotion`). Held so the
+    /// HUD and the catalogue can show the reasoning rather than the
+    /// verdict alone.
+    loco_mode: locomotion::Decision,
+    /// seconds left in the blade swing; 0 = idle. Drives the pose's arm
+    /// channel and lands the arc at mid-swing.
+    swing: f32,
     /// the player's own per-section damage (`sections.rs`). Bots carry
     /// theirs on `Bot`; the player's lives here for the same reason —
     /// so a body and its wounds cannot drift apart.
@@ -854,6 +897,25 @@ struct Game {
     combo_t: f32,
     air_t: f32,
     air_link: f32,
+}
+
+/// Impulse (delta-v, m/s) to hp damage. ONE conversion for everything the
+/// player shoots — the bots' section damage and the sortie engagement's
+/// strike both go through it, so a railshot is worth the same wherever it
+/// lands and the number can be retuned in one place.
+const IMPULSE_TO_DAMAGE: f32 = 0.02;
+
+/// One blade swing, trigger to follow-through, seconds. The arc lands at
+/// the midpoint. A GUESS tuned by feel once it is on a screen.
+const SWING_S: f32 = 0.38;
+
+/// A fresh seed per arrival, derived from the destination so the same
+/// world is the same place twice. ONE derivation, shared by `depart_to`
+/// and `begin_sortie` — a destination that generates differently depending
+/// on why you went there would be the two-answers-to-one-question mistake
+/// wearing a map.
+fn dest_seed(id: &str) -> u64 {
+    id.bytes().fold(0x9E37u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64))
 }
 
 fn assets_dir() -> PathBuf {
@@ -1922,6 +1984,15 @@ fn main() {
         mode: Mode::Splash,
         menu_from_pause: false,
         deck: None,
+        sortie: None,
+        raid: None,
+        forge_rx: None,
+        shots: shots::Shots::default(),
+        ship_class: aboard::FLEET_DEFAULT,
+        loco_mode: locomotion::decide(4, 0, 0, 0.0, 0.0),
+        ambient: ballistics::Ambient::earthlike(),
+        world_g: 9.81,
+        swing: 0.0,
         hotbar,
         body: sections::Body::default(),
         grime: grime::Grime::default(),
@@ -1947,9 +2018,10 @@ fn main() {
     // Upload the ship's hull once. `Aboard::upload_hull` needs `&mut Gpu`, so
     // it happens here rather than in the struct literal — Game owns the gpu.
     {
-        let mut ab = std::mem::replace(&mut game.aboard, aboard::Aboard::new(1.0));
-        ab.upload_hull(&mut game.gpu);
-        game.aboard = ab;
+        // The replace/restore dance this used to do existed to get two
+        // &mut out of `game` at once; `upload_ship_hull` is a method, so
+        // disjoint-field borrows handle it and the swap can go.
+        game.upload_ship_hull();
         // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
         // one object is how a hull you can see and a hull you can hit end up
         // in different places, so both read `ground_lift` — and this is the
@@ -2056,15 +2128,25 @@ fn main() {
                                     _ => "",
                                 };
                                 let phys = event.physical_key;
-                                let dir = if ch == "[" || phys == PhysicalKey::Code(KeyCode::BracketLeft) {
+                                let dir = if ch == "[" || ch == "{" || phys == PhysicalKey::Code(KeyCode::BracketLeft) {
                                     -1
-                                } else if ch == "]" || phys == PhysicalKey::Code(KeyCode::BracketRight) {
+                                } else if ch == "]" || ch == "}" || phys == PhysicalKey::Code(KeyCode::BracketRight) {
                                     1
                                 } else {
                                     0
                                 };
                                 if dir != 0 {
-                                    game.cycle_car(dir);
+                                    // SHIFTED BRACKETS CYCLE THE SHIP. Read the
+                                    // CHARACTER for the shift, not a modifier
+                                    // state: `{` is what the keyboard sends and
+                                    // it survives every layout that moves the
+                                    // bracket keys, which is the same reason
+                                    // the physical fallback above exists.
+                                    if ch == "{" || ch == "}" {
+                                        game.cycle_ship(dir);
+                                    } else {
+                                        game.cycle_car(dir);
+                                    }
                                 }
                             }
                             // ALREADY-HELD GUARD, not just !event.repeat: an
@@ -2226,6 +2308,9 @@ fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.wheel_r = (m.wheel_r * size).max(0.05);
     car.drive = m.drive;
     car.hover = m.hover;
+    // `flight` and a DETECTED cushion are applied by the caller
+    // (`set_car_model`) through `locomotion`, because they depend on the
+    // decision rather than on the model's own fields.
     // The other half of da831f98: that fix updated ride_h every frame
     // during a smooth-morph blend (xform::Morph::bounds_at) but never
     // here, in the static per-pose path every chassis switch runs
@@ -2522,7 +2607,104 @@ impl Game {
     /// resting on. Same lift `cycle_car` does — factored out because the
     /// transform needs it on every frame of the fold, not just once.
     fn set_car_model(&mut self, m: usize) {
+        // THE MOVEMENT PIPELINE, run once per chassis switch:
+        //
+        //   cloud -> cockpit (which end is the bow)
+        //         -> locomotion::decide (wheels? thrust? skirt?)
+        //         -> physics (Car::hover / Car::flight)
+        //
+        // Until now only the five hand-written hovercars ever set a mode,
+        // so every pose-strip chassis drove on invisible wheels — a
+        // hovertank sank onto its skirt and a jet drove. The chassis
+        // manifest still wins where it speaks (`declared`); detection
+        // covers everything nobody will hand-tune.
+        let cg = cockpit::signed_forward(&self.cars.models[m].cloud, Vec3::Y, Vec3::NEG_Z);
+        self.cam.cockpit_local = if cg.confident { Some(cg.pos) } else { None };
+        self.loco_mode = {
+            let mdl = &self.cars.models[m];
+            let declared = if mdl.hover.is_some() {
+                Some(locomotion::Mode::Hover)
+            } else if self
+                .cars
+                .xform
+                .get(&m)
+                .and_then(|(ci, _)| self.cars.chassis.get(*ci))
+                .map(|c| c.flight)
+                .unwrap_or(false)
+            {
+                Some(locomotion::Mode::Flight)
+            } else {
+                None
+            };
+            let measured = {
+                let m = locomotion::from_cloud(&mdl.cloud, Vec3::Y, cg.forward, mdl.half_h);
+                locomotion::decide_tracked(
+                    mdl.fittings.tracked(),
+                    m.wheels,
+                    m.thrusters,
+                    m.legs,
+                    m.skirt,
+                    m.thrust_aft,
+                )
+            };
+            locomotion::decide_with_override(declared, measured)
+        };
         self.switch_car(m);
+        // THE DECISION REACHES THE PHYSICS. `switch_car` -> `apply_car_dims`
+        // copies the model's own `hover`; this is where a DETECTED mode
+        // lands, and where flight stops being a field nobody assigned.
+        match self.loco_mode.mode {
+            locomotion::Mode::Wheeled => {
+                self.car.flight = false;
+                // a declared cushion survives; a detected wheeled chassis
+                // must not keep one from the model it replaced
+                if self.cars.models[m].hover.is_none() {
+                    self.car.hover = None;
+                }
+            }
+            locomotion::Mode::Hover => {
+                self.car.flight = false;
+                if self.car.hover.is_none() {
+                    self.car.hover =
+                        Some(locomotion::cushion_for(self.car.half_h, self.car.half_len));
+                }
+            }
+            locomotion::Mode::Flight => {
+                self.car.flight = true;
+                self.car.hover = None; // a flyer is not a cushion
+            }
+        }
+        // AND WHAT IT IS LIKE TO DRIVE. Everything `driveline` needs was
+        // measured on the way here: the hull's extents and wheel radius
+        // from the model, treads from `turret`, wheels/thrusters and the
+        // mode from `locomotion`. One more step, no new measurement.
+        self.car.hand = driveline::derive(driveline::Shape {
+            half_len: self.car.half_len,
+            half_w: self.car.half_w,
+            half_h: self.car.half_h,
+            wheel_r: self.car.wheel_r,
+            wheels: self.loco_mode.wheels,
+            tracked: self.cars.models[m].fittings.tracked(),
+            hovering: self.car.hover.is_some(),
+            flying: self.car.flight,
+            thrusters: self.loco_mode.thrusters,
+        });
+        let h = self.car.hand;
+        self.toastf(&format!(
+            "{}: {:?} — {} · {:.1} t, accel x{:.2} top x{:.2} grip x{:.2}{}",
+            self.cars.names[m],
+            self.loco_mode.mode,
+            self.loco_mode.why,
+            h.mass_t,
+            h.accel,
+            h.top_speed,
+            h.grip,
+            if h.stall_ms > 0.0 {
+                format!(" · stall {:.0} m/s, T/W {:.2}", h.stall_ms, h.twr)
+            } else {
+                String::new()
+            }
+        ));
         let d = self.world.sdf(self.car.pos);
         // THE GUARD HAS TO USE THE SAME NUMBER AS THE CORRECTION.
         //
@@ -2720,12 +2902,28 @@ impl Game {
                 let strip = &self.cars.chassis[cid].strip;
                 let veh_len = self.cars.models[strip[0]].half_len;
                 let bot_len = self.cars.models[*strip.last().unwrap()].half_len;
+                // THE TWO TRANSFORMS WERE FIGHTING, and this is where.
+                //
+                // `redistribute_length_to_height` stretches the blended
+                // half-extents — the overflow from a mid-fold body that is
+                // momentarily too long gets folded into HEIGHT. The drop to
+                // the lowest point was passed through untouched, so during
+                // every blended frame `half_h` grew while `ride_h` did not,
+                // and the body was seated by a ride height that belonged to
+                // a shorter body than the one on screen. The static path has
+                // no redistribution, which is exactly why the old static
+                // pose sits on the ground and the blended one does not.
+                //
+                // Same stretch, same number: whatever the redistribution
+                // does to height, it does to the ride.
+                let raw_y = hb.y.max(1e-4);
                 let hb = xform::redistribute_length_to_height(hb, veh_len, bot_len, t);
+                let stretch = (hb.y / raw_y).clamp(0.5, 3.0);
                 let h = hb * self.cfg.car.size;
                 self.car.half_w = h.x.max(0.12);
                 self.car.half_h = h.y.max(0.10);
                 self.car.half_len = h.z.max(0.10);
-                self.car.ride_h = (drop * self.cfg.car.size).max(0.10);
+                self.car.ride_h = (drop * stretch * self.cfg.car.size).max(0.10);
             }
         } else {
             // FALLBACK: no morph built, step the strip as before
@@ -2822,6 +3020,42 @@ impl Game {
         ));
     }
 
+    /// The blade lands: everything in reach inside the front arc takes a
+    /// Melee hit — the one Kind that severs, per `sections`' own rule —
+    /// and a shove along the cut. Reach is the weapon's own number.
+    fn melee_arc(&mut self) {
+        let p = self.wep.effective();
+        let fwd = self.car.forward();
+        let reach = p.reach.max(3.0);
+        let dmg = p.impulse * IMPULSE_TO_DAMAGE;
+        let mut struck: Vec<(usize, Vec3)> = Vec::new();
+        for (i, b) in self.bots.iter().enumerate() {
+            let to = b.car.pos - self.car.pos;
+            if to.length() < reach + b.car.half_len && to.normalize_or(fwd).dot(fwd) > 0.35 {
+                struck.push((i, to.normalize_or(fwd)));
+            }
+        }
+        let any = !struck.is_empty();
+        for (i, dir) in struck {
+            let b = &mut self.bots[i];
+            let _ = b.body.hit(sections::Kind::Melee, Vec3::new(0.0, 1.0, 0.0), dir, dmg, 0.0);
+            b.car.vel += dir * (p.impulse * 0.5);
+        }
+        if any {
+            self.fx.ring_burst(self.car.pos + fwd * (reach * 0.6), [1.0, 0.85, 0.3, 1.0], false);
+        }
+    }
+
+    /// Close the console AND refresh the shell's own hotbar from the save
+    /// — the armory can rearrange the slots now, and a hotbar the deck
+    /// edited while the shell kept its stale copy is the drift this
+    /// helper exists to prevent. ONE close path.
+    fn close_deck(&mut self) {
+        if self.deck.take().is_some() {
+            self.hotbar = hotbar::Hotbar::from_line(&save::load().0.hotbar);
+        }
+    }
+
     /// Pull the trigger.
     ///
     /// Robot mode only: a car has no arms. Boost is the ammunition, which is
@@ -2845,10 +3079,72 @@ impl Game {
                 r: b.car.half_len.max(b.car.half_h),
             })
             .collect();
-        let cost = self.wep.effective().cost;
-        let out = self.wep.fire(origin, aim, &targets, self.car.boost);
+        let p = self.wep.effective();
+        let cost = p.cost;
+        // THE PROJECTILE SPLIT. Beams (and the grapple) keep the instant
+        // volley; thrown mass and launched charges FLY through `shots.rs`;
+        // a blade swings (`melee_arc`). `fire` still gates cost, cooldown
+        // and fx for every verb — targets are withheld from the flying
+        // verbs so the instant path cannot double-apply what the pool will
+        // land a few frames later.
+        let deliv = p.verb.delivery();
+        let instant =
+            matches!(deliv, ballistics::Delivery::Beam) || p.verb == weapons::Verb::Grapple;
+        let volley: &[weapons::Target] = if instant { &targets } else { &[] };
+        let out = self.wep.fire(origin, aim, volley, self.car.boost);
         if !out.fired {
             return;
+        }
+        match deliv {
+            ballistics::Delivery::Kinetic | ballistics::Delivery::Blast => {
+                // a live LOCK at trigger time flies a charge as a missile:
+                // nearest mark inside the muzzle cone, pro-nav from there
+                // (`guidance`'s whole argument against tail-chasing)
+                let seek = if matches!(deliv, ballistics::Delivery::Blast) {
+                    self.bots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| {
+                            let to = b.car.pos - origin;
+                            to.length() < 250.0 && to.normalize_or(aim).dot(aim) > 0.995
+                        })
+                        .min_by(|(_, a), (_, b)| {
+                            let da = (a.car.pos - origin).length_squared();
+                            let db = (b.car.pos - origin).length_squared();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(i, _)| i)
+                } else {
+                    None
+                };
+                let elem = self.wep.watch.active();
+                let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+                let upv = side.cross(aim).normalize_or(Vec3::Y);
+                for k in 0..p.pellets.max(1) {
+                    // deterministic scatter: the same trigger pull throws
+                    // the same pattern
+                    let h = (k as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                    let jx = ((h >> 16) & 0xFF) as f32 / 127.5 - 1.0;
+                    let jy = ((h >> 32) & 0xFF) as f32 / 127.5 - 1.0;
+                    let dir = (aim + (side * jx + upv * jy) * p.spread).normalize_or(aim);
+                    self.shots.spawn(
+                        origin,
+                        dir,
+                        deliv,
+                        p.speed.max(40.0),
+                        p.impulse,
+                        elem,
+                        &self.ambient,
+                        seek,
+                    );
+                }
+            }
+            ballistics::Delivery::Melee => {
+                if p.verb != weapons::Verb::Grapple && self.swing <= 0.0 {
+                    self.swing = SWING_S;
+                }
+            }
+            ballistics::Delivery::Beam => {}
         }
         self.car.boost = (self.car.boost - cost).max(0.0);
         self.car.vel += out.self_impulse;
@@ -2857,6 +3153,32 @@ impl Game {
         }
         for e in &out.fx {
             self.fx.ring_burst(e.pos, e.color, e.scale > 1.5);
+        }
+
+        // THE SORTIE BRIDGE: a shot that fired lands its REAL numbers on
+        // the engagement — the weapon's impulse through the same
+        // `IMPULSE_TO_DAMAGE` the section damage below uses, the Watch's
+        // element through the same advantage table the volleys use
+        // (`active()` is `Element::None` mid-attune, and that costs what
+        // the table says it costs). Pellets and chains are NOT multiplied
+        // in: one trigger pull, one hit on the line — conservative until
+        // the abstract fight has positions for a scatter to spread over.
+        if self.sortie.as_ref().map(|s| s.engaged()).unwrap_or(false) {
+            let p = self.wep.effective();
+            let elem = self.wep.watch.active();
+            if let Some(s) = self.sortie.as_mut() {
+                s.strike(p.impulse * IMPULSE_TO_DAMAGE, elem);
+            }
+        }
+        // the raid's kill bridge takes the same converted damage; no
+        // element table against warden mechs yet, so the ring stays flat
+        // inside `RaidFlow::strike` (labelled there)
+        if self.raid.as_ref().map(|r| r.assaulting()).unwrap_or(false) {
+            let p = self.wep.effective();
+            let at = self.car.pos;
+            if let Some(r) = self.raid.as_mut() {
+                r.strike(p.impulse * IMPULSE_TO_DAMAGE, at);
+            }
         }
 
         // SECTION DAMAGE. `hits_on` carries (target id, delta-v), which is
@@ -2868,7 +3190,7 @@ impl Game {
         let radius = if kind == sections::Kind::Blast { self.wep.effective().reach.min(3.0) } else { 0.0 };
         for (id, dv) in &out.hits_on {
             let Some(bot) = self.bots.get_mut(*id as usize) else { continue };
-            let amount = dv.length() * 0.02;
+            let amount = dv.length() * IMPULSE_TO_DAMAGE;
             if amount <= 0.0 {
                 continue;
             }
@@ -2909,6 +3231,32 @@ impl Game {
         let vert = self.car.vel.dot(up);
         let horiz = (self.car.vel - up * vert).length();
         let boosting = self.car.flight || self.action_down(Action::Boost);
+        // HOW BADLY IS IT DOING, AND IS THERE ANYTHING TO LEAN ON.
+        // `limp()` is already 0..1 across the section damage, which is
+        // exactly the input the gait machine wants — no second damage
+        // model. The wall is probed with the SDF the physics already
+        // trusts: sample left and right at shoulder height and take the
+        // nearer, so a body only hugs a surface that is really there.
+        let hurt = self.body.limp();
+        let wall = if hurt > anim::CROUCH_HURT {
+            let side = self.car.rot * Vec3::X;
+            let at = self.car.pos + up * (self.car.half_h * 0.5);
+            let reach = self.car.half_w * 3.0 + 1.0;
+            let (l, r) = (
+                self.world.sdf(at - side * reach),
+                self.world.sdf(at + side * reach),
+            );
+            if l.min(r) > reach * 0.9 {
+                0.0 // open ground both sides
+            } else if l < r {
+                -1.0
+            } else {
+                1.0
+            }
+        } else {
+            0.0
+        };
+        self.loco.condition(hurt, wall);
         self.loco_pose = self
             .loco
             .update(dt, horiz, vert, self.car.on_ground, boosting);
@@ -2919,6 +3267,19 @@ impl Game {
         // hurt; the gait owns what a stride looks like; this is the only
         // place the two meet. A limp is an asymmetry on channels the pose
         // already has, not a new animation.
+        // THE SWING drives the arm channel the pose already carries —
+        // unconsumed by the renderer until bodies are rigs, but the data
+        // layer is the truth and the arc is real either way. Mid-swing is
+        // when the blade lands (`melee_arc`).
+        if self.swing > 0.0 {
+            let t = 1.0 - (self.swing / SWING_S);
+            self.loco_pose.arm_r = (t * std::f32::consts::PI).sin() * 2.2;
+            let before = self.swing;
+            self.swing -= dt;
+            if before > SWING_S * 0.5 && self.swing <= SWING_S * 0.5 {
+                self.melee_arc();
+            }
+        }
         let limp = self.body.limp();
         if limp.abs() > 0.02 {
             // the hurt leg swings less and the body rolls away from it —
@@ -3867,6 +4228,138 @@ impl Game {
         // to the console. Everything else is swallowed: a player at a
         // console is AT the console.
         if self.mode == Mode::Play {
+            // THE RAID EATS INPUT the way the sortie below does. Between
+            // phases, Enter loads the next arena and briefs it — the map
+            // swap needs the shell, which is why the stage exists at all.
+            if let Some(r) = self.raid.as_mut() {
+                match r.stage {
+                    raidflow::Stage::Brief => match &key {
+                        Key::Named(NamedKey::ArrowUp) => {
+                            r.site_cycle(-1);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            r.site_cycle(1);
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let lz = r.lz_now();
+                            let gy = self.world.ground_h(lz.x, lz.z);
+                            if r.launch(gy) && self.xf.is_robot() {
+                                self.transform();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.raid = None;
+                            self.toastf("raid stood down — nothing recorded");
+                            return;
+                        }
+                        _ => return,
+                    },
+                    raidflow::Stage::Assault => match &key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.raid = None;
+                            self.toastf("raid abandoned — nothing recorded");
+                            return;
+                        }
+                        // TEMP BIND, labelled: G asks the machine for a
+                        // grapple toward the nearest live AIR node. Free in
+                        // Play mode today; a real binding belongs in chord.
+                        Key::Character(c) if c.as_str() == "g" || c.as_str() == "G" => {
+                            let at = self.car.pos;
+                            if let Some(v) = r.grapple(at) {
+                                self.car.vel = Vec3::new(v[0], v[1], v[2]);
+                                self.toastf("grapple away");
+                            } else {
+                                self.toastf("no node in reach");
+                            }
+                            return;
+                        }
+                        _ => {} // play controls stay live on the field
+                    },
+                    raidflow::Stage::Between => match &key {
+                        Key::Named(NamedKey::Enter) => {
+                            let a = r.next_arena();
+                            self.arena_map(a);
+                            if let Some(r) = self.raid.as_mut() {
+                                r.brief_next();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.raid = None;
+                            self.toastf("raid abandoned between phases — nothing recorded");
+                            return;
+                        }
+                        _ => return,
+                    },
+                    raidflow::Stage::Debrief { .. } => match &key {
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                            let line = r.commit();
+                            self.raid = None;
+                            self.toastf(&line);
+                            return;
+                        }
+                        _ => return,
+                    },
+                    raidflow::Stage::Falling => {}
+                }
+            }
+            // THE SORTIE EATS INPUT the way the deck does: a player at a
+            // briefing is AT the briefing. Falling handles nothing here —
+            // the fold rides the jump edge inside the fixed loop, and there
+            // is no backing out of the air. During the engagement the play
+            // controls stay live (you are standing on the field); only
+            // Escape is claimed, to abandon.
+            if let Some(s) = self.sortie.as_mut() {
+                match s.stage {
+                    sortie::Stage::Brief => match &key {
+                        Key::Named(NamedKey::ArrowUp) => {
+                            s.site_cycle(-1);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            s.site_cycle(1);
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let lz = s.lz_now();
+                            let gy = self.world.ground_h(lz.x, lz.z);
+                            if s.launch(gy) && self.xf.is_robot() {
+                                // you leave the door folded: the drop
+                                // machine starts in Vehicle, so the visual
+                                // state machine follows it out
+                                self.transform();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.sortie = None;
+                            self.toastf("sortie stood down — nothing recorded");
+                            return;
+                        }
+                        _ => return,
+                    },
+                    sortie::Stage::Engage => {
+                        if key == Key::Named(NamedKey::Escape) {
+                            self.sortie = None;
+                            self.toastf("sortie abandoned — nothing recorded");
+                            return;
+                        }
+                    }
+                    sortie::Stage::Debrief { .. } => match &key {
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                            let line = s.commit();
+                            self.sortie = None;
+                            self.toastf(&line);
+                            return;
+                        }
+                        _ => return,
+                    },
+                    sortie::Stage::Falling => {}
+                }
+            }
             // Computed BEFORE the deck is borrowed, for the same reason the
             // Enter arm resolves its order outside the borrow: acting on the
             // deck needs the shell, and the shell is what is borrowed.
@@ -3907,6 +4400,38 @@ impl Game {
                             if let stations::Order::Depart { dest, line } = &order {
                                 let (dest, line) = (*dest, line.clone());
                                 self.depart_to(dest, &line);
+                                return;
+                            }
+                            // A SORTIE IS FLOWN when its destination can be
+                            // dropped on. Intercepted like Depart and for
+                            // the same reasons: it loads a map, and the
+                            // flow needs the shell. Docks fall through to
+                            // `run_order`'s resolved path — you berth at a
+                            // station, you do not drop on it.
+                            if let Some((mid, week)) = sortie::order_flyable(&order) {
+                                self.begin_sortie(mid, week);
+                                return;
+                            }
+                            // the Wardeck's raid order takes the same door
+                            if let stations::Order::Raid(boss) = &order {
+                                let boss = *boss;
+                                self.begin_raid(boss);
+                                return;
+                            }
+                            // the forge is a worker thread, not a stall:
+                            // the order lights it and the frame moves on
+                            if let stations::Order::Forge(theme) = &order {
+                                if self.forge_rx.is_some() {
+                                    self.toastf("the forge is already lit — one signal at a time");
+                                } else {
+                                    self.forge_rx = Some(raidforge::forge_async(theme.clone()));
+                                    self.toastf("forging a signal — the wardeck will chime when it resolves");
+                                }
+                                return;
+                            }
+                            if let stations::Order::Echo(id) = &order {
+                                let id = *id;
+                                self.begin_echo(id);
                                 return;
                             }
                             let st = d.station;
@@ -4628,7 +5153,7 @@ impl Game {
         if let Some(d) = self.deck.as_mut() {
             d.tick(dt);
             if d.is_shut() {
-                self.deck = None;
+                self.close_deck();
             }
         }
         // on-screen controls: recognizer + one-shot decay
@@ -4850,9 +5375,219 @@ impl Game {
                 self.prev_crot = self.car.rot;
                 self.prev_bpos = self.ball.pos;
                 self.prev_brot = self.ball.rot;
+                // A DROP REPLACES THE CAR'S PHYSICS for as long as it lasts:
+                // the falling body is `drop::Drop`'s, and the car mirrors it
+                // so the camera and the renderer follow for free. The jump
+                // edge is the fold — same button, same consume-inside-the-
+                // loop rule as the physics jump above.
+                if self.sortie.as_ref().map(|s| s.falling()).unwrap_or(false) {
+                    let gy = {
+                        let s = self.sortie.as_ref().unwrap();
+                        self.world.ground_h(s.drop.pos.x, s.drop.pos.z)
+                    };
+                    let folding = c.jump_pressed;
+                    let s = self.sortie.as_mut().unwrap();
+                    if folding {
+                        s.fold();
+                    }
+                    let steer = Vec3::new(c.steer, 0.0, -c.throttle);
+                    s.update(FIXED_DT, steer, gy, &mut self.body);
+                    self.car.pos = s.drop.pos;
+                    self.car.vel = s.drop.vel;
+                    // THE BODY READS THE FALL: nose down the velocity as a
+                    // dart, upright over flat heading as a parachute. The
+                    // car's forward is -Z in its own frame (`Car::forward`),
+                    // so the arc maps that. Eased, because a fold is a
+                    // decelerating lurch, not a teleport — same reasoning
+                    // as the drop's own drag curve.
+                    let v = s.drop.vel;
+                    if v.length_squared() > 1.0 {
+                        let target = match s.drop.mode {
+                            drop::Mode::Vehicle => {
+                                Quat::from_rotation_arc(Vec3::NEG_Z, v.normalize())
+                            }
+                            drop::Mode::Robot => {
+                                let flat =
+                                    (v * Vec3::new(1.0, 0.0, 1.0)).normalize_or(Vec3::NEG_Z);
+                                Quat::from_rotation_arc(Vec3::NEG_Z, flat)
+                            }
+                        };
+                        let k = 1.0 - (-6.0 * FIXED_DT).exp();
+                        self.car.rot = self.car.rot.slerp(target, k);
+                    }
+                    c.jump_pressed = false;
+                    if folding {
+                        // the visual fold follows the drop's flip. A
+                        // chassis that cannot fold visually still drops
+                        // honestly — the machine is the truth, the mesh
+                        // catches up when it can (`transform` says why not
+                        // in a toast if it must).
+                        self.transform();
+                    }
+                    self.acc -= FIXED_DT;
+                    continue;
+                }
+                // the raid's descent — mirrors the sortie branch above,
+                // same machine, same rules; a THIRD flow is the cue to
+                // extract this block rather than mirror it again
+                if self.raid.as_ref().map(|r| r.falling()).unwrap_or(false) {
+                    let gy = {
+                        let r = self.raid.as_ref().unwrap();
+                        self.world.ground_h(r.drop.pos.x, r.drop.pos.z)
+                    };
+                    let folding = c.jump_pressed;
+                    let r = self.raid.as_mut().unwrap();
+                    if folding {
+                        r.fold();
+                    }
+                    let steer = Vec3::new(c.steer, 0.0, -c.throttle);
+                    r.update(FIXED_DT, steer, gy, &mut self.body);
+                    self.car.pos = r.drop.pos;
+                    self.car.vel = r.drop.vel;
+                    let v = r.drop.vel;
+                    if v.length_squared() > 1.0 {
+                        let target = match r.drop.mode {
+                            drop::Mode::Vehicle => {
+                                Quat::from_rotation_arc(Vec3::NEG_Z, v.normalize())
+                            }
+                            drop::Mode::Robot => {
+                                let flat =
+                                    (v * Vec3::new(1.0, 0.0, 1.0)).normalize_or(Vec3::NEG_Z);
+                                Quat::from_rotation_arc(Vec3::NEG_Z, flat)
+                            }
+                        };
+                        let k = 1.0 - (-6.0 * FIXED_DT).exp();
+                        self.car.rot = self.car.rot.slerp(target, k);
+                    }
+                    c.jump_pressed = false;
+                    if folding {
+                        self.transform();
+                    }
+                    self.acc -= FIXED_DT;
+                    continue;
+                }
                 physics::step(&mut self.car, &mut self.ball, &mut self.world, &c, &self.cfg, FIXED_DT, &mut ev);
                 c.jump_pressed = false;
+                // THE ENGAGEMENT TICKS WITH THE WORLD, at the same fixed
+                // rate as everything else — `resolve` is for terminals.
+                // The player's fire reaches it through `fire_weapon`, shot
+                // by shot, with the weapon's real numbers.
+                if let Some(s) = self.sortie.as_mut() {
+                    if s.engaged() {
+                        s.tick_engage(FIXED_DT);
+                    }
+                }
+                // THE ASSAULT TICKS ON POSITIONS: the machine is handed the
+                // player and the two seat-holding squad ghosts, and hands
+                // back what its mechanics did. Slams and chips are the
+                // shell's to apply — the runtime never moves a unit.
+                let mut raid_ev: Vec<raidrun::Event> = Vec::new();
+                if let Some(r) = self.raid.as_mut() {
+                    if r.assaulting() {
+                        let gy = self.world.ground_h(self.car.pos.x, self.car.pos.z);
+                        raid_ev = r.tick(FIXED_DT, self.car.pos, gy);
+                    }
+                }
+                for e in raid_ev {
+                    match e {
+                        raidrun::Event::Slam { vy, .. } => {
+                            self.car.vel.y = vy;
+                        }
+                        raidrun::Event::Chip { dmg, .. } => {
+                            let was = self.body.alive();
+                            let _ = self.body.hit(
+                                sections::Kind::Beam,
+                                Vec3::new(0.0, 1.0, 0.0),
+                                Vec3::Y,
+                                dmg,
+                                0.4,
+                            );
+                            if was && !self.body.alive() {
+                                self.toastf("STRUCTURAL FAILURE — grounded");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // LIVE SHOTS fly under the map's own medium and gravity;
+                // impacts land through the SAME conversion the instant
+                // path uses — same sections, same shove, a few frames
+                // later. Blast splash beyond the direct hit is named,
+                // not wired.
+                if !self.shots.live.is_empty() {
+                    let marks: Vec<shots::Mark> = self
+                        .bots
+                        .iter()
+                        .map(|b| shots::Mark {
+                            pos: b.car.pos,
+                            vel: b.car.vel,
+                            r: b.car.half_len.max(b.car.half_h),
+                        })
+                        .collect();
+                    let hits = self.shots.step(
+                        FIXED_DT,
+                        self.world_g,
+                        &self.ambient,
+                        &marks,
+                        &|x, z| self.world.ground_h(x, z),
+                    );
+                    for h in hits {
+                        match h.target {
+                            Some(i) => {
+                                if let Some(b) = self.bots.get_mut(i) {
+                                    let kind = match h.delivery {
+                                        ballistics::Delivery::Blast => sections::Kind::Blast,
+                                        _ => sections::Kind::Kinetic,
+                                    };
+                                    let amount = h.dv.length() * IMPULSE_TO_DAMAGE;
+                                    let local = (h.at - b.car.pos) * 0.5;
+                                    let _ = b.body.hit(kind, local, h.dv.normalize_or(Vec3::Y), amount, 1.0);
+                                    b.car.vel += h.dv;
+                                    self.fx.ring_burst(h.at, [1.0, 0.6, 0.25, 1.0], false);
+                                }
+                            }
+                            None => self.fx.ring_burst(h.at, [0.85, 0.7, 0.45, 1.0], false),
+                        }
+                    }
+                }
                 self.acc -= FIXED_DT;
+            }
+            // whatever the flow wanted said this frame, said once — the
+            // toast is single-slot, so the FEED keeps the history and the
+            // last line wins the slot
+            // THE FORGE RESOLVES IN THE LOOP: one try_recv per frame, no
+            // blocking, no async runtime — the worker thread owns the wait.
+            if let Some(rx) = &self.forge_rx {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        self.forge_rx = None;
+                        match res.and_then(|t| raidforge::accept(&t)) {
+                            Ok(name) => self.toastf(&format!(
+                                "a new signal resolves on the wardeck — {name}"
+                            )),
+                            Err(e) => self.toastf(&format!("the forge sputtered: {e}")),
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.forge_rx = None;
+                        self.toastf("the forge went cold — no answer came back");
+                    }
+                }
+            }
+            let mut sortie_lines: Vec<String> = Vec::new();
+            if let Some(s) = self.sortie.as_mut() {
+                while let Some(t) = s.pop_toast() {
+                    sortie_lines.push(t);
+                }
+            }
+            if let Some(r) = self.raid.as_mut() {
+                while let Some(t) = r.pop_toast() {
+                    sortie_lines.push(t);
+                }
+            }
+            for t in sortie_lines {
+                self.toastf(&t);
             }
 
             // host: remote cars can touch the authoritative ball
@@ -5709,6 +6444,14 @@ impl Game {
         };
         let bot_dots: Vec<(Vec3, u8)> = self.bots.iter().map(|b| (b.car.pos, b.team)).collect();
         hud::hud(ui, &info, &self.world, &self.car, &self.ball, &bot_dots);
+        // the sortie panel rides the left edge — brief, drop, engagement,
+        // debrief — with the flow composing its own rows (`hud_rows`)
+        if let Some(s) = self.sortie.as_ref() {
+            hud::sortie_panel(ui, aspect, &s.hud_rows());
+        }
+        if let Some(r) = self.raid.as_ref() {
+            hud::sortie_panel(ui, aspect, &r.hud_rows());
+        }
         // the action bar sits over the HUD, drawn last so nothing overlaps it
         hud::draw_hotbar(ui, aspect, &self.hotbar);
     }
@@ -6036,13 +6779,157 @@ impl Game {
             return;
         };
         let style = mapsim::style_for(d);
-        // a fresh seed per arrival, derived from the destination so the same
-        // world is the same place twice
-        let seed = d.id.bytes().fold(0x9E37u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
-        self.load_map(style, seed);
+        self.load_map(style, dest_seed(d.id));
+        self.set_medium_for(d);
         // the console belongs to the ship you just left
-        self.deck = None;
+        self.close_deck();
+        // YARD TIME: berthing at a dock squares the hull away — the one
+        // release for the wear that LZ-pinned sorties accumulate
+        // (`stations::ship_wear`), so the loop closes: fight from open
+        // ground, fly dirtier passes, put in at a station to fix it.
+        if stations::is_dock(d) {
+            let was = stations::clear_ship_wear();
+            if was > 0.05 {
+                self.toastf(&format!("{line} · yard time: hull wear {was:.1} squared away"));
+                return;
+            }
+        }
         self.toastf(line);
+    }
+
+    /// The medium the shots fly through at this destination, and its
+    /// gravity. One derivation for every way of arriving somewhere —
+    /// airless worlds get the vacuum their ballistics deserve.
+    fn set_medium_for(&mut self, d: &'static patrol::Destination) {
+        let g = mapsim::ground_for(d);
+        self.ambient = if g.air <= 0.001 {
+            ballistics::Ambient::vacuum()
+        } else {
+            ballistics::Ambient::earthlike()
+        };
+        self.world_g = g.g.max(0.01);
+    }
+
+    /// Accept a sortie order and open the flow: load the destination's
+    /// world — the SAME style and seed a Depart would use, so the mission
+    /// happens at the place the starmap flies you to and not a parallel
+    /// copy of it — then hold at the brief until the player launches.
+    fn begin_sortie(&mut self, mission_id: &'static str, week: Option<u64>) {
+        match sortie::Sortie::begin(mission_id, week) {
+            Ok(s) => {
+                let d = s.dest;
+                self.load_map(mapsim::style_for(d), dest_seed(d.id));
+                self.set_medium_for(d);
+                self.close_deck();
+                self.toastf(&format!("sortie accepted — {} over {}", s.mission.id, d.name));
+                self.raid = None; // one flight at a time
+                self.sortie = Some(s);
+            }
+            Err(e) => self.toastf(e),
+        }
+    }
+
+    /// Accept the Wardeck's raid order: brief phase one and load its
+    /// arena's world. The dropship pass launches from the brief, same as
+    /// a sortie — a raid just does it once per phase.
+    fn begin_raid(&mut self, boss_id: &'static str) {
+        match raidflow::RaidFlow::begin(boss_id) {
+            Ok(r) => {
+                let a = r.arena();
+                self.arena_map(a);
+                self.close_deck();
+                self.toastf(&format!("the signal is answered — {}", r.boss.name));
+                self.sortie = None; // one flight at a time
+                self.raid = Some(r);
+            }
+            Err(e) => self.toastf(e),
+        }
+    }
+
+    /// Fly a forged echo from the Wardeck's browser: same flow, same
+    /// arenas, banks nothing.
+    fn begin_echo(&mut self, id: &str) {
+        let Some(e) = raidforge::find(id) else {
+            self.toastf("that echo has faded from the file");
+            return;
+        };
+        match raidflow::RaidFlow::begin_echo(e.to_plan()) {
+            Ok(r) => {
+                let a = r.arena();
+                self.arena_map(a);
+                self.close_deck();
+                self.toastf(&format!("the echo answers — {}", r.boss.name));
+                self.sortie = None;
+                self.raid = Some(r);
+            }
+            Err(e) => self.toastf(e),
+        }
+    }
+
+    /// Load the world for an arena. Arenas that hang off a patrol
+    /// destination (`via`) land on that destination's OWN style and seed —
+    /// the raid happens at the place the starmap knows. Orphan arenas get
+    /// a hashed style: the same known-wrong-but-cheap mapping `style_for`
+    /// already owns, one shelf over.
+    fn arena_map(&mut self, a: &'static raidcon::Arena) {
+        if let Some(via) = a.via {
+            if let Some(d) = patrol::ROUTE.iter().find(|x| x.id == via) {
+                self.load_map(mapsim::style_for(d), dest_seed(d.id));
+                self.set_medium_for(d);
+                return;
+            }
+        }
+        let h = raidgen::strhash(a.id);
+        self.load_map(h as usize % world::STYLE_COUNT, h);
+        // an orphan arena breathes: earthlike until arenas carry a sky
+        self.ambient = ballistics::Ambient::earthlike();
+        self.world_g = 9.81 * 0.8;
+    }
+
+    /// Step through the hull classes (`aboard::FLEET`). A ship is one
+    /// number today — the hull length the eight rooms are laid out in — so
+    /// cycling is regenerate, repark, re-upload, and put the player
+    /// OUTSIDE: rebuilding the hull around somebody standing in it would
+    /// leave them inside solid structure, which the seating guard would
+    /// then shove somewhere arbitrary.
+    fn cycle_ship(&mut self, dir: i32) {
+        let n = aboard::FLEET.len() as i32;
+        self.ship_class = (((self.ship_class as i32 + dir) % n + n) % n) as usize;
+        let (name, heights, note) = aboard::FLEET[self.ship_class];
+        let body_h = self.car.half_h * 2.0;
+        self.aboard.ship = aboard::fleet_ship(self.ship_class, body_h.max(0.5));
+        self.aboard.ship.unseal(); // a ship at rest has its doors open
+        self.repark();
+        self.aboard.hull_slot = None; // force a fresh upload at the new size
+        self.upload_ship_hull();
+        self.step_outside();
+        self.toastf(&format!(
+            "{name} — {:.0} m hull ({:.0} heights): {note}",
+            self.aboard.ship.hull_half.z * 2.0,
+            heights
+        ));
+    }
+
+    /// Put the player down clear of the parked hull, on the ground, facing
+    /// it. Used when the ship changes shape underneath them.
+    fn step_outside(&mut self) {
+        let Some((origin, ship)) = self.world.parked.as_ref() else { return };
+        let (origin, half) = (*origin, ship.hull_half);
+        let out = origin + Vec3::new(half.x + 6.0 + self.car.half_len * 2.0, 0.0, 0.0);
+        let gy = self.world.ground_h(out.x, out.z);
+        self.car.pos = Vec3::new(out.x, gy + self.car.stand_h() + 0.2, out.z);
+        self.car.vel = Vec3::ZERO;
+        // look back at what you just changed
+        let to = (origin - self.car.pos) * Vec3::new(1.0, 0.0, 1.0);
+        self.car.rot = Quat::from_rotation_arc(Vec3::NEG_Z, to.normalize_or(Vec3::NEG_Z));
+        self.last_room = None;
+        self.cam.indoors = None;
+    }
+
+    /// Upload (or replace) the parked hull's mesh. One path, so a ship
+    /// that changed shape cannot leave a stale silhouette on screen.
+    fn upload_ship_hull(&mut self) {
+        self.aboard.upload_hull(&mut self.gpu);
     }
 
     fn repark(&mut self) {
@@ -6688,7 +7575,60 @@ impl Game {
         let base = Mat4::from_translation(pos) * Mat4::from_quat(rot) * flip_m
             * Mat4::from_scale(Vec3::splat(scale));
         let active = &self.cars.models[model_i];
-        for prim in active.prims.iter() {
+        // THE TURRET TRACKS THE LOOK, not the hull. Two orientations on one
+        // body is what makes armour read as armour: the hull goes where you
+        // steer and the gun goes where you are aiming. Yaw only, about the
+        // RING rather than the turret's mass (`turret::find`) — a gun that
+        // pivots on its own centroid swings its breech through the hull.
+        // Elevation is deliberately absent: pitching a turret needs the
+        // mantlet's own axis, which is a second detection and not this one.
+        let turret_q = if active.fittings.has_turret() {
+            // where the EYE is looking, taken from the camera's own
+            // geometry rather than a euler it does not keep: the vector
+            // from the eye to what it is framing, flattened.
+            let view = (self.cam.look - self.cam.pos) * Vec3::new(1.0, 0.0, 1.0);
+            let want = if view.length_squared() > 1e-4 {
+                view.x.atan2(-view.z)
+            } else {
+                let f = rot * Vec3::NEG_Z;
+                f.x.atan2(-f.z)
+            };
+            let hull = {
+                let f = rot * Vec3::NEG_Z;
+                f.x.atan2(-f.z)
+            };
+            let mut d = want - hull;
+            while d > std::f32::consts::PI {
+                d -= std::f32::consts::TAU;
+            }
+            while d < -std::f32::consts::PI {
+                d += std::f32::consts::TAU;
+            }
+            Some(Quat::from_rotation_y(d))
+        } else {
+            None
+        };
+        let robot = self.xf.is_robot();
+        // STAND THE DESTINATION UP WITHOUT BENDING THE JOURNEY.
+        //
+        // The fold is coherent — the animation lines up from vehicle into
+        // robot — so the shared chassis frame is right and must not be
+        // touched. What is wrong is where it ENDS: an artist may author the
+        // robot standing along a different axis from the one the vehicle
+        // drives along, and a correct interpolation carries it there. So
+        // the leftover uprighting (`Model::settle`) is applied RAMPED by
+        // fold progress: identity while driving, full at the end, smooth
+        // in between. The animation is untouched; only its destination
+        // moves.
+        let settle_q = {
+            let t = self.xf.eased().clamp(0.0, 1.0);
+            if active.settle == Quat::IDENTITY || t <= 0.0 {
+                None
+            } else {
+                Some(Quat::IDENTITY.slerp(active.settle, t))
+            }
+        };
+        for (pi, prim) in active.prims.iter().enumerate() {
             if !wheels && !matches!(prim.tag, model::Tag::Body) {
                 continue;
             }
@@ -6703,6 +7643,56 @@ impl Game {
             // its own phase from its position, so panels move out of step
             // with one another the way real machinery does — a car where
             // everything moves together reads as one wobbling object.
+            // the turret's own transform rides inside the hull's: rotate
+            // about the ring in MODEL space, before the hull matrix
+            // ROBOT MODE PULLS ITS APPENDAGES IN. A wing is correct at
+            // vehicle scale and absurd on a standing bot, and the fold
+            // cannot fix it because it interpolates vertices and the wing
+            // is where the artist left it (`skeleton::compact`).
+            // EACH MODE PACKS ITS OWN WAY. Robot mode shortens overhangs
+            // so the bot is not swallowed by its wingspan (`compact`);
+            // vehicle mode contains them inside the hull envelope so the
+            // fold reads as a solid object rather than a skeleton in a box
+            // (`contain`). Both are zero for a body that never needed it.
+            let base = match &settle_q {
+                Some(q) => base * Mat4::from_quat(*q),
+                None => base,
+            };
+            let shift = if robot { active.tuck.get(pi) } else { active.pack.get(pi) };
+            let base = match shift {
+                Some(t) if *t != Vec3::ZERO => base * Mat4::from_translation(*t),
+                _ => base,
+            };
+            // DETECTED WHEELS SPIN TOO. `split_wheels` tags wheels it
+            // recognises and the match below turns those; an imported bot
+            // whose wheels are not at tidy corners got no tags, so nothing
+            // turned. `fittings.rollers` is the fallback, spun on the same
+            // `wheel_spin` the tagged ones use so they cannot drift apart.
+            // ROLLERS ONLY ROLL WHEN THE BODY IS A VEHICLE. The detector
+            // runs on every pose in the strip, and a robot pose has plenty
+            // of round low outboard prims — knees, shoulders, heel blocks.
+            // Spinning those is the reported "body parts rolling like
+            // wheels in bot mode". The tagged wheels below have the same
+            // problem in principle, but they are tagged from the vehicle
+            // pose and the fold hides them; these are detected per pose
+            // and are not hidden, so the guard goes here.
+            let base = match active.fittings.rollers.iter().find(|(i, _)| *i == pi) {
+                Some((_, pivot)) if !robot && matches!(prim.tag, model::Tag::Body) => {
+                    base * Mat4::from_translation(*pivot)
+                        * Mat4::from_rotation_x(-wheel_spin)
+                        * Mat4::from_translation(-*pivot)
+                }
+                _ => base,
+            };
+            let base = match (&turret_q, active.fittings.turret.contains(&pi)) {
+                (Some(q), true) => {
+                    let r = active.fittings.ring;
+                    base * Mat4::from_translation(r)
+                        * Mat4::from_quat(*q)
+                        * Mat4::from_translation(-r)
+                }
+                _ => base,
+            };
             let base = if rig > 0 {
                 let seed = prim.pivot.x * 3.1 + prim.pivot.z * 2.3 + prim.mesh_id as f32 * 0.37;
                 let t = self.time;

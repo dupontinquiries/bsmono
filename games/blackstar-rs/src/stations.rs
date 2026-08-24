@@ -30,7 +30,7 @@ use crate::chi::Chi;
 use crate::content::MISSIONS;
 use crate::energon;
 use crate::gear::{Gear, Item, Rail};
-use crate::menu::{Event, Menu, Row, Value};
+use crate::menu::{Event, Menu, Row};
 use crate::menufx::DeployStyle;
 use crate::nightfall::{self, NightfallLog};
 use crate::raidcon::BOSSES;
@@ -42,7 +42,7 @@ use crate::archive;
 use crate::curriculum;
 use crate::provenance::{assay_with, Bearing, Dig, Ladder, Medium};
 use crate::hotbar::Hotbar;
-use crate::watch::{self, Watch, NATIVE, PHOTON};
+use crate::watch::{Watch, NATIVE, PHOTON};
 
 /// The rooms with consoles in them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -278,6 +278,15 @@ pub enum Order {
     /// The line is the arrival report, already computed, so the shell does not
     /// have to fly the drop a second time to know what to say.
     Depart { dest: &'static str, line: String },
+    /// FLY THE WARDEN RAID (boss id). Passes through to the shell for the
+    /// same reason Sortie does — and more so: a raid is a run of phases,
+    /// each with its own arena, its own sky, and its own drop.
+    Raid(&'static str),
+    /// LIGHT THE FORGE: ask the model for a new echo signal on this theme.
+    /// Passes through because the call runs on a shell worker thread.
+    Forge(String),
+    /// FLY A FORGED ECHO (its `echo:<hash>` id from `raidforge::catalog`).
+    Echo(&'static str),
 }
 
 /// Evidence recoverable but not yet recorded: sited where a mission has been
@@ -323,6 +332,18 @@ pub struct Arrival {
 /// knows that world's gravity and surface, and `drop.rs` flies the fall. A
 /// scattered landing is the first thing in this game where arriving badly
 /// costs you at the far end rather than being scenery.
+/// Miss distance -> engagement penalty. A clean drop is free; a scattered
+/// one hurts, capped so a bad landing is a setback rather than a loss
+/// before the fight starts.
+///
+/// ONE formula, used by the autopiloted arrival below AND by the flown
+/// sortie (`sortie.rs`) — the flown drop must be worth exactly what the
+/// autopilot's competence used to be worth, and a penalty computed twice
+/// is the two-answers-to-one-question mistake `--parity` hunts.
+pub fn landing_penalty(l: &crate::drop::Landing) -> f32 {
+    ((l.miss_distance - 20.0) / 300.0).clamp(0.0, 0.35)
+}
+
 pub fn arrive_at(dest: &str) -> Arrival {
     let Some(d) = crate::patrol::ROUTE.iter().find(|d| d.id == dest) else {
         return Arrival { line: String::new(), penalty: 0.0 };
@@ -332,9 +353,7 @@ pub fn arrive_at(dest: &str) -> Arrival {
     }
     let g = crate::mapsim::ground_for(d);
     let l = fly_the_drop(d, &g);
-    // a clean drop is free; a scattered one hurts, capped so a bad landing is
-    // a setback rather than a loss before the fight starts
-    let penalty = ((l.miss_distance - 20.0) / 300.0).clamp(0.0, 0.35);
+    let penalty = landing_penalty(&l);
     let line = if l.miss_distance < 20.0 {
         format!("clean drop on {} —", d.name)
     } else if penalty < 0.2 {
@@ -626,6 +645,37 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                     _ => row.hint("press to arm"),
                 });
             }
+            // THE HOTBAR, from the room where the weapons live. Nine slots
+            // (`hotbar.rs`), pressed to clear; the armed rails send with
+            // one press each — arm at the rail, rack it on the bar, and
+            // the shell's number keys reach it in the field. The shell
+            // refreshes its own copy when the console closes (`close_deck`),
+            // so what the armory arranges is what the field sees.
+            rows.push(Row::gap());
+            rows.push(Row::heading("HOTBAR — press a slot to clear it"));
+            for i in 0..crate::hotbar::SLOTS {
+                match sb.hotbar.slot(i) {
+                    Some(hs) => {
+                        let name: String = hs.item.label().chars().take(34).collect();
+                        rows.push(Row::action(hb_row_id(i), &format!("[{}] {}", i + 1, name)));
+                    }
+                    None => rows.push(
+                        Row::action(hb_row_id(i), &format!("[{}] --", i + 1)).disabled(),
+                    ),
+                }
+            }
+            for (rail, slot) in [
+                (Rail::Kinetic, &sb.gear.kinetic),
+                (Rail::Energy, &sb.gear.energy),
+                (Rail::Power, &sb.gear.power),
+            ] {
+                if slot.is_some() {
+                    rows.push(
+                        Row::action(hb_send_id(rail), &format!("{} -> first open slot", rail.name()))
+                            .hint("racks the armed item on the bar"),
+                    );
+                }
+            }
         }
         Station::Hold => {
             rows.push(Row::heading("THE CHEST — press a slot to withdraw"));
@@ -700,11 +750,39 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                 let row = Row::action(b.id, &label);
                 rows.push(if cleared { row.hint("the shard is banked") } else { row.hint(b.arena) });
             }
+            // THE ECHO BROWSER: signals the forge wrote (`raidforge`), on
+            // file beside the save, flyable through the same flow as the
+            // ladder's own and worth nothing to the seal. Ids leak once per
+            // rebuild through the same `leak` the hints use — bounded by
+            // menu size, per its own comment.
+            rows.push(Row::gap());
+            rows.push(Row::heading("ECHO SIGNALS — forged, not found"));
+            for e in crate::raidforge::catalog() {
+                rows.push(
+                    Row::action(leak(e.id()), &format!("{:24} {} phases", e.name, e.phases.len()))
+                        .hint("an echo: flyable, banks nothing"),
+                );
+            }
+            rows.push(Row::action("forge:storm", "FORGE: a siege under closing weather"));
+            rows.push(Row::action("forge:sky", "FORGE: a fight that lives in the air"));
+            rows.push(Row::action("forge:deep", "FORGE: an excavation that woke something"));
         }
     }
     let mut m = Menu::new(st.title(), rows);
     m.view = 11;
     m
+}
+
+fn hb_row_id(i: usize) -> &'static str {
+    const IDS: [&str; 9] = ["hb:0", "hb:1", "hb:2", "hb:3", "hb:4", "hb:5", "hb:6", "hb:7", "hb:8"];
+    IDS[i.min(8)]
+}
+fn hb_send_id(r: Rail) -> &'static str {
+    match r {
+        Rail::Kinetic => "hbsend:kinetic",
+        Rail::Energy => "hbsend:energy",
+        Rail::Power => "hbsend:power",
+    }
 }
 
 fn rail_row_id(r: Rail) -> &'static str {
@@ -753,6 +831,38 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
     let Event::Pressed(id) = ev else { return None };
     let id = *id;
     match st {
+        Station::Wardeck => {
+            // the forge and the echoes sit outside the ladder's gate: an
+            // echo is not a signal, so nothing about the seal applies
+            if let Some(theme) = id.strip_prefix("forge:") {
+                let theme = match theme {
+                    "storm" => "a siege under closing weather",
+                    "sky" => "a fight that lives in the air, nodes and grapples",
+                    "deep" => "an excavation that woke something old",
+                    other => other,
+                };
+                return Some(Order::Forge(theme.to_string()));
+            }
+            if id.starts_with("echo:") {
+                return Some(Order::Echo(id));
+            }
+            // THE LADDER GATES. `next_up` is the lowest-tier unrecovered
+            // warden; everything above it is a signal you can read and not
+            // yet answer, and a banked shard is not fought twice. Pressing
+            // the eligible one is the whole point of the console — it now
+            // emits the order instead of being a list.
+            let b = BOSSES.iter().find(|b| b.id == id)?;
+            if sb.raids.is_cleared(b.id) {
+                return Some(Order::Did(format!("{} — the shard is banked", b.name)));
+            }
+            return match sb.raids.next_up() {
+                Some(next) if next.id == b.id => Some(Order::Raid(b.id)),
+                _ => Some(Order::Did(format!(
+                    "{} — the ladder holds; answer the lower signal first",
+                    b.name
+                ))),
+            };
+        }
         Station::Starmap => {
             use crate::patrol::ROUTE;
             let Some(d) = ROUTE.iter().find(|d| d.id == id) else { return None };
@@ -863,6 +973,39 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
             None
         }
         Station::Armory => {
+            // hotbar traffic first: it edits `sb.hotbar`, not the gear
+            if let Some(rest) = id.strip_prefix("hb:") {
+                let i = rest.parse::<usize>().ok()?;
+                return Some(match sb.hotbar.clear(i) {
+                    Some(it) => {
+                        sb.store();
+                        Order::Did(format!("slot {} cleared — {} stays armed", i + 1, it.label()))
+                    }
+                    None => Order::Did(format!("slot {} is already empty", i + 1)),
+                });
+            }
+            if let Some(rail) = id.strip_prefix("hbsend:") {
+                let item = match rail {
+                    "kinetic" => sb.gear.kinetic.clone(),
+                    "energy" => sb.gear.energy.clone(),
+                    "power" => sb.gear.power.clone(),
+                    _ => None,
+                };
+                let Some(item) = item else {
+                    return Some(Order::Refused(format!("nothing armed on the {rail} rail")));
+                };
+                let open = (0..crate::hotbar::SLOTS).find(|i| sb.hotbar.slot(*i).is_none());
+                return Some(match open {
+                    Some(i) => match sb.hotbar.assign(i, item) {
+                        Ok(()) => {
+                            sb.store();
+                            Order::Did(format!("racked on slot {}", i + 1))
+                        }
+                        Err(e) => Order::Refused(e),
+                    },
+                    None => Order::Refused("the bar is full — clear a slot first".into()),
+                });
+            }
             let out = if let Some(rest) = id.strip_prefix("bag:") {
                 rest.parse::<usize>().ok().map(|i| sb.gear.equip(i, &sb.chi))
             } else if let Some(rail) = id.strip_prefix("rail:") {
@@ -935,7 +1078,6 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
                 Err(e) => Order::Refused(e),
             })
         }
-        Station::Wardeck => None,
     }
 }
 
@@ -986,12 +1128,79 @@ fn order_target(
 ///
 /// The DECISION half lives in `order_target` so it can be tested without
 /// touching the save file; this function is the effect.
+/// Record a cleared mission (and its nightfall week, when it was one) on
+/// the save. THE ONE PERSISTENCE PATH: the resolved sortie below and the
+/// flown one (`sortie.rs`) both land here, so the two cannot drift into
+/// writing different lines. Its own load-modify-store rather than taking a
+/// loaded save, because the flown path commits minutes after it last read
+/// the file and must not clobber whatever else moved in between.
+///
+/// Returns whether the clear was fresh.
+pub fn record_outcome(mission_id: &str, nightfall_week: Option<u64>) -> bool {
+    let (mut sv, binds, cfg) = crate::save::load();
+    let mut camp = crate::campaign::CampaignLog::from_line(&sv.missions);
+    let fresh = camp.record(mission_id);
+    sv.missions = camp.line();
+    if let Some(w) = nightfall_week {
+        let mut nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
+        nf.record(w);
+        sv.nightfalls = nf.line();
+    }
+    crate::save::store(&sv, &binds, &cfg);
+    fresh
+}
+
+/// Record a recovered warden shard on the save. The raid twin of
+/// `record_outcome` and under the same discipline: its own
+/// load-modify-store, one path for both the flown raid and any future
+/// resolved one. Returns whether the shard was fresh.
+pub fn record_raid_outcome(boss_id: &str) -> bool {
+    let (mut sv, binds, cfg) = crate::save::load();
+    let mut raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
+    let fresh = raids.record(boss_id);
+    sv.wardens = raids.line();
+    crate::save::store(&sv, &binds, &cfg);
+    fresh
+}
+
+/// Accumulated hull wear, read for the next voyage's briefing.
+pub fn ship_wear() -> f32 {
+    crate::save::load().0.shipwear
+}
+
+/// Charge wear to the hull, capped. The cap is a GUESS sized so a run of
+/// careless LZ sorties makes the pass genuinely ugly without becoming
+/// unflyable — the ratchet needs a ceiling because the only release is
+/// yard time, and a save that spirals past recoverable is a corrupted
+/// save wearing a mechanic's clothes.
+pub fn record_ship_wear(delta: f32) {
+    if delta <= 0.0 {
+        return;
+    }
+    let (mut sv, binds, cfg) = crate::save::load();
+    sv.shipwear = (sv.shipwear + delta).clamp(0.0, 8.0);
+    crate::save::store(&sv, &binds, &cfg);
+}
+
+/// Yard time: berthing at a dock squares the hull away. Returns what was
+/// cleared, so the shell can say something only when there was something
+/// to say.
+pub fn clear_ship_wear() -> f32 {
+    let (mut sv, binds, cfg) = crate::save::load();
+    let was = sv.shipwear;
+    if was > 0.0 {
+        sv.shipwear = 0.0;
+        crate::save::store(&sv, &binds, &cfg);
+    }
+    was
+}
+
 pub fn run_order(order: &Order) -> (String, bool) {
     use crate::campaign::{CampaignLog, MissionRun, DEFAULT_DOCTRINE, DEFAULT_SQUAD};
-    let (sv, binds, cfg) = crate::save::load();
-    let mut camp = CampaignLog::from_line(&sv.missions);
+    let (sv, _binds, _cfg) = crate::save::load();
+    let camp = CampaignLog::from_line(&sv.missions);
     let raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
-    let mut nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
+    let nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
     let have = crate::energon::energon(&camp, &raids, nf.count());
 
     let Some((m, card)) = order_target(order) else {
@@ -1030,14 +1239,7 @@ pub fn run_order(order: &Order) -> (String, bool) {
             false,
         );
     }
-    let mut sv = sv;
-    let fresh = camp.record(m.id);
-    sv.missions = camp.line();
-    if let Some(c) = &card {
-        nf.record(c.week);
-        sv.nightfalls = nf.line();
-    }
-    crate::save::store(&sv, &binds, &cfg);
+    let fresh = record_outcome(m.id, card.as_ref().map(|c| c.week));
     let what = if card.is_some() { "nightfall" } else { "sortie" };
     (
         format!(
@@ -1687,6 +1889,56 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_ne!(sb.watch.current_name(), "PHOTON", "a tap opened the ceiling");
+    }
+
+    #[test]
+    fn the_armory_racks_an_armed_rail_onto_the_hotbar_and_clears_it() {
+        let mut sb = board();
+        sb.gear.take(Item::Weapon { verb: Verb::Pierce, element: Element::Ice, from: None }).unwrap();
+        sb.gear.equip(0, &sb.chi.clone()).unwrap();
+        assert!(sb.gear.kinetic.is_some(), "arming the rail is the precondition");
+        // the send row exists only for an occupied rail, and pressing it racks
+        let m = build(Station::Armory, &sb, 0);
+        assert!(m.rows.iter().any(|r| r.id == "hbsend:kinetic"), "no send row for an armed rail");
+        match apply(Station::Armory, &Event::Pressed("hbsend:kinetic"), &mut sb, 0) {
+            Some(Order::Did(msg)) => assert!(msg.contains("slot 1"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(sb.hotbar.slot(0).is_some(), "the press did not reach the bar");
+        // the rail keeps its item: the bar is quick access, not a move
+        assert!(sb.gear.kinetic.is_some(), "racking should not disarm the rail");
+        // pressing the slot clears it
+        match apply(Station::Armory, &Event::Pressed("hb:0"), &mut sb, 0) {
+            Some(Order::Did(msg)) => assert!(msg.contains("cleared"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(sb.hotbar.slot(0).is_none());
+        // and an empty rail refuses out loud
+        match apply(Station::Armory, &Event::Pressed("hbsend:energy"), &mut sb, 0) {
+            Some(Order::Refused(e)) => assert!(e.contains("nothing armed"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_wardeck_launches_only_the_ladders_next_signal() {
+        let mut sb = board();
+        let next = sb.raids.next_up().expect("a fresh board has a ladder").id;
+        assert_eq!(
+            apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4),
+            Some(Order::Raid(next)),
+            "the eligible signal must come back as a flyable order"
+        );
+        // any other boss is a held signal, not an order — the ladder gates
+        if let Some(other) = BOSSES.iter().find(|b| b.id != next) {
+            assert!(
+                matches!(
+                    apply(Station::Wardeck, &Event::Pressed(other.id), &mut board(), 4),
+                    Some(Order::Did(_))
+                ),
+                "a signal above the ladder must be refused with a reason, not launched"
+            );
+        }
     }
 
     #[test]

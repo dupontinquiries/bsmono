@@ -1,0 +1,132 @@
+#!/bin/sh
+# cargo-ailite — fail-fast, single-core, low-disk cargo wrapper.
+#
+# Install:  put this on PATH as `cargo-ailite`, chmod +x  ->  `cargo ailite ...`
+# Usage:    cargo ailite [check|test|build|run|clippy] [cargo args] [-- harness args]
+#           default mode is `check`.
+#
+# What it does (all of it is printed before running; nothing else is changed):
+#   * defines a custom `ailite` profile on the fly via --config — no Cargo.toml
+#     edits, works on any crate you point it at (needs cargo >= 1.63 for
+#     --config; profile config keys are stable):
+#       inherits dev, debug = 0, strip = "debuginfo", incremental = false
+#     debug=0 is the big lever: it shrinks proc-macro dylibs and build-script
+#     binaries even under `check`, and dep rlibs + link time under build/test.
+#   * CARGO_BUILD_JOBS=1        (override: AILITE_JOBS=n; jobs=1 also caps peak
+#                                RAM — rustc's parallelism is per-crate-graph)
+#   * CARGO_INCREMENTAL=0       (override: AILITE_INCREMENTAL=1 for iterative
+#                                edit-check loops; costs disk, saves warm time)
+#   * test mode adds `-- --test-threads=1` unless you passed your own `--`
+#                               (override thread count: AILITE_TEST_THREADS=n)
+#   * AILITE_BUILD_DIR=/tmp/xx  optionally shunts ALL intermediate artifacts
+#                               out of target/ via build.build-dir (cargo >=
+#                               1.96; point it at tmpfs and target/ stays tiny)
+#
+# Fail-fast status quo (no flag needed): cargo already stops at the first
+# crate that fails to compile, and `cargo test` stops after the first test
+# *binary* that fails. Inside one binary, stable libtest has no fail-fast;
+# if you need per-test fail-fast, cargo-nextest is the tool for that.
+#
+# Not done here on purpose: panic="abort" (breaks the libtest harness on
+# stable; needs nightly -Zpanic-abort-tests), touching your global cache
+# policy (set CARGO_CACHE_AUTO_CLEAN_FREQUENCY yourself if you want that),
+# and opt-level changes (inherited 0 is already the fastest to compile).
+
+set -eu
+
+say() { [ "${AILITE_QUIET:-0}" = "1" ] || echo "ailite: $*" >&2; }
+
+[ "${1:-}" = "ailite" ] && shift    # invoked as `cargo ailite`
+
+mode="${1:-check}"
+[ $# -gt 0 ] && shift || true
+
+# gate mode: fail-fast ordering cargo doesn't do. Cargo's scheduler favors
+# crates with many dependents, so a broken local leaf crate can be checked
+# LAST — the full-workspace error arrived at ~24s on a 294-crate egui
+# workspace, while `check -p <touched-crate>` hit the same error in 0.14s.
+# `gate` finds workspace-local crates with uncommitted (or since
+# AILITE_GATE_BASE) changes via git and checks only those, in one cargo call.
+# Run it from the workspace root; compose as: cargo ailite gate && cargo ailite check
+if [ "$mode" = "gate" ]; then
+  base="${AILITE_GATE_BASE:-HEAD}"
+  # Explicit order wins: AILITE_GATE_PKGS="pkga pkgb" is the orchestrator
+  # driving the schedule directly (e.g. cheapest-dep-tree or most-suspect
+  # first). Otherwise the order is the sorted changed-file list from git —
+  # note a changed crate's cold time-to-error includes its OWN dep tree
+  # (a serde-using crate cost ~30 s cold here); pair gate with ailite-cache
+  # restore and it is sub-second regardless.
+  pkgs="${AILITE_GATE_PKGS:-}"
+  if [ -z "$pkgs" ]; then
+  files=$( { git diff --name-only --relative "$base" -- . 2>/dev/null
+             git ls-files --others --exclude-standard -- . 2>/dev/null; } | sort -u )
+  for f in $files; do            # note: breaks on paths with spaces
+    d=$(dirname "$f")
+    while :; do
+      if [ -f "$d/Cargo.toml" ] && grep -q '^\[package\]' "$d/Cargo.toml"; then
+        n=$(sed -n '/^\[package\]/,/^\[/{s/^name[ \t]*=[ \t]*"\(.*\)".*/\1/p;}' "$d/Cargo.toml" | head -1)
+        [ -n "$n" ] && case " $pkgs " in *" $n "*) ;; *) pkgs="$pkgs $n";; esac
+        break
+      fi
+      [ "$d" = "." ] && break
+      d=$(dirname "$d")
+    done
+  done
+  fi
+  if [ -z "$pkgs" ]; then
+    say "gate: no changed crates under $(pwd) (base $base); running full check"
+    mode=check
+  elif [ "${AILITE_GATE_ONESHOT:-0}" = "1" ]; then
+    say "gate: changed crates first:$pkgs"
+    mode=check
+    for p in $pkgs; do set -- -p "$p" "$@"; done
+  else
+    # Serial by default: one cargo invocation per changed crate, strict
+    # first-fail order (sorted changed-file order). A single invocation with
+    # several -p flags would hand ordering back to cargo's scheduler, which
+    # prioritizes by dependent count, not by what you touched. Repeat
+    # invocations share the target dir, so already-built deps cost ~0.05 s
+    # of freshness checking each — ordering at the seam is effectively free.
+    for p in $pkgs; do
+      say "gate: checking $p"
+      "$0" check -p "$p" "$@" || exit $?
+    done
+    exit 0
+  fi
+fi
+
+jobs="${AILITE_JOBS:-1}"
+incr="${AILITE_INCREMENTAL:-0}"
+tthreads="${AILITE_TEST_THREADS:-1}"
+
+export CARGO_BUILD_JOBS="$jobs"
+export CARGO_INCREMENTAL="$incr"
+say "CARGO_BUILD_JOBS=$jobs CARGO_INCREMENTAL=$incr"
+
+set -- "$mode" \
+  --config 'profile.ailite.inherits="dev"' \
+  --config 'profile.ailite.debug=0' \
+  --config 'profile.ailite.strip="debuginfo"' \
+  --config 'profile.ailite.incremental=false' \
+  --profile ailite \
+  "$@"
+
+# Gotcha (verified on cargo 1.96): --config is a clap "global" arg. If it
+# appears both before AND after the subcommand, the pre-subcommand values are
+# silently discarded. So every --config must go after the mode word.
+if [ -n "${AILITE_BUILD_DIR:-}" ]; then
+  say "build.build-dir=$AILITE_BUILD_DIR (intermediates leave target/)"
+  set -- "$@" --config "build.build-dir=\"$AILITE_BUILD_DIR\""
+fi
+
+if [ "$mode" = "test" ]; then
+  seen_dashdash=0
+  for a in "$@"; do [ "$a" = "--" ] && seen_dashdash=1 && break; done
+  if [ "$seen_dashdash" = "0" ]; then
+    set -- "$@" -- --test-threads="$tthreads"
+    say "test harness: --test-threads=$tthreads"
+  fi
+fi
+
+say "exec: cargo $*"
+exec cargo "$@"

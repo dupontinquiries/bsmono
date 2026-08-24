@@ -339,6 +339,26 @@ pub fn legend(ui: &mut Vec<UiVert>, y: f32, a: f32, px_in: f32, pairs: &[(&str, 
 }
 
 /// Translucent glass card with a thin accent border and a light top edge.
+/// The sortie flow's panel — brief, drop, engagement, debrief — as rows the
+/// flow itself composed (`Sortie::hud_rows`). The panel only knows where
+/// text goes; the flow knows what matters. Row zero is the stage title;
+/// rows starting with `·` are the event ticker and render dim.
+pub fn sortie_panel(ui: &mut Vec<UiVert>, a: f32, rows: &[String]) {
+    if rows.is_empty() {
+        return;
+    }
+    let (x0, x1) = (-0.98, -0.50);
+    let top = 0.58;
+    let line = 0.034;
+    let h = line * rows.len() as f32 + 0.030;
+    panel(ui, a, x0, top - h, x1, top);
+    label(ui, x0 + 0.02 / a, top - 0.030, 0.0098, a, GOLD, &rows[0]);
+    for (i, r) in rows.iter().enumerate().skip(1) {
+        let c = if r.starts_with('·') { DIM } else { PAPER };
+        label(ui, x0 + 0.02 / a, top - 0.030 - line * i as f32, 0.0082, a, c, r);
+    }
+}
+
 pub fn panel(ui: &mut Vec<UiVert>, a: f32, x0: f32, y0: f32, x1: f32, y1: f32) {
     // soldier's menu_frame: slate fill, slate-blue hairline stroke
     quad(ui, x0, y0, x1, y1, [0.070, 0.086, 0.110, 0.96]);

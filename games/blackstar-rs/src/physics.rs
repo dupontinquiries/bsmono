@@ -81,6 +81,11 @@ pub struct Car {
     /// grounded — which is precisely the state the aerial control block
     /// already handles. Setting this is most of what "flying" means here.
     pub flight: bool,
+    /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
+    /// the player's `CarCfg`, so tuning stays the player's and character
+    /// stays the vehicle's. `Default` is all 1.0 — a chassis nobody
+    /// measured drives exactly as it did before this existed.
+    pub hand: crate::driveline::Handling,
     /// how this hull stays up. None means the flat legacy behaviour.
     pub lift: Option<crate::lift::Lift>,
     /// local atmosphere, 0 = vacuum. A wing and a rotor both need it.
@@ -226,6 +231,7 @@ impl Car {
             drive: crate::model::Drive::Combustion,
             hover: None,
             flight: false,
+            hand: crate::driveline::Handling::default(),
             lift: None,
             air: 1.0,
             robot: false,
@@ -886,7 +892,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     // jump buffering: remember a press for a beat so hitting jump a frame
     // before touchdown still hops the instant wheels touch (the "getting my
     // jump back is slow" fix — the press used to be eaten mid-air)
-    if (c.jump_pressed && car.hover.is_none()) {
+    if c.jump_pressed && car.hover.is_none() {
         car.jbuf = 0.09;
     } else {
         car.jbuf = (car.jbuf - dt).max(0.0);
@@ -969,14 +975,27 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         let up = match car.lift {
             Some(l) => {
                 let airspeed = (car.vel - gdir * car.vel.dot(gdir)).length();
-                l.lift_accel(airspeed, t.min(1.0), car.air, g_here)
+                // this hull's stall speed, from its own wing loading
+                l.lift_accel_at(car.hand.stall_ms, airspeed, t.min(1.0), car.air, g_here)
             }
             None => g_here * 0.92,
         };
         car.vel -= gdir * up * dt;
-        car.vel += car.forward() * t * THRUST * dt;
+        // THRUST IS THE HULL'S, not a constant. `driveline` derives
+        // thrust-to-weight from nozzle count over a mass taken from the
+        // volume, which is the ratio that decides how an aircraft feels
+        // more than any other — so a four-nozzle interceptor and a
+        // single-engine hauler stop climbing identically.
+        //
+        // The LIFT side is deliberately untouched: `car.lift` is already a
+        // real model that knows about airspeed, air density and rotors,
+        // and `Handling::stall_ms` is the same aerodynamics computed for
+        // reporting. Two implementations of lift would be two answers to
+        // one question; the derived stall speed is there to be shown and
+        // to inform tuning, not to fight the model that exists.
+        car.vel += car.forward() * t * THRUST * car.hand.accel * dt;
         // a rotor is slow: it bleeds speed harder than a wing or a rocket
-        let top = car.lift.map_or(1.0, |l| l.top_speed_frac());
+        let top = car.lift.map_or(1.0, |l| l.top_speed_frac()) * car.hand.top_speed;
         car.vel *= 1.0 - (DRAG / top.max(0.2) * dt).min(0.9);
     }
     // FLOODWATER: a flooded tube's current owns you — strong downstream
@@ -999,8 +1018,10 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         _ => {}
     }
 
-    let top = CAR_MAX * cfg.car.top_speed * car.drive.top();
-    let drive_max = DRIVE_MAX * cfg.car.top_speed;
+    // the hull's own character multiplies the player's setting, never
+    // replaces it
+    let top = CAR_MAX * cfg.car.top_speed * car.hand.top_speed * car.drive.top();
+    let drive_max = DRIVE_MAX * cfg.car.top_speed * car.hand.top_speed;
 
     if grounded {
         car.dodge_window = 1.45;
@@ -1051,19 +1072,19 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // This is the whole character difference — an EV wins the first two
         // car-lengths off a kickoff and gives it back on a long straight.
         let speed_frac = (vf.abs() / drive_max.max(1.0)).clamp(0.0, 1.0);
-        let acc = 16.5 * cfg.car.accel * car.drive.torque(speed_frac);
+        let acc = 16.5 * cfg.car.accel * car.hand.accel * car.drive.torque(speed_frac);
         let mut a = 0.0;
         if c.throttle > 0.05 {
-            a = if vf < -0.3 { 35.0 * cfg.car.accel } else if vf < drive_max { acc * c.throttle } else { 0.0 };
+            a = if vf < -0.3 { 35.0 * cfg.car.accel * car.hand.accel } else if vf < drive_max { acc * c.throttle } else { 0.0 };
         } else if c.throttle < -0.05 {
-            a = if vf > 0.3 { -35.0 * cfg.car.accel } else if vf > -drive_max * 0.8 { acc * c.throttle } else { 0.0 };
+            a = if vf > 0.3 { -35.0 * cfg.car.accel * car.hand.accel } else if vf > -drive_max * 0.8 { acc * c.throttle } else { 0.0 };
         } else if sp > 0.1 {
             a = -5.25 * vf.signum();
         }
         car.vel += f_t * a * dt;
 
         // lateral grip (loosened by powerslide)
-        let grip_k = cfg.car.grip * cfg.arena.friction;
+        let grip_k = cfg.car.grip * car.hand.grip * cfg.arena.friction;
         // slide grip near-zero so the rear swings: hairpins on a dime
         // A HOVERCAR BARELY HOLDS: it keeps its momentum while the nose
         // points elsewhere, so you steer by pointing and thrusting.
@@ -1625,7 +1646,18 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     for off in [0.0f32, 0.8, -0.8] {
         let p = car.pos + f * (car.half_len * off);
         let d = world.sdf(p);
-        let r = car.half_h;
+        // THE FOURTH SEATING SITE, and the one that was still burying feet.
+        //
+        // Three sites were fixed when `ride_h` landed and the per-frame
+        // contact test was fixed after that — this one, the depenetration
+        // that runs AFTER integration, kept reading `half_h`. A standing
+        // robot's feet hang `ride_h` below its centre and `ride_h > half_h`
+        // for any body whose box is not centred on the origin, so every
+        // frame this pass pushed the body out to half its BOX and let the
+        // feet stay under the floor by exactly the difference. The contact
+        // test above then reported grounded, so nothing looked wrong except
+        // the feet.
+        let r = car.stand_h();
         if d < r {
             let n = world.normal(p);
             car.pos += n * (r - d);
@@ -1699,10 +1731,12 @@ pub fn portal_car(car: &mut Car, world: &World, dt: f32) -> bool {
         car.pos += (r * Vec3::Z) * 1.2;
         for _ in 0..8 {
             let d = world.sdf(car.pos);
-            if d > car.half_h + 0.15 {
+            // same fix as the depenetration above: unstick to where the
+            // body actually STANDS, not to half its bounding box
+            if d > car.stand_h() + 0.15 {
                 break;
             }
-            car.pos += world.normal(car.pos) * (car.half_h + 0.25 - d).max(0.15);
+            car.pos += world.normal(car.pos) * (car.stand_h() + 0.25 - d).max(0.15);
         }
         car.tp_cd = 0.12;
         car.prev = car.pos;
@@ -2215,6 +2249,39 @@ mod reset_tests {
     /// hang well below the origin, so `ride_h` is much larger than `half_h`.
     fn bot_shaped() -> Car {
         Car { half_h: 0.9, ride_h: 1.5, half_len: 0.6, half_w: 0.5, ..Car::new() }
+    }
+
+    #[test]
+    /// The meta-test above checks nobody re-derives `ride_h > 0` by hand.
+    /// It could not see the OTHER shape of the same bug: a site that reads
+    /// `car.half_h` as a ground clearance and never mentions `ride_h` at
+    /// all. That is what buried the feet for a second time, in the
+    /// depenetration that runs after integration, so this checks the
+    /// clearance sites name `stand_h`.
+    #[test]
+    fn no_ground_clearance_is_measured_from_half_h() {
+        let src = include_str!("physics.rs");
+        let mut bad = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim();
+            if l.starts_with("//") {
+                continue;
+            }
+            // a clearance is a radius compared against an sdf distance;
+            // these are the two idioms that do it
+            let clearance_ish = l.contains("let r = car.half_h")
+                || l.contains("d > car.half_h +")
+                || l.contains("< car.half_h + 0.1");
+            if clearance_ish {
+                bad.push(format!("physics.rs:{}: {}", i + 1, l));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "ground clearance measured from the bounding box, not from where \
+             the body stands — the feet will sink by (ride_h - half_h):\n{}",
+            bad.join("\n")
+        );
     }
 
     #[test]

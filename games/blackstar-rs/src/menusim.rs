@@ -227,6 +227,32 @@ fn narrate(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) {
                 println!("  > (the save moved; reopen the console to see it)");
             }
         }
+        // The shell-only orders, reported like Depart: a raid is a run of
+        // maps and the forge is a worker thread, so the harness prints the
+        // CHECKABLE half — what the shell would fly — rather than a
+        // disclaimer or a network call in a tape-driven loop.
+        Some(Order::Raid(boss)) => match crate::raidcon::BOSSES.iter().find(|b| b.id == boss) {
+            Some(b) => {
+                let plan = crate::raidgen::plan_for(b, 3, crate::raidgen::strhash(b.id));
+                println!("  > the shell would fly {} — {} phases:", b.name, plan.phases.len());
+                for (i, ph) in plan.phases.iter().enumerate() {
+                    println!("  >   {} — {} ({} enc)", i + 1, ph.arena.name, ph.enc.len());
+                }
+            }
+            None => println!("  > (no such warden)"),
+        },
+        Some(Order::Echo(id)) => match crate::raidforge::find(id) {
+            Some(e) => println!(
+                "  > the shell would fly the echo '{}' — {} phases, resembling {}",
+                e.name,
+                e.phases.len(),
+                e.resembles.name
+            ),
+            None => println!("  > (that echo has faded from the file)"),
+        },
+        Some(Order::Forge(theme)) => {
+            println!("  > the shell would light the forge on a worker thread — theme: {theme}");
+        }
         Some(Order::Goto(s)) => println!("  > walking to {}", s.id()),
         None => match ev {
             Event::Open(id) => println!("  > opens {id}"),

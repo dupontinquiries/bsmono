@@ -98,6 +98,10 @@ impl CamMode {
 }
 
 pub struct Camera {
+    /// the active chassis' DETECTED cockpit, model-local (`cockpit.rs`),
+    /// set by the shell on every chassis switch. None = the hull was too
+    /// symmetric to call, and the nose camera keeps its fixed fraction.
+    pub cockpit_local: Option<Vec3>,
     /// smoothed velocity of the platform under the car (bend)
     plat_lag: Vec3,
     pub pos: Vec3,
@@ -139,6 +143,7 @@ pub struct Camera {
 impl Camera {
     pub fn new() -> Camera {
         Camera {
+            cockpit_local: None,
             plat_lag: Vec3::ZERO,
             pos: Vec3::new(0.0, 3.0, 34.0),
             look: Vec3::ZERO,
@@ -349,7 +354,15 @@ impl Camera {
                 (self.heading - self.up * self.heading.dot(self.up)).normalize_or(self.heading)
             };
             self.pos = if self.nose_cam {
-                car.pos + f * (car.half_len * 0.95) + self.up * (car.half_h * 0.35)
+                // ANCHOR AT THE DETECTED COCKPIT when the model's own
+                // cloud named one (`cockpit.rs`) — the eye sits where the
+                // canopy is on THIS hull, not at a fraction that fits the
+                // average one. The fixed fraction stays as the fallback
+                // for hulls too symmetric to call.
+                match self.cockpit_local {
+                    Some(c) => car.pos + car.rot * c,
+                    None => car.pos + f * (car.half_len * 0.95) + self.up * (car.half_h * 0.35),
+                }
             } else {
                 car.pos + self.up * (car.half_h * 1.55) + f * (car.half_len * 0.55 + 0.25)
             };

@@ -6437,6 +6437,102 @@ the table already holds.
 
 1133 passing, zero dead code in the module.
 
+YOU COULD NOT DRIVE INTO THE SHIP, AND THE REASON WAS METRES AGAIN.
+
+`DRIVE_HALF_W` and `DRIVE_HALF_H` were absolute — 2.8 and 1.9 — sized for a
+seventy metre hull and left unchanged when hulls became occupant-relative. At
+15 m the clearance test compared a cap of 0.82 against a requirement of 1.9,
+concluded the ship was too small to drive, and gave every door a CREW HATCH.
+The rooms were fine. The doors were sized for a body five times taller than
+the one flying.
+
+Same mistake as the hull, one file over, and the lesson is the same: a number
+written in metres does not move when the thing it measures does.
+
+AND FIXING IT HAD A CONSEQUENCE WORTH STATING. With the requirement in
+occupant heights AND the hull in occupant heights, both sides of the
+comparison scale together — so `drive_clearance` no longer depends on length
+at all. "Walk-only lander" stopped being something a ship can be by being
+SHORT; it would have to be a different PLAN, narrower in the beam, and there
+is one plan. Two tests asserted the old behaviour and now assert the new
+property instead of being tuned until they passed.
+
+HULL_HEIGHTS 40 -> 160. Forty is a ship you can stand in and not one you can
+live in: rooms three occupants across, which fits a body and leaves nowhere to
+put anything. At 160 the rooms are 12.5 x 12.5 x 8.1 occupants and the bridge
+is 16.9 — a hangar you could land something in, which is what a hangar is for.
+
+I ALSO HAD 15.2 HARD-CODED IN THE TEST FOR THE MODULE THAT ARGUES AGAINST
+HARD-CODED METRES. It failed the moment `HULL_HEIGHTS` moved, which is the
+test doing its job and me having written the wrong assertion: what is fixed is
+the RATIO and the ordering, not the metre value.
+
+AND THE DIAGNOSTIC WAS MISSING THE ONE NUMBER THAT MATTERED. Neither of us
+could tell whether a room was big enough because nothing printed room sizes in
+occupant units. `--aboard` does now, and the answer was visible immediately.
+
+1133 passing.
+
+CLOSING THE SESSION: DOCS FOR A COLD START.
+
+`PRIORITIES.md` had accreted as things got done — eleven open boxes scattered
+through sections whose headings said DONE — so it is rewritten from the state
+as it is rather than as a diff against how it was. The old one is in git if
+the reasoning is wanted.
+
+The honest headline: everything underneath is built and tested, and what
+remains is almost entirely THE RENDERER BOUNDARY. The mission is still
+`MissionRun::resolve`, a simulation. The drop flies and nobody flies it.
+`foothold::assess` has never been asked at runtime.
+
+`docs/START_HERE.md` is new, because `DESIGN.md` is ten thousand lines of
+chronology and not where anybody should begin. It explains the skydribble
+inheritance, which accounts for most of what looks strange — the player being
+a car, the maps being called MEADOW and CATHEDRAL, the physics being Rocket
+League's — and names the two stacks that do not talk to each other.
+
+AND THE README STILL DESCRIBED THE ROCKET LEAGUE SANDBOX with no pointer to
+any of this. It is a Transformers game whose front page was about air
+dribbling. Fixed, with the sandbox description kept below the fold because it
+is still accurate about the part it describes.
+
+Two habits written down where a newcomer will hit them, both earned badly this
+session: a regression test written after the fix will pass and prove nothing
+unless you put the bug back, and a number written in metres does not move when
+the thing it measures does.
+
+1133 passing.
+
+I SHIPPED A BUNDLE WHOSE TEST LOOP DID NOT WORK IN IT.
+
+`tools/fastcheck` shells out to `cargo ailite`, which lived at
+`/home/claude/ailite/` — outside the monorepo, and therefore outside every
+bundle I cut. Somebody cloning one hit `no such subcommand`, and rather than
+bypass the loop they RECONSTRUCTED the tool from the comments in `fastcheck`.
+
+That was the right instinct and the reconstruction could not have been right,
+because the levers are in the tool and the comments are in the caller. It
+missed `debug = 0` and `strip = "debuginfo"` (the actual size and time
+levers), `CARGO_BUILD_JOBS=1` (which caps peak RAM and matters on one vCPU),
+`--test-threads=1`, and `gate` mode entirely. It also ADDED an opt-level knob,
+which the real tool deliberately does not touch — dev inherits 0 and that is
+already the fastest to compile.
+
+Vendored now at `<repo>/tools/cargo-ailite`, with `ailite-cache` and the
+schedule patch beside it and a `tools/README.md` tabulating exactly what the
+reconstruction missed, so the next person to find a gap knows what they are
+comparing against. `fastcheck` prefers `PATH`, falls back to the vendored
+copy, and falls back again to plain `cargo` with a warning — verified by
+running it with the tool hidden.
+
+AND THE "3 SECOND LOOP" IN MY OWN DOCS IS WRONG. That is the COMPILE side. The
+suite alone runs ~14 s at opt-0, so the unfiltered cycle is about that;
+filters get back to seconds. Corrected in `START_HERE.md` — a figure that only
+holds under a filter nobody mentioned is a figure that makes the tool look
+broken.
+
+1133 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -40,6 +40,16 @@ pub enum Gait {
     Fall,
     /// the beat just after touchdown
     Land,
+    /// HURT AND STILL STANDING. A damaged body drops its centre of mass:
+    /// shorter stride, deeper bob, and a lean that never comes back up.
+    /// Not a separate cycle — a crouch is a walk done badly, so the phase
+    /// carries and the limbs keep swinging, just less.
+    Crouch,
+    /// HURT AND FINDING A WALL. Below the crouch threshold a body stops
+    /// presenting its front: it turns a shoulder in, rolls toward the
+    /// nearest cover, and keeps moving low. This is the last gait before
+    /// the body stops being a body.
+    WallHug,
 }
 
 impl Gait {
@@ -51,6 +61,8 @@ impl Gait {
             Gait::Boost => "BOOST",
             Gait::Fall => "FALL",
             Gait::Land => "LAND",
+            Gait::Crouch => "CROUCH",
+            Gait::WallHug => "HUG",
         }
     }
     /// Cadence multiplier on top of the Froude term. A run is not merely a
@@ -60,12 +72,23 @@ impl Gait {
         match self {
             Gait::Walk => 1.0,
             Gait::Run => 1.12,
+            // a hurt body takes more steps for less ground: cadence up,
+            // stride down. The stride length is in the pose's swing
+            // amplitude, so these two together read as scurrying rather
+            // than as slow motion.
+            Gait::Crouch => 1.18,
+            Gait::WallHug => 1.3,
             _ => 0.0,
         }
     }
     /// Does this gait have a cycle at all?
     pub fn cyclic(self) -> bool {
-        matches!(self, Gait::Walk | Gait::Run)
+        matches!(self, Gait::Walk | Gait::Run | Gait::Crouch | Gait::WallHug)
+    }
+    /// Is this body hurt? Used by the shell to decide whether a camera or
+    /// a HUD should say anything about it.
+    pub fn wounded(self) -> bool {
+        matches!(self, Gait::Crouch | Gait::WallHug)
     }
 }
 
@@ -81,6 +104,14 @@ pub const RUN_HYSTERESIS: f32 = 1.8;
 pub const FALL_SPEED: f32 = 3.0;
 /// How long the landing beat lasts.
 pub const LAND_SEC: f32 = 0.22;
+
+/// Damage at which a body stops walking upright. `sections::Body::limp()`
+/// is the input. A GUESS, but a considered one: a third of the way to
+/// wrecked is when a leg section is usually gone, and a body missing a leg
+/// section should not still be striding.
+pub const CROUCH_HURT: f32 = 0.34;
+/// ...and where it starts looking for a wall.
+pub const HUG_HURT: f32 = 0.68;
 
 // ---- ported from exengine/robot_parts.h ----
 /// base cadence, before the Froude term
@@ -140,6 +171,12 @@ pub struct Locomotion {
     was_grounded: bool,
     /// smoothed speed, so one frame of noise cannot change gait
     speed: f32,
+    /// 0 = whole, 1 = barely standing. Smoothed like the speed, because a
+    /// section popping off should bend a body over rather than snap it.
+    hurt: f32,
+    /// which way the nearest wall is, in the body's own frame: -1 left,
+    /// +1 right, 0 none in reach. A hug needs something to hug.
+    wall: f32,
 }
 
 impl Default for Locomotion {
@@ -157,7 +194,20 @@ impl Locomotion {
             land_t: 0.0,
             was_grounded: true,
             speed: 0.0,
+            hurt: 0.0,
+            wall: 0.0,
         }
+    }
+
+    /// Tell the machine how badly the body is doing, and where cover is.
+    ///
+    /// `hurt` is 0..1 — `sections::Body::limp()` is exactly this number and
+    /// is what the shell passes. `wall` is the signed lateral bearing of
+    /// the nearest surface within reach, or 0 for open ground: a body only
+    /// hugs what is actually there.
+    pub fn condition(&mut self, hurt: f32, wall: f32) {
+        self.hurt = hurt.clamp(0.0, 1.0);
+        self.wall = wall.clamp(-1.0, 1.0);
     }
 
     /// Advance.
@@ -180,6 +230,13 @@ impl Locomotion {
             if vert < -FALL_SPEED { Gait::Fall } else { Gait::Boost }
         } else if self.land_t > 0.0 {
             Gait::Land
+        } else if self.hurt > HUG_HURT && self.wall.abs() > 0.2 {
+            // badly hurt with something to put a shoulder against. Ranked
+            // above Idle deliberately: a body this damaged is hugging the
+            // wall whether or not it is going anywhere.
+            Gait::WallHug
+        } else if self.hurt > CROUCH_HURT {
+            Gait::Crouch
         } else if self.speed < IDLE_SPEED {
             Gait::Idle
         } else {
@@ -232,22 +289,36 @@ impl Locomotion {
             // read as left-right rather than as a bounce
             // bob and roll are the C engine's: move_amp * BODY_BOB_MAX at
             // twice stride frequency, and sin(phase) * 0.04 * move_amp
-            Gait::Walk | Gait::Run => {
+            Gait::Walk | Gait::Run | Gait::Crouch | Gait::WallHug => {
                 let move_amp = (self.speed / 8.0).clamp(0.0, 1.0);
                 let ll = leg_swing(p, false, self.speed);
                 let lr = leg_swing(p, true, self.speed);
                 let k = ARM_SWING_MAX / LEG_SWING_MAX;
+                // A HURT BODY IS THE SAME CYCLE, DONE SMALLER. Shortening
+                // the stride and dropping the hips is what a limp is —
+                // inventing a second cycle would put a foot down twice
+                // when the gait changed mid-stride, which is the bug the
+                // phase-carrying rule above exists to prevent.
+                let (stride, sink, hunch, tilt) = match self.gait {
+                    Gait::Crouch => (0.62, -BODY_BOB_MAX * 0.55, 0.22, 0.0),
+                    // a hug turns a shoulder into the wall and stays low;
+                    // the roll is toward the wall, so it leans on it
+                    Gait::WallHug => (0.45, -BODY_BOB_MAX * 0.95, 0.34, self.wall * 0.28),
+                    _ => (1.0, 0.0, 0.0, 0.0),
+                };
                 Pose {
-                    bob: -(2.0 * p).sin().abs() * move_amp * BODY_BOB_MAX * 0.5,
-                    lean: if self.gait == Gait::Run { 0.16 } else { 0.045 },
-                    roll: p.sin() * 0.04 * move_amp,
+                    bob: -(2.0 * p).sin().abs() * move_amp * BODY_BOB_MAX * 0.5 * stride + sink,
+                    lean: (if self.gait == Gait::Run { 0.16 } else { 0.045 }) + hunch,
+                    roll: p.sin() * 0.04 * move_amp * stride + tilt,
                     phase: self.phase,
                     weight: self.blend,
-                    squash: (2.0 * p).sin().abs() * move_amp * 0.7,
-                    leg_l: ll,
-                    leg_r: lr,
-                    arm_l: -ll * k,
-                    arm_r: -lr * k,
+                    squash: (2.0 * p).sin().abs() * move_amp * 0.7 * stride,
+                    leg_l: ll * stride,
+                    leg_r: lr * stride,
+                    // the arms come IN as the body folds up rather than
+                    // swinging wide: a hurt body guards its middle
+                    arm_l: -ll * k * stride,
+                    arm_r: -lr * k * stride,
                 }
             }
             // thrusters: the body hangs off them, nose up, feet trailing
@@ -310,6 +381,55 @@ impl Locomotion {
 
 #[cfg(test)]
 mod tests {
+    /// A hurt body crouches, and a badly hurt one with a wall to hand
+    /// hugs it — but only when the wall exists. A gait that hugs open air
+    /// is a body cowering at nothing.
+    #[test]
+    fn damage_bends_the_body_and_a_wall_is_required_to_hug_one() {
+        let step = |hurt: f32, wall: f32| {
+            let mut l = super::Locomotion::new();
+            l.condition(hurt, wall);
+            let mut pose = l.update(0.016, 4.0, 0.0, true, false);
+            for _ in 0..40 {
+                pose = l.update(0.016, 4.0, 0.0, true, false);
+            }
+            (l.gait, pose)
+        };
+        let (whole, wp) = step(0.0, 1.0);
+        assert_eq!(whole, super::Gait::Walk, "an undamaged body limped");
+        let (hurt, hp) = step(0.5, 0.0);
+        assert_eq!(hurt, super::Gait::Crouch, "a damaged body kept striding");
+        assert!(hp.bob < wp.bob, "the crouch did not drop the hips");
+        assert!(hp.leg_l.abs() < wp.leg_l.abs(), "the stride did not shorten");
+        // badly hurt in the open: still a crouch, because there is nothing
+        // to hug
+        let (open, _) = step(0.9, 0.0);
+        assert_eq!(open, super::Gait::Crouch, "it hugged open air");
+        let (cover, cp) = step(0.9, 1.0);
+        assert_eq!(cover, super::Gait::WallHug);
+        assert!(cp.roll > 0.1, "it did not lean into the wall: {}", cp.roll);
+        let (_, left) = step(0.9, -1.0);
+        assert!(left.roll < -0.1, "it leaned away from a wall on the left");
+    }
+
+    /// The phase must carry across a gait change between two cyclic gaits,
+    /// or a body that gets shot mid-stride puts the same foot down twice.
+    #[test]
+    fn getting_hurt_mid_stride_does_not_reset_the_foot() {
+        let mut l = super::Locomotion::new();
+        for _ in 0..30 {
+            l.update(0.016, 5.0, 0.0, true, false);
+        }
+        let before = l.update(0.016, 5.0, 0.0, true, false).phase;
+        l.condition(0.5, 0.0);
+        let after = l.update(0.016, 5.0, 0.0, true, false).phase;
+        assert_eq!(l.gait, super::Gait::Crouch);
+        assert!(
+            (after - before).abs() < 0.1,
+            "the phase jumped on the gait change: {before} -> {after}"
+        );
+    }
+
     use super::*;
 
     fn run_for(l: &mut Locomotion, secs: f32, speed: f32, vert: f32, ground: bool, boost: bool) -> Pose {

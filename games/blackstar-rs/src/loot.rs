@@ -21,7 +21,7 @@
 //! that makes the whole loadout system a choice; a drop that dominates its
 //! slot cost quietly deletes that choice.
 
-use crate::loadout::{BodyFit, Effect, Mod, MODS};
+use crate::loadout::{Effect, Mod, MODS};
 use crate::sun::{Orbit, Surface};
 use crate::survival::Body;
 

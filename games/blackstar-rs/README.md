@@ -1,4 +1,18 @@
-# skydribble
+# blackstar-rs
+
+> **New here? Read `docs/START_HERE.md`, then `docs/PRIORITIES.md`.**
+>
+> This is a Transformers open-world game built on the bones of **skydribble**,
+> the Rocket-League-like described below. That inheritance explains most of
+> what looks odd — the player is a car, the maps are named MEADOW and
+> CATHEDRAL, and the physics constants are Rocket League's. The skydribble
+> sandbox still works and the README below is still accurate about it.
+>
+> `tools/fastcheck` is a three-second edit-test loop; use it rather than
+> `cargo build`. Audio needs `libasound2-dev`, or build
+> `--no-default-features`.
+
+## The sandbox it grew out of
 
 An open-world air-dribble sandbox inspired by Rocket League's freeplay, written in
 Rust on wgpu 22 / winit 0.29. One big procedurally generated island of playful

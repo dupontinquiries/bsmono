@@ -102,6 +102,65 @@ fn guess_for(pose_dir: &Path) -> Option<(orient::Guess, Vec<crate::meshgen::Vert
         return None;
     }
     let raws = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::model::load_raw_unoriented(pose_dir))).ok()?;
+    // SAY WHAT THE FILTER DID, on real assets, where my synthetic fixtures
+    // cannot reach. `massfilter`'s thresholds are reasoned rather than
+    // fitted, so the only way to judge them is to print what they reject
+    // per pose and look — which is what this driver is for.
+    {
+        let pts: Vec<Vec<glam::Vec3>> = raws
+            .iter()
+            .map(|r| r.verts.iter().map(|v| glam::Vec3::from_array(v.pos)).collect())
+            .collect();
+        let refs: Vec<&[glam::Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+        let m = crate::massfilter::classify(&refs);
+        if m.dropped > 0 {
+            println!("       {}", m.report());
+            if let (Some(a), Some(b)) = (
+                crate::massfilter::bounds(&refs, &vec![true; refs.len()]),
+                crate::massfilter::bounds(&refs, &m.keep),
+            ) {
+                println!(
+                    "       ride_h {:.2} -> {:.2}, half.y {:.2} -> {:.2}",
+                    a.1, b.1, a.0.y, b.0.y
+                );
+            }
+        }
+    }
+    // WHAT THE BODY WILL ACTUALLY SIT ON. Two rounds of guessing at the
+    // feet have now cost more than measuring would have, so this reports
+    // the seating numbers per pose: the loader's `ride_h` (how far the
+    // lowest point hangs below the origin), `half_h`, and the gap between
+    // them — which is exactly how far a body sinks when a clearance is
+    // taken from the box instead of from where it stands.
+    {
+        let pts: Vec<Vec<glam::Vec3>> = raws
+            .iter()
+            .map(|r| r.verts.iter().map(|v| glam::Vec3::from_array(v.pos)).collect())
+            .collect();
+        let refs: Vec<&[glam::Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+        let mass = crate::massfilter::classify(&refs);
+        if let Some((half, ride)) = crate::massfilter::bounds(&refs, &mass.keep) {
+            let sink = ride - half.y;
+            println!(
+                "       seat: ride_h {:.2}  half_h {:.2}  {}",
+                ride,
+                half.y,
+                if sink.abs() < 0.02 {
+                    "centred (box clearance would be right by luck)".to_string()
+                } else if sink > 0.0 {
+                    format!("origin is {sink:.2} ABOVE centre — a box clearance buries the feet by that much")
+                } else {
+                    format!("origin is {:.2} below centre — a box clearance floats it", -sink)
+                }
+            );
+        }
+        let sk = crate::skeleton::skeletonize(&refs);
+        println!("       {}", sk.report());
+        let f = crate::turret::find(&refs);
+        if f.has_turret() || f.tracked() || !f.rollers.is_empty() {
+            println!("       {}, {} rollers", f.report(), f.rollers.len());
+        }
+    }
     let verts = orient::all_verts(&raws);
     if verts.is_empty() {
         return None;
@@ -191,6 +250,25 @@ fn check(bot: &str) {
         return;
     }
     println!("{bot}: {} poses", ps.len());
+    // WHAT THE LOADER WILL ACTUALLY DO. The per-pose lines below are
+    // `orient::guess` — a second opinion, useful for seeing disagreement,
+    // but not the frame the game applies. The game takes ONE frame per
+    // chassis (declared sidecar, else `model::strip_guess` from the
+    // vehicle pose) and rotates every pose by it, so a printout that only
+    // showed the per-pose guesses could look broken when the loader was
+    // fine, or fine when it was broken.
+    match crate::model::loader_frame(&ps[0]) {
+        Some((q, src)) => {
+            let up = q.inverse() * glam::Vec3::Y;
+            let fwd = q.inverse() * glam::Vec3::NEG_Z;
+            println!(
+                "  LOADER applies one frame to all poses ({src}): asset up={} fwd={}",
+                orient::axis_name(up),
+                orient::axis_name(fwd)
+            );
+        }
+        None => println!("  LOADER falls back to a per-pose guess (not a strip)"),
+    }
     for p in &ps {
         let name = p.file_name().unwrap().to_string_lossy();
         match guess_for(p) {
