@@ -391,3 +391,28 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
   HiveMind_Strategy_Logscope.md still exists outside the repo, diff it
   against 11-hive-matrix.md; anything it mandates that the code does not do
   is a gap worth listing rather than silently dropping.
+
+## 19. Hive: multi-machine plumbing + the missing worker-bee spec
+
+- **DONE**: NodeReport on the wire (announce conventions, own version byte,
+  every-truncation-refused, 10s warmth expiry) and backend::node_report
+  filling this machine's cell from kvtree::pick_anchor.
+- **C11-19a — the last mile, two call sites**: broadcast the local report on
+  the fabric's announce tick, and hold received ones in discovery's drain as
+  HeldReport { report, at_s }. Then hive::assemble(local, peers,
+  fresh_reports(&held, now)) is the whole scheduler input. I/O, so untestable
+  here — needs two machines.
+- **C11-19b — THE WORKER-BEE SPEC IS MISSING AND IS WHAT THE OPERATOR MEANT
+  BY "hive".** `HiveMind_Strategy_Logscope.md` is cited by capability.rs and
+  lib.rs and is NOT in the tree. The live prompt creator for highly specified
+  workers partly exists as `capability::profile(duty, ctx) -> String`
+  (conditional sections, dropout when has_code/has_compiler/peers are false,
+  tests asserting ABSENCE). When the spec resurfaces: diff it against
+  capability.rs and list every mandate the code does not implement, rather
+  than assuming the overlap is complete. Do NOT rewrite capability.rs from
+  guesswork first — the c11 lesson about a stale DUPLICATE.md applies exactly.
+- **C11-19c — `docs/11-hive-matrix.md` is about the MATRIX (placement), not
+  the worker-bee prompt creator.** If both are called "hive", the doc should
+  say which is which in its first line to stop the next reader conflating
+  them; consider renaming to 11-placement-matrix.md and giving the prompt
+  creator its own chapter once 19b's spec exists.
