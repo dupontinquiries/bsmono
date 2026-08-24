@@ -3548,6 +3548,18 @@ impl Gpu {
     #[track_caller]
     fn alloc(&self, rows: usize, cols: usize) -> Tensor {
         let size = (rows * cols * 4) as u64;
+        // THE SYSTEMIC GUARD for the 2.50 GB class. wgpu reports an over-cap
+        // create_buffer "non-fatally", hands back an invalid buffer, and the
+        // process dies later in get_mapped_range with no shape in the message.
+        // Every tensor allocation flows through here, so this names the shape
+        // and the caller AT the allocation, before an invalid handle can
+        // travel. #[track_caller] above already gives the site for free.
+        let cap = self.device.limits().max_buffer_size;
+        assert!(size <= cap,
+            "tensor allocation {rows} x {cols} f32 = {size} bytes exceeds this device's \
+max buffer size {cap} (at {}:{}). Whatever sized this is seq-proportional and needs chunking — \
+see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(),
+            std::panic::Location::caller().line());
         // `#[track_caller]` gives each allocation site a stable identity at zero runtime cost, and
         // the pool is keyed by it. Without this, two sites allocating the same size hand each other
         // buffers whenever their order interleaves, and the bind-group key moves again.
@@ -12097,15 +12109,13 @@ different metadata keys and disagree here; output will be degraded rather than b
         // Trained context, for automatic window sizing. Absent stays 0 = unknown; plan_ctx treats
         // 0 as "no trained bound" rather than as a 0-token window.
         let trained_ctx = g.get_u32(&format!("{pfx}.context_length")).unwrap_or(0) as usize;
-        if g.get_str(&format!("{pfx}.rope.scaling.type")) == Some("yarn") {
+        {
+            let ty = g.get_str(&format!("{pfx}.rope.scaling.type")).map(|t| t.to_string());
             let sf = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
             let orig = g.get_u32(&format!("{pfx}.rope.scaling.original_context_length")).unwrap_or(0);
             let attnf = g.get_f32(&format!("{pfx}.rope.scaling.attn_factor")).unwrap_or(1.0);
-            if sf > 1.0 && orig > 0 {
-                let (ffv, ms) = yarn_factors(head_dim, base, sf, orig, 32.0, 1.0, attnf);
-                rope_vals = ffv; mscale = ms;
-                eprintln!("wgpu-engine: YaRN rope scaling ON — {sf}× over {orig} native ctx (mscale {mscale:.4})");
-            }
+            mscale = apply_rope_scaling(&mut rope_vals, ty.as_deref(), sf, orig, attnf, head_dim, base)
+                ?; // the loader already speaks String errors
         }
         // ONE LINE THAT ANSWERS "IS ROPE SET UP RIGHT". Every rope input is metadata-driven — there
         // is no LOGSCOPE_ROPE_* flag to forget and the autotuner never touches rope; it tunes decode
@@ -16829,6 +16839,63 @@ pub fn pick(logits: &[f32], sampler: &SamplerParams, recent: &[u32], rng: &mut u
     if sampler.temperature > 0.0 { sample(logits, sampler, rng) } else { argmax(logits) }
 }
 
+/// Fold rope scaling metadata into the per-dim frequency divisors every rope
+/// kernel already divides by. Pure, so the mapping from GGUF keys to what the
+/// shader sees is a unit test rather than a field report.
+///
+/// The field report this closes: deepseek-coder-6.7b ships
+/// `rope.scaling.type = "linear"` with factor 4, which this loader READ,
+/// LOGGED as "linear (inactive)", and ignored — every position then rotated
+/// 4x too fast and the output was gibberish. Linear scaling divides every
+/// rotation angle by the factor; the kernels divide angles by these values,
+/// so linear is a uniform multiply here — the same fold-into-ff move the
+/// YaRN path already uses.
+///
+/// A scaling that is PRESENT but cannot be applied — an unknown type, or a
+/// yarn record missing its original_context_length — is a hard, named error:
+/// a model refusing to load names its reason once; a model loading without
+/// its scaling names nothing and answers everything wrongly.
+fn apply_rope_scaling(
+    rope_vals: &mut [f32],
+    ty: Option<&str>,
+    sf: f32,
+    orig: u32,
+    attnf: f32,
+    head_dim: usize,
+    base: f32,
+) -> Result<f32, String> {
+    match ty {
+        None | Some("none") => Ok(1.0),
+        Some("linear") => {
+            if sf > 1.0 {
+                for v in rope_vals.iter_mut() { *v *= sf; }
+                eprintln!("wgpu-engine: linear rope scaling ON — angles divided by {sf} (deepseek-coder-style)");
+            }
+            Ok(1.0)
+        }
+        Some("yarn") => {
+            if sf > 1.0 {
+                if orig == 0 {
+                    return Err(format!(
+                        "rope.scaling.type=yarn with factor {sf} but no \
+original_context_length — this checkpoint NEEDS its scaling and the metadata to apply it is \
+missing; loading without it would generate confidently and wrongly. Re-export the GGUF with \
+rope.scaling.original_context_length set."));
+                }
+                let (ffv, ms) = yarn_factors(head_dim, base, sf, orig, 32.0, 1.0, attnf);
+                rope_vals.copy_from_slice(&ffv);
+                eprintln!("wgpu-engine: YaRN rope scaling ON — {sf}x over {orig} native ctx (mscale {ms:.4})");
+                return Ok(ms);
+            }
+            Ok(1.0)
+        }
+        Some(other) => Err(format!(
+            "rope.scaling.type={other:?} (factor {sf}) is not implemented in this engine. \
+Refusing to load: running WITHOUT a checkpoint's rope scaling produces fluent gibberish, which \
+is strictly worse than this message. Known types: none, linear, yarn.")),
+    }
+}
+
 /// YaRN per-dimension rope factors + attention mscale (pure; unit-checked in --validate).
 /// Kernels compute theta = pos·base^(−2i/hd) / ff[i], so ff[i] = 1 / ((1−γᵢ)/s + γᵢ) where γᵢ is
 /// the extrapolation weight from the β-ramp: γ=1 for high-frequency dims (many rotations inside
@@ -21542,5 +21609,49 @@ mod seeded_suffix_tests {
         }
         assert!(cross_dev > 1e-2,
             "a zero-offset suffix wrote the SAME K rows as the seeded-offset one (max dev {cross_dev}) — the position offset is being ignored in RoPE");
+    }
+}
+
+#[cfg(test)]
+mod rope_scaling_tests {
+    use super::apply_rope_scaling;
+
+    #[test]
+    fn linear_multiplies_every_divisor_by_the_factor() {
+        let mut v = vec![1.0f32, 1.0, 1.0, 1.0];
+        let ms = apply_rope_scaling(&mut v, Some("linear"), 4.0, 0, 1.0, 8, 100000.0).unwrap();
+        assert_eq!(ms, 1.0);
+        assert_eq!(v, vec![4.0; 4], "angles must be divided by 4 — deepseek-coder's factor");
+    }
+
+    #[test]
+    fn none_and_absent_touch_nothing() {
+        for ty in [None, Some("none")] {
+            let mut v = vec![1.0f32; 4];
+            assert_eq!(apply_rope_scaling(&mut v, ty, 4.0, 0, 1.0, 8, 1e4).unwrap(), 1.0);
+            assert_eq!(v, vec![1.0; 4]);
+        }
+    }
+
+    /// The silent-gibberish cases become named refusals: a yarn record with
+    /// no original_context_length, and any type this engine does not know.
+    #[test]
+    fn incomplete_or_unknown_scaling_refuses_to_load() {
+        let mut v = vec![1.0f32; 4];
+        let e = apply_rope_scaling(&mut v, Some("yarn"), 4.0, 0, 1.0, 8, 1e4).unwrap_err();
+        assert!(e.contains("original_context_length"), "{e}");
+        let e = apply_rope_scaling(&mut v, Some("longrope"), 2.0, 0, 1.0, 8, 1e4).unwrap_err();
+        assert!(e.contains("not implemented") && e.contains("longrope"), "{e}");
+        assert_eq!(v, vec![1.0; 4], "a refused load must not have half-applied anything");
+    }
+
+    /// The yarn happy path still runs through the same fn (behaviour moved,
+    /// not changed): factors land in place and mscale comes back non-1.
+    #[test]
+    fn yarn_with_complete_metadata_applies_in_place() {
+        let mut v = vec![1.0f32; 4]; // head_dim 8 -> 4 divisors
+        let ms = apply_rope_scaling(&mut v, Some("yarn"), 4.0, 2048, 1.0, 8, 1e4).unwrap();
+        assert!(ms != 1.0, "yarn sets an attention mscale");
+        assert!(v.iter().any(|&x| x != 1.0), "yarn wrote per-dim factors");
     }
 }
