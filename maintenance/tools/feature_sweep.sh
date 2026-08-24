@@ -103,11 +103,22 @@ packages() {
     done | sort -u
 }
 
+# --only <prefix> narrows every mode to units whose path starts with <prefix>.
+# Exists so a slice can be run HONESTLY: the alternative was pre-filling the
+# report with `ok` rows for everything else, which makes a partial run read as
+# a complete one — the exact thing --report is built to prevent.
+ONLY=""
+if [ "${1:-}" = "--only" ]; then
+  ONLY="${2:?--only needs a path prefix, e.g. shared/}"
+  shift 2
+fi
+units() { if [ -n "$ONLY" ]; then packages | grep "^$ONLY"; else packages; fi; }
+
 case "${1:-}" in
-  --list) packages; exit 0 ;;
+  --list) units; exit 0 ;;
   --report)
     [ -f "$REPORT" ] || { echo "no report at $REPORT — nothing has run"; exit 2; }
-    total=$(packages | wc -l)
+    total=$(units | wc -l)
     done_n=$(grep -c . "$REPORT")
     printf 'checked %s of %s package(s)\n' "$done_n" "$total"
     for st in FAIL TIMEOUT SKIP ok; do
@@ -117,7 +128,7 @@ case "${1:-}" in
     done
     # The honest part: name what was never reached, so a partial run is not
     # read as a clean one.
-    missing=$(comm -23 <(packages) <(cut -f1 "$REPORT" | sort -u))
+    missing=$(comm -23 <(units) <(cut -f1 "$REPORT" | sort -u))
     if [ -n "$missing" ]; then
       printf 'NOT REACHED (%s):\n' "$(printf '%s\n' "$missing" | wc -l)"
       printf '%s\n' "$missing" | sed 's/^/           /'
@@ -140,7 +151,7 @@ case "${1:-}" in
 esac
 
 mkdir -p "$(dirname "$REPORT")"; touch "$REPORT"
-todo=$(comm -23 <(packages) <(cut -f1 "$REPORT" | sort -u))
+todo=$(comm -23 <(units) <(cut -f1 "$REPORT" | sort -u))
 [ -n "$todo" ] || { echo "nothing left to check — $REPORT is complete"; exit 0; }
 
 echo "sweep: $(printf '%s\n' "$todo" | wc -l) package(s) left, ${TIMEOUT}s each, report $REPORT"
