@@ -1425,3 +1425,35 @@ against a real ffmpeg fixture) cached on a half-second key: a scrub
 preview and edit reference at ~2 fps, said on screen, with realtime
 playback named as the streaming decoder's job. Tabs stay the phone layout;
 every strip is resizable or off.
+
+
+**Archive v2: dedup is exact; similarity is a report.** Media is stored as
+content-defined chunks (the assets module's own chunker): a re-bounce that
+changed one bar, a comped vocal reusing a phrase — the shared bytes land
+once, every reassembly verifies against its whole-asset hash, and one
+flipped bit refuses the whole archive, because a subtly-wrong take is worse
+than a refused file. The tempting next lever — batching MERELY SIMILAR
+audio under one entry — is deliberately not a lever: two takes 97% alike
+may differ precisely in the distortion someone chose, and a format that
+collapses that has made a musical decision on its own authority. Instead
+the pack report names the near-duplicate pairs with their chunk-overlap
+score (gitmind's yardstick) so a person can consolidate if the takes really
+are one take; the status line surfaces dedup savings and the pairs. (One
+test lesson recorded in the suite: periodic fixture data never trips the
+rolling hash, making every file one MAX_CHUNK — noise-like data or the
+fixture tests nothing.)
+
+**The roster is enforced.** An archive that names artists derives the
+session TEAM from them — the same sorted-roster id math hand-built teams
+use, so every holder of the archive lands on one session and a stranger's
+join is refused at the door. An archive with no roster keeps the opener's
+own team: metadata that was never written must not lock anyone out.
+
+**Layout, saved simply, per device.** `<name>.workspace` beside the
+project: workbench on/off, panel, side slot, zoom, scroll — written on
+save, read on open, lenient by construction (unknown keys are a newer
+build's business, garbage means defaults, hostile numbers clamp), and
+never load-bearing: view state must not be the reason a project fails to
+open. This is the pattern for several frontends sharing one project — each
+keeps its own sidecar over the shared file, and their states save simply
+because they never entangle.

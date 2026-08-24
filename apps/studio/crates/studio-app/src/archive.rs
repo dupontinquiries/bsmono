@@ -33,6 +33,22 @@
 //! any malformation or truncation refuses the WHOLE archive — an archive
 //! that half-opens is how files get lost, which is the failure this
 //! format exists to end.
+//!
+//! ## Dedup is exact; similarity is a REPORT
+//!
+//! v2 stores media as content-defined chunks (the assets module's own
+//! chunker): a chunk shared by two takes — a re-bounce that changed one
+//! bar, a comped vocal reusing a phrase — is stored ONCE, and every
+//! reassembly is verified against its whole-asset hash, so dedup can only
+//! ever save bytes, never change them. The tempting next lever — batching
+//! MERELY SIMILAR audio under one entry — is deliberately not a lever:
+//! two takes 97% alike may differ precisely in the distortion someone
+//! chose, and a format that collapses that difference has made a musical
+//! decision on its own authority. Instead [`PackReport::similar`] names
+//! the near-duplicate pairs and their chunk-overlap score at pack time
+//! (gitmind's `similarity.rs` yardstick), so a PERSON can consolidate
+//! sources if the takes really are one take. Version 1 never left a test
+//! suite; v2 refuses it like any other unknown version.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +58,7 @@ use studio_collab::file::SaveFile;
 use studio_core::{Op, SourceId};
 
 pub const MAGIC: &[u8; 8] = b"STUARCH1";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// The fidelity presets the save popup's slider walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +125,19 @@ pub struct MediaEntry {
     pub kind: MediaKind,
     pub ext: String,
     pub bytes: Vec<u8>,
+}
+
+/// What `pack` has to say beyond the bytes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PackReport {
+    /// Sources the session holds NO audio for — said now, not found later.
+    pub missing: Vec<SourceId>,
+    /// Bytes the chunk store saved over storing every entry whole.
+    pub deduped_bytes: usize,
+    /// Near-duplicate pairs (chunk-overlap score, byte-weighted) that are
+    /// NOT byte-identical — the identical ones dedup silently. Reported,
+    /// never acted on: see the module docs on distortion.
+    pub similar: Vec<(SourceId, SourceId, f32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,7 +229,7 @@ pub fn pack(
     audio: &BTreeMap<SourceId, SourceAudio>,
     originals: &BTreeMap<SourceId, (String, Vec<u8>)>,
     meta: &ArchiveMeta,
-) -> Result<(Vec<u8>, Vec<SourceId>), String> {
+) -> Result<(Vec<u8>, PackReport), String> {
     let mut o = Vec::new();
     o.extend(MAGIC);
     o.push(VERSION);
@@ -255,15 +284,59 @@ pub fn pack(
             None => missing.push(src.id),
         }
     }
+    // ── the chunk store: every entry chunked, shared chunks once ────────
+    use studio_collab::assets::Manifest;
+    let mut store: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut manifests: Vec<(usize, Manifest)> = Vec::new();
+    let mut whole_bytes = 0usize;
+    for (i, e) in entries.iter().enumerate() {
+        whole_bytes += e.bytes.len();
+        let (m, chunks) = Manifest::build(&e.bytes);
+        store.extend(chunks);
+        manifests.push((i, m));
+    }
+    let stored_bytes: usize = store.values().map(Vec::len).sum();
+
+    // The similarity report: byte-weighted chunk overlap per pair, the
+    // identical pairs excluded (they deduped silently and completely).
+    let mut similar = Vec::new();
+    for x in 0..manifests.len() {
+        for y in x + 1..manifests.len() {
+            let (ix, mx) = &manifests[x];
+            let (iy, my) = &manifests[y];
+            if mx.asset == my.asset { continue; }
+            let set: std::collections::BTreeSet<u64> = mx.chunks.iter().copied().collect();
+            let shared: usize = my.chunks.iter().filter(|c| set.contains(c))
+                .filter_map(|c| store.get(c).map(Vec::len)).sum();
+            let score = shared as f32 / mx.total_len.max(my.total_len).max(1) as f32;
+            if score >= 0.5 {
+                similar.push((entries[*ix].source, entries[*iy].source, score));
+            }
+        }
+    }
+
+    o.extend((store.len() as u32).to_le_bytes());
+    for (id, bytes) in &store {
+        o.extend(id.to_le_bytes());
+        put_blob(&mut o, bytes);
+    }
     o.extend((entries.len() as u32).to_le_bytes());
-    for e in &entries {
+    for (i, e) in entries.iter().enumerate() {
         o.extend(e.source.0.to_le_bytes());
         o.push(match e.kind { MediaKind::OpusProxy => 0, MediaKind::Original => 1,
                               MediaKind::Wav => 2 });
         put_str(&mut o, &e.ext);
-        put_blob(&mut o, &e.bytes);
+        let m = &manifests.iter().find(|(mi, _)| *mi == i).unwrap().1;
+        o.extend(m.asset.to_le_bytes());
+        o.extend((m.total_len as u64).to_le_bytes());
+        o.extend((m.chunks.len() as u32).to_le_bytes());
+        for c in &m.chunks { o.extend(c.to_le_bytes()); }
     }
-    Ok((o, missing))
+    Ok((o, PackReport {
+        missing,
+        deduped_bytes: whole_bytes.saturating_sub(stored_bytes),
+        similar,
+    }))
 }
 
 /// Open the archive, or `None` for anything malformed or truncated —
@@ -283,6 +356,12 @@ pub fn unpack(b: &[u8]) -> Option<Unpacked> {
         _ => return None,
     };
     let save = SaveFile::decode(&r.blob()?)?;
+    let cn = r.u32()? as usize;
+    let mut store: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for _ in 0..cn.min(1 << 24) {
+        let id = r.u64()?;
+        store.insert(id, r.blob()?);
+    }
     let mn = r.u32()? as usize;
     let mut media = Vec::with_capacity(mn.min(65_536));
     for _ in 0..mn {
@@ -292,7 +371,19 @@ pub fn unpack(b: &[u8]) -> Option<Unpacked> {
             _ => return None,
         };
         let ext = r.str()?;
-        let bytes = r.blob()?;
+        let asset = r.u64()?;
+        let total_len = r.u64()? as usize;
+        let nch = r.u32()? as usize;
+        let mut chunks = Vec::with_capacity(nch.min(1 << 24));
+        for _ in 0..nch { chunks.push(r.u64()?); }
+        let m = studio_collab::assets::Manifest { asset, total_len, chunks };
+        let bytes = m.assemble(&store).ok()?;
+        // Dedup can only ever save bytes, never change them: the
+        // reassembly must hash back to the manifest's own asset id, or
+        // the WHOLE archive refuses — a subtly-wrong take is worse than
+        // a refused file.
+        let (check, _) = studio_collab::assets::Manifest::build(&bytes);
+        if check.asset != asset { return None; }
         media.push(MediaEntry { source, kind, ext, bytes });
     }
     if r.i != b.len() { return None; } // trailing garbage is damage too
@@ -356,9 +447,9 @@ mod tests {
         let save = save_with_sources(2);
         let mut audio = BTreeMap::new();
         audio.insert(SourceId(1), tone(44_100, 1.0)); // source 2 has NO audio
-        let (bytes, missing) = pack(&save, &audio, &BTreeMap::new(),
+        let (bytes, report) = pack(&save, &audio, &BTreeMap::new(),
                                     &meta(Level::Demo)).unwrap();
-        assert_eq!(missing, vec![SourceId(2)],
+        assert_eq!(report.missing, vec![SourceId(2)],
                    "the hole is reported to the person saving, not found by a collaborator");
         let u = unpack(&bytes).expect("opens whole");
         assert_eq!(u.save, save, "ALL state: mixer, rack, patterns, rolls, automation");
@@ -393,9 +484,9 @@ mod tests {
         let mut originals = BTreeMap::new();
         let fake_opus = vec![7u8; 999]; // the BYTES are what must survive
         originals.insert(SourceId(1), ("opus".to_string(), fake_opus.clone()));
-        let (bytes, missing) = pack(&save, &audio, &originals,
+        let (bytes, report) = pack(&save, &audio, &originals,
                                     &meta(Level::Master)).unwrap();
-        assert!(missing.is_empty());
+        assert!(report.missing.is_empty());
         let u = unpack(&bytes).unwrap();
         let s1 = u.media.iter().find(|m| m.source == SourceId(1)).unwrap();
         assert_eq!(s1.kind, MediaKind::Original);
@@ -403,6 +494,65 @@ mod tests {
         let s2 = u.media.iter().find(|m| m.source == SourceId(2)).unwrap();
         assert_eq!(s2.kind, MediaKind::Wav, "PCM the session recorded goes lossless");
         assert!(studio_media::decode_bytes(s2.bytes.clone(), Some("wav")).is_ok());
+    }
+
+    #[test]
+    fn identical_takes_dedup_silently_and_similar_ones_are_only_reported() {
+        // Three masters: 1 and 2 byte-identical, 3 sharing a long region
+        // with them but ending differently — the distortion case. The data
+        // must be NOISE-LIKE: this test's first draft used a 251-periodic
+        // ramp, whose rolling hash never hit a boundary, so every file was
+        // one MAX_CHUNK and 'similar' files shared everything or nothing —
+        // a fixture that quietly tested the wrong thing.
+        let save = save_with_sources(3);
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 };
+        let shared: Vec<u8> = (0..1_500_000).map(|_| rng()).collect();
+        let mut originals = BTreeMap::new();
+        originals.insert(SourceId(1), ("wav".to_string(), shared.clone()));
+        originals.insert(SourceId(2), ("wav".to_string(), shared.clone()));
+        let mut variant = shared.clone();
+        for b in variant.iter_mut().skip(1_200_000) { *b = b.wrapping_add(90); }
+        originals.insert(SourceId(3), ("wav".to_string(), variant.clone()));
+        let (bytes, report) = pack(&save, &BTreeMap::new(), &originals,
+                                   &meta(Level::Master)).unwrap();
+        // The identical pair costs one copy, not two.
+        assert!(report.deduped_bytes >= shared.len(),
+                "byte-identical takes stored once: saved {}", report.deduped_bytes);
+        assert!(bytes.len() < shared.len() * 3,
+                "the archive is smaller than three whole copies");
+        // The similar-but-different take is REPORTED, and comes back
+        // byte-for-byte — dedup can only save bytes, never change them.
+        assert!(report.similar.iter().any(|(a, b, s)| {
+            let pair = (*a == SourceId(3)) != (*b == SourceId(3));
+            pair && *s > 0.5 && *s < 1.0
+        }), "the near-duplicate is named with its score: {:?}", report.similar);
+        assert!(!report.similar.iter().any(|(a, b, _)|
+            (*a == SourceId(1) && *b == SourceId(2)) ||
+            (*a == SourceId(2) && *b == SourceId(1))),
+            "the identical pair is dedup's business, not the report's");
+        let u = unpack(&bytes).unwrap();
+        let s3 = u.media.iter().find(|m| m.source == SourceId(3)).unwrap();
+        assert_eq!(s3.bytes, variant, "the different take is EXACTLY the different take");
+    }
+
+    #[test]
+    fn a_flipped_chunk_byte_refuses_the_whole_archive() {
+        // The hash check behind "dedup never changes bytes": corrupt one
+        // byte deep in the chunk store and the archive refuses whole —
+        // a subtly-wrong take is worse than a refused file.
+        let save = save_with_sources(1);
+        let mut originals = BTreeMap::new();
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let mut rng = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 };
+        originals.insert(SourceId(1), ("wav".to_string(),
+            (0..300_000).map(|_| rng()).collect::<Vec<u8>>()));
+        let (mut bytes, _) = pack(&save, &BTreeMap::new(), &originals,
+                                  &meta(Level::Master)).unwrap();
+        assert!(unpack(&bytes).is_some());
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x40;
+        assert!(unpack(&bytes).is_none(), "one flipped bit, whole refusal");
     }
 
     #[test]

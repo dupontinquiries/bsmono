@@ -25,6 +25,7 @@ pub mod mixer_panel;
 pub mod program_panel;
 pub mod project_dir;
 pub mod viewport;
+pub mod workspace;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -338,6 +339,15 @@ impl Studio {
         let u = archive::unpack(&bytes)
             .ok_or_else(|| format!("{} is not a studio archive (or is damaged)",
                                    path.display()))?;
+        // Authorized collaborators, ENFORCED: when the archive names a
+        // roster, the session's team is derived from it — same id math a
+        // hand-built team uses, so every holder of the archive lands on
+        // one session and a join from outside it is refused at the door.
+        // An archive with no roster keeps the caller's team: metadata that
+        // was never written must not lock anyone out.
+        let team = if u.meta.artists.is_empty() { team } else {
+            Team::from_contacts(&u.save.name, &u.meta.artists)
+        };
         let mut s = Studio::new(u.save.to_project(), site, team);
         if let Some(rack) = u.save.rack { s.rack = rack; }
         let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -373,13 +383,13 @@ impl Studio {
 
     /// The archive's pack half: state from the live project + rack,
     /// originals reassembled from the content-addressed chunk store, PCM
-    /// from the caller's decode cache. Returns the bytes and the sources
-    /// the session holds nothing for — said now, not found later.
+    /// from the caller's decode cache. Returns the bytes and the pack
+    /// report — missing sources, dedup savings, near-duplicate pairs.
     pub fn pack_archive(
         &self,
         audio: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
         meta: &archive::ArchiveMeta,
-    ) -> Result<(Vec<u8>, Vec<studio_core::SourceId>), String> {
+    ) -> Result<(Vec<u8>, archive::PackReport), String> {
         let save = studio_collab::file::SaveFile::from_project(
             &self.session.doc.project, Vec::new(), Some(self.rack.clone()));
         let mut originals = std::collections::BTreeMap::new();
@@ -1209,6 +1219,15 @@ impl Default for App {
         } else {
             Studio::demo()
         };
+        // The per-device layout sidecar: applied after the project so a
+        // failed project load still gets a sane default layout, and view
+        // state is never the reason a project fails to open.
+        let ws = workspace::load(&project_path);
+        studio.combined = ws.combined;
+        if let Some(p) = studio_egui::touch::Panel::ALL.iter()
+            .find(|p| p.label() == ws.panel) { studio.panel = *p; }
+        studio.view.px_per_sec = ws.px_per_sec;
+        studio.view.scroll = studio_core::Ticks(ws.scroll_ticks);
         studio.status = match load_note {
             Some(e) => format!("{e} — started fresh (Ctrl+S will overwrite!)"),
             None => format!("{} — audition: {}", studio.status, sink.describe()),
@@ -1243,7 +1262,13 @@ impl Default for App {
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
               archive_ui: None,
-              side_slot: SideSlot::Viewport,
+              side_slot: match ws.side_slot.as_str() {
+                  "off" => SideSlot::Off,
+                  "mixer" => SideSlot::Mixer,
+                  "rack" => SideSlot::Rack,
+                  "program" => SideSlot::Program,
+                  _ => SideSlot::Viewport,
+              },
               frame_cache: viewport::FrameCache::default(),
               export_dialog: None,
               export_note: String::new(),
@@ -1350,6 +1375,17 @@ impl eframe::App for App {
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
                 {
                     let path = self.project_path.clone();
+                    workspace::save(&path, &workspace::WorkspaceState {
+                        combined: self.studio.combined,
+                        panel: self.studio.panel.label().to_string(),
+                        side_slot: match self.side_slot {
+                            SideSlot::Off => "off", SideSlot::Viewport => "viewport",
+                            SideSlot::Mixer => "mixer", SideSlot::Rack => "rack",
+                            SideSlot::Program => "program",
+                        }.to_string(),
+                        px_per_sec: self.studio.view.px_per_sec,
+                        scroll_ticks: self.studio.view.scroll.0,
+                    });
                     if self.studio.save_to(&path).is_ok() {
                         // The save happened; history is the extra. A missing
                         // git binary demotes to a note, never a lost save.
@@ -1997,19 +2033,36 @@ impl App {
                         };
                         if let Some(dest) = dest {
                             match self.studio.pack_archive(&self.audio, &meta) {
-                                Ok((bytes, missing)) => {
+                                Ok((bytes, report)) => {
                                     if let Some(d) = dest.parent() {
                                         let _ = std::fs::create_dir_all(d);
                                     }
                                     match std::fs::write(&dest, &bytes) {
                                         Ok(()) => {
+                                            let mut extra = String::new();
+                                            if report.deduped_bytes > 0 {
+                                                extra.push_str(&format!(
+                                                    ", dedup saved {:.1} MB",
+                                                    report.deduped_bytes as f64 / 1e6));
+                                            }
+                                            if !report.similar.is_empty() {
+                                                // A report, never an action:
+                                                // see archive's module docs
+                                                // on distortion.
+                                                extra.push_str(&format!(
+                                                    ", {} near-duplicate pair{} (consolidate by hand if they are one take)",
+                                                    report.similar.len(),
+                                                    if report.similar.len() == 1 { "" } else { "s" }));
+                                            }
+                                            if !report.missing.is_empty() {
+                                                extra.push_str(&format!(
+                                                    ", {} sources have NO audio",
+                                                    report.missing.len()));
+                                            }
                                             self.studio.status = format!(
-                                                "archived {} ({:.1} MB{})",
+                                                "archived {} ({:.1} MB{extra})",
                                                 dest.display(),
-                                                bytes.len() as f64 / 1e6,
-                                                if missing.is_empty() { String::new() }
-                                                else { format!(", {} sources have NO audio",
-                                                               missing.len()) });
+                                                bytes.len() as f64 / 1e6);
                                             close = true;
                                         }
                                         Err(e) => a.note = format!("write failed: {e}"),
@@ -3690,7 +3743,7 @@ mod archive_shell_tests {
             search_paths: vec!["hq".into()],
             level: archive::Level::Demo,
         };
-        let (bytes, _missing) = s.pack_archive(&sources, &meta).expect("packs");
+        let (bytes, _report) = s.pack_archive(&sources, &meta).expect("packs");
         let path = dir.join("cut.studioarch");
         std::fs::write(&path, &bytes).unwrap();
 
@@ -3708,5 +3761,36 @@ mod archive_shell_tests {
         let out = back.render_arrangement(48_000, &opened_sources);
         let energy: f32 = out[..9600.min(out.len())].iter().map(|v| v.abs()).sum();
         assert!(energy > 5.0, "the bounced beat plays from the archive alone ({energy})");
+    }
+
+    #[test]
+    fn the_archives_roster_is_the_team_and_outsiders_are_refused_at_the_door() {
+        // The metadata is enforced now: the artists the popup names ARE
+        // the session's authorized collaborators, by the same derived-id
+        // math a hand-built team uses.
+        let dir = std::env::temp_dir()
+            .join(format!("studio-arch-team-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Studio::demo();
+        let meta = archive::ArchiveMeta {
+            artists: vec!["sc-ada".into(), "sc-lin".into()],
+            search_paths: vec![],
+            level: archive::Level::Sketch,
+        };
+        let (bytes, _) = s.pack_archive(&Default::default(), &meta).unwrap();
+        let path = dir.join("cut.studioarch");
+        std::fs::write(&path, &bytes).unwrap();
+        let caller_team = Team::from_contacts("solo", &["sc-local".into()]);
+        let mut back = Studio::open_archive(&path, SiteId(2), caller_team).unwrap();
+        assert!(back.session.join(SiteId(9), "sc-stranger", "??", 0).is_none(),
+                "a contact outside the archive's roster is refused");
+        assert!(back.session.join(SiteId(3), "sc-ada", "ada", 0).is_some(),
+                "a named collaborator joins");
+        // And two people opening the same archive independently land on
+        // one session, because the team id derives from the SORTED roster.
+        let t1 = Team::from_contacts("cut", &["sc-ada".into(), "sc-lin".into()]);
+        let t2 = Team::from_contacts("whatever", &["sc-lin".into(), "sc-ada".into()]);
+        assert_eq!(t1.id, t2.id);
     }
 }
