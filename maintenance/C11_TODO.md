@@ -287,3 +287,26 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
 - **C11-13c — consider a kit-installed icon font** (one embedded subset with
   the handful of UI glyphs the fleet uses) so the probe's fallback branch
   becomes rare instead of machine-dependent. Weigh binary size on device.
+
+## 14. Repository-work thread (c11, later)
+
+- **C11-14a — summarize dropped-signal: FIXED** (compact_poll). On device,
+  confirm the amber "context is full" offer now appears on a long
+  auto-continue chat — it never could before, so nobody has seen it work.
+- **C11-14b — patch mode silence: FIXED** (no_patch_reason always notes).
+  Remaining question the fix does NOT answer: whether the 1B's diffs are
+  merely unparseable-but-close. If the note says "diff-looking lines this
+  parser did not accept" on device, capture one reply and widen
+  parse_patches against it — that is a different bug wearing the same coat.
+- **C11-14c — git history reading landed** (parse_git_log + git_history_block,
+  hostile refs contained). NOT wired: no caller runs `git log` yet. Next:
+  a workspace_exec tool (`git_log` verb, and a line-grammar `!<nonce> log N`
+  for small models) feeding git_history_block at the session's ModelClass.
+- **C11-14d — still the big one: wire read_harness into backend prompt
+  assembly** (was C11-11d). Files AND history now have budgeted, fenced
+  renderers with no consumer; the prompt builder should stop hand-rolling
+  file inclusion and call them, taking ModelClass from the engine's real
+  parameter count.
+- **C11-14e — `--- ` in prose false-positives no_patch_reason's diff branch**
+  (a reply quoting an em-dash list could match). Harmless today (it only
+  picks the wording of a note) but tighten if it ever gates behaviour.
