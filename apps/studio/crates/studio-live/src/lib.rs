@@ -362,6 +362,23 @@ impl Pattern {
             }
         }
     }
+    /// Set the velocity of EVERY note starting at `start` on this channel.
+    /// A chord is one gesture — its notes struck together carry one
+    /// dynamic, which is also the only unambiguous meaning a single lane
+    /// bar over a stacked column can have.
+    pub fn set_start_vel(&mut self, ch: usize, start: u32, vel: f32) {
+        if let Some(notes) = self.rolls.get_mut(&ch) {
+            for n in notes.iter_mut().filter(|n| n.start == start) {
+                n.vel = vel.clamp(0.0, 1.0);
+            }
+        }
+    }
+    /// The loudest velocity among notes starting at `start`, if any — what
+    /// a lane bar over that column draws.
+    pub fn start_vel(&self, ch: usize, start: u32) -> Option<f32> {
+        self.roll(ch).iter().filter(|n| n.start == start)
+            .map(|n| n.vel).fold(None, |a, v| Some(a.map_or(v, |m: f32| m.max(v))))
+    }
     /// Flip the slide flag of the note at (start, key).
     pub fn toggle_note_slide(&mut self, ch: usize, start: u32, key: i8) {
         if let Some(notes) = self.rolls.get_mut(&ch) {

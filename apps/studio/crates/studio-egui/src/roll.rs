@@ -42,6 +42,61 @@ pub enum RollEdit {
     Remove { channel: usize, start: u32, key: i8 },
     Resize { channel: usize, start: u32, key: i8, len: u32 },
     ToggleSlide { channel: usize, start: u32, key: i8 },
+    /// Velocity for every note starting at `start` — a chord is one
+    /// gesture and carries one dynamic (see `Pattern::set_start_vel`).
+    SetVel { channel: usize, start: u32, vel: f32 },
+}
+
+/// Velocity-lane height.
+pub const VEL_H: f32 = 40.0;
+
+/// y within the velocity lane → 0..=1, top loud, bottom silent.
+pub fn vel_from_y(y: f32, top: f32) -> f32 {
+    (1.0 - (y - top) / VEL_H).clamp(0.0, 1.0)
+}
+
+/// The velocity lane under the roll: one draggable bar per start column
+/// that has notes, mirroring `lanes`' bar grammar so the two read as one
+/// family. Columns without notes are inert — a velocity with nothing to
+/// carry it would be an edit to nowhere.
+pub fn vel_lane(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
+                c: &uikit_egui::PaletteColors) -> Vec<RollEdit> {
+    let mut edits = Vec::new();
+    if pattern.steps == 0 { return edits; }
+    let width = LABEL_W + pattern.steps as f32 * CELL;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, VEL_H),
+                                              egui::Sense::click_and_drag());
+    let painter = ui.painter();
+    painter.text(egui::pos2(rect.left() + 4.0, rect.center().y),
+                 egui::Align2::LEFT_CENTER, "vel",
+                 egui::FontId::proportional(10.0), c.text_weak);
+    for s in 0..pattern.steps {
+        let x = rect.left() + LABEL_W + s as f32 * CELL;
+        let col = egui::Rect::from_min_size(egui::pos2(x + 1.0, rect.top()),
+                                            egui::vec2(CELL - 2.0, VEL_H));
+        painter.rect_filled(col, 0.0,
+            if crate::grid::is_beat(s) { c.bg_raised } else { c.bg_base });
+        if let Some(v) = pattern.start_vel(channel, s) {
+            let bh = (v.clamp(0.0, 1.0) * VEL_H).max(2.0);
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(x + 3.0, rect.bottom() - bh),
+                egui::vec2(CELL - 6.0, bh));
+            painter.rect_filled(bar, 1.0, c.accent);
+        }
+    }
+    if let Some(pos) = resp.interact_pointer_pos() {
+        if resp.dragged() || resp.clicked() {
+            let rel_x = pos.x - rect.left();
+            if rel_x >= LABEL_W {
+                let s = ((rel_x - LABEL_W) / CELL) as u32;
+                if s < pattern.steps && pattern.start_vel(channel, s).is_some() {
+                    edits.push(RollEdit::SetVel {
+                        channel, start: s, vel: vel_from_y(pos.y, rect.top()) });
+                }
+            }
+        }
+    }
+    edits
 }
 
 /// A resize in progress — either a fresh note being sized as it is dragged
@@ -315,6 +370,32 @@ mod tests {
         // Another channel does not see this channel's note.
         assert_eq!(hit(egui::vec2(body_x, mid_y), &p, 1, top, rows),
                    Some(RollHit::Empty { key: 3, step: 5 }));
+    }
+
+    #[test]
+    fn the_velocity_lane_clamps_and_points_the_right_way_up() {
+        let top = 50.0;
+        assert_eq!(vel_from_y(top, top), 1.0, "the lane's top is loud");
+        assert_eq!(vel_from_y(top + VEL_H, top), 0.0, "its bottom is silent");
+        assert!((vel_from_y(top + VEL_H * 0.5, top) - 0.5).abs() < 1e-6);
+        assert_eq!(vel_from_y(top - 20.0, top), 1.0, "above clamps");
+        assert_eq!(vel_from_y(top + VEL_H + 20.0, top), 0.0, "below clamps");
+    }
+
+    #[test]
+    fn a_chord_shares_one_dynamic_and_its_neighbours_keep_theirs() {
+        let mut p = Pattern::new("A", 16, 1);
+        p.add_note(0, Note { key: 0, start: 4, len: 2, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 7, start: 4, len: 2, vel: 0.8, slide: false });
+        p.add_note(0, Note { key: 0, start: 8, len: 1, vel: 0.6, slide: false });
+        assert!((p.start_vel(0, 4).unwrap() - 1.0).abs() < 1e-6, "the bar draws the loudest");
+        p.set_start_vel(0, 4, 0.3);
+        for n in p.roll(0).iter().filter(|n| n.start == 4) {
+            assert!((n.vel - 0.3).abs() < 1e-6, "the whole chord moved");
+        }
+        assert!((p.roll(0).iter().find(|n| n.start == 8).unwrap().vel - 0.6).abs() < 1e-6,
+                "the neighbour kept its own dynamic");
+        assert_eq!(p.start_vel(0, 12), None, "an empty column has no bar to grab");
     }
 
     #[test]

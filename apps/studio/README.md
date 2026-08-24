@@ -1309,8 +1309,14 @@ melodic instrument. Wire v9 carries the roll. The panel itself follows
 `grid`'s contract: pure geometry (row/key mapping across negative offsets,
 body-vs-edge hit testing) returning edits as values; drag draws a note out
 in one gesture, click removes, the right edge resizes, right-click toggles
-slide. Velocity editing wants a lane, named rather than faked with a
-pointer that has no pressure axis.
+slide. Velocity got its lane: bars under the
+roll sharing its columns the way `lanes` sits under the grid, one dynamic
+per start column because a chord is one gesture. The automation strip
+landed too — `studio_egui::auto` under the timeline, mapping time through
+the SAME `View` the arrangement uses so alignment is by construction:
+click places a point, right-click removes, a vertical drag is one op and
+a time move is two (the left-trim precedent), all through the op-log door
+so a ride is undoable, on the wire, and refusable out loud.
 
 **Automation — the ride, as ops.** `Project` gains lanes: points per
 `AutoTarget` (track gain and bus gain first; the enum is where a

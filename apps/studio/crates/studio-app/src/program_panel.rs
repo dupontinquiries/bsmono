@@ -57,6 +57,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         edits = roll::roll(ui, &pattern, channel, TOP, ROWS,
                            &mut s.roll_drag, playhead, c);
+        // The velocity lane sits under the roll, sharing its columns the
+        // way `lanes` sits under the grid — one dynamic per start column,
+        // because a chord is one gesture (`Pattern::set_start_vel`).
+        ui.add_space(2.0);
+        edits.extend(roll::vel_lane(ui, &pattern, channel, c));
     });
     if let Some(p) = s.rack.patterns.get_mut(s.current_pattern) {
         for e in edits {
@@ -65,6 +70,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
                 RollEdit::Remove { channel, start, key } => { p.remove_note(channel, start, key); }
                 RollEdit::Resize { channel, start, key, len } => p.resize_note(channel, start, key, len),
                 RollEdit::ToggleSlide { channel, start, key } => p.toggle_note_slide(channel, start, key),
+                RollEdit::SetVel { channel, start, vel } => p.set_start_vel(channel, start, vel),
             }
         }
     }
