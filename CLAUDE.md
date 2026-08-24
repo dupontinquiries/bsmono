@@ -72,22 +72,36 @@ free.
 
 ## 3. Native dependencies block whole crates — use the feature gates
 
-Missing here: `libasound2-dev`, `libssl-dev`, `cmake`, `libudev-dev`, Qt6,
-GTK4/libadwaita, any Vulkan ICD, `/dev/dri`. That means a build script fails and takes the whole
-crate with it, including headless code that never touches the device.
+**Install before you gate.** Much of what this section used to call "missing"
+is one `apt-get update && apt-get install` away, and c12 verified it by
+building the crates that were recorded as unbuildable:
+`libasound2-dev`, `libopus-dev`, `cmake`, `xorg-dev`, `libgstreamer1.0-dev`,
+`libgstreamer-plugins-base1.0-dev`, `mesa-vulkan-drivers` (lavapipe — there is
+no ICD in a fresh sandbox, despite older notes assuming one) and `vulkan-tools`
+all install cleanly. `apt-get update` FIRST — the baked lists are stale and bare
+installs 404 — and clear the `deb.nodesource.com` entry, which 403s and makes
+the whole update look failed.
 
-Known escapes, all default-on so ordinary builds are unaffected:
+Still genuinely absent: Qt6, GTK4/libadwaita, `/dev/dri` (so lavapipe is the
+only device, CPU and slow). `libssl-dev`/`libudev-dev` are untried since the
+list was written; try apt before believing them.
 
-| crate | flag | blocked by |
-|---|---|---|
-| `apps/beatspace` | `--no-default-features` | cpal→alsa-sys, opus→audiopus_sys(cmake) |
-| `games/blackstar-rs` | `--no-default-features` | cpal→alsa-sys |
-| `apps/studio` `studio-media` | `--no-default-features` | opus→libopus via cmake |
-| `system/snapclone` `snapclone-crypto` | `SNAPCLONE_SKIP_CBINDGEN=1` | see §4 |
-| `games/blackstar-rs` `gamepad` | already off by default | gilrs → libudev-sys |
+A build script failing still takes the whole crate with it, including headless
+code that never touches the device — so the escapes below stay, because they
+are right for a host that really lacks the headers. What changed is that here
+you can usually verify the DEFAULT configuration instead of only the gated one.
 
-If you meet a new one, **add a default-on feature** rather than working around
-it in the shell. Three crates already do this; it is the house pattern.
+| crate | flag | blocked by | still blocked here? |
+|---|---|---|---|
+| `apps/beatspace` | `--no-default-features` | cpal→alsa-sys, opus→audiopus_sys(cmake) | no — both apt-installable (c12) |
+| `games/blackstar-rs` | `--no-default-features` | cpal→alsa-sys | no — `libasound2-dev` (c12) |
+| `apps/studio` `studio-media` | `--no-default-features` | opus→libopus via cmake | no — built with default `opus`, 21 tests (c12) |
+| `system/snapclone` `snapclone-crypto` | `SNAPCLONE_SKIP_CBINDGEN=1` | see §4 | yes |
+| `games/blackstar-rs` `gamepad` | already off by default | gilrs → libudev-sys | untried |
+
+If you meet a new one, check apt first; if apt does not have it, **add a
+default-on feature** rather than working around it in the shell. Three crates
+already do this; it is the house pattern.
 
 **And check the NON-default configurations before believing a crate is green.**
 `cargo ailite check` builds the default features only. `games/clawbound`'s

@@ -119,3 +119,25 @@ it. GTK4/libadwaita/Qt6 remain absent from what has been tried.
 Also confirmed installable (c11): `cmake` and `xorg-dev` — which unblocks
 glfw-sys and unendlich's `window` feature. The CLAUDE.md §3 "missing:
 cmake" entry predates this; prefer apt over feature-gating for cmake now.
+
+Also confirmed installable (c12), each verified by building something the
+old list called unbuildable rather than by the install succeeding:
+
+* `libasound2-dev` — the alsa-sys block behind every `cpal` gate in the tree.
+  `studio-app` then built with its DEFAULT features (app/audio/midi/picker),
+  149 tests. This is the biggest of the corrections: three crates carry
+  `--no-default-features` escapes written around this dep.
+* `libopus-dev` — `studio-media` built with its default `opus` feature (21
+  tests) and `studio-video`, which depends on it with defaults on, went from
+  a build-script panic to 13 tests.
+* `mesa-vulkan-drivers` + `vulkan-tools` — **a fresh sandbox has no Vulkan ICD
+  at all**; `/usr/share/vulkan/icd.d/` does not exist. C11_TODO §21 says "this
+  sandbox has lavapipe", which is true only after this install. Afterwards
+  `vulkaninfo --summary` reports llvmpipe (LLVM 20.1.2), Vulkan 1.4.318,
+  PHYSICAL_DEVICE_TYPE_CPU. Still no `/dev/dri`, so it is CPU rasterisation
+  and slow; fine for correctness and submit-counting, useless for timing.
+
+One trap worth thirty seconds: a `deb.nodesource.com` entry in
+`/etc/apt/sources.list.d/` returns 403, and `apt-get update` prints it as a
+fatal-looking error while the Ubuntu repos have in fact updated. Read past it
+(or remove the file) rather than concluding apt is unavailable.
