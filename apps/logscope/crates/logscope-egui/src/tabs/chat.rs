@@ -6784,7 +6784,7 @@ if let Some(msg) = self.error_banner.clone() {
                     if ui.small_button("✕").on_hover_text("dismiss").clicked() {
                         self.error_banner = None;
                     }
-                    if ui.small_button("⧉").on_hover_text("copy the full message").clicked() {
+                    if ui.small_button(uikit_egui::icons::copy_label(ui.ctx())).on_hover_text("copy the full message").clicked() {
                         ui.ctx().copy_text(msg.clone());
                     }
                 });
@@ -7298,7 +7298,7 @@ if let Some(msg) = self.error_banner.clone() {
                                         ui.label(RichText::new(shown).monospace().size(10.5).color(theme::INK()));
                                         if more { ui.label(RichText::new("…").color(theme::FAINT()).small()); }
                                     });
-                                if ui.small_button("⧉ copy code").clicked() { ui.ctx().copy_text(code.clone()); }
+                                if ui.small_button(format!("{} copy code", uikit_egui::icons::copy_label(ui.ctx()))).clicked() { ui.ctx().copy_text(code.clone()); }
                             }
                             if !kws.is_empty() {
                                 ui.add_space(5.0);
@@ -8120,7 +8120,7 @@ session's budget from 2470 down to 814 tokens over seventeen turns without sayin
                         }
                         // collapsed in from the old top bar: checkpoint · history · tree · export
                         ui.add_space(10.0);
-                        if ui.add_enabled(!self.msgs.is_empty(), egui::Button::new(RichText::new("⧉").small()))
+                        if ui.add_enabled(!self.msgs.is_empty(), egui::Button::new(RichText::new(uikit_egui::icons::copy_label(ui.ctx())).small()))
                             .on_hover_text("Export the chat as Markdown").clicked() { do_export = true; }
                         if self.vault.is_some() {
                             let n = self.vault.as_ref().map(|v| v.all_ids().len()).unwrap_or(0);
@@ -8338,7 +8338,7 @@ dense briefing that replaces them as the working context, then carry on with roo
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if !streaming_any && !m.editing {
                                             if ui.small_button("🗑").on_hover_text("Delete from here down").clicked() { action = Some(MsgAction::Delete(i)); }
-                                            if !m.text().is_empty() && ui.small_button("⧉").on_hover_text("Copy message").clicked() { action = Some(MsgAction::Copy(i)); }
+                                            if !m.text().is_empty() && ui.small_button(uikit_egui::icons::copy_label(ui.ctx())).on_hover_text("Copy message").clicked() { action = Some(MsgAction::Copy(i)); }
                                             if m.role == Role::User && ui.small_button("✎").on_hover_text("Edit & re-run from here").clicked() { action = Some(MsgAction::EditStart(i)); }
                                             if m.role == Role::Assistant && i + 1 >= nmsgs && ui.small_button("↻").on_hover_text("Reroll (keeps the old as a branch)").clicked() { action = Some(MsgAction::Regenerate(i)); }
                                         }

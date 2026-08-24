@@ -61,6 +61,7 @@ pub mod skin;
 pub mod livebg;
 pub mod nav;
 pub mod pager;   // pages as data: hysteretic mobile/dashboard plan + the shared swipe (c11)
+pub mod icons;   // glyphs that actually render, or an honest word (c11 tofu report)
 pub mod path_picker;
 pub mod segmented_tabs;
 pub mod scroll;
