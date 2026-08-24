@@ -59,6 +59,13 @@ pub fn parse_line_calls(text: &str, nonce: &str) -> (Vec<Tool>, Vec<LineReject>)
             "list" if args.len() <= 1 => {
                 out.push(Tool::ListDir { path: args.first().copied().unwrap_or("").into() })
             }
+            // History is READ-side evidence, so it belongs in the small-model
+            // grammar too: `!<nonce> log` or `!<nonce> log 20`.
+            "log" if args.is_empty() => out.push(Tool::GitLog { n: 10 }),
+            "log" if args.len() == 1 => match args[0].parse::<usize>() {
+                Ok(n) => out.push(Tool::GitLog { n }),
+                Err(_) => bad.push(LineReject::BadArgs { verb: "log".into(), want: "log <count>" }),
+            },
             "read_file" | "read_range" => bad.push(LineReject::BadArgs {
                 verb: verb.into(),
                 want: if verb == "read_file" { "read_file <path>" } else { "read_range <path> <first-line> <last-line>" },
@@ -78,6 +85,7 @@ pub fn corrective(nonce: &str) -> String {
          nothing else. Examples:\n\
          !{nonce} read_range src/lib.rs 1 60\n\
          !{nonce} list src\n\
+         !{nonce} log 10\n\
          Or, if the task is finished, reply exactly: TASK_COMPLETE"
     )
 }
@@ -162,6 +170,20 @@ mod tests {
         let (tools, bad) = parse_line_calls(&text, N);
         assert_eq!(bad, vec![LineReject::WrongNonce]);
         assert_eq!(tools, vec![Tool::ListDir { path: "".into() }]);
+    }
+
+    /// History is reachable from the small-model grammar, with and without a
+    /// count, and a non-numeric count is a named reject rather than a default.
+    #[test]
+    fn the_log_verb_reaches_git_history() {
+        let (t, b) = parse_line_calls(&format!("!{N} log"), N);
+        assert_eq!(t, vec![Tool::GitLog { n: 10 }]);
+        assert!(b.is_empty());
+        let (t, _) = parse_line_calls(&format!("!{N} log 25"), N);
+        assert_eq!(t, vec![Tool::GitLog { n: 25 }]);
+        let (t, b) = parse_line_calls(&format!("!{N} log lots"), N);
+        assert!(t.is_empty());
+        assert!(matches!(&b[0], LineReject::BadArgs { verb, .. } if verb == "log"));
     }
 
     #[test]

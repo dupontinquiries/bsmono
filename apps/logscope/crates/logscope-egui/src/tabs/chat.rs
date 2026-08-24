@@ -3030,12 +3030,55 @@ them to", patches.len());
         };
     }
 
+    /// The model's capability class, from the engine's own label. Everything
+    /// budgeted — file bytes, history depth, whether bodies appear — keys on
+    /// this rather than on constants that suited whichever model was loaded
+    /// the day the constant was written.
+    fn read_class(&self) -> crate::read_harness::ModelClass {
+        crate::read_harness::ModelClass::resolve(None, &self.model_label())
+    }
+
+    /// The workspace as EVIDENCE: tree, shared docs and recent history, each
+    /// sanitized, budgeted to the model's class and fenced with its
+    /// provenance.
+    ///
+    /// Before this the caps were fixed (300 tree entries, 6000 doc bytes, no
+    /// history at all) — a 1B drowned in the same context a 70B found thin,
+    /// and neither could see what the repository had recently DONE, which is
+    /// most of what "work on this repo" means. Nothing here is fenced twice:
+    /// repo_tree and collect_shared_docs still produce the text; the harness
+    /// decides how much and wraps it.
     fn agent_context(&self) -> String {
         let Some(sess) = self.gitmind_session.as_ref() else { return String::new() };
         let root = sess.work_dir();
-        let tree = crate::workspace_exec::repo_tree(root, 300);
-        let docs = crate::workspace_exec::collect_shared_docs(root, 6_000);
-        if docs.is_empty() { tree } else { format!("{tree}\n\n{docs}") }
+        let class = self.read_class();
+        let b = crate::read_harness::budget(class);
+
+        // Tree entries scale with what the class can hold; the byte cap inside
+        // fence() is the real backstop.
+        let tree_cap = match class {
+            crate::read_harness::ModelClass::Small => 80,
+            crate::read_harness::ModelClass::Mid => 300,
+            crate::read_harness::ModelClass::Large => 900,
+            crate::read_harness::ModelClass::Sota => 3000,
+        };
+        let tree = crate::workspace_exec::repo_tree(root, tree_cap);
+        let mut out = crate::read_harness::fence("repository tree", &root.display().to_string(), &tree, &b, None);
+
+        let docs = crate::workspace_exec::collect_shared_docs(root, b.block_bytes);
+        if !docs.is_empty() {
+            out.push_str(&crate::read_harness::fence("shared notes", ".logscope/docs", &docs, &b, None));
+        }
+
+        // Recent history, if this is a git worktree. Hostile refs and messages
+        // are contained by git_history_block; a repo without git simply
+        // contributes nothing.
+        let commits = crate::read_harness::read_git_log(root, b.git_entries);
+        if !commits.is_empty() {
+            out.push_str(&crate::read_harness::git_history_block(
+                &commits, &b, &format!("{} @ HEAD", root.display())));
+        }
+        out
     }
 
     /// Start a single agent run over the loaded workspace (shared by `:agent` and the plain-message

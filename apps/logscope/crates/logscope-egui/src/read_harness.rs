@@ -560,3 +560,18 @@ mod git_tests {
         assert!(!large.contains("older commits not shown"), "80 >= 40, nothing omitted");
     }
 }
+
+/// Run `git log` in `root` and parse it. Returns empty when the directory is
+/// not a git worktree, git is absent, or the command fails — a repository
+/// without history contributes nothing rather than an error into a prompt.
+/// `n` bounds the request at the source, so a 200k-commit repo does not get
+/// serialized just to be truncated afterwards.
+pub fn read_git_log(root: &std::path::Path, n: usize) -> Vec<Commit> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &root.display().to_string(), "log", GIT_LOG_FORMAT, "-n", &n.to_string()])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_git_log(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
