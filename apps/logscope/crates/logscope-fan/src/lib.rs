@@ -46,8 +46,9 @@
 // completely different thing — NAT reflexive-address learning, not the
 // coordinator's pattern-to-reaction spinal cord. The near-collision is a
 // plausible reason nobody noticed one of the two was missing.
-// The per-worker capability contract HiveMind_Strategy_Logscope.md makes
-// mandatory: Duty says where a worker may run and engmode::prompt_for says what
+// The per-worker capability contract the hive design makes mandatory (see
+// docs/11-hive-matrix.md; the old HiveMind_Strategy_Logscope.md citation had
+// no file behind it): Duty says where a worker may run and engmode::prompt_for says what
 // phase it is in, but nothing told a worker what it IS.
 // One correct fence scan, shared. Seven files look for triple backticks with
 // three different strategies and three of them had bugs; this is the primitive
@@ -59,6 +60,10 @@
 // Should the run carry on when the model stops talking? Cheap rules first, a
 // small-model call only when they genuinely cannot tell.
 #[allow(dead_code)] pub mod continuation;
+// The beehive matrix: which (model, node, KV-warmth) cell runs a job. Joins
+// workerkit's Reach, coordinator's mode and the engine's prefix-tree warmth,
+// which were four correct modules with nothing between them.
+#[allow(dead_code)] pub mod hive;
 // How far the operator has gone past each node: what lets the graph badge an
 // unanswered question instead of the run having to stop for it.
 #[allow(dead_code)] pub mod readmark;

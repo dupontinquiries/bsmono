@@ -2,7 +2,9 @@
 //!
 //! ## The gap this fills
 //!
-//! `HiveMind_Strategy_Logscope.md` makes one requirement mandatory:
+//! `HiveMind_Strategy_Logscope.md` (not in the tree — the citation outlived
+//! the file; `docs/11-hive-matrix.md` is the standing design) makes one
+//! requirement mandatory:
 //!
 //! > a worker cannot infer its job merely from its model or its name. Every
 //! > spawned worker needs a compact capability contract telling it what it
