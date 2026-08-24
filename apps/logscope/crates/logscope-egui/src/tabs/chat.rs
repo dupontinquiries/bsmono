@@ -8339,7 +8339,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                     // CONTEXT IS FULL. The alternative is the default: shrink this reply, and the
                     // next, and the one after that, without saying so. One session's budget walked
                     // 2470 → 814 tokens over seventeen turns that way.
-                    if let Some(req) = self.compact_offer {
+                    if let Some(req) = self.compact_offer.clone() {
                         egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
                             outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::AMBER()), ..Default::default() }
                         .show(ui, |ui| {

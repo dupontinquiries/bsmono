@@ -427,3 +427,184 @@ mod assembly_tests {
         assert_eq!(over.len(), 3, "the fan invented cells to fill the count");
     }
 }
+
+// ── the wire: a node reporting its cells ─────────────────────────────────────
+
+/// Wire version for a hive report. Separate from `announce`'s: the two travel
+/// the same fabric but change for different reasons, and a shared version byte
+/// would force a lockstep upgrade of both.
+pub const REPORT_V1: u8 = 1;
+const REPORT_TAG: &[u8] = b"logscope-hive-report-v1\0";
+
+/// Bound on what one datagram may claim, so a hostile or broken peer cannot
+/// make a receiver allocate. A machine with more than this many resident
+/// models is not a case this protocol needs to serve.
+pub const MAX_RESIDENTS: usize = 64;
+
+impl NodeReport {
+    /// Encode for the fabric. Same conventions as `announce::Announce`:
+    /// version byte, tag, length-prefixed UTF-8 fields, little-endian numbers.
+    pub fn payload(&self) -> Vec<u8> {
+        let mut v = vec![REPORT_V1];
+        v.extend_from_slice(REPORT_TAG);
+        let put_str = |v: &mut Vec<u8>, s: &str| {
+            v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            v.extend_from_slice(s.as_bytes());
+        };
+        put_str(&mut v, &self.id);
+        v.extend_from_slice(&self.tok_s.to_le_bytes());
+        let n = self.residents.len().min(MAX_RESIDENTS);
+        v.extend_from_slice(&(n as u32).to_le_bytes());
+        for (model, warm, busy) in self.residents.iter().take(n) {
+            put_str(&mut v, model);
+            v.extend_from_slice(&(*warm as u64).to_le_bytes());
+            v.push(if *busy { 1 } else { 0 });
+        }
+        v
+    }
+
+    /// Parse a report datagram body. Refuses rather than clamps — a corrupt
+    /// datagram must not become a plausible one, which is `announce`'s rule
+    /// and matters more here: a fabricated warmth number would misroute work.
+    pub fn parse(buf: &[u8]) -> Result<NodeReport, crate::announce::Reject> {
+        use crate::announce::Reject;
+        if buf.is_empty() { return Err(Reject::Malformed("empty")); }
+        if buf[0] != REPORT_V1 { return Err(Reject::Version(buf[0])); }
+        if buf.len() < 1 + REPORT_TAG.len() || &buf[1..1 + REPORT_TAG.len()] != REPORT_TAG {
+            return Err(Reject::Malformed("wrong tag"));
+        }
+        let mut o = 1 + REPORT_TAG.len();
+        let field = |o: &mut usize| -> Result<String, Reject> {
+            if buf.len() < *o + 4 { return Err(Reject::Malformed("truncated length")); }
+            let n = u32::from_le_bytes([buf[*o], buf[*o + 1], buf[*o + 2], buf[*o + 3]]) as usize;
+            *o += 4;
+            if buf.len() < *o + n { return Err(Reject::Malformed("truncated field")); }
+            let s = String::from_utf8(buf[*o..*o + n].to_vec())
+                .map_err(|_| Reject::Malformed("field is not utf-8"))?;
+            *o += n;
+            Ok(s)
+        };
+        let id = field(&mut o)?;
+        if buf.len() < o + 4 { return Err(Reject::Malformed("truncated tok_s")); }
+        let tok_s = f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+        o += 4;
+        if !tok_s.is_finite() || tok_s < 0.0 {
+            return Err(Reject::Malformed("tok_s is not a finite non-negative rate"));
+        }
+        if buf.len() < o + 4 { return Err(Reject::Malformed("truncated resident count")); }
+        let n = u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as usize;
+        o += 4;
+        if n > MAX_RESIDENTS { return Err(Reject::Malformed("too many residents")); }
+        let mut residents = Vec::with_capacity(n);
+        for _ in 0..n {
+            let model = field(&mut o)?;
+            if buf.len() < o + 9 { return Err(Reject::Malformed("truncated resident")); }
+            let warm = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap()) as usize;
+            o += 8;
+            let busy = match buf[o] { 0 => false, 1 => true, _ => return Err(Reject::Malformed("busy is not a bool")) };
+            o += 1;
+            residents.push((model, warm, busy));
+        }
+        Ok(NodeReport { id, tok_s, residents })
+    }
+}
+
+/// A peer's report plus when it arrived, so stale warmth can be dropped.
+#[derive(Clone, Debug)]
+pub struct HeldReport {
+    pub report: NodeReport,
+    pub at_s: u64,
+}
+
+/// How long a warmth claim stays credible.
+///
+/// Shorter than `announce::MAX_AGE_S` on purpose: an ADDRESS stays true for
+/// a while, but warmth is invalidated by the peer's very next turn — it may
+/// have taken another job and evicted the prefix this report described. A
+/// stale warmth number is worse than none, because placement commits to it.
+pub const REPORT_MAX_AGE_S: u64 = 10;
+
+/// Reports still fresh enough to place work against.
+pub fn fresh_reports(held: &[HeldReport], now_s: u64) -> Vec<NodeReport> {
+    held.iter()
+        .filter(|h| now_s.saturating_sub(h.at_s) <= REPORT_MAX_AGE_S && h.at_s <= now_s + 2)
+        .map(|h| h.report.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::announce::Reject;
+
+    fn sample() -> NodeReport {
+        NodeReport {
+            id: "m2ultra".into(),
+            tok_s: 62.5,
+            residents: vec![("Qwen3-14B".into(), 1600, false), ("draft-1B".into(), 0, true)],
+        }
+    }
+
+    #[test]
+    fn a_report_round_trips() {
+        let r = sample();
+        assert_eq!(NodeReport::parse(&r.payload()).unwrap(), r);
+    }
+
+    /// Every truncation must be refused, not clamped into a plausible report:
+    /// a report that parses with a fabricated warmth number misroutes work,
+    /// which is worse than a dropped datagram.
+    #[test]
+    fn every_truncation_is_refused() {
+        let full = sample().payload();
+        for cut in 1..full.len() {
+            match NodeReport::parse(&full[..cut]) {
+                Err(_) => {}
+                Ok(r) => panic!("a {cut}-byte prefix parsed as {r:?}"),
+            }
+        }
+        assert!(matches!(NodeReport::parse(&[]), Err(Reject::Malformed("empty"))));
+    }
+
+    #[test]
+    fn a_wrong_version_or_tag_is_named_apart() {
+        let mut p = sample().payload();
+        p[0] = 9;
+        assert!(matches!(NodeReport::parse(&p), Err(Reject::Version(9))));
+        let mut p = sample().payload();
+        p[3] = b'X';
+        assert!(matches!(NodeReport::parse(&p), Err(Reject::Malformed("wrong tag"))));
+    }
+
+    /// A peer claiming absurdities is refused at the boundary rather than
+    /// allocated for.
+    #[test]
+    fn hostile_counts_and_rates_are_refused() {
+        let mut p = sample().payload();
+        // resident count sits right after id-field and the 4-byte tok_s
+        let count_at = 1 + REPORT_TAG.len() + 4 + "m2ultra".len() + 4;
+        p[count_at..count_at + 4].copy_from_slice(&(u32::MAX).to_le_bytes());
+        assert!(matches!(NodeReport::parse(&p), Err(Reject::Malformed("too many residents"))));
+
+        let mut p = sample().payload();
+        let rate_at = 1 + REPORT_TAG.len() + 4 + "m2ultra".len();
+        p[rate_at..rate_at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(NodeReport::parse(&p), Err(Reject::Malformed(_))));
+    }
+
+    /// Warmth expires FAST. A report older than REPORT_MAX_AGE_S is dropped,
+    /// because the peer may have evicted that prefix on its very next turn —
+    /// and a report from the future is dropped too, the same replay reasoning
+    /// announce::freshness uses.
+    #[test]
+    fn stale_and_future_reports_are_dropped() {
+        let held = vec![
+            HeldReport { report: sample(), at_s: 100 },
+            HeldReport { report: NodeReport { id: "old".into(), ..sample() }, at_s: 80 },
+            HeldReport { report: NodeReport { id: "future".into(), ..sample() }, at_s: 200 },
+        ];
+        let fresh = fresh_reports(&held, 105);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].id, "m2ultra");
+    }
+}

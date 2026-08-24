@@ -108,6 +108,31 @@ Two rules in `assemble` are load-bearing enough to have break-checked tests:
   silent machine is *absent* from the matrix, not a cell that might work.
   Inventing a placeholder cell is how a scheduler sends a job into a hole.
 
+## Over the wire
+
+A report crosses the fabric in `announce`'s conventions — version byte, tag,
+length-prefixed UTF-8, little-endian numbers — with its **own** version byte:
+the two messages travel the same fabric but change for different reasons, and
+a shared version would force a lockstep upgrade.
+
+Parsing refuses rather than clamps, and the test walks *every* truncation
+length of a valid report to prove it. The reason is sharper here than for an
+address: a datagram that clamps into a plausible report carries a fabricated
+warmth number, and placement commits to that number. A dropped datagram costs
+one scheduling round; a believed lie misroutes work.
+
+**Warmth expires fast** — `REPORT_MAX_AGE_S` is 10s against `announce`'s 30.
+An address stays true for a while; warmth can be invalidated by the peer's
+very next turn, since it may have taken another job and evicted the prefix the
+report described. Reports from the future are dropped too, the same replay
+reasoning `announce::freshness` uses.
+
+The engine fills its own report with `backend::node_report`, whose warmth is
+`kvtree::pick_anchor`'s answer against *this* prompt — the same call the local
+prefill path makes, so the number reported is the number that would actually
+be saved. A machine that has not generated yet reports `tok_s = 0.0`, which
+`place` treats as the slowest possible cell rather than dividing by zero.
+
 ## Mode decides how many; placement decides which
 
 `coordinator::Mode` plans the breadth of a run — barebones is one worker,

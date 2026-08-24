@@ -2269,6 +2269,92 @@ pub(crate) static CTX_FIT: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 pub(crate) static COMPACT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the engine wants folded, and what must survive verbatim.
+/// This machine's cell report for the hive matrix, built from what the engine
+/// already knows: the model it holds, how much of `prompt_ids` its KV pool
+/// already covers, and whether it is generating.
+///
+/// The warmth number is `kvtree::pick_anchor`'s own answer against THIS
+/// prompt — the same call the local prefill path makes — not a guess about
+/// conversation shape. `docs/11-hive-matrix.md` explains why that distinction
+/// decides the design: placement commits to the number, so a wrong prediction
+/// is worse than reporting a cold cell.
+///
+/// `tok_s` is the last measured decode rate; 0.0 before the first turn, which
+/// `hive::place` treats as the slowest possible cell rather than dividing by
+/// zero.
+pub fn node_report(
+    id: &str,
+    model_label: &str,
+    anchors: &[(Vec<u32>, usize, usize)],
+    prompt_ids: &[u32],
+    last_tok_s: f32,
+    busy: bool,
+) -> logscope_fan::hive::NodeReport {
+    let warm = crate::kvtree::pick_anchor(
+        anchors, prompt_ids, 16, crate::kvtree::suffix_bound(prompt_ids.len()))
+        .map(|(_, ln)| ln)
+        .unwrap_or(0);
+    logscope_fan::hive::NodeReport {
+        id: id.to_string(),
+        tok_s: last_tok_s.max(0.0),
+        residents: vec![(model_label.to_string(), warm, busy)],
+    }
+}
+
+#[cfg(test)]
+mod node_report_tests {
+    use super::*;
+
+    /// The report's warmth is the prefix tree's OWN answer: an anchor sharing
+    /// a long prefix is reported as warm, and an unrelated one as cold. If
+    /// these two cases ever agree, the report has stopped measuring.
+    #[test]
+    fn warmth_comes_from_the_anchor_pool() {
+        let prompt: Vec<u32> = (0..400u32).collect();
+        // an anchor sharing the first 300 tokens
+        let shared: Vec<u32> = prompt[..300].to_vec();
+        let anchors = vec![(shared.clone(), 300usize, 300usize)];
+        let r = node_report("here", "Qwen3-14B", &anchors, &prompt, 12.5, false);
+        assert_eq!(r.residents.len(), 1);
+        assert!(r.residents[0].1 >= 16, "a 300-token shared prefix reported as {}", r.residents[0].1);
+        assert_eq!(r.tok_s, 12.5);
+
+        // an unrelated anchor is cold
+        let other: Vec<u32> = (9000..9300u32).collect();
+        let cold = node_report("here", "Qwen3-14B", &[(other, 300, 300)], &prompt, 12.5, false);
+        assert_eq!(cold.residents[0].1, 0, "an unrelated anchor was reported warm");
+    }
+
+    /// An engine that has not generated yet reports 0.0 rather than a
+    /// fabricated rate; hive::place must survive it.
+    #[test]
+    fn a_fresh_engine_reports_no_rate_and_still_places() {
+        let r = node_report("here", "m", &[], &[1, 2, 3], 0.0, false);
+        assert_eq!(r.tok_s, 0.0);
+        let matrix = logscope_fan::hive::assemble(Some(&r), &[], &[]);
+        let job = logscope_fan::hive::Job {
+            reach: logscope_fan::workerkit::Reach::Lan,
+            partner_node: None, prompt_tokens: 3, models: vec![],
+        };
+        let p = logscope_fan::hive::place(&job, &matrix).expect("a zero-rate cell is still a cell");
+        assert_eq!(p.cell.node.id, "here");
+    }
+
+    /// A busy engine reports busy, and hive::place then skips it — the
+    /// end-to-end path from engine state to a placement decision.
+    #[test]
+    fn a_busy_engine_is_not_placed_on() {
+        let r = node_report("here", "m", &[], &[1, 2, 3], 20.0, true);
+        let matrix = logscope_fan::hive::assemble(Some(&r), &[], &[]);
+        let job = logscope_fan::hive::Job {
+            reach: logscope_fan::workerkit::Reach::Lan,
+            partner_node: None, prompt_tokens: 3, models: vec![],
+        };
+        assert!(logscope_fan::hive::place(&job, &matrix).is_none());
+        assert!(logscope_fan::hive::explain_empty(&job, &matrix).contains("wait, not a failure"));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactRequest { pub summarize_upto: usize, pub keep_recent: usize, pub seq: usize }
 
