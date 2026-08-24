@@ -370,3 +370,39 @@ mod tests {
         assert_eq!(out.text, "a\nB\nc\nd\ne\nF");
     }
 }
+
+
+/// Why a patch-mode reply produced no patches — the text shown to the
+/// operator. Patch mode used to return in silence here, which is what made it
+/// read as a black box: the model answered, no file changed, nothing said.
+/// The three cases call for different next moves, so they are named apart.
+pub fn no_patch_reason(reply: &str) -> &'static str {
+    if reply.trim().is_empty() {
+        "the reply was empty"
+    } else if reply.contains("@@") || reply.contains("--- ") {
+        "the reply contains diff-looking lines this parser did not accept"
+    } else {
+        "the reply was prose — no unified diff in it"
+    }
+}
+
+#[cfg(test)]
+mod no_patch_reason_tests {
+    use super::*;
+
+    #[test]
+    fn each_failure_shape_is_named_apart() {
+        assert!(no_patch_reason("   \n ").contains("empty"));
+        assert!(no_patch_reason("@@ -1,2 +1,3 @@\n context").contains("did not accept"));
+        assert!(no_patch_reason("Sure! I would change the function to...").contains("prose"));
+    }
+
+    /// A reply that DOES parse must never reach this function's prose branch —
+    /// the guard is that parse_patches found something, so this test pins the
+    /// pairing: real patch text is classified as diff-looking, not prose.
+    #[test]
+    fn real_patch_text_is_never_called_prose() {
+        let real = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n-old\n+new\n";
+        assert!(!no_patch_reason(real).contains("prose"));
+    }
+}

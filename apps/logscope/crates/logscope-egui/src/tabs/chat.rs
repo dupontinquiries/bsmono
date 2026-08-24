@@ -2986,7 +2986,17 @@ reply is framed differently from the turn that produced it.");
     /// model produced or the source it was reasoning about.
     fn apply_patch_reply(&mut self, reply: &str) {
         let patches = crate::patchmode::parse_patches(reply);
-        if patches.is_empty() { return; }
+        if patches.is_empty() {
+            // NOT SILENT. Patch mode asks the model for unified diffs; a model
+            // that answered in prose (or in a diff shape this parser does not
+            // accept) produced a reply that changed no files and said nothing
+            // about it — the mode reads as a black box with no response. Say
+            // what happened, and say what the reply DID look like, since the
+            // useful next move differs: re-ask, or turn the mode off.
+            let shape = crate::patchmode::no_patch_reason(reply);
+            self.note = format!("patch mode: no patches applied — {shape}. Nothing was written. Ask again, or turn patch mode off to get whole files.");
+            return;
+        }
         let Some(sess) = self.gitmind_session.as_ref() else {
             self.note = format!("patch mode: {} patch(es) parsed but no workspace is open to apply \
 them to", patches.len());
@@ -7611,10 +7621,24 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
         // student/teacher self-compaction with a pinnable KV checkpoint — so this offers that
         // rather than growing a second folding path beside it.
         if let Some(req) = infer.compact_request() {
-            if req.seq != self.compact_declined && self.stream.is_none() {
-                self.compact_offer = Some(req);
+            // CLEAR ONLY WHAT WE TOOK. The engine publishes this from inside
+            // generate() — i.e. always while the stream is live — so a poll
+            // that skipped the offer because `stream.is_some()` and cleared
+            // anyway threw the request away before the stream could end. The
+            // offer then never appeared, which is "the summarize toggle does
+            // nothing" exactly: the policy fired, the request was published,
+            // and one frame later it was gone. Declines still clear (the
+            // seq check below handles that), so a request is dropped only
+            // when it has actually been seen.
+            match crate::backend::compact_poll(req.seq, self.compact_declined, self.stream.is_some()) {
+                crate::backend::CompactPoll::Take => {
+                    self.compact_offer = Some(req);
+                    infer.clear_compact_request();
+                }
+                crate::backend::CompactPoll::Clear => infer.clear_compact_request(),
+                crate::backend::CompactPoll::Leave => {}
             }
-            infer.clear_compact_request();
+            // else: leave it pending — the next frame after the stream ends takes it
         }
         let mut do_compact = false;
         let mut do_send = false;

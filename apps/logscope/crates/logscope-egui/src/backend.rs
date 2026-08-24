@@ -2270,6 +2270,54 @@ pub(crate) fn compact_pack(summarize_upto: usize, keep_recent: usize) -> u64 {
         | ((keep_recent.min((1 << 21) - 1) as u64) << 22)
         | seq
 }
+/// What a per-frame poll of the compaction request should DO. Pure, because
+/// getting it wrong is invisible: the engine publishes the request from inside
+/// generate(), so every poll that sees a fresh one sees it mid-stream, and a
+/// poll that cleared unconditionally destroyed the signal one frame after it
+/// was raised — the "summarize does nothing" field report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactPoll {
+    /// Show the offer and clear the slot.
+    Take,
+    /// Already declined at this seq — clear without offering.
+    Clear,
+    /// Mid-stream: leave it pending for a later frame.
+    Leave,
+}
+
+pub fn compact_poll(req_seq: usize, declined: usize, streaming: bool) -> CompactPoll {
+    if req_seq == declined {
+        CompactPoll::Clear
+    } else if streaming {
+        CompactPoll::Leave
+    } else {
+        CompactPoll::Take
+    }
+}
+
+#[cfg(test)]
+mod compact_poll_tests {
+    use super::*;
+
+    /// The field bug, as a sequence: the request is raised mid-stream, must
+    /// SURVIVE every frame until the stream ends, and is then offered once.
+    #[test]
+    fn a_request_raised_mid_stream_survives_until_the_stream_ends() {
+        for _frame in 0..5 {
+            assert_eq!(compact_poll(7, 0, true), CompactPoll::Leave,
+                "a mid-stream poll must not consume the request");
+        }
+        assert_eq!(compact_poll(7, 0, false), CompactPoll::Take);
+    }
+
+    #[test]
+    fn a_declined_request_is_cleared_not_re_offered() {
+        assert_eq!(compact_poll(7, 7, false), CompactPoll::Clear);
+        assert_eq!(compact_poll(7, 7, true), CompactPoll::Clear, "declines clear even mid-stream");
+        assert_eq!(compact_poll(8, 7, false), CompactPoll::Take, "a NEW request after a decline offers again");
+    }
+}
+
 pub(crate) fn compact_unpack(v: u64) -> CompactRequest {
     CompactRequest { summarize_upto: (v >> 43) as usize,
                      keep_recent: ((v >> 22) & ((1 << 21) - 1)) as usize,
