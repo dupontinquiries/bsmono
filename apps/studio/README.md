@@ -1334,3 +1334,26 @@ a file is the ops that rebuild the project — `snapshot()` emits each
 lane's points before the relock, tested with a locked track's lane on
 purpose. Wire v10. Named, not built: the timeline view that draws and
 drags these points.
+
+
+**The export flow grew its questions.** The one-click exporter stays (a
+synchronous whole-arrangement render to `./exports`, no dialog); "export…"
+now opens the flow around the questions: opus or wav; full arrangement,
+selection (the hull of the selected clips, refused out loud when nothing
+is), or the rack loop; one file or stems — a stem is a soloed track for the
+arrangement and a channel for the loop, and a track earns a stem only if it
+carries material in the span (for a selection export, only SELECTED
+material: soloing a track whose in-range clip wasn't selected would smuggle
+it in). WAV keeps rate and layout; opus gets a bitrate and pins 48 kHz
+stereo — the codec's contract, enforced in the run rather than trusted to
+the dialog. Then the native picker (`rfd`, XDG portal, behind the `picker`
+feature — a headless build falls back to `./exports` and the status line
+says so; with a real picker, cancelling it cancels), then the tracker: a
+worker thread renders chunk by chunk through `mixdown_with_cache` — one
+cache per job, so the tracked export is bit-identical to the untracked one
+by the streaming renderer's own pinned property — reporting progress over
+mpsc drained once per frame, with a cancel checked between chunks that
+writes NO partial file and keeps the files already finished. The decision
+layer (`export::plan_jobs`/`plan_rack_jobs`) is pure and tested headless;
+the end-to-end tests export real files, decode the opus back through this
+repo's own decoder, and pin that a cancelled run leaves nothing behind.

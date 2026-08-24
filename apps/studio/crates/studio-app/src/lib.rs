@@ -16,6 +16,7 @@ use studio_egui::touch::{Panel, ViewMode};
 use studio_live::transport::Transport;
 
 pub mod audition;
+pub mod export;
 pub mod clip_inspector;
 pub mod library;
 pub mod midi;
@@ -1078,8 +1079,14 @@ pub struct App {
     library_root: std::path::PathBuf,
     library: Vec<library::LibraryEntry>,
     library_open: bool,
-    export_rate: u32,
-    export_layout: studio_audio::format::ChannelFormat,
+    /// The export dialog's plan while it is open, plus its last refusal —
+    /// shown inline so a bad plan is a message, not a closed window.
+    export_dialog: Option<export::Plan>,
+    export_note: String,
+    /// A render in flight, drained once per frame into the tracker.
+    export_run: Option<export::Run>,
+    export_done: Vec<std::path::PathBuf>,
+    export_progress: (usize, usize, f32),
     tune_root: u8,
     tune_mode: studio_fx::retune::Mode,
     /// Velocity source for playing mode. `NullAnalog` today; a Wooting
@@ -1147,8 +1154,11 @@ impl Default for App {
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
               carrier, project_path, library_root, library, library_open: true,
-              export_rate: 48_000,
-              export_layout: studio_audio::format::ChannelFormat::Stereo,
+              export_dialog: None,
+              export_note: String::new(),
+              export_run: None,
+              export_done: Vec::new(),
+              export_progress: (0, 0, 0.0),
               tune_root: 0, tune_mode: studio_fx::retune::Mode::Minor,
               analog: Box::new(analog),
               loaded: SinkContent::Nothing }
@@ -1251,33 +1261,9 @@ impl eframe::App for App {
                     let path = self.project_path.clone();
                     let _ = self.studio.save_to(&path);
                 }
-                egui::ComboBox::from_id_salt("export-rate")
-                    .selected_text(format!("{} Hz", self.export_rate))
-                    .width(84.0)
-                    .show_ui(ui, |ui| {
-                        for r in [44_100u32, 48_000, 96_000, 192_000] {
-                            ui.selectable_value(&mut self.export_rate, r, format!("{r} Hz"));
-                        }
-                    });
-                egui::ComboBox::from_id_salt("export-layout")
-                    .selected_text(self.export_layout.label())
-                    .width(64.0)
-                    .show_ui(ui, |ui| {
-                        for f in studio_audio::format::ChannelFormat::ALL {
-                            ui.selectable_value(&mut self.export_layout, f, f.label());
-                        }
-                    });
-                if ui.button("export wav").clicked() {
-                    let _ = self.studio.export_arrangement(
-                        &self.audio, std::path::Path::new("exports"),
-                        ExportFormat::Wav, self.export_rate, self.export_layout);
-                }
-                if ui.button("export opus").on_hover_text("always 48000 Hz — the codec's contract")
-                    .clicked() {
-                    let _ = self.studio.export_arrangement(
-                        &self.audio, std::path::Path::new("exports"),
-                        ExportFormat::Opus, self.export_rate,
-                        studio_audio::format::ChannelFormat::Stereo);
+                if ui.button("export…").clicked() {
+                    self.export_dialog = Some(export::Plan::default());
+                    self.export_note.clear();
                 }
             });
         });
@@ -1289,6 +1275,9 @@ impl eframe::App for App {
                 });
             });
         });
+        self.export_dialog_window(ctx);
+        self.export_tracker_window(ctx);
+
         // ── files dropped on the window become rack channels ─────────────
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
@@ -1727,6 +1716,192 @@ impl eframe::App for App {
                 }
             }
         });
+    }
+}
+
+
+#[cfg(feature = "app")]
+impl App {
+    /// The export dialog: the plan's questions, answered as values, then
+    /// the native picker, then the run. A refusal (empty selection, all
+    /// channels muted) is shown INLINE — a bad plan is a message to fix,
+    /// not a window that closed on you.
+    fn export_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(mut plan) = self.export_dialog else { return };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Export").open(&mut open).resizable(false)
+            .collapsible(false).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("format:");
+                    ui.selectable_value(&mut plan.format, ExportFormat::Opus, "opus");
+                    ui.selectable_value(&mut plan.format, ExportFormat::Wav, "wav");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("scope:");
+                    ui.selectable_value(&mut plan.scope, export::Scope::Full, "full arrangement");
+                    let has_sel = !self.studio.selection.is_empty();
+                    ui.add_enabled_ui(has_sel, |ui| {
+                        ui.selectable_value(&mut plan.scope, export::Scope::Selection, "selection")
+                            .on_disabled_hover_text("select clips on the timeline first");
+                    });
+                    ui.selectable_value(&mut plan.scope, export::Scope::RackLoop, "rack loop");
+                });
+                ui.checkbox(&mut plan.stems,
+                    if plan.scope == export::Scope::RackLoop { "stems — one file per channel" }
+                    else { "stems — one file per track" });
+                match plan.format {
+                    ExportFormat::Wav => {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("exp-rate")
+                                .selected_text(format!("{} Hz", plan.rate))
+                                .show_ui(ui, |ui| {
+                                    for r in [44_100u32, 48_000, 96_000, 192_000] {
+                                        ui.selectable_value(&mut plan.rate, r, format!("{r} Hz"));
+                                    }
+                                });
+                            egui::ComboBox::from_id_salt("exp-layout")
+                                .selected_text(plan.layout.label())
+                                .show_ui(ui, |ui| {
+                                    for f in studio_audio::format::ChannelFormat::ALL {
+                                        ui.selectable_value(&mut plan.layout, f, f.label());
+                                    }
+                                });
+                        });
+                    }
+                    ExportFormat::Opus => {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("exp-bitrate")
+                                .selected_text(format!("{} kbps", plan.opus_bitrate / 1000))
+                                .show_ui(ui, |ui| {
+                                    for b in [96_000u32, 128_000, 160_000, 192_000, 256_000] {
+                                        ui.selectable_value(&mut plan.opus_bitrate, b,
+                                                            format!("{} kbps", b / 1000));
+                                    }
+                                });
+                            ui.colored_label(egui::Color32::GRAY,
+                                "48 kHz stereo — the codec's contract");
+                        });
+                    }
+                }
+                if !self.export_note.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, &self.export_note);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("choose destination…").clicked() {
+                        close = self.begin_export(&plan);
+                    }
+                    if ui.button("cancel").clicked() { close = true; }
+                });
+            });
+        self.export_dialog = if close || !open { None } else { Some(plan) };
+    }
+
+    /// Plan → picker → run. Returns true when the dialog should close
+    /// (a run started, or the fallback path was taken); false keeps it
+    /// open with `export_note` explaining why.
+    fn begin_export(&mut self, plan: &export::Plan) -> bool {
+        let project = &self.studio.session.doc.project;
+        let suggested = format!("{}.{}", export::sanitize(&project.name), plan.format.ext());
+        // Plan first: a refusal must show BEFORE a native dialog opens over it.
+        enum Planned {
+            Arr(Vec<export::Job>),
+            Rack(Vec<(String, studio_live::Rack)>),
+        }
+        let planned = if plan.scope == export::Scope::RackLoop {
+            export::plan_rack_jobs(plan.stems, &self.studio.rack, self.studio.current_pattern)
+                .map(Planned::Rack)
+        } else {
+            export::plan_jobs(plan, project, &self.studio.selection).map(Planned::Arr)
+        };
+        let planned = match planned {
+            Ok(p) => p,
+            Err(e) => { self.export_note = format!("refused: {e}"); return false; }
+        };
+        let dest = if plan.stems {
+            export::pick_folder().map(export::Dest::Folder)
+        } else {
+            export::pick_save(&suggested).map(export::Dest::File)
+        };
+        let dest = match dest {
+            Some(d) => d,
+            // With a real picker, None means the person cancelled it —
+            // honour that. Without one, None means there is nothing to
+            // open: fall back to ./exports and SAY so.
+            None if export::PICKER_AVAILABLE => return false,
+            None => {
+                self.studio.status =
+                    "no native file dialog on this system — exporting to ./exports".into();
+                if plan.stems {
+                    export::Dest::Folder("exports".into())
+                } else {
+                    export::Dest::File(std::path::Path::new("exports").join(&suggested))
+                }
+            }
+        };
+        self.export_done.clear();
+        self.export_progress = (0, 0, 0.0);
+        self.export_run = Some(match planned {
+            Planned::Arr(jobs) => export::start_arrangement(
+                *plan, jobs, dest, project.clone(), self.audio.clone()),
+            Planned::Rack(jobs) => export::start_rack(
+                *plan, jobs, dest, self.studio.current_pattern,
+                self.audio.clone(), project.name.clone()),
+        });
+        true
+    }
+
+    /// The render tracker: a bar that moves, the files as they land, and a
+    /// cancel that means soon. Repaint is requested while a run is live —
+    /// egui only redraws on input, and a background render is not input.
+    fn export_tracker_window(&mut self, ctx: &egui::Context) {
+        let Some(run) = &self.export_run else { return };
+        let mut finished = false;
+        while let Ok(e) = run.rx.try_recv() {
+            match e {
+                export::Event::Progress { done, jobs, frac } => {
+                    self.export_progress = (done, jobs, frac);
+                }
+                export::Event::File(p) => self.export_done.push(p),
+                export::Event::Done => {
+                    self.studio.status = format!(
+                        "exported {} file{}", self.export_done.len(),
+                        if self.export_done.len() == 1 { "" } else { "s" });
+                    finished = true;
+                }
+                export::Event::Cancelled => {
+                    self.studio.status = format!(
+                        "export cancelled — {} file{} kept", self.export_done.len(),
+                        if self.export_done.len() == 1 { "" } else { "s" });
+                    finished = true;
+                }
+                export::Event::Failed(e) => {
+                    self.studio.status = format!("export failed: {e}");
+                    finished = true;
+                }
+            }
+        }
+        if finished { self.export_run = None; return; }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        let (done, jobs, frac) = self.export_progress;
+        let overall = if jobs == 0 { 0.0 } else { (done as f32 + frac) / jobs as f32 };
+        let mut cancel = false;
+        egui::Window::new("Exporting").resizable(false).collapsible(false)
+            .show(ctx, |ui| {
+                ui.add(egui::ProgressBar::new(overall)
+                    .text(format!("{}/{} files", self.export_done.len().max(done), jobs.max(1))));
+                for f in &self.export_done {
+                    ui.label(f.file_name().map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| f.display().to_string()));
+                }
+                if ui.button("cancel").clicked() { cancel = true; }
+            });
+        if cancel {
+            if let Some(run) = &self.export_run {
+                run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 }
 
