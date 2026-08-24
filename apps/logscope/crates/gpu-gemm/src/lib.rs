@@ -21656,3 +21656,54 @@ mod rope_scaling_tests {
         assert!(v.iter().any(|&x| x != 1.0), "yarn wrote per-dim factors");
     }
 }
+
+#[cfg(test)]
+mod vocab_alignment_tests {
+    use super::*;
+
+    /// The Qwen3 gibberish, hunted to arithmetic: Qwen3's vocabulary is
+    /// 151936 = 256 x 593.5 — NOT block-aligned — while every model the
+    /// engine generated cleanly on is (Llama-3 128256 = 501x256, Qwen2.5
+    /// 152064 = 594x256, deepseek 32256 = 126x256), and the tiny-qwen3
+    /// fixture that passes has vocab 256. This test runs the plain greedy
+    /// path against the windowed path (the one the field log shows active)
+    /// on a fixture whose vocab shares Qwen3's residue (640 ≡ 128 mod 256):
+    /// the two paths are DEFINED to agree greedily, so divergence here is
+    /// the bug, isolated.
+    #[test]
+    fn windowed_and_plain_greedy_agree_on_a_misaligned_vocab() {
+        let gpu = Gpu::new();
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen3-oddvocab.gguf") { Some(b) => b, None => return };
+        let m = gpu.load_gguf_opt(&bytes, false).expect("odd-vocab fixture loads");
+        if m.vocab % 256 != 128 {
+            // The testfix pattern: skip LOUDLY, naming the fix. gen3.py's qwen3
+            // path sizes the vocab from its tokenizer array, overriding the
+            // D/HD/…/VOCAB tuple — so the odd-vocab fixture came out aligned
+            // and this test cannot yet test what it is for. Extend the token
+            // list (or write vocab_size and the embed/output dims from VOCAB)
+            // in the generator, regenerate, and this precondition disappears.
+            eprintln!("SKIP (loud): odd-vocab fixture loaded with vocab {} (residue {}),                        wanted residue 128 — fix tools/tiny-variants/gen3.py's qwen3 vocab                        derivation and regenerate /tmp/tiny-qwen3-oddvocab.gguf", m.vocab, m.vocab % 256);
+            return;
+        }
+        let prompt: Vec<u32> = (0..10u32).map(|i| 1 + (i * 7) % 200).collect();
+        let plain = gpu.generate_kv(&m, &prompt, 12);
+        let windowed = gpu.generate_kv_window(&m, &prompt, 12, 4);
+        assert_eq!(plain, windowed,
+            "greedy windowed decode diverged from plain greedy on vocab {} — \
+             the n-side (vocab) path breaks on a 256-misaligned vocabulary, \
+             which is Qwen3's shape and the field gibberish", m.vocab);
+    }
+
+    /// The control: the same comparison on the ALIGNED tiny-qwen3 fixture
+    /// must also agree — so a failure above is the alignment, not the
+    /// comparison.
+    #[test]
+    fn the_aligned_control_agrees_too() {
+        let gpu = Gpu::new();
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen3.gguf") { Some(b) => b, None => return };
+        let m = gpu.load_gguf_opt(&bytes, false).expect("tiny-qwen3 loads");
+        assert_eq!(m.vocab % 256, 0);
+        let prompt: Vec<u32> = (0..10u32).map(|i| 1 + (i * 7) % 200).collect();
+        assert_eq!(gpu.generate_kv(&m, &prompt, 12), gpu.generate_kv_window(&m, &prompt, 12, 4));
+    }
+}
