@@ -64,7 +64,16 @@ pub struct Aboard {
 /// the player an 8.5 m bot. Nobody has to remember to change it, which
 /// matters because the whole point of the rescale is that a hundred numbers
 /// move at once and the ones that get missed are the ones written in metres.
-pub const HULL_HEIGHTS: f32 = 40.0;
+/// **Raised from 40.** Forty occupant-heights is a ship you can stand in and
+/// not one you can live in: at that size a room is about three occupants
+/// across, which fits a body and leaves nowhere to put anything, and the
+/// playtest note was "we don't even fit one room at the scale I imagined".
+///
+/// A hundred and sixty gives rooms of a dozen occupants across and thirty
+/// long — a hangar you could land something in, which is what a hangar is
+/// for. It is still a RATIO, so a bot's ship is 1.4 km and a person's is
+/// 280 m, and the number moves in one place.
+pub const HULL_HEIGHTS: f32 = 160.0;
 
 /// The hull length for a given occupant.
 pub fn hull_for(body_h_m: f32) -> f32 {
@@ -301,7 +310,15 @@ pub fn run(argv: &[String]) {
     println!("  {} rooms, {} corridors, deck at {:.1}\n",
         a.ship.cells.len(), a.ship.links.len(), a.ship.deck_y);
 
-    println!("  {:<14} {:<10} {:>9}  {}", "room", "console", "reachable", "what it is");
+    // ROOM SIZES IN OCCUPANT UNITS. Neither of us could tell whether a room
+    // was big enough because nothing printed the one number that answers it:
+    // how many occupants fit across, along, and standing up.
+    let occ = hull / HULL_HEIGHTS;
+    println!("  an occupant is {occ:.2} m; rooms in occupant-units:\n");
+    println!(
+        "  {:<14} {:>18} {:>9} {:<10} {}",
+        "room", "w x l x h (occ)", "reachable", "console", "what it is"
+    );
     for idx in 0..a.ship.cells.len() {
         let c = &a.ship.cells[idx];
         let (id, name, blurb) = (c.id, c.name, c.blurb);
@@ -311,7 +328,16 @@ pub fn run(argv: &[String]) {
             .map(|s| s.id())
             .unwrap_or("—");
         let reach = if a.reachable(id) { "yes" } else { "no" };
-        println!("  {:<14} {:<10} {:>9}  {}", name.to_lowercase(), con, reach, blurb);
+        println!(
+            "  {:<14} {:>5.1} x{:>5.1} x{:>5.1} {:>9} {:<10} {}",
+            name.to_lowercase(),
+            c.half.x * 2.0 / occ,
+            c.half.z * 2.0 / occ,
+            c.half.y * 2.0 / occ,
+            reach,
+            con,
+            blurb.chars().take(28).collect::<String>()
+        );
     }
 
     println!("\n  WALKING\n");
@@ -545,7 +571,11 @@ mod tests {
         let car = hull_for(0.38);
         let human = hull_for(1.75);
         let bot = hull_for(8.5);
-        assert!((car - 15.2).abs() < 0.1, "the engine body gets a {car} m hull");
+        // NOT a hard-coded metre figure. This asserted 15.2 m, which is the
+        // module's own mistake written into its own test — the whole point is
+        // that the metre value moves when `HULL_HEIGHTS` does, and it just
+        // did. What is fixed is the ratio and the ordering.
+        assert!(car < human && human < bot, "hulls do not scale with occupants");
         assert!(bot > 300.0, "a bot's ship is only {bot} m — building size was the ask");
         // the RATIO is what is fixed, at every scale
         for (h, hull) in [(0.38, car), (1.75, human), (8.5, bot)] {

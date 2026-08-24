@@ -29,12 +29,25 @@ use glam::Vec3;
 use crate::airlock::{Airlock, Door, Gauge, Kind};
 use crate::content::{RoomKind, HUB};
 
-/// Smallest corridor a vehicle can use, half-extents in metres. A skydribble
-/// car is about 1.1 wide and 0.6 tall at `car.size` 1, so this is roughly
-/// two-and-a-half car widths — enough to drive without scraping and to turn
-/// at a junction.
-pub const DRIVE_HALF_W: f32 = 2.8;
-pub const DRIVE_HALF_H: f32 = 1.9;
+/// Smallest corridor a vehicle can use, in OCCUPANT HEIGHTS.
+///
+/// **These were absolute metres — 2.8 and 1.9 — and that is why you could not
+/// drive into the ship.** Sized for a hull of seventy metres, they survived
+/// the move to occupant-relative hulls unchanged, so at 15 m the clearance
+/// test compared a cap of 0.82 against a requirement of 1.9, decided the ship
+/// was too small to drive, and gave every door a crew hatch. The rooms were
+/// fine; the doors were the wrong size for a body a fifth as tall.
+///
+/// The same mistake as the hull itself, one file over: a number written in
+/// metres does not move when the thing it measures does. Anything sized
+/// against a body belongs in body units.
+pub const DRIVE_HEIGHTS_W: f32 = 1.5;
+pub const DRIVE_HEIGHTS_H: f32 = 1.0;
+
+/// Half-extents of the smallest driveable corridor for a given occupant.
+pub fn drive_half(occupant_h: f32) -> (f32, f32) {
+    (occupant_h * DRIVE_HEIGHTS_W, occupant_h * DRIVE_HEIGHTS_H)
+}
 
 /// What a room is for, and therefore what is in it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,6 +130,10 @@ pub struct Link {
 /// camera about ships or wrapping the world in a refcount.
 #[derive(Clone)]
 pub struct Interior {
+    /// the body this hull was sized for. Kept rather than re-derived, because
+    /// two places computing `length / HULL_HEIGHTS` is the duplication
+    /// `--parity` exists to find.
+    pub occupant_h: f32,
     pub cells: Vec<Cell>,
     pub links: Vec<Link>,
     /// the hull this was fitted into
@@ -177,9 +194,13 @@ impl Interior {
             hull_half.y * 0.6,
             (hull_half.z - reach_z * s).max(0.4),
         );
-        let drive_clearance = cap.x >= DRIVE_HALF_W && cap.y >= DRIVE_HALF_H;
+        // the occupant this hull was built for, recovered from its length —
+        // `aboard::HULL_HEIGHTS` is the other end of the same relationship
+        let occupant = hull_length / crate::aboard::HULL_HEIGHTS;
+        let (dw, dh) = drive_half(occupant);
+        let drive_clearance = cap.x >= dw && cap.y >= dh;
         let floor = if drive_clearance {
-            Vec3::new(DRIVE_HALF_W, DRIVE_HALF_H, DRIVE_HALF_W)
+            Vec3::new(dw, dh, dw)
         } else {
             cap * 0.55
         };
@@ -263,7 +284,7 @@ impl Interior {
             ),
             None => Airlock::new(Vec3::ZERO, Vec3::ONE, Gauge::Personnel),
         };
-        Interior { cells, links, hull_half, deck_y, drive_clearance, lock }
+        Interior { occupant_h: occupant, cells, links, hull_half, deck_y, drive_clearance, lock }
     }
 
     fn box_sdf(p: Vec3, c: Vec3, h: Vec3) -> f32 {
@@ -361,12 +382,13 @@ impl Interior {
         if !self.walkable(p) {
             return false;
         }
+        let (dw, dh) = drive_half(self.occupant_h);
         let probes = [
-            Vec3::new(DRIVE_HALF_W * 0.9, 0.0, 0.0),
-            Vec3::new(-DRIVE_HALF_W * 0.9, 0.0, 0.0),
-            Vec3::new(0.0, DRIVE_HALF_H * 0.9, 0.0),
-            Vec3::new(0.0, 0.0, DRIVE_HALF_W * 0.9),
-            Vec3::new(0.0, 0.0, -DRIVE_HALF_W * 0.9),
+            Vec3::new(dw * 0.9, 0.0, 0.0),
+            Vec3::new(-dw * 0.9, 0.0, 0.0),
+            Vec3::new(0.0, dh * 0.9, 0.0),
+            Vec3::new(0.0, 0.0, dw * 0.9),
+            Vec3::new(0.0, 0.0, -dw * 0.9),
         ];
         probes.iter().all(|o| self.walkable(p + *o))
     }
@@ -549,11 +571,29 @@ mod tests {
     }
 
     #[test]
-    fn a_lander_is_walk_only_and_says_so() {
-        // 28 m long is about 5 m in the beam: a vehicle corridor would be
-        // wider than the ship. Better to report it than to fake it.
-        let i = Interior::generate(28.0);
-        assert!(!i.drive_clearance);
+    fn this_plan_is_driveable_at_every_size() {
+        // THE OLD TEST SAID A 28 M LANDER IS WALK-ONLY, and it was right when
+        // the corridor requirement was 2.8 absolute metres. Now that the
+        // requirement is in OCCUPANT HEIGHTS and the hull is too, both sides
+        // of the comparison scale together and the ratio is fixed — so
+        // `drive_clearance` no longer depends on length at all.
+        //
+        // That is a real consequence and worth stating rather than papering
+        // over: with one plan at fixed proportions, "walk-only" is not
+        // something a ship can be by being SHORT. It would have to be a
+        // different plan — narrower in the beam relative to its length — and
+        // there is only one plan today.
+        let sizes = [0.25f32, 1.0, 4.0, 20.0].map(|k| crate::aboard::HULL_HEIGHTS * k);
+        let first = Interior::generate(sizes[0]).drive_clearance;
+        for s in sizes {
+            let i = Interior::generate(s);
+            assert_eq!(
+                i.drive_clearance, first,
+                "a {s} m hull disagrees with the others; the proportions are fixed"
+            );
+        }
+        assert!(first, "the standard plan cannot be driven at any size");
+        let i = Interior::generate(sizes[1]);
         // and it is still a real interior you can walk
         for c in &i.cells {
             assert!(i.walkable(c.centre), "{} is solid even on foot", c.id);
@@ -653,11 +693,16 @@ mod tests {
         assert!(big.drive_clearance);
         let bay = big.links.iter().find(|l| l.door.kind == Kind::Launch).unwrap();
         assert!(bay.door.admits(Gauge::Launch), "a flyer cannot leave the hangar");
-        // a walk-only lander fits nothing but crew, and says so consistently
-        let small = Interior::generate(28.0);
-        assert!(!small.drive_clearance);
-        assert!(small.links.iter().all(|l| !l.door.admits(Gauge::Vehicle)),
-            "a walk-only ship has a vehicle door");
+        // and a small one is driveable too, because the plan's proportions
+        // are fixed — see `this_plan_is_driveable_at_every_size`. What used
+        // to be asserted here (a short ship is walk-only) stopped being true
+        // when the corridor requirement moved into occupant units.
+        let small = Interior::generate(crate::aboard::HULL_HEIGHTS * 0.25);
+        assert!(small.drive_clearance);
+        assert!(
+            small.links.iter().any(|l| l.door.admits(Gauge::Vehicle)),
+            "a driveable ship has no vehicle door"
+        );
     }
 
     #[test]

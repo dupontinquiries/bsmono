@@ -143,6 +143,22 @@ fixed, and moving between them is a position and a walkable check.
       (`main.rs`, the `M_TERRAIN_0 + ci` block). Both want eyes on the result,
       which is why I stopped here rather than writing them blind.
 
+### 2c. The ship as a Transformer — NOT STARTED
+
+The ship is meant to be its own Transformer and is currently a box that holds
+rooms. The catalogue has the pieces:
+
+- **31 ship models**, 21 of them `spaceship` class.
+- `imported_spaceship_praetor_aka_spaceship_with_partial_interior` — a ship
+  model that already HAS an interior, which is the hard part.
+- `imported_reference_ship_parts_for_transformation_aka_star_sparrow_modular_spaceship`
+  — parts authored for a ship that folds. That is the reference for this.
+
+What it needs that nothing else has: `xform.rs` folds a chassis, and a ship
+folding is the same machine at a different scale with rooms inside it that
+have to go somewhere. That last clause is the real work — a room is a carved
+void and a folded ship's voids move.
+
 ### 3. Campaign missions you can play
 
 - [x] **A sortie flies to its destination before it resolves.** The Bridge

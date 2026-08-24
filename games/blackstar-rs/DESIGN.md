@@ -6437,6 +6437,42 @@ the table already holds.
 
 1133 passing, zero dead code in the module.
 
+YOU COULD NOT DRIVE INTO THE SHIP, AND THE REASON WAS METRES AGAIN.
+
+`DRIVE_HALF_W` and `DRIVE_HALF_H` were absolute — 2.8 and 1.9 — sized for a
+seventy metre hull and left unchanged when hulls became occupant-relative. At
+15 m the clearance test compared a cap of 0.82 against a requirement of 1.9,
+concluded the ship was too small to drive, and gave every door a CREW HATCH.
+The rooms were fine. The doors were sized for a body five times taller than
+the one flying.
+
+Same mistake as the hull, one file over, and the lesson is the same: a number
+written in metres does not move when the thing it measures does.
+
+AND FIXING IT HAD A CONSEQUENCE WORTH STATING. With the requirement in
+occupant heights AND the hull in occupant heights, both sides of the
+comparison scale together — so `drive_clearance` no longer depends on length
+at all. "Walk-only lander" stopped being something a ship can be by being
+SHORT; it would have to be a different PLAN, narrower in the beam, and there
+is one plan. Two tests asserted the old behaviour and now assert the new
+property instead of being tuned until they passed.
+
+HULL_HEIGHTS 40 -> 160. Forty is a ship you can stand in and not one you can
+live in: rooms three occupants across, which fits a body and leaves nowhere to
+put anything. At 160 the rooms are 12.5 x 12.5 x 8.1 occupants and the bridge
+is 16.9 — a hangar you could land something in, which is what a hangar is for.
+
+I ALSO HAD 15.2 HARD-CODED IN THE TEST FOR THE MODULE THAT ARGUES AGAINST
+HARD-CODED METRES. It failed the moment `HULL_HEIGHTS` moved, which is the
+test doing its job and me having written the wrong assertion: what is fixed is
+the RATIO and the ordering, not the metre value.
+
+AND THE DIAGNOSTIC WAS MISSING THE ONE NUMBER THAT MATTERED. Neither of us
+could tell whether a room was big enough because nothing printed room sizes in
+occupant units. `--aboard` does now, and the answer was visible immediately.
+
+1133 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
