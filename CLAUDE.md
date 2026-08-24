@@ -7,7 +7,9 @@ are.
 Orientation, not rules: [NEWCOMER_DEVELOPER.md](NEWCOMER_DEVELOPER.md) for the
 build system, [LAYOUT.md](LAYOUT.md) for the taxonomy,
 [docs/agents/INDEX.md](docs/agents/INDEX.md) for the doc catalog,
-[maintenance/C9_TODO.md](maintenance/C9_TODO.md) for open threads.
+[maintenance/C10_TODO.md](maintenance/C10_TODO.md) for the newest open threads
+and [maintenance/C9_TODO.md](maintenance/C9_TODO.md) for the larger backlog
+behind it (still current — c10 edited its status lines in place).
 
 ---
 

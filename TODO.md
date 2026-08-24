@@ -1,8 +1,10 @@
 # TODO — monorepo unification
 
-Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log) and
-`maintenance/C9_TODO.md` (the c9 session's open threads, each marked with how
-it was established — verified, read, or assumed).
+Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log),
+`maintenance/C10_TODO.md` (the c10 session's open threads — start here) and
+`maintenance/C9_TODO.md` (the larger backlog behind it; c10 edited its status
+lines in place, so it is current). Each item in both is marked with how it was
+established — verified, read, or assumed.
 
 `maintenance/journal.txt` was referenced here as the session catalog and does
 not exist in the tree; tracked as C9-7c rather than silently dropped.
