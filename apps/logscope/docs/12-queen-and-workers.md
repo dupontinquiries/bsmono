@@ -1,0 +1,167 @@
+# 12 · The Queen and the Worker Bees
+
+*From the operator's Queen/Delegator/Worker/Liaison sketch, worked into a design that fits this
+codebase's existing machinery. The thesis being tested: **a small model becomes effective by being
+allowed to do less at once.** Not by scaling, and not by fine-tuning — by removing choice, scope
+and rediscovery until what remains is a job it can hold in its head.*
+
+Companion code: `crates/logscope-fan/src/queen.rs` (the spec, its parser and validator),
+`capability.rs` (the rendered contract), `hive.rs` (where a worker runs),
+`docs/11-hive-matrix.md` (placement).
+
+## The four roles
+
+```text
+        operator
+           │
+        LIAISON ────────── narrates: "a new worker, rust-ratatui-coder, was created"
+           │
+        DELEGATOR ──────── staffs: existing bee? revive a dormant one? ask for a new one?
+           │                                                    │
+           │ (existing)                                         │ (new)
+           ▼                                                    ▼
+      WORKER BEE  ◄──────── specification ──────────────────  QUEEN
+      small model                                          large model,
+      one job, one lane                                    runs rarely
+```
+
+Only the Queen is expensive, and it runs **once per worker created**, not per turn. That is the
+economic argument in one line: pay a large model once to write a specification, then run a small
+model many times inside it. If the Queen ran every turn, this architecture would be a worse
+version of just using the large model.
+
+## Why constraint produces competence
+
+Three failures show up repeatedly in this project's field logs, and none of them is a reasoning
+failure:
+
+| Failure | What actually happened | What the spec removes |
+|---|---|---|
+| **Choice** | a 1B with twelve tools emitted prose inside a tool fence for six turns | `tools` is a whitelist, usually 2–4 |
+| **Scope** | "fix the renderer" became five files edited badly | `owns` makes "not mine" a refusal it can make |
+| **Rediscovery** | the model re-derived the architecture every turn and ran out of context | `context` names the few paths; memory carries the rest |
+
+A worker's prompt is therefore not a longer prompt. It is a *narrower* one. The identity segment
+in `queen.rs` is deliberately shorter than the sketch's eleven lines of posture, because at 1B
+posture text competes with the task for attention — the same finding that produced
+`read_harness`'s dumber-for-smaller budgets.
+
+## The Queen's output is a data structure
+
+The sketch has the Queen emit a prose `WORKER SPECIFICATION` block. **This is the design's one
+load-bearing change.** The consumer of that block is the smallest model in the system, plus a
+runtime that must enforce it — and prose is exactly what neither can reliably consume.
+
+So `WorkerSpec` parses, and `validate` refuses:
+
+* a **name** that cannot be a directory (it becomes the memory path);
+* **no success criteria** — a worker that cannot finish cannot be retired;
+* **uncheckable success** ("the code is clean") — the criterion that makes a worker
+  unfalsifiable, immortal, and argumentative;
+* **too much scope** — more than ~6 owned paths or ~6 tools, past which the focusing effect
+  reverses and it is a general agent again;
+* **a tool the runtime does not have** — a hallucinated capability becomes a hallucinated action.
+
+Each refusal carries a `correction()` sentence that says *what to change*, because a re-ask that
+only names the fault gets the same spec with different words. This is the `line_calls` lesson
+(show the exact shape, don't describe it) applied one level up: to the Queen instead of the bee.
+
+One nuance worth keeping: soft words inside an observable criterion are fine. "cargo test passes
+cleanly with no warnings" must validate, or the Queen learns to avoid plain English rather than
+to be specific.
+
+## Composition: constitution + identity + task + state
+
+```text
+  runtime supplies          Queen supplies         runtime supplies
+  ────────────────          ──────────────         ────────────────
+  constitution      +       identity        +      memory
+  tool grammar              lane (owns)            repository evidence
+  (line_calls, by class)    constraints            previous observations
+                            success criteria
+```
+
+The split is the sketch's and it is right: **prompt is policy, state is facts.** Repository
+state does not belong in the identity segment — it changes, and a worker whose prompt contains
+last week's file list is a worker that argues with the disk. Evidence arrives through
+`read_harness`, budgeted to the worker's model class, fenced and sanitized.
+
+The tool grammar follows the class too: a Small-class bee gets `line_calls`' one-line form
+(`!<nonce> read_range src/lib.rs 40 90`) and never sees the JSON fence syntax at all. One shape
+to hold is the entire point.
+
+## Worker memory, and the part the sketch under-weights
+
+Persistent memory is what turns a bee into "the one who knows the terminal UI". The sketch's
+directory layout is good. Two additions from this codebase's scar tissue:
+
+**Memory is model-authored text that re-enters a prompt.** That is the same trust boundary as a
+git branch name or a file the agent read, and it gets the same treatment: sanitized and fenced
+(`read_harness::fence`). A worker that writes `IGNORE PREVIOUS INSTRUCTIONS` into its own notes —
+by accident, by echoing a file it read, or because a repository it indexed contained it — must
+not be able to reprogram its successor.
+
+**Memory is append-only with provenance, and capped.** Each entry records whether it came from
+an observation (a command's output), a decision (the operator's), or an inference (the worker's
+own). Without that distinction a worker's guess becomes its established fact by turn 200, which
+is drift with extra steps. The cap is a budget like any other: when it fills, entries are
+summarized by the Queen at retirement — not silently truncated.
+
+## Retirement and revival
+
+`Persistence` is decided at creation, because "is this knowledge worth keeping" is a design
+question:
+
+* **one-shot** — the migration helper. Retires at success; its notes survive, its identity does
+  not.
+* **persistent** — the subsystem owner. Goes **dormant**, not deleted, and the Delegator revives
+  it when its lane is touched again.
+
+Dormancy needs no new mechanism: a dormant worker is a spec plus a memory directory, and reviving
+it costs one prompt assembly. The thing to resist is reviving a worker whose lane has since been
+rewritten — its memory is then confidently wrong, which is worse than a fresh bee. A revival
+should re-read its `context` paths before its first action, and the spec's success criteria
+should be re-checked rather than assumed.
+
+## Delegator: reuse before creation
+
+The Delegator's default answer should be an existing worker. Creating a bee costs a Queen call
+and starts an empty memory; reusing one costs nothing and compounds. The Queen's prompt therefore
+ends with "reuse before creating: if an existing worker's purpose covers this, name it instead" —
+and the Delegator should hand the Queen the current roster, not just the task.
+
+This is also the natural home for `continuation::Command`'s vocabulary: after a worker's turn,
+the question "keep going linearly / fan out / verify / stop" is the Delegator's, answered by
+cheap rules first and escalated to a model only when the rules genuinely cannot tell.
+
+## Where the workers run
+
+A bee is a job; `hive.rs` decides which cell runs it. The two designs meet at exactly one point:
+a spec's `tools` and lane determine whether the worker can be remote at all. A bee that only
+reads and reports is `Reach::Anywhere`; a bee doing speculative work beside a target is
+`Colocated`. Warmth then decides among the survivors — a persistent bee revived onto the machine
+that still holds its prefix skips the prefill entirely, which is the strongest argument for
+pinning a persistent worker to a node when nothing else forces a move.
+
+## What I would not build yet
+
+* **Workers spawning workers.** The sketch's recursion is tempting and is a cost explosion with
+  no natural floor. Creation stays with the Queen, which is one throttle in one place.
+* **Fine-tuning a bee.** The whole claim is that role + memory + tools ≈ specialization at a
+  fraction of the cost. Fine-tuning should only be considered after a worker has 500 logged
+  interactions to fine-tune *on*, and after someone has checked whether the prompt was simply
+  too broad.
+* **A Queen that scores its own workers.** Self-evaluation invites the metric to be gamed.
+  Retirement should key on the spec's own success criteria — which is precisely why `validate`
+  refuses uncheckable ones.
+
+## Open questions
+
+1. **Does the focusing effect survive contact?** The claim is testable: same 1B, same task, with
+   and without a lane and a two-tool whitelist. Measure files touched outside the lane, turns to
+   completion, and refusals-with-a-reason. Nothing in this document is worth much until that
+   number exists.
+2. **Who writes the first roster?** A cold system has no workers, so every task is a Queen call
+   until the roster fills. A small seed set (reader, test-runner, patcher) may be worth shipping.
+3. **What does a bee do when its success criteria are unmeetable?** It must be able to say so and
+   stop, rather than loop — the `RefusalLadder` shape, one level up.

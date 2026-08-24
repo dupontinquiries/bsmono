@@ -64,6 +64,10 @@
 // workerkit's Reach, coordinator's mode and the engine's prefix-tree warmth,
 // which were four correct modules with nothing between them.
 #[allow(dead_code)] pub mod hive;
+// The Queen designs workers instead of doing work: a parseable, validated
+// WorkerSpec, so the smallest model in the system can consume what the
+// largest one emits. docs/12-queen-and-workers.md.
+#[allow(dead_code)] pub mod queen;
 // How far the operator has gone past each node: what lets the graph badge an
 // unanswered question instead of the run having to stop for it.
 #[allow(dead_code)] pub mod readmark;
