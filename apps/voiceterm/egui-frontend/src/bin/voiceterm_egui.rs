@@ -2858,41 +2858,6 @@ impl eframe::App for VoicetermApp {
             self.pty_out.extend_from_slice(&key_bytes);
             // THE SCREEN. Drawn only when there is something on it, so a fresh
             // session shows the block log rather than 24 blank rows.
-            if self.grid.is_dirty() || self.grid.cursor() != (0, 0) {
-                let (cx, cy) = self.grid.cursor();
-                // The grid reports WHICH rows changed; RowCache turns that into
-                // the minimal set to re-shape. take_dirty rather than
-                // dirty_rows, so the range is consumed once — reading it
-                // without clearing would mark the same rows every frame and
-                // the cache would never hit.
-                if let Some((lo, hi)) = self.grid.take_dirty() {
-                    self.row_dirty.mark_range(lo, hi);
-                }
-                let width = ui.available_width();
-                // frame_plan flushes the dirty set and INVALIDATES those
-                // slots, returning which rows need rebuilding. The return value
-                // is not iterated here — get_or_build below does the work,
-                // building exactly the invalidated rows and reusing the rest.
-                // Calling it for its effect is the point.
-                let _plan = voiceterm_egui::row_render::frame_plan(
-                    &mut self.row_dirty, &mut self.row_galleys, width);
-                egui::Frame::NONE.show(ui, |ui| {
-                    for y in 0..24 {
-                        // A hit returns the cached string; a miss shapes it
-                        // once. row_text is the expensive part on a wide grid,
-                        // and the closure means an unchanged row never calls it.
-                        let Some(row) = self.row_galleys
-                            .get_or_build(y, || self.grid.row_text(y)) else { continue };
-                        if row.trim().is_empty() && y > cy { continue; }
-                        // The cursor row is marked rather than drawn as a
-                        // block: this is a monospace label, not a canvas, and a
-                        // fake caret that sits in the wrong column is worse
-                        // than none.
-                        let txt = if y == cy { format!("{row}  <{cx}") } else { row };
-                        ui.label(egui::RichText::new(txt).monospace().small());
-                    }
-                });
-            }
             if let Some(line) = submitted {
                 // AUDIT, before the bytes leave. Every command joins the hash
                 // chain — except one typed at a password prompt, which is the
@@ -3139,6 +3104,55 @@ impl eframe::App for VoicetermApp {
             // Long-press on the pane opens the 3x3 marking menu at the press point (detached host:
             // the terminal isn't a widget Response). The line selection the long-press also made is
             // exactly what the menu's "copy" cell copies.
+            // THE LIVE VT GRID, in the FOCUSED pane. This block used to sit
+            // above the pane layout in flow position, so every typed byte
+            // echoed into a thin strip at the top of the panel while the
+            // bordered pane below showed the demo log — the field report's
+            // garbled line (its `<NN` tail is this block's cursor marker).
+            // Painting here, after the focused app, puts the live session in
+            // the pane the border says is focused. One grid still serves
+            // whichever pane holds focus; a per-pane grid (session follows
+            // its pane) stays on-device work, recorded in C11_TODO.
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(term_rect.shrink(8.0)),
+                |ui| {
+            if self.grid.is_dirty() || self.grid.cursor() != (0, 0) {
+                let (cx, cy) = self.grid.cursor();
+                // The grid reports WHICH rows changed; RowCache turns that into
+                // the minimal set to re-shape. take_dirty rather than
+                // dirty_rows, so the range is consumed once — reading it
+                // without clearing would mark the same rows every frame and
+                // the cache would never hit.
+                if let Some((lo, hi)) = self.grid.take_dirty() {
+                    self.row_dirty.mark_range(lo, hi);
+                }
+                let width = ui.available_width(); // the child ui below term_rect's border
+                // frame_plan flushes the dirty set and INVALIDATES those
+                // slots, returning which rows need rebuilding. The return value
+                // is not iterated here — get_or_build below does the work,
+                // building exactly the invalidated rows and reusing the rest.
+                // Calling it for its effect is the point.
+                let _plan = voiceterm_egui::row_render::frame_plan(
+                    &mut self.row_dirty, &mut self.row_galleys, width);
+                egui::Frame::NONE.show(ui, |ui| {
+                    for y in 0..24 {
+                        // A hit returns the cached string; a miss shapes it
+                        // once. row_text is the expensive part on a wide grid,
+                        // and the closure means an unchanged row never calls it.
+                        let Some(row) = self.row_galleys
+                            .get_or_build(y, || self.grid.row_text(y)) else { continue };
+                        if row.trim().is_empty() && y > cy { continue; }
+                        // The cursor row is marked rather than drawn as a
+                        // block: this is a monospace label, not a canvas, and a
+                        // fake caret that sits in the wrong column is worse
+                        // than none.
+                        let txt = if y == cy { format!("{row}  <{cx}") } else { row };
+                        ui.label(egui::RichText::new(txt).monospace().small());
+                    }
+                });
+            }
+            })
+            ;
             if let Some(p) = self.app.take_long_press() {
                 self.pane_menu.open_at(ui, p, &pane_menu());
             }
@@ -3174,9 +3188,16 @@ impl eframe::App for VoicetermApp {
                         self.toasts.success("Copied", ctx.input(|i| i.time));
                     }
                     Some(PaneAction::CommandPalette) => self.app.open_search(), // nearest on-device affordance today
-                    // Split/Close/NewTab drive the workspace (ws_command) and Mic starts capture —
-                    // on-device wiring, same status as the sidebar's New/Graph/Settings above.
-                    Some(PaneAction::Split(_)) | Some(PaneAction::Close(_)) | Some(PaneAction::NewTab) => {}
+                    // Through apply(), the same WsCall path the keyboard chords use —
+                    // this arm was `{}` and the 3x3 menu's new-tab/split/close silently
+                    // did nothing (field report, c11). Mic remains on-device wiring.
+                    Some(PaneAction::Split(cmd)) | Some(PaneAction::Close(cmd)) => {
+                        // the variant carries the EXACT ws_command string (gesture_menus:236)
+                        self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(cmd.into()));
+                    }
+                    Some(PaneAction::NewTab) => {
+                        self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("new tab".into()));
+                    }
                     Some(PaneAction::Mic) => {}
                     Some(PaneAction::PageUpScrollback) => {
                         let page = self.app.terminal.grid.rows.saturating_sub(1).max(1);
