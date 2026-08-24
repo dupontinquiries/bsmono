@@ -46,11 +46,11 @@ edits exactly reversible, which floats are not.
 
 | crate | what it is | tests |
 |---|---|---|
-| `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
+| `studio-core` | timebase, tracks, clips, sources, effects, **automation lanes**, `Op`, `History` | 39 |
 | `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 93 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **streaming render** + **block-backed edit sequences** + **destructive editing** | 83 |
-| `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
+| `studio-live` | pattern rack, **piano roll**, synths (incl. beatspace), recording, transport | 69 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
 | `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
@@ -1288,3 +1288,613 @@ picks; the amount and asymmetry move instead. Unvoiced stretches HOLD the
 register so a drum hit between two sung notes cannot swing the character,
 and `detectors()` exposes both numbers, because an adaptive effect whose
 decisions you cannot see is indistinguishable from a broken one.
+
+
+**The Program panel is the piano roll.** FL's grammar splits a channel's
+content in two — the step grid for hits, the roll for held notes, chords
+and slides — and the Rack tab only ever had the first. `Pattern` gains
+`rolls`: per-channel `Note` lists (key offset from the channel's own pitch,
+start, length, velocity, slide), serde-defaulted so a pre-roll rack loads
+with the empty roll it effectively had. A roll note renders through the
+SAME placement pass as a hit: swing moves it by the off-step rule, choke
+groups cut it, the bounce and the audition loop render it, and the
+whole-rack LWW sync carries it — a note is more pattern, not a second
+engine. Its length is its gate (cut with the choke fade; a short-decay 808
+under a long note simply ends earlier), and slide is a note property
+gliding from the previous roll note, which is where FL puts it. Samplers
+pitch now too: with no pitch field for `apply_step_mod` to offset, the
+renderer repitches the RENDERED voice — which un-no-ops the grid's Tune
+lane on sample channels in the same breath and makes a one-shot chop a
+melodic instrument. Wire v9 carries the roll. The panel itself follows
+`grid`'s contract: pure geometry (row/key mapping across negative offsets,
+body-vs-edge hit testing) returning edits as values; drag draws a note out
+in one gesture, click removes, the right edge resizes, right-click toggles
+slide. Velocity got its lane: bars under the
+roll sharing its columns the way `lanes` sits under the grid, one dynamic
+per start column because a chord is one gesture. The automation strip
+landed too — `studio_egui::auto` under the timeline, mapping time through
+the SAME `View` the arrangement uses so alignment is by construction:
+click places a point, right-click removes, a vertical drag is one op and
+a time move is two (the left-trim precedent), all through the op-log door
+so a ride is undoable, on the wire, and refusable out loud.
+
+**Automation — the ride, as ops.** `Project` gains lanes: points per
+`AutoTarget` (track gain and bus gain first; the enum is where a
+clip-gain or effect-parameter target lands later), edited by
+`SetAutoPoint`/`RemoveAutoPoint` in the house op shape — absolute
+(time, value) so peers converge per-point, a refusal when a removal has
+nothing to restore, locked tracks refusing their lane the way they refuse
+their fader. A lane RIDES its fader (multiplied, never substituted —
+pinned at 0.5 × 0.5 = 0.125), and a project with no lanes renders
+bit-identically to a pre-automation one. `mixdown` evaluates per sample
+at the tick its clip loop already computes; the bus fold rides per
+interleaved frame so a ramp cannot tilt the stereo image; the streaming
+engine inherits both through the shared path. A file saves lanes because
+a file is the ops that rebuild the project — `snapshot()` emits each
+lane's points before the relock, tested with a locked track's lane on
+purpose. Wire v10. Named, not built: the timeline view that draws and
+drags these points.
+
+
+**The export flow grew its questions.** The one-click exporter stays (a
+synchronous whole-arrangement render to `./exports`, no dialog); "export…"
+now opens the flow around the questions: opus or wav; full arrangement,
+selection (the hull of the selected clips, refused out loud when nothing
+is), or the rack loop; one file or stems — a stem is a soloed track for the
+arrangement and a channel for the loop, and a track earns a stem only if it
+carries material in the span (for a selection export, only SELECTED
+material: soloing a track whose in-range clip wasn't selected would smuggle
+it in). WAV keeps rate and layout; opus gets a bitrate and pins 48 kHz
+stereo — the codec's contract, enforced in the run rather than trusted to
+the dialog. Then the native picker (`rfd`, XDG portal, behind the `picker`
+feature — a headless build falls back to `./exports` and the status line
+says so; with a real picker, cancelling it cancels), then the tracker: a
+worker thread renders chunk by chunk through `mixdown_with_cache` — one
+cache per job, so the tracked export is bit-identical to the untracked one
+by the streaming renderer's own pinned property — reporting progress over
+mpsc drained once per frame, with a cancel checked between chunks that
+writes NO partial file and keeps the files already finished. The decision
+layer (`export::plan_jobs`/`plan_rack_jobs`) is pure and tested headless;
+the end-to-end tests export real files, decode the opus back through this
+repo's own decoder, and pin that a cancelled run leaves nothing behind.
+
+
+**Saves have history now.** The `.studio` file already carried everything a
+session is — snapshot ops (mixer busses, chains, sends, automation), the
+rack (channels, patterns, rolls), optional undo history — and its folder
+already moved as a unit. `project_dir` makes that folder a git repository:
+every Ctrl+S commits (identity supplied inline, so a machine that never ran
+`git config` still saves), `meta.toml` lands beside the file (name, bpm,
+counts — the greppable card catalogue), and "the mix from Tuesday" is
+`file_at(commit, "project.studio")`, read without touching the working
+tree. An unchanged save is `Ok(None)` — a fact, not an error — and a
+missing git binary demotes to a status note, never a lost save.
+`.gitattributes` marks compressed media `-delta`: the deltas do not exist,
+and the real compression rule stays the asset store's (never store PCM).
+For media that outgrows git — video — `MediaMode::External` gitignores
+`media/` and commits a manifest instead, so every version still says what
+it needs while the bytes live in a content-addressed store: `apps/gitmind`'s
+(AV1 transcode, near-dup chunk linking — its `MEDIA.md`) is the intended
+tenant of that seam, by path rather than by a cross-app crate dependency.
+
+**The workbench layout.** Four full-screen tabs remain the phone's layout;
+the desktop gets "workbench": the timeline (inspector, arrangement,
+automation strip) stays on screen while Rack / Program / Mixer live in a
+resizable strip below it, sharing the SAME panel state as the tabs so
+switching layouts never loses your place.
+
+**The routing map.** The Mixer's rows are the right place to CHANGE routing
+and a hopeless place to READ it — a graph question answered one dropdown at
+a time. The map draws the whole graph at once: tracks left, busses in
+columns by depth (deepest first, so left→right follows the signal), master
+right; main routes solid, sends dashed (amber = pre-fader); an unrouted
+track's implicit master feed drawn explicitly, because a default nobody can
+see is most of why routing reads as confusing. Read-only on purpose: the
+map explains, the rows edit. Layout is pure and pinned, including that a
+foreign file's cycle terminates instead of hanging the frame.
+
+
+**The archive is the professional artifact.** The folder-of-relative-paths
+save loses files eventually — a moved sample, a half-synced directory, a
+session with holes. `.studioarch` is the session as ONE file: all state
+(the SaveFile — mixer, automation, rack with patterns and rolls) and every
+reference recording embedded, opening whole or refusing whole (every-prefix
+truncation sweep, the collab format's discipline; trailing garbage refuses
+too). The save popup's FIDELITY SLIDER decides what the audio costs:
+sketch/demo/standard re-encode each source to Opus proxies at 64/96/160k —
+the musician's proxy workflow, an archive that plays everywhere — while
+master embeds originals byte-for-byte (a `.opus` stays `.opus`) with
+dithered 16-bit WAV for PCM-only takes, never a hole. The popup also holds
+the credits / authorized collaborators and the SEARCH PATHS where each
+device may hold full-quality artifacts: on open, `find_upgrade` checks them
+— exact basename first, then lossless extensions before lossy, because a
+worse file than the proxy is an upgrade in name only — and decodes the
+device's file over the embedded proxy. Pinned end to end: a bounced session
+packed, moved to a bare directory, reopened from the archive ALONE, and the
+beat still renders. `project_dir`'s git history stays as working-folder
+convenience; the archive is what leaves the building.
+
+**The viewport, and the music-video loop.** The workbench grew a
+configurable right slot — viewport (default), mixer, rack, program, or off
+— so the frame under the playhead sits beside the music panels instead of
+an export → import → watch iteration through the filesystem. Clip choice is
+pure and pinned (topmost video track wins, trims honoured, a gap lets the
+lower track show through); frames come from `studio_video::frame_rgb` (raw
+RGB at a fixed size, aspect padded — no image decoder in the loop, tested
+against a real ffmpeg fixture) cached on a half-second key: a scrub
+preview and edit reference at ~2 fps, said on screen, with realtime
+playback named as the streaming decoder's job. Tabs stay the phone layout;
+every strip is resizable or off.
+
+
+**Archive v2: dedup is exact; similarity is a report.** Media is stored as
+content-defined chunks (the assets module's own chunker): a re-bounce that
+changed one bar, a comped vocal reusing a phrase — the shared bytes land
+once, every reassembly verifies against its whole-asset hash, and one
+flipped bit refuses the whole archive, because a subtly-wrong take is worse
+than a refused file. The tempting next lever — batching MERELY SIMILAR
+audio under one entry — is deliberately not a lever: two takes 97% alike
+may differ precisely in the distortion someone chose, and a format that
+collapses that has made a musical decision on its own authority. Instead
+the pack report names the near-duplicate pairs with their chunk-overlap
+score (gitmind's yardstick) so a person can consolidate if the takes really
+are one take; the status line surfaces dedup savings and the pairs. (One
+test lesson recorded in the suite: periodic fixture data never trips the
+rolling hash, making every file one MAX_CHUNK — noise-like data or the
+fixture tests nothing.)
+
+**The roster is enforced.** An archive that names artists derives the
+session TEAM from them — the same sorted-roster id math hand-built teams
+use, so every holder of the archive lands on one session and a stranger's
+join is refused at the door. An archive with no roster keeps the opener's
+own team: metadata that was never written must not lock anyone out.
+
+**Layout, saved simply, per device.** `<name>.workspace` beside the
+project: workbench on/off, panel, side slot, zoom, scroll — written on
+save, read on open, lenient by construction (unknown keys are a newer
+build's business, garbage means defaults, hostile numbers clamp), and
+never load-bearing: view state must not be the reason a project fails to
+open. This is the pattern for several frontends sharing one project — each
+keeps its own sidecar over the shared file, and their states save simply
+because they never entangle.
+
+
+**Vocal alignment, and the tooltip that teaches it.** Mapping a double to
+its lead by eye is the slow part of vocal work, so the timeline grew the
+tools: select the lead, shift-click the take, **A** aligns it — envelope
+cross-correlation (one value per millisecond, so it is rate-agnostic by
+construction and phase-blind, which two mics of one performance need),
+±500 ms search, landing as an ordinary `MoveClip`: undoable, on the wire,
+refusable out loud (wrong selection count and absent media both SAY so).
+**Q** quantizes selected clip starts to the rack's step grid; **, / .**
+nudge by a step and **< / >** by a millisecond, clamped at zero. Two sign
+disciplines are pinned because both first drafts got them wrong: silence
+correlates to an honest zero rather than the leftmost shift that beat the
+sentinel, and the take lands at `reference − lag` — the `+` version would
+have doubled every error instead of fixing it. And the part that makes any
+of this exist for a user: hovering a clip shows its name and the tool list
+— `CLIP_HINTS`, a public const the shell's key handler pins BY TEST: every
+intercepted key must appear in the tooltip and stay unbound in the Helix
+keymap, so the shortcuts, the keymap, and what the clip teaches cannot
+drift apart. A shortcut nobody can see is a shortcut nobody uses.
+
+
+**The mixer grew its input side, the timeline grew compositions, the
+library grew eyes.** Routing could only ever be edited from the SOURCE end
+— a track's combo, a bus's parent fixed at creation. `SetBusParent` (wire
+v11) makes reparenting an op with the same cycle refusal `AddBus` had, and
+the Mixer's "bus inputs" section reads the graph the way a console does:
+each bus lists what feeds it, ✕ returns a feeder to master, "+ input" adds
+a track or bus from the receiving side. Compositions are kdenlive's
+pre-batched groups as the smallest honest model: `SetGroup`/`RemoveGroup`
+(absolute membership, refused empty, dissolving never touches a clip),
+folded on the timeline as one chevroned block — `g` groups a selection
+(born closed, because the fold is the point), the ▸ opens it, clicking the
+block selects its members so nudge/quantize/align/delete act on the
+composition as one thing, and open-or-closed is per-device sidecar state,
+never an op. The viewfinder collapses when no video clip exists — a music
+project gets its width back. And the library finally fits a real one
+(23,000 files deep): a LAZY tree (one readdir per opened folder, cached),
+a bounded deep search, batch-converter variant detection (the `.wav`
+beside its `FFaudioConverter/*.opus` — lossless offered first), and a
+filename classifier feeding the ⋯ menu's smart offers: "replace channel
+'Snare'" when the rack has one, "clip on a new track → bus 'Drums'" for
+drum material with the bus found by name or made on the spot. Every
+classifier case in the tests is a verbatim filename from the library this
+was asked against; a wrong guess costs one wrong suggestion, never a
+wrong action. (The voiceterm hover-drag selector is the named upgrade for
+that menu once the widget lives in shared/.)
+
+
+**The morph pad.** logscope has its matrix, beatspace its latent pad; the
+sample library now has the same gesture: load one to four SIMILAR sounds
+onto the field's corners from a sample's ⋯ menu and the puck blends them
+(renormalizing bilinear weights — two anchors degrade to a clean one-axis
+crossfade, pinned), or with one sound loaded the puck reshapes it: X is
+spectral tilt (a crossfade toward a one-pole low/high split whose halves
+sum back to the original by construction), Y is decay (the roll's gate
+rule, driven by a knob). Neutral is pinned to be the IDENTITY — a pad that
+colours the sound at rest cannot be trusted anywhere else — and blending
+is rate-agnostic (a 44.1k anchor beside a 48k one, pinned by
+zero-crossing). The pad's output enters the workflow through the
+library's own door: right-click bounces the current sound to
+`<library>/morphs/` as a WAV the tree, classifier and rack/clip buttons
+treat like any other sample (unique names, the exporter's rule); double
+right-click resets the puck AND un-bounces the file the double's first
+click just wrote — a reset that leaves junk behind teaches people to fear
+the reset. The hint line lives on the widget, the tooltip lesson applied
+at birth. Similar-sounds blending stays a hands-on act: the pad judges
+nothing and merges nothing on its own authority — the archive's
+distortion rule, one surface over.
+
+
+**Lossless without the WAV bill.** studio-media grew a real FLAC encoder —
+deliberately the honest subset: fixed predictors (best of orders 0–4 per
+frame) with Rice coding, 16-bit mono/stereo, dithered from f32 by the WAV
+path's own TPDF rule, escape-to-verbatim for pathological frames. Small
+enough to read whole, and validated the only way that proves anything:
+sample-exact round trips through symphonia's independent decoder, with
+multi-byte frame numbers exercised on purpose (the clever coded-number
+writer broke at exactly frame 128; the boring explicit-thresholds version
+replaced it and the test that caught it stays). Library-bound renders now
+ride a per-device fidelity rung — opus 128/192/256, flac, wav — chosen on
+a settings slider and stored in the workspace sidecar, because storage
+constraints ARE per device: opus-192 is the default (transparent on most
+systems at a tenth the size), flac is the lossless rung, wav exists for
+whoever insists and is nobody's default. A build without the opus feature
+falls to flac, bigger but never a hole. The archive's Master-level PCM
+fallback went the same way (v3): a bounce embeds as FLAC, byte-exact
+originals still byte-exact.
+
+
+**The breakout loop.** The pad's place in the workflow, made structural:
+start with a basic pattern, break the sound OUT to the pad, tune it,
+return the authored sound to the pattern. The classifier now proposes pad
+loadouts — "pad: load with 3 similar" in a sample's ⋯ menu, neighbours
+found in the sample's OWN directory by the same classifier (a format
+variant of the same sound is not a neighbour) — proposed, loaded only by
+the click. "⇐ channel" breaks the selected rack channel's sample onto the
+pad. And the return path closes the loop twice over: "⇒ replace" bounces
+at the device's fidelity rung and swaps the channel to the bounced FILE
+(the source of truth is the file, not the in-memory blend — what you hear
+later is what returned), while "⇒ layer" adds it as a new channel that
+INHERITS the source channel's steps and step-mods in every pattern, a
+copy not a link, so the layer plays in lockstep and then diverges freely
+— which is what developing the authored layers means. Every returned
+sound is also a library file: authorship accretes where the samples live.
+
+
+**The synthesizer is in the piano roll now.** The built-in synths — `Sub`,
+the 808 voice with glide, tube drive and decay, and `Sine` — were half
+wired to the roll already: a note's key reached them through the tune mod
+and slide became glide, but the envelope was a fixed decay from t=0, so a
+held note DIED at `decay_ms` no matter how long it was drawn. The synth
+was reachable and could not be held. `Synth::render_gated`
+(default-implemented on the trait, so a host synth inherits held notes for
+free) gives the tonal kinds a gated envelope: ~2ms attack, sustain at
+unity while the note lasts, then a fixed 30ms note-off release — NOT a
+second `decay_ms`, because the roll's oldest pin refused that draft: a
+2-step note on a 2-second 808 must stop at 2 steps, and the long ring-out
+is the hit path's sound. Placement sizes each note's window as gate plus
+release tail; the sampler and drums are untouched (the sampler's window
+already IS its gate, a drum's decay is its identity). Pinned: held means
+held (step-5 RMS ≈ step-0 RMS where the old envelope was silent),
+note-off still gates half a step later, and an octave in the roll is an
+octave out of the synth by zero-crossing count. Draw notes on the 808
+channel and it is a bass synth; the glide the hits already had chains
+through the roll the same way.
+
+
+**The mix & master pass, callable from the mixer.** `studio_fx::assistant`
+(findings-first analysis, strength-capped proposals, and the two rules its
+own tests enforce — strength 0 changes nothing, a balanced mix yields NO
+findings) and `studio_copilot::mix_pass` (findings → real ops) both
+existed and neither was reachable: the analysis had no caller, the
+proposal had no button. Now the Mixer — the panel mixing and mastering is
+FOR — has "mix & master…", which measures the actual mixdown (loudest
+power-of-two window, crest, correlation, low-end width from a low-passed
+pair) and opens a window in the assistant's own order: measurements, then
+findings, then a strength dial, then one apply. Two things the caller had
+to get right. `mix_pass` emits each move as a standalone one-effect chain
+because it is pure and cannot see the bus — applied verbatim those would
+delete the user's own effects and then each other, so `mix_assistant::
+compose` folds them onto the existing chain as one `SetBusChain`. And the
+whole pass applies as ONE undo step (`Op::Group`, wire v12, atomic with
+rollback): a mastering pass that takes six presses of `u` to reverse is a
+pass nobody dares try. Pinned: the user's reverb keeps its place at the
+head of the chain, one `u` restores both chain and gain, and a mid-group
+failure leaves nothing behind. One bug found by its own test and worth
+recording: judging silence on the mono SUM skipped analysis on a fully
+out-of-phase mix — precisely the mix most worth warning about — so
+silence is judged per channel and a collapsed sum reads one channel
+instead, letting the correlation finding carry the warning.
+
+
+**The command palette (`C-p`), built as paths rather than a list.** Type a
+few letters, pick a verb, and if the verb needs a target the palette asks
+for that too: "route" → which track → which bus, *or* "new bus", which
+creates and routes in ONE group so changing your mind never leaves an
+orphan bus. That step structure is the design, not decoration — because a
+command is a path of choices resolved by matching text,
+`Palette::resolve(project, &["route", "vocals", "drums"])` returns the
+finished act with no UI at all. That is the seam voice mode plugs into
+later: no second implementation of the wizard, no second registry of
+verbs. Three properties are pinned. Fuzzy ranking is a subsequence match
+with word-start and run bonuses, so "rtb" finds "route track to bus" and
+"undo" beats longer matches. Every entry that has a keybinding CARRIES
+that key (`Act::Key`) rather than reimplementing the verb, shows it
+right-aligned — a palette that teaches its way out of being needed — and
+a test asserts every claimed key is one the keymap or the shell's
+interception actually handles. And a completed path applies through
+`edit_group`, so a two-op command is one press of `u`. While the palette
+is open it owns the keyboard: typing `d` is a search, not a delete.
+
+
+**The library sidebar, narrowed.** Search results used to repeat the folder
+on every row, which is what forced the sidebar as wide as the longest path
+in the pack; they group under one folder header now and the rows carry
+only the filename (the full path survives underneath, so every action
+still works). Every button moved to the RIGHT in one column the eye can
+track, the identicon to the LEFT: extension tag, tinted by format, plus an
+ANVIL when the file is heavy for a phone. Heaviness is judged from
+extension and size — the only inputs available without probing 23,000
+files — and pinned against the two cases it was specified against: a
+96 kHz float WAV at 6144 kb/s wears the anvil (heavy by KIND, whatever its
+size), a 219 kb/s Opus never does at any plausible one-shot size, FLAC is
+light until it is simply big, and mp3 is marked by kind. The mark has to
+be rare to mean anything. Below ~260 px the row goes compact: the name
+elides to first-four…last-four (`Vox_Dry_Waduwap_high_A#.opus` →
+`Vox_…h_A#`), short names shown whole, and the two word-buttons fold into
+⋯ — the controls survive, which is the right thing to keep. Finally,
+triage against rack overload: SWIPE right to pin a sample to the top of
+its listing, left to demote it to the bottom, both toggling, both also in
+the ⋯ menu because a gesture nobody discovers is a feature nobody has. A
+swipe needs real travel (36 px) so a wandering scroll never re-ranks the
+library. Pins are per project, stored in the workspace sidecar rather than
+the op log: a pin is how one person keeps their head straight in one
+session, not a fact about the music, and a collaborator's triage must not
+rearrange yours mid-take.
+
+
+**Two touch bugs from real use.** The list would not scroll over text on a
+phone: the row claimed the gesture with `Sense::drag`, so the ScrollArea
+never saw it. Rows are hover-sensed now and the press is tracked by hand,
+which leaves every drag with the scroll area — and the swipe additionally
+requires the travel to be decisively horizontal (at least 2:1 over
+vertical), because a finger flicking the list up through a row always
+wanders sideways. Pinned: a 60×200 px flick is a scroll, an 80×39 px drag
+is a pin. Second, the row mixed `small_button` (tight, text-sized) with
+`menu_button` (full-height), so each icon sat at a different offset inside
+a differently sized hit rect — every control is now the same 34 px square
+via one `touch_button` helper, the row is one touch tall so identicon,
+name and buttons share a centre line, and the compact threshold is derived
+from the actual control budget (`wants_compact`) rather than a guessed
+pixel count. Folding to compact removes buttons from the row but never
+verbs: both fold into ⋯.
+
+
+**The playhead can be moved now.** `g g` and `g e` always reset it to the
+start and end — but nothing on screen said so and the ruler did nothing,
+which meant a new user had no way back to the start at all. Three fixes,
+each at its own layer: the ruler band takes clicks AND drags and reports
+`sought` every frame of the drag, so scrubbing follows the finger (clamped
+at zero, since a negative playhead is not a position, and strictly above
+the tracks, since selecting a clip must never scrub); ⏮ and ⏭ sit in the
+top bar with their key bindings in the tooltip; and the palette carries
+"playhead to start / to end" with the same hints. The seek is a transport
+move, not a model edit — moving the playhead is not something a
+collaborator should undo. Pinned headlessly: the band seeks through the
+same transform the ruler labels use, the strip below it does not, and the
+gutter column is not time.
+
+
+**Render efficiency: 2.2× on a real workload.** Measured, not guessed —
+the sample loop was doing a `BTreeMap` lookup PER SAMPLE to fetch the
+track's automation lane (48,000 tree walks per second of audio per track,
+for a value that cannot change within a track), then binary-searching that
+lane per sample, then re-checking the destination bound per sample. The
+lookup is hoisted, the lane is swept with a cursor (`eval_lane_cursor` —
+O(1) amortized forward, falling back to the search on any backwards jump
+so it is exactly `eval_lane` for every input), and the bound is resolved
+once by arithmetic. Same machine, same 8-track/80-clip/dense-automation
+workload: 110 ms → 50 ms for ten seconds of audio, 91× → 202× realtime.
+Guarded by an equivalence test that recomputes the expected mix from the
+model with the naive per-sample lookup, so the fast path cannot drift from
+the meaning.
+
+**Vocal takes.** The editor could import, bounce and synthesize audio and
+could not RECORD any. `capture.rs` is the input half of `audition`'s
+output half: a cpal input stream behind the `audio` feature, a null
+capture that SAYS it has no device rather than faking one, and an audio
+callback that never blocks — it `try_lock`s and drops-and-counts rather
+than waiting, because a dropped block is a click in one take while a
+blocked callback is a glitch in everything. Dropped blocks are reported on
+the take, not swallowed. ⏺ in the top bar turns red and counts up while
+live; `C-r` and the palette do the same. A finished take is trimmed of the
+walk to and from the microphone (a silent take is returned WHOLE — a
+mic-gain mistake must not delete the performance), imported as an ordinary
+source, and placed as a clip at the playhead where recording started, so a
+take is one undoable, shareable, archivable op like any other edit. Its
+asset is stored FLAC-encoded, so a phone session's takes cost what they
+should. `C-r`, not `r`: the palette's drift test refused `r` the moment
+this tried to take it, because the keymap already owns it — the guard
+doing exactly its job.
+
+
+**Microphone: negotiate, don't assume.** The first capture build failed on
+a real Linux stack with `snd_pcm_hw_params` → ENOENT, which is ALSA's way
+of saying "not that combination, and I will not tell you which" — because
+cpal's `default_input_config()` reports a configuration the device then
+refuses. Opening now walks what the device actually enumerates: `attempts`
+builds the try-order (48 kHz first, the project rate with no resample,
+then 44.1, then the range's own bounds; mono before stereo, since a vocal
+take is mono and mono opens where stereo sometimes will not; backend
+buffer before a pinned 1024-frame period, because ALSA plug devices reject
+one or the other and which varies by machine), rates outside the device's
+enumerated range are never proposed, and nothing is tried twice. Both
+stages must pass — `build_input_stream` succeeding is not enough, since
+hw_params can still refuse at `play()`. If the default device refuses
+every attempt the open falls through to every other input device on the
+host, and total failure reports how many configurations were tried plus
+the last error, rather than repeating one opaque backend string. The
+negotiated device and rate land in the status line, because "recording" at
+a rate nobody chose is how a take ends up the wrong length.
+
+
+**The save structure, rebuilt around containment.** A real bug, reported
+from real use: the first `project_dir` ran `git init` and `git add -A` in
+whatever directory the project file sat in — launched from a source
+checkout, that is the USER'S OWN REPOSITORY, and a save committed 2,734
+files of their code with the message "save". The fix is structural. A
+project now lives in its own directory under a projects root
+(`$STUDIO_PROJECTS`, else wherever the last archive was written, else
+`$XDG_DATA_HOME/studio/projects`) and never in the working directory. That
+directory is marked with `.studio-project` at creation. `guard` refuses
+any directory that is not marked ours, and refuses outright when the
+directory OR ANY ANCESTOR is a git work tree we did not create — the
+ancestor walk being the case that actually did the damage. Commits name
+explicit pathspecs; there is no `-A` left in the file, so even a
+mis-scoped directory could stage only the handful of files a project
+consists of. A folder holding nothing but project files is still adoptable
+(an older build's save), one stray `src/` is not. All four properties are
+pinned, including that a refused save leaves the foreign tree byte-for-byte
+untouched.
+
+Shaped by what the neighbours do: Zrythm makes each project a DIRECTORY
+under `XDG_DATA_HOME` with timestamped snapshots in `backups/` — the same
+layout, with git commits playing the part of numbered backups; Reaper
+defaults to a projects ROOT with a per-project subdirectory, which is the
+"never save loose in the cwd" half; and Audacity abandoned `.aup` plus a
+`_data` folder for the single-file `.aup3` after years of users moving the
+folder and breaking sessions — the same argument that makes `.studioarch`
+the thing you send while this directory stays the working copy.
+
+
+**Note names, a project key, and the guide that reads it.** Every piano
+roll row now names itself — `A1`, `C#4`, `A5` — instead of only the octave
+lines carrying a signed offset. The labels come from `studio_core::
+note_label`, which reads the SAME reference pitch the synth does (key 0 is
+A1, 55 Hz, `sub_freq`'s own reference), so a label and a sound cannot
+disagree; that is pinned. The project gained a `key` (root + scale: major,
+minor, dorian, mixolydian, chromatic) as an absolute, undoable op, and the
+roll dims out-of-key rows when the guide is on — dimmed, never disabled: a
+scale is advice, and a tool that silently refused the blue note would be
+wrong about music. `None` key means no opinion and nothing is dimmed. The
+palette carries "set project key" (root, then scale) and "toggle
+out-of-key dimming".
+
+**Markers, and the wishes behind them.** Reading the FL Studio and
+kdenlive communities, the same request appears in both vocabularies:
+named markers, jump-to, and "Delete All Timeline Markers" (kdenlive
+26.04 literally shipped that action; FL's Alt+T marker naming is a
+top-of-list wish; Premiere users ask for marker-based selection). So:
+`SetMarker` is absolute BY NAME (setting an existing name moves it — "no,
+the chorus is here"), `ClearMarkers` inverts to a single `Group` so one
+`u` restores every one, and the palette gains "drop a marker here", "jump
+to marker" (a wizard over the project's own markers), "delete all
+markers", "hide (mute) a track" (the other repeated ask), and "split
+every clip at the playhead".
+
+**One voice framework, no second command system.** `voice.rs` is the
+dialog handler and the port of voiceterm-qt's feedback popup, built on the
+seam the palette already had: a command is a path of choices resolved by
+matching text, so speech needs no verbs of its own. Three pure pieces.
+`normalize` closes the gap a recognizer leaves — "eight oh eight" → `808`,
+"see sharp" → `C#`, "b flat" → `A#` (flats spoken, sharps stored),
+connectives and filler dropped so they cannot dilute a score. `policy`
+decides what one utterance may do: destructive or wide acts are said back
+and wait for a leading, unambiguous "yes" — the first draft searched the
+whole reply for an affirmative and took "no, go to the mixer" as consent,
+which is worse than no confirmation and is now pinned against. `Dialog`
+walks the palette consuming the longest matching prefix at each step, so a
+whole command fits in one breath ("route vocals drum bus") or arrives word
+by word, with the popup listing what can be said next — the reason
+voiceterm showed a popup at all. `EXTRA_SPOKEN` collects the phrasings
+nobody would put in a menu because nothing was listening: asking the room
+a question, acting on everything except one thing, starting a take on a
+count. The recognizer itself is not in this repo; `App::voice_utterance`
+is the one call a backend needs.
+
+
+**Two libraries, one search, ordered by where you are.** `STUDIO_VIDEO_LIB`
+names a footage root beside `STUDIO_LIBRARY`'s sample root — two roots
+rather than one tree because they live on different disks and arrive on
+different schedules (a pack is installed once, footage arrives per shoot).
+Search now covers both, and the ACTIVE TAB decides the order: on the
+timeline footage is a first-class hit; in the rack and the program tab
+samples come first and footage stays reachable underneath, because a
+sampler can absolutely take its material from a video's audio and refusing
+that would be the tool deciding what a sound is allowed to come from.
+Footage rows carry a ▣ so a video turning up in a sample search is never a
+surprise, and switching tabs re-ranks the results rather than serving
+stale ones.
+
+**The video sampler's headless half.** `studio_video::audio_segment` pulls
+the audio between two points out of a video as WAV bytes any decoder here
+reads — trimming inside ffmpeg (`-ss` before `-i`, `-t` for the span) so
+taking two seconds out of a forty-minute rush costs two seconds of work.
+A backwards or empty span is refused, and a video with no audio is
+`NoAudioStream` — a named fact rather than an empty buffer that would look
+like silence — in both shapes ffmpeg reports it. Tested end to end against
+a generated fixture: half a second asked for, half a second of real tone
+back. The UI is deliberately NOT wired: the plugin's shape is the open
+question, and this is the part that will be true whatever shape it takes.
+
+
+**Genre vocabularies for the voice fastpath.** A recognizer emits what a
+person SAYS, and nobody names a file "braams" or "hi hat" — so the
+fastpath gained starter dictionaries: common, trap, hip hop, classical,
+film score, country, and instrument names. Each is a small table mapping a
+spoken phrase to the word the library actually uses ("sub bass" → 808,
+"pedal steel" → steel, "pizzicato" → pizz, "whoosh" → riser), applied
+longest-phrase-first so a two-word term never splits into two useless
+ones. Deliberately STARTER-sized: the terms someone says in the first
+minute, not an attempt at a genre's whole language — they are data, so
+growing one is a line.
+
+The design rule that matters: **an alias may only widen what can be
+understood, never narrow it.** Aliasing "vocals" to "vox" stops a track
+literally named *vocals* from matching — so the aliased words are a second
+READING, tried first, with the literal utterance tried after. That bug
+appeared immediately in the tests and is now pinned both ways. A drift
+guard checks every entry in every table: targets lowercase, single-token,
+non-empty, and spoken sides that survive normalization — an alias pointing
+at a word no file uses would leave the spoken term worse off than saying
+nothing. Unknown words always pass through, `common` cannot be switched
+off, and the chosen domains ride in the workspace sidecar because the ears
+follow the room, not the song. Pick them from the palette: "voice
+vocabulary (genre words)".
+
+
+**Find in the timeline — voiceterm's lever, not a second implementation.**
+Searching a session of takes for a spoken word is the case where a real
+recognizer is correct and far too slow to type into. voiceterm already
+solved it and its own notes name the mechanism: the fingerprint DB
+short-circuits whisper on most utterances. So the pure half of that —
+`phonetic.rs`'s MFCC pipeline and `acoustic_index.rs`'s 39-dimensional
+mean/std/delta fingerprint with its cosine metric — was lifted VERBATIM
+into `shared/voiceprint-kit`, where a second app can use it without a
+second implementation drifting from the first. voiceterm's exemplar
+database, promotion policy and whisper pool stay in voiceterm, which is
+where that policy belongs.
+
+`find.rs` layers the search: a NAME match first because it is free and
+certain (and never invents a distance it did not measure); then the
+fingerprint prescreen over every candidate clip — 39 floats and a cosine,
+microseconds each — which orders the field without deciding it; then
+verification on the survivors only, through a `Verifier` trait whose
+intended implementation is voiceterm's whisper pool. With no verifier
+present, results are returned as a RANKING and labelled as such: the panel
+shows "name", "sound ~0.14", or "heard: …" so a cheap guess can never be
+mistaken for something a recognizer read. A verifier that runs and
+disagrees demotes the hit — heard-but-wrong is weaker evidence than
+never-heard, because something did listen. And the gate answers the other
+question: search everything, only tracks carrying audio, or ONLY the
+silent ones ("why can I not hear track twelve" — a track with no clips at
+all and a clip below the floor are both reported, while media that never
+arrived is neither, because that is a different problem). One fixture
+lesson recorded in the kit: steady synthetic tones are degenerate for a
+mean/std/delta statistic — two thirds of its dimensions are variance and
+frame-to-frame delta, which for a constant tone hold only rounding noise,
+so the first test ranked a 5 Hz shift as farther than a whole different
+vowel. Moving formants are what speech is.

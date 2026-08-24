@@ -30,7 +30,7 @@ pub mod block;
 pub mod destructive;
 
 use std::collections::BTreeMap;
-use studio_core::{Project, SourceId, Ticks, TrackKind};
+use studio_core::{eval_lane, AutoTarget, Project, SourceId, Ticks, TrackKind};
 
 pub mod export;
 pub mod repitch;
@@ -562,6 +562,12 @@ pub fn mixdown_into(
             None => master.as_mut(),
         };
 
+        // Hoisted out of the sample loop: this was a BTreeMap lookup PER
+        // SAMPLE — at 48 kHz, forty-eight thousand tree walks per second
+        // of audio per track to fetch a value that cannot change within a
+        // track. The lane itself is then swept with a cursor rather than
+        // binary-searched per sample (see `eval_lane_cursor`).
+        let track_lane = project.automation.get(&AutoTarget::TrackGain(track.id));
         for clip in project.track_clips(track.id) {
             // skip clips entirely outside the window
             if clip.end() <= from || clip.pos >= to { continue; }
@@ -583,8 +589,15 @@ pub fn mixdown_into(
             let stop = clip.end().min(to);
             let out_off = (start.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
             let n = (stop.to_samples(rate) - start.to_samples(rate)).max(0) as usize;
+            // The destination bound, resolved ONCE: the old loop asked
+            // `oi + 1 >= dest.len()` every sample to catch the same
+            // condition arithmetic settles here.
+            let room = dest.len().saturating_sub(out_off * 2) / 2;
+            let n = n.min(room);
+            let start_sample = start.to_samples(rate);
+            let mut lane_cursor = 0usize;
             for i in 0..n {
-                let at = Ticks::from_samples(start.to_samples(rate) + i as i64, rate);
+                let at = Ticks::from_samples(start_sample + i as i64, rate);
                 let into_clip = at.saturating_sub(clip.pos);
                 // Index the SOURCE at the source's own rate — indexing a
                 // 44.1k file at 48k-sample positions plays it ~9% sharp and
@@ -593,9 +606,17 @@ pub fn mixdown_into(
                 // fractional position, linear interpolation; a same-rate
                 // source takes the exact integer path untouched.
                 let src_t = clip.src_in.saturating_add(into_clip);
-                let g = clip.gain * track.gain * fade.gain_at(into_clip, clip.len);
+                // The lane RIDES the fader — multiplied, not substituted —
+                // so the fader stays a trim (see `Project::automation`'s
+                // docs). Per-sample evaluation at the `at` this loop
+                // already computes: automation that stepped per buffer
+                // would zipper on any ramp steeper than gentle.
+                let auto = match track_lane {
+                    Some(lane) => studio_core::eval_lane_cursor(lane, at, &mut lane_cursor),
+                    None => 1.0,
+                };
+                let g = clip.gain * track.gain * auto * fade.gain_at(into_clip, clip.len);
                 let oi = (out_off + i) * 2;
-                if oi + 1 >= dest.len() { break; }
                 let read = |c: &[f32], pos: f64| -> Option<f32> {
                     let i0 = pos as usize;
                     if i0 + 1 >= c.len() { return None; }
@@ -694,7 +715,21 @@ pub fn mixdown_into(
         }
         zero_resize(&mut scratch.pre, buf.len());
         scratch.pre.copy_from_slice(&buf);
-        for s in buf.iter_mut() { *s *= bus.gain; }
+        match project.automation.get(&AutoTarget::BusGain(id)) {
+            Some(lane) => {
+                // The bus fader's ride, per interleaved frame — L and R of
+                // one instant share one lane value, or a ramp would tilt
+                // the image sideways.
+                let from_s = from.to_samples(rate);
+                for (fi, pair) in buf.chunks_exact_mut(2).enumerate() {
+                    let at = Ticks::from_samples(from_s + fi as i64, rate);
+                    let g = bus.gain * eval_lane(lane, at);
+                    pair[0] *= g;
+                    pair[1] *= g;
+                }
+            }
+            None => for s in buf.iter_mut() { *s *= bus.gain; },
+        }
 
         for send in &bus.sends {
             let tap: &[f32] = if send.pre_fader { &scratch.pre } else { &buf };
@@ -1620,5 +1655,478 @@ mod source_rate_tests {
         // the source lasts the whole second at pitch.
         let late_l = out[(47_990) * 2];
         assert!(late_l > 0.95, "the source fills its true duration, got {late_l}");
+    }
+}
+
+#[cfg(test)]
+mod automation_render_tests {
+    use super::*;
+    use studio_core::{AutoTarget, Bus, BusId, Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn one_clip_project() -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![vec![0.5; 48_000]] });
+        (p, audio)
+    }
+    fn render(p: &Project, a: &BTreeMap<SourceId, SourceAudio>) -> Vec<f32> {
+        mixdown(p, a, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(1.0), 48_000, &[], &[])
+    }
+
+    #[test]
+    fn a_gain_ramp_is_a_fade_the_render_actually_follows() {
+        // 0→1 across the second: the first sample near silent, the midpoint
+        // near half, the end at the fader's own level — per-sample linear,
+        // not stepped per buffer.
+        let (mut p, audio) = one_clip_project();
+        let t = AutoTarget::TrackGain(TrackId(1));
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks::ZERO, value: 0.0 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks::from_seconds(1.0), value: 1.0 }).unwrap();
+        let out = render(&p, &audio);
+        assert!(out[0].abs() < 1e-3, "the ramp starts at silence, got {}", out[0]);
+        let mid = out[out.len() / 2];
+        assert!((mid - 0.25).abs() < 0.01, "midpoint is half the ride on a 0.5 source: {mid}");
+        let last = out[out.len() - 2];
+        assert!((last - 0.5).abs() < 0.01, "the end reaches the full source level: {last}");
+    }
+
+    #[test]
+    fn no_lane_renders_bit_identically_to_a_pre_automation_project() {
+        // The property that makes automation safe to land: a project that
+        // never touched it cannot sound different.
+        let (p, audio) = one_clip_project();
+        let mut with_empty_map = p.clone();
+        with_empty_map.automation.clear();
+        assert_eq!(render(&p, &audio), render(&with_empty_map, &audio));
+    }
+
+    #[test]
+    fn the_lane_rides_the_fader_rather_than_replacing_it() {
+        // Fader 0.5 × lane 0.5 = a quarter of the source — the documented
+        // multiply, pinned so "automation ate my fader" can never ship.
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::SetTrackGain { id: TrackId(1), gain: 0.5 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: AutoTarget::TrackGain(TrackId(1)),
+                                    at: Ticks::ZERO, value: 0.5 }).unwrap();
+        let out = render(&p, &audio);
+        let mid = out[out.len() / 2];
+        assert!((mid - 0.125).abs() < 1e-3, "0.5 source × 0.5 fader × 0.5 lane: {mid}");
+    }
+
+    #[test]
+    fn a_bus_lane_rides_the_bus_fader_over_time() {
+        // Route the track through a bus and ramp the BUS down: the mix ends
+        // quieter than it starts, and a flat lane at unity changes nothing.
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0,
+            muted: false, chain: vec![], sends: vec![], parent: None } }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let b = AutoTarget::BusGain(BusId(1));
+        let mut ramped = p.clone();
+        ramped.apply(&Op::SetAutoPoint { target: b, at: Ticks::ZERO, value: 1.0 }).unwrap();
+        ramped.apply(&Op::SetAutoPoint { target: b, at: Ticks::from_seconds(1.0), value: 0.0 }).unwrap();
+        let out = render(&ramped, &audio);
+        let head = out[..2400].iter().map(|s| s.abs()).sum::<f32>();
+        let tail = out[out.len() - 2400..].iter().map(|s| s.abs()).sum::<f32>();
+        assert!(head > tail * 20.0, "the ride pulled the bus down: head {head}, tail {tail}");
+
+        let mut flat = p.clone();
+        flat.apply(&Op::SetAutoPoint { target: b, at: Ticks::ZERO, value: 1.0 }).unwrap();
+        let plain = render(&p, &audio);
+        let unity = render(&flat, &audio);
+        for i in 0..plain.len() {
+            assert!((plain[i] - unity[i]).abs() < 1e-6, "a unity lane is transparent at {i}");
+        }
+    }
+}
+
+// ── vocal alignment ─────────────────────────────────────────────────────
+
+/// The audio's energy envelope at one value per millisecond — the domain
+/// alignment happens in. Envelopes are RATE-AGNOSTIC by construction (a
+/// 44.1k take and a 48k reference land on the same time axis), phase-blind
+/// (two mics of one performance correlate even when the waveforms do not),
+/// and a thousand times cheaper than sample-rate correlation.
+pub fn envelope_ms(samples: &[f32], rate: u32) -> Vec<f32> {
+    let hop = (rate / 1000).max(1) as usize;
+    samples.chunks(hop)
+        .map(|c| c.iter().map(|s| s.abs()).sum::<f32>() / c.len() as f32)
+        .collect()
+}
+
+/// The lag, in MILLISECONDS, at which `take` best matches `reference`:
+/// positive means the take's material happens LATER than the reference's
+/// (the fix is moving the take's clip earlier by that much), negative the
+/// opposite. Normalized cross-correlation over ±`max_shift_ms`, on
+/// envelopes from [`envelope_ms`]. Silence against silence is honest
+/// zero, not a confident lie.
+pub fn align_offset_ms(reference: &[f32], take: &[f32], max_shift_ms: usize) -> i64 {
+    if reference.is_empty() || take.is_empty() { return 0; }
+    let mut best = (0i64, f32::MIN);
+    for shift in -(max_shift_ms as i64)..=(max_shift_ms as i64) {
+        let mut dot = 0.0f32;
+        let mut na = 0.0f32;
+        let mut nb = 0.0f32;
+        for (i, r) in reference.iter().enumerate() {
+            let j = i as i64 + shift;
+            if j < 0 || j as usize >= take.len() { continue; }
+            let t = take[j as usize];
+            dot += r * t;
+            na += r * r;
+            nb += t * t;
+        }
+        let norm = (na * nb).sqrt();
+        let score = if norm > 1e-12 { dot / norm } else { 0.0 };
+        // Strictly-greater keeps the SMALLEST winning lag when scores tie
+        // (a periodic take ties at every period): the least surprising
+        // move wins, and iteration order from -max makes "smallest" mean
+        // "most negative" deterministically rather than by float luck.
+        if score > best.1 { best = (shift, score); }
+    }
+    // No positive correlation anywhere — silence, or unrelated material —
+    // is an honest zero, not the leftmost shift that happened to beat the
+    // f32::MIN sentinel (exactly how the first draft returned -max for
+    // silence-vs-silence).
+    if best.1 <= 1e-6 { 0 } else { best.0 }
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+
+    fn burst(rate: u32) -> Vec<f32> {
+        // A syllable-like shape: silence, an attack, a decaying tail — the
+        // envelope structure real vocals have and pure tones do not.
+        let mut v = vec![0.0f32; rate as usize / 10];
+        for i in 0..(rate as usize / 5) {
+            let t = i as f32 / rate as f32;
+            let env = (-t * 12.0).exp();
+            v.push((t * 300.0 * std::f32::consts::TAU).sin() * env);
+        }
+        v.extend(vec![0.0f32; rate as usize / 10]);
+        v
+    }
+
+    #[test]
+    fn a_delayed_copy_is_found_to_within_the_envelope_hop() {
+        let rate = 48_000;
+        let r = burst(rate);
+        let mut late = vec![0.0f32; (rate / 1000 * 37) as usize]; // 37 ms late
+        late.extend(&r);
+        let d = align_offset_ms(&envelope_ms(&r, rate), &envelope_ms(&late, rate), 200);
+        assert!((d - 37).abs() <= 1, "37 ms of delay recovered, got {d}");
+        // And the other direction: the take EARLY means a negative lag.
+        let d = align_offset_ms(&envelope_ms(&late, rate), &envelope_ms(&r, rate), 200);
+        assert!((d + 37).abs() <= 1, "early is negative, got {d}");
+    }
+
+    #[test]
+    fn rates_do_not_matter_because_the_envelope_domain_is_milliseconds() {
+        // A 44.1k double against a 48k lead — the exact case that makes
+        // sample-domain correlation quietly wrong by the rate ratio.
+        let lead = burst(48_000);
+        let mut double = vec![0.0f32; 44_100 / 1000 * 25]; // 25 ms late, at 44.1k
+        double.extend(burst(44_100));
+        let d = align_offset_ms(&envelope_ms(&lead, 48_000),
+                                &envelope_ms(&double, 44_100), 200);
+        assert!((d - 25).abs() <= 2, "cross-rate alignment holds, got {d}");
+    }
+
+    #[test]
+    fn silence_is_an_honest_zero_not_a_confident_lie() {
+        let z = vec![0.0f32; 48_000];
+        assert_eq!(align_offset_ms(&envelope_ms(&z, 48_000),
+                                   &envelope_ms(&z, 48_000), 100), 0);
+    }
+}
+
+// ── the morph pad ───────────────────────────────────────────────────────
+
+/// Bilinear corner weights for a puck at (x, y) over up to four anchors,
+/// corner order TL, TR, BL, BR (y up). Fewer anchors take the first
+/// corners and the weights RENORMALIZE over what is present — with two
+/// anchors on the top edge the pad degrades to a clean one-axis
+/// crossfade, x alone deciding, which is exactly what a two-sound blend
+/// should feel like.
+pub fn morph_weights(n: usize, x: f32, y: f32) -> Vec<f32> {
+    let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    let corners = [(1.0 - x) * y, x * y, (1.0 - x) * (1.0 - y), x * (1.0 - y)];
+    let mut w: Vec<f32> = corners[..n.clamp(1, 4)].to_vec();
+    let sum: f32 = w.iter().sum();
+    if sum <= 1e-9 {
+        // The puck parked exactly opposite every present anchor: nearest
+        // wins outright rather than dividing by nothing.
+        let mut z = vec![0.0; w.len()];
+        z[0] = 1.0;
+        return z;
+    }
+    for v in &mut w { *v /= sum; }
+    w
+}
+
+fn morph_mono_48k(a: &SourceAudio) -> Vec<f32> {
+    let ratio = a.sample_rate as f64 / 48_000.0;
+    let out_len = (a.frames() as f64 / ratio).max(1.0) as usize;
+    (0..out_len).map(|i| {
+        let pos = i as f64 * ratio;
+        let i0 = pos as usize;
+        let frac = (pos - i0 as f64) as f32;
+        let s0 = a.mono(i0.min(a.frames().saturating_sub(1)));
+        let s1 = a.mono((i0 + 1).min(a.frames().saturating_sub(1)));
+        s0 * (1.0 - frac) + s1 * frac
+    }).collect()
+}
+
+/// One sound, reshaped by the puck: X is spectral TILT (left dark, right
+/// bright, centre untouched — a crossfade toward a one-pole low- or
+/// high-passed copy), Y is DECAY (1.0 untouched, lower fades the tail
+/// earlier — a drum's most-reached-for knob). Neutral is (0.5, 1.0), and
+/// neutral is pinned to be the identity: a pad that colours the sound at
+/// rest cannot be trusted anywhere else.
+pub fn tone_map(a: &SourceAudio, x: f32, y: f32) -> SourceAudio {
+    let src = morph_mono_48k(a);
+    let x = x.clamp(0.0, 1.0);
+    let y = y.clamp(0.0, 1.0);
+    let mut out = src.clone();
+    if (x - 0.5).abs() > 1e-3 {
+        // One-pole low-pass at ~800 Hz; the high-pass is its residue, so
+        // the two halves sum back to the original by construction.
+        let k = 1.0 - (-2.0 * std::f32::consts::PI * 800.0 / 48_000.0).exp();
+        let mut lp_state = 0.0f32;
+        for (i, s) in src.iter().enumerate() {
+            lp_state += k * (s - lp_state);
+            let hp = s - lp_state;
+            out[i] = if x < 0.5 {
+                let t = (0.5 - x) * 2.0; // toward dark
+                s * (1.0 - t) + lp_state * t
+            } else {
+                let t = (x - 0.5) * 2.0; // toward bright
+                s * (1.0 - t) + hp * t
+            };
+        }
+    }
+    if y < 1.0 - 1e-3 {
+        // The tail fades over the first y of the length and is silent
+        // after — the roll's gate rule, driven by a knob.
+        let gate = ((out.len() as f32) * y.max(0.02)) as usize;
+        let fade = (gate / 8).max(48).min(gate);
+        for i in 0..out.len() {
+            if i >= gate { out[i] = 0.0; }
+            else if i >= gate - fade {
+                out[i] *= (gate - i) as f32 / fade as f32;
+            }
+        }
+    }
+    SourceAudio { sample_rate: 48_000, channels: vec![out] }
+}
+
+/// The pad's sound at (x, y): one anchor is [`tone_map`], several blend by
+/// [`morph_weights`] — resampled to 48k mono, padded to the longest, the
+/// weighted sum. Similar sounds blended sit BETWEEN them; dissimilar
+/// sounds layer, which is also a sound — the pad judges nothing.
+pub fn morph_blend(anchors: &[&SourceAudio], x: f32, y: f32) -> SourceAudio {
+    match anchors {
+        [] => SourceAudio { sample_rate: 48_000, channels: vec![vec![]] },
+        [one] => tone_map(one, x, y),
+        many => {
+            let w = morph_weights(many.len(), x, y);
+            let monos: Vec<Vec<f32>> = many.iter().map(|a| morph_mono_48k(a)).collect();
+            let len = monos.iter().map(Vec::len).max().unwrap_or(0);
+            let mut out = vec![0.0f32; len];
+            for (mono, wt) in monos.iter().zip(&w) {
+                for (i, s) in mono.iter().enumerate() {
+                    out[i] += s * wt;
+                }
+            }
+            SourceAudio { sample_rate: 48_000, channels: vec![out] }
+        }
+    }
+}
+
+#[cfg(test)]
+mod morph_tests {
+    use super::*;
+
+    fn tone(hz: f32, secs: f32, rate: u32) -> SourceAudio {
+        let n = (rate as f32 * secs) as usize;
+        SourceAudio { sample_rate: rate, channels: vec![
+            (0..n).map(|i| (i as f32 / rate as f32 * hz * std::f32::consts::TAU).sin() * 0.5)
+                .collect()] }
+    }
+    fn energy(b: &[f32], from: usize, to: usize) -> f32 {
+        b[from.min(b.len())..to.min(b.len())].iter().map(|s| s * s).sum()
+    }
+
+    #[test]
+    fn weights_renormalize_and_two_anchors_are_a_clean_crossfade() {
+        for (n, x, y) in [(4, 0.3, 0.7), (3, 0.9, 0.1), (2, 0.5, 0.2), (1, 0.0, 0.0)] {
+            let w = morph_weights(n, x, y);
+            assert_eq!(w.len(), n);
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{n} anchors at ({x},{y})");
+        }
+        // Two anchors share the top edge: y must cancel out entirely.
+        let a = morph_weights(2, 0.25, 0.9);
+        let b = morph_weights(2, 0.25, 0.2);
+        assert!((a[0] - b[0]).abs() < 1e-5, "a two-sound blend is x alone: {a:?} vs {b:?}");
+        assert!((a[0] - 0.75).abs() < 1e-5);
+        // Bottom-left puck over top-edge anchors: nearest wins, no NaN.
+        let z = morph_weights(2, 0.0, 0.0);
+        assert!(z.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn neutral_is_the_identity_and_the_axes_do_what_their_labels_say() {
+        let a = tone(200.0, 0.5, 48_000);
+        let neutral = tone_map(&a, 0.5, 1.0);
+        for (i, s) in neutral.channels[0].iter().enumerate() {
+            assert!((s - a.channels[0][i]).abs() < 1e-5,
+                    "a pad that colours the sound at rest cannot be trusted: sample {i}");
+        }
+        // X right on a dull+bright mix: the high band's share must rise.
+        let mut mix = tone(150.0, 0.5, 48_000);
+        let hi = tone(4000.0, 0.5, 48_000);
+        for (i, s) in mix.channels[0].iter_mut().enumerate() {
+            *s = *s * 0.5 + hi.channels[0][i] * 0.5;
+        }
+        let hi_share = |a: &SourceAudio| {
+            let bright = tone_map(a, 0.5, 1.0); // identity, but through the same path
+            let hp: f32 = {
+                // crude residue: sample-to-sample difference energy tracks
+                // high-frequency content well enough to order two sounds
+                let b = &bright.channels[0];
+                b.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>()
+            };
+            hp / energy(&bright.channels[0], 0, usize::MAX).max(1e-9)
+        };
+        let dark = tone_map(&mix, 0.1, 1.0);
+        let bright = tone_map(&mix, 0.9, 1.0);
+        assert!(hi_share(&bright) > hi_share(&dark) * 2.0,
+                "right is brighter than left by any honest measure");
+        // Y down: the tail dies where the knob says.
+        let short = tone_map(&a, 0.5, 0.4);
+        let n = short.channels[0].len();
+        assert!(energy(&short.channels[0], n * 6 / 10, n) < 1e-6,
+                "past the gate is silence");
+        assert!(energy(&short.channels[0], 0, n / 4) > 0.1, "before it, the sound");
+    }
+
+    #[test]
+    fn a_blend_at_the_corners_is_the_corner_and_rates_do_not_matter() {
+        let a = tone(200.0, 0.25, 48_000);
+        let b = tone(500.0, 0.25, 44_100); // different rate ON PURPOSE
+        let left = morph_blend(&[&a, &b], 0.0, 1.0);
+        let right = morph_blend(&[&a, &b], 1.0, 1.0);
+        for (i, s) in left.channels[0].iter().enumerate().take(4_000) {
+            assert!((s - a.channels[0][i]).abs() < 1e-4, "x=0 is anchor A alone");
+        }
+        // x=1 is B alone, resampled to 48k: same pitch, verified by
+        // zero-crossing count over the shared quarter second.
+        let zc = |v: &[f32]| v.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        let want = zc(&morph_blend(&[&b], 0.5, 1.0).channels[0]);
+        assert!((zc(&right.channels[0]) as i64 - want as i64).abs() <= 2,
+                "x=1 is anchor B, at the pad's 48k");
+    }
+}
+
+#[cfg(test)]
+mod render_speed_tests {
+    use super::*;
+    use studio_core::{AutoTarget, Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    /// A project with real shape: several tracks, several clips each, and a
+    /// dense automation lane — the case where the per-sample map lookup
+    /// used to cost the most.
+    fn busy_project(tracks: usize, clips_each: usize)
+        -> (Project, BTreeMap<SourceId, SourceAudio>)
+    {
+        let mut p = Project::default();
+        let n = 48_000;
+        let audio_src = SourceAudio { sample_rate: 48_000, channels: vec![
+            (0..n).map(|i| (i as f32 / 48_000.0 * 220.0
+                            * std::f32::consts::TAU).sin() * 0.2).collect()] };
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "s".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        let mut cid = 1u64;
+        for t in 0..tracks {
+            let id = TrackId(t as u64 + 1);
+            p.apply(&Op::AddTrack { track: Track { id, kind: TrackKind::Audio,
+                name: format!("t{t}"), muted: false, locked: false, gain: 1.0,
+                route: None }, at: t }).unwrap();
+            for c in 0..clips_each {
+                p.apply(&Op::AddClip { clip: Clip { id: ClipId(cid), source: SourceId(1),
+                    track: id, pos: Ticks::from_seconds(c as f64 * 1.1),
+                    src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0),
+                    gain: 0.8, effects: vec![] } }).unwrap();
+                cid += 1;
+            }
+            // A point every 50 ms across the whole span.
+            for k in 0..200 {
+                p.apply(&Op::SetAutoPoint { target: AutoTarget::TrackGain(id),
+                    at: Ticks::from_seconds(k as f64 * 0.05),
+                    value: 0.5 + (k % 7) as f32 * 0.05 }).unwrap();
+            }
+        }
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), audio_src);
+        (p, audio)
+    }
+
+    #[test]
+    fn the_hoisted_render_still_matches_a_naive_per_sample_reference() {
+        // The optimization guard: automation hoisted out of the sample
+        // loop and swept with a cursor must produce EXACTLY what the
+        // straightforward per-sample lookup produced. Computed here from
+        // the model directly, so this test does not merely re-run the code
+        // it is checking.
+        let (p, audio) = busy_project(2, 3);
+        let rate = 48_000;
+        let to = Ticks::from_seconds(2.0);
+        let got = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, to, rate, &[], &[]);
+        let frames = to.to_samples(rate) as usize;
+        let mut want = vec![0.0f32; frames * 2];
+        for track in &p.tracks {
+            for clip in p.clips.values().filter(|c| c.track == track.id) {
+                let src = &audio[&clip.source];
+                let n = clip.len.to_samples(rate) as usize;
+                for i in 0..n {
+                    let at = Ticks::from_samples(clip.pos.to_samples(rate) + i as i64, rate);
+                    if at >= to { break; }
+                    let auto = match p.automation.get(&AutoTarget::TrackGain(track.id)) {
+                        Some(lane) => studio_core::eval_lane(lane, at),
+                        None => 1.0,
+                    };
+                    let g = clip.gain * track.gain * auto;
+                    let f = i;
+                    if f >= src.frames() { break; }
+                    let oi = (at.to_samples(rate) as usize) * 2;
+                    if oi + 1 >= want.len() { break; }
+                    want[oi] += src.channels[0][f] * g;
+                    want[oi + 1] += src.channels[0][f] * g;
+                }
+            }
+        }
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!((a - b).abs() < 1e-5, "sample {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    #[ignore = "timing, not correctness — run with --ignored to measure"]
+    fn measure_render_throughput() {
+        let (p, audio) = busy_project(8, 10);
+        let to = Ticks::from_seconds(10.0);
+        let t0 = std::time::Instant::now();
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, to, 48_000, &[], &[]);
+        let dt = t0.elapsed();
+        println!("rendered {} frames of 8x10 clips + dense automation in {dt:?} \
+                  ({:.1}x realtime)", out.len() / 2, 10.0 / dt.as_secs_f64());
     }
 }

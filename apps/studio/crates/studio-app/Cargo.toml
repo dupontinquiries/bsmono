@@ -17,6 +17,9 @@ studio-live = { path = "../studio-live" }
 studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
 studio-media = { path = "../studio-media" }
+studio-video = { path = "../studio-video" }
+studio-copilot = { path = "../studio-copilot" }
+voiceprint-kit = { path = "../../../../shared/voiceprint-kit" }
 analog-kit = { path = "../../../../shared/analog-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
@@ -28,13 +31,19 @@ cpal = { version = "0.15", optional = true }
 # optional so a build without those headers still produces a working editor.
 midir = { version = "0.10", optional = true }
 
+rfd = { version = "0.15", optional = true, default-features = false, features = ["xdg-portal", "async-std"] }
+
 [features]
 # Default-on so `cargo build --release` produces the deployable binary directly,
 # the same convention every other egui frontend in the fleet uses.
-default = ["app", "audio", "midi"]
+default = ["app", "audio", "midi", "picker"]
 app = ["dep:eframe"]
 # Loop audition through cpal. Off => NullSink: the app still runs, silently,
 # with a wall-clock playhead — a build box without ALSA headers must not lose
 # the ability to build the editor.
 audio = ["dep:cpal"]
+# The native file dialog (XDG portal on Linux). Off => the export flow falls
+# back to ./exports and the status line says so — a headless build must not
+# lose the exporter, the audio feature's own reasoning.
+picker = ["dep:rfd"]
 midi = ["dep:midir"]

@@ -1,0 +1,582 @@
+//! export — the dialog's decision layer, and the run that does the work.
+//!
+//! The one-click exporter (`Studio::export_arrangement`) stays what it is: a
+//! synchronous whole-arrangement render to `./exports`, no questions asked.
+//! This module is the flow around the questions — stems or one file, the
+//! whole arrangement or the selection or the rack loop, which rate, which
+//! bitrate — split the way everything here is split:
+//!
+//! * [`Plan`] + [`plan_jobs`]/[`plan_rack_jobs`] are PURE: a plan and a
+//!   project in, a list of named render jobs out, refusals as `Err` strings
+//!   the dialog shows instead of closing. Every decision a UI test cannot
+//!   reach lives here, headless.
+//! * [`start_arrangement`]/[`start_rack`] run the jobs on a worker thread —
+//!   the TCP carrier's shape: a thread that owns the work, an mpsc facing
+//!   the shell, drained once per frame — reporting [`Event`]s chunk by
+//!   chunk so a long render is a moving bar, not a frozen window, and a
+//!   cancel flag checked between chunks so "stop" means soon, not at the
+//!   end. A cancelled job writes NO file; files from jobs already finished
+//!   stay, and the `File` events already said which those are.
+//! * [`pick_save`]/[`pick_folder`] are the native picker behind the
+//!   `picker` cargo feature (rfd, XDG portal on Linux) — the `midi`
+//!   feature's precedent: a build without it still compiles, and a runtime
+//!   without a portal service degrades to the default `./exports` path with
+//!   the status line saying so, never a silent no-op.
+//!
+//! Rendering reuses `mixdown_with_cache` with one cache per job: contiguous
+//! chunked calls match a one-shot offline render sample for sample — the
+//! property the streaming renderer already pinned — so a tracked export is
+//! bit-identical to the untracked one.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+
+use studio_audio::SourceAudio;
+use studio_core::{ClipId, Project, Ticks, TrackId, TrackKind};
+
+pub use crate::ExportFormat;
+
+/// What kind of span the export covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Tick zero through the last clip's end.
+    Full,
+    /// The hull of the selected clips — first selected start to last
+    /// selected end. Refused out loud when nothing is selected.
+    Selection,
+    /// One pass of the current rack pattern, rendered by the same
+    /// `render_pattern` the audition loop plays.
+    RackLoop,
+}
+
+/// Everything the dialog decides, as a value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Plan {
+    pub format: ExportFormat,
+    pub scope: Scope,
+    /// One file per stem instead of one mixdown. For the arrangement a stem
+    /// is a track (soloed through its own busses); for the rack loop it is
+    /// a channel.
+    pub stems: bool,
+    /// WAV render rate. Opus pins 48k — the codec's contract, enforced in
+    /// the run rather than trusted to the dialog.
+    pub rate: u32,
+    pub layout: studio_audio::format::ChannelFormat,
+    /// Opus bitrate in bits/sec.
+    pub opus_bitrate: u32,
+}
+
+impl Default for Plan {
+    fn default() -> Plan {
+        Plan { format: ExportFormat::Opus, scope: Scope::Full, stems: false,
+               rate: 48_000, layout: studio_audio::format::ChannelFormat::Stereo,
+               opus_bitrate: 128_000 }
+    }
+}
+
+/// One arrangement render: a name (empty for the single mixdown), a span,
+/// and the solo set that isolates the stem.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    pub name: String,
+    pub from: Ticks,
+    pub to: Ticks,
+    pub solo: Vec<TrackId>,
+}
+
+/// The arrangement jobs a plan means. Pure — every refusal is a string the
+/// dialog can show without closing.
+pub fn plan_jobs(plan: &Plan, project: &Project, selection: &[ClipId])
+                 -> Result<Vec<Job>, String> {
+    let (from, to) = match plan.scope {
+        Scope::Full => {
+            let end = project.duration();
+            if end <= Ticks::ZERO { return Err("the arrangement is empty".into()); }
+            (Ticks::ZERO, end)
+        }
+        Scope::Selection => {
+            let clips: Vec<_> = selection.iter()
+                .filter_map(|id| project.clips.get(id)).collect();
+            if clips.is_empty() { return Err("nothing is selected".into()); }
+            let from = clips.iter().map(|c| c.pos).min().unwrap();
+            let to = clips.iter().map(|c| c.end()).max().unwrap();
+            (from, to)
+        }
+        Scope::RackLoop => return Err("rack jobs are planned by plan_rack_jobs".into()),
+    };
+    if !plan.stems {
+        return Ok(vec![Job { name: String::new(), from, to, solo: Vec::new() }]);
+    }
+    // A stem per audio track that actually carries material in the span —
+    // a silent stem is a file nobody asked for. For a selection export the
+    // material that counts is the SELECTED clips: soloing a track whose
+    // only clip in range wasn't selected would smuggle it into its stem.
+    let counts = |t: TrackId| -> bool {
+        project.clips.values().any(|c| {
+            c.track == t && c.pos < to && c.end() > from
+                && (plan.scope != Scope::Selection || selection.contains(&c.id))
+        })
+    };
+    let jobs: Vec<Job> = project.tracks.iter()
+        .filter(|t| t.kind == TrackKind::Audio && counts(t.id))
+        .map(|t| Job { name: t.name.clone(), from, to, solo: vec![t.id] })
+        .collect();
+    if jobs.is_empty() {
+        return Err("no audio track carries material in that span".into());
+    }
+    Ok(jobs)
+}
+
+/// The rack-loop jobs a plan means: one render of the current pattern, or a
+/// stem per unmuted channel (rendered with every other channel muted — the
+/// mute flag `render_pattern` already honours).
+pub fn plan_rack_jobs(stems: bool, rack: &studio_live::Rack, pattern: usize)
+                      -> Result<Vec<(String, studio_live::Rack)>, String> {
+    if rack.patterns.get(pattern).is_none() {
+        return Err("no pattern to render".into());
+    }
+    if !stems {
+        return Ok(vec![(String::new(), rack.clone())]);
+    }
+    let live: Vec<usize> = rack.channels.iter().enumerate()
+        .filter(|(_, c)| !c.muted).map(|(i, _)| i).collect();
+    if live.is_empty() { return Err("every channel is muted".into()); }
+    Ok(live.into_iter().map(|keep| {
+        let mut r = rack.clone();
+        for (i, ch) in r.channels.iter_mut().enumerate() {
+            if i != keep { ch.muted = true; }
+        }
+        (rack.channels[keep].name.clone(), r)
+    }).collect())
+}
+
+/// Where the deliverables land: an exact file (single) or a folder (stems),
+/// which is also which native dialog the shell opens.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dest {
+    File(PathBuf),
+    Folder(PathBuf),
+}
+
+/// What the worker tells the shell, drained once per frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// `done` whole jobs finished; `frac` is progress within the current one.
+    Progress { done: usize, jobs: usize, frac: f32 },
+    /// A deliverable landed on disk.
+    File(PathBuf),
+    Done,
+    Cancelled,
+    Failed(String),
+}
+
+/// A run in flight. Dropping it does NOT cancel — an export someone started
+/// should finish even if the tracker window is closed; the cancel button
+/// sets the flag on purpose.
+pub struct Run {
+    pub rx: mpsc::Receiver<Event>,
+    pub cancel: Arc<AtomicBool>,
+    pub jobs: usize,
+}
+
+/// Whether a native picker is compiled in — how the shell tells "the user
+/// cancelled the dialog" (do nothing) from "there is no dialog to open"
+/// (fall back to `./exports` and say so).
+#[cfg(feature = "picker")]
+pub const PICKER_AVAILABLE: bool = true;
+#[cfg(not(feature = "picker"))]
+pub const PICKER_AVAILABLE: bool = false;
+
+pub fn sanitize(s: &str) -> String {
+    let out: String = s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    if out.is_empty() { "untitled".into() } else { out }
+}
+
+/// A path that does not exist yet — the exporter's overwrite guard,
+/// extracted so stems get it too.
+fn unique_path(dir: &Path, base: &str, ext: &str) -> PathBuf {
+    let mut path = dir.join(format!("{base}.{ext}"));
+    let mut n = 1u32;
+    while path.exists() {
+        path = dir.join(format!("{base}-{n}.{ext}"));
+        n += 1;
+    }
+    path
+}
+
+/// Interleaved stereo → the deliverable on disk.
+fn write_deliverable(plan: &Plan, stereo: &[f32], rate: u32, seed: u64, path: &Path)
+                     -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
+    }
+    match plan.format {
+        ExportFormat::Wav => {
+            let samples = studio_audio::format::expand_from_stereo(stereo, plan.layout, rate);
+            studio_audio::export::export_wav_dithered(
+                &samples, plan.layout.channels() as u16, rate, seed, path)
+                .map_err(|e| format!("wav write: {e}"))
+        }
+        ExportFormat::Opus => {
+            let mut planes = vec![Vec::with_capacity(stereo.len() / 2); 2];
+            for fr in stereo.chunks(2) {
+                planes[0].push(fr[0]);
+                planes[1].push(*fr.get(1).unwrap_or(&fr[0]));
+            }
+            let audio = SourceAudio { sample_rate: rate, channels: planes };
+            let bytes = studio_media::encode_opus(&audio, plan.opus_bitrate as i32)
+                .map_err(|e| e.to_string())?;
+            std::fs::write(path, bytes).map_err(|e| format!("write {path:?}: {e}"))
+        }
+    }
+}
+
+fn job_path(dest: &Dest, plan: &Plan, project_name: &str, job_name: &str) -> PathBuf {
+    let ext = plan.format.ext();
+    match dest {
+        Dest::File(p) => p.clone(),
+        Dest::Folder(dir) => {
+            let base = if job_name.is_empty() { sanitize(project_name) }
+                       else { format!("{}-{}", sanitize(project_name), sanitize(job_name)) };
+            unique_path(dir, &base, ext)
+        }
+    }
+}
+
+/// Render the plan's arrangement jobs on a worker thread. Everything the
+/// worker needs is CLONED IN — the shell keeps editing while the export
+/// renders the project as it stood when the button was pressed, which is
+/// the only export anyone means.
+pub fn start_arrangement(
+    plan: Plan,
+    jobs: Vec<Job>,
+    dest: Dest,
+    project: Project,
+    audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
+) -> Run {
+    // Opus's contract, enforced where it cannot be forgotten.
+    let mut plan = plan;
+    if plan.format == ExportFormat::Opus {
+        plan.rate = 48_000;
+        plan.layout = studio_audio::format::ChannelFormat::Stereo;
+    }
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let n_jobs = jobs.len();
+    std::thread::spawn(move || {
+        let rate = plan.rate;
+        let chunk = Ticks::from_seconds(1.0);
+        for (ji, job) in jobs.iter().enumerate() {
+            // One cache per job: contiguous chunks match the one-shot
+            // render exactly; a NEW job is a seek, and a fresh cache is
+            // precisely the reset a seek means.
+            let mut cache = studio_audio::EffectCache::new();
+            let total = (job.to.0 - job.from.0).max(1);
+            let mut stereo: Vec<f32> = Vec::new();
+            let mut at = job.from;
+            while at < job.to {
+                if flag.load(Ordering::Relaxed) {
+                    let _ = tx.send(Event::Cancelled);
+                    return;
+                }
+                let to = Ticks((at.0 + chunk.0).min(job.to.0));
+                stereo.extend(studio_audio::mixdown_with_cache(
+                    &project, &audio, &std::collections::BTreeMap::new(),
+                    at, to, rate, &job.solo, &[], &mut cache));
+                at = to;
+                let _ = tx.send(Event::Progress {
+                    done: ji, jobs: n_jobs,
+                    frac: ((at.0 - job.from.0) as f64 / total as f64) as f32,
+                });
+            }
+            let path = job_path(&dest, &plan, &project.name, &job.name);
+            match write_deliverable(&plan, &stereo, rate, path_seed(&path), &path) {
+                Ok(()) => { let _ = tx.send(Event::File(path)); }
+                Err(e) => { let _ = tx.send(Event::Failed(e)); return; }
+            }
+        }
+        let _ = tx.send(Event::Done);
+    });
+    Run { rx, cancel, jobs: n_jobs }
+}
+
+/// Render the rack-loop jobs — one `render_pattern` pass each, duplicated
+/// to both channels (the loop is mono by construction, and a stereo file
+/// is what every player expects).
+pub fn start_rack(
+    plan: Plan,
+    jobs: Vec<(String, studio_live::Rack)>,
+    dest: Dest,
+    pattern: usize,
+    audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
+    project_name: String,
+) -> Run {
+    let mut plan = plan;
+    if plan.format == ExportFormat::Opus {
+        plan.rate = 48_000;
+        plan.layout = studio_audio::format::ChannelFormat::Stereo;
+    }
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let n_jobs = jobs.len();
+    std::thread::spawn(move || {
+        for (ji, (name, rack)) in jobs.iter().enumerate() {
+            if flag.load(Ordering::Relaxed) {
+                let _ = tx.send(Event::Cancelled);
+                return;
+            }
+            let Some(pat) = rack.patterns.get(pattern) else {
+                let _ = tx.send(Event::Failed("the pattern vanished mid-export".into()));
+                return;
+            };
+            let mut synth = studio_live::BuiltinSynth { sources: &audio };
+            let mono = studio_live::render_pattern(
+                pat, rack, &mut synth, &rack.tempo(), plan.rate, 0);
+            let mut stereo = Vec::with_capacity(mono.len() * 2);
+            for s in &mono { stereo.push(*s); stereo.push(*s); }
+            let path = job_path(&dest, &plan, &project_name, name);
+            match write_deliverable(&plan, &stereo, plan.rate, path_seed(&path), &path) {
+                Ok(()) => { let _ = tx.send(Event::File(path)); }
+                Err(e) => { let _ = tx.send(Event::Failed(e)); return; }
+            }
+            let _ = tx.send(Event::Progress { done: ji + 1, jobs: n_jobs, frac: 0.0 });
+        }
+        let _ = tx.send(Event::Done);
+    });
+    Run { rx, cancel, jobs: n_jobs }
+}
+
+/// The dither seed: derived from the path so re-exporting the same name is
+/// still deterministic per deliverable, the property the one-click
+/// exporter's timestamp seed already had by accident.
+fn path_seed(p: &Path) -> u64 {
+    p.to_string_lossy().bytes().fold(0xcbf2_9ce4_8422_2325u64,
+        |h, b| (h ^ b as u64).wrapping_mul(0x1000_0000_01b3))
+}
+
+// ── the native picker, behind its feature ───────────────────────────────
+
+/// The native save dialog, or `None` when the feature is off or the
+/// desktop has no portal to ask — the caller falls back to `./exports`
+/// and says so, never silently.
+#[cfg(feature = "picker")]
+pub fn pick_save(suggested: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Export to…")
+        .set_file_name(suggested)
+        .save_file()
+}
+#[cfg(not(feature = "picker"))]
+pub fn pick_save(_suggested: &str) -> Option<PathBuf> { None }
+
+/// The native folder dialog for stems, same fallback contract.
+#[cfg(feature = "picker")]
+pub fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title("Export stems into…").pick_folder()
+}
+#[cfg(not(feature = "picker"))]
+pub fn pick_folder() -> Option<PathBuf> { None }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studio_core::{Clip, Op, Source, SourceId, Track};
+
+    fn project() -> Project {
+        let mut p = Project { name: "cut".into(), ..Default::default() };
+        for (i, (kind, nm)) in [(TrackKind::Video, "V1"), (TrackKind::Audio, "A1"),
+                                 (TrackKind::Audio, "A2"), (TrackKind::Audio, "empty")]
+            .iter().enumerate()
+        {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(i as u64 + 1), kind: *kind,
+                name: (*nm).into(), muted: false, locked: false, gain: 1.0, route: None },
+                at: i }).unwrap();
+        }
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        for (id, track, at) in [(1u64, 2u64, 0.0), (2, 3, 1.0), (3, 2, 3.0)] {
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1),
+                track: TrackId(track), pos: Ticks::from_seconds(at),
+                src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0),
+                gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn a_full_single_export_is_one_job_spanning_the_arrangement() {
+        let p = project();
+        let jobs = plan_jobs(&Plan::default(), &p, &[]).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].from, Ticks::ZERO);
+        assert_eq!(jobs[0].to, p.duration());
+        assert!(jobs[0].solo.is_empty(), "a mixdown solos nothing");
+    }
+
+    #[test]
+    fn stems_are_one_per_audio_track_that_carries_material() {
+        // The video track is not audio; the "empty" track has no clips —
+        // neither earns a file. A silent stem is a file nobody asked for.
+        let p = project();
+        let plan = Plan { stems: true, ..Plan::default() };
+        let jobs = plan_jobs(&plan, &p, &[]).unwrap();
+        assert_eq!(jobs.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(),
+                   vec!["A1", "A2"]);
+        assert_eq!(jobs[0].solo, vec![TrackId(2)], "each stem solos its own track");
+    }
+
+    #[test]
+    fn a_selection_export_spans_the_hull_and_refuses_when_empty() {
+        let p = project();
+        let plan = Plan { scope: Scope::Selection, ..Plan::default() };
+        assert!(plan_jobs(&plan, &p, &[]).is_err(), "no selection, said out loud");
+        // Clips 1 (0..1s) and 3 (3..4s): the hull is 0..4s.
+        let jobs = plan_jobs(&plan, &p, &[ClipId(1), ClipId(3)]).unwrap();
+        assert_eq!(jobs[0].from, Ticks::ZERO);
+        assert_eq!(jobs[0].to, Ticks::from_seconds(4.0));
+    }
+
+    #[test]
+    fn selection_stems_cover_only_tracks_owning_selected_clips() {
+        // Clip 2 lives on A2 inside the hull but is NOT selected: soloing
+        // A2 would smuggle it into a stem, so A2 earns no job.
+        let p = project();
+        let plan = Plan { scope: Scope::Selection, stems: true, ..Plan::default() };
+        let jobs = plan_jobs(&plan, &p, &[ClipId(1), ClipId(3)]).unwrap();
+        assert_eq!(jobs.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(), vec!["A1"]);
+    }
+
+    #[test]
+    fn rack_stems_are_one_per_unmuted_channel_with_the_rest_muted() {
+        let mut rack = studio_live::Rack::trap_kit();
+        rack.channels[1].muted = true;
+        let jobs = plan_rack_jobs(true, &rack, 0).unwrap();
+        assert_eq!(jobs.len(), rack.channels.len() - 1, "the muted channel earns no stem");
+        for (name, r) in &jobs {
+            let live: Vec<_> = r.channels.iter().enumerate()
+                .filter(|(_, c)| !c.muted).collect();
+            assert_eq!(live.len(), 1, "exactly one channel sounds in '{name}'");
+            assert_eq!(&live[0].1.name, name);
+        }
+        let single = plan_rack_jobs(false, &rack, 0).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].1, rack, "the single render is the rack as it stands");
+        assert!(plan_rack_jobs(true, &rack, 99).is_err(), "a missing pattern refuses");
+    }
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("studio-export-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn drain(run: &Run) -> Vec<Event> {
+        let mut evs = Vec::new();
+        while let Ok(e) = run.rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            let last = matches!(e, Event::Done | Event::Cancelled | Event::Failed(_));
+            evs.push(e);
+            if last { break; }
+        }
+        evs
+    }
+
+    #[test]
+    fn a_tracked_wav_export_lands_the_file_and_reports_monotonic_progress() {
+        let p = project();
+        let mut audio = std::collections::BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000,
+            channels: vec![vec![0.25; 48_000 * 10]] });
+        let plan = Plan { format: ExportFormat::Wav, ..Plan::default() };
+        let jobs = plan_jobs(&plan, &p, &[]).unwrap();
+        let dir = tempdir("wav");
+        let run = start_arrangement(plan, jobs, Dest::File(dir.join("mix.wav")), p, audio);
+        let evs = drain(&run);
+        assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
+        let mut last = -1.0f32;
+        for e in &evs {
+            if let Event::Progress { frac, .. } = e {
+                assert!(*frac >= last, "progress went backwards: {evs:?}");
+                last = *frac;
+            }
+        }
+        assert!((last - 1.0).abs() < 1e-6, "the bar reaches the end");
+        let f = dir.join("mix.wav");
+        assert!(evs.contains(&Event::File(f.clone())));
+        assert!(std::fs::metadata(&f).map(|m| m.len() > 44).unwrap_or(false),
+                "a real WAV landed");
+    }
+
+    #[test]
+    fn stems_land_one_named_file_each_and_opus_survives_its_own_decoder() {
+        let p = project();
+        let mut audio = std::collections::BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000,
+            channels: vec![vec![0.25; 48_000 * 10]] });
+        let plan = Plan { format: ExportFormat::Opus, stems: true, rate: 44_100,
+                          ..Plan::default() };
+        let jobs = plan_jobs(&plan, &p, &[]).unwrap();
+        let dir = tempdir("stems");
+        let run = start_arrangement(plan, jobs, Dest::Folder(dir.clone()), p, audio);
+        let evs = drain(&run);
+        assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
+        let files: Vec<_> = evs.iter().filter_map(|e| match e {
+            Event::File(p) => Some(p.clone()), _ => None }).collect();
+        assert_eq!(files.len(), 2, "one file per stem: {files:?}");
+        assert!(files[0].file_name().unwrap().to_string_lossy().contains("A1"));
+        // The deliverable is a real Ogg Opus: this crate's own decoder —
+        // the roundtrip yardstick the encoder tests already use — reads it
+        // back at the codec's contractual 48k despite the plan asking 44.1.
+        let bytes = std::fs::read(&files[0]).unwrap();
+        let back = studio_media::decode_bytes(bytes, Some("opus")).expect("decodes");
+        assert_eq!(back.sample_rate, 48_000);
+        // The ARRANGEMENT is four seconds (three one-second clips, the last
+        // at 3s) — this assertion's first draft measured against the ten-
+        // second SOURCE and failed, which is exactly the confusion the
+        // span-vs-source distinction exists to prevent.
+        let secs = back.frames() as f64 / 48_000.0;
+        assert!((secs - 4.0).abs() < 0.1, "the stem is the span, not the source: {secs}s");
+    }
+
+    #[test]
+    fn cancel_stops_the_run_and_writes_no_file() {
+        let p = project();
+        let mut audio = std::collections::BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000,
+            channels: vec![vec![0.25; 48_000 * 10]] });
+        let plan = Plan { format: ExportFormat::Wav, ..Plan::default() };
+        let jobs = plan_jobs(&plan, &p, &[]).unwrap();
+        let dir = tempdir("cancel");
+        let dest = dir.join("mix.wav");
+        let run = start_arrangement(plan, jobs, Dest::File(dest.clone()), p, audio);
+        // Cancel before the worker gets anywhere: the flag is checked
+        // before every chunk, so the first check already sees it.
+        run.cancel.store(true, Ordering::Relaxed);
+        let evs = drain(&run);
+        assert!(evs.contains(&Event::Cancelled), "{evs:?}");
+        assert!(!evs.iter().any(|e| matches!(e, Event::File(_))));
+        assert!(!dest.exists(), "a cancelled job writes nothing");
+    }
+
+    #[test]
+    fn a_rack_loop_export_is_audible_and_stereo() {
+        let rack = studio_live::Rack::trap_kit();
+        let jobs = plan_rack_jobs(false, &rack, 0).unwrap();
+        let dir = tempdir("rack");
+        let plan = Plan { format: ExportFormat::Opus, scope: Scope::RackLoop,
+                          ..Plan::default() };
+        let run = start_rack(plan, jobs, Dest::File(dir.join("loop.opus")), 0,
+                             Default::default(), "cut".into());
+        let evs = drain(&run);
+        assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
+        let bytes = std::fs::read(dir.join("loop.opus")).unwrap();
+        let back = studio_media::decode_bytes(bytes, Some("opus")).expect("decodes");
+        assert_eq!(back.channels.len(), 2);
+        assert!(back.channels[0].iter().any(|s| s.abs() > 0.01), "the kit is in the file");
+    }
+}

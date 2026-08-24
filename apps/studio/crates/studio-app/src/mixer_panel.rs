@@ -56,6 +56,91 @@ pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
 }
 
 pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
+    // The map explains what the rows below edit: the whole graph at once,
+    // tracks → busses → master, sends dashed. Collapsed state is egui's
+    // own; default open, because 'where does my signal go' is the first
+    // question this panel gets asked.
+    egui::CollapsingHeader::new("routing map").default_open(true).show(ui, |ui| {
+        egui::ScrollArea::horizontal().id_salt("routing-map").show(ui, |ui| {
+            studio_egui::routing::routing_map(ui, &s.session.doc.project, c);
+        });
+    });
+    ui.separator();
+    // The mastering pass lives HERE — on the mixer, beside the busses it
+    // would act on — not in a menu: mixing and mastering is what this
+    // panel is for, and a tool you have to go looking for is a tool that
+    // gets used once. The button only ASKS for the analysis; the window
+    // it opens keeps diagnosis, dial and apply in that order.
+    ui.horizontal(|ui| {
+        let target = s.session.doc.project.busses.iter()
+            .find(|(_, b)| b.parent.is_none())
+            .map(|(id, b)| (*id, b.name.clone()));
+        let enabled = target.is_some();
+        if ui.add_enabled(enabled, egui::Button::new("mix & master…"))
+            .on_hover_text("measure the mix and propose moves — nothing applies until you say so")
+            .on_disabled_hover_text("add a bus feeding master first")
+            .clicked() {
+            if let Some((id, name)) = target {
+                s.mix_pass_request = Some((id, name));
+            }
+        }
+        ui.colored_label(c.text_weak, "analysis reads the current mixdown");
+    });
+    ui.separator();
+    // ── inputs, per bus ─────────────────────────────────────────────────
+    // Routing could only ever be edited from the SOURCE end (a track's
+    // route combo) and, for busses, only at creation. A mixer strip reads
+    // the other way — "what feeds me" — so each bus lists its inputs and
+    // offers more: adding one is SetRoute/SetBusParent from the receiving
+    // side, removing one sends the feeder back to master. A reparent that
+    // would loop is refused by the op and the status line says so.
+    let project = s.session.doc.project.clone();
+    egui::CollapsingHeader::new("bus inputs").default_open(false).show(ui, |ui| {
+        for (bid, bus) in &project.busses {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("{} ⇐", bus.name));
+                for t in project.tracks.iter().filter(|t| t.route == Some(*bid)) {
+                    if ui.small_button(format!("{} ✕", t.name))
+                        .on_hover_text("send this track back to master").clicked() {
+                        s.edit(studio_core::Op::SetRoute { track: t.id, bus: None },
+                               "input removed");
+                    }
+                }
+                for (cid, c) in project.busses.iter().filter(|(_, c)| c.parent == Some(*bid)) {
+                    if ui.small_button(format!("bus {} ✕", c.name))
+                        .on_hover_text("send this bus back to master").clicked() {
+                        s.edit(studio_core::Op::SetBusParent { id: *cid, parent: None },
+                               "input removed");
+                    }
+                }
+                ui.menu_button("+ input", |ui| {
+                    for t in project.tracks.iter()
+                        .filter(|t| t.kind == studio_core::TrackKind::Audio
+                                    && t.route != Some(*bid)) {
+                        if ui.button(format!("track {}", t.name)).clicked() {
+                            s.edit(studio_core::Op::SetRoute {
+                                track: t.id, bus: Some(*bid) }, "input added");
+                            ui.close();
+                        }
+                    }
+                    for (cid, c) in project.busses.iter()
+                        .filter(|(cid, c)| *cid != bid && c.parent != Some(*bid)) {
+                        if ui.button(format!("bus {}", c.name)).clicked() {
+                            // A cycle is the op's refusal, not this menu's
+                            // guess — the status line explains it.
+                            s.edit(studio_core::Op::SetBusParent {
+                                id: *cid, parent: Some(*bid) }, "input added");
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
+        if project.busses.is_empty() {
+            ui.colored_label(c.text_weak, "no busses yet — add one below");
+        }
+    });
+    ui.separator();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| show_inner(ui, s, c));

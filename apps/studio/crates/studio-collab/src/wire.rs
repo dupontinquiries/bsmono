@@ -31,11 +31,27 @@
 //! can be receiving live edits while the catch-up is still arriving.
 
 use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
-use studio_core::{Bus, BusId, Clip, ClipId, Effect, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
-use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
+use studio_core::{AutoTarget, Bus, BusId, Clip, ClipId, Effect, GroupId, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
+///
+/// v13: the key and the markers — `SetKey`(26), `SetMarker`(27),
+/// `RemoveMarker`(28), `ClearMarkers`(29).
+///
+/// v12: `Op::Group`(25) — several ops as one undo step, nested encoding.
+///
+/// v11: `Op` gained the input-side routing and composition set —
+/// `SetBusParent`(22), `SetGroup`(23), `RemoveGroup`(24) — and `GroupId`.
+///
+/// v10: `Op` gained the automation pair — `SetAutoPoint`(20) /
+/// `RemoveAutoPoint`(21) — and with them the `AutoTarget` encoding
+/// (kind byte + id).
+///
+/// v9: `Pattern` gained `rolls` — the piano roll's held notes, per channel.
+/// A rack shape change, so it moves both `Packet::Rack` and the file
+/// format's mandatory rack section (which shares this codec).
 ///
 /// v2: `Track` gained `route: Option<BusId>`, and `Op` gained the bus-graph
 /// variants (`AddBus`/`RemoveBus`/`SetBusGain`/`SetBusChain`/`SetBusSends`/
@@ -63,7 +79,7 @@ use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 8;
+pub const WIRE_VERSION: u8 = 13;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -233,6 +249,20 @@ fn get_bus(r: &mut R) -> Option<Bus> {
     })
 }
 
+fn put_auto_target(o: &mut Vec<u8>, t: AutoTarget) {
+    match t {
+        AutoTarget::TrackGain(id) => { put_u8(o, 0); put_u64(o, id.0); }
+        AutoTarget::BusGain(id) => { put_u8(o, 1); put_u64(o, id.0); }
+    }
+}
+fn get_auto_target(r: &mut R) -> Option<AutoTarget> {
+    match r.u8()? {
+        0 => Some(AutoTarget::TrackGain(TrackId(r.u64()?))),
+        1 => Some(AutoTarget::BusGain(BusId(r.u64()?))),
+        _ => None, // an unknown target refuses the packet, like an unknown op
+    }
+}
+
 fn put_track(o: &mut Vec<u8>, t: &Track) {
     put_u64(o, t.id.0);
     put_u8(o, matches!(t.kind, TrackKind::Audio) as u8);
@@ -298,6 +328,48 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
         Op::RemoveSource { id } => { put_u8(o, 18); put_u64(o, id.0); }
         Op::SetTrackGain { id, gain } => { put_u8(o, 19); put_u64(o, id.0); put_f32(o, *gain); }
+        Op::SetAutoPoint { target, at, value } => {
+            put_u8(o, 20); put_auto_target(o, *target); put_ticks(o, *at); put_f32(o, *value);
+        }
+        Op::RemoveAutoPoint { target, at } => {
+            put_u8(o, 21); put_auto_target(o, *target); put_ticks(o, *at);
+        }
+        Op::SetBusParent { id, parent } => {
+            put_u8(o, 22); put_u64(o, id.0);
+            match parent {
+                Some(p) => { put_u8(o, 1); put_u64(o, p.0); }
+                None => put_u8(o, 0),
+            }
+        }
+        Op::SetGroup { id, name, clips } => {
+            put_u8(o, 23); put_u64(o, id.0); put_str(o, name);
+            put_u16(o, clips.len().min(u16::MAX as usize) as u16);
+            for c in clips { put_u64(o, c.0); }
+        }
+        Op::RemoveGroup { id } => { put_u8(o, 24); put_u64(o, id.0); }
+        Op::SetKey { key } => {
+            put_u8(o, 26);
+            match key {
+                None => put_u8(o, 0),
+                Some(k) => {
+                    put_u8(o, 1);
+                    put_u8(o, k.root);
+                    put_u8(o, match k.scale {
+                        studio_core::Scale::Major => 0, studio_core::Scale::Minor => 1,
+                        studio_core::Scale::Dorian => 2, studio_core::Scale::Mixolydian => 3,
+                        studio_core::Scale::Chromatic => 4,
+                    });
+                }
+            }
+        }
+        Op::SetMarker { at, name } => { put_u8(o, 27); put_ticks(o, *at); put_str(o, name); }
+        Op::RemoveMarker { name } => { put_u8(o, 28); put_str(o, name); }
+        Op::ClearMarkers => put_u8(o, 29),
+        Op::Group { ops } => {
+            put_u8(o, 25);
+            put_u16(o, ops.len().min(u16::MAX as usize) as u16);
+            for inner in ops.iter().take(u16::MAX as usize) { put_op(o, inner); }
+        }
     }
 }
 
@@ -337,6 +409,41 @@ fn get_op(r: &mut R) -> Option<Op> {
         16 => Op::SetRoute { track: TrackId(r.u64()?), bus: get_opt_bus_id(r)? },
         18 => Op::RemoveSource { id: SourceId(r.u64()?) },
         19 => Op::SetTrackGain { id: TrackId(r.u64()?), gain: r.f32()? },
+        20 => Op::SetAutoPoint { target: get_auto_target(r)?, at: r.ticks()?, value: r.f32()? },
+        21 => Op::RemoveAutoPoint { target: get_auto_target(r)?, at: r.ticks()? },
+        22 => Op::SetBusParent {
+            id: BusId(r.u64()?),
+            parent: match r.u8()? { 0 => None, 1 => Some(BusId(r.u64()?)), _ => return None },
+        },
+        23 => {
+            let id = GroupId(r.u64()?);
+            let name = r.str()?;
+            let n = r.u16()? as usize;
+            let mut clips = Vec::with_capacity(n.min(4096));
+            for _ in 0..n { clips.push(ClipId(r.u64()?)); }
+            Op::SetGroup { id, name, clips }
+        }
+        24 => Op::RemoveGroup { id: GroupId(r.u64()?) },
+        26 => Op::SetKey { key: match r.u8()? {
+            0 => None,
+            1 => Some(studio_core::Key {
+                root: r.u8()?,
+                scale: match r.u8()? {
+                    0 => studio_core::Scale::Major, 1 => studio_core::Scale::Minor,
+                    2 => studio_core::Scale::Dorian, 3 => studio_core::Scale::Mixolydian,
+                    4 => studio_core::Scale::Chromatic, _ => return None,
+                } }),
+            _ => return None,
+        } },
+        27 => Op::SetMarker { at: Ticks(r.i64()?), name: r.str()? },
+        28 => Op::RemoveMarker { name: r.str()? },
+        29 => Op::ClearMarkers,
+        25 => {
+            let n = r.u16()? as usize;
+            let mut ops = Vec::with_capacity(n.min(4096));
+            for _ in 0..n { ops.push(get_op(r)?); }
+            Op::Group { ops }
+        }
         _ => return None, // an op kind from a newer build: refuse, don't guess
     })
 }
@@ -477,6 +584,20 @@ fn put_pattern(o: &mut Vec<u8>, pat: &Pattern) {
         put_u32(o, *step);
         put_stepmod(o, m);
     }
+    // v9: the piano roll. BTreeMap iteration and add_note's sorted lists
+    // keep the encoding canonical — the same roll is always the same bytes.
+    put_u16(o, pat.rolls.len().min(u16::MAX as usize) as u16);
+    for (ch, notes) in &pat.rolls {
+        put_u16(o, *ch as u16);
+        put_u16(o, notes.len().min(u16::MAX as usize) as u16);
+        for n in notes {
+            put_u8(o, n.key as u8);
+            put_u32(o, n.start);
+            put_u32(o, n.len);
+            put_f32(o, n.vel);
+            put_u8(o, n.slide as u8);
+        }
+    }
 }
 fn get_pattern(r: &mut R) -> Option<Pattern> {
     let name = r.str()?;
@@ -492,7 +613,24 @@ fn get_pattern(r: &mut R) -> Option<Pattern> {
         let m = get_stepmod(r)?;
         mods.insert((ch, step), m);
     }
-    Some(Pattern { name, steps, rows, mods })
+    let rn = r.u16()? as usize;
+    let mut rolls = std::collections::BTreeMap::new();
+    for _ in 0..rn {
+        let ch = r.u16()? as usize;
+        let nn = r.u16()? as usize;
+        let mut notes = Vec::with_capacity(nn.min(4096));
+        for _ in 0..nn {
+            notes.push(Note {
+                key: r.u8()? as i8,
+                start: r.u32()?,
+                len: r.u32()?,
+                vel: r.f32()?,
+                slide: r.u8()? != 0,
+            });
+        }
+        rolls.insert(ch, notes);
+    }
+    Some(Pattern { name, steps, rows, mods, rolls })
 }
 
 fn put_rack(o: &mut Vec<u8>, rack: &Rack) {
@@ -819,6 +957,11 @@ mod tests {
         pattern.toggle(0, 0);
         pattern.toggle(1, 4);
         pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)) });
+        // v9: a roll with the awkward parts — a negative key, a chord, and
+        // a slide — so every rack round trip exercises the note codec.
+        pattern.add_note(1, Note { key: -12, start: 0, len: 4, vel: 0.9, slide: false });
+        pattern.add_note(1, Note { key: 7, start: 0, len: 2, vel: 0.5, slide: false });
+        pattern.add_note(1, Note { key: 3, start: 6, len: 1, vel: 1.0, slide: true });
         Rack {
             channels: vec![
                 Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2) },
@@ -954,7 +1097,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 8, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 13, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1027,5 +1170,46 @@ mod tests {
         let again = host.catchup_for(0);
         joiner.receive(Packet::decode(&again.encode()).unwrap());
         assert_eq!(joiner.project, host.project, "replaying everything changes nothing");
+    }
+}
+
+#[cfg(test)]
+mod automation_wire_tests {
+    use super::*;
+    use studio_core::AutoTarget;
+
+    #[test]
+    fn the_automation_ops_survive_the_wire_exactly() {
+        for op in [
+            Op::SetAutoPoint { target: AutoTarget::TrackGain(TrackId(3)),
+                               at: Ticks(705_600_000), value: 0.25 },
+            Op::SetAutoPoint { target: AutoTarget::BusGain(BusId(9)),
+                               at: Ticks(0), value: 1.5 },
+            Op::RemoveAutoPoint { target: AutoTarget::TrackGain(TrackId(3)),
+                                  at: Ticks(705_600_000) },
+        ] {
+            let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 7, site: SiteId(2) }, op });
+            assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_wire_tests {
+    use super::*;
+    use studio_core::GroupId;
+
+    #[test]
+    fn the_v11_ops_survive_the_wire_exactly() {
+        for op in [
+            Op::SetBusParent { id: BusId(3), parent: Some(BusId(9)) },
+            Op::SetBusParent { id: BusId(3), parent: None },
+            Op::SetGroup { id: GroupId(7), name: "hook".into(),
+                           clips: vec![ClipId(1), ClipId(5)] },
+            Op::RemoveGroup { id: GroupId(7) },
+        ] {
+            let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 3, site: SiteId(1) }, op });
+            assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
+        }
     }
 }

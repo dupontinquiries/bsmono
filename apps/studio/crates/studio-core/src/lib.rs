@@ -76,6 +76,7 @@ id_type!(ClipId, "A clip's stable identity. Never reused, never an index — thi
 id_type!(TrackId, "A track's stable identity.");
 id_type!(SourceId, "A media source (Audacity's sequence/blocks, kdenlive's bin clip). The timeline references samples; it never owns them.");
 id_type!(BusId, "A bus's stable identity. Busses form a routing graph (parent hierarchy plus sends), not a flat list, which is why they get ids rather than being addressed by position.");
+id_type!(GroupId, "A composition's stable identity: a named set of clips the timeline folds to one block — kdenlive's pre-batched group, After Effects' precomp, as the smallest model that supports the gesture. Membership is a PROJECT fact (a collaborator sees your composition); folded open or closed is view state in the device's workspace sidecar, the solo rule.");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackKind { Video, Audio }
@@ -188,6 +189,154 @@ pub struct Project {
     /// existed at all.
     pub busses: BTreeMap<BusId, Bus>,
     pub name: String,
+    /// Automation lanes: points per target, each lane sorted by time. A
+    /// lane RIDES its fader (the render multiplies the two), it does not
+    /// replace it — the fader stays a trim you can grab without fighting
+    /// the curve, and a project with no lanes renders bit-identically to
+    /// one from before lanes existed. Sparse: an emptied lane drops its
+    /// entry, and a target that was removed may leave a dangling lane —
+    /// harmless (the render skips unknown targets) and cheaper than making
+    /// `RemoveTrack` responsible for a second cleanup undo can't restore.
+    /// `serde(default)` so any pre-automation serialization still loads.
+    #[serde(default)]
+    pub automation: BTreeMap<AutoTarget, Vec<(Ticks, f32)>>,
+    /// Compositions (see [`GroupId`]). A clip may sit in several groups; a
+    /// removed clip may dangle in one — the automation rule again:
+    /// harmless, filtered at draw time, cheaper than a second cleanup
+    /// undo could not restore.
+    #[serde(default)]
+    pub groups: BTreeMap<GroupId, Group>,
+    /// The song's key, when the writer has decided one. `None` means "no
+    /// opinion" and every note is in key — a project must never be told
+    /// its notes are wrong because nobody set a field.
+    #[serde(default)]
+    pub key: Option<Key>,
+    /// Named points on the timeline — the one feature both the FL Studio
+    /// and kdenlive communities ask for in the same words ("markers",
+    /// "jump to", "delete all"). Sorted by position on read, so the
+    /// keyboard's next/previous is just a scan.
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+}
+
+/// A key: a root pitch class (0 = C) and a scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Key {
+    pub root: u8,
+    pub scale: Scale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Scale { Major, Minor, Dorian, Mixolydian, Chromatic }
+
+impl Scale {
+    /// Semitone offsets from the root.
+    pub fn degrees(self) -> &'static [u8] {
+        match self {
+            Scale::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Scale::Minor => &[0, 2, 3, 5, 7, 8, 10],
+            Scale::Dorian => &[0, 2, 3, 5, 7, 9, 10],
+            Scale::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
+            Scale::Chromatic => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Scale::Major => "major", Scale::Minor => "minor",
+            Scale::Dorian => "dorian", Scale::Mixolydian => "mixolydian",
+            Scale::Chromatic => "chromatic",
+        }
+    }
+}
+
+/// The twelve names, sharps — the spelling a piano roll uses.
+pub const PITCH_NAMES: [&str; 12] =
+    ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+/// A roll key's MIDI number. Key 0 is A1 (55 Hz, MIDI 33) — the rack's
+/// own `sub_freq` reference, so a label and a pitch cannot disagree.
+pub const KEY_ZERO_MIDI: i32 = 33;
+
+pub fn key_midi(key: i8) -> i32 { KEY_ZERO_MIDI + key as i32 }
+
+/// The label a piano roll shows: `A1` for key 0, `C#4`, `A5`.
+pub fn note_label(key: i8) -> String {
+    let m = key_midi(key);
+    let pc = m.rem_euclid(12) as usize;
+    let octave = m.div_euclid(12) - 1;
+    format!("{}{}", PITCH_NAMES[pc], octave)
+}
+
+impl Key {
+    /// Is this roll key in the scale? A `None` key (no opinion) is handled
+    /// by the caller — everything is in key when nothing was chosen.
+    pub fn contains(&self, key: i8) -> bool {
+        let pc = (key_midi(key) - self.root as i32).rem_euclid(12) as u8;
+        self.scale.degrees().contains(&pc)
+    }
+    pub fn name(&self) -> String {
+        format!("{} {}", PITCH_NAMES[(self.root % 12) as usize], self.scale.name())
+    }
+}
+
+/// A named point on the timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub at: Ticks,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    pub name: String,
+    pub clips: Vec<ClipId>,
+}
+
+/// What an automation lane drives. Track and bus gain first — the volume
+/// ride is the automation everyone reaches for — with the enum here so a
+/// clip-gain or effect-parameter target is a variant away, not a redesign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AutoTarget {
+    TrackGain(TrackId),
+    BusGain(BusId),
+}
+
+/// A lane's value at `at`: linear between points, held flat before the
+/// first and after the last (the ends are what the automation last said,
+/// not a cliff back to unity), and 1.0 — a transparent ride — for a lane
+/// with no points at all.
+/// [`eval_lane`] for a caller sweeping time FORWARD, which every renderer
+/// is: `cursor` remembers the segment last used, so a lane of ten thousand
+/// points costs one comparison per sample instead of a binary search.
+/// Falls back to the search whenever `at` moves backwards (a loop wrap, a
+/// seek), so it is exactly `eval_lane` for any input — pinned by a test
+/// that sweeps both and compares every sample.
+pub fn eval_lane_cursor(points: &[(Ticks, f32)], at: Ticks, cursor: &mut usize) -> f32 {
+    if points.is_empty() { return 1.0; }
+    if *cursor >= points.len() || (*cursor > 0 && points[*cursor - 1].0 > at) {
+        *cursor = points.partition_point(|(t, _)| *t <= at);
+    }
+    while *cursor < points.len() && points[*cursor].0 <= at { *cursor += 1; }
+    let i = *cursor;
+    if i == 0 { return points[0].1.max(0.0); }
+    if i == points.len() { return points[i - 1].1.max(0.0); }
+    let (t0, v0) = points[i - 1];
+    let (t1, v1) = points[i];
+    let span = (t1.0 - t0.0).max(1) as f64;
+    let frac = ((at.0 - t0.0) as f64 / span) as f32;
+    (v0 + (v1 - v0) * frac).max(0.0)
+}
+
+pub fn eval_lane(points: &[(Ticks, f32)], at: Ticks) -> f32 {
+    if points.is_empty() { return 1.0; }
+    let i = points.partition_point(|(t, _)| *t <= at);
+    if i == 0 { return points[0].1.max(0.0); }
+    if i == points.len() { return points[i - 1].1.max(0.0); }
+    let (t0, v0) = points[i - 1];
+    let (t1, v1) = points[i];
+    let span = (t1.0 - t0.0).max(1) as f64;
+    let frac = ((at.0 - t0.0) as f64 / span) as f32;
+    (v0 + (v1 - v0) * frac).max(0.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +362,16 @@ pub enum Op {
     /// edit, not the lock toggle; `SetTrackFlags` stays the only edit a
     /// locked track accepts, because something has to be able to unlock it.
     SetTrackGain { id: TrackId, gain: f32 },
+    /// Place (or move, or restate) one automation point: absolute (time,
+    /// value), so two peers editing the same lane converge per-point the
+    /// way clips converge per-field — a point at the same tick is the same
+    /// point, and the last writer's value wins on every replica. Refused on
+    /// a locked track for `SetTrackGain`'s reason: a ride is a mix edit.
+    SetAutoPoint { target: AutoTarget, at: Ticks, value: f32 },
+    /// Remove the point at exactly (target, at). Refused when there is no
+    /// such point — the inverse an undo needs (`SetAutoPoint` of the old
+    /// value) would otherwise have nothing to restore.
+    RemoveAutoPoint { target: AutoTarget, at: Ticks },
     AddClip { clip: Clip },
     RemoveClip { id: ClipId },
     /// Absolute placement, not a delta — see the module docs on convergence.
@@ -252,11 +411,49 @@ pub enum Op {
     SetBusSends { id: BusId, sends: Vec<Send> },
     /// `bus: None` routes the track straight to master.
     SetRoute { track: TrackId, bus: Option<BusId> },
+    /// Re-parent a bus — the INPUT side of the graph, so a mixer strip can
+    /// say "this feeds me" instead of routing only ever being edited from
+    /// the source end and only at creation. `None` is master. Refused when
+    /// the new parent chain reaches back to `id`: a bus cannot feed itself.
+    SetBusParent { id: BusId, parent: Option<BusId> },
+    /// Create or restate a composition, absolutely — name and full
+    /// membership every time, the LWW-friendly shape. Refused empty: a
+    /// group of nothing folds to nothing.
+    SetGroup { id: GroupId, name: String, clips: Vec<ClipId> },
+    /// Dissolve a composition. Its clips are untouched — ungrouping is an
+    /// organizational act, never an edit to the music.
+    RemoveGroup { id: GroupId },
+    /// Set (or clear) the song's key. Absolute, like every other setting
+    /// here, so two writers converge on the last word rather than on a
+    /// sum of transpositions.
+    SetKey { key: Option<Key> },
+    /// Add or move a named marker. Absolute by NAME: setting a marker
+    /// that already exists moves it, which is what "set the chorus here"
+    /// means when you meant it the second time.
+    SetMarker { at: Ticks, name: String },
+    RemoveMarker { name: String },
+    /// Both communities ask for this by name ("Delete All Timeline
+    /// Markers"). One op, one undo — a hundred RemoveMarkers would be a
+    /// hundred presses of `u`.
+    ClearMarkers,
+    /// Several ops as ONE step: applied in order, inverted as a whole (the
+    /// inverse is the members' inverses in reverse). A partial application
+    /// rolls back what landed — half an edit is worse than none. This is
+    /// what lets a multi-move mastering pass be a single press of `u`.
+    Group { ops: Vec<Op> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditError {
     NoSuchClip(ClipId),
+    /// A `RemoveAutoPoint` aimed at a point that is not there.
+    NoSuchAutoPoint,
+    /// A `SetGroup` with no members.
+    EmptyGroup,
+    /// A marker must have a name — an unnamed one cannot be jumped to.
+    EmptyMarker,
+    NoSuchMarker(String),
+    NoSuchGroup(GroupId),
     NoSuchTrack(TrackId),
     TrackLocked(TrackId),
     /// Refused because clips are still on this track — see `Op::RemoveTrack`.
@@ -285,6 +482,17 @@ impl Project {
     /// The inverse is computed from the state BEFORE the change, which is what
     /// makes undo exact rather than approximate — and it is also why undo and
     /// collaboration share one mechanism: both are just ops.
+    /// An automation target must exist to be ridden, and a locked track
+    /// refuses its lane the way it refuses its fader.
+    fn check_auto_target(&self, target: AutoTarget) -> Result<(), EditError> {
+        match target {
+            AutoTarget::TrackGain(id) => self.check_track(id),
+            AutoTarget::BusGain(id) => {
+                if self.busses.contains_key(&id) { Ok(()) } else { Err(EditError::NoSuchBus(id)) }
+            }
+        }
+    }
+
     pub fn apply(&mut self, op: &Op) -> Result<Op, EditError> {
         match op {
             Op::AddTrack { track, at } => {
@@ -327,6 +535,36 @@ impl Project {
                 let inv = Op::SetTrackGain { id: *id, gain: t.gain };
                 t.gain = *gain;
                 Ok(inv)
+            }
+            Op::SetAutoPoint { target, at, value } => {
+                self.check_auto_target(*target)?;
+                let lane = self.automation.entry(*target).or_default();
+                match lane.iter_mut().find(|(t, _)| t == at) {
+                    Some(p) => {
+                        // Restating a point at its own tick is a value
+                        // change; the inverse restores the old value.
+                        let inv = Op::SetAutoPoint { target: *target, at: *at, value: p.1 };
+                        p.1 = *value;
+                        Ok(inv)
+                    }
+                    None => {
+                        lane.push((*at, *value));
+                        lane.sort_by_key(|(t, _)| *t);
+                        Ok(Op::RemoveAutoPoint { target: *target, at: *at })
+                    }
+                }
+            }
+            Op::RemoveAutoPoint { target, at } => {
+                self.check_auto_target(*target)?;
+                let lane = self.automation.get_mut(target)
+                    .ok_or(EditError::NoSuchAutoPoint)?;
+                let i = lane.iter().position(|(t, _)| t == at)
+                    .ok_or(EditError::NoSuchAutoPoint)?;
+                let (_, old) = lane.remove(i);
+                // An emptied lane drops its entry — sparse, the same rule
+                // `Pattern::set_mod` follows one crate over.
+                if lane.is_empty() { self.automation.remove(target); }
+                Ok(Op::SetAutoPoint { target: *target, at: *at, value: old })
             }
             Op::AddClip { clip } => {
                 self.check_track(clip.track)?;
@@ -479,6 +717,93 @@ impl Project {
                 let inv = Op::SetRoute { track: *track, bus: t.route };
                 t.route = *bus;
                 Ok(inv)
+            }
+            Op::SetBusParent { id, parent } => {
+                let Some(b) = self.busses.get(id) else {
+                    return Err(EditError::NoSuchBus(*id));
+                };
+                if let Some(p) = parent {
+                    if !self.busses.contains_key(p) {
+                        return Err(EditError::NoSuchBus(*p));
+                    }
+                    // Walk the proposed parent's chain; reaching `id` means
+                    // the graph would feed itself. Capped at the bus count
+                    // so even a corrupt project terminates.
+                    let mut at = *p;
+                    for _ in 0..=self.busses.len() {
+                        if at == *id { return Err(EditError::BusCycle { id: *id }); }
+                        match self.busses.get(&at).and_then(|b| b.parent) {
+                            Some(next) => at = next,
+                            None => break,
+                        }
+                    }
+                }
+                let inv = Op::SetBusParent { id: *id, parent: b.parent };
+                self.busses.get_mut(id).unwrap().parent = *parent;
+                Ok(inv)
+            }
+            Op::SetGroup { id, name, clips } => {
+                if clips.is_empty() {
+                    return Err(EditError::EmptyGroup);
+                }
+                let inv = match self.groups.get(id) {
+                    Some(old) => Op::SetGroup { id: *id, name: old.name.clone(),
+                                                clips: old.clips.clone() },
+                    None => Op::RemoveGroup { id: *id },
+                };
+                self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone() });
+                Ok(inv)
+            }
+            Op::SetKey { key } => {
+                let inv = Op::SetKey { key: self.key };
+                self.key = *key;
+                Ok(inv)
+            }
+            Op::SetMarker { at, name } => {
+                if name.trim().is_empty() { return Err(EditError::EmptyMarker); }
+                let inv = match self.markers.iter().find(|m| m.name == *name) {
+                    Some(old) => Op::SetMarker { at: old.at, name: old.name.clone() },
+                    None => Op::RemoveMarker { name: name.clone() },
+                };
+                self.markers.retain(|m| m.name != *name);
+                self.markers.push(Marker { at: *at, name: name.clone() });
+                self.markers.sort_by_key(|m| m.at);
+                Ok(inv)
+            }
+            Op::RemoveMarker { name } => {
+                let Some(i) = self.markers.iter().position(|m| m.name == *name) else {
+                    return Err(EditError::NoSuchMarker(name.clone()));
+                };
+                let old = self.markers.remove(i);
+                Ok(Op::SetMarker { at: old.at, name: old.name })
+            }
+            Op::ClearMarkers => {
+                if self.markers.is_empty() { return Err(EditError::NoSuchMarker("any".into())); }
+                let all = std::mem::take(&mut self.markers);
+                // The inverse of clearing many is a GROUP that puts each
+                // one back — one undo, as promised.
+                Ok(Op::Group { ops: all.into_iter()
+                    .map(|m| Op::SetMarker { at: m.at, name: m.name }).collect() })
+            }
+            Op::Group { ops } => {
+                let mut inverses = Vec::with_capacity(ops.len());
+                for op in ops {
+                    match self.apply(op) {
+                        Ok(inv) => inverses.push(inv),
+                        Err(e) => {
+                            for inv in inverses.into_iter().rev() {
+                                let _ = self.apply(&inv);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                inverses.reverse();
+                Ok(Op::Group { ops: inverses })
+            }
+            Op::RemoveGroup { id } => {
+                let old = self.groups.remove(id).ok_or(EditError::NoSuchGroup(*id))?;
+                Ok(Op::SetGroup { id: *id, name: old.name, clips: old.clips })
             }
         }
     }
@@ -1253,5 +1578,262 @@ mod track_gain_tests {
         let old = r#"{"id":3,"kind":"Audio","name":"A1","muted":false,"locked":false,"route":null}"#;
         let t: Track = serde_json::from_str(old).expect("pre-fader track loads");
         assert_eq!(t.gain, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+
+    fn project() -> Project {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p
+    }
+    fn tg() -> AutoTarget { AutoTarget::TrackGain(TrackId(1)) }
+
+    #[test]
+    fn a_point_lands_sorted_and_its_inverse_removes_it() {
+        let mut p = project();
+        p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(200), value: 0.5 }).unwrap();
+        let inv = p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.8 }).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.8), (Ticks(200), 0.5)],
+                   "sorted by time regardless of edit order");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(200), 0.5)], "the inverse is a removal");
+    }
+
+    #[test]
+    fn restating_a_points_tick_changes_its_value_and_undoes_to_the_old_one() {
+        let mut p = project();
+        p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.8 }).unwrap();
+        let inv = p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.2 }).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.2)], "same tick is the same point");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.8)]);
+    }
+
+    #[test]
+    fn removing_the_last_point_drops_the_lane_and_undo_restores_it() {
+        let mut p = project();
+        p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.8 }).unwrap();
+        let inv = p.apply(&Op::RemoveAutoPoint { target: tg(), at: Ticks(100) }).unwrap();
+        assert!(p.automation.is_empty(), "an emptied lane keeps the map sparse");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.automation[&tg()], vec![(Ticks(100), 0.8)]);
+    }
+
+    #[test]
+    fn removing_a_point_that_is_not_there_is_refused_out_loud() {
+        let mut p = project();
+        assert!(matches!(p.apply(&Op::RemoveAutoPoint { target: tg(), at: Ticks(9) }),
+                         Err(EditError::NoSuchAutoPoint)),
+                "an inverse with nothing to restore must never be minted");
+    }
+
+    #[test]
+    fn a_locked_track_refuses_its_lane_like_it_refuses_its_fader() {
+        let mut p = project();
+        p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
+        assert!(matches!(p.apply(&Op::SetAutoPoint { target: tg(), at: Ticks(0), value: 0.5 }),
+                         Err(EditError::TrackLocked(_))));
+        assert!(matches!(p.apply(&Op::SetAutoPoint {
+            target: AutoTarget::BusGain(BusId(7)), at: Ticks(0), value: 0.5 }),
+                         Err(EditError::NoSuchBus(_))),
+                "and a lane cannot be aimed at a bus that does not exist");
+    }
+
+    #[test]
+    fn concurrent_lane_edits_converge_in_either_order() {
+        // Two peers, two different points on one lane: absolute (time,
+        // value) means both survive and both replicas agree — the same
+        // property clips get from absolute positions.
+        let a = Op::SetAutoPoint { target: tg(), at: Ticks(100), value: 0.2 };
+        let b = Op::SetAutoPoint { target: tg(), at: Ticks(300), value: 0.9 };
+        let mut ab = project();
+        ab.apply(&a).unwrap(); ab.apply(&b).unwrap();
+        let mut ba = project();
+        ba.apply(&b).unwrap(); ba.apply(&a).unwrap();
+        assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn eval_is_linear_inside_held_at_the_ends_and_unity_when_empty() {
+        let lane = vec![(Ticks(100), 0.0), (Ticks(300), 1.0)];
+        assert_eq!(eval_lane(&lane, Ticks(0)), 0.0, "held flat before the first point");
+        assert_eq!(eval_lane(&lane, Ticks(100)), 0.0);
+        assert!((eval_lane(&lane, Ticks(200)) - 0.5).abs() < 1e-6, "linear between");
+        assert_eq!(eval_lane(&lane, Ticks(300)), 1.0);
+        assert_eq!(eval_lane(&lane, Ticks(9999)), 1.0, "held flat after the last");
+        assert_eq!(eval_lane(&[], Ticks(0)), 1.0, "no lane is a transparent ride");
+        // A negative value never reaches the mix as a phase flip.
+        assert_eq!(eval_lane(&[(Ticks(0), -2.0)], Ticks(5)), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod group_and_bus_input_tests {
+    use super::*;
+
+    fn project() -> Project {
+        let mut p = Project::default();
+        for id in [1u64, 2, 3] {
+            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: format!("B{id}"),
+                parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn reparenting_a_bus_is_undoable_and_a_cycle_is_refused_by_name() {
+        let mut p = project();
+        // Chain: 3 → 2 → 1 → master, built from the INPUT side.
+        p.apply(&Op::SetBusParent { id: BusId(2), parent: Some(BusId(1)) }).unwrap();
+        let inv = p.apply(&Op::SetBusParent { id: BusId(3), parent: Some(BusId(2)) }).unwrap();
+        assert_eq!(p.busses[&BusId(3)].parent, Some(BusId(2)));
+        // 1 ← 3 would make the chain feed itself: refused, said which bus.
+        assert!(matches!(p.apply(&Op::SetBusParent { id: BusId(1), parent: Some(BusId(3)) }),
+                         Err(EditError::BusCycle { id: BusId(1) })));
+        assert!(matches!(p.apply(&Op::SetBusParent { id: BusId(1), parent: Some(BusId(1)) }),
+                         Err(EditError::BusCycle { .. })), "self-feeding is the shortest cycle");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.busses[&BusId(3)].parent, None, "undo puts the input back");
+    }
+
+    #[test]
+    fn a_group_restates_absolutely_and_dissolving_touches_no_clip() {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A".into(), muted: false, locked: false, gain: 1.0, route: None },
+            at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        for id in [1u64, 2] {
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1),
+                track: TrackId(1), pos: Ticks::from_seconds(id as f64 * 2.0),
+                src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0),
+                gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        assert!(matches!(p.apply(&Op::SetGroup { id: GroupId(1), name: "hook".into(),
+                                                  clips: vec![] }),
+                         Err(EditError::EmptyGroup)));
+        let inv = p.apply(&Op::SetGroup { id: GroupId(1), name: "hook".into(),
+                                          clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+        assert!(matches!(inv, Op::RemoveGroup { .. }), "undo of a new group dissolves it");
+        let clips_before = p.clips.clone();
+        let inv2 = p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
+        assert_eq!(p.clips, clips_before, "ungrouping is organizational, never musical");
+        p.apply(&inv2).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].name, "hook");
+    }
+}
+
+#[cfg(test)]
+mod lane_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn the_cursor_sweep_equals_the_search_at_every_sample_including_backwards() {
+        // The optimization's only job is to be identical. A dense lane, a
+        // forward sweep at sample resolution, then a jump BACKWARDS (a
+        // loop wrap or a seek — the case a naive cursor gets wrong).
+        let points: Vec<(Ticks, f32)> = (0..200)
+            .map(|i| (Ticks::from_seconds(i as f64 * 0.05),
+                      ((i as f32 * 0.37).sin() * 0.5 + 0.5)))
+            .collect();
+        let mut cursor = 0usize;
+        for s in 0..4_000 {
+            let at = Ticks::from_samples(s * 12, 48_000);
+            let a = eval_lane(&points, at);
+            let b = eval_lane_cursor(&points, at, &mut cursor);
+            assert!((a - b).abs() < 1e-6, "sample {s}: {a} vs {b}");
+        }
+        // Wrap to the start: the cursor must reset rather than hold the
+        // late segment.
+        for s in 0..500 {
+            let at = Ticks::from_samples(s * 12, 48_000);
+            let a = eval_lane(&points, at);
+            let b = eval_lane_cursor(&points, at, &mut cursor);
+            assert!((a - b).abs() < 1e-6, "after wrap, sample {s}: {a} vs {b}");
+        }
+        // Edges and the empty lane behave as the search does.
+        let mut c2 = 0;
+        assert_eq!(eval_lane_cursor(&[], Ticks::from_seconds(1.0), &mut c2), 1.0);
+        let far = Ticks::from_seconds(1000.0);
+        assert_eq!(eval_lane_cursor(&points, far, &mut c2), eval_lane(&points, far));
+    }
+}
+
+#[cfg(test)]
+mod key_and_marker_tests {
+    use super::*;
+
+    #[test]
+    fn note_labels_agree_with_the_synths_own_pitch_reference() {
+        // Key 0 is A1 because sub_freq's reference is 55 Hz — a label that
+        // disagreed with the sound would be worse than no label.
+        assert_eq!(note_label(0), "A1");
+        assert_eq!(note_label(3), "C2");
+        assert_eq!(note_label(12), "A2");
+        assert_eq!(note_label(-1), "G#1");
+        assert_eq!(note_label(-9), "C1");
+        assert_eq!(note_label(4), "C#2");
+        assert_eq!(note_label(51), "C6", "midi 84 — the octave boundary, not a sharp");
+        assert_eq!(note_label(52), "C#6");
+        assert_eq!(note_label(48), "A5");
+    }
+
+    #[test]
+    fn a_key_knows_its_own_notes_and_no_key_judges_nothing() {
+        let c_major = Key { root: 0, scale: Scale::Major };
+        // C2 is key 3; D2 is 5; C#2 (key 4) is not in C major.
+        assert!(c_major.contains(3));
+        assert!(c_major.contains(5));
+        assert!(!c_major.contains(4));
+        assert_eq!(c_major.name(), "C major");
+        // A minor shares C major's notes — the classic check.
+        let a_minor = Key { root: 9, scale: Scale::Minor };
+        for k in 0..24 { assert_eq!(a_minor.contains(k), c_major.contains(k), "key {k}"); }
+        // Chromatic accepts everything, which is how "no opinion" is said
+        // when someone HAS chosen it deliberately.
+        let chrom = Key { root: 7, scale: Scale::Chromatic };
+        assert!((0..12).all(|k| chrom.contains(k)));
+    }
+
+    #[test]
+    fn markers_move_by_name_and_clearing_them_all_is_one_undo() {
+        let mut p = Project::default();
+        p.apply(&Op::SetMarker { at: Ticks::from_seconds(4.0), name: "chorus".into() }).unwrap();
+        p.apply(&Op::SetMarker { at: Ticks::from_seconds(1.0), name: "intro".into() }).unwrap();
+        assert_eq!(p.markers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                   vec!["intro", "chorus"], "kept in time order for next/previous");
+        // Setting an existing name MOVES it rather than duplicating: "no,
+        // the chorus is here".
+        let inv = p.apply(&Op::SetMarker { at: Ticks::from_seconds(8.0),
+                                           name: "chorus".into() }).unwrap();
+        assert_eq!(p.markers.len(), 2);
+        assert_eq!(p.markers[1].at, Ticks::from_seconds(8.0));
+        p.apply(&inv).unwrap();
+        assert_eq!(p.markers[1].at, Ticks::from_seconds(4.0), "undo puts it back");
+        assert!(matches!(p.apply(&Op::SetMarker { at: Ticks::ZERO, name: "  ".into() }),
+                         Err(EditError::EmptyMarker)));
+        // Clear all, then ONE undo restores every one.
+        let inv = p.apply(&Op::ClearMarkers).unwrap();
+        assert!(p.markers.is_empty());
+        p.apply(&inv).unwrap();
+        assert_eq!(p.markers.len(), 2, "one undo, every marker back");
+        assert!(matches!(p.apply(&Op::RemoveMarker { name: "nope".into() }),
+                         Err(EditError::NoSuchMarker(_))));
+    }
+
+    #[test]
+    fn the_key_is_absolute_and_undoable() {
+        let mut p = Project::default();
+        let inv = p.apply(&Op::SetKey { key: Some(Key { root: 2, scale: Scale::Dorian }) }).unwrap();
+        assert_eq!(p.key.unwrap().name(), "D dorian");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.key, None, "back to having no opinion");
     }
 }

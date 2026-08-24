@@ -18,7 +18,10 @@ pub mod playkeys;
 pub mod spectrum;
 
 /// The step-sequencer surface for studio-live.
+pub mod auto;
 pub mod grid;
+pub mod roll;
+pub mod routing;
 pub mod lanes;
 
 /// Time-range selection — the audio editor's unit, distinct from clip picking.
@@ -254,6 +257,11 @@ pub fn move_target(
 /// What one timeline frame produced for the host.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TimelineResponse {
+    /// A composition's fold chevron was clicked: flip its open/closed.
+    pub toggled_group: Option<studio_core::GroupId>,
+    /// A closed composition's block was clicked: the host selects its
+    /// members, so the keyboard works on the composition as one thing.
+    pub clicked_group: Option<studio_core::GroupId>,
     /// A clip was clicked (selection is the host's business).
     pub clicked: Option<ClipId>,
     /// A drag ended: move this clip here. An op-shaped fact, not a mutation.
@@ -262,6 +270,10 @@ pub struct TimelineResponse {
     /// len)`. A left trim changes all three, which is why this is not just
     /// a length.
     pub trimmed: Option<(ClipId, Ticks, Ticks, Ticks)>,
+    /// The ruler was clicked or dragged: put the playhead here. Reported
+    /// every frame OF the drag, not just at its end — scrubbing is only
+    /// useful if it follows the finger.
+    pub sought: Option<Ticks>,
 }
 
 pub fn hit_test(project: &Project, view: &View, at: Pos2, origin: Pos2) -> Option<ClipId> {
@@ -320,7 +332,33 @@ pub fn timeline(
     // must never gate editing.
     peaks: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
     trim_side: TrimSide,
+    // Compositions folded CLOSED on this device — view state, passed in
+    // because open-or-closed is the workspace sidecar's business while
+    // membership is the project's.
+    closed_groups: &std::collections::BTreeSet<studio_core::GroupId>,
 ) -> TimelineResponse {
+    // Closed compositions: which clips are folded away, and each fold's
+    // hull. Computed FIRST so drawing (skip members, draw the block) and
+    // click routing (a click on the block is the group's, not a member's)
+    // agree on what is folded — one truth, two consumers.
+    let mut folded: std::collections::BTreeSet<studio_core::ClipId> = Default::default();
+    let mut hulls: Vec<(studio_core::GroupId, String, Ticks, Ticks, usize, usize)> = Vec::new();
+    {
+        let row_of = |t: studio_core::TrackId|
+            doc.project.tracks.iter().position(|x| x.id == t).unwrap_or(0);
+        for (gid, g) in &doc.project.groups {
+            if !closed_groups.contains(gid) { continue; }
+            let live: Vec<_> = g.clips.iter()
+                .filter_map(|c| doc.project.clips.get(c)).collect();
+            if live.is_empty() { continue; } // every member deleted: nothing folds
+            let from = live.iter().map(|c| c.pos).min().unwrap();
+            let to = live.iter().map(|c| c.end()).max().unwrap();
+            let top = live.iter().map(|c| row_of(c.track)).min().unwrap();
+            let bot = live.iter().map(|c| row_of(c.track)).max().unwrap();
+            for c in &live { folded.insert(c.id); }
+            hulls.push((*gid, g.name.clone(), from, to, top, bot));
+        }
+    }
     let rows = track_rows(&doc.project);
     let height = RULER_H + rows.len().max(1) as f32 * view.track_h;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
@@ -366,6 +404,7 @@ pub fn timeline(
                      if track.locked { colors.text_weak } else { colors.text });
 
         for clip in doc.project.track_clips(*tid) {
+            if folded.contains(&clip.id) { continue; } // drawn as its fold's block
             let r = view.clip_rect(clip.pos, clip.len, row, origin);
             if r.max.x < origin.x + view.gutter || r.min.x > rect.max.x { continue; }
             let selected = selection.contains(&clip.id);
@@ -501,11 +540,101 @@ pub fn timeline(
             view.drag = None;
         }
     }
-    out.clicked = resp.interact_pointer_pos()
-        .filter(|_| resp.clicked())
-        .and_then(|p| hit_test(&doc.project, view, p, origin));
+    // Fold blocks over the hulls, chevron first — kdenlive's pre-batched
+    // group, After Effects' precomp, drawn as one openable thing. Open
+    // groups get only the ▾ tab above their first member, so an unfolded
+    // composition costs almost no pixels.
+    let mut fold_rects: Vec<(studio_core::GroupId, Rect, Rect)> = Vec::new();
+    for (gid, name, from, to, top, bot) in &hulls {
+        let a = view.clip_rect(*from, Ticks(to.0 - from.0), *top, origin);
+        let b = view.clip_rect(*from, Ticks(to.0 - from.0), *bot, origin);
+        let r = a.union(b);
+        if r.max.x < origin.x + view.gutter || r.min.x > rect.max.x { continue; }
+        painter.rect_filled(r, 4.0, colors.bg_raised.gamma_multiply(0.95));
+        painter.rect_stroke(r, 4.0, Stroke::new(1.5, colors.accent), egui::StrokeKind::Inside);
+        let chev = Rect::from_min_size(r.min, egui::vec2(18.0, r.height().min(18.0)));
+        painter.text(chev.center(), egui::Align2::CENTER_CENTER, "▸",
+                     egui::FontId::proportional(12.0), colors.accent);
+        painter.text(Pos2::new(chev.max.x + 2.0, r.min.y + 9.0),
+                     egui::Align2::LEFT_CENTER, name,
+                     egui::FontId::proportional(11.0), colors.text);
+        fold_rects.push((*gid, r, chev));
+    }
+    for (gid, g) in &doc.project.groups {
+        if closed_groups.contains(gid) { continue; }
+        let live: Vec<_> = g.clips.iter().filter_map(|c| doc.project.clips.get(c)).collect();
+        let Some(first) = live.iter().min_by_key(|c| c.pos) else { continue };
+        let row = doc.project.tracks.iter().position(|t| t.id == first.track).unwrap_or(0);
+        let r = view.clip_rect(first.pos, first.len, row, origin);
+        let tab = Rect::from_min_size(Pos2::new(r.min.x, r.min.y - 12.0),
+                                      egui::vec2(60.0, 12.0));
+        painter.rect_filled(tab, 2.0, colors.bg_raised);
+        painter.text(tab.left_center() + egui::vec2(2.0, 0.0), egui::Align2::LEFT_CENTER,
+                     format!("▾ {}", g.name), egui::FontId::proportional(9.0), colors.text_weak);
+        fold_rects.push((*gid, Rect::NOTHING, tab));
+    }
+    if let Some(p) = resp.interact_pointer_pos() {
+        if resp.clicked() {
+            for (gid, body, chev) in &fold_rects {
+                if chev.contains(p) { out.toggled_group = Some(*gid); break; }
+                if body.contains(p) { out.clicked_group = Some(*gid); break; }
+            }
+        }
+    }
+    // ── the ruler seeks ────────────────────────────────────────────────
+    // Until now the playhead could only be moved by `g g` / `g e`, which
+    // is invisible: a timeline whose ruler does nothing gives a new user
+    // no way to get back to the start at all. The ruler band takes clicks
+    // AND drags, reporting every frame so scrubbing follows the finger,
+    // and clamps at zero because a negative playhead is not a position.
+    let ruler_band = Rect::from_min_max(
+        Pos2::new(rect.left() + view.gutter, rect.top()),
+        Pos2::new(rect.right(), rect.top() + RULER_H));
+    if let Some(p) = resp.interact_pointer_pos() {
+        if (resp.clicked() || resp.dragged()) && ruler_band.contains(p) {
+            let t = view.x_to_time(p.x, origin.x);
+            out.sought = Some(Ticks(t.0.max(0)));
+        }
+    }
+    out.clicked = if out.sought.is_some()
+        || out.toggled_group.is_some() || out.clicked_group.is_some() {
+        None // the fold owns this click; a folded member must not be reachable
+    } else {
+        resp.interact_pointer_pos()
+            .filter(|_| resp.clicked())
+            .and_then(|p| hit_test(&doc.project, view, p, origin))
+            .filter(|id| !folded.contains(id))
+    };
+    // The tooltip is where the tools become learnable: a shortcut nobody
+    // can see is a shortcut nobody uses — across every editor ever
+    // shipped. Hovering a clip shows its name and the alignment tools;
+    // the LIST is a public const so the shell's key handler can pin, by
+    // test, that every key it intercepts is written here — the tooltip
+    // and the behavior cannot drift apart.
+    if let Some(p) = resp.hover_pos() {
+        if let Some(id) = hit_test(&doc.project, view, p, origin) {
+            let name = doc.project.clips.get(&id)
+                .and_then(|c| doc.project.sources.get(&c.source))
+                .map(|s| s.path.clone()).unwrap_or_default();
+            resp.clone().on_hover_ui(|ui| {
+                ui.strong(name);
+                for h in CLIP_HINTS { ui.weak(*h); }
+            });
+        }
+    }
     out
 }
+
+/// What hovering a clip teaches. One source of truth: the shell's key
+/// handler tests that every alignment key it intercepts appears here.
+pub const CLIP_HINTS: &[&str] = &[
+    "drag: move · edge: trim (alt-; flips the grabbed side)",
+    "A: align 2nd selected clip to 1st (vocal double → lead)",
+    "Q: quantize selected clip starts to the beat grid",
+    ", / . : nudge selected by one step · < / > : by 1 ms",
+    "g: group selection into a composition · G: ungroup",
+    "C-r: record a take from the microphone at the playhead",
+];
 
 /// A stable, well-separated colour per site id. Deterministic so the same peer
 /// is the same colour on every screen in the session — a peer who changes
@@ -526,6 +655,45 @@ pub fn format_timecode(t: Ticks) -> String {
     let (h, m, s, ms) = (total_ms / 3_600_000, total_ms / 60_000 % 60,
                          total_ms / 1000 % 60, total_ms % 1000);
     format!("{}{h}:{m:02}:{s:02}.{ms:03}", if neg { "-" } else { "" })
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    /// The ruler band's own arithmetic, stated once so the widget and this
+    /// test cannot disagree: the strip is RULER_H tall, starts after the
+    /// gutter, and maps x to time through the same view transform every
+    /// clip uses.
+    fn seek_at(view: &View, origin: Pos2, x: f32, y: f32) -> Option<Ticks> {
+        let in_band = y >= origin.y && y < origin.y + RULER_H
+            && x >= origin.x + view.gutter;
+        if !in_band { return None; }
+        Some(Ticks(view.x_to_time(x, origin.x).0.max(0)))
+    }
+
+    #[test]
+    fn the_ruler_seeks_and_the_tracks_below_it_do_not() {
+        let view = View::default();
+        let origin = Pos2::new(10.0, 20.0);
+        // A click 300px into the ruler lands where the ruler's own label
+        // arithmetic says it should — same transform, so they agree by
+        // construction rather than by tuning.
+        let x = origin.x + view.gutter + 300.0;
+        let t = seek_at(&view, origin, x, origin.y + 4.0).expect("the band seeks");
+        assert_eq!(t, view.x_to_time(x, origin.x));
+        // Below the band is clip territory: a click there must never move
+        // the playhead, or selecting a clip would scrub.
+        assert!(seek_at(&view, origin, x, origin.y + RULER_H + 1.0).is_none());
+        // Left of the gutter is the track-name column, not time.
+        assert!(seek_at(&view, origin, origin.x + 2.0, origin.y + 4.0).is_none());
+        // Scrolled back past zero, a seek clamps: a negative playhead is
+        // not a position.
+        let mut scrolled = View::default();
+        scrolled.scroll = Ticks::ZERO;
+        let left_edge = scrolled.gutter + origin.x;
+        assert_eq!(seek_at(&scrolled, origin, left_edge, origin.y + 2.0), Some(Ticks(0)));
+    }
 }
 
 #[cfg(test)]
