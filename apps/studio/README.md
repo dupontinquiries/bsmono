@@ -1562,3 +1562,24 @@ INHERITS the source channel's steps and step-mods in every pattern, a
 copy not a link, so the layer plays in lockstep and then diverges freely
 — which is what developing the authored layers means. Every returned
 sound is also a library file: authorship accretes where the samples live.
+
+
+**The synthesizer is in the piano roll now.** The built-in synths — `Sub`,
+the 808 voice with glide, tube drive and decay, and `Sine` — were half
+wired to the roll already: a note's key reached them through the tune mod
+and slide became glide, but the envelope was a fixed decay from t=0, so a
+held note DIED at `decay_ms` no matter how long it was drawn. The synth
+was reachable and could not be held. `Synth::render_gated`
+(default-implemented on the trait, so a host synth inherits held notes for
+free) gives the tonal kinds a gated envelope: ~2ms attack, sustain at
+unity while the note lasts, then a fixed 30ms note-off release — NOT a
+second `decay_ms`, because the roll's oldest pin refused that draft: a
+2-step note on a 2-second 808 must stop at 2 steps, and the long ring-out
+is the hit path's sound. Placement sizes each note's window as gate plus
+release tail; the sampler and drums are untouched (the sampler's window
+already IS its gate, a drum's decay is its identity). Pinned: held means
+held (step-5 RMS ≈ step-0 RMS where the old envelope was silent),
+note-off still gates half a step later, and an octave in the roll is an
+octave out of the synth by zero-crossing count. Draw notes on the 808
+channel and it is a bass synth; the glide the hits already had chains
+through the roll the same way.

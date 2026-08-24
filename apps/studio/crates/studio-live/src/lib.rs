@@ -498,6 +498,41 @@ pub trait Synth {
     /// how much room the caller has, not how long the sound is — a synth that
     /// wants to ring longer is cut off, which is the caller's decision.
     fn render(&mut self, kind: &SynthKind, rate: u32, out: &mut [f32]);
+
+    /// Render with a GATE, for a piano-roll note: the tonal kinds — `Sub`
+    /// and `Sine` — sustain while `hold` samples last and release into the
+    /// rest of `out`; everything else delegates to [`Synth::render`],
+    /// because the sampler's window already IS its gate and a drum's decay
+    /// is its identity. Default-implemented so a host `Synth` (a beatspace
+    /// build, say) inherits held notes without writing envelope code.
+    fn render_gated(&mut self, kind: &SynthKind, rate: u32, out: &mut [f32], hold: usize) {
+        match kind {
+            SynthKind::Sub { note, glide_from, glide_ms, drive, decay_ms } => {
+                sub_voice(*note, *glide_from, *glide_ms, *drive, *decay_ms,
+                          rate, out, Some(hold.min(out.len())));
+            }
+            SynthKind::Sine { hz } => {
+                let hold = hold.min(out.len()).max(1);
+                let attack = (rate as usize / 500).max(1).min(hold);
+                let release = (out.len() - hold).max(1);
+                for (i, s) in out.iter_mut().enumerate() {
+                    let t = i as f32 / rate as f32;
+                    let env = if i < attack {
+                        i as f32 / attack as f32
+                    } else if i < hold {
+                        1.0
+                    } else {
+                        // The hit path's cubic fade, applied to the release
+                        // span: same shape a Sine hit already has, starting
+                        // where the gate ends.
+                        (1.0 - (i - hold) as f32 / release as f32).powf(3.0)
+                    };
+                    *s = (t * hz * std::f32::consts::TAU).sin() * env;
+                }
+            }
+            _ => self.render(kind, rate, out),
+        }
+    }
 }
 
 /// The always-available synth: sine tones and sample playback. A rack made only
@@ -553,45 +588,77 @@ impl Synth for BuiltinSynth<'_> {
                 out.fill(0.0);
             }
             SynthKind::Sub { note, glide_from, glide_ms, drive, decay_ms } => {
-                let target_hz = sub_freq(*note);
-                let start_hz = glide_from.map(sub_freq).unwrap_or(target_hz);
-                let glide_samples = ((*glide_ms / 1000.0) * rate as f32).round().max(0.0) as usize;
-                let glide_samples = glide_samples.min(out.len());
-                // Decay time constant so amplitude reaches -60dB (1/1000) by
-                // decay_ms: exp(-decay_ms/1000/tau) = 1/1000 → tau =
-                // (decay_ms/1000) / ln(1000).
-                let tau = ((*decay_ms).max(1.0) / 1000.0) / 6.907_755;
-                // Phase is integrated every sample and NEVER reset, even
-                // while the frequency is sweeping — that is what makes the
-                // glide phase-continuous by construction rather than by
-                // careful tuning: a discontinuity only happens if something
-                // jumps the phase, and nothing here does.
-                let mut phase = 0.0f64;
-                for (i, s) in out.iter_mut().enumerate() {
-                    let hz = if glide_samples == 0 || i >= glide_samples {
-                        target_hz
-                    } else {
-                        // Exponential (log-frequency) interpolation — a
-                        // musical glide sweeps octaves at a constant rate,
-                        // not Hz at a constant rate.
-                        let t = i as f32 / glide_samples as f32;
-                        start_hz * (target_hz / start_hz).powf(t)
-                    };
-                    phase += std::f64::consts::TAU * hz as f64 / rate as f64;
-                    let t_s = i as f32 / rate as f32;
-                    let env = (-(t_s as f64 / tau.max(1e-6) as f64)).exp() as f32;
-                    *s = phase.sin() as f32 * env;
-                }
-                if *drive > 0.0 {
-                    let mut sat = studio_fx::saturation::Saturator::new(studio_fx::saturation::Profile::Tube);
-                    sat.drive = drive.clamp(0.0, 1.0);
-                    sat.process_block(out);
-                }
+                sub_voice(*note, *glide_from, *glide_ms, *drive, *decay_ms,
+                          rate, out, None);
             }
             SynthKind::Drum { voice, tone, decay_ms, tune } => {
                 render_drum(*voice, tone.clamp(0.0, 1.0), decay_ms.max(1.0), *tune, rate, out);
             }
         }
+    }
+}
+
+/// Note-off on a held Sub is a CUT with a musical fade, not a second
+/// decay: 30ms to -60dB, short enough that "the note stops at its end"
+/// stays true at any sane tempo, long enough never to click. The first
+/// draft reused `decay_ms` as the release — one knob, both modes — and
+/// the roll's own oldest pin refused it: a 2-step note on a 2-second 808
+/// must stop at 2 steps, and the long ring-out is the HIT path's sound.
+const SUB_RELEASE_MS: f32 = 30.0;
+
+/// The Sub oscillator, shared by the hit path and the gated (piano-roll)
+/// path. `gate: None` is the HIT envelope — exponential decay from t=0,
+/// reaching -60dB by `decay_ms`, the 808 one-shot. `gate: Some(hold)` is
+/// the HELD-NOTE envelope: ~2ms attack, sustain at unity while the gate
+/// lasts, then the fixed [`SUB_RELEASE_MS`] release. Phase is integrated
+/// and never reset, so the glide stays phase-continuous by construction
+/// in both paths.
+#[allow(clippy::too_many_arguments)]
+fn sub_voice(note: i8, glide_from: Option<i8>, glide_ms: f32, drive: f32,
+             decay_ms: f32, rate: u32, out: &mut [f32], gate: Option<usize>) {
+    let target_hz = sub_freq(note);
+    let start_hz = glide_from.map(sub_freq).unwrap_or(target_hz);
+    let glide_samples = ((glide_ms / 1000.0) * rate as f32).round().max(0.0) as usize;
+    let glide_samples = glide_samples.min(out.len());
+    // -60dB by decay_ms: exp(-decay_ms/1000/tau) = 1/1000 →
+    // tau = (decay_ms/1000) / ln(1000).
+    let tau = (decay_ms.max(1.0) / 1000.0) / 6.907_755;
+    let attack = gate.map(|h| ((rate as usize / 500).max(1)).min(h.max(1)));
+    let mut phase = 0.0f64;
+    for (i, s) in out.iter_mut().enumerate() {
+        let hz = if glide_samples == 0 || i >= glide_samples {
+            target_hz
+        } else {
+            // Log-frequency interpolation — a musical glide sweeps octaves
+            // at a constant rate, not Hz at a constant rate.
+            let t = i as f32 / glide_samples as f32;
+            start_hz * (target_hz / start_hz).powf(t)
+        };
+        phase += std::f64::consts::TAU * hz as f64 / rate as f64;
+        let env = match gate {
+            None => {
+                let t_s = i as f32 / rate as f32;
+                (-(t_s as f64 / tau.max(1e-6) as f64)).exp() as f32
+            }
+            Some(hold) => {
+                let a = attack.unwrap_or(1);
+                if i < a {
+                    i as f32 / a as f32
+                } else if i < hold {
+                    1.0
+                } else {
+                    let t_s = (i - hold) as f32 / rate as f32;
+                    let rel_tau = (SUB_RELEASE_MS / 1000.0) / 6.907_755;
+                    (-(t_s as f64 / rel_tau as f64)).exp() as f32
+                }
+            }
+        };
+        *s = phase.sin() as f32 * env;
+    }
+    if drive > 0.0 {
+        let mut sat = studio_fx::saturation::Saturator::new(studio_fx::saturation::Profile::Tube);
+        sat.drive = drive.clamp(0.0, 1.0);
+        sat.process_block(out);
     }
 }
 
@@ -813,6 +880,10 @@ pub fn render_pattern(
         /// ~2ms — its end is a musical decision, and a decision must not
         /// click. A hit only fades when choke actually cut it.
         gate: bool,
+        /// `Some(samples)`: a roll note on a TONAL kind — sustain this long,
+        /// then release into the rest of the window (which placement sized
+        /// to fit the tail). `None` everywhere else.
+        hold: Option<usize>,
         /// Semitone repitch applied to the RENDERED voice — nonzero only for
         /// [`SynthKind::Sampler`], which has no pitch parameter of its own
         /// for `apply_step_mod` to act on. The kinds that understand `tune`
@@ -866,6 +937,7 @@ pub fn render_pattern(
                 group: ch.choke_group,
                 window: voice_len,
                 gate: false,
+                hold: None,
                 pitch,
             });
         }
@@ -890,15 +962,31 @@ pub fn render_pattern(
             if let SynthKind::Sub { note, .. } = &kind { prev = Some(*note); }
             let swing = tempo.swing_delay_samples(n.start, rate);
             let pitch = if matches!(ch.kind, SynthKind::Sampler { .. }) { n.key } else { 0 };
+            // The note's end is its gate; the tonal synths then RELEASE
+            // past it (their tail sized from their own decay), the way a
+            // hit already rings past its step — so the window is gate plus
+            // tail for them and exactly the gate for everything else,
+            // whose length semantics live elsewhere (the sampler's window
+            // IS its gate).
+            let gate_len = (n.len.max(1).min(pattern.steps.max(1)) as usize) * step;
+            let (window, hold) = match &kind {
+                SynthKind::Sub { .. } => {
+                    // Room for the fixed release to reach silence: twice
+                    // SUB_RELEASE_MS covers -120dB.
+                    let tail = ((SUB_RELEASE_MS * 2.0 / 1000.0) * rate as f32) as usize;
+                    (gate_len + tail, Some(gate_len))
+                }
+                SynthKind::Sine { .. } => (gate_len + rate as usize / 8, Some(gate_len)),
+                _ => (gate_len, None),
+            };
             placed.push(Placed {
                 at: n.start as usize * step + swing,
                 kind,
                 amp: ch.gain * n.vel.clamp(0.0, 1.0),
                 group: ch.choke_group,
-                // The note's end is its gate; a note cannot outlast the
-                // pattern it lives in, which also bounds the scratch below.
-                window: (n.len.max(1).min(pattern.steps.max(1)) as usize) * step,
+                window,
                 gate: true,
+                hold,
                 pitch,
             });
         }
@@ -951,7 +1039,10 @@ pub fn render_pattern(
         // the longest voice in the pattern happened to be.
         let sw = p.window.min(scratch.len());
         scratch[..sw].fill(0.0);
-        synth.render(&p.kind, rate, &mut scratch[..sw]);
+        match p.hold {
+            Some(h) => synth.render_gated(&p.kind, rate, &mut scratch[..sw], h.min(sw)),
+            None => synth.render(&p.kind, rate, &mut scratch[..sw]),
+        }
         let voice: &[f32] = if p.pitch != 0 {
             // Repitch by reading the rendered voice at a fractional rate —
             // up consumes the material sooner (silence after), down means
@@ -2378,5 +2469,75 @@ mod pattern_length_tests {
         assert_eq!(out.len(), step * 64, "four bars of buffer");
         let tail: f32 = out[step * 63..].iter().map(|v| v.abs()).sum();
         assert!(tail > 1.0, "the step-63 kick is in the last step's audio");
+    }
+}
+
+#[cfg(test)]
+mod gated_synth_tests {
+    use super::*;
+
+    fn sub_rack_decay(decay_ms: f32) -> Rack {
+        let mut r = Rack::trap_kit();
+        r.channels = vec![Channel {
+            name: "808".into(),
+            kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0,
+                                   drive: 0.0, decay_ms },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+        }];
+        for p in &mut r.patterns { p.rows = vec![0]; p.mods.clear(); p.rolls.clear(); }
+        r
+    }
+    fn rms(b: &[f32], from: usize, to: usize) -> f32 {
+        let s = &b[from.min(b.len())..to.min(b.len())];
+        if s.is_empty() { return 0.0; }
+        (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn a_held_note_sustains_where_a_short_decay_used_to_die() {
+        // THE wiring this exists for: before render_gated, a held roll note
+        // on a 120ms-decay Sub was silent by its second step — the synth
+        // was reachable from the roll but could not be HELD. Now the note
+        // sustains at full level to its gate, then cuts with the fixed
+        // release.
+        let rack = sub_rack_decay(120.0);
+        let mut p = Pattern::new("hold", 8, 1);
+        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false });
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let tempo = rack.tempo();
+        let out = render_pattern(&p, &rack, &mut synth, &tempo, 48_000, 0);
+        let step = tempo.step_len().to_samples(48_000).max(1) as usize;
+        let early = rms(&out, step / 2, step);
+        let late = rms(&out, step * 5, step * 11 / 2); // deep in the hold
+        assert!(late > early * 0.7,
+                "held means HELD: step-5 rms {late} vs step-0 {early}");
+        // And the gate still gates: half a step past note-off, silence —
+        // the roll's oldest pin, restated against the sustaining envelope.
+        assert!(rms(&out, step * 13 / 2, step * 7) < early * 0.01,
+                "note-off is a cut with a fade, not a second decay");
+    }
+
+    #[test]
+    fn the_rolls_key_is_the_synths_pitch() {
+        // key +12 through the tune mod must land exactly an octave up —
+        // pinned by zero-crossing count over the sustained region, where
+        // the tone is steady by construction.
+        let rack = sub_rack_decay(200.0);
+        let zc_of = |key: i8| {
+            let mut p = Pattern::new("k", 8, 1);
+            p.add_note(0, Note { key, start: 0, len: 8, vel: 1.0, slide: false });
+            let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+            let tempo = rack.tempo();
+            let out = render_pattern(&p, &rack, &mut synth, &tempo, 48_000, 0);
+            let step = tempo.step_len().to_samples(48_000).max(1) as usize;
+            let s = &out[step..step * 6];
+            s.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count() as f64
+        };
+        let (base, octave) = (zc_of(0), zc_of(12));
+        let ratio = octave / base.max(1.0);
+        assert!((ratio - 2.0).abs() < 0.06,
+                "an octave in the roll is an octave out of the synth: {ratio}");
     }
 }
