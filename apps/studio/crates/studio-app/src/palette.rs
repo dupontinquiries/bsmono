@@ -41,6 +41,7 @@ pub enum Act {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellVerb {
+    RecordTake,
     GotoStart,
     GotoEnd,
     MixMaster,
@@ -96,6 +97,8 @@ pub fn root() -> Vec<Choice> {
         label: label.into(), hint: hint.map(str::to_owned), then };
     vec![
         c("play / pause", Some("space"), Then::Do(Act::Key(' '))),
+        c("record a take (microphone)", Some("C-r"),
+          Then::Do(Act::Shell(ShellVerb::RecordTake))),
         c("playhead to start", Some("g g"), Then::Do(Act::Shell(ShellVerb::GotoStart))),
         c("playhead to end", Some("g e"), Then::Do(Act::Shell(ShellVerb::GotoEnd))),
         c("undo", Some("u"), Then::Do(Act::Key('u'))),

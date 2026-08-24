@@ -633,6 +633,7 @@ pub const CLIP_HINTS: &[&str] = &[
     "Q: quantize selected clip starts to the beat grid",
     ", / . : nudge selected by one step · < / > : by 1 ms",
     "g: group selection into a composition · G: ungroup",
+    "C-r: record a take from the microphone at the playhead",
 ];
 
 /// A stable, well-separated colour per site id. Deterministic so the same peer

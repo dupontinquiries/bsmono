@@ -562,6 +562,12 @@ pub fn mixdown_into(
             None => master.as_mut(),
         };
 
+        // Hoisted out of the sample loop: this was a BTreeMap lookup PER
+        // SAMPLE — at 48 kHz, forty-eight thousand tree walks per second
+        // of audio per track to fetch a value that cannot change within a
+        // track. The lane itself is then swept with a cursor rather than
+        // binary-searched per sample (see `eval_lane_cursor`).
+        let track_lane = project.automation.get(&AutoTarget::TrackGain(track.id));
         for clip in project.track_clips(track.id) {
             // skip clips entirely outside the window
             if clip.end() <= from || clip.pos >= to { continue; }
@@ -583,8 +589,15 @@ pub fn mixdown_into(
             let stop = clip.end().min(to);
             let out_off = (start.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
             let n = (stop.to_samples(rate) - start.to_samples(rate)).max(0) as usize;
+            // The destination bound, resolved ONCE: the old loop asked
+            // `oi + 1 >= dest.len()` every sample to catch the same
+            // condition arithmetic settles here.
+            let room = dest.len().saturating_sub(out_off * 2) / 2;
+            let n = n.min(room);
+            let start_sample = start.to_samples(rate);
+            let mut lane_cursor = 0usize;
             for i in 0..n {
-                let at = Ticks::from_samples(start.to_samples(rate) + i as i64, rate);
+                let at = Ticks::from_samples(start_sample + i as i64, rate);
                 let into_clip = at.saturating_sub(clip.pos);
                 // Index the SOURCE at the source's own rate — indexing a
                 // 44.1k file at 48k-sample positions plays it ~9% sharp and
@@ -598,13 +611,12 @@ pub fn mixdown_into(
                 // docs). Per-sample evaluation at the `at` this loop
                 // already computes: automation that stepped per buffer
                 // would zipper on any ramp steeper than gentle.
-                let auto = match project.automation.get(&AutoTarget::TrackGain(track.id)) {
-                    Some(lane) => eval_lane(lane, at),
+                let auto = match track_lane {
+                    Some(lane) => studio_core::eval_lane_cursor(lane, at, &mut lane_cursor),
                     None => 1.0,
                 };
                 let g = clip.gain * track.gain * auto * fade.gain_at(into_clip, clip.len);
                 let oi = (out_off + i) * 2;
-                if oi + 1 >= dest.len() { break; }
                 let read = |c: &[f32], pos: f64| -> Option<f32> {
                     let i0 = pos as usize;
                     if i0 + 1 >= c.len() { return None; }
@@ -2020,5 +2032,101 @@ mod morph_tests {
         let want = zc(&morph_blend(&[&b], 0.5, 1.0).channels[0]);
         assert!((zc(&right.channels[0]) as i64 - want as i64).abs() <= 2,
                 "x=1 is anchor B, at the pad's 48k");
+    }
+}
+
+#[cfg(test)]
+mod render_speed_tests {
+    use super::*;
+    use studio_core::{AutoTarget, Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    /// A project with real shape: several tracks, several clips each, and a
+    /// dense automation lane — the case where the per-sample map lookup
+    /// used to cost the most.
+    fn busy_project(tracks: usize, clips_each: usize)
+        -> (Project, BTreeMap<SourceId, SourceAudio>)
+    {
+        let mut p = Project::default();
+        let n = 48_000;
+        let audio_src = SourceAudio { sample_rate: 48_000, channels: vec![
+            (0..n).map(|i| (i as f32 / 48_000.0 * 220.0
+                            * std::f32::consts::TAU).sin() * 0.2).collect()] };
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "s".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        let mut cid = 1u64;
+        for t in 0..tracks {
+            let id = TrackId(t as u64 + 1);
+            p.apply(&Op::AddTrack { track: Track { id, kind: TrackKind::Audio,
+                name: format!("t{t}"), muted: false, locked: false, gain: 1.0,
+                route: None }, at: t }).unwrap();
+            for c in 0..clips_each {
+                p.apply(&Op::AddClip { clip: Clip { id: ClipId(cid), source: SourceId(1),
+                    track: id, pos: Ticks::from_seconds(c as f64 * 1.1),
+                    src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0),
+                    gain: 0.8, effects: vec![] } }).unwrap();
+                cid += 1;
+            }
+            // A point every 50 ms across the whole span.
+            for k in 0..200 {
+                p.apply(&Op::SetAutoPoint { target: AutoTarget::TrackGain(id),
+                    at: Ticks::from_seconds(k as f64 * 0.05),
+                    value: 0.5 + (k % 7) as f32 * 0.05 }).unwrap();
+            }
+        }
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), audio_src);
+        (p, audio)
+    }
+
+    #[test]
+    fn the_hoisted_render_still_matches_a_naive_per_sample_reference() {
+        // The optimization guard: automation hoisted out of the sample
+        // loop and swept with a cursor must produce EXACTLY what the
+        // straightforward per-sample lookup produced. Computed here from
+        // the model directly, so this test does not merely re-run the code
+        // it is checking.
+        let (p, audio) = busy_project(2, 3);
+        let rate = 48_000;
+        let to = Ticks::from_seconds(2.0);
+        let got = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, to, rate, &[], &[]);
+        let frames = to.to_samples(rate) as usize;
+        let mut want = vec![0.0f32; frames * 2];
+        for track in &p.tracks {
+            for clip in p.clips.values().filter(|c| c.track == track.id) {
+                let src = &audio[&clip.source];
+                let n = clip.len.to_samples(rate) as usize;
+                for i in 0..n {
+                    let at = Ticks::from_samples(clip.pos.to_samples(rate) + i as i64, rate);
+                    if at >= to { break; }
+                    let auto = match p.automation.get(&AutoTarget::TrackGain(track.id)) {
+                        Some(lane) => studio_core::eval_lane(lane, at),
+                        None => 1.0,
+                    };
+                    let g = clip.gain * track.gain * auto;
+                    let f = i;
+                    if f >= src.frames() { break; }
+                    let oi = (at.to_samples(rate) as usize) * 2;
+                    if oi + 1 >= want.len() { break; }
+                    want[oi] += src.channels[0][f] * g;
+                    want[oi + 1] += src.channels[0][f] * g;
+                }
+            }
+        }
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!((a - b).abs() < 1e-5, "sample {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    #[ignore = "timing, not correctness — run with --ignored to measure"]
+    fn measure_render_throughput() {
+        let (p, audio) = busy_project(8, 10);
+        let to = Ticks::from_seconds(10.0);
+        let t0 = std::time::Instant::now();
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, to, 48_000, &[], &[]);
+        let dt = t0.elapsed();
+        println!("rendered {} frames of 8x10 clips + dense automation in {dt:?} \
+                  ({:.1}x realtime)", out.len() / 2, 10.0 / dt.as_secs_f64());
     }
 }

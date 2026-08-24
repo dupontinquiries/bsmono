@@ -227,6 +227,28 @@ pub enum AutoTarget {
 /// first and after the last (the ends are what the automation last said,
 /// not a cliff back to unity), and 1.0 — a transparent ride — for a lane
 /// with no points at all.
+/// [`eval_lane`] for a caller sweeping time FORWARD, which every renderer
+/// is: `cursor` remembers the segment last used, so a lane of ten thousand
+/// points costs one comparison per sample instead of a binary search.
+/// Falls back to the search whenever `at` moves backwards (a loop wrap, a
+/// seek), so it is exactly `eval_lane` for any input — pinned by a test
+/// that sweeps both and compares every sample.
+pub fn eval_lane_cursor(points: &[(Ticks, f32)], at: Ticks, cursor: &mut usize) -> f32 {
+    if points.is_empty() { return 1.0; }
+    if *cursor >= points.len() || (*cursor > 0 && points[*cursor - 1].0 > at) {
+        *cursor = points.partition_point(|(t, _)| *t <= at);
+    }
+    while *cursor < points.len() && points[*cursor].0 <= at { *cursor += 1; }
+    let i = *cursor;
+    if i == 0 { return points[0].1.max(0.0); }
+    if i == points.len() { return points[i - 1].1.max(0.0); }
+    let (t0, v0) = points[i - 1];
+    let (t1, v1) = points[i];
+    let span = (t1.0 - t0.0).max(1) as f64;
+    let frac = ((at.0 - t0.0) as f64 / span) as f32;
+    (v0 + (v1 - v0) * frac).max(0.0)
+}
+
 pub fn eval_lane(points: &[(Ticks, f32)], at: Ticks) -> f32 {
     if points.is_empty() { return 1.0; }
     let i = points.partition_point(|(t, _)| *t <= at);
@@ -1580,5 +1602,41 @@ mod group_and_bus_input_tests {
         assert_eq!(p.clips, clips_before, "ungrouping is organizational, never musical");
         p.apply(&inv2).unwrap();
         assert_eq!(p.groups[&GroupId(1)].name, "hook");
+    }
+}
+
+#[cfg(test)]
+mod lane_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn the_cursor_sweep_equals_the_search_at_every_sample_including_backwards() {
+        // The optimization's only job is to be identical. A dense lane, a
+        // forward sweep at sample resolution, then a jump BACKWARDS (a
+        // loop wrap or a seek — the case a naive cursor gets wrong).
+        let points: Vec<(Ticks, f32)> = (0..200)
+            .map(|i| (Ticks::from_seconds(i as f64 * 0.05),
+                      ((i as f32 * 0.37).sin() * 0.5 + 0.5)))
+            .collect();
+        let mut cursor = 0usize;
+        for s in 0..4_000 {
+            let at = Ticks::from_samples(s * 12, 48_000);
+            let a = eval_lane(&points, at);
+            let b = eval_lane_cursor(&points, at, &mut cursor);
+            assert!((a - b).abs() < 1e-6, "sample {s}: {a} vs {b}");
+        }
+        // Wrap to the start: the cursor must reset rather than hold the
+        // late segment.
+        for s in 0..500 {
+            let at = Ticks::from_samples(s * 12, 48_000);
+            let a = eval_lane(&points, at);
+            let b = eval_lane_cursor(&points, at, &mut cursor);
+            assert!((a - b).abs() < 1e-6, "after wrap, sample {s}: {a} vs {b}");
+        }
+        // Edges and the empty lane behave as the search does.
+        let mut c2 = 0;
+        assert_eq!(eval_lane_cursor(&[], Ticks::from_seconds(1.0), &mut c2), 1.0);
+        let far = Ticks::from_seconds(1000.0);
+        assert_eq!(eval_lane_cursor(&points, far, &mut c2), eval_lane(&points, far));
     }
 }

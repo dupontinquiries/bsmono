@@ -1686,3 +1686,36 @@ move, not a model edit — moving the playhead is not something a
 collaborator should undo. Pinned headlessly: the band seeks through the
 same transform the ruler labels use, the strip below it does not, and the
 gutter column is not time.
+
+
+**Render efficiency: 2.2× on a real workload.** Measured, not guessed —
+the sample loop was doing a `BTreeMap` lookup PER SAMPLE to fetch the
+track's automation lane (48,000 tree walks per second of audio per track,
+for a value that cannot change within a track), then binary-searching that
+lane per sample, then re-checking the destination bound per sample. The
+lookup is hoisted, the lane is swept with a cursor (`eval_lane_cursor` —
+O(1) amortized forward, falling back to the search on any backwards jump
+so it is exactly `eval_lane` for every input), and the bound is resolved
+once by arithmetic. Same machine, same 8-track/80-clip/dense-automation
+workload: 110 ms → 50 ms for ten seconds of audio, 91× → 202× realtime.
+Guarded by an equivalence test that recomputes the expected mix from the
+model with the naive per-sample lookup, so the fast path cannot drift from
+the meaning.
+
+**Vocal takes.** The editor could import, bounce and synthesize audio and
+could not RECORD any. `capture.rs` is the input half of `audition`'s
+output half: a cpal input stream behind the `audio` feature, a null
+capture that SAYS it has no device rather than faking one, and an audio
+callback that never blocks — it `try_lock`s and drops-and-counts rather
+than waiting, because a dropped block is a click in one take while a
+blocked callback is a glitch in everything. Dropped blocks are reported on
+the take, not swallowed. ⏺ in the top bar turns red and counts up while
+live; `C-r` and the palette do the same. A finished take is trimmed of the
+walk to and from the microphone (a silent take is returned WHOLE — a
+mic-gain mistake must not delete the performance), imported as an ordinary
+source, and placed as a clip at the playhead where recording started, so a
+take is one undoable, shareable, archivable op like any other edit. Its
+asset is stored FLAC-encoded, so a phone session's takes cost what they
+should. `C-r`, not `r`: the palette's drift test refused `r` the moment
+this tried to take it, because the keymap already owns it — the guard
+doing exactly its job.

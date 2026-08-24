@@ -17,6 +17,7 @@ use studio_live::transport::Transport;
 
 pub mod archive;
 pub mod audition;
+pub mod capture;
 pub mod export;
 pub mod clip_inspector;
 pub mod library;
@@ -1329,6 +1330,9 @@ pub struct App {
     /// The command palette, open when `Some`. C-p opens it; it holds the
     /// wizard's position and the current query between frames.
     palette: Option<palette::Palette>,
+    mic: Box<dyn capture::Capture>,
+    /// Where the take started, so it lands where it was sung.
+    take_from: studio_core::Ticks,
     settings_open: bool,
     library_open: bool,
     /// The export dialog's plan while it is open, plus its last refusal —
@@ -1436,6 +1440,8 @@ impl Default for App {
               bounce_format,
               mix_pass: None,
               palette: None,
+              mic: capture::open_capture(),
+              take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: true,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
@@ -1472,6 +1478,12 @@ impl eframe::App for App {
         // C-p, read from the key events rather than the text stream: a
         // modified chord never arrives as Event::Text. Consumed here so no
         // widget with focus can eat it.
+        // C-r records. NOT plain 'r': the keymap already owns that, and
+        // the palette's drift test said so out loud the moment this tried
+        // to take it — exactly the collision that guard exists to catch.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R)) {
+            self.toggle_take();
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
             self.palette = match self.palette {
                 Some(_) => None, // C-p again closes: a toggle, not a stack
@@ -1661,6 +1673,21 @@ impl eframe::App for App {
                 // The playhead's visible controls. `g g` and `g e` have
                 // always done this; nothing on screen said so, which
                 // meant a new user had no way back to the start at all.
+                // The take button. Red while live, with the elapsed time
+                // on it — a recording UI that does not show you it is
+                // recording is how takes get lost.
+                let live = self.mic.recording();
+                let label = if live { format!("⏺ {:.1}s", self.mic.elapsed()) }
+                            else { "⏺".to_string() };
+                let btn = egui::Button::new(label)
+                    .fill(if live { egui::Color32::from_rgb(150, 40, 40) }
+                          else { ui.visuals().widgets.inactive.bg_fill });
+                if ui.add(btn)
+                    .on_hover_text(format!("record a take from {} (C-r)", self.mic.device_name()))
+                    .clicked() {
+                    self.toggle_take();
+                }
+                if live { ctx.request_repaint(); } // the counter must tick
                 if ui.button("⏮").on_hover_text("playhead to start (g g)").clicked() {
                     self.studio.transport.set_position(studio_core::Ticks::ZERO);
                     self.studio.status = "playhead at start".into();
@@ -2720,6 +2747,7 @@ impl App {
                 self.studio.status = format!("{}", panel.label());
             }
             palette::Act::Shell(v) => match v {
+                palette::ShellVerb::RecordTake => { self.toggle_take(); }
                 palette::ShellVerb::GotoStart => {
                     self.studio.transport.set_position(studio_core::Ticks::ZERO);
                     self.studio.status = "playhead at start".into();
@@ -2753,6 +2781,61 @@ impl App {
                     self.library_open = !self.library_open;
                 }
             },
+        }
+    }
+
+    /// Start or finish a vocal take. A finished take is trimmed, imported
+    /// as an ordinary source, and placed as a clip AT THE PLAYHEAD WHERE
+    /// IT STARTED — recording then behaves like every other edit: one op,
+    /// undoable, shareable, archivable. Its asset is stored FLAC-encoded,
+    /// so a phone session's takes do not cost three times what they need.
+    fn toggle_take(&mut self) {
+        if self.mic.recording() {
+            let Some(take) = self.mic.stop() else {
+                self.studio.status = "take stopped — nothing was captured".into();
+                return;
+            };
+            let dropped = take.dropped_blocks;
+            let audio = capture::trim_silence(&take.audio, 0.004, 80.0);
+            let name = format!("take {}", self.studio.session.doc.project.sources.len() + 1);
+            let path = format!("takes/{}.flac", export::sanitize(&name));
+            let id = self.studio.import_audio(&name, &path, &audio);
+            // The rack channel import_audio appends is not what a vocal
+            // take wants; drop it and place a CLIP instead.
+            let appended = self.studio.rack.channels.len().saturating_sub(1);
+            self.studio.rack.channels.truncate(appended);
+            for p in &mut self.studio.rack.patterns { p.rows.truncate(appended); }
+            let track = self.studio.session.doc.project.tracks.iter()
+                .find(|t| t.kind == studio_core::TrackKind::Audio).map(|t| t.id);
+            let len = studio_core::Ticks::from_samples(
+                audio.frames() as i64, audio.sample_rate);
+            if let Some(track) = track {
+                let cid = studio_core::ClipId(
+                    self.studio.session.doc.project.clips.keys()
+                        .map(|c| c.0).max().unwrap_or(0) + 1);
+                self.studio.edit(studio_core::Op::AddClip { clip: studio_core::Clip {
+                    id: cid, source: id, track, pos: self.take_from,
+                    src_in: studio_core::Ticks::ZERO, len, gain: 1.0,
+                    effects: vec![] } }, "take");
+            }
+            if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
+                self.studio.register_asset(id, &bytes);
+            }
+            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.audio.insert(id, audio);
+            self.studio.status = format!("take: {:.1}s{}", len.to_seconds(),
+                if dropped > 0 {
+                    // Said, not swallowed: a take with holes must not be
+                    // built on unknowingly.
+                    format!(" — WARNING: {dropped} block(s) dropped, check the take")
+                } else { String::new() });
+        } else {
+            self.take_from = self.studio.playhead();
+            match self.mic.start() {
+                Ok(()) => self.studio.status =
+                    format!("recording from {}…", self.mic.device_name()),
+                Err(e) => self.studio.status = e,
+            }
         }
     }
 
