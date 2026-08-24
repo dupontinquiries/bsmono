@@ -507,8 +507,34 @@ pub fn timeline(
     out.clicked = resp.interact_pointer_pos()
         .filter(|_| resp.clicked())
         .and_then(|p| hit_test(&doc.project, view, p, origin));
+    // The tooltip is where the tools become learnable: a shortcut nobody
+    // can see is a shortcut nobody uses — across every editor ever
+    // shipped. Hovering a clip shows its name and the alignment tools;
+    // the LIST is a public const so the shell's key handler can pin, by
+    // test, that every key it intercepts is written here — the tooltip
+    // and the behavior cannot drift apart.
+    if let Some(p) = resp.hover_pos() {
+        if let Some(id) = hit_test(&doc.project, view, p, origin) {
+            let name = doc.project.clips.get(&id)
+                .and_then(|c| doc.project.sources.get(&c.source))
+                .map(|s| s.path.clone()).unwrap_or_default();
+            resp.clone().on_hover_ui(|ui| {
+                ui.strong(name);
+                for h in CLIP_HINTS { ui.weak(*h); }
+            });
+        }
+    }
     out
 }
+
+/// What hovering a clip teaches. One source of truth: the shell's key
+/// handler tests that every alignment key it intercepts appears here.
+pub const CLIP_HINTS: &[&str] = &[
+    "drag: move · edge: trim (alt-; flips the grabbed side)",
+    "A: align 2nd selected clip to 1st (vocal double → lead)",
+    "Q: quantize selected clip starts to the beat grid",
+    ", / . : nudge selected by one step · < / > : by 1 ms",
+];
 
 /// A stable, well-separated colour per site id. Deterministic so the same peer
 /// is the same colour on every screen in the session — a peer who changes

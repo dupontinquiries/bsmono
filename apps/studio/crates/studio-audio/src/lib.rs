@@ -1734,3 +1734,103 @@ mod automation_render_tests {
         }
     }
 }
+
+// ── vocal alignment ─────────────────────────────────────────────────────
+
+/// The audio's energy envelope at one value per millisecond — the domain
+/// alignment happens in. Envelopes are RATE-AGNOSTIC by construction (a
+/// 44.1k take and a 48k reference land on the same time axis), phase-blind
+/// (two mics of one performance correlate even when the waveforms do not),
+/// and a thousand times cheaper than sample-rate correlation.
+pub fn envelope_ms(samples: &[f32], rate: u32) -> Vec<f32> {
+    let hop = (rate / 1000).max(1) as usize;
+    samples.chunks(hop)
+        .map(|c| c.iter().map(|s| s.abs()).sum::<f32>() / c.len() as f32)
+        .collect()
+}
+
+/// The lag, in MILLISECONDS, at which `take` best matches `reference`:
+/// positive means the take's material happens LATER than the reference's
+/// (the fix is moving the take's clip earlier by that much), negative the
+/// opposite. Normalized cross-correlation over ±`max_shift_ms`, on
+/// envelopes from [`envelope_ms`]. Silence against silence is honest
+/// zero, not a confident lie.
+pub fn align_offset_ms(reference: &[f32], take: &[f32], max_shift_ms: usize) -> i64 {
+    if reference.is_empty() || take.is_empty() { return 0; }
+    let mut best = (0i64, f32::MIN);
+    for shift in -(max_shift_ms as i64)..=(max_shift_ms as i64) {
+        let mut dot = 0.0f32;
+        let mut na = 0.0f32;
+        let mut nb = 0.0f32;
+        for (i, r) in reference.iter().enumerate() {
+            let j = i as i64 + shift;
+            if j < 0 || j as usize >= take.len() { continue; }
+            let t = take[j as usize];
+            dot += r * t;
+            na += r * r;
+            nb += t * t;
+        }
+        let norm = (na * nb).sqrt();
+        let score = if norm > 1e-12 { dot / norm } else { 0.0 };
+        // Strictly-greater keeps the SMALLEST winning lag when scores tie
+        // (a periodic take ties at every period): the least surprising
+        // move wins, and iteration order from -max makes "smallest" mean
+        // "most negative" deterministically rather than by float luck.
+        if score > best.1 { best = (shift, score); }
+    }
+    // No positive correlation anywhere — silence, or unrelated material —
+    // is an honest zero, not the leftmost shift that happened to beat the
+    // f32::MIN sentinel (exactly how the first draft returned -max for
+    // silence-vs-silence).
+    if best.1 <= 1e-6 { 0 } else { best.0 }
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+
+    fn burst(rate: u32) -> Vec<f32> {
+        // A syllable-like shape: silence, an attack, a decaying tail — the
+        // envelope structure real vocals have and pure tones do not.
+        let mut v = vec![0.0f32; rate as usize / 10];
+        for i in 0..(rate as usize / 5) {
+            let t = i as f32 / rate as f32;
+            let env = (-t * 12.0).exp();
+            v.push((t * 300.0 * std::f32::consts::TAU).sin() * env);
+        }
+        v.extend(vec![0.0f32; rate as usize / 10]);
+        v
+    }
+
+    #[test]
+    fn a_delayed_copy_is_found_to_within_the_envelope_hop() {
+        let rate = 48_000;
+        let r = burst(rate);
+        let mut late = vec![0.0f32; (rate / 1000 * 37) as usize]; // 37 ms late
+        late.extend(&r);
+        let d = align_offset_ms(&envelope_ms(&r, rate), &envelope_ms(&late, rate), 200);
+        assert!((d - 37).abs() <= 1, "37 ms of delay recovered, got {d}");
+        // And the other direction: the take EARLY means a negative lag.
+        let d = align_offset_ms(&envelope_ms(&late, rate), &envelope_ms(&r, rate), 200);
+        assert!((d + 37).abs() <= 1, "early is negative, got {d}");
+    }
+
+    #[test]
+    fn rates_do_not_matter_because_the_envelope_domain_is_milliseconds() {
+        // A 44.1k double against a 48k lead — the exact case that makes
+        // sample-domain correlation quietly wrong by the rate ratio.
+        let lead = burst(48_000);
+        let mut double = vec![0.0f32; 44_100 / 1000 * 25]; // 25 ms late, at 44.1k
+        double.extend(burst(44_100));
+        let d = align_offset_ms(&envelope_ms(&lead, 48_000),
+                                &envelope_ms(&double, 44_100), 200);
+        assert!((d - 25).abs() <= 2, "cross-rate alignment holds, got {d}");
+    }
+
+    #[test]
+    fn silence_is_an_honest_zero_not_a_confident_lie() {
+        let z = vec![0.0f32; 48_000];
+        assert_eq!(align_offset_ms(&envelope_ms(&z, 48_000),
+                                   &envelope_ms(&z, 48_000), 100), 0);
+    }
+}

@@ -1457,3 +1457,23 @@ never load-bearing: view state must not be the reason a project fails to
 open. This is the pattern for several frontends sharing one project — each
 keeps its own sidecar over the shared file, and their states save simply
 because they never entangle.
+
+
+**Vocal alignment, and the tooltip that teaches it.** Mapping a double to
+its lead by eye is the slow part of vocal work, so the timeline grew the
+tools: select the lead, shift-click the take, **A** aligns it — envelope
+cross-correlation (one value per millisecond, so it is rate-agnostic by
+construction and phase-blind, which two mics of one performance need),
+±500 ms search, landing as an ordinary `MoveClip`: undoable, on the wire,
+refusable out loud (wrong selection count and absent media both SAY so).
+**Q** quantizes selected clip starts to the rack's step grid; **, / .**
+nudge by a step and **< / >** by a millisecond, clamped at zero. Two sign
+disciplines are pinned because both first drafts got them wrong: silence
+correlates to an honest zero rather than the leftmost shift that beat the
+sentinel, and the take lands at `reference − lag` — the `+` version would
+have doubled every error instead of fixing it. And the part that makes any
+of this exist for a user: hovering a clip shows its name and the tool list
+— `CLIP_HINTS`, a public const the shell's key handler pins BY TEST: every
+intercepted key must appear in the tooltip and stay unbound in the Helix
+keymap, so the shortcuts, the keymap, and what the clip teaches cannot
+drift apart. A shortcut nobody can see is a shortcut nobody uses.

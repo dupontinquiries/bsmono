@@ -686,6 +686,91 @@ impl Studio {
     }
 
     /// Route a key through the modal map. Returns true if it was consumed.
+    /// Align the SECOND selected clip to the FIRST — the vocal-double
+    /// case: select the lead, shift-click the take, press A. Envelope
+    /// cross-correlation (rate-agnostic, phase-blind) within ±500 ms; the
+    /// move is an ordinary `MoveClip` — undoable, on the wire, refusable.
+    pub fn align_selected(
+        &mut self,
+        audio: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    ) {
+        let [ref_id, take_id] = self.selection[..] else {
+            self.status = "align: select the reference first, then the take (2 clips)".into();
+            return;
+        };
+        let clip = |id| self.session.doc.project.clips.get(&id).cloned();
+        let (Some(r), Some(t)) = (clip(ref_id), clip(take_id)) else {
+            self.status = "align refused: a selected clip vanished".into();
+            return;
+        };
+        let window = |c: &studio_core::Clip| -> Option<Vec<f32>> {
+            let a = audio.get(&c.source)?;
+            let from = c.src_in.to_seconds().max(0.0) * a.sample_rate as f64;
+            let len = c.len.to_seconds().max(0.0) * a.sample_rate as f64;
+            let (from, to) = (from as usize, (from + len) as usize);
+            let ch = a.channels.first()?;
+            Some(ch.get(from..to.min(ch.len()))?.to_vec())
+        };
+        let (Some(rw), Some(tw)) = (window(&r), window(&t)) else {
+            self.status = "align refused: a clip's media has not arrived yet".into();
+            return;
+        };
+        let (ra, ta) = (audio[&r.source].sample_rate, audio[&t.source].sample_rate);
+        let ms = studio_audio::align_offset_ms(
+            &studio_audio::envelope_ms(&rw, ra),
+            &studio_audio::envelope_ms(&tw, ta), 500);
+        // The lag is measured WITHIN each clip's window: take[i+d]≈ref[i]
+        // means the take's event sits d ms later than the reference's,
+        // counted from their own starts. Aligning the material on the
+        // timeline therefore lands the take's clip at r.pos − d — the
+        // derivation matters, because the first draft wrote r.pos + d and
+        // would have doubled every error instead of fixing it.
+        let want = studio_core::Ticks(
+            (r.pos.0 - studio_core::Ticks::from_seconds(ms as f64 / 1000.0).0)
+                .max(0));
+        if (want.0 - t.pos.0).abs() < studio_core::Ticks::from_seconds(0.0005).0 {
+            self.status = "already aligned (within half a millisecond)".into();
+            return;
+        }
+        self.edit(studio_core::Op::MoveClip { id: take_id, pos: want, track: t.track },
+                  &format!("aligned: the take was {ms:+} ms off"));
+    }
+
+    /// Snap every selected clip's start to the nearest rack step. One
+    /// `MoveClip` per clip, each its own undo — the multi-op precedent.
+    pub fn quantize_selected(&mut self) {
+        if self.selection.is_empty() {
+            self.status = "quantize: nothing selected".into();
+            return;
+        }
+        let step = self.rack.tempo().step_len().0.max(1);
+        for id in self.selection.clone() {
+            let Some(c) = self.session.doc.project.clips.get(&id).cloned() else { continue };
+            let snapped = studio_core::Ticks(((c.pos.0 + step / 2) / step * step).max(0));
+            if snapped != c.pos {
+                self.edit(studio_core::Op::MoveClip { id, pos: snapped, track: c.track },
+                          "quantized to the grid");
+            }
+        }
+    }
+
+    /// Nudge every selected clip by `delta` ticks (clamped at zero) — the
+    /// keyboard's fine alignment: a step with , and . , a millisecond
+    /// with < and > .
+    pub fn nudge_selected(&mut self, delta: studio_core::Ticks) {
+        if self.selection.is_empty() {
+            self.status = "nudge: nothing selected".into();
+            return;
+        }
+        for id in self.selection.clone() {
+            let Some(c) = self.session.doc.project.clips.get(&id).cloned() else { continue };
+            let pos = studio_core::Ticks((c.pos.0 + delta.0).max(0));
+            if pos != c.pos {
+                self.edit(studio_core::Op::MoveClip { id, pos, track: c.track }, "nudged");
+            }
+        }
+    }
+
     pub fn key(&mut self, k: studio_egui::keys::Key) -> bool {
         use studio_egui::keys::{Action, Resolution};
         // In Playing mode the editing keymap is inert: `d` is a note, not a
@@ -1293,7 +1378,25 @@ impl eframe::App for App {
             egui::Event::Text(t) => t.chars().collect::<Vec<_>>(),
             _ => Vec::new(),
         }).collect());
-        for ch in typed { self.studio.key(studio_egui::keys::Key::c(ch)); }
+        for ch in typed {
+            // The alignment keys, intercepted before the Helix keymap —
+            // they need `self.audio` (the keymap cannot) and their chars
+            // are pinned unbound in the keymap by test. Every one of them
+            // appears in `studio_egui::CLIP_HINTS`, also by test: a
+            // shortcut the timeline does not show is one nobody learns.
+            let step = studio_core::Ticks(self.studio.rack.tempo().step_len().0);
+            let ms = studio_core::Ticks::from_seconds(0.001);
+            match ch {
+                'A' => { self.studio.align_selected(&self.audio); continue; }
+                'Q' => { self.studio.quantize_selected(); continue; }
+                ',' => { self.studio.nudge_selected(studio_core::Ticks(-step.0)); continue; }
+                '.' => { self.studio.nudge_selected(step); continue; }
+                '<' => { self.studio.nudge_selected(studio_core::Ticks(-ms.0)); continue; }
+                '>' => { self.studio.nudge_selected(ms); continue; }
+                _ => {}
+            }
+            self.studio.key(studio_egui::keys::Key::c(ch));
+        }
 
         let colors = uikit_egui::palette_colors("midnight");
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
@@ -3792,5 +3895,113 @@ mod archive_shell_tests {
         let t1 = Team::from_contacts("cut", &["sc-ada".into(), "sc-lin".into()]);
         let t2 = Team::from_contacts("whatever", &["sc-lin".into(), "sc-ada".into()]);
         assert_eq!(t1.id, t2.id);
+    }
+}
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Ticks, TrackId};
+
+    fn burst(rate: u32, delay_ms: usize) -> studio_audio::SourceAudio {
+        let mut v = vec![0.0f32; rate as usize / 1000 * delay_ms];
+        for i in 0..(rate as usize / 4) {
+            let t = i as f32 / rate as f32;
+            v.push((t * 300.0 * std::f32::consts::TAU).sin() * (-t * 10.0).exp());
+        }
+        v.extend(vec![0.0f32; rate as usize / 10]);
+        studio_audio::SourceAudio { sample_rate: rate, channels: vec![v] }
+    }
+
+    fn studio_with_pair(delay_ms: usize)
+        -> (Studio, std::collections::BTreeMap<SourceId, studio_audio::SourceAudio>)
+    {
+        let mut s = Studio::demo();
+        let mut audio = std::collections::BTreeMap::new();
+        for (sid, d) in [(100u64, 0usize), (101, delay_ms)] {
+            let a = burst(48_000, d);
+            let len = Ticks::from_samples(a.frames() as i64, 48_000);
+            s.edit(Op::AddSource { source: Source { id: SourceId(sid),
+                path: format!("takes/{sid}.wav"), len, sample_rate: 48_000,
+                channels: 1, has_video: false } }, "src");
+            audio.insert(SourceId(sid), a);
+        }
+        // Far past the demo clips, on the two audio tracks, same position:
+        // the classic double — recorded against the lead, landed sloppy.
+        let len = Ticks::from_seconds(0.4);
+        for (cid, sid, track) in [(100u64, 100u64, 2u64), (101, 101, 3)] {
+            s.edit(Op::AddClip { clip: Clip { id: ClipId(cid), source: SourceId(sid),
+                track: TrackId(track), pos: Ticks::from_seconds(60.0),
+                src_in: Ticks::ZERO, len, gain: 1.0, effects: vec![] } }, "clip");
+        }
+        s.selection = vec![ClipId(100), ClipId(101)];
+        (s, audio)
+    }
+
+    #[test]
+    fn press_a_and_the_double_lands_on_the_lead() {
+        // The take's burst is 37 ms late inside its window; aligned, its
+        // clip must sit 37 ms EARLIER than the reference — the sign this
+        // function's first draft got backwards, which would have doubled
+        // the error instead of fixing it.
+        let (mut s, audio) = studio_with_pair(37);
+        s.align_selected(&audio);
+        let take = s.session.doc.project.clips[&ClipId(101)].pos;
+        let want = Ticks::from_seconds(60.0 - 0.037);
+        let err_ms = (take.0 - want.0).abs() as f64
+            / studio_core::TICKS_PER_SECOND as f64 * 1000.0;
+        assert!(err_ms <= 1.5, "landed {err_ms:.2} ms from the lead");
+        // And it is an ordinary op: one undo puts the sloppy take back.
+        s.key(studio_egui::keys::Key::c('u'));
+        assert_eq!(s.session.doc.project.clips[&ClipId(101)].pos,
+                   Ticks::from_seconds(60.0));
+    }
+
+    #[test]
+    fn align_refuses_out_loud_without_exactly_two_clips_or_their_media() {
+        let (mut s, audio) = studio_with_pair(10);
+        s.selection = vec![ClipId(100)];
+        s.align_selected(&audio);
+        assert!(s.status.contains("select the reference first"), "{}", s.status);
+        s.selection = vec![ClipId(100), ClipId(101)];
+        s.align_selected(&Default::default()); // media not arrived
+        assert!(s.status.contains("has not arrived"), "{}", s.status);
+    }
+
+    #[test]
+    fn quantize_snaps_to_the_nearest_step_and_nudge_walks_by_one() {
+        let (mut s, _) = studio_with_pair(0);
+        let step = Ticks(s.rack.tempo().step_len().0);
+        // Park the take just past a step boundary, then quantize.
+        let off = Ticks(step.0 * 500 + step.0 / 3);
+        s.edit(Op::MoveClip { id: ClipId(101), pos: off, track: TrackId(3) }, "park");
+        s.selection = vec![ClipId(101)];
+        s.quantize_selected();
+        assert_eq!(s.session.doc.project.clips[&ClipId(101)].pos, Ticks(step.0 * 500),
+                   "a third past the line snaps back, not forward");
+        s.nudge_selected(step);
+        assert_eq!(s.session.doc.project.clips[&ClipId(101)].pos, Ticks(step.0 * 501));
+        s.nudge_selected(Ticks(-step.0 * 600));
+        assert_eq!(s.session.doc.project.clips[&ClipId(101)].pos, Ticks(0),
+                   "a nudge past zero clamps rather than going negative");
+    }
+
+    #[test]
+    fn the_alignment_keys_are_unbound_in_the_keymap_and_taught_by_the_tooltip() {
+        // Two drift-proofing pins in one place. (1) The chars the shell
+        // intercepts must stay unbound in the Helix keymap — a future
+        // binding would be silently shadowed. (2) Every intercepted key
+        // must appear in the timeline's CLIP_HINTS: a shortcut the clip
+        // does not show is one nobody learns, in every editor ever
+        // shipped — the tooltip and the behavior are one source of truth.
+        use studio_egui::keys::{Key, Keymap, Resolution};
+        let hints = studio_egui::CLIP_HINTS.join(" ");
+        for ch in ['A', 'Q', ',', '.', '<', '>'] {
+            let mut k = Keymap::new();
+            assert!(!matches!(k.feed(Key::c(ch)), Resolution::Act(_)),
+                    "'{ch}' must stay free in the keymap");
+            assert!(hints.contains(ch),
+                    "'{ch}' is intercepted but the clip tooltip never teaches it");
+        }
     }
 }
