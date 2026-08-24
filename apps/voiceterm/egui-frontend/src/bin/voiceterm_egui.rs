@@ -14,6 +14,7 @@
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, BlockAction, LinkAction, PaneAction};
+use voiceterm_egui::surface::{Surface, Surfaces};
 use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, settings_panel, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
@@ -542,10 +543,9 @@ struct VoicetermApp {
     /// baseline identity.
     theme: snapclone_theme::PaletteId,
     theme_menu: voiceterm_egui::slide_menu::SlideMenu,
-    /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; `blocks_open`
-    /// toggles the left-edge drawer.
+    /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
+    /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     blocks: uikit_term::blocks::BlockTracker,
-    blocks_open: bool,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
@@ -605,13 +605,7 @@ struct VoicetermApp {
     /// held live — the ranking is recency-weighted and a sheet built once at
     /// startup would show the wrong "most recent" an hour later.
     cmd_sheet: voiceterm_egui::cmd_sheet::CmdSheet,
-    /// The missing-package sidebar. Open state only — the list itself lives in
-    /// the detector, which owns dismissal so a package reappearing in a NEW
-    /// block comes back.
-    missing_pkg_open: bool,
-    /// The favorites panel. Open state only — the list is read fresh on every
-    /// draw, so someone editing Dolphin's favorites mid-session sees it.
-    favorites_open: bool,
+
     /// When the memory footprint was last sampled, in seconds since start.
     /// Only moves when WEB2QML_MEMLOG is set; see voiceterm_egui::memlog.
     last_memlog_s: f64,
@@ -682,12 +676,16 @@ struct VoicetermApp {
     /// the shared model decided, so voiceterm does not grow its own
     /// drag-delta arithmetic and gets the same swipe feel as every other app.
     tab_swipe: uikit_egui::GestureLayer,
-    /// The command palette: open state and query. Everything not on the rail
-    /// is reachable here or by voice, which is what replaces eleven tabs.
-    palette_open: bool,
+    /// Which transient surface is up — blocks drawer, missing packages,
+    /// workspaces, settings, favorites, command sheet, or the palette. At most
+    /// one, like the QML's modal popups; see `voiceterm_egui::surface`. Every
+    /// open/close route (chip, sidebar action, voice command, Ctrl+P, close
+    /// button) goes through this — no per-surface flags.
+    surfaces: Surfaces,
+    /// The command palette's query state. Everything not on the rail is
+    /// reachable here or by voice, which is what replaces eleven tabs.
     palette_query: String,
     palette_sel: usize,
-    workspaces_open: bool,
     workspaces_filter: String,
     bar_state: voiceterm_egui::bars::BarState,
     /// The graph's SOURCE, not a prebuilt topology.
@@ -698,9 +696,9 @@ struct VoicetermApp {
     /// edges come from text. Holding the SOURCE means the graph redraws when
     /// the text changes, which is the point of a live diagram.
     graph_source: String,
-    /// The settings screen (QML settings page): sidebar ⚙ toggles the right panel; edits apply
-    /// live (App::apply_settings + palette each frame) and persist to prefs.kv on change.
-    settings_open: bool,
+    // The settings screen (QML settings page) renders when `surfaces` says
+    // `Surface::Settings`; edits apply live (App::apply_settings + palette
+    // each frame) and persist to prefs.kv on change.
     /// Terminals for the panes that are NOT focused. `self.app` is always the focused pane's
     /// terminal; on a focus change the two are swapped, so each pane keeps its own scrollback
     /// and every existing `self.app` call site stays as it was.
@@ -736,12 +734,16 @@ impl VoicetermApp {
             Command::NewTab => { self.workspace.apply(&WsCall::Command("new tab".into())); }
             Command::NextTab => { self.workspace.apply(&WsCall::Command("next tab".into())); }
             Command::PrevTab => { self.workspace.apply(&WsCall::Command("previous tab".into())); }
-            Command::ShowPalette => { self.palette_open = true; }
+            Command::ShowPalette => {
+                self.surfaces.open(Surface::Palette);
+                self.palette_query.clear();
+                self.palette_sel = 0;
+            }
             // Repointed from `rail_open` to `tabbar_open`: the palette entry
             // ("Toggle sidebar") and the voice phrase ("hide the sidebar") keep
             // working and now move the column that actually holds the tabs.
             Command::ToggleRail => { self.tabbar_open = !self.tabbar_open; }
-            Command::ToggleSettings => { self.settings_open = !self.settings_open; }
+            Command::ToggleSettings => { self.surfaces.toggle(Surface::Settings); }
         }
     }
 
@@ -786,7 +788,10 @@ impl VoicetermApp {
             close = true;
         }
         if close {
-            self.palette_open = false;
+            // `close_if`, not `close`: running ToggleSettings from here just
+            // replaced Palette with Settings, and a blind close would shut the
+            // panel the command opened. surface.rs has the test.
+            self.surfaces.close_if(Surface::Palette);
             self.palette_query.clear();
             self.palette_sel = 0;
         }
@@ -836,7 +841,7 @@ impl eframe::App for VoicetermApp {
         // FAVORITES. Read fresh each draw rather than on open: the QML
         // refreshes on open for the same reason, and "each draw" is strictly
         // fresher for the cost of parsing one small XML file.
-        if self.favorites_open {
+        if self.surfaces.is(Surface::Favorites) {
             let colors = self.colors;
             egui::Window::new("favorites")
                 .collapsible(false).resizable(false)
@@ -851,9 +856,9 @@ impl eframe::App for VoicetermApp {
                             fv::Action::Cd(path) => {
                                 self.pty_out.extend_from_slice(
                                     format!("cd {path:?}").as_bytes());
-                                self.favorites_open = false;
+                                self.surfaces.close();
                             }
-                            fv::Action::Close => self.favorites_open = false,
+                            fv::Action::Close => self.surfaces.close(),
                         }
                     }
                 });
@@ -861,8 +866,10 @@ impl eframe::App for VoicetermApp {
 
         // MISSING PACKAGES, right edge as in the QML. A side panel rather
         // than a modal: the list is something to read WHILE looking at the
-        // command output that produced it.
-        if self.missing_pkg_open {
+        // command output that produced it. The list itself lives in the
+        // detector, which owns dismissal so a package reappearing in a NEW
+        // block comes back.
+        if self.surfaces.is(Surface::MissingPkg) {
             let colors = self.colors;
             egui::SidePanel::right("missing_pkg").show(ctx, |ui| {
                 use voiceterm_egui::missing_pkg as mp;
@@ -878,7 +885,7 @@ impl eframe::App for VoicetermApp {
                         mp::Action::Dismiss { ecosystem, name } => {
                             mp::missing_packages::dismiss(&ecosystem, &name);
                         }
-                        mp::Action::Close => self.missing_pkg_open = false,
+                        mp::Action::Close => self.surfaces.close(),
                     }
                 }
             });
@@ -886,7 +893,7 @@ impl eframe::App for VoicetermApp {
 
         // THE TOUCH COMMAND HISTORY. A bottom panel rather than a modal: it
         // is a picker, and the terminal behind it is the context for choosing.
-        if self.cmd_sheet.open {
+        if self.surfaces.is(Surface::CmdSheet) {
             let colors = self.colors;
             egui::TopBottomPanel::bottom("cmd_sheet").show(ctx, |ui| {
                 if let Some(a) = voiceterm_egui::cmd_sheet::cmd_sheet_ui(
@@ -899,14 +906,18 @@ impl eframe::App for VoicetermApp {
                         // one just before something went wrong.
                         A::Drop(cmd) => {
                             self.pty_out.extend_from_slice(cmd.as_bytes());
-                            self.cmd_sheet.close();
+                            self.surfaces.close();
+                            self.cmd_sheet.close(); // clears the in-flight drag
                         }
                         A::Save(cmd) => {
                             // Marked in the sheet so a second drag on the same
                             // card does not offer to star it again.
                             self.cmd_sheet.mark_saved(&cmd);
                         }
-                        A::Dismiss => self.cmd_sheet.close(),
+                        A::Dismiss => {
+                            self.surfaces.close();
+                            self.cmd_sheet.close(); // clears the in-flight drag
+                        }
                     }
                 }
             });
@@ -992,7 +1003,7 @@ impl eframe::App for VoicetermApp {
         // THE WORKSPACES PAGE, as a side panel. Rows come from the sidebar's
         // real session list and the live tabs from the real workspace — a
         // page fed demo rows would sort and filter convincingly over nothing.
-        if self.workspaces_open {
+        if self.surfaces.is(Surface::Workspaces) {
             use voiceterm_egui::workspaces_view as wv;
             let now_ms = (ctx.input(|i| i.time) * 1000.0) as u64;
             let rows: Vec<wv::WorkspaceRow> = self.sidebar.sessions.iter()
@@ -1043,7 +1054,7 @@ impl eframe::App for VoicetermApp {
                             wv::age_label(now_ms, r.updated_ms))).size(11.0));
                     });
                 }
-                if ui.small_button("close").clicked() { self.workspaces_open = false; }
+                if ui.small_button("close").clicked() { self.surfaces.close(); }
             });
         }
 
@@ -1096,16 +1107,17 @@ impl eframe::App for VoicetermApp {
                 }
                 // the 🏠 chip opens favorites (QML: home icon in the toolbar)
                 if ui.button("\u{1F3E0}").clicked() {
-                    self.favorites_open = !self.favorites_open;
+                    self.surfaces.toggle(Surface::Favorites);
                 }
                 // the 📦 chip opens the missing-package sidebar
                 if ui.button("\u{1F4E6}").clicked() {
-                    self.missing_pkg_open = !self.missing_pkg_open;
+                    self.surfaces.toggle(Surface::MissingPkg);
                 }
                 // the ⏱ chip opens the touch command history (QML cmdSheet)
                 if ui.button("\u{23F1}").clicked() {
-                    if self.cmd_sheet.open {
-                        self.cmd_sheet.close();
+                    if self.surfaces.is(Surface::CmdSheet) {
+                        self.surfaces.close();
+                        self.cmd_sheet.close(); // clears the in-flight drag
                     } else {
                         // RANKED AT OPEN, not held live: recall scores recency
                         // against frequency, so a list built once at startup
@@ -1131,11 +1143,12 @@ impl eframe::App for VoicetermApp {
                         // which is what a history sheet opens on.
                         let hits = recall::recall("", &items, now, 40);
                         self.cmd_sheet.open_with(hits);
+                        self.surfaces.open(Surface::CmdSheet);
                     }
                 }
                 // the 📜 chip toggles the blocks drawer (QML blocksDrawer.open())
                 if ui.button("\u{1F4DC}").clicked() {
-                    self.blocks_open = !self.blocks_open;
+                    self.surfaces.toggle(Surface::Blocks);
                 }
                 // hold the palette chip to show all vibes (the settings screenshot's theme grid)
                 let theme_host = ui.button("\u{1F3A8}");
@@ -1421,13 +1434,13 @@ impl eframe::App for VoicetermApp {
         }  // if show_chrome — the keycap and gesture rows
 
         // the settings screen (QML settings page) as a right panel; edits persist + re-apply live
-        if self.settings_open {
+        if self.surfaces.is(Surface::Settings) {
             egui::SidePanel::right("settings").resizable(true).default_width(300.0).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Settings");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("\u{2715}").clicked() {
-                            self.settings_open = false;
+                            self.surfaces.close();
                         }
                     });
                 });
@@ -1445,13 +1458,13 @@ impl eframe::App for VoicetermApp {
         }
 
         // the blocks drawer slides in at the left edge (QML Drawer, LeftEdge)
-        if self.blocks_open {
+        if self.surfaces.is(Surface::Blocks) {
             egui::SidePanel::left("blocks-drawer").resizable(true).default_width(340.0).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Blocks");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("\u{2715}").clicked() {
-                            self.blocks_open = false;
+                            self.surfaces.close();
                         }
                     });
                 });
@@ -1671,9 +1684,9 @@ impl eframe::App for VoicetermApp {
                             // The workspaces page. The sidebar's Graph action was
                             // a no-op with a TODO; this is the page the Qt app
                             // puts behind it.
-                            self.workspaces_open = !self.workspaces_open;
+                            self.surfaces.toggle(Surface::Workspaces);
                         }
-                        SidebarAction::Settings => self.settings_open = !self.settings_open,
+                        SidebarAction::Settings => self.surfaces.toggle(Surface::Settings),
                     }
                 }
             });
@@ -1766,11 +1779,11 @@ impl eframe::App for VoicetermApp {
         // palette" — the eleven-tab switcher's replacement, and the reason the
         // rail only needs to carry tabs.
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
-            self.palette_open = !self.palette_open;
+            self.surfaces.toggle(Surface::Palette);
             self.palette_query.clear();
             self.palette_sel = 0;
         }
-        if self.palette_open {
+        if self.surfaces.is(Surface::Palette) {
             self.palette_ui(ctx);
         }
 
@@ -3296,7 +3309,6 @@ fn main() -> eframe::Result<()> {
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
                 blocks: blocks,
-                blocks_open: false,
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 view: CentralView::Terminal,
@@ -3321,8 +3333,6 @@ fn main() -> eframe::Result<()> {
                 pending_confirm: None,
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
-                missing_pkg_open: false,
-                favorites_open: false,
                 last_memlog_s: 0.0,
                 peer: None,
                 deck: Default::default(),
@@ -3346,14 +3356,12 @@ fn main() -> eframe::Result<()> {
                 // thumb expects it on every app in the fleet.
                 tab_swipe: uikit_egui::GestureLayer::horizontal_page(320.0),
                 walk: Default::default(),
-                palette_open: false,
+                surfaces: Surfaces::default(),
                 palette_query: String::new(),
                 palette_sel: 0,
-                workspaces_open: false,
                 workspaces_filter: String::new(),
                 bar_state: Default::default(),
                 graph_source: String::new(),
-                settings_open: false,
             }))
         }),
     )
