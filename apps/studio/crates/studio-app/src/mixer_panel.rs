@@ -56,6 +56,16 @@ pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
 }
 
 pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
+    // The map explains what the rows below edit: the whole graph at once,
+    // tracks → busses → master, sends dashed. Collapsed state is egui's
+    // own; default open, because 'where does my signal go' is the first
+    // question this panel gets asked.
+    egui::CollapsingHeader::new("routing map").default_open(true).show(ui, |ui| {
+        egui::ScrollArea::horizontal().id_salt("routing-map").show(ui, |ui| {
+            studio_egui::routing::routing_map(ui, &s.session.doc.project, c);
+        });
+    });
+    ui.separator();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| show_inner(ui, s, c));

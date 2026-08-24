@@ -1357,3 +1357,38 @@ writes NO partial file and keeps the files already finished. The decision
 layer (`export::plan_jobs`/`plan_rack_jobs`) is pure and tested headless;
 the end-to-end tests export real files, decode the opus back through this
 repo's own decoder, and pin that a cancelled run leaves nothing behind.
+
+
+**Saves have history now.** The `.studio` file already carried everything a
+session is — snapshot ops (mixer busses, chains, sends, automation), the
+rack (channels, patterns, rolls), optional undo history — and its folder
+already moved as a unit. `project_dir` makes that folder a git repository:
+every Ctrl+S commits (identity supplied inline, so a machine that never ran
+`git config` still saves), `meta.toml` lands beside the file (name, bpm,
+counts — the greppable card catalogue), and "the mix from Tuesday" is
+`file_at(commit, "project.studio")`, read without touching the working
+tree. An unchanged save is `Ok(None)` — a fact, not an error — and a
+missing git binary demotes to a status note, never a lost save.
+`.gitattributes` marks compressed media `-delta`: the deltas do not exist,
+and the real compression rule stays the asset store's (never store PCM).
+For media that outgrows git — video — `MediaMode::External` gitignores
+`media/` and commits a manifest instead, so every version still says what
+it needs while the bytes live in a content-addressed store: `apps/gitmind`'s
+(AV1 transcode, near-dup chunk linking — its `MEDIA.md`) is the intended
+tenant of that seam, by path rather than by a cross-app crate dependency.
+
+**The workbench layout.** Four full-screen tabs remain the phone's layout;
+the desktop gets "workbench": the timeline (inspector, arrangement,
+automation strip) stays on screen while Rack / Program / Mixer live in a
+resizable strip below it, sharing the SAME panel state as the tabs so
+switching layouts never loses your place.
+
+**The routing map.** The Mixer's rows are the right place to CHANGE routing
+and a hopeless place to READ it — a graph question answered one dropdown at
+a time. The map draws the whole graph at once: tracks left, busses in
+columns by depth (deepest first, so left→right follows the signal), master
+right; main routes solid, sends dashed (amber = pre-fader); an unrouted
+track's implicit master feed drawn explicitly, because a default nobody can
+see is most of why routing reads as confusing. Read-only on purpose: the
+map explains, the rows edit. Layout is pure and pinned, including that a
+foreign file's cycle terminates instead of hanging the frame.

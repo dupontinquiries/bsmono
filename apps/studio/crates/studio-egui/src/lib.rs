@@ -21,6 +21,7 @@ pub mod spectrum;
 pub mod auto;
 pub mod grid;
 pub mod roll;
+pub mod routing;
 pub mod lanes;
 
 /// Time-range selection — the audio editor's unit, distinct from clip picking.

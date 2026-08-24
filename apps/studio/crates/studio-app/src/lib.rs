@@ -22,6 +22,7 @@ pub mod library;
 pub mod midi;
 pub mod mixer_panel;
 pub mod program_panel;
+pub mod project_dir;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -99,6 +100,11 @@ pub struct Studio {
     /// The strip's point mid-drag — ghost until release, ops on release,
     /// the fader rule.
     pub auto_drag: Option<studio_egui::auto::PointDrag>,
+    /// Workbench layout: the timeline stays on screen with the Rack /
+    /// Program / Mixer in a resizable strip below it, instead of four
+    /// full-screen tabs. The tabs remain the phone's layout; this is the
+    /// desktop's "shown together".
+    pub combined: bool,
     /// The bus faders' twin of `mixer_drag`.
     pub bus_drag: Option<(studio_core::BusId, f32)>,
     /// Motions (the Helix keymap) or Playing (the keyboard is a piano).
@@ -144,6 +150,7 @@ impl Studio {
             roll_drag: None,
             auto_target: None,
             auto_drag: None,
+            combined: false,
             bus_drag: None,
             input_mode: Default::default(),
             octave: 0,
@@ -1259,8 +1266,39 @@ impl eframe::App for App {
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
                 {
                     let path = self.project_path.clone();
-                    let _ = self.studio.save_to(&path);
+                    if self.studio.save_to(&path).is_ok() {
+                        // The save happened; history is the extra. A missing
+                        // git binary demotes to a note, never a lost save.
+                        let dir = path.parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let p = &self.studio.session.doc.project;
+                        let meta = project_dir::Meta {
+                            name: p.name.clone(),
+                            bpm: self.studio.rack.tempo_bpm,
+                            tracks: p.tracks.len(),
+                            clips: p.clips.len(),
+                            busses: p.busses.len(),
+                            patterns: self.studio.rack.patterns.len(),
+                            channels: self.studio.rack.channels.len(),
+                        };
+                        match project_dir::save_versioned(
+                            &dir, &meta, project_dir::MediaMode::Committed, "save") {
+                            Ok(Some(id)) => self.studio.status =
+                                format!("{} — commit {id}", self.studio.status),
+                            Ok(None) => {}
+                            Err(e) => self.studio.status =
+                                format!("{} (history skipped: {})",
+                                        self.studio.status, e.lines().next().unwrap_or("git error")),
+                        }
+                    }
                 }
+                let mut combined = self.studio.combined;
+                if ui.add(egui::Button::selectable(combined, "workbench"))
+                    .on_hover_text("timeline above, rack/program/mixer below — instead of tabs")
+                    .clicked() { combined = !combined; }
+                self.studio.combined = combined;
                 if ui.button("export…").clicked() {
                     self.export_dialog = Some(export::Plan::default());
                     self.export_note.clear();
@@ -1593,8 +1631,35 @@ impl eframe::App for App {
             }
         }
 
+        if self.studio.combined {
+            egui::TopBottomPanel::bottom("workbench").resizable(true)
+                .default_height(300.0).show(ctx, |ui| {
+                    // Which tool sits in the strip is the SAME panel state
+                    // the tab layout uses, so switching layouts never loses
+                    // your place; Timeline just isn't a strip tool — the
+                    // timeline is the whole point of the top half.
+                    let mut tab = match self.studio.panel {
+                        Panel::Timeline => Panel::Rack,
+                        p => p,
+                    };
+                    ui.horizontal(|ui| {
+                        for p in [Panel::Rack, Panel::Program, Panel::Mixer] {
+                            if ui.add(egui::Button::selectable(tab == p, p.label())).clicked() {
+                                tab = p;
+                            }
+                        }
+                    });
+                    self.studio.panel = tab;
+                    match tab {
+                        Panel::Rack => rack_panel::show(ui, &mut self.studio, &colors, playhead_col),
+                        Panel::Program => program_panel::show(ui, &mut self.studio, &colors, playhead_col),
+                        Panel::Mixer => mixer_panel::show(ui, &mut self.studio, &colors),
+                        Panel::Timeline => {}
+                    }
+                });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
-            match self.studio.panel {
+            match if self.studio.combined { Panel::Timeline } else { self.studio.panel } {
                 Panel::Rack => {
                     rack_panel::show(ui, &mut self.studio, &colors, playhead_col);
                 }
