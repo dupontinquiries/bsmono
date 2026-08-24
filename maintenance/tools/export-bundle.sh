@@ -10,8 +10,14 @@
 # usage:  ./export-bundle.sh <summary-slug> [repo]
 #   e.g.  ./export-bundle.sh trap-merge
 #         -> /mnt/user-data/outputs/c9-001-trap-merge.bundle
+#         SERIES=c12unified ./export-bundle.sh trap-merge
+#         -> /mnt/user-data/outputs/c12unified-001-trap-merge.bundle
 #
-# NNN auto-increments from the highest c9-NNN already in the output dir.
+# NNN auto-increments from the highest <SERIES>-NNN already in the output dir,
+# so each series numbers independently. SERIES defaults to c9 for continuity
+# with CLAUDE.md §9 and is an ENV VAR, not a hardcoded prefix — worth saying
+# out loud because a c12 session read the default as a hardcoded one, exported
+# a c9-NNN file and renamed it by hand.
 set -euo pipefail
 
 SUMMARY="${1:?usage: export-bundle.sh <summary-slug> [repo]}"
