@@ -1917,6 +1917,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "netview"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3441,6 +3449,7 @@ dependencies = [
  "log",
  "nalgebra-glm",
  "netcode",
+ "netview",
  "noise",
  "ogg 0.9.2",
  "parking_lot",

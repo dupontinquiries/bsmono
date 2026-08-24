@@ -5,6 +5,12 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
+# The headless spectator (src/bin/unendlich-netview.rs) serves sim snapshots
+# through the shared netview kit. The bin is auto-discovered, so this dep
+# missing broke EVERY default `cargo check` of the engine — the r-radar-F
+# orphan fix declared sim::netview but nobody added the crate the bin's
+# `use netview::serve` needs. std-only, so it is free.
+netview = { path = "../../../../shared/netview" }
 rodio = { version = "0.19", optional = true }  # spatial music playback; only built with --features audio
 audiopus = { version = "0.2", optional = true }  # opus decode (libopus); audio feature only
 ogg = { version = "0.9", optional = true }  # ogg demux for ogg-opus; audio feature only
