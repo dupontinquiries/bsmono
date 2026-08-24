@@ -484,7 +484,7 @@ mod drafter_against_the_real_engine {
             4, 4, crate::SpecPrefill::Chunked(16), &mut a, &mut run);
         let cache = run.cache.expect("the run must hand its cache back or reuse cannot be wired");
         let seeded = gpu.speculative_generate_drafter_with(&m, &mut PromptLookup { ngram: 2 }, &prompt,
-            10, 4, crate::SpecPrefill::Seeded { src: &cache, len: 24 }, &mut b);
+            10, 4, crate::SpecPrefill::Seeded { src: &cache, len: 24, chunk: 16 }, &mut b);
         let mut c = SpecStats::default();
         let fresh = gpu.speculative_generate_drafter_with(&m, &mut PromptLookup { ngram: 2 }, &prompt,
             10, 4, crate::SpecPrefill::Chunked(16), &mut c);

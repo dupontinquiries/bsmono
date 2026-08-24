@@ -1086,7 +1086,7 @@ names which)",
                         crate::diag!("wgpu-engine: [{}] speculative prefix reuse — {n} of {} prompt \
 tokens seeded from the previous speculative turn, {} to prefill",
                             self.name, prompt_ids.len(), prompt_ids.len() - n);
-                        gpu_kernels::SpecPrefill::Seeded { src: c, len: n }
+                        gpu_kernels::SpecPrefill::Seeded { src: c, len: n, chunk }
                     }
                     None => {
                         crate::diag!("wgpu-engine: [{}] speculative prefill — {} prompt tokens, chunk \

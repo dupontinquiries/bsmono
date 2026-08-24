@@ -9,7 +9,9 @@
 //!
 //! Formula, straight from Meta's reference (`llama-models/models/llama4/model.py`):
 //!
-//!     attn_scale(pos) = log( floor((pos + 1) / floor_scale) + 1 ) * attn_scale + 1
+//! ```text
+//! attn_scale(pos) = log( floor((pos + 1) / floor_scale) + 1 ) * attn_scale + 1
+//! ```
 //!
 //! with defaults `floor_scale = 8192`, `attn_scale = 0.1`. It's the identity (1.0) until `pos+1` reaches
 //! `floor_scale`, then grows logarithmically — so short contexts are unaffected and only long ones get the

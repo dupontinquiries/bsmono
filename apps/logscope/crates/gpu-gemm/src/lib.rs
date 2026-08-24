@@ -888,7 +888,9 @@ pub fn dims_cache_misses() -> u64 { DIMS_MISSES.load(std::sync::atomic::Ordering
 /// and a global pool hands a dead one to the next device — which the test suite
 /// caught immediately, because it builds a Gpu per test:
 ///
-///     Buffer[Id(1,1)] is no longer alive
+/// ```text
+/// Buffer[Id(1,1)] is no longer alive
+/// ```
 ///
 /// In production there is one device, so this would have sat quiet until the
 /// first device loss or OOM recovery recreated it, and then failed inside an
@@ -7573,6 +7575,20 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// identical to `prefill_batched` (each block attends causally to the cache the prior blocks
     /// filled). Only the final block's last row is projected, matching `prefill_batched`.
     pub fn prefill_chunked(&self, m: &Model, c: &KvCache, prompt: &[u32], chunk: usize) -> Vec<f32> {
+        self.prefill_chunked_from(m, c, prompt, 0, chunk)
+    }
+
+    /// As `prefill_chunked`, but the tokens begin at sequence position `first_pos` —
+    /// the KV rows below `first_pos` are already in `c` (a prefix-tree hit, a
+    /// speculative seed). This is what the spec `Seeded` prefill needed and did
+    /// not have: it ran its whole divergent suffix through `verify_forward`,
+    /// which materialises `s x vocab` logits, so a 4882-token suffix on a
+    /// 128256-vocab model asked wgpu for a 2.50 GB buffer — over the 2^31-1
+    /// device max — and kept 513 KB of it (the last row). The invalid buffer
+    /// then reached `get_mapped_range`, which is the panic in the field
+    /// report. Chunking bounds every allocation and projects ONLY the last
+    /// row, exactly as first-turn prefill always has.
+    pub fn prefill_chunked_from(&self, m: &Model, c: &KvCache, prompt: &[u32], first_pos: usize, chunk: usize) -> Vec<f32> {
         self.activate_model(m);
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
@@ -7609,7 +7625,7 @@ prompt tokenises fine and then indexes past the embedding table.", m.embed.len()
             let mut x = self.upload(&xh, s, m.d);
             for li in 0..m.n_layers {
                 x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
-                                           start, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+                                           first_pos + start, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
             }
             if end == t {
                 let xn = self.rmsnorm_t(&x, &m.out_norm, s, m.d, m.eps);
@@ -13428,7 +13444,10 @@ pub enum SpecPrefill<'a> {
     /// 14.7 s. Against 39 output tokens that is 8.2 tok/s with reuse and 2.1 without — and ordinary
     /// non-speculative streaming, which reuses, gets 6.0. The drafter's 1.49x cannot pay for a
     /// thrown-away prefix cache.
-    Seeded { src: &'a KvCache, len: usize },
+    /// `chunk` is the caller's streaming chunk rule — the same "one helper owns
+    /// the tuning rule" reasoning as `Chunked`; the suffix after a seed can be
+    /// thousands of tokens and MUST be chunked (see prefill_chunked_from).
+    Seeded { src: &'a KvCache, len: usize, chunk: usize },
 }
 
 /// One independent generation session: its own KV cache, stream position and RNG,
@@ -16166,6 +16185,19 @@ like a bad model rather than a wiring bug.");
         self.activate_model(m);
         let s = tokens.len();
         if s == 0 { return Vec::new(); }
+        // verify_forward materialises s x vocab logits BY DESIGN (speculative
+        // verification wants every drafted position). That design has a size:
+        // past the device buffer max the allocation fails "non-fatally", the
+        // invalid buffer reaches get_mapped_range, and THAT one is fatal — the
+        // field crash. Long suffixes belong to prefill_chunked_from, which
+        // projects only the last row; this assert turns the wrong call into a
+        // one-line diagnosis at the call site instead of a panic in wgpu.
+        let need = (s as u64) * (m.vocab as u64) * 4;
+        let cap = self.device.limits().max_buffer_size;
+        assert!(need <= cap,
+            "verify_forward on {s} tokens x {} vocab needs a {need}-byte logits buffer; this \
+device caps buffers at {cap}. A suffix this long is a PREFILL, not a verification — call \
+prefill_chunked_from (it keeps only the last row).", m.vocab);
         let mut xh = Vec::with_capacity(s * m.d);
         for &id in tokens { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
         let mut x = self.upload(&xh, s, m.d);
@@ -16254,7 +16286,7 @@ like a bad model rather than a wiring bug.");
             // already owns that rule and the codebase's own note on it is that two copies of a
             // tuning rule is how they drift.
             SpecPrefill::Chunked(chunk) => { prev = self.prefill_chunked(target, &tc, prompt, chunk.max(1)); }
-            SpecPrefill::Seeded { src, len } => {
+            SpecPrefill::Seeded { src, len, chunk } => {
                 // Same two steps as the streaming reuse path: copy the shared rows, then run the
                 // divergent suffix through the BATCHED kernel rather than per-token decode. The
                 // suffix must be batched for the reason that path already documents — per-token and
@@ -16266,8 +16298,12 @@ like a bad model rather than a wiring bug.");
                     self.write_rows(&tc.v[li], &src.v[li], 0, len, kv);
                 }
                 if len < prompt.len() {
-                    let all = self.verify_forward(target, &tc, &prompt[len..], len);
-                    prev = all[all.len() - target.vocab..].to_vec();
+                    // Chunked, not verify_forward: the suffix after a seed can be
+                    // thousands of tokens, and verify_forward's s x vocab logits
+                    // do not fit a device buffer at that length (the 2.50 GB
+                    // field crash: 4882 x 128256 x 4). The chunk is the CALLER's
+                    // streaming rule, carried on the variant like Chunked's.
+                    prev = self.prefill_chunked_from(target, &tc, &prompt[len..], len, chunk.max(1));
                 } else {
                     // The whole prompt was already in the seed; re-run the last token to obtain the
                     // logits it implies, since the seed carries KV and not a distribution.
@@ -21423,5 +21459,88 @@ mod row_grid_tests {
             let cells = x as u64 * y as u64;
             assert!(cells < rows as u64 + 65535);
         }
+    }
+}
+
+#[cfg(test)]
+mod seeded_suffix_tests {
+    use super::*;
+
+    /// The 2.50 GB field crash, at test scale: a seeded speculative prefill
+    /// ran its whole divergent suffix through `verify_forward`, which
+    /// materialises `s x vocab` logits, and a 4882-token suffix blew the
+    /// device buffer cap. The fix routes the suffix through
+    /// `prefill_chunked_from`, which projects only the last row — and on a
+    /// model small enough for BOTH paths to run, they must produce the same
+    /// last-row logits from the same seed. That equality is the whole
+    /// correctness claim: same KV writes at the same positions, same final
+    /// distribution, only the allocation differs.
+    #[test]
+    fn a_chunked_suffix_from_a_seed_matches_verify_forward() {
+        let gpu = Gpu::new();
+        let bytes = match crate::testfix::read("/tmp/tiny-qwen2.gguf") { Some(b) => b, None => return };
+        let m = gpu.load_gguf_opt(&bytes, false).expect("tiny-qwen2 loads");
+        let prompt: Vec<u32> = (0..24u32).map(|i| 1 + (i * 7) % 100).collect();
+        let seed_len = 9usize;
+
+        // The seed: prefill the shared prefix once, as the anchor turn would.
+        let seed = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+        let _ = gpu.prefill_chunked(&m, &seed, &prompt[..seed_len], 5);
+
+        // Path A (the old one, safe at this size): verify_forward over the
+        // suffix, keeping the last row.
+        let a_cache = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+        for li in 0..m.n_layers {
+            gpu.write_rows(&a_cache.k[li], &seed.k[li], 0, seed_len, m.kv_dim());
+            gpu.write_rows(&a_cache.v[li], &seed.v[li], 0, seed_len, m.kv_dim());
+        }
+        let all = gpu.verify_forward(&m, &a_cache, &prompt[seed_len..], seed_len);
+        let a_last = &all[all.len() - m.vocab..];
+
+        // Path B (the fix): the same suffix through prefill_chunked_from, with
+        // a chunk small enough to force several chunks over this suffix.
+        let b_cache = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+        for li in 0..m.n_layers {
+            gpu.write_rows(&b_cache.k[li], &seed.k[li], 0, seed_len, m.kv_dim());
+            gpu.write_rows(&b_cache.v[li], &seed.v[li], 0, seed_len, m.kv_dim());
+        }
+        let b_last = gpu.prefill_chunked_from(&m, &b_cache, &prompt[seed_len..], seed_len, 4);
+
+        assert_eq!(a_last.len(), b_last.len(), "both paths produce one vocab row");
+        let mut max_dev = 0.0f32;
+        for (x, y) in a_last.iter().zip(&b_last) {
+            max_dev = max_dev.max((x - y).abs());
+        }
+        assert!(max_dev < 1e-3,
+            "chunked-from diverges from verify_forward by {max_dev} — same seed, same \
+             suffix, same positions must give the same final logits");
+
+        // The offset claim, proven where it cannot wash out: the KV rows.
+        // A first version of this test asserted the LOGITS of a zero-offset
+        // run diverge, and they did not (0.00016) — on this random-weight
+        // fixture the logits barely feel position at all, so that control
+        // tested the fixture, not the code. RoPE'd KEYS are position-
+        // dependent by construction: chunked-from must write what
+        // verify_forward writes at the same offset, and must NOT write what
+        // a zero-offset run writes.
+        let a_rows = gpu.download(&a_cache.k[0]);
+        let b_rows = gpu.download(&b_cache.k[0]);
+        let suffix_lo = seed_len * m.kv_dim();
+        let suffix_hi = prompt.len() * m.kv_dim();
+        let mut same_dev = 0.0f32;
+        for i in suffix_lo..suffix_hi {
+            same_dev = same_dev.max((a_rows[i] - b_rows[i]).abs());
+        }
+        assert!(same_dev < 1e-4,
+            "chunked-from wrote different K rows than verify_forward at the same offset (max dev {same_dev})");
+        let c_cache = gpu.new_cache(m.n_layers, 64, m.kv_dim());
+        let _ = gpu.prefill_chunked_from(&m, &c_cache, &prompt[seed_len..], 0, 4);
+        let c_rows = gpu.download(&c_cache.k[0]);
+        let mut cross_dev = 0.0f32;
+        for (i, j) in (suffix_lo..suffix_hi).zip(0..(prompt.len() - seed_len) * m.kv_dim()) {
+            cross_dev = cross_dev.max((a_rows[i] - c_rows[j]).abs());
+        }
+        assert!(cross_dev > 1e-2,
+            "a zero-offset suffix wrote the SAME K rows as the seeded-offset one (max dev {cross_dev}) — the position offset is being ignored in RoPE");
     }
 }
