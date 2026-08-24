@@ -46,11 +46,11 @@ edits exactly reversible, which floats are not.
 
 | crate | what it is | tests |
 |---|---|---|
-| `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
+| `studio-core` | timebase, tracks, clips, sources, effects, **automation lanes**, `Op`, `History` | 39 |
 | `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 93 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **streaming render** + **block-backed edit sequences** + **destructive editing** | 83 |
-| `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
+| `studio-live` | pattern rack, **piano roll**, synths (incl. beatspace), recording, transport | 69 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
 | `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
@@ -1288,3 +1288,43 @@ picks; the amount and asymmetry move instead. Unvoiced stretches HOLD the
 register so a drum hit between two sung notes cannot swing the character,
 and `detectors()` exposes both numbers, because an adaptive effect whose
 decisions you cannot see is indistinguishable from a broken one.
+
+
+**The Program panel is the piano roll.** FL's grammar splits a channel's
+content in two — the step grid for hits, the roll for held notes, chords
+and slides — and the Rack tab only ever had the first. `Pattern` gains
+`rolls`: per-channel `Note` lists (key offset from the channel's own pitch,
+start, length, velocity, slide), serde-defaulted so a pre-roll rack loads
+with the empty roll it effectively had. A roll note renders through the
+SAME placement pass as a hit: swing moves it by the off-step rule, choke
+groups cut it, the bounce and the audition loop render it, and the
+whole-rack LWW sync carries it — a note is more pattern, not a second
+engine. Its length is its gate (cut with the choke fade; a short-decay 808
+under a long note simply ends earlier), and slide is a note property
+gliding from the previous roll note, which is where FL puts it. Samplers
+pitch now too: with no pitch field for `apply_step_mod` to offset, the
+renderer repitches the RENDERED voice — which un-no-ops the grid's Tune
+lane on sample channels in the same breath and makes a one-shot chop a
+melodic instrument. Wire v9 carries the roll. The panel itself follows
+`grid`'s contract: pure geometry (row/key mapping across negative offsets,
+body-vs-edge hit testing) returning edits as values; drag draws a note out
+in one gesture, click removes, the right edge resizes, right-click toggles
+slide. Velocity editing wants a lane, named rather than faked with a
+pointer that has no pressure axis.
+
+**Automation — the ride, as ops.** `Project` gains lanes: points per
+`AutoTarget` (track gain and bus gain first; the enum is where a
+clip-gain or effect-parameter target lands later), edited by
+`SetAutoPoint`/`RemoveAutoPoint` in the house op shape — absolute
+(time, value) so peers converge per-point, a refusal when a removal has
+nothing to restore, locked tracks refusing their lane the way they refuse
+their fader. A lane RIDES its fader (multiplied, never substituted —
+pinned at 0.5 × 0.5 = 0.125), and a project with no lanes renders
+bit-identically to a pre-automation one. `mixdown` evaluates per sample
+at the tick its clip loop already computes; the bus fold rides per
+interleaved frame so a ramp cannot tilt the stereo image; the streaming
+engine inherits both through the shared path. A file saves lanes because
+a file is the ops that rebuild the project — `snapshot()` emits each
+lane's points before the relock, tested with a locked track's lane on
+purpose. Wire v10. Named, not built: the timeline view that draws and
+drags these points.
