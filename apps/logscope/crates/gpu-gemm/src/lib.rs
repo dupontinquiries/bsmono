@@ -591,7 +591,7 @@ impl SubmitCauseSnapshot {
 /// that the fixes had already closed.
 pub fn run_verdict_delta_shares(
     no_frame: u64, download: u64, passes: u64, gpu_passes: u64, dispatches: u64,
-    tokens: u64, wall_s: f64, sync_s: f64,
+    tokens: u64, wall_s: f64, sync_s: f64, moe: bool,
 ) -> (String, Option<String>) {
     // gpu_passes/dispatches are DELTAS supplied by the caller against its own run-start snapshot —
     // loading the statics here would carry a lifetime total into a per-generation verdict, the
@@ -600,7 +600,7 @@ pub fn run_verdict_delta_shares(
         submits: no_frame + download + passes,
         no_frame, download, passes,
         gpu_passes, dispatches,
-        tokens, wall_s, sync_s,
+        tokens, wall_s, sync_s, moe,
     };
     (shape.headline(), shape.caveat())
 }
@@ -617,6 +617,10 @@ pub fn run_verdict(tokens: u64, wall_s: f64, sync_s: f64) -> (String, Option<Str
         // baseline to delta against, and both numbers share the same lifetime so their ratio holds.
         gpu_passes: GPU_PASSES_OPENED.load(Relaxed),
         dispatches: GPU_DISPATCHES.load(Relaxed),
+        // Process-wide entry: no model in scope, so it cannot claim MoE. The
+        // dense arm names a lever that exists either way, which is why false
+        // is the safe unknown.
+        moe: false,
         tokens, wall_s, sync_s,
     };
     (shape.headline(), shape.caveat())

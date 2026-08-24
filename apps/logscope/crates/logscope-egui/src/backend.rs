@@ -1759,7 +1759,10 @@ than none)", self.name),
                 gpu_kernels::GPU_PASSES_OPENED.load(AOrd::Relaxed).saturating_sub(gp0),
                 gpu_kernels::GPU_DISPATCHES.load(AOrd::Relaxed).saturating_sub(gd0));
             let (headline, caveat) = gpu_kernels::run_verdict_delta_shares(v_nf, v_dl, v_ps, v_gp, v_gd,
-                per as u64, secs as f64, sync_ms / 1000.0);
+                per as u64, secs as f64, sync_ms / 1000.0,
+                // the REAL answer, from the loaded model — the verdict's MoE arm
+                // asserted router logits on dense models before this was passed
+                self.model.moe_counts().is_some());
             crate::diag!("wgpu-engine: [{}] {headline}", self.name);
             if let Some(c) = caveat { crate::diag!("wgpu-engine: [{}] {c}", self.name); }
             // EXPERT RESIDENCY. These counters have been tracked and reported nowhere, so there has

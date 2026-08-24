@@ -913,6 +913,14 @@ pub struct RunShape {
     pub wall_s: f64,
     /// Aggregate CPU wait across threads. May exceed wall time; that is not an error.
     pub sync_s: f64,
+    /// Does this model route experts? The READBACK arm used to assert MoE
+    /// router logits UNCONDITIONALLY, so a dense run — which is what the c11
+    /// field logs were, Llama-3.2-1B and a dense Qwen3-14B — got told to
+    /// "compute every expert" on a model with no experts. That advice cannot
+    /// be acted on, and an unactionable lever is worse than none: it spends
+    /// the reader's session. `false` when unknown, which is the safe default
+    /// because the dense arm names a lever that exists either way.
+    pub moe: bool,
 }
 
 impl RunShape {
@@ -939,10 +947,22 @@ impl RunShape {
         let (share, what) = if nf >= dl && nf >= ps {
             (nf / total, "dispatches ran with NO FRAME OPEN, so each became its own submit. Something \
 takes the frame and does not restore it — `--frame-diag` names which pipeline")
+        } else if dl >= ps && self.moe {
+            (dl / total, "submits were READBACKS — on this MoE model, per-layer router logits going \
+to the CPU to choose experts; computing every expert instead removes them entirely when the stall \
+dominates")
         } else if dl >= ps {
-            (dl / total, "submits were READBACKS. On a MoE model these are per-layer router logits \
-going to the CPU to choose experts; computing every expert instead removes them entirely when the \
-stall dominates")
+            // DENSE. There are no router logits to blame, and the previous
+            // text blamed them anyway. On a dense decode the readbacks are the
+            // SAMPLING window: generate_kv_window_sampled downloads the deposit
+            // slots once per window of k, so readbacks fall as 1/k. A run
+            // reporting ~0.5 readbacks per token is therefore NOT running the
+            // k=4 window it logged — something is flushing mid-window, and
+            // that discrepancy is the thing to chase before any kernel work.
+            (dl / total, "submits were READBACKS on a DENSE model, so these are not router logits: \
+they are the sampling window's deposit-slot downloads, which fall as 1/k with LOGSCOPE_SAMPLE_WINDOW. \
+Compare readbacks-per-token against 1/k — if it is higher, the window is being flushed early and \
+that is the bug to find before tuning kernels")
         } else {
             // Names the concrete lever now that one exists. After both frame leaks were fixed this
             // became the dominant cause on a dense model, and "work cannot accumulate" described the
@@ -1001,7 +1021,7 @@ mod headline_tests {
 
     fn shape(nf: u64, dl: u64, ps: u64, tokens: u64, wall: f64, sync: f64) -> RunShape {
         RunShape { submits: nf + dl + ps, no_frame: nf, download: dl, passes: ps,
-                   gpu_passes: 0, dispatches: 0, tokens, wall_s: wall, sync_s: sync }
+                   gpu_passes: 0, dispatches: 0, tokens, wall_s: wall, sync_s: sync, moe: false }
     }
 
     #[test]
@@ -1016,9 +1036,24 @@ mod headline_tests {
 
     #[test]
     fn a_READBACK_dominated_run_names_the_dense_MoE_lever() {
-        let h = shape(100, 900, 50, 100, 10.0, 5.0).headline();
+        let mut moe = shape(100, 900, 50, 100, 10.0, 5.0);
+        moe.moe = true;
+        let h = moe.headline();
         assert!(h.contains("READBACKS"));
         assert!(h.contains("computing every expert"));
+    }
+
+    /// The c11 field bug: BOTH logged runs were dense (Llama-3.2-1B, a dense
+    /// Qwen3-14B) and both were told to compute every expert on a model with
+    /// no experts. An unactionable lever is worse than none — it spends the
+    /// reader's session — so the dense arm must name something that exists.
+    #[test]
+    fn a_dense_readback_run_is_not_told_to_compute_experts() {
+        let h = shape(100, 900, 50, 100, 10.0, 5.0).headline();
+        assert!(h.contains("READBACKS"), "{h}");
+        assert!(!h.contains("expert"), "dense run blamed on MoE routers: {h}");
+        assert!(h.contains("sampling window"), "{h}");
+        assert!(h.contains("1/k"), "the dense lever must be checkable by the reader: {h}");
     }
 
     #[test]
