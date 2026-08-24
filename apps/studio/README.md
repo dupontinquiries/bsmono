@@ -1545,3 +1545,20 @@ whoever insists and is nobody's default. A build without the opus feature
 falls to flac, bigger but never a hole. The archive's Master-level PCM
 fallback went the same way (v3): a bounce embeds as FLAC, byte-exact
 originals still byte-exact.
+
+
+**The breakout loop.** The pad's place in the workflow, made structural:
+start with a basic pattern, break the sound OUT to the pad, tune it,
+return the authored sound to the pattern. The classifier now proposes pad
+loadouts — "pad: load with 3 similar" in a sample's ⋯ menu, neighbours
+found in the sample's OWN directory by the same classifier (a format
+variant of the same sound is not a neighbour) — proposed, loaded only by
+the click. "⇐ channel" breaks the selected rack channel's sample onto the
+pad. And the return path closes the loop twice over: "⇒ replace" bounces
+at the device's fidelity rung and swaps the channel to the bounced FILE
+(the source of truth is the file, not the in-memory blend — what you hear
+later is what returned), while "⇒ layer" adds it as a new channel that
+INHERITS the source channel's steps and step-mods in every pattern, a
+copy not a link, so the layer plays in lockstep and then diverges freely
+— which is what developing the authored layers means. Every returned
+sound is also a library file: authorship accretes where the samples live.

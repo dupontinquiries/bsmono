@@ -776,6 +776,27 @@ impl Studio {
         }
     }
 
+    /// Add a channel that LAYERS channel `from`: same steps, same mods,
+    /// in every pattern, so the authored sound plays in lockstep with the
+    /// sound it was tuned from — the breakout loop's return path. The new
+    /// channel's row is a copy, not a link: editing the layer afterwards
+    /// diverges freely, which is what "develop the layers" means.
+    pub fn layer_channel(&mut self, from: usize, channel: studio_live::Channel) -> usize {
+        let ix = self.rack.add_channel(channel);
+        for p in &mut self.rack.patterns {
+            if let Some(row) = p.rows.get(from).copied() {
+                p.rows[ix] = row;
+            }
+            let inherited: Vec<_> = p.mods.iter()
+                .filter(|((ch, _), _)| *ch == from)
+                .map(|((_, step), m)| ((ix, *step), m.clone()))
+                .collect();
+            p.mods.extend(inherited);
+        }
+        self.loop_dirty = true;
+        ix
+    }
+
     pub fn key(&mut self, k: studio_egui::keys::Key) -> bool {
         use studio_egui::keys::{Action, Resolution};
         // In Playing mode the editing keymap is inert: `d` is a note, not a
@@ -1874,6 +1895,44 @@ impl eframe::App for App {
                 let pad_open = !self.morph.anchors.is_empty();
                 egui::CollapsingHeader::new("morph pad").default_open(pad_open)
                     .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Breakout FROM the pattern: the selected rack
+                            // channel's sound onto the pad.
+                            if ui.small_button("⇐ channel")
+                                .on_hover_text("load the selected rack channel's sample")
+                                .clicked() {
+                                let sel = self.studio.selected_channel;
+                                let src = self.studio.rack.channels.get(sel).and_then(|ch| {
+                                    if let studio_live::SynthKind::Sampler { source } = ch.kind {
+                                        self.audio.get(&source).cloned()
+                                            .map(|a| (ch.name.clone(), a))
+                                    } else { None }
+                                });
+                                match src {
+                                    Some((name, a)) => self.morph.push(name, a),
+                                    None => self.studio.status =
+                                        "the selected channel is not a sampler (or its audio is absent)".into(),
+                                }
+                            }
+                            // The return path: the tuned sound back INTO
+                            // the pattern — replacing the sound it came
+                            // from, or layered beside it with the same
+                            // steps. Both bounce to the library first, so
+                            // every authored sound is also a FILE.
+                            let ready = !self.morph.anchors.is_empty();
+                            if ui.add_enabled(ready, egui::Button::small(
+                                    egui::Button::new("⇒ replace")))
+                                .on_hover_text("bounce, then swap the selected channel to it")
+                                .clicked() {
+                                self.morph_return(false);
+                            }
+                            if ui.add_enabled(ready, egui::Button::small(
+                                    egui::Button::new("⇒ layer")))
+                                .on_hover_text("bounce, then add it as a channel with the same steps")
+                                .clicked() {
+                                self.morph_return(true);
+                            }
+                        });
                         match morph_pad::show(ui, &mut self.morph, &colors) {
                             Some(morph_pad::PadAction::Preview) => {
                                 let a = self.morph.blend();
@@ -1927,6 +1986,24 @@ impl eframe::App for App {
             let (path, to_rack) = match action {
                 library::LibraryAction::ToRack(p) => (p, true),
                 library::LibraryAction::ToTimeline(p) => (p, false),
+                library::LibraryAction::ToMorphSet(paths) => {
+                    self.morph.anchors.clear();
+                    let mut loaded = 0;
+                    for p in paths.iter().take(4) {
+                        if let Some(audio) = std::fs::read(p).ok().and_then(|raw| {
+                            let hint = p.extension().and_then(|e| e.to_str())
+                                .map(str::to_owned);
+                            studio_media::decode_bytes(raw, hint.as_deref()).ok()
+                        }) {
+                            let name = p.file_stem().and_then(|x| x.to_str())
+                                .unwrap_or("sound").to_owned();
+                            self.morph.push(name, audio);
+                            loaded += 1;
+                        }
+                    }
+                    self.studio.status = format!("morph pad loaded: {loaded} of a family");
+                    return;
+                }
                 library::LibraryAction::ToMorph(p) => {
                     match std::fs::read(&p).ok().and_then(|raw| {
                         let hint = p.extension().and_then(|e| e.to_str()).map(str::to_owned);
@@ -2323,6 +2400,70 @@ struct ArchiveUi {
 
 #[cfg(feature = "app")]
 impl App {
+    /// The breakout loop's return: bounce the pad's sound to the library
+    /// at the device's fidelity rung, decode THAT FILE back (the source of
+    /// truth is the bounce, not the in-memory blend — what you hear later
+    /// is what returned), then either swap the selected channel's sample
+    /// or add a layer channel inheriting its steps.
+    fn morph_return(&mut self, layer: bool) {
+        let path = match morph_pad::bounce(&self.library_root, &self.morph,
+                                           self.bounce_format) {
+            Ok(p) => p,
+            Err(e) => { self.studio.status = e; return; }
+        };
+        self.morph.last_bounce = Some(path.clone());
+        self.library_tree.refresh();
+        let decoded = std::fs::read(&path).ok().and_then(|raw| {
+            let hint = path.extension().and_then(|e| e.to_str()).map(str::to_owned);
+            studio_media::decode_bytes(raw.clone(), hint.as_deref()).ok()
+                .map(|a| (raw, a))
+        });
+        let Some((raw, audio)) = decoded else {
+            self.studio.status = format!("bounced {} but could not decode it back",
+                                         path.display());
+            return;
+        };
+        let name = path.file_stem().and_then(|x| x.to_str())
+            .unwrap_or("morph").to_owned();
+        let sel = self.studio.selected_channel;
+        if layer {
+            let id = self.studio.import_audio(&name, &path.display().to_string(), &audio);
+            // import_audio appended a channel with the new sound; move it
+            // into a LAYER of the breakout channel: same steps, then drop
+            // the plain appended one.
+            let appended = self.studio.rack.channels.len() - 1;
+            let ch = self.studio.rack.channels[appended].clone();
+            self.studio.rack.channels.truncate(appended);
+            for p in &mut self.studio.rack.patterns {
+                p.rows.truncate(self.studio.rack.channels.len());
+            }
+            let ix = self.studio.layer_channel(sel, ch);
+            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.audio.insert(id, audio);
+            self.studio.register_asset(id, &raw);
+            self.studio.status = format!(
+                "'{name}' layered as channel {} — same steps, yours to diverge", ix + 1);
+        } else {
+            let id = self.studio.import_audio(&name, &path.display().to_string(), &audio);
+            let appended = self.studio.rack.channels.len().saturating_sub(1);
+            if sel < appended {
+                self.studio.rack.channels[sel].kind =
+                    studio_live::SynthKind::Sampler { source: id };
+                self.studio.rack.channels[sel].name = name.clone();
+                self.studio.rack.channels.truncate(appended);
+                for p in &mut self.studio.rack.patterns {
+                    p.rows.truncate(self.studio.rack.channels.len());
+                }
+                self.studio.selected_channel = sel;
+                self.studio.loop_dirty = true;
+                self.studio.status = format!("channel {} is now '{name}'", sel + 1);
+            }
+            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.audio.insert(id, audio);
+            self.studio.register_asset(id, &raw);
+        }
+    }
+
     /// The save-archive popup: the fidelity slider, the credits/authorized
     /// collaborators, the per-device search paths — then the picker, then
     /// one file on disk that opens whole or refuses whole.
@@ -4263,5 +4404,33 @@ mod alignment_tests {
             assert!(hints.contains(ch),
                     "'{ch}' is intercepted but the clip tooltip never teaches it");
         }
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    #[test]
+    fn a_layer_inherits_steps_and_mods_and_then_diverges_freely() {
+        let mut s = Studio::demo();
+        let from = 0usize;
+        let steps_before = s.rack.patterns[0].rows[from];
+        assert_ne!(steps_before, 0, "the demo kick has steps to inherit");
+        s.rack.patterns[0].mods.insert((from, 2),
+            studio_live::StepMod { vel: 0.5, ..Default::default() });
+        let ix = s.layer_channel(from, studio_live::Channel {
+            name: "kick-tone".into(),
+            kind: s.rack.channels[from].kind.clone(),
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+        });
+        assert_eq!(s.rack.patterns[0].rows[ix], steps_before,
+                   "the layer fires in lockstep with its source");
+        assert_eq!(s.rack.patterns[0].mods.get(&(ix, 2)).map(|m| m.vel),
+                   Some(0.5), "step mods came along");
+        // Divergence is a copy's whole point.
+        s.rack.patterns[0].rows[ix] = 0b1;
+        assert_eq!(s.rack.patterns[0].rows[from], steps_before,
+                   "editing the layer never touches the source");
     }
 }

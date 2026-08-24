@@ -218,6 +218,24 @@ pub fn suggest(kind: SampleKind, rack: &studio_live::Rack,
     out
 }
 
+/// This sample's same-kind neighbours in ITS OWN directory — the pack's
+/// natural family ("Snare 1" beside "Snare 14"), up to `cap`, converter
+/// subdirs excluded because a format-variant of the SAME sound is not a
+/// neighbour. Feeds the pad-loadout suggestion: proposed, never loaded on
+/// the pad's own authority.
+pub fn similar_in_dir(path: &Path, cap: usize) -> Vec<PathBuf> {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else { return vec![] };
+    let kind = classify(&stem.to_string_lossy());
+    if kind == SampleKind::Unknown { return vec![]; }
+    scan_dir(dir).files.into_iter()
+        .filter(|e| e.path != *path)
+        .filter(|e| e.path.file_stem() != Some(stem)) // a variant is not a neighbour
+        .filter(|e| classify(&e.label) == kind)
+        .map(|e| e.path)
+        .take(cap)
+        .collect()
+}
+
 /// What the sidebar asked the shell to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibraryAction {
@@ -227,6 +245,9 @@ pub enum LibraryAction {
     ReplaceChannel(usize, PathBuf),
     /// Send this sample to the morph pad's next corner.
     ToMorph(PathBuf),
+    /// Load the pad WHOLE: this sample plus its proposed neighbours —
+    /// the breakout's opening move, taken only because it was clicked.
+    ToMorphSet(Vec<PathBuf>),
     ToNewTrackBus(PathBuf, Option<studio_core::BusId>),
 }
 
@@ -288,6 +309,15 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry,
             if ui.button("add to morph pad").clicked() {
                 *action = Some(LibraryAction::ToMorph(e.path.clone()));
                 ui.close();
+            }
+            let kin = similar_in_dir(&e.path, 3);
+            if !kin.is_empty() {
+                if ui.button(format!("pad: load with {} similar", kin.len())).clicked() {
+                    let mut set = vec![e.path.clone()];
+                    set.extend(kin);
+                    *action = Some(LibraryAction::ToMorphSet(set));
+                    ui.close();
+                }
             }
             let alts = variants(&e.path);
             if !alts.is_empty() {
@@ -464,6 +494,22 @@ mod tests {
         let s = suggest(SampleKind::Vox, &rack, &with_bus);
         assert!(!s.iter().any(|x| matches!(x.act, SuggestAct::ClipToBus(_))),
                 "a vocal is not offered a drum bus");
+    }
+
+    #[test]
+    fn neighbours_are_same_kind_same_dir_and_never_a_format_variant() {
+        let root = fixture();
+        let deep = root.join("zaytoven/808s & Kicks");
+        // Give the 808 real neighbours plus a decoy.
+        std::fs::write(deep.join("808 5.wav"), b"x").unwrap();
+        std::fs::write(deep.join("zaytoven_808_2.wav"), b"x").unwrap();
+        let kin = similar_in_dir(&deep.join("808 1 (LAYER WITH KICK 1).wav"), 3);
+        assert_eq!(kin.len(), 2, "the two 808s, not the kick: {kin:?}");
+        assert!(kin.iter().all(|p| classify(&p.to_string_lossy())
+                                   == SampleKind::Bass808));
+        assert!(!kin.iter().any(|p| p.to_string_lossy().contains("FFaudio")),
+                "a format variant of the same sound is not a neighbour");
+        assert!(similar_in_dir(&root.join("Read_Me.pdf"), 3).is_empty());
     }
 
     #[test]
