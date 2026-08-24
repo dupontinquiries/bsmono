@@ -310,3 +310,17 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
 - **C11-14e — `--- ` in prose false-positives no_patch_reason's diff branch**
   (a reply quoting an em-dash list could match). Harmless today (it only
   picks the wording of a note) but tighten if it ever gates behaviour.
+
+## 15. The allocation defect, closed as a class
+
+- **C11-15a — DONE**: verify_forward slices to fit (all rows, bounded
+  buffers); the ordinary streaming reuse path uses prefill_chunked_from.
+  The c11-013 guard is what caught the second site — keep that pattern:
+  a named assert at the allocation is how the next class gets found.
+- **C11-15b — retest `:ws` on a big repo with the 1B.** Expect: no cap line,
+  slices in the log, an answer. If a NEW shape appears, Gpu::alloc's guard
+  names it with the call site.
+- **C11-15c — the lesson, for the checklist**: when a fix is "this caller
+  should chunk", grep every caller of the primitive BEFORE committing. Two
+  sessions were spent on one defect because the first fix stopped at the
+  backtrace it was handed.
