@@ -66,6 +66,10 @@ egui    = "0.34"
 # arc-swap gives us lock-free reads on the hot path
 arc-swap = "1"
 
+# Device selection (which camera, which format) — the shared decision layer;
+# see src/source_plan.rs for why the desktop webcam gap existed.
+device-kit = { path = "../../../shared/device-kit" }
+
 # Error handling
 anyhow    = "1"
 
@@ -102,3 +106,4 @@ opt-level     = 3
 lto           = true
 codegen-units = 1
 strip         = true
+

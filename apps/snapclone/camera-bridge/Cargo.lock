@@ -523,6 +523,7 @@ dependencies = [
  "arc-swap",
  "base64",
  "clap",
+ "device-kit",
  "directories",
  "dotenvy",
  "ed25519-dalek",
@@ -876,6 +877,10 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "device-kit"
+version = "0.1.0"
 
 [[package]]
 name = "digest"

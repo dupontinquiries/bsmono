@@ -258,6 +258,11 @@ EXAMPLES:
 
 // ── Shared frame ──────────────────────────────────────────────────────────────
 
+#[path = "source_plan.rs"]
+mod source_plan;
+#[path = "capture.rs"]
+mod capture;
+
 struct CameraFrame {
     pixels: Vec<u8>,   // RGBA8 row-major
     width:  usize,
@@ -268,19 +273,7 @@ type SharedFrame = Arc<ArcSwap<Option<CameraFrame>>>;
 
 // ── GStreamer capture pipeline ────────────────────────────────────────────────
 
-fn build_pipeline(pw_node: &str, flip_method: Option<&str>) -> String {
-    let flip = match flip_method {
-        Some(m) => format!("videoflip method={m} ! "),
-        None    => String::new(),
-    };
-    format!(
-        "pipewiresrc target-object=\"{pw_node}\" ! \
-         videoconvert ! \
-         {flip}\
-         video/x-raw,format=RGBA ! \
-         appsink name=sink max-buffers=2 drop=true sync=false"
-    )
-}
+// build_pipeline moved into source_plan::pipewire_pipeline (one tail, two sources).
 
 /// Run a capture pipeline until `stop` is set or an error occurs.
 fn run_pipeline(
@@ -369,16 +362,33 @@ struct CaptureHandle {
 }
 
 impl CaptureHandle {
-    /// Spawn a new capture thread with the given pipeline.
-    fn spawn(pipeline_str: String, shared: SharedFrame) -> Self {
+    /// Spawn a capture thread that tries each candidate IN ORDER until one
+    /// plays. A candidate that fails to reach PLAYING (missing plugin, busy
+    /// device, absent node) is logged and the next is tried — which is the
+    /// whole desktop-webcam fix: the pipewire candidate fails fast on a
+    /// desktop and the v4l2 one behind it takes over. An exhausted list is
+    /// an error log, not a fabricated source.
+    fn spawn(candidates: Vec<source_plan::SourceCandidate>, shared: SharedFrame) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("gst-capture".into())
             .spawn(move || {
-                if let Err(e) = run_pipeline(&pipeline_str, shared, stop_clone) {
-                    error!("Capture thread error: {e}");
+                if candidates.is_empty() {
+                    error!("no camera source found: no libcamera pipewire nodes, no v4l2 capture devices");
+                    return;
                 }
+                for c in &candidates {
+                    info!("camera source: trying {} [{:?}]", c.label, c.kind);
+                    match run_pipeline(&c.pipeline, Arc::clone(&shared), Arc::clone(&stop_clone)) {
+                        Ok(()) => return, // ran until stop was requested
+                        Err(e) => warn!("camera source {} failed: {e}; trying next", c.label),
+                    }
+                    if stop_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                error!("every camera source candidate failed ({} tried)", candidates.len());
             })
             .expect("Failed to spawn capture thread");
         Self { stop, thread: Some(thread) }
@@ -444,8 +454,21 @@ impl CameraApp {
         } else {
             rotation.videoflip_method()
         };
-        let pipeline_str = build_pipeline(&config.pw_node, flip);
-        let capture = CaptureHandle::spawn(pipeline_str, Arc::clone(&shared));
+        // The plan replaces the single pipewire pipeline: the configured node
+        // (as an override) first, then probed libcamera nodes, then v4l2
+        // captures — which is what makes a desktop webcam exist at all here.
+        let v4l2_listing = std::process::Command::new("v4l2-ctl")
+            .arg("--list-devices").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let probed_nodes: Vec<String> =
+            capture::probe_camera_nodes().into_iter().map(|(name, _desc)| name).collect();
+        let candidates = source_plan::plan(
+            &probed_nodes, &v4l2_listing,
+            (!config.pw_node.trim().is_empty()).then_some(config.pw_node.as_str()),
+            flip,
+        );
+        let capture = CaptureHandle::spawn(candidates, Arc::clone(&shared));
 
         Self {
             pw_node:           config.pw_node,
@@ -480,8 +503,22 @@ impl CameraApp {
         self.texture_size = (0, 0);
 
         // 3. Start fresh pipeline with correct flip.
-        let pipeline_str = build_pipeline(&self.pw_node, resolved.videoflip_method());
-        self.capture = Some(CaptureHandle::spawn(pipeline_str, Arc::clone(&self.shared)));
+        // Rebuild the whole plan with the resolved flip: the flip is baked
+        // into every candidate's pipeline string, so a restart re-plans
+        // rather than patching one string (and re-probes, so a camera
+        // plugged in since launch is found — Qt Multimedia got that free).
+        let probed_nodes: Vec<String> =
+            capture::probe_camera_nodes().into_iter().map(|(name, _desc)| name).collect();
+        let v4l2_listing = std::process::Command::new("v4l2-ctl")
+            .arg("--list-devices").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let candidates = source_plan::plan(
+            &probed_nodes, &v4l2_listing,
+            (!self.pw_node.trim().is_empty()).then_some(self.pw_node.as_str()),
+            resolved.videoflip_method(),
+        );
+        self.capture = Some(CaptureHandle::spawn(candidates, Arc::clone(&self.shared)));
     }
 
     fn upload_texture(&mut self, ctx: &egui::Context, frame: &CameraFrame) {
