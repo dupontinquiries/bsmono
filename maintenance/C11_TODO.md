@@ -250,3 +250,18 @@ seam (8a/8b), netview import (5a), fire-shelter scan (5c). Newly recorded:
 - **C11-11d — wire read_harness into backend prompt assembly**: chunking,
   fences, git log formatting through the budget; the module has no consumer
   yet. Also feed ModelClass from the engine's real param count.
+
+## 12. The agent-format thread (prose in the fence, six turns zero files)
+
+- **C11-12a — line grammar + corrective + refusal ladder: DONE** at unit +
+  compile level (see the commit). Retest the original task on device with
+  the 1B: expect either line-grammar calls landing, or a bounded stop whose
+  verdict names the format failure — never the silent loop.
+- **C11-12b — mock-Llm integration test under ToolGate::Required**: drive
+  step_turn with a scripted model that fails twice then emits a valid line
+  call; assert the corrective landed in the prompt between turns and the
+  ladder reset. The fixtures all run Open today, which bypasses the ladder.
+- **C11-12c — per-class prompt shaping**: the protocol note now teaches both
+  shapes to every model; read_harness::ModelClass should choose — Small gets
+  the line grammar FIRST and the fence form omitted entirely (one shape to
+  hold is the point), Large keeps fences primary.
