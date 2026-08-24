@@ -6473,6 +6473,36 @@ occupant units. `--aboard` does now, and the answer was visible immediately.
 
 1133 passing.
 
+CLOSING THE SESSION: DOCS FOR A COLD START.
+
+`PRIORITIES.md` had accreted as things got done — eleven open boxes scattered
+through sections whose headings said DONE — so it is rewritten from the state
+as it is rather than as a diff against how it was. The old one is in git if
+the reasoning is wanted.
+
+The honest headline: everything underneath is built and tested, and what
+remains is almost entirely THE RENDERER BOUNDARY. The mission is still
+`MissionRun::resolve`, a simulation. The drop flies and nobody flies it.
+`foothold::assess` has never been asked at runtime.
+
+`docs/START_HERE.md` is new, because `DESIGN.md` is ten thousand lines of
+chronology and not where anybody should begin. It explains the skydribble
+inheritance, which accounts for most of what looks strange — the player being
+a car, the maps being called MEADOW and CATHEDRAL, the physics being Rocket
+League's — and names the two stacks that do not talk to each other.
+
+AND THE README STILL DESCRIBED THE ROCKET LEAGUE SANDBOX with no pointer to
+any of this. It is a Transformers game whose front page was about air
+dribbling. Fixed, with the sandbox description kept below the fold because it
+is still accurate about the part it describes.
+
+Two habits written down where a newcomer will hit them, both earned badly this
+session: a regression test written after the fix will pass and prove nothing
+unless you put the bug back, and a number written in metres does not move when
+the thing it measures does.
+
+1133 passing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
