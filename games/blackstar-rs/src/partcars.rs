@@ -185,6 +185,7 @@ pub fn assemble(
         // a parts-built car has no measured skeleton or fittings: it is
         // assembled from known pieces rather than read off an import
         tuck: Vec::new(),
+        pack: Vec::new(),
         fittings: crate::turret::Fittings::default(),
         cloud: Vec::new(),
         cloud_n: Vec::new(),

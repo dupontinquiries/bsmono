@@ -355,6 +355,64 @@ pub fn compact(sk: &Skeleton, prim_count: usize, factor: f32) -> Vec<Vec3> {
     out
 }
 
+/// PACK THE APPENDAGES INSIDE THE HULL, for vehicle mode.
+///
+/// `compact` shortens a limb by half so a standing bot is not swallowed by
+/// its own wingspan. Vehicle mode wants something different and stricter:
+/// a folded car should read as a solid object, and instead the skeleton
+/// shows — limbs hanging outside the silhouette, so the fold looks like a
+/// bounding box with parts stuck to it rather than a vehicle.
+///
+/// So this does not shorten by a ratio, it CONTAINS: every prim is pulled
+/// until its own bounds sit inside the hull envelope, which is the core's
+/// box grown by `slack` and no further. A prim already inside does not
+/// move at all, which is the important half — a car whose parts are where
+/// they belong is untouched, and only what pokes out gets pulled in.
+///
+/// The envelope is the CORE's box rather than the whole body's, because
+/// the whole body's box is exactly the thing the appendages defined: using
+/// it would contain nothing.
+pub fn contain(sk: &Skeleton, prims: &[&[Vec3]], slack: f32) -> Vec<Vec3> {
+    let mut out = vec![Vec3::ZERO; prims.len()];
+    if sk.core_half.max_element() <= 1e-4 {
+        return out;
+    }
+    let env = sk.core_half * (1.0 + slack.max(0.0));
+    let (elo, ehi) = (sk.core_centre - env, sk.core_centre + env);
+    for limb in &sk.limbs {
+        // measure the limb as a whole, so its pieces move together and it
+        // does not come apart on the way in
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for i in &limb.prims {
+            for p in prims.get(*i).copied().unwrap_or(&[]) {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+        }
+        if !(hi.x >= lo.x) {
+            continue;
+        }
+        // how far each axis pokes out, in the direction it pokes
+        let over_hi = (hi - ehi).max(Vec3::ZERO);
+        let over_lo = (elo - lo).max(Vec3::ZERO);
+        let mut shift = over_lo - over_hi;
+        // never push a limb THROUGH the body: cap the pull at the distance
+        // to the core centre, or a long wing crosses to the far side
+        let span = hi - lo;
+        let cap = (env * 2.0 - span).max(Vec3::ZERO);
+        shift = shift.clamp(-cap, cap);
+        if shift.length_squared() < 1e-8 {
+            continue;
+        }
+        for i in &limb.prims {
+            if let Some(slot) = out.get_mut(*i) {
+                *slot = shift;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +466,46 @@ mod tests {
         let wing_before = centroid(&j[1]).length();
         let wing_after = centroid(&moved[1]).length();
         assert!(wing_after < wing_before, "the wing was pushed outward");
+    }
+
+    #[test]
+    fn vehicle_mode_packs_the_limbs_inside_the_hull() {
+        let j = jet();
+        let refs: Vec<&[Vec3]> = j.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        let off = contain(&sk, &refs, 0.25);
+        let env = sk.core_half * 1.25;
+        for (i, o) in off.iter().enumerate() {
+            if sk.core.contains(&i) {
+                continue;
+            }
+            let (lo, hi) = bounds(&j[i].iter().map(|p| *p + *o).collect::<Vec<_>>());
+            let out_hi = (hi - (sk.core_centre + env)).max_element();
+            let out_lo 
+                = ((sk.core_centre - env) - lo).max_element();
+            assert!(
+                out_hi < 0.35 && out_lo < 0.35,
+                "prim {i} still pokes out by {:.2}/{:.2} after containment",
+                out_hi,
+                out_lo
+            );
+        }
+    }
+
+    #[test]
+    fn containment_leaves_a_tidy_body_alone() {
+        // the important half: a vehicle whose parts are already inside its
+        // own hull must not be nudged at all
+        let car = vec![
+            blob(Vec3::ZERO, Vec3::new(1.2, 0.7, 2.4), 600),
+            blob(Vec3::new(0.5, 0.2, 0.4), Vec3::splat(0.25), 80),
+        ];
+        let refs: Vec<&[Vec3]> = car.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        let off = contain(&sk, &refs, 0.25);
+        for (i, o) in off.iter().enumerate() {
+            assert!(o.length() < 1e-3, "prim {i} moved on a tidy body: {o:?}");
+        }
     }
 
     #[test]

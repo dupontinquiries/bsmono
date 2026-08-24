@@ -7612,10 +7612,15 @@ impl Game {
             // vehicle scale and absurd on a standing bot, and the fold
             // cannot fix it because it interpolates vertices and the wing
             // is where the artist left it (`skeleton::compact`).
-            let base = match active.tuck.get(pi) {
-                Some(t) if *t != Vec3::ZERO && self.xf.is_robot() => {
-                    base * Mat4::from_translation(*t)
-                }
+            // EACH MODE PACKS ITS OWN WAY. Robot mode shortens overhangs
+            // so the bot is not swallowed by its wingspan (`compact`);
+            // vehicle mode contains them inside the hull envelope so the
+            // fold reads as a solid object rather than a skeleton in a box
+            // (`contain`). Both are zero for a body that never needed it.
+            let robot = self.xf.is_robot();
+            let shift = if robot { active.tuck.get(pi) } else { active.pack.get(pi) };
+            let base = match shift {
+                Some(t) if *t != Vec3::ZERO => base * Mat4::from_translation(*t),
                 _ => base,
             };
             let base = match (&turret_q, active.fittings.turret.contains(&pi)) {

@@ -69,6 +69,11 @@ pub struct Model {
     /// and applied only when folded to robot — a vehicle's wings are the
     /// right size for a vehicle.
     pub tuck: Vec<Vec3>,
+    /// per-prim pull-in for VEHICLE MODE: what it takes to get each limb
+    /// inside the hull envelope, so a folded body reads as a solid object
+    /// instead of a skeleton in a box (`skeleton::contain`). Zero for
+    /// anything already tidy.
+    pub pack: Vec<Vec3>,
     /// what this hull carries: a turret to aim and treads to roll
     /// (`turret::find`). Indices are into `prims`, so the draw path can
     /// give the turret its own rotation without a second model.
@@ -690,10 +695,37 @@ fn nose_corrected(q: Quat, verts: &[Vertex]) -> Quat {
 /// the one the game runs, so a disagreeing printout proved nothing either
 /// way.
 pub fn loader_frame(pose_dir: &Path) -> Option<(Quat, &'static str)> {
+    let heuristic = sidecar_is_heuristic(pose_dir);
     if let Some(q) = declared_orientation(pose_dir) {
-        return Some((q, "declared sidecar"));
+        if !heuristic {
+            return Some((q, "declared sidecar"));
+        }
     }
-    strip_guess(pose_dir).map(|q| (q, "guessed from the vehicle pose"))
+    strip_guess(pose_dir).map(|q| {
+        (
+            q,
+            if heuristic {
+                "guessed: the sidecar was only a heuristic"
+            } else {
+                "guessed from the vehicle pose"
+            },
+        )
+    })
+}
+
+/// Was this chassis' sidecar written by an exporter that knew, or by an
+/// older run of the same heuristic? See the call site for why it matters.
+fn sidecar_is_heuristic(pose_dir: &Path) -> bool {
+    let txt = match strip_orientation_text(pose_dir) {
+        Some(t) => t,
+        None => match std::fs::read_to_string(pose_dir.join("orient.json")) {
+            Ok(t) => t,
+            Err(_) => return false,
+        },
+    };
+    // an authored answer names its source; anything calling itself a
+    // heuristic is a guess we can now make better
+    txt.contains("heuristic") && !txt.contains("foldview") && !txt.contains("rigpose")
 }
 
 fn declared_orientation(dir: &Path) -> Option<Quat> {
@@ -993,7 +1025,18 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
         // declared path has enforced that since the sidecars landed; the
         // guessed path did not, and a strip that guesses per pose tumbles
         // as it folds (see `strip_guess`).
-        let q = match declared_orientation(dir) {
+        // A SIDECAR IS ONLY WORTH TRUSTING IF SOMETHING KNEW THE ANSWER.
+        //
+        // `orient.json` comes in two kinds. `foldview` and `rigpose` were
+        // written by exporters that could see the skeleton — those are
+        // facts. `orient_heuristic_v1` was written by THIS SAME GUESS run
+        // offline, per pose, before the strip rule existed: 48 of 221
+        // chassis disagree with themselves and every one of them is that
+        // kind. Reading a stale copy of a guess we have since improved is
+        // strictly worse than guessing again, so heuristic sidecars are
+        // skipped and the strip guess (which also gets the debris filter
+        // and the cockpit nose vote) is used instead.
+        let q = match declared_orientation(dir).filter(|_| !sidecar_is_heuristic(dir)) {
             Some(q) => q,
             None => match strip_guess(dir) {
                 Some(q) => q,
@@ -1231,9 +1274,15 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     // the appendages; `compact` shortens each overhanging one along its
     // own axis to half its reach, which is the number that keeps a jet's
     // wings from being the whole silhouette when it stands up.
-    let tuck = {
+    let (tuck, pack) = {
         let sk = crate::skeleton::skeletonize(&refs);
-        crate::skeleton::compact(&sk, refs.len(), 0.5)
+        (
+            crate::skeleton::compact(&sk, refs.len(), 0.5),
+            // vehicle mode is stricter: contain rather than shorten, with
+            // a quarter of the core's own size as slack so a bonnet still
+            // reads as a bonnet
+            crate::skeleton::contain(&sk, &refs, 0.25),
+        )
     };
 
     let wheel_r = if wheel_bottom < wheel_top {
@@ -1247,7 +1296,7 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, drive: Drive::Combustion, hover: None, tuck, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
+    Model { prims, drive: Drive::Combustion, hover: None, tuck, pack, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
             half_len: half.z, half_h: half.y, half_w: half.x, wheel_r,
             // Same sign convention as xform::Morph::bounds_at: -lo.y, the
             // distance from the origin to the pose's actual lowest point,

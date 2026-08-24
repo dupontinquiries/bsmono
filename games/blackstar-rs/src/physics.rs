@@ -1626,7 +1626,18 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     for off in [0.0f32, 0.8, -0.8] {
         let p = car.pos + f * (car.half_len * off);
         let d = world.sdf(p);
-        let r = car.half_h;
+        // THE FOURTH SEATING SITE, and the one that was still burying feet.
+        //
+        // Three sites were fixed when `ride_h` landed and the per-frame
+        // contact test was fixed after that — this one, the depenetration
+        // that runs AFTER integration, kept reading `half_h`. A standing
+        // robot's feet hang `ride_h` below its centre and `ride_h > half_h`
+        // for any body whose box is not centred on the origin, so every
+        // frame this pass pushed the body out to half its BOX and let the
+        // feet stay under the floor by exactly the difference. The contact
+        // test above then reported grounded, so nothing looked wrong except
+        // the feet.
+        let r = car.stand_h();
         if d < r {
             let n = world.normal(p);
             car.pos += n * (r - d);
@@ -1700,10 +1711,12 @@ pub fn portal_car(car: &mut Car, world: &World, dt: f32) -> bool {
         car.pos += (r * Vec3::Z) * 1.2;
         for _ in 0..8 {
             let d = world.sdf(car.pos);
-            if d > car.half_h + 0.15 {
+            // same fix as the depenetration above: unstick to where the
+            // body actually STANDS, not to half its bounding box
+            if d > car.stand_h() + 0.15 {
                 break;
             }
-            car.pos += world.normal(car.pos) * (car.half_h + 0.25 - d).max(0.15);
+            car.pos += world.normal(car.pos) * (car.stand_h() + 0.25 - d).max(0.15);
         }
         car.tp_cd = 0.12;
         car.prev = car.pos;
@@ -2186,6 +2199,39 @@ mod reset_tests {
     /// hang well below the origin, so `ride_h` is much larger than `half_h`.
     fn bot_shaped() -> Car {
         Car { half_h: 0.9, ride_h: 1.5, half_len: 0.6, half_w: 0.5, ..Car::new() }
+    }
+
+    #[test]
+    /// The meta-test above checks nobody re-derives `ride_h > 0` by hand.
+    /// It could not see the OTHER shape of the same bug: a site that reads
+    /// `car.half_h` as a ground clearance and never mentions `ride_h` at
+    /// all. That is what buried the feet for a second time, in the
+    /// depenetration that runs after integration, so this checks the
+    /// clearance sites name `stand_h`.
+    #[test]
+    fn no_ground_clearance_is_measured_from_half_h() {
+        let src = include_str!("physics.rs");
+        let mut bad = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim();
+            if l.starts_with("//") {
+                continue;
+            }
+            // a clearance is a radius compared against an sdf distance;
+            // these are the two idioms that do it
+            let clearance_ish = l.contains("let r = car.half_h")
+                || l.contains("d > car.half_h +")
+                || l.contains("< car.half_h + 0.1");
+            if clearance_ish {
+                bad.push(format!("physics.rs:{}: {}", i + 1, l));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "ground clearance measured from the bounding box, not from where \
+             the body stands — the feet will sink by (ride_h - half_h):\n{}",
+            bad.join("\n")
+        );
     }
 
     #[test]
