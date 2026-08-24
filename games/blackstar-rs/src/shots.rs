@@ -130,7 +130,11 @@ impl Shots {
                 match marks.get(i) {
                     Some(m) => {
                         let missile = Missile { pos: s.pos, vel: s.vel, turn: TURN, lethal_r: LETHAL_R };
-                        let tgt = Target { pos: m.pos, vel: m.vel };
+                        // agility is the JINK model's budget inside
+                        // `guidance::intercept`; a live mark evades for
+                        // real (the pool re-reads its pos/vel every step),
+                        // so the modelled budget stays zero here
+                        let tgt = Target { pos: m.pos, vel: m.vel, agility: 0.0 };
                         let a = guidance::steer(Law::Proportional, &missile, &tgt);
                         let a = a.clamp_length_max(TURN);
                         s.vel += a * dt;
