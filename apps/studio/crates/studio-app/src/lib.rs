@@ -1301,7 +1301,8 @@ pub struct App {
     /// the same predictable-beats-configurable trade the export path makes,
     /// and this shell's whole collab stack works identically without it.
     carrier: Option<studio_collab::stream::StreamPeer>,
-    /// Where Ctrl+S writes: STUDIO_PROJECT if set, else ./project.studio.
+    /// Where Ctrl+S writes: STUDIO_PROJECT if set, else a project
+    /// directory under the projects root.
     project_path: std::path::PathBuf,
     /// The MIDI controller, if one was found at startup. `None` is normal
     /// and silent: most sessions have no controller, and an editor that
@@ -1367,9 +1368,20 @@ enum SinkContent { Nothing, RackLoop, Arrangement }
 impl Default for App {
     fn default() -> Self {
         let sink = audition::open_sink();
-        let project_path = std::env::var("STUDIO_PROJECT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| "project.studio".into());
+        // Never `./project.studio` any more: an unnamed project gets its
+        // OWN directory under the projects root (see project_dir's
+        // containment rule and the accident that motivated it). The root
+        // is $STUDIO_PROJECTS, else the last place an archive was written
+        // — a person who archives to an SD card wants the working copy
+        // beside it — else the freedesktop data directory.
+        let project_path = match std::env::var("STUDIO_PROJECT") {
+            Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+            _ => {
+                let root = last_archive_root()
+                    .unwrap_or_else(project_dir::projects_root);
+                project_dir::project_dir(&root, "untitled").join("project.studio")
+            }
+        };
         // Open the named project when it exists; a demo otherwise. A load
         // FAILURE is neither: overwriting a damaged-but-real file with a
         // demo on the next Ctrl+S would finish what the damage started, so
@@ -1637,6 +1649,17 @@ impl eframe::App for App {
                         demoted: self.library_prefs.demoted.iter()
                             .map(|p| p.display().to_string()).collect(),
                     });
+                    // The directory must exist (and be ours) BEFORE the
+                    // file is written: a save into a fresh project root
+                    // otherwise fails on the open, and a save into
+                    // someone's source tree must fail here rather than
+                    // after leaving a file in it.
+                    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        if let Err(e) = project_dir::ensure_project_dir(dir) {
+                            self.studio.status = e;
+                            return;
+                        }
+                    }
                     if self.studio.save_to(&path).is_ok() {
                         // The save happened; history is the extra. A missing
                         // git binary demotes to a note, never a lost save.
@@ -2535,6 +2558,35 @@ impl eframe::App for App {
 }
 
 
+/// Where the last archive was written, remembered across runs in the
+/// freedesktop config directory — app-level state, so it belongs beside
+/// the app's config and not in any one project's sidecar.
+#[cfg(feature = "app")]
+fn last_archive_note() -> std::path::PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME").ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h|
+            std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("studio/last-archive")
+}
+
+#[cfg(feature = "app")]
+fn last_archive_root() -> Option<std::path::PathBuf> {
+    let p = std::fs::read_to_string(last_archive_note()).ok()?;
+    let p = std::path::PathBuf::from(p.trim());
+    if p.is_dir() { Some(p) } else { None }
+}
+
+#[cfg(feature = "app")]
+fn remember_archive_root(dir: &std::path::Path) {
+    if let Some(parent) = last_archive_note().parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(last_archive_note(), dir.display().to_string());
+}
+
 /// One proposed move, in words a mixing engineer reads at a glance.
 #[cfg(feature = "app")]
 fn describe_op(op: &studio_core::Op) -> String {
@@ -3003,6 +3055,14 @@ impl App {
                                                 extra.push_str(&format!(
                                                     ", {} sources have NO audio",
                                                     report.missing.len()));
+                                            }
+                                            // Remembered app-wide: the
+                                            // next unnamed project is born
+                                            // beside the last archive, so
+                                            // "wherever I archived" is
+                                            // where work accumulates.
+                                            if let Some(d) = dest.parent() {
+                                                remember_archive_root(d);
                                             }
                                             self.studio.status = format!(
                                                 "archived {} ({:.1} MB{extra})",

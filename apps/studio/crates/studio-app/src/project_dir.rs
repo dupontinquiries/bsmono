@@ -26,6 +26,37 @@
 //! reached by path rather than by a cross-app crate dependency the repo's
 //! layering would refuse.
 //!
+//! ## The containment rule (learned the hard way)
+//!
+//! The first version of this ran `git init` and `git add -A` in whatever
+//! directory the project file happened to sit in. Launched from a source
+//! checkout, that directory is the USER'S OWN REPOSITORY: a save committed
+//! 2,734 files of their source tree with the message "save". That is a
+//! genuinely dangerous bug and the fix is structural, not a patch —
+//!
+//! * a project lives in ITS OWN directory under a projects root
+//!   ([`projects_root`]), never in the current working directory;
+//! * that directory is marked ours with [`MARKER`] at creation;
+//! * [`guard`] refuses to touch any directory that is not marked ours, and
+//!   refuses outright if the directory or ANY ancestor is already a git
+//!   work tree we did not create;
+//! * commits name explicit pathspecs. There is no `-A` anywhere in this
+//!   file anymore, so even a mis-scoped directory could only ever stage
+//!   the handful of files a project consists of.
+//!
+//! ## What other Linux DAWs do, and what this borrows
+//!
+//! Zrythm makes the project a DIRECTORY under `XDG_DATA_HOME` and keeps
+//! timestamped snapshots in `backups/` — the layout copied here, with git
+//! playing the role of `backups/` (every save a commit beats N numbered
+//! copies). Reaper defaults to a projects ROOT and offers a per-project
+//! subdirectory, which is the "never save loose in the cwd" half. Audacity
+//! went the other way entirely: `.aup` plus a `_data` folder became the
+//! single-file `.aup3` after years of users moving or deleting the folder
+//! and breaking their sessions — which is exactly the argument for
+//! `.studioarch`, and why THIS directory is the working copy while the
+//! archive remains the thing you send.
+//!
 //! ## Degradation is a message, never a lost save
 //!
 //! The save itself is the caller's write of `project.studio`; this module
@@ -35,6 +66,130 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Marks a directory as one this app created and may write git history
+/// into. Its absence is a refusal, not a prompt.
+pub const MARKER: &str = ".studio-project";
+
+/// Where projects live by default: `$STUDIO_PROJECTS`, else
+/// `$XDG_DATA_HOME/studio/projects`, else `~/.local/share/studio/projects`
+/// — the freedesktop location Zrythm uses for the same reason, and never
+/// the current working directory, which is how the source-tree accident
+/// happened.
+pub fn projects_root() -> PathBuf {
+    if let Ok(p) = std::env::var("STUDIO_PROJECTS") {
+        if !p.trim().is_empty() { return PathBuf::from(p); }
+    }
+    if let Ok(x) = std::env::var("XDG_DATA_HOME") {
+        if !x.trim().is_empty() { return PathBuf::from(x).join("studio/projects"); }
+    }
+    match std::env::var("HOME") {
+        Ok(h) if !h.trim().is_empty() =>
+            PathBuf::from(h).join(".local/share/studio/projects"),
+        // No HOME (a service, a container): a visible subdirectory of the
+        // cwd, still never the cwd itself.
+        _ => PathBuf::from("studio-projects"),
+    }
+}
+
+/// A file-system-safe directory name for a project title.
+pub fn slug(name: &str) -> String {
+    let s: String = name.chars().map(|c| {
+        if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }
+    }).collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() { "untitled".into() } else { s.chars().take(64).collect() }
+}
+
+/// The directory a project of this name belongs in, under `root` (usually
+/// [`projects_root`], or wherever the last archive was written — a person
+/// who archives to an SD card wants their working copy on the SD card).
+pub fn project_dir(root: &Path, name: &str) -> PathBuf {
+    root.join(slug(name))
+}
+
+/// Why a directory may not be versioned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Refusal {
+    /// The directory, or an ancestor, is a git work tree this app did not
+    /// create. Never touched: someone's source checkout is not a project.
+    ForeignRepo(PathBuf),
+    /// Not marked as a project directory and not empty — refusing rather
+    /// than adopting whatever happens to be there.
+    NotOurs(PathBuf),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::ForeignRepo(p) => write!(f,
+                "{} is inside a git repository this app did not create — \
+                 refusing to commit there. Save into a project directory \
+                 (under {}) instead.", p.display(), projects_root().display()),
+            Refusal::NotOurs(p) => write!(f,
+                "{} is not an empty or studio-owned directory — refusing to \
+                 put project history in it.", p.display()),
+        }
+    }
+}
+
+/// May this directory hold project history? Marked-ours passes. Otherwise
+/// it must be empty (or absent) AND have no git work tree above it.
+///
+/// The ancestor walk is the important half: `~/code/c9/apps/studio` has no
+/// `.git` of its own, and committing there is exactly what damaged a real
+/// repository.
+pub fn guard(dir: &Path) -> Result<(), Refusal> {
+    if dir.join(MARKER).is_file() { return Ok(()); }
+    let mut at = Some(dir.to_path_buf());
+    while let Some(p) = at {
+        if p.join(".git").exists() && !p.join(MARKER).is_file() {
+            return Err(Refusal::ForeignRepo(p));
+        }
+        at = p.parent().map(|x| x.to_path_buf());
+    }
+    // Adoptable when everything in it is something a project consists of.
+    // "Empty" alone would refuse a real project folder saved by an older
+    // build; "anything goes" would adopt a source tree. The known-set test
+    // is the line between them: one stray `src/` and this refuses.
+    match std::fs::read_dir(dir) {
+        Err(_) => Ok(()), // does not exist yet: ours to create
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !is_project_file(&name) {
+                    return Err(Refusal::NotOurs(dir.to_path_buf()));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The complete inventory of what a project directory may contain. Kept
+/// as one list because [`guard`] and the commit pathspec must agree: a
+/// file worth committing is a file worth adopting, and nothing else is
+/// either.
+pub fn is_project_file(name: &str) -> bool {
+    const EXACT: [&str; 7] = [MARKER, "meta.toml", ".gitattributes", ".gitignore",
+                              "media.list", "media", ".git"];
+    EXACT.contains(&name)
+        || name.ends_with(".studio")
+        || name.ends_with(".studioarch")
+        || name.ends_with(".workspace")
+}
+
+/// Create (or adopt) a project directory: makes it, marks it ours.
+pub fn ensure_project_dir(dir: &Path) -> Result<(), String> {
+    guard(dir).map_err(|r| r.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
+    if !dir.join(MARKER).is_file() {
+        std::fs::write(dir.join(MARKER),
+            "# a studio project directory; history and media live here\nformat = 1\n")
+            .map_err(|e| format!("marker: {e}"))?;
+    }
+    Ok(())
+}
 
 /// Project metadata, written as `meta.toml` beside the project file — the
 /// human-readable card catalogue entry git history makes greppable.
@@ -118,7 +273,10 @@ const GITATTRIBUTES: &str = "\
 /// happened and must be reported as such by the caller.
 pub fn save_versioned(dir: &Path, meta: &Meta, mode: MediaMode, message: &str)
                       -> Result<Option<String>, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
+    // The containment rule, enforced before anything is written: this
+    // function will not create or extend git history in a directory that
+    // is not a studio project.
+    ensure_project_dir(dir)?;
     std::fs::write(dir.join("meta.toml"), meta.to_toml())
         .map_err(|e| format!("meta.toml: {e}"))?;
     if !dir.join(".gitattributes").exists() {
@@ -152,7 +310,23 @@ pub fn save_versioned(dir: &Path, meta: &Meta, mode: MediaMode, message: &str)
     if !dir.join(".git").exists() {
         git(dir, &["init", "-q"])?;
     }
-    git(dir, &["add", "-A"])?;
+    // EXPLICIT pathspecs, never `-A`: a project is a known handful of
+    // files, and the wildcard is what turned a save into a commit of
+    // someone's source tree. Missing paths are skipped rather than
+    // failing the save.
+    let mut spec: Vec<&str> = vec![MARKER, "meta.toml", ".gitattributes"];
+    for extra in ["project.studio", ".gitignore", "media.list"] {
+        if dir.join(extra).exists() { spec.push(extra); }
+    }
+    // `media` only in Committed mode — naming an ignored path explicitly
+    // is an ERROR to git, not a silent skip, so External mode must not
+    // ask for the directory it just told git to ignore.
+    if mode == MediaMode::Committed && dir.join("media").exists() {
+        spec.push("media");
+    }
+    let mut args = vec!["add", "--"];
+    args.extend(spec);
+    git(dir, &args)?;
     // Identity inline: a save must work on a machine that never ran
     // `git config`, and a project's history is the app's, not the user's
     // global persona.
@@ -232,6 +406,84 @@ mod tests {
         // Tuesday's mix is readable without touching the working tree.
         assert_eq!(file_at(&dir, &first, "project.studio").unwrap(), b"v1");
         assert_eq!(file_at(&dir, &second, "project.studio").unwrap(), b"v2");
+    }
+
+    #[test]
+    fn a_save_never_commits_someone_elses_repository() {
+        // THE bug: launched from a source checkout, the old version ran
+        // `git init` + `git add -A` in the user's own tree and committed
+        // 2,734 files of their code with the message "save". Both shapes
+        // of that accident are refused now — the directory itself being a
+        // repo, and (the one that actually happened) an ANCESTOR being
+        // one, several levels up.
+        let root = tempdir("foreign");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[workspace]").unwrap();
+        assert!(matches!(guard(&root), Err(Refusal::ForeignRepo(_))));
+        let deep = root.join("apps/studio");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(matches!(guard(&deep), Err(Refusal::ForeignRepo(_))),
+                "an ancestor repository is the case that did the damage");
+        // And the refusal is total: no repo created, no commit made.
+        let before = std::fs::read_dir(&deep).unwrap().count();
+        let err = save_versioned(&deep, &meta(), MediaMode::Committed, "save")
+            .expect_err("must refuse");
+        assert!(err.contains("did not create"), "{err}");
+        assert_eq!(std::fs::read_dir(&deep).unwrap().count(), before,
+                   "nothing was written into the foreign tree");
+        assert!(!deep.join(".git").exists());
+    }
+
+    #[test]
+    fn a_directory_of_stray_files_is_refused_but_a_real_project_folder_is_adopted() {
+        // Adoptable: everything present is something a project consists of
+        // (an older build's save, say).
+        let ok = tempdir("adopt");
+        std::fs::write(ok.join("cut.studio"), b"x").unwrap();
+        std::fs::write(ok.join("cut.workspace"), b"y").unwrap();
+        assert!(guard(&ok).is_ok());
+        // Not adoptable: one thing that is not ours, and this stays out.
+        let stray = tempdir("stray");
+        std::fs::write(stray.join("cut.studio"), b"x").unwrap();
+        std::fs::create_dir_all(stray.join("src")).unwrap();
+        assert!(matches!(guard(&stray), Err(Refusal::NotOurs(_))));
+        // Marked ours: adopted regardless of what accumulated inside.
+        let ours = tempdir("ours");
+        std::fs::write(ours.join(MARKER), b"format = 1").unwrap();
+        std::fs::create_dir_all(ours.join("whatever")).unwrap();
+        assert!(guard(&ours).is_ok());
+    }
+
+    #[test]
+    fn a_commit_stages_project_files_and_nothing_else() {
+        // Even inside a project directory, the commit names its paths:
+        // no `-A` means a stray file cannot ride along.
+        let dir = tempdir("pathspec");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.studio"), b"v1").unwrap();
+        save_versioned(&dir, &meta(), MediaMode::Committed, "save").unwrap();
+        std::fs::write(dir.join("scratch.txt"), b"not mine").unwrap();
+        std::fs::write(dir.join("project.studio"), b"v2").unwrap();
+        save_versioned(&dir, &meta(), MediaMode::Committed, "save 2").unwrap();
+        let tracked = git(&dir, &["ls-files"]).unwrap();
+        assert!(tracked.contains("project.studio"));
+        assert!(tracked.contains(MARKER), "the marker travels with the history");
+        assert!(!tracked.contains("scratch.txt"),
+                "a stray file is never staged: {tracked}");
+    }
+
+    #[test]
+    fn projects_live_under_a_root_never_in_the_working_directory() {
+        // The other half of the fix: a project has its own directory, and
+        // the default root is the freedesktop location — the same place
+        // Zrythm puts its Projects folder, and never `.`.
+        let root = projects_root();
+        assert!(root.is_absolute() || root.starts_with("studio-projects"),
+                "{}", root.display());
+        assert_ne!(root, PathBuf::from("."));
+        assert_eq!(project_dir(Path::new("/data"), "My Cut #2"),
+                   PathBuf::from("/data/My-Cut--2"));
+        assert_eq!(slug("///"), "untitled", "an unnameable project still gets a home");
     }
 
     #[test]

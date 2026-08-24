@@ -1739,3 +1739,32 @@ host, and total failure reports how many configurations were tried plus
 the last error, rather than repeating one opaque backend string. The
 negotiated device and rate land in the status line, because "recording" at
 a rate nobody chose is how a take ends up the wrong length.
+
+
+**The save structure, rebuilt around containment.** A real bug, reported
+from real use: the first `project_dir` ran `git init` and `git add -A` in
+whatever directory the project file sat in — launched from a source
+checkout, that is the USER'S OWN REPOSITORY, and a save committed 2,734
+files of their code with the message "save". The fix is structural. A
+project now lives in its own directory under a projects root
+(`$STUDIO_PROJECTS`, else wherever the last archive was written, else
+`$XDG_DATA_HOME/studio/projects`) and never in the working directory. That
+directory is marked with `.studio-project` at creation. `guard` refuses
+any directory that is not marked ours, and refuses outright when the
+directory OR ANY ANCESTOR is a git work tree we did not create — the
+ancestor walk being the case that actually did the damage. Commits name
+explicit pathspecs; there is no `-A` left in the file, so even a
+mis-scoped directory could stage only the handful of files a project
+consists of. A folder holding nothing but project files is still adoptable
+(an older build's save), one stray `src/` is not. All four properties are
+pinned, including that a refused save leaves the foreign tree byte-for-byte
+untouched.
+
+Shaped by what the neighbours do: Zrythm makes each project a DIRECTORY
+under `XDG_DATA_HOME` with timestamped snapshots in `backups/` — the same
+layout, with git commits playing the part of numbered backups; Reaper
+defaults to a projects ROOT with a per-project subdirectory, which is the
+"never save loose in the cwd" half; and Audacity abandoned `.aup` plus a
+`_data` folder for the single-file `.aup3` after years of users moving the
+folder and breaking sessions — the same argument that makes `.studioarch`
+the thing you send while this directory stays the working copy.
