@@ -17,6 +17,43 @@
 //! `GestureLayer`, snapclone's `pager`) should keep using it, not hand it
 //! to a second owner. [`nav_ui`] is the one convenience that also draws,
 //! for the common case of "just the strip or nothing."
+//!
+//! ## What this must NEVER gate
+//!
+//! This decides layout only — which shape the CHROME takes. It must never
+//! be the thing that decides whether a page's underlying work runs.
+//! Two failure modes this module is written to make impossible rather than
+//! easy to fall into by accident:
+//!
+//! * **Energy: don't do expensive work for a page nobody is looking at.**
+//!   Both `Tabs` and `Pages` already render only the active page's body —
+//!   the strip/picker is chrome, not a second copy of every page — so the
+//!   free win is already there. The gap is everything ELSE a page's own
+//!   state does per frame regardless of which layout mode is showing it:
+//!   a physics step, a DSP graph pull, a decode. That is the CALLER's
+//!   `match self.view_idx { ... }` (or equivalent), and it should skip
+//!   the expensive half of an inactive page's update — this module has no
+//!   opinion on how, because it owns none of that state. [`NavLayoutTracker`]
+//!   exists for the one thing this module CAN help with: telling a caller
+//!   when the layout itself actually changed, so a resize that doesn't
+//!   flip `Tabs`/`Pages` doesn't retrigger whatever a caller does on a
+//!   real transition (resetting a scroll position, restarting an
+//!   animation) every single frame while a window is being dragged.
+//!
+//! * **Collaboration: visibility must never gate network state.**
+//!   `logscope` and `studio-live` (and anything else with a Doc/op-log
+//!   syncing across peers) have a page that is not "the current view" in
+//!   exactly the sense this module cares about, but is very much still
+//!   live: a peer's edits keep landing whether or not the local user has
+//!   that tab open. If an app gated its op-log replay, presence pings, or
+//!   outbound edits on `layout == Tabs && page == N`, a collaborator's
+//!   work would silently stall the moment the local user looked away —
+//!   the collaboration-session equivalent of the a11y module's own rule
+//!   that hidden state must still answer correctly. `choose`/`choose_adaptive`
+//!   take only a width and a count; they have no way to reach into a
+//!   Doc or a socket even by accident, which is deliberate, not
+//!   incidental — a future version of this module must not grow a
+//!   parameter that could tempt a caller into wiring one to the other.
 
 use crate::segmented_tabs::TabStrip;
 use crate::PaletteColors;
@@ -91,6 +128,39 @@ pub fn nav_ui(ui: &mut egui::Ui, strip: &TabStrip, min_tab_width: f32,
     (layout, clicked)
 }
 
+/// Remembers the last computed layout so a caller can tell "still Tabs"
+/// from "just became Tabs" — the energy-relevant distinction. A window
+/// being resized calls [`choose`] every frame; most of those frames the
+/// answer doesn't change, and a caller that does real work on every
+/// transition (resetting scroll, restarting a peel-hint animation,
+/// re-laying-out a strip) should do that work once per actual flip, not
+/// once per frame of a drag that happens to cross the fit boundary
+/// several times as the window snaps between sizes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NavLayoutTracker {
+    last: Option<NavLayout>,
+}
+
+impl NavLayoutTracker {
+    pub fn new() -> NavLayoutTracker { NavLayoutTracker { last: None } }
+
+    /// Feed this frame's inputs. Returns `Some(layout)` only on the first
+    /// call and on every actual change; `None` when the layout this frame
+    /// is the same as last frame's. The layout is still `choose`'s honest
+    /// answer either way — call [`choose`] directly if you want it every
+    /// frame regardless of whether it changed; this is for the caller
+    /// that only wants to react to a flip.
+    pub fn update(&mut self, available_width: f32, section_count: usize,
+                  min_tab_width: f32) -> Option<NavLayout> {
+        let now = choose(available_width, section_count, min_tab_width);
+        if self.last == Some(now) { return None; }
+        self.last = Some(now);
+        Some(now)
+    }
+
+    pub fn current(&self) -> Option<NavLayout> { self.last }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +216,23 @@ mod tests {
         // through a click requires the full harness this crate's other
         // UI-drawing functions are already exempted from unit-testing.
         assert_eq!(choose(50.0, 5, 80.0), NavLayout::Pages);
+    }
+
+    #[test]
+    fn the_tracker_reports_only_the_first_frame_and_real_flips() {
+        let mut t = NavLayoutTracker::new();
+        // First call always reports, even though nothing "changed" yet —
+        // there is no prior frame to compare against.
+        assert_eq!(t.update(1000.0, 3, 80.0), Some(NavLayout::Tabs));
+        // Same answer, repeatedly (the resize-drag case): silence.
+        assert_eq!(t.update(999.0, 3, 80.0), None);
+        assert_eq!(t.update(1000.0, 3, 80.0), None);
+        assert_eq!(t.current(), Some(NavLayout::Tabs));
+        // An actual flip reports exactly once.
+        assert_eq!(t.update(50.0, 3, 80.0), Some(NavLayout::Pages));
+        assert_eq!(t.update(50.0, 3, 80.0), None, "the new layout is now the baseline too");
+        // And flipping back reports again — this is change detection, not
+        // a one-shot latch.
+        assert_eq!(t.update(1000.0, 3, 80.0), Some(NavLayout::Tabs));
     }
 }
