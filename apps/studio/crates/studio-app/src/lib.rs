@@ -39,6 +39,21 @@ pub struct Studio {
     pub session: Session,
     pub transport: Transport,
     pub view: studio_egui::View,
+    /// Camera (zoom/scroll) for each song-group, so switching between songs
+    /// in an album restores where you were in THAT song rather than
+    /// carrying one song's zoom onto another. Device-local, not synced —
+    /// exactly the same category `GroupId`'s own doc comment already
+    /// names for fold-open/closed state ("view state in the device's
+    /// workspace sidecar"), so this deliberately lives here rather than
+    /// in the `Project`/Op log: two collaborators are allowed to look at
+    /// different parts of the same song at different zoom levels.
+    /// Populated lazily by [`Studio::current_view_mut`]; a song never
+    /// opened this session simply isn't a key yet.
+    pub song_views: std::collections::BTreeMap<studio_core::GroupId, studio_egui::View>,
+    /// Which song-group the timeline is currently showing. `None` means
+    /// "the whole project as one timeline" — today's only behavior, and
+    /// what every project with zero groups still gets, unchanged.
+    pub active_song: Option<studio_core::GroupId>,
     pub panel: Panel,
     pub mode: ViewMode,
     pub selection: Vec<studio_core::ClipId>,
@@ -145,6 +160,8 @@ impl Studio {
             session: Session::open(team, &name, Doc::new(site, project)),
             transport: Transport::new(48_000),
             view: studio_egui::View::default(),
+            song_views: std::collections::BTreeMap::new(),
+            active_song: None,
             panel: Panel::Timeline,
             mode: ViewMode::Split,
             selection: Vec::new(),
@@ -966,6 +983,41 @@ impl Studio {
         self.mode.effective_playhead(self.transport.position(), None)
     }
 
+    /// The camera the timeline should draw with right now: `active_song`'s
+    /// own remembered zoom/scroll, or the single project-wide `view` when
+    /// nothing is selected (today's only behaviour, for every project with
+    /// no groups or with no song picked yet).
+    pub fn current_view(&self) -> &studio_egui::View {
+        match self.active_song {
+            Some(id) => self.song_views.get(&id).unwrap_or(&self.view),
+            None => &self.view,
+        }
+    }
+
+    /// Mutable version, for the timeline's own scroll/zoom handling.
+    /// Creates the song's entry on first use rather than requiring one to
+    /// already exist — a song opened for the first time this session
+    /// starts from a fresh default camera, not a missing one.
+    pub fn current_view_mut(&mut self) -> &mut studio_egui::View {
+        match self.active_song {
+            Some(id) => self.song_views.entry(id).or_default(),
+            None => &mut self.view,
+        }
+    }
+
+    /// Switch which song the timeline shows. A no-op guard against
+    /// clobbering: switching to the song already active must not reset
+    /// anything, since `current_view_mut` would otherwise be free to
+    /// insert a fresh default over a camera that already existed the
+    /// instant this ran with the SAME id — it doesn't today (`entry`
+    /// preserves an existing value), but the guard also means this
+    /// function is the one place "switch song" logic lives if that ever
+    /// needs to do more than assign a field (recentring the playhead on
+    /// the song's own start, for instance).
+    pub fn switch_song(&mut self, to: Option<studio_core::GroupId>) {
+        self.active_song = to;
+    }
+
     /// Write the arrangement to `dir` as a file worth sending: 16-bit
     /// dithered WAV or 128kbps Ogg Opus — the format this project's own
     /// sample libraries arrive in, at roughly a tenth of the WAV's size.
@@ -1223,6 +1275,40 @@ impl Studio {
 mod tests {
     use super::*;
     use studio_egui::keys::Key;
+
+    #[test]
+    fn each_song_remembers_its_own_camera() {
+        // The whole point: zooming into song A must not move where song B
+        // is scrolled to, and switching back to A must restore exactly
+        // where it was, not reset to a fresh default.
+        let mut s = Studio::demo();
+        assert_eq!(s.active_song, None, "no groups yet: the single legacy view");
+        let (a, b) = (studio_core::GroupId(1), studio_core::GroupId(2));
+
+        s.switch_song(Some(a));
+        s.current_view_mut().px_per_sec = 40.0;
+        s.current_view_mut().scroll = Ticks(1000);
+
+        s.switch_song(Some(b));
+        // A fresh song starts from a fresh default, not a copy of A's camera.
+        assert_eq!(s.current_view().px_per_sec, studio_egui::View::default().px_per_sec);
+        s.current_view_mut().px_per_sec = 200.0;
+        s.current_view_mut().scroll = Ticks(50_000);
+
+        s.switch_song(Some(a));
+        assert_eq!(s.current_view().px_per_sec, 40.0, "A's zoom must survive visiting B");
+        assert_eq!(s.current_view().scroll, Ticks(1000));
+
+        s.switch_song(Some(b));
+        assert_eq!(s.current_view().px_per_sec, 200.0, "B's zoom must survive visiting A");
+        assert_eq!(s.current_view().scroll, Ticks(50_000));
+
+        // Leaving song mode entirely falls back to the ORIGINAL single
+        // view, untouched by either song's camera — the exact behaviour
+        // every pre-existing (groupless) project still gets.
+        s.switch_song(None);
+        assert_eq!(s.current_view().px_per_sec, studio_egui::View::default().px_per_sec);
+    }
 
     #[test]
     fn the_demo_project_is_not_empty() {
@@ -1694,8 +1780,8 @@ impl eframe::App for App {
                             SideSlot::Mixer => "mixer", SideSlot::Rack => "rack",
                             SideSlot::Program => "program",
                         }.to_string(),
-                        px_per_sec: self.studio.view.px_per_sec,
-                        scroll_ticks: self.studio.view.scroll.0,
+                        px_per_sec: self.studio.current_view().px_per_sec,
+                        scroll_ticks: self.studio.current_view().scroll.0,
                         closed_groups: self.studio.closed_groups.iter()
                             .map(|g| g.0).collect(),
                         bounce_format: self.bounce_format.token().to_string(),
@@ -2505,14 +2591,29 @@ impl eframe::App for App {
                     clip_inspector::show(ui, &mut self.studio, &colors);
                     let ph = self.studio.playhead();
                     let sel = self.studio.selection.clone();
-                    let tr = studio_egui::timeline(ui, &self.studio.session.doc,
-                                                   &mut self.studio.view,
+                    let mode = self.studio.keys.mode();
+                    let input_mode = self.studio.input_mode;
+                    let pending = self.studio.keys.pending();
+                    // One destructure, several fields at once: Rust treats
+                    // fields named together in a `let Struct { .. } = &mut
+                    // x` pattern as independently borrowed, which a method
+                    // call like `current_view_mut()` cannot express (it
+                    // takes `&mut self.studio` as a whole, opaque to the
+                    // borrow checker) — same shape as the identical fix in
+                    // rusty-board-egui and uikit-egui's `timeline()` call
+                    // this session.
+                    let Studio { view, song_views, active_song, session, trim_side,
+                                 closed_groups, .. } = &mut self.studio;
+                    let view = match *active_song {
+                        Some(id) => song_views.entry(id).or_default(),
+                        None => view,
+                    };
+                    let tr = studio_egui::timeline(ui, &session.doc,
+                                                   view,
                                                    &colors, ph, &sel, &self.peaks,
-                                                   self.studio.trim_side,
-                                                   &self.studio.closed_groups,
-                                                   self.studio.keys.mode(),
-                                                   self.studio.input_mode,
-                                                   &self.studio.keys.pending());
+                                                   *trim_side,
+                                                   closed_groups,
+                                                   mode, input_mode, &pending);
                     if let Some(t) = tr.sought {
                         // Scrub. The transport owns position, so this is a
                         // seek and not a model edit — moving the playhead
@@ -2620,7 +2721,7 @@ impl eframe::App for App {
                             .get(&target).cloned().unwrap_or_default();
                         let mut drag = self.studio.auto_drag;
                         let edits = studio_egui::auto::strip(
-                            ui, &points, &self.studio.view, &mut drag, Some(ph), &colors);
+                            ui, &points, self.studio.current_view(), &mut drag, Some(ph), &colors);
                         self.studio.auto_drag = drag;
                         for e in edits {
                             match e {
