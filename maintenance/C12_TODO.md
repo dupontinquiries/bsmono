@@ -428,16 +428,19 @@ build a song on, not a new concept.
 
 What's still needed, roughly in dependency order:
 
-- **C12-14a — per-song key.** `Project.key: Option<Key>` is project-wide
-  today; an album needs each song able to disagree. NOT a bare field on
-  `Group` — checked `Op::SetGroup`'s apply/invert (studio-core/src/lib.rs
-  ~745-755): undo reconstructs a full `Group` from `old.name`/
-  `old.clips`, so a third field would be silently NULLED by any undo of
-  an unrelated rename unless that reconstruction line is also updated.
-  The safe shape mirrors the existing project-wide `Op::SetKey`: a new
-  `Op::SetGroupKey { id: GroupId, key: Option<Key> }`, separate from
-  `SetGroup`, so existing serialized ops/patches and every existing
-  `SetGroup` call site stay exactly as they are.
+- **C12-14a — closed (`38b83972`).** `Op::SetGroupKey { id: GroupId, key:
+  Option<Key> }`, separate from `SetGroup`, exactly as designed below.
+  `SetGroup`'s own apply now preserves an existing key across a rename
+  (it didn't before this commit — would have silently nulled it), and
+  `RemoveGroup`'s undo bundles the key back in via `Op::Group` since by
+  the time that inverse runs the group is already gone and has nothing
+  to read a key from. Wire protocol (tag 30), command classification,
+  and the file-based project reconstruction path all updated too — each
+  would have silently dropped a song's key on its own path otherwise.
+  Tested at every layer (apply/invert, wire round-trip covering every
+  `Scale` variant, full-suite regression). Not yet wired to any UI —
+  needs 14d's song switcher first, so there's something to attach a key
+  picker to.
 - **C12-14b — per-song markers, maybe per-song tempo.** `Project.markers`
   is one flat `Vec<Marker>` today; whether an album wants markers scoped
   per-song or shared across the whole project (a "verse" marker meaning
