@@ -205,7 +205,22 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     let palette_open = state.palette.is_some();
     let other_widget_focused = ui.ctx().memory(|mem| mem.focused().is_some());
     if !palette_open && !other_widget_focused {
+        // THE TAB FIGHT, settled: when the editor owns input, Tab means
+        // indent / accept-ghost — but egui ALSO uses Tab for focus
+        // traversal, so with the F2 pane open a Tab would simultaneously
+        // edit AND yank keyboard focus into the pane's provider combo,
+        // sending the NEXT keystroke to the wrong place. Consuming Tab
+        // here removes it from egui's view before the focus system acts;
+        // once a pane field is genuinely focused (clicked), the guard
+        // above skips the editor and Tab field-hops in the pane as forms
+        // do.
+        // (Clone FIRST: consume_key strips the event, and the editor
+        // still needs its copy.)
         let events = ui.ctx().input(|i| i.events.clone());
+        ui.ctx().input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+            i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+        });
         for ev in events {
             let translated = match ev {
                 egui::Event::Text(t) => Some(Ev::Text(t)),
