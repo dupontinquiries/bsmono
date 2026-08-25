@@ -492,13 +492,16 @@ replace). Both tested, both green.
     `scroll_to_active()` keeps the current tab visible in a
     horizontally-scrolling bar, rather than collapsing to one page at a
     time. A working, different, equally legitimate strategy — not a gap.
-  - Also found along the way: snapclone's `nav_chrome::TabStrip` is a
-    SEPARATE copy of `uikit_egui::segmented_tabs::TabStrip`, not a user
-    of it — `segmented_tabs`' own doc says it was "hoisted FROM
-    snapclone's nav_chrome," and nothing ever switched snapclone over
-    to the hoisted version afterward. Same duplicated-kit shape as
-    voiceprint-kit/voiceterm and glove/a11y earlier this session. Worth
-    a dedup pass on its own, unrelated to responsive_nav.
+  - **Correction to a claim in the commit that introduced this
+    section:** I said snapclone's `nav_chrome::TabStrip` was a
+    SEPARATE, undedup'd copy of `uikit_egui::segmented_tabs::TabStrip`.
+    That was wrong — checked more carefully and `nav_chrome.rs` line 52
+    is `pub use uikit_egui::segmented_tabs::{strip_ui, Tab, TabStrip};`,
+    a plain re-export, with a comment right above it saying exactly
+    that ("The strip moved to the kit... snapclone keeps the peel
+    hint"). No duplication, no dedup needed. Recording the correction
+    here rather than quietly editing it away, since the wrong claim is
+    still sitting in `3b1a7644`'s commit message.
   `responsive_nav` stays a good fit for an app with NO existing overflow
   strategy — which is what ambient-learner and bot-arena both were
   before this session's changes — not a blanket replacement for every
