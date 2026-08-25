@@ -251,3 +251,169 @@ re-deriving the mandate.
 C11's §21 perf hunt (the submit-cause counting around `generate_kv_stream`
 that this session was oriented to do), the whole hive/queen thread (§19–20),
 and C11-2b's seven orphaned .rs files.
+
+## 9. voiceterm-egui: feature parity by direct comparison, not the audit tool
+
+The parity-audit tool's "87% code coverage" for voiceterm is close to
+meaningless: it counts one surface per `.qml` file, and voiceterm-qt puts
+almost everything — IRC, mail, browser, settings, manpages, the graph view
+— as inline `Item`/`Component` blocks inside one ~30,000-line `main.qml`.
+Eight `.qml` files total. The tool cannot see inside the monolith, so its
+number is not evidence either way. Compared directly instead, file by file:
+
+| Area | egui-frontend status |
+|---|---|
+| Graph view | `graph_view.rs` + `connections_graph.rs` + `layered_graph.rs` exist (323/317/384 lines) — real modules, not stubs. Feature-for-feature depth vs Qt's graph not yet checked. |
+| Email | `mail.rs` + `mail_view.rs` + `mail_selector.rs` exist (337/453/273 lines) — same, real modules, depth unchecked. |
+| IRC | **Nothing.** Qt has irc-search logic reachable from main.qml; egui-frontend has zero irc-anything. Not partial — absent. |
+| Mastodon | **Not a port gap.** Doesn't exist in voiceterm-qt either — `C9_TODO.md` names Tokodon (a separate KDE app) as reading material for an idea never built on either side. Don't spend effort "porting" something with no source. |
+| Niftycharts | Qt has niftyplot-equivalent rendering wired to `nifty-core` (extended this session with the hardware-diagram parser, `fd59fd3c`). egui-frontend has no nifty view file at all, despite already depending on `nifty-core` elsewhere (voiceterm's own `link_graph.rs`). Closest thing to a pure "the pieces exist, nobody wired the last one" gap. |
+| Web browsing | `browser.rs` exists (362 lines) — real module, depth unchecked. |
+| Settings | **Nothing.** No settings module, no settings file, anywhere in egui-frontend. Qt's Settings popup is large (model setup, wake-word config, alignment recalibration, notification toggles, per-section state) and none of it has a home on the egui side. |
+| Manpages | `manpage_view.rs` exists but documents its own real limitation in its header comment: it renders documents handed to it rather than owning the registry, because that logic lives inside `manpages.rs` (4,117 lines) tangled with Qt-only code, and splitting it needs a Qt-buildable host to verify against — which this sandbox has never had. An honest, named blocker, not neglect. |
+
+- **C12-9a** — IRC and Settings are the two genuine zero-to-something gaps.
+  Niftycharts is close behind (the hard part, `nifty-core`, already exists —
+  this is a wiring job, not a build-from-scratch). Recommended order:
+  Settings, then niftycharts, then IRC, then a real depth-check on
+  graph/mail/browser before touching them (their line counts say "real
+  module," not "feature-complete").
+
+## 10. logscope gpu-gemm: an architecture the wgpu engine correctly refuses
+
+Not a bug — the engine's refusal is working as designed, recorded here so a
+future session doesn't "fix" the refusal instead of the actual gap:
+
+    loader: .block_count is absent, but it IS present as ["muse-glimmer"] —
+      the hparam prefix is not the architecture name.
+    worker: load failed: architecture 'muse-glimmer' isn't supported by the
+      wgpu engine yet — use the llama.cpp backend. Also UNREAD tensors
+      (attn_gate.weight, 27262976 weights) — nothing in this engine consumes
+      it. A tensor the forward pass ignores does not error; it produces
+      plausible wrong output.
+
+The tensor dump (731 tensors, `attn_gate`/`attn_q_norm`/`attn_k_norm`/
+`post_attention_norm`/`post_ffw_norm` alongside the usual attn/ffn set) is
+a QK-norm architecture with a gating tensor the current engine's forward
+pass has no path for — a Gemma-2/3-shaped or Cohere-shaped variant, not one
+of the architectures already wired. `LOGSCOPE_TRY_UNSUPPORTED_ARCH=1` exists
+specifically so someone CAN force it and get wrong-but-plausible output on
+purpose; that is the documented expected failure, not a surprise to debug.
+
+- **C12-10a** — add `muse-glimmer` (or whatever GGUF actually names this
+  architecture family once the real name is confirmed — `hparam` prefixes
+  are not architecture names, per the loader's own log line) to the wgpu
+  engine: needs `attn_gate`, `attn_q_norm`/`attn_k_norm` (QK-norm), and
+  `post_attention_norm`/`post_ffw_norm` (post-norm placement, not the
+  usual pre-norm) wired into the forward pass. Per the refusal message
+  itself: an architecture becomes supported only once it has completed a
+  forward pass on a real checkpoint and produced coherent output — that is
+  the acceptance test, not "it loads without erroring."
+- **C12-10b** — separately, `.block_count` being absent under the expected
+  hparam key but present under `["muse-glimmer"]` suggests the GGUF
+  metadata key convention for this model family differs from what the
+  loader's hparam-prefix guesser expects. Worth checking whether that
+  guesser needs a fallback more general than "read the tensor names"
+  (which is what it fell back to here and which worked) for OTHER
+  metadata fields beyond block count.
+
+## 11. bo-suite-egui: split into the apps it already claims to be
+
+`README.md` already describes `bo-mux` (headless soundscape engine +
+multi-speaker mux, meant to survive GUI restarts, systemd-managed — see
+`DECISIONS.md`'s rejection of running it in-process inside the GUI) as
+architecturally separate from `bo-controller` (the GUI). The BACKEND is
+already split. The FRONTEND is not: `apps/bo-suite/egui-frontend` has
+exactly one binary target (`src/bin/bo_suite_egui.rs`) and one crate
+holding soundscape UI (`soundscape.rs`, 307 lines), music-player UI
+(`library.rs`/`queue.rs`/`transport.rs`/`all_tracks.rs`), device/ANC
+control (`anc.rs`, 506 lines — the whole-home noise-cancelling piece),
+and settings (`settings_page.rs`) all in one crate, all launched by one
+binary. Splitting the GUI to mirror the backend's own architecture is the
+ask, not building new backend separation.
+
+- **C12-11a** — not started. Candidate split: a soundscapes app (wraps
+  `soundscape.rs` + `spaces.rs`, talks to `bo-mux`), a music player (
+  `library.rs`/`queue.rs`/`transport.rs`/`all_tracks.rs`/`browse.rs`/
+  `catalog_source.rs`/`tags.rs`), and a control center (`anc.rs`/
+  `device.rs`/`outputs.rs`/`settings_page.rs` — the whole-home ANC piece
+  named in the ask). `chrome.rs`/`shell_bits.rs`/`dial.rs`/
+  `dial_watermark.rs`/`scrollfeel.rs`/`product_silhouette.rs`/
+  `safety.rs`/`dialogs.rs`/`channel.rs`/`anticipation.rs`/`fileproc.rs`
+  not yet sorted into a bucket — need reading before assuming which app
+  each belongs to, or whether some (chrome, shell_bits) are genuinely
+  shared shell code all three should keep depending on rather than
+  duplicate.
+- **C12-11b — media theater integration.** Not started, and no existing
+  file found to build on (`grep -rl "theater"` across bo-suite and
+  studio came back empty). Needs a design pass: is this bo-suite driving
+  a media-theater DEVICE/room profile (an ANC/spaces preset, closer to
+  `spaces.rs`), or bo-suite integrating WITH `apps/studio`'s video
+  pipeline for a home-theater playback surface? The ask doesn't say
+  which, and the two are different enough in scope that guessing wrong
+  wastes the work.
+
+## 12. bsgames: launch already works one way; the reverse and the rest don't exist yet
+
+`games/bsgames` already does more than a fresh read would guess. Its
+README states the design goal directly ("launch the fleet's games, see
+friends' presence over the netcode DHT, and chat via snapclone"), and
+`wiring.rs` backs it with real tests: `host_then_join_over_the_fleet_dht`
+publishes a session over snapcore's real Kademlia DHT (with a fake-DHT
+test double for when OpenDHT itself is down) and a deterministic session
+token so re-hosting reuses the same DHT key. `games/shared/netcode::
+handoff` — adopted verbatim from `soldier`'s original, now the one
+canonical copy every fleet game (`clawbound`, `soldier`, `blackstar-rs`,
+`skydribble`, `unendlich`, `echelon`) reads at startup — is the
+BSGAMES_HANDOFF_* env-var protocol: bsgames launches a game with
+`BSGAMES_HANDOFF_ROLE=host|join`, `_ME`, `_PEER` already set, so the game
+presents the SAME identity bsgames published rather than minting a second
+one, and joins the peer directly, skipping that game's own menus.
+
+What's genuinely missing, checked directly rather than assumed:
+
+- **C12-12a — no reverse direction.** bsgames -> game (launch with a
+  handoff) exists and is tested. Game -> bsgames (summon the centre from
+  inside a running game, to invite a friend or check who's online
+  without quitting) has no mechanism anywhere — grepped for any
+  in-game invocation of bsgames across every game directory, found
+  nothing. This is the literal "open bsgames from any game" half of the
+  ask, and it's the harder half: it needs either an overlay bsgames can
+  render inside another process's window, or a way for the running game
+  to spawn/focus a separate bsgames instance and hand control back
+  cleanly, which is a real design decision, not a wiring job.
+- **C12-12b — friends list.** `identity.rs` (118 lines) has the
+  player's own identity; not yet checked whether it or anything else
+  persists a FRIENDS list (as opposed to ad-hoc peers discovered per
+  session) — needs reading before claiming this is missing or present.
+- **C12-12c — voicechat through snapclone pipelines, with in-game
+  reverb.** No trace of this anywhere: grepped bsgames, netcode, and
+  snapclone for "voicechat"/"reverb" and found nothing. snapclone's own
+  voice-call pipeline (`voice_bridge.rs`, `group_voice.rs` per the
+  earlier snapclone session) is the thing to reuse rather than a fourth
+  voice stack, per this session's own recurring lesson about duplicated
+  kits (voiceprint-kit, glove vs a11y) — but reuse here means bsgames
+  depending on snapclone's voice crates directly, or a smaller shared
+  voice-pipeline crate extracted from snapclone the way `source_plan`
+  was pulled from camera-bridge into device-kit. Not designed yet.
+  "In-game reverb" specifically — sending a peer's voice through a
+  spatial/room effect tied to the game's own environment rather than
+  playing it dry — has no existing DSP hook identified in either
+  snapclone or any game's audio path.
+
+## 13. studio: the running tally against the original ask
+
+Restated so it isn't scattered across several earlier sessions' turns.
+Done: clip delete via `d` (already existed, `Action::Delete` was already
+wired), 32k/64k opus fidelity rungs (`914efea3`), the tune-key selector
+defaulting to no scale (`a7da20e4`), the mode HUD (`f054a1ef`). Still
+open, unchanged since last recorded: keybind-customization settings
+(needs a Settings-popup section — voiceterm-qt turned out NOT to have a
+customizable-keybind UI to copy, only a toggle-row settings popup shape,
+so this is new UI, not a port), the `Settings…`/`Archive…`/`Export…`
+buttons plus the scale switcher unified into one hamburger menu, video
+library management (reframed in §6 above — the audio-add sidebar gains a
+video path, not a new screen), and native av1/fao-codec decode wiring
+with proxy pushback for other formats (the biggest of the four, spans
+`studio-video`, `apps/fao-codec`, `apps/av1tuner`, not started).
+

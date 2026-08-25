@@ -115,11 +115,25 @@ impl Profile {
     /// Average each station with its neighbours — but never below what the
     /// rooms needed, which is why `fit` smooths AFTER the taper and why
     /// this takes the max with the original.
+    ///
+    /// BUG (found chasing the ship-interior test failures, c5blackstar-008):
+    /// this used to clamp to `a0[i] * 0.92`, not `a0[i]` — an 8% shrink
+    /// "for roundness" that the comment above never actually allowed for.
+    /// `fit` already bakes in `PLATE` (0.9m) between a room's true extent
+    /// and the pre-smooth station requirement, so an 8% cut only breaks
+    /// containment once a station is wide enough that 8% of it exceeds
+    /// 0.9m — which is exactly the mid-size-and-larger ships the failing
+    /// tests use (`len` 40/90/200) and exactly why a small hull could
+    /// still pass while `the_hull_contains_every_room_it_was_fitted_to`
+    /// failed at every length tried. `interior.rs`/`aboard.rs` build their
+    /// own containment on this same `Profile`, which is why their failures
+    /// (room bridge outside the hull, walkable hull corners, "mostly
+    /// corridor") were one root cause wearing four names, not four bugs.
     fn smooth(&mut self) {
         let (a0, b0) = (self.a, self.b);
         for i in 1..STATIONS - 1 {
-            self.a[i] = ((a0[i - 1] + a0[i] * 2.0 + a0[i + 1]) * 0.25).max(a0[i] * 0.92);
-            self.b[i] = ((b0[i - 1] + b0[i] * 2.0 + b0[i + 1]) * 0.25).max(b0[i] * 0.92);
+            self.a[i] = ((a0[i - 1] + a0[i] * 2.0 + a0[i + 1]) * 0.25).max(a0[i]);
+            self.b[i] = ((b0[i - 1] + b0[i] * 2.0 + b0[i + 1]) * 0.25).max(b0[i]);
         }
     }
 
