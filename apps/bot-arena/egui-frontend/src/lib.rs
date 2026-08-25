@@ -133,8 +133,10 @@ impl Dashboard {
         self.engine.running() || self.studio_host.worker_running()
     }
 
-    /// Render the dashboard. Swipe left/right pages between views; on desktop a tab row is
-    /// also shown (adaptive — the phone relies on the swipe).
+    /// Render the dashboard. Swipe left/right pages between views; a tab row
+    /// is shown instead whenever `VIEWS` actually fits the available width
+    /// (`uikit_egui::responsive_nav`) — a real fit check, not a device-class
+    /// guess, so the phone-vs-desktop line isn't drawn in the wrong place.
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
         let colors = uikit_egui::palette_colors(&self.palette);
         self.a11y.begin_frame();
@@ -146,8 +148,18 @@ impl Dashboard {
             self.swipe(dir.sign());
         }
 
-        // desktop shows a tab row; phone swipes
-        if !adaptive.is_compact() {
+        // Which shape fits: a real width check against VIEWS.len(), not a
+        // device-class guess. `adaptive.is_compact()` used to decide this
+        // alone, which can disagree with an actual fit in both directions —
+        // six short labels fit fine on a phone in landscape, and six long
+        // ones might not fit on a "regular" phone `is_compact()` says isn't
+        // narrow. `choose_adaptive` still reads the device's own touch
+        // target for the minimum tab width, so a touch screen gets the
+        // bigger, tappable segments it needs rather than as many as fit at
+        // mouse-cursor precision.
+        let layout = uikit_egui::responsive_nav::choose_adaptive(
+            adaptive, ui.available_width(), VIEWS.len());
+        if layout == uikit_egui::responsive_nav::NavLayout::Tabs {
             // The kit's strip, not a selectable_label row. Three apps were
             // hand-rolling the same thing and getting none of what the strip
             // gives: equal segments instead of tabs that resize with their
