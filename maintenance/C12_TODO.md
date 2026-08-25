@@ -74,10 +74,17 @@ looks like "the match rate got worse" rather than an error.
 
 - **C12-2a** — the real fix is voiceterm depending on the kit, which touches
   the AI01→AI02 file format and `N_MFCC`'s visibility; not a merge-integration
-  change.
-- **C12-2b** — the cheap guard is a `maintenance/tools` checker comparing
-  normalised function bodies across the two files and FAILING if either side
-  is missing (§5b: a scan that finds nothing must not pass).
+  change. Still open.
+- **C12-2b — closed.** `maintenance/tools/voiceprint_parity_check.py`
+  compares normalised `fingerprint`/`compute_mfcc` bodies across the two
+  files and fails on drift OR on either function going missing (a rename
+  is not a pass). Break-tested three ways on a scratch copy: a real logic
+  change (`N_MFCC` → `N_MFCC + 1` in the DCT call) is caught as DRIFTED; a
+  renamed function is caught as MISSING rather than silently skipped; the
+  known structural difference (voiceterm's `fingerprint` calls
+  `crate::phonetic::`-qualified paths that voiceprint-kit's unqualified
+  version does not need) is correctly normalised away rather than reported
+  as drift. Currently PASSES on this tree.
 
 ## 3. Inherited lore that was wrong, both corrected in place
 

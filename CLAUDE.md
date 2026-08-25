@@ -291,7 +291,15 @@ python3 maintenance/tools/orphan_check.py  # .rs files no `mod` declaration reac
 python3 maintenance/tools/archive_check.py # maintenance/archive/ provenance headers
 python3 maintenance/tools/aarch64_flags_check.py  # committed CPU flags vs the weakest target
 python3 maintenance/tools/eframe_backend_check.py . # eframe backends chosen, not inherited (glow, or wgpu with visible intent)
+python3 maintenance/tools/voiceprint_parity_check.py . # voiceterm's fingerprint/compute_mfcc vs shared/voiceprint-kit's copy
 ```
+
+`voiceprint_parity_check.py` exists because voiceprint-kit is a straight copy
+of voiceterm's own fingerprint code (`pub(crate)` widened to `pub`), not a
+shared dependency — see `maintenance/C12_TODO.md` §2. Nothing else notices if
+one side changes and the other doesn't; the checker fails loudly on drift or
+on either function going missing, until voiceterm depends on the kit for
+real (C12-2a) and the second copy can be deleted.
 
 `lock_check.py` exists because three stale lockfiles were found by tripping
 over them. A stale lock works perfectly online — cargo resolves the missing
