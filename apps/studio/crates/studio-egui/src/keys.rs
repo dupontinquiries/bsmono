@@ -42,6 +42,28 @@ pub enum Mode {
     Insert,
 }
 
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "normal",
+            Mode::Select => "select",
+            Mode::Insert => "insert",
+        }
+    }
+    /// A handful of keys worth putting in front of someone who is not sure
+    /// what mode does. Not the whole keymap — the HUD this feeds is meant
+    /// to stay small, so these are the ones with no other affordance on
+    /// screen: `w`/`b`/`e` motion is discoverable by trying arrow-like keys,
+    /// but `;` (collapse) and `C` (add selection) are not guessable at all.
+    pub fn hints(self) -> &'static [&'static str] {
+        match self {
+            Mode::Normal => &["x select", "d delete", "s split", "v select mode", "S-space menu"],
+            Mode::Select => &["w/b extend", "; collapse", "d delete", "Esc back to normal"],
+            Mode::Insert => &["Esc back to normal"],
+        }
+    }
+}
+
 /// A key press, reduced to what the map cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
@@ -303,6 +325,43 @@ mod tests {
 
     fn km() -> Keymap { Keymap::new() }
     fn act(k: &mut Keymap, ch: char) -> Resolution { k.feed(Key::c(ch)) }
+
+    #[test]
+    fn every_mode_has_a_label_and_the_hud_hints_are_not_stale() {
+        // The HUD in studio-egui's timeline() reads Mode::label()/hints()
+        // straight off the current Keymap. This is the guard against the
+        // hints drifting from the actual bindings above: each hinted key,
+        // fed through the real keymap in the mode it's hinted for, must
+        // produce an Act (bound) or Pending (a real prefix like 'g'), never
+        // None (unbound) — a stale hint pointing at a dead key is worse
+        // than no hint.
+        for mode in [Mode::Normal, Mode::Select, Mode::Insert] {
+            assert!(!mode.label().is_empty());
+            for hint in mode.hints() {
+                if hint.starts_with("Esc") {
+                    continue; // the escape hatch, not a feedable single char
+                }
+                let (key, rest) = if let Some(r) = hint.strip_prefix("S-") {
+                    let ch = if r.starts_with("space") { ' ' } else {
+                        r.chars().next().unwrap_or(' ')
+                    };
+                    (Key::shift(ch), r)
+                } else {
+                    let Some(ch) = hint.chars().next() else { continue };
+                    if !ch.is_ascii_alphanumeric() && !"%;=-".contains(ch) { continue; }
+                    (Key::c(ch), *hint)
+                };
+                let _ = rest;
+                let mut k = km();
+                k.mode = mode;
+                match k.feed(key) {
+                    Resolution::None => panic!(
+                        "{mode:?} hints '{hint}' but that key is unbound in that mode"),
+                    _ => {}
+                }
+            }
+        }
+    }
 
     #[test]
     fn counts_accumulate_and_apply_to_the_motion() {

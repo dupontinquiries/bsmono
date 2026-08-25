@@ -336,6 +336,12 @@ pub fn timeline(
     // because open-or-closed is the workspace sidecar's business while
     // membership is the project's.
     closed_groups: &std::collections::BTreeSet<studio_core::GroupId>,
+    // What mode/keyboard state the HUD in the corner reports. Passed in
+    // rather than read from a shared cell: this function stays a pure
+    // draw-and-report over its arguments, same as the rest of the file.
+    mode: keys::Mode,
+    input_mode: playkeys::InputMode,
+    pending: &str,
 ) -> TimelineResponse {
     // Closed compositions: which clips are folded away, and each fold's
     // hull. Computed FIRST so drawing (skip members, draw the block) and
@@ -620,6 +626,55 @@ pub fn timeline(
                 ui.strong(name);
                 for h in CLIP_HINTS { ui.weak(*h); }
             });
+        }
+    }
+    // ── mode HUD ───────────────────────────────────────────────────────────
+    // Playing mode replaces the whole keymap (see playkeys' module docs), so
+    // the HUD's hints must too — showing Normal-mode Helix hints while `d`
+    // is actually a piano note would be actively misleading. Bottom-left, on
+    // the timeline itself rather than the top bar: it is about what the
+    // NEXT keypress does here, so it belongs where the eyes already are
+    // when a hand freezes over the keyboard mid-edit, not in a strip that
+    // could be four scroll-lengths away in the workbench layout.
+    {
+        let label = if input_mode == playkeys::InputMode::Playing {
+            "playing".to_string()
+        } else if pending.is_empty() {
+            mode.label().to_string()
+        } else {
+            format!("{} {pending}", mode.label())
+        };
+        let hints: &[&str] = if input_mode == playkeys::InputMode::Playing {
+            &["any key plays a note", "C-space voice"]
+        } else {
+            mode.hints()
+        };
+        let pad = 6.0_f32;
+        let line_h = 13.0_f32;
+        let font_label = egui::FontId::proportional(11.0);
+        let font_hint = egui::FontId::monospace(9.0);
+        let label_w = painter.layout_no_wrap(label.clone(), font_label.clone(), colors.text)
+            .rect.width();
+        let hint_w = hints.iter()
+            .map(|h| painter.layout_no_wrap((*h).to_string(), font_hint.clone(), colors.text_weak)
+                .rect.width())
+            .fold(0.0_f32, f32::max);
+        let w = label_w.max(hint_w) + pad * 2.0;
+        let h = line_h * (1 + hints.len()) as f32 + pad * 2.0;
+        let hud = Rect::from_min_size(
+            Pos2::new(rect.left() + 4.0, rect.bottom() - h - 4.0), egui::vec2(w, h));
+        // Never over the ruler-seek or a clip a person is trying to reach:
+        // clamp to the visible band rather than letting a short, zoomed-out
+        // timeline push it off the top.
+        let hud = hud.translate(egui::vec2(0.0,
+            (origin.y + RULER_H - hud.top()).max(0.0)));
+        painter.rect_filled(hud, 4.0, colors.bg_raised.gamma_multiply(0.85));
+        painter.rect_stroke(hud, 4.0, Stroke::new(1.0, colors.border), egui::StrokeKind::Inside);
+        painter.text(Pos2::new(hud.left() + pad, hud.top() + pad), Align2::LEFT_TOP,
+                     &label, font_label, colors.accent);
+        for (i, h) in hints.iter().enumerate() {
+            painter.text(Pos2::new(hud.left() + pad, hud.top() + pad + line_h * (i + 1) as f32),
+                         Align2::LEFT_TOP, *h, font_hint.clone(), colors.text_weak);
         }
     }
     out

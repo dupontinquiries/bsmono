@@ -2509,7 +2509,10 @@ impl eframe::App for App {
                                                    &mut self.studio.view,
                                                    &colors, ph, &sel, &self.peaks,
                                                    self.studio.trim_side,
-                                                   &self.studio.closed_groups);
+                                                   &self.studio.closed_groups,
+                                                   self.studio.keys.mode(),
+                                                   self.studio.input_mode,
+                                                   &self.studio.keys.pending());
                     if let Some(t) = tr.sought {
                         // Scrub. The transport owns position, so this is a
                         // seek and not a model edit — moving the playhead
