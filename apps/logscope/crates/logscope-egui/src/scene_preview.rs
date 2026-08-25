@@ -32,6 +32,16 @@ impl Default for ScenePreview {
                 chat.set_cam(n[0], n[1], n[2]);
             }
         }
+        // Reach the full-screen-spatial composer/action-row panels in a headless screenshot without an
+        // interactive click on the toggle.
+        if std::env::var("LOGSCOPE_HIDE_BAR").map(|v| v != "0").unwrap_or(false) {
+            chat.set_hide_bottom_bar(true);
+        }
+        // Reach the PLAN/WORKSPACE/candidates panels (normally only populated by a live agent run) for
+        // headless screenshot verification.
+        if std::env::var("LOGSCOPE_AGENT_PANELS").is_ok() {
+            chat.debug_fill_agent_panels();
+        }
         Self { chat }
     }
 }

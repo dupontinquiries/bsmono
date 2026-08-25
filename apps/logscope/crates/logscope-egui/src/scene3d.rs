@@ -495,7 +495,13 @@ fn mistfall() -> Scene {
     let n_isle = ((5.0 + 8.0 * (ms - 1.0)).max(5.0) * td) as i32;
     for k in 0..n_isle {
         let ang = std::f32::consts::TAU * k as f32 / n_isle as f32 + hash(k, 1) * 0.5;
-        let rad = (3.4 + hash(k, 2) * 8.0) * ms.min(2.0);
+        // MIN RADIUS raised from 3.4: the auto-fit camera's distance floor is 5.0 (spatial::fit_distance's
+        // clamp), so on a small/tightly-clustered conversation an island could land closer to the target
+        // than the camera itself ever sits — screenshot comparison caught exactly this: a mossy boulder
+        // filling most of the frame at default distance, gone entirely once the camera pulled back. 6.5
+        // clears that floor plus the island's own radius (up to ~1.8) with margin, whatever angle the
+        // camera ends up facing.
+        let rad = (6.5 + hash(k, 2) * 8.0) * ms.min(2.0);
         let p = v(ang.cos() * rad, 1.6 + hash(k, 4) * 8.0, ang.sin() * rad * 0.8 + 0.5); // varied heights, lifted clear of the lake
         let mut isle = m3::rock(p, 0.9 + hash(k, 6) * 0.9, 200 + k as u32, c(0x3c, 0x46, 0x4a));
         m3::tint_up(&mut isle, c(0x4a, 0x60, 0x42), c(0x2c, 0x34, 0x38)); isle.mat = M::STONE; // mossy top, wet stone sides
