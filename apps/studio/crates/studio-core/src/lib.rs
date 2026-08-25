@@ -290,6 +290,15 @@ pub struct Marker {
 pub struct Group {
     pub name: String,
     pub clips: Vec<ClipId>,
+    /// This song's own key, independent of `Project.key` — an album
+    /// where each song is in a different key. `None` means "no opinion,"
+    /// same meaning as the project-wide key's `None`: every note is in
+    /// key when nobody set one, never "this song's notes are wrong."
+    /// `#[serde(default)]` so a project saved before this field existed
+    /// still loads, with every group reading as "no opinion" rather than
+    /// failing to deserialize.
+    #[serde(default)]
+    pub key: Option<Key>,
 }
 
 /// What an automation lane drives. Track and bus gain first — the volume
@@ -427,6 +436,16 @@ pub enum Op {
     /// here, so two writers converge on the last word rather than on a
     /// sum of transpositions.
     SetKey { key: Option<Key> },
+    /// Same, scoped to one song within a multi-song project — an album
+    /// where each track is in a different key. Deliberately its own op
+    /// rather than a field folded into `SetGroup`: `SetGroup` restates
+    /// name+membership absolutely on every rename, and a bare key field
+    /// there would be silently overwritten (or need every existing
+    /// `SetGroup` caller to start threading a key through a rename that
+    /// has nothing to do with key). Refused on a group that does not
+    /// exist — unlike the project-wide key, which always has a project
+    /// to belong to, a group-scoped key needs a group.
+    SetGroupKey { id: GroupId, key: Option<Key> },
     /// Add or move a named marker. Absolute by NAME: setting a marker
     /// that already exists moves it, which is what "set the chorus here"
     /// means when you meant it the second time.
@@ -746,17 +765,30 @@ impl Project {
                 if clips.is_empty() {
                     return Err(EditError::EmptyGroup);
                 }
+                let old_key = self.groups.get(id).and_then(|g| g.key);
                 let inv = match self.groups.get(id) {
                     Some(old) => Op::SetGroup { id: *id, name: old.name.clone(),
                                                 clips: old.clips.clone() },
                     None => Op::RemoveGroup { id: *id },
                 };
-                self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone() });
+                // `SetGroup` restates name+membership absolutely (LWW), but
+                // NOT the key — that has its own op (`SetGroupKey`) and its
+                // own last-write-wins slot, same reasoning as why renaming
+                // a track doesn't reset its fader. A rename must not
+                // silently erase a song's key.
+                self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone(),
+                                                 key: old_key });
                 Ok(inv)
             }
             Op::SetKey { key } => {
                 let inv = Op::SetKey { key: self.key };
                 self.key = *key;
+                Ok(inv)
+            }
+            Op::SetGroupKey { id, key } => {
+                let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
+                let inv = Op::SetGroupKey { id: *id, key: g.key };
+                g.key = *key;
                 Ok(inv)
             }
             Op::SetMarker { at, name } => {
@@ -803,7 +835,23 @@ impl Project {
             }
             Op::RemoveGroup { id } => {
                 let old = self.groups.remove(id).ok_or(EditError::NoSuchGroup(*id))?;
-                Ok(Op::SetGroup { id: *id, name: old.name, clips: old.clips })
+                let restore = Op::SetGroup { id: *id, name: old.name, clips: old.clips };
+                // The key has its own op and would otherwise be lost:
+                // `SetGroup`'s own apply reads the CURRENT `self.groups`
+                // entry for the key to preserve, and by the time this
+                // inverse actually runs the group has already been
+                // removed, so a bare `SetGroup` alone would restore the
+                // membership but silently drop the key. Bundle both as one
+                // `Group` op — same one-undo-per-user-action shape
+                // `ClearMarkers` already uses — only when there was a key
+                // to restore, so a keyless group's undo stays the plain
+                // single op it always was.
+                match old.key {
+                    Some(key) => Ok(Op::Group { ops: vec![
+                        restore, Op::SetGroupKey { id: *id, key: Some(key) },
+                    ] }),
+                    None => Ok(restore),
+                }
             }
         }
     }
@@ -1727,6 +1775,54 @@ mod group_and_bus_input_tests {
         assert_eq!(p.clips, clips_before, "ungrouping is organizational, never musical");
         p.apply(&inv2).unwrap();
         assert_eq!(p.groups[&GroupId(1)].name, "hook");
+    }
+
+    #[test]
+    fn a_groups_key_has_its_own_op_and_survives_rename_and_remove_undo() {
+        let mut p = project();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A".into(), muted: false, locked: false, gain: 1.0, route: None },
+            at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "Track 1".into(),
+                                clips: vec![ClipId(1)] }).unwrap();
+
+        // SetGroupKey refuses a group that does not exist — a group-scoped
+        // key needs a group, unlike the project-wide key.
+        assert!(matches!(p.apply(&Op::SetGroupKey { id: GroupId(99), key: None }),
+                         Err(EditError::NoSuchGroup(GroupId(99)))));
+
+        let d_dorian = Key { root: 2, scale: Scale::Dorian };
+        let inv = p.apply(&Op::SetGroupKey { id: GroupId(1), key: Some(d_dorian) }).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].key, Some(d_dorian));
+        assert_eq!(inv, Op::SetGroupKey { id: GroupId(1), key: None }, "invert = the old value");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].key, None, "inverse round-trips cleanly");
+        p.apply(&Op::SetGroupKey { id: GroupId(1), key: Some(d_dorian) }).unwrap();
+
+        // Renaming (SetGroup) must NOT reset the key — a rename has
+        // nothing to do with key, and SetGroup restates name+membership
+        // absolutely on every call.
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "Verse".into(),
+                                clips: vec![ClipId(1)] }).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].key, Some(d_dorian),
+                   "a rename silently erasing the key would be exactly the bug this guards");
+
+        // RemoveGroup's undo must restore the key too, not just name+membership —
+        // by the time the inverse runs the group is already gone, so `SetGroup`
+        // alone (which reads the CURRENT entry to preserve a key) has nothing to
+        // read from.
+        let inv_remove = p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
+        assert!(p.groups.get(&GroupId(1)).is_none());
+        p.apply(&inv_remove).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].name, "Verse");
+        assert_eq!(p.groups[&GroupId(1)].key, Some(d_dorian),
+                   "undo-of-remove must not silently drop the song's key");
     }
 }
 

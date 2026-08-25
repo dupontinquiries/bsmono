@@ -129,6 +129,13 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
             .filter(|c| project.clips.contains_key(c)).collect();
         if !clips.is_empty() {
             ops.push(Op::SetGroup { id: *id, name: g.name.clone(), clips });
+            // SetGroup does not carry the key (see its own doc comment —
+            // key has its own last-write-wins slot), so a group's key
+            // needs its own op here too, or replaying this reconstruction
+            // silently drops every song's key.
+            if g.key.is_some() {
+                ops.push(Op::SetGroupKey { id: *id, key: g.key });
+            }
         }
     }
     ops.extend(relock);

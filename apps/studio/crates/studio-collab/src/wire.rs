@@ -349,28 +349,53 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::RemoveGroup { id } => { put_u8(o, 24); put_u64(o, id.0); }
         Op::SetKey { key } => {
             put_u8(o, 26);
-            match key {
-                None => put_u8(o, 0),
-                Some(k) => {
-                    put_u8(o, 1);
-                    put_u8(o, k.root);
-                    put_u8(o, match k.scale {
-                        studio_core::Scale::Major => 0, studio_core::Scale::Minor => 1,
-                        studio_core::Scale::Dorian => 2, studio_core::Scale::Mixolydian => 3,
-                        studio_core::Scale::Chromatic => 4,
-                    });
-                }
-            }
+            put_opt_key(o, key);
         }
         Op::SetMarker { at, name } => { put_u8(o, 27); put_ticks(o, *at); put_str(o, name); }
         Op::RemoveMarker { name } => { put_u8(o, 28); put_str(o, name); }
         Op::ClearMarkers => put_u8(o, 29),
+        Op::SetGroupKey { id, key } => {
+            put_u8(o, 30); put_u64(o, id.0); put_opt_key(o, key);
+        }
         Op::Group { ops } => {
             put_u8(o, 25);
             put_u16(o, ops.len().min(u16::MAX as usize) as u16);
             for inner in ops.iter().take(u16::MAX as usize) { put_op(o, inner); }
         }
     }
+}
+
+/// `SetKey` and `SetGroupKey` write the identical `Option<Key>` shape
+/// (0 = None, 1 + root + scale-tag = Some) — factored out once this
+/// session added the second writer of it, rather than a second hand-kept
+/// copy of the scale-tag table drifting from the first.
+fn put_opt_key(o: &mut Vec<u8>, key: &Option<studio_core::Key>) {
+    match key {
+        None => put_u8(o, 0),
+        Some(k) => {
+            put_u8(o, 1);
+            put_u8(o, k.root);
+            put_u8(o, match k.scale {
+                studio_core::Scale::Major => 0, studio_core::Scale::Minor => 1,
+                studio_core::Scale::Dorian => 2, studio_core::Scale::Mixolydian => 3,
+                studio_core::Scale::Chromatic => 4,
+            });
+        }
+    }
+}
+
+fn get_opt_key(r: &mut R) -> Option<Option<studio_core::Key>> {
+    Some(match r.u8()? {
+        0 => None,
+        1 => Some(studio_core::Key {
+            root: r.u8()?,
+            scale: match r.u8()? {
+                0 => studio_core::Scale::Major, 1 => studio_core::Scale::Minor,
+                2 => studio_core::Scale::Dorian, 3 => studio_core::Scale::Mixolydian,
+                4 => studio_core::Scale::Chromatic, _ => return None,
+            } }),
+        _ => return None,
+    })
 }
 
 fn get_op(r: &mut R) -> Option<Op> {
@@ -424,20 +449,11 @@ fn get_op(r: &mut R) -> Option<Op> {
             Op::SetGroup { id, name, clips }
         }
         24 => Op::RemoveGroup { id: GroupId(r.u64()?) },
-        26 => Op::SetKey { key: match r.u8()? {
-            0 => None,
-            1 => Some(studio_core::Key {
-                root: r.u8()?,
-                scale: match r.u8()? {
-                    0 => studio_core::Scale::Major, 1 => studio_core::Scale::Minor,
-                    2 => studio_core::Scale::Dorian, 3 => studio_core::Scale::Mixolydian,
-                    4 => studio_core::Scale::Chromatic, _ => return None,
-                } }),
-            _ => return None,
-        } },
+        26 => Op::SetKey { key: get_opt_key(r)? },
         27 => Op::SetMarker { at: Ticks(r.i64()?), name: r.str()? },
         28 => Op::RemoveMarker { name: r.str()? },
         29 => Op::ClearMarkers,
+        30 => Op::SetGroupKey { id: GroupId(r.u64()?), key: get_opt_key(r)? },
         25 => {
             let n = r.u16()? as usize;
             let mut ops = Vec::with_capacity(n.min(4096));
@@ -1213,3 +1229,29 @@ mod group_wire_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod group_key_wire_tests {
+    use super::*;
+    use studio_core::{GroupId, Key, Scale};
+
+    #[test]
+    fn set_group_key_survives_the_wire_exactly_some_and_none() {
+        for op in [
+            Op::SetGroupKey { id: GroupId(7), key: Some(Key { root: 2, scale: Scale::Dorian }) },
+            Op::SetGroupKey { id: GroupId(7), key: None },
+            // every scale tag, since put_opt_key/get_opt_key hand-encode
+            // the tag table rather than deriving it — a new Scale variant
+            // added without a matching wire tag would silently miscode
+            // rather than fail to compile, so every tag gets exercised.
+            Op::SetGroupKey { id: GroupId(1), key: Some(Key { root: 0, scale: Scale::Major }) },
+            Op::SetGroupKey { id: GroupId(1), key: Some(Key { root: 0, scale: Scale::Minor }) },
+            Op::SetGroupKey { id: GroupId(1), key: Some(Key { root: 0, scale: Scale::Mixolydian }) },
+            Op::SetGroupKey { id: GroupId(1), key: Some(Key { root: 0, scale: Scale::Chromatic }) },
+        ] {
+            let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 4, site: SiteId(1) }, op });
+            assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
+        }
+    }
+}
+
