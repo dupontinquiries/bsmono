@@ -441,26 +441,48 @@ What's still needed, roughly in dependency order:
   `Scale` variant, full-suite regression). Not yet wired to any UI —
   needs 14d's song switcher first, so there's something to attach a key
   picker to.
-- **C12-14b — per-song markers, maybe per-song tempo.** `Project.markers`
-  is one flat `Vec<Marker>` today; whether an album wants markers scoped
-  per-song or shared across the whole project (a "verse" marker meaning
-  the same thing in every song) is a real design question, not
-  self-evident — needs a decision before touching the data model, since
-  it's the same undo-correctness shape as 14a either way.
-  `Ticks`/tempo — not checked yet whether tempo is per-project or
-  per-track/clip already; if project-wide, same problem as key.
+- **C12-14b — closed for tempo (`52e7b093`), still open for markers.**
+  `Op::SetGroupTempo { id: GroupId, tempo: Option<TempoMap> }`, same
+  shape as 14a's key, including the same `SetGroup`-preserves-it-across-
+  rename and `RemoveGroup`-undo-bundles-it-back-in fixes, generalized
+  to handle key and tempo together. `TempoMap` itself: piecewise-
+  constant BPM, `tick_to_beat`/`beat_to_tick` as a read-only lens over
+  ticks a clip never gets stretched to match — verified with a
+  round-trip sweep across a tempo change, not just at cherry-picked
+  points. Whether MARKERS should be per-song or shared across the whole
+  project remains an open design question, unchanged from when this
+  item was first written.
+- **C12-14d — closed (`07f9b8fc`).** Landed in the command palette
+  ("switch song" / "set song key"), per direct instruction to put it
+  there until it has an obvious permanent home rather than invent one.
+  Tested: resolves to the right group and to "whole project" with and
+  without existing groups; the key path is checked to land on
+  `SetGroupKey`, never the project-wide `SetKey`.
 - **C12-14c — the music-video link.** No existing field anywhere
   associates a `Group`/song with a video clip or a `studio-video` asset.
   Needs the video pipeline this session already tracked as unstarted
   (§13, av1/fao-codec wiring) to exist in some form first, or at minimum
   a placeholder association (a `GroupId` -> `ClipId` map for "this
   song's video") that doesn't depend on decode actually working yet.
-- **C12-14d — UI: switching the active song.** `Studio::switch_song()`
-  exists and is tested at the model layer; nothing calls it from the UI.
-  Needs a song-switcher affordance (tabs? a list in the sidebar?) in
-  `studio-app`'s timeline chrome, and probably belongs in the same
-  hamburger-menu unification already tracked in §13 rather than as a
-  fifth separate top-bar control.
+- **C12-14f — the four pieces still genuinely untouched, named
+  explicitly so "the tempo work" doesn't read as more done than it is:**
+  - **Grid rendering.** Non-uniform tick markers on screen, following
+    `TempoMap`'s detents instead of a fixed spacing — "something unique
+    in the code," per the original framing, and a separate
+    rendering-layer task now that the model underneath it is trustworthy
+    (tested), not before.
+  - **Clip-stretching/alignment DSP.** Explicitly still hard, explicitly
+    NOT "stretch every clip to the workspace tempo" — that's the
+    antipattern `TempoMap` was designed around, not toward.
+  - **Export-popup wizard grouping.** By-section vs. chapters vs. a
+    single export, as a distinct grouping/wizard on the export popup —
+    ties into C12-14e below (what "export the album" means) but is its
+    own UI work regardless of how that question resolves.
+  - **Palette wiring for tempo.** "Set song tempo" doesn't exist yet in
+    `palette.rs` — should mirror "set song key"'s three-step shape
+    (`Ask::SongForKey` → root → scale becomes something equivalent for
+    a BPM value or a tap-tempo entry) now that `SetGroupTempo` is
+    verified, the same order C12-14a/14d already followed.
 - **C12-14e — what "the whole project" means once songs exist.** Export
   (`bounce`), the mixer, and anything that currently assumes one
   timeline for the whole project need a decision: does exporting "the
@@ -513,4 +535,52 @@ replace). Both tested, both green.
   COMPILE that error message as code. Fenced as ` ```text ` instead.
   `cargo test --doc` now runs 0 doctests (correctly, the false one is
   gone) with 0 failures.
+
+## 16. Energy-aware adaptive dashboarding — the design, and where it stops
+
+Direct instruction: smart adaptive layout (`responsive_nav` and anything
+like it) must respect performance and energy constraints — cull what isn't
+shown before reaching for a manual tuning knob — and must not create bugs
+or stall networking for apps with a collaboration element (`logscope`,
+`studio-live`, anything syncing a Doc/op-log across peers).
+
+**Done (`7d8a8ea4`):** `responsive_nav` gained `NavLayoutTracker`
+(change-only notification, so a resize drag doesn't retrigger transition
+work every frame it happens to straddle the fit boundary) and an explicit
+module-doc section stating the two rules directly rather than leaving them
+implicit: this module decides chrome shape only, never gates an inactive
+page's real work (that is the caller's `match self.view_idx` to skip or
+not), and visibility must never gate op-log replay, presence, or outbound
+edits — `choose`/`choose_adaptive` take only a width and a count by design,
+with no parameter a future caller could wire to network state by accident.
+
+**The cull-vs-tune order, as asked ("your call"):** for a page that IS
+hidden and NOT collaborative, the automatic-first ladder is (1) skip the
+frame's expensive recompute entirely if the page has no visible surface
+and no other reason to run (a physics step, a filter graph, a decode with
+nobody watching), (2) if the app needs SOME liveness even when hidden
+(a level meter that should read correctly the instant you switch to it,
+not a beat late), lower the tick rate rather than stopping it outright,
+(3) only reach for a manual per-app tuning knob (an app-specific "how much
+to do when hidden" setting) when neither of the first two is a clean fit —
+which should be rare, because most dashboards are exactly the "nobody's
+looking, do nothing" case. This ladder is not built as reusable kit code
+yet — recorded as the decision, not the deliverable, since the actual
+skip/throttle logic lives in each app's own update loop and there was no
+single obvious primitive to hoist without a second real consumer to check
+it against (the same reason a kit function should follow, not precede, a
+concrete need — see `device-kit::source_plan`'s own history this session).
+
+- **C12-16a** — apply the ladder above to a real dashboard app once one
+  is identified with an actual hidden-page cost worth culling (candidates:
+  `bo-suite`'s ANC/soundscape panels, `ambient-learner`'s sensor pages —
+  neither audited yet for what their inactive pages actually compute per
+  frame).
+- **C12-16b — logscope and studio-live specifically.** Neither has
+  been audited for whether ANY existing code already makes the mistake
+  this section warns against (gating sync/replay on tab visibility).
+  Given `responsive_nav` has no foothold into either app yet (§15's
+  C12-15a found neither app's tab problem is a `responsive_nav` fit), this
+  audit is independent of that module — it's about their OWN update
+  loops, not about adopting new nav chrome. Not started.
 
