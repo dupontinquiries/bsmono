@@ -29,6 +29,8 @@ use studio_audio::SourceAudio;
 /// whoever insists — never as anyone's default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BounceFormat {
+    Opus32,
+    Opus64,
     Opus128,
     Opus192,
     Opus256,
@@ -36,11 +38,19 @@ pub enum BounceFormat {
     Wav,
 }
 impl BounceFormat {
-    pub const ALL: [BounceFormat; 5] = [BounceFormat::Opus128, BounceFormat::Opus192,
+    pub const ALL: [BounceFormat; 7] = [BounceFormat::Opus32, BounceFormat::Opus64,
+                                        BounceFormat::Opus128, BounceFormat::Opus192,
                                         BounceFormat::Opus256, BounceFormat::Flac,
                                         BounceFormat::Wav];
     pub fn label(self) -> &'static str {
         match self {
+            // 32k/64k are voice rungs, not music ones — named as such so the
+            // slider doesn't imply they're a smaller version of the same
+            // thing 128k is. Reaching past 64k for spoken word is the
+            // library-management use case this exists for; music wants the
+            // 128k floor above.
+            BounceFormat::Opus32 => "opus 32k (voice)",
+            BounceFormat::Opus64 => "opus 64k (voice)",
             BounceFormat::Opus128 => "opus 128k",
             BounceFormat::Opus192 => "opus 192k",
             BounceFormat::Opus256 => "opus 256k",
@@ -51,6 +61,7 @@ impl BounceFormat {
     /// Sidecar round-trip token — stable, label-independent.
     pub fn token(self) -> &'static str {
         match self {
+            BounceFormat::Opus32 => "opus-32", BounceFormat::Opus64 => "opus-64",
             BounceFormat::Opus128 => "opus-128", BounceFormat::Opus192 => "opus-192",
             BounceFormat::Opus256 => "opus-256", BounceFormat::Flac => "flac",
             BounceFormat::Wav => "wav",
@@ -128,7 +139,9 @@ pub fn bounce(dir: &Path, state: &PadState, format: BounceFormat)
         BounceFormat::Flac => studio_media::flac::encode_flac(&a, seed)
             .map_err(|e| format!("flac: {e}"))?,
         f => {
-            let bitrate = match f { BounceFormat::Opus128 => 128_000,
+            let bitrate = match f { BounceFormat::Opus32 => 32_000,
+                                    BounceFormat::Opus64 => 64_000,
+                                    BounceFormat::Opus128 => 128_000,
                                     BounceFormat::Opus256 => 256_000,
                                     _ => 192_000 };
             match studio_media::encode_opus(&a, bitrate) {
@@ -262,6 +275,31 @@ mod tests {
                 "lossless without the uncompressed bill");
         assert!(bounce(&dir, &PadState::default(), BounceFormat::Opus192).is_err(),
                 "an empty pad refuses out loud");
+    }
+
+    #[test]
+    fn voice_bitrate_rungs_bounce_smaller_than_music_ones() {
+        let dir = std::env::temp_dir()
+            .join(format!("studio-morph-voice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pad = PadState::default();
+        pad.push("Narration".into(), tone(220.0));
+        let thirty_two = bounce(&dir, &pad, BounceFormat::Opus32).expect("bounces at 32k");
+        let sixty_four = bounce(&dir, &pad, BounceFormat::Opus64).expect("bounces at 64k");
+        let one_two_eight = bounce(&dir, &pad, BounceFormat::Opus128).expect("bounces at 128k");
+        // Actual bitstream size, not the requested rate — this is the thing
+        // library management cares about, and it's the only way a build
+        // without libopus (which falls back to FLAC for every Opus* rung,
+        // see `bounce`) would still be caught making all three identical.
+        let size = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+        assert!(size(&thirty_two) < size(&sixty_four),
+                "32k rung should be smaller than 64k");
+        assert!(size(&sixty_four) < size(&one_two_eight),
+                "64k rung should be smaller than 128k");
+        assert_eq!(BounceFormat::from_token("opus-32"), BounceFormat::Opus32);
+        assert_eq!(BounceFormat::from_token("opus-64"), BounceFormat::Opus64);
+        assert_eq!(BounceFormat::ALL.len(), 7, "32k and 64k joined the existing five rungs");
     }
 
     #[test]
