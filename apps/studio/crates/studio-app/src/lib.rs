@@ -3079,6 +3079,16 @@ impl App {
                 palette::ShellVerb::ToggleLibrary => {
                     self.library_open = !self.library_open;
                 }
+                palette::ShellVerb::SwitchSong(id) => {
+                    self.studio.switch_song(id);
+                    self.studio.status = match id {
+                        Some(id) => match self.studio.session.doc.project.groups.get(&id) {
+                            Some(g) => format!("song: {}", g.name),
+                            None => "song".into(),
+                        },
+                        None => "whole project".into(),
+                    };
+                }
             },
         }
     }

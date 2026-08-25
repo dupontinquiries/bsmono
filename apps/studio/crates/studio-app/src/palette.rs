@@ -56,6 +56,8 @@ pub enum ShellVerb {
     Settings,
     ToggleWorkbench,
     ToggleLibrary,
+    /// Make the timeline show this song (`None` = the whole project).
+    SwitchSong(Option<studio_core::GroupId>),
 }
 
 /// One offer in the current step.
@@ -101,6 +103,17 @@ pub enum Ask {
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
     MuteTrack,
+    /// Which song (group) to make the timeline show — or "whole project"
+    /// to leave song mode. No permanent home in the chrome yet (there is
+    /// no song-switcher tab), so this lives here until one exists; the
+    /// palette is explicitly the fallback for exactly that case.
+    SwitchSong,
+    /// Which song to set a key for…
+    SongForKey,
+    /// …then which root (carries the chosen song)…
+    SongKeyRootPick(studio_core::GroupId),
+    /// …then which scale (carries song and root).
+    SongKeyScale(studio_core::GroupId, u8),
 }
 
 fn db(gain: f32, delta_db: i8) -> f32 {
@@ -116,6 +129,8 @@ pub fn root() -> Vec<Choice> {
         c("play / pause", Some("space"), Then::Do(Act::Key(' '))),
         // Key and scale — the data flow the roll's guide reads.
         c("set project key", None, Then::Ask(Ask::KeyRoot)),
+        c("switch song", None, Then::Ask(Ask::SwitchSong)),
+        c("set song key", None, Then::Ask(Ask::SongForKey)),
         c("voice vocabulary (genre words)", None, Then::Ask(Ask::VoiceVocab)),
         c("toggle out-of-key dimming", None,
           Then::Do(Act::Shell(ShellVerb::ToggleKeyGuide))),
@@ -174,6 +189,36 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                                 studio_core::Scale::Chromatic].iter()
             .map(|s| plain(s.name().to_string(), Then::Do(Act::Ops(vec![
                 Op::SetKey { key: Some(studio_core::Key { root, scale: *s }) }]))))
+            .collect(),
+        Ask::SwitchSong => {
+            let mut out: Vec<Choice> = project.groups.iter()
+                .map(|(id, g)| plain(g.name.clone(),
+                    Then::Do(Act::Shell(ShellVerb::SwitchSong(Some(*id))))))
+                .collect();
+            // Always offered, even with zero groups — the way back to the
+            // one camera every project starts in, and the only path back
+            // once a song has been picked.
+            out.push(plain("whole project".into(),
+                Then::Do(Act::Shell(ShellVerb::SwitchSong(None)))));
+            out
+        }
+        Ask::SongForKey => project.groups.iter()
+            .map(|(id, g)| plain(
+                match g.key {
+                    Some(k) => format!("{} ({})", g.name, k.name()),
+                    None => g.name.clone(),
+                },
+                Then::Ask(Ask::SongKeyRootPick(*id))))
+            .collect(),
+        Ask::SongKeyRootPick(song) => studio_core::PITCH_NAMES.iter().enumerate()
+            .map(|(i, n)| plain((*n).to_string(), Then::Ask(Ask::SongKeyScale(song, i as u8))))
+            .collect(),
+        Ask::SongKeyScale(song, root) => [studio_core::Scale::Major, studio_core::Scale::Minor,
+                                studio_core::Scale::Dorian, studio_core::Scale::Mixolydian,
+                                studio_core::Scale::Chromatic].iter()
+            .map(|s| plain(s.name().to_string(), Then::Do(Act::Ops(vec![
+                Op::SetGroupKey { id: song,
+                    key: Some(studio_core::Key { root, scale: *s }) }]))))
             .collect(),
         Ask::FindHow => vec![
             plain("by name".into(), Then::Do(Act::Shell(ShellVerb::Find(0)))),
@@ -376,6 +421,58 @@ mod tests {
         // Stopping mid-wizard is None, not a half-applied guess.
         assert!(Palette::resolve(&p, &["route"]).is_none());
         assert!(Palette::resolve(&p, &["route", "nonesuch"]).is_none());
+    }
+
+    fn project_with_groups() -> Project {
+        let mut p = project();
+        p.apply(&Op::AddSource { source: studio_core::Source { id: studio_core::SourceId(1),
+            path: "x".into(), len: studio_core::Ticks::from_seconds(10.0), sample_rate: 48_000,
+            channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: studio_core::Clip { id: studio_core::ClipId(1),
+            source: studio_core::SourceId(1), track: TrackId(1), pos: studio_core::Ticks::ZERO,
+            src_in: studio_core::Ticks::ZERO, len: studio_core::Ticks::from_seconds(1.0),
+            gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(1), name: "Track 1".into(),
+                                clips: vec![studio_core::ClipId(1)] }).unwrap();
+        p
+    }
+
+    #[test]
+    fn switch_song_offers_every_group_plus_the_way_back() {
+        let p = project_with_groups();
+        let act = Palette::resolve(&p, &["switch song", "track 1"]).expect("resolves");
+        assert_eq!(act, Act::Shell(ShellVerb::SwitchSong(Some(studio_core::GroupId(1)))));
+        // The way back exists even though "whole project" was never a
+        // group — this is the one candidate list that must offer an
+        // option NOT drawn from `project.groups`, or there would be no
+        // path out of song mode from the palette at all.
+        let back = Palette::resolve(&p, &["switch song", "whole project"]).expect("resolves");
+        assert_eq!(back, Act::Shell(ShellVerb::SwitchSong(None)));
+    }
+
+    #[test]
+    fn switch_song_offers_the_way_back_even_with_zero_groups() {
+        // A project with no songs yet must still resolve "whole project" —
+        // it is not just the alternative to a group, it is the default,
+        // and a palette that only shows it once a group exists would make
+        // the very first group irreversible from here.
+        let p = project();
+        let act = Palette::resolve(&p, &["switch song", "whole project"]).expect("resolves");
+        assert_eq!(act, Act::Shell(ShellVerb::SwitchSong(None)));
+    }
+
+    #[test]
+    fn set_song_key_walks_song_then_root_then_scale() {
+        let p = project_with_groups();
+        let act = Palette::resolve(&p, &["set song key", "track 1", "d", "dorian"])
+            .expect("resolves");
+        assert_eq!(act, Act::Ops(vec![Op::SetGroupKey { id: studio_core::GroupId(1),
+            key: Some(studio_core::Key { root: 2, scale: studio_core::Scale::Dorian }) }]));
+        // This must be Op::SetGroupKey, never the project-wide Op::SetKey —
+        // the whole reason C12-14a exists as its own op rather than reusing
+        // the project-wide one is that these two must never be confused,
+        // in either direction.
+        assert!(!matches!(act, Act::Ops(ref ops) if matches!(ops[0], Op::SetKey { .. })));
     }
 
     #[test]
