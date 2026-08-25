@@ -627,6 +627,13 @@ pub struct AgentConfig {
     /// Doc mode: teach the agent the document-organization convention (front-matter + section tree +
     /// generated index) so its docs stay organized and, in a fan, merge cleanly across branches.
     pub doc_mode: bool,
+    /// HectorMode: fold in the working-discipline block (find the oracle,
+    /// observe before building, verify by measuring output rather than exit
+    /// status, name the layer before editing, report dead ends, never write
+    /// unverified work in the past tense). Distilled from a 472-hour observed
+    /// engineering corpus rather than from taste; see `hectormode.rs`. Costs
+    /// ~450 tokens of prompt (`HECTOR_MODE_BRIEF` is ~120 for small windows).
+    pub hector_mode: bool,
     /// Patch-first editing (context economy for big models): instruct the model to modify EXISTING
     /// files with the `edit` tool (anchored find→replace) rather than re-emitting whole files.
     /// Whole-file output is what fills the window and drags tok/s; anchored patches keep each turn a
@@ -657,6 +664,7 @@ impl Default for AgentConfig {
             gate_done_on_verify: true,
             read_policy: ReadPolicy::Full,
             doc_mode: false,
+            hector_mode: false,
             prefer_patches: true,
             digest_verify: true,
             context: String::new(),
@@ -673,7 +681,7 @@ impl AgentConfig {
     /// tighter step budget — for fast parallel spin-off, per the coordinator-mode discussion.
     pub fn worker() -> Self {
         Self { max_steps: 10, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
-               read_policy: ReadPolicy::Surgical, doc_mode: false, ..Default::default() }
+               read_policy: ReadPolicy::Surgical, doc_mode: false, hector_mode: false, ..Default::default() }
     }
 }
 
@@ -1221,6 +1229,11 @@ you. Favor code that compiles over clever code that might not; when you see erro
         )
     };
     let doc_note = if cfg.doc_mode { format!("\n\n{}", crate::docorg::DOC_ORG_GUIDE) } else { String::new() };
+    // Working discipline. Placed with the other mode blocks so prompt order
+    // stays stable across runs (a moving prompt invalidates KV reuse).
+    let hector_note = if cfg.hector_mode {
+        format!("\n\n{}", crate::hectormode::HECTOR_MODE_GUIDE)
+    } else { String::new() };
     // Turn-0 context: the workspace tree + shared crew docs, so no model starts blind.
     let ctx_note = if cfg.context.is_empty() { String::new() }
         else { format!("\n\nWORKSPACE OVERVIEW (you can read any of these with the tools above):\n{}", cfg.context) };
@@ -1285,7 +1298,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{ctx_note}"
+Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{hector_note}{ctx_note}"
     )
 }
 
@@ -2367,7 +2380,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         // model emitting PLAIN tool calls, which is the thing under test. Under the default gate
         // those calls are stripped and the tests fail — correctly. Stated per fixture so a reader
         // sees an opt-out rather than a default that happens to be permissive.
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
@@ -2387,7 +2400,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         // diff_fn returns a per-branch canned diff (no git needed in the test)
         let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
@@ -2436,7 +2449,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("fanadd");
         std::fs::create_dir_all(base.join("b0")).unwrap();
         std::fs::create_dir_all(base.join("b1")).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
         // first branch starts running
         let s0 = fan.next();
@@ -2455,7 +2468,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("adopt");
         std::fs::create_dir_all(base.join("orig")).unwrap();
         std::fs::create_dir_all(base.join("react")).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         // a single run in progress, with a queued next prompt
         let (run, first) = AgentRun::start(base.join("orig"), "build a thing", cfg.clone());
         let mut fan = AgentFan::adopt(run, Some(first), "build a thing", "original", &cfg, Box::new(|_| String::new()));
@@ -2551,6 +2564,16 @@ error: could not compile `demo` (lib) due to 3 previous errors
     }
 
     #[test]
+    fn hector_mode_prompt_carries_the_discipline() {
+        let cfg = AgentConfig { hector_mode: true, ..AgentConfig::default() };
+        let p = system_prompt("do a thing", &cfg);
+        assert!(p.contains("HectorMode"), "mode block must reach the prompt");
+        assert!(p.contains("FIND THE ORACLE"), "rule 1 must survive formatting");
+        let off = system_prompt("do a thing", &AgentConfig::default());
+        assert!(!off.contains("HectorMode"), "must be off by default");
+    }
+
+    #[test]
     fn doc_mode_prompt_carries_the_convention() {
         let cfg = AgentConfig::docs();
         assert!(cfg.doc_mode && cfg.verify_cmd.is_empty());
@@ -2568,7 +2591,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
                 Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
             }
         }
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
         assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
         assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
@@ -2578,7 +2601,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
     fn async_driver_matches_sync_behavior() {
         // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
         // captures the plan, and finishes — the same state machine the sync loop uses.
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
         assert!(first.contains("PLAN")); // prompt asks for a plan
         let replies = [
@@ -2619,7 +2642,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let mut ws = Workspace::new(tmp("gate"));
         struct ClaimsDone;
         impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
         // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
         assert_eq!(s.stop, Stop::StepLimit);

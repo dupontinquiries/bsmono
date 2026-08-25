@@ -33,6 +33,7 @@ pub mod enginestrip;
 #[allow(dead_code)] pub mod fabric;
 pub mod genguard;
 pub mod patchmode; // unified-diff patch mode: model edits via diffs instead of full-file rewrites
+pub mod hectormode; // working-discipline prompt block distilled from an observed engineering corpus
 pub use logscope_fan::consensus;
 pub use logscope_fan::vimmode;
 pub use logscope_fan::treeexport;
