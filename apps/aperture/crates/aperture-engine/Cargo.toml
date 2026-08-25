@@ -1,0 +1,26 @@
+[package]
+name = "aperture-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "aperture's IN-PROCESS inference backend: logscope's wgpu engine (gpu-gemm) linked directly, exposed as an aperture-complete Provider. No HTTP, no daemon, no second process — the model is resident in the editor. The same `gen` closure shape logscope-serve already uses, so the identical engine can later be shared with logscope through a daemon without either side changing."
+
+# WHY THIS IS ITS OWN CRATE, and not code inside aperture-complete:
+#
+# aperture-complete is ZERO-DEPENDENCY on purpose (its own manifest calls it
+# "the logscope-fan rule" — sub-second recompiles, clean cross-compile to
+# aarch64/musl, no TLS stack to audit). gpu-gemm pulls wgpu + naga + pollster
+# + bytemuck + memmap2, which is exactly the weight that rule exists to keep
+# out. Putting the wgpu backend HERE keeps the trait crate untouched: this
+# crate depends on aperture-complete, never the reverse, so nothing that
+# merely wants `Provider` pays for a GPU stack.
+[dependencies]
+aperture-complete = { workspace = true }
+gpu-gemm = { path = "../../../logscope/crates/gpu-gemm", optional = true }
+
+[features]
+# OFF by default: the trait, the prompt shaping and the provider are pure
+# and compile in a second. Turning this on links wgpu/naga/pollster through
+# gpu-gemm and is what makes the model actually resident.
+default = []
+gpu = ["dep:gpu-gemm"]

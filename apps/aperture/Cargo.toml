@@ -18,6 +18,7 @@ members = [
     "crates/aperture-complete",
     "crates/aperture-egui",
     "crates/aperture-scene",
+    "crates/aperture-engine",
 ]
 resolver = "2"
 
@@ -25,6 +26,7 @@ resolver = "2"
 egui = "0.34"
 aperture-core = { path = "crates/aperture-core" }
 aperture-complete = { path = "crates/aperture-complete" }
+aperture-engine = { path = "crates/aperture-engine" }
 
 [profile.dev]
 opt-level = 1
