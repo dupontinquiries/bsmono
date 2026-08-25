@@ -68,14 +68,39 @@ impl Profile {
     /// Fit a hull around these rooms.
     pub fn fit(cells: &[Cell], hull_half: Vec3) -> Profile {
         let half_z = hull_half.z.max(0.5);
+        // Half the gap between neighbouring stations. A room narrower than
+        // one station's spacing can sit entirely BETWEEN two sampled
+        // points — the point-in-span test below would then never see it
+        // at all, and the skin at that z has nothing telling it a room is
+        // there (found chasing "room upgrade_bay is outside the hull it
+        // was fitted to" on a 40m hull: `upgrade_bay`'s z-half is smaller
+        // than this hull's station spacing, so no station's exact z ever
+        // fell inside it). Expanding each room's test span by half a
+        // station's gap on either side guarantees the nearest station on
+        // each side always sees the room, regardless of how thin it is
+        // relative to the sampling grid — a wide room's stations were
+        // already being counted and this only adds a small margin there.
+        let station_gap_half = half_z / (STATIONS - 1).max(1) as f32;
         let (mut a, mut b) = ([0.0f32; STATIONS], [0.0f32; STATIONS]);
+        // Which stations got a REAL room requirement, as opposed to the
+        // "nearest neighbour" fill below or the tip taper after it — the
+        // fact this session's fix needed, found chasing "room bridge is
+        // outside the hull" on a 90m hull: `bridge` sits deliberately at
+        // the very nose, and the unconditional tip clamp two steps below
+        // used to shrink station 0 toward a cosmetic point EVEN WHEN a
+        // real room needed more room than that point allows. A ship
+        // coming to a point is a preference; a room fitting inside the
+        // hull it was fitted to is the one guarantee this whole module
+        // exists for — see the module doc. When they conflict, room wins.
+        let mut has_room = [false; STATIONS];
         for i in 0..STATIONS {
             let z = station_z(i, half_z);
             // what the interior needs at this station
             for c in cells {
-                if (z - c.centre.z).abs() <= c.half.z {
+                if (z - c.centre.z).abs() <= c.half.z + station_gap_half {
                     a[i] = a[i].max(c.centre.x.abs() + c.half.x + PLATE);
                     b[i] = b[i].max(c.centre.y.abs() + c.half.y + PLATE);
+                    has_room[i] = true;
                 }
             }
         }
@@ -94,10 +119,14 @@ impl Profile {
         }
         // MONOTONE TAPER at both ends, walking in from the tips
         let (tip_a, tip_b) = (widest * TIP, tallest * TIP);
-        a[0] = a[0].min(tip_a);
-        b[0] = b[0].min(tip_b);
-        a[STATIONS - 1] = a[STATIONS - 1].min(tip_a);
-        b[STATIONS - 1] = b[STATIONS - 1].min(tip_b);
+        if !has_room[0] {
+            a[0] = a[0].min(tip_a);
+            b[0] = b[0].min(tip_b);
+        }
+        if !has_room[STATIONS - 1] {
+            a[STATIONS - 1] = a[STATIONS - 1].min(tip_a);
+            b[STATIONS - 1] = b[STATIONS - 1].min(tip_b);
+        }
         for i in 1..STATIONS / 2 {
             a[i] = a[i].max(a[i - 1]);
             b[i] = b[i].max(b[i - 1]);
