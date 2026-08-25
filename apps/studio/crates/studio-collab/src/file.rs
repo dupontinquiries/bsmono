@@ -136,6 +136,9 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
             if g.key.is_some() {
                 ops.push(Op::SetGroupKey { id: *id, key: g.key });
             }
+            if g.tempo.is_some() {
+                ops.push(Op::SetGroupTempo { id: *id, tempo: g.tempo.clone() });
+            }
         }
     }
     ops.extend(relock);

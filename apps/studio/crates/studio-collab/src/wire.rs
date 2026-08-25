@@ -357,6 +357,9 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetGroupKey { id, key } => {
             put_u8(o, 30); put_u64(o, id.0); put_opt_key(o, key);
         }
+        Op::SetGroupTempo { id, tempo } => {
+            put_u8(o, 31); put_u64(o, id.0); put_opt_tempo(o, tempo);
+        }
         Op::Group { ops } => {
             put_u8(o, 25);
             put_u16(o, ops.len().min(u16::MAX as usize) as u16);
@@ -394,6 +397,37 @@ fn get_opt_key(r: &mut R) -> Option<Option<studio_core::Key>> {
                 2 => studio_core::Scale::Dorian, 3 => studio_core::Scale::Mixolydian,
                 4 => studio_core::Scale::Chromatic, _ => return None,
             } }),
+        _ => return None,
+    })
+}
+
+/// `TempoMap` is opaque (its `points` field is private, deliberately, so
+/// every reader gets the sorted/floored/non-empty invariant `TempoMap::new`
+/// enforces) — the wire round-trips it through `.points()`/`::new()`
+/// rather than reaching into a field the type does not expose, same
+/// discipline as encoding `Effect`/`Bus` elsewhere in this file via their
+/// own public accessors.
+fn put_opt_tempo(o: &mut Vec<u8>, tempo: &Option<studio_core::TempoMap>) {
+    match tempo {
+        None => put_u8(o, 0),
+        Some(t) => {
+            put_u8(o, 1);
+            let pts = t.points();
+            put_u16(o, pts.len().min(u16::MAX as usize) as u16);
+            for (tick, bpm) in pts { put_ticks(o, *tick); put_f32(o, *bpm); }
+        }
+    }
+}
+
+fn get_opt_tempo(r: &mut R) -> Option<Option<studio_core::TempoMap>> {
+    Some(match r.u8()? {
+        0 => None,
+        1 => {
+            let n = r.u16()? as usize;
+            let mut pts = Vec::with_capacity(n.min(4096));
+            for _ in 0..n { pts.push((r.ticks()?, r.f32()?)); }
+            Some(studio_core::TempoMap::new(pts))
+        }
         _ => return None,
     })
 }
@@ -454,6 +488,7 @@ fn get_op(r: &mut R) -> Option<Op> {
         28 => Op::RemoveMarker { name: r.str()? },
         29 => Op::ClearMarkers,
         30 => Op::SetGroupKey { id: GroupId(r.u64()?), key: get_opt_key(r)? },
+        31 => Op::SetGroupTempo { id: GroupId(r.u64()?), tempo: get_opt_tempo(r)? },
         25 => {
             let n = r.u16()? as usize;
             let mut ops = Vec::with_capacity(n.min(4096));

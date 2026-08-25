@@ -299,6 +299,14 @@ pub struct Group {
     /// failing to deserialize.
     #[serde(default)]
     pub key: Option<Key>,
+    /// This song's own tempo map, independent of every other song's.
+    /// `None` means "no opinion" — the timeline draws this song's beat
+    /// grid at a DAW-default 120 BPM rather than refusing to draw one,
+    /// same "no opinion is not an error" shape as `key`. `#[serde(default)]`
+    /// for the same reason: a project saved before this field existed
+    /// still loads.
+    #[serde(default)]
+    pub tempo: Option<TempoMap>,
 }
 
 /// What an automation lane drives. Track and bus gain first — the volume
@@ -348,9 +356,137 @@ pub fn eval_lane(points: &[(Ticks, f32)], at: Ticks) -> f32 {
     (v0 + (v1 - v0) * frac).max(0.0)
 }
 
+/// A tempo map: piecewise-constant BPM over the timeline, per song.
+///
+/// The failure this exists to avoid is named directly in the request that
+/// prompted it: stretching every clip to fit one fixed workspace tempo,
+/// which is what makes tempo changes hard to align in the tools that try
+/// it. This does the opposite — clips keep their own native timing in
+/// TICKS (already time, not beats, per [`Ticks`]'s own definition), and a
+/// tempo map is a read-only LENS a beat grid or a quantizer looks through
+/// to ask "which beat is at this tick" or "which tick is beat N". Nothing
+/// about a clip's audio or its tick position changes when the tempo map
+/// changes underneath it — exactly the "detent markers with variable
+/// offset" framing: the detents move, the clips don't.
+///
+/// A segment's BPM holds from its own tick UP TO the next segment's tick
+/// (or forever, for the last one) — the same "held flat, changes at a
+/// point" shape [`eval_lane`] uses for automation, deliberately, since a
+/// tempo change is a step (bar 17 becomes 140 BPM), not a ramp, in every
+/// piece of music notation and every DAW this was checked against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TempoMap {
+    /// Sorted ascending by `.0`. Never empty after construction — see
+    /// [`TempoMap::new`] — so every lookup has at least one segment to
+    /// read, the same reason `Project` never needs an `Option` around it
+    /// at the call site even where the SONG's map itself is optional.
+    points: Vec<(Ticks, f32)>,
+}
+
+/// Below this, a beat stops meaning anything a grid can draw at a legible
+/// spacing (at 1 BPM, one bar is a minute wide) and a segment length of
+/// zero divides by it. Not a realistic tempo either way — the floor exists
+/// to keep the map's own arithmetic finite, not to bless slow music.
+const MIN_BPM: f32 = 1.0;
+
+impl TempoMap {
+    /// A constant-tempo map — what a song with "just set the tempo" wants,
+    /// and the only way to build one with no risk of an out-of-order or
+    /// non-positive point sneaking in through construction.
+    pub fn constant(bpm: f32) -> TempoMap {
+        TempoMap { points: vec![(Ticks::ZERO, bpm.max(MIN_BPM))] }
+    }
+
+    /// Build from explicit (tick, bpm) points, in any order, with any
+    /// BPM. Sorted and floored on the way in — every OTHER method on this
+    /// type gets to assume sorted-ascending-and-positive rather than
+    /// re-checking it, the same trade `Marker` storage already makes by
+    /// sorting once on write. Always has at least one point: an empty
+    /// input becomes a single implicit 120 BPM point at `Ticks::ZERO`,
+    /// the genre-agnostic DAW default, so "no opinion" still answers every
+    /// query rather than needing its own `Option` branch at every call
+    /// site.
+    pub fn new(mut points: Vec<(Ticks, f32)>) -> TempoMap {
+        for p in &mut points { p.1 = p.1.max(MIN_BPM); }
+        points.sort_by_key(|(t, _)| *t);
+        points.dedup_by_key(|(t, _)| *t);
+        if points.is_empty() {
+            points.push((Ticks::ZERO, 120.0));
+        }
+        TempoMap { points }
+    }
+
+    pub fn points(&self) -> &[(Ticks, f32)] { &self.points }
+
+    /// The tempo in effect at `at` — the segment it falls in, held flat
+    /// before the first point (there is no "before the first," since
+    /// construction guarantees one exists, but a tick before the first
+    /// point's own tick still reads as that point's tempo, same as
+    /// `eval_lane`'s pre-first-point rule).
+    pub fn bpm_at(&self, at: Ticks) -> f32 {
+        let i = self.points.partition_point(|(t, _)| *t <= at);
+        self.points[i.saturating_sub(1).min(self.points.len() - 1)].1
+    }
+
+    /// Ticks per beat at a given tempo — the one conversion factor
+    /// everything else here is built from.
+    fn ticks_per_beat(bpm: f32) -> f64 {
+        TICKS_PER_SECOND as f64 * 60.0 / bpm as f64
+    }
+
+    /// How many beats have elapsed by `at`, counting from beat 0 at
+    /// `Ticks::ZERO` — fractional, so a tick that lands mid-beat gives a
+    /// mid-beat answer rather than truncating. Walks every segment before
+    /// `at` and sums its beat length, which is the direct, unoptimized
+    /// version; a cursor variant (mirroring `eval_lane_cursor`) is the
+    /// obvious next step if a beat-grid renderer ever calls this once per
+    /// visible beat per frame, but nothing does yet.
+    pub fn tick_to_beat(&self, at: Ticks) -> f64 {
+        let mut beats = 0.0f64;
+        for i in 0..self.points.len() {
+            let (seg_start, bpm) = self.points[i];
+            let seg_end = self.points.get(i + 1).map(|(t, _)| *t).unwrap_or(Ticks(i64::MAX));
+            if at <= seg_start { break; }
+            let span_end = at.min(seg_end);
+            let span_ticks = (span_end.0 - seg_start.0).max(0) as f64;
+            beats += span_ticks / Self::ticks_per_beat(bpm);
+            if at <= seg_end { break; }
+        }
+        beats
+    }
+
+    /// The inverse of [`Self::tick_to_beat`]: which tick is beat number
+    /// `beat` (fractional beats allowed — "beat 4.5" is the off-beat).
+    /// Walks the same segments accumulating beats until `beat` falls
+    /// inside one, then converts the REMAINDER within that segment back
+    /// to ticks at that segment's own tempo — never assumes one global
+    /// ticks-per-beat, which is the whole reason this is a map and not a
+    /// single number.
+    pub fn beat_to_tick(&self, beat: f64) -> Ticks {
+        if beat <= 0.0 { return self.points[0].0; }
+        let mut acc_beats = 0.0f64;
+        for i in 0..self.points.len() {
+            let (seg_start, bpm) = self.points[i];
+            let seg_end_tick = self.points.get(i + 1).map(|(t, _)| *t);
+            let seg_beats = match seg_end_tick {
+                Some(end) => (end.0 - seg_start.0).max(0) as f64 / Self::ticks_per_beat(bpm),
+                None => f64::INFINITY, // the last segment never ends
+            };
+            if beat <= acc_beats + seg_beats || seg_end_tick.is_none() {
+                let remainder_beats = beat - acc_beats;
+                let remainder_ticks = remainder_beats * Self::ticks_per_beat(bpm);
+                return Ticks(seg_start.0 + remainder_ticks.round() as i64);
+            }
+            acc_beats += seg_beats;
+        }
+        unreachable!("the last segment has no end, so the loop always returns inside it")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub id: SourceId,
+
     pub path: String,
     pub len: Ticks,
     pub sample_rate: u32,
@@ -446,6 +582,12 @@ pub enum Op {
     /// exist — unlike the project-wide key, which always has a project
     /// to belong to, a group-scoped key needs a group.
     SetGroupKey { id: GroupId, key: Option<Key> },
+    /// Same shape as `SetGroupKey`, for a song's tempo map — its own op
+    /// for the identical reason: `SetGroup` restates name+membership on
+    /// every rename and must not be the thing a tempo map rides along
+    /// with, or a rename would need to start threading tempo through too.
+    /// Refused on a group that does not exist, same as `SetGroupKey`.
+    SetGroupTempo { id: GroupId, tempo: Option<TempoMap> },
     /// Add or move a named marker. Absolute by NAME: setting a marker
     /// that already exists moves it, which is what "set the chorus here"
     /// means when you meant it the second time.
@@ -765,19 +907,19 @@ impl Project {
                 if clips.is_empty() {
                     return Err(EditError::EmptyGroup);
                 }
-                let old_key = self.groups.get(id).and_then(|g| g.key);
+                let (old_key, old_tempo) = self.groups.get(id)
+                    .map(|g| (g.key, g.tempo.clone())).unwrap_or((None, None));
                 let inv = match self.groups.get(id) {
                     Some(old) => Op::SetGroup { id: *id, name: old.name.clone(),
                                                 clips: old.clips.clone() },
                     None => Op::RemoveGroup { id: *id },
                 };
-                // `SetGroup` restates name+membership absolutely (LWW), but
-                // NOT the key — that has its own op (`SetGroupKey`) and its
-                // own last-write-wins slot, same reasoning as why renaming
-                // a track doesn't reset its fader. A rename must not
-                // silently erase a song's key.
+                // Neither key nor tempo travels through `SetGroup` — both
+                // have their own ops and their own last-write-wins slots,
+                // same reasoning as why renaming a track doesn't reset its
+                // fader. A rename must not silently erase either.
                 self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone(),
-                                                 key: old_key });
+                                                 key: old_key, tempo: old_tempo });
                 Ok(inv)
             }
             Op::SetKey { key } => {
@@ -789,6 +931,12 @@ impl Project {
                 let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
                 let inv = Op::SetGroupKey { id: *id, key: g.key };
                 g.key = *key;
+                Ok(inv)
+            }
+            Op::SetGroupTempo { id, tempo } => {
+                let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
+                let inv = Op::SetGroupTempo { id: *id, tempo: g.tempo.clone() };
+                g.tempo = tempo.clone();
                 Ok(inv)
             }
             Op::SetMarker { at, name } => {
@@ -836,21 +984,23 @@ impl Project {
             Op::RemoveGroup { id } => {
                 let old = self.groups.remove(id).ok_or(EditError::NoSuchGroup(*id))?;
                 let restore = Op::SetGroup { id: *id, name: old.name, clips: old.clips };
-                // The key has its own op and would otherwise be lost:
-                // `SetGroup`'s own apply reads the CURRENT `self.groups`
-                // entry for the key to preserve, and by the time this
-                // inverse actually runs the group has already been
-                // removed, so a bare `SetGroup` alone would restore the
-                // membership but silently drop the key. Bundle both as one
-                // `Group` op — same one-undo-per-user-action shape
-                // `ClearMarkers` already uses — only when there was a key
-                // to restore, so a keyless group's undo stays the plain
-                // single op it always was.
-                match old.key {
-                    Some(key) => Ok(Op::Group { ops: vec![
-                        restore, Op::SetGroupKey { id: *id, key: Some(key) },
-                    ] }),
-                    None => Ok(restore),
+                // Same reasoning as the key: both key and tempo have their
+                // own ops, and by the time this inverse runs the group is
+                // already gone, so `SetGroup`'s own preservation logic has
+                // nothing to read from. Bundle whichever of the two
+                // actually had a value — a keyless, tempoless group's undo
+                // stays the plain single op it always was.
+                let mut restores = vec![restore];
+                if let Some(key) = old.key {
+                    restores.push(Op::SetGroupKey { id: *id, key: Some(key) });
+                }
+                if let Some(tempo) = old.tempo {
+                    restores.push(Op::SetGroupTempo { id: *id, tempo: Some(tempo) });
+                }
+                if restores.len() == 1 {
+                    Ok(restores.pop().unwrap())
+                } else {
+                    Ok(Op::Group { ops: restores })
                 }
             }
         }
@@ -1823,6 +1973,104 @@ mod group_and_bus_input_tests {
         assert_eq!(p.groups[&GroupId(1)].name, "Verse");
         assert_eq!(p.groups[&GroupId(1)].key, Some(d_dorian),
                    "undo-of-remove must not silently drop the song's key");
+    }
+}
+
+#[cfg(test)]
+mod tempo_map_tests {
+    use super::*;
+
+    #[test]
+    fn constant_tempo_round_trips_beat_and_tick_exactly() {
+        let m = TempoMap::constant(120.0);
+        // At 120 BPM, one beat = half a second.
+        assert_eq!(m.tick_to_beat(Ticks::ZERO), 0.0);
+        assert!((m.tick_to_beat(Ticks::from_seconds(2.0)) - 4.0).abs() < 1e-6);
+        assert_eq!(m.beat_to_tick(0.0), Ticks::ZERO);
+        assert_eq!(m.beat_to_tick(4.0), Ticks::from_seconds(2.0));
+        // The two functions must be exact inverses at a sweep of points,
+        // not just at the ones the other assertions happen to check.
+        for beat in [0.0, 0.5, 1.0, 3.25, 100.0] {
+            let tick = m.beat_to_tick(beat);
+            assert!((m.tick_to_beat(tick) - beat).abs() < 1e-6, "beat {beat}");
+        }
+    }
+
+    #[test]
+    fn a_tempo_change_bends_the_grid_without_moving_earlier_beats() {
+        // 120 BPM for the first 4 beats (2 seconds), then 90 BPM.
+        let m = TempoMap::new(vec![(Ticks::ZERO, 120.0), (Ticks::from_seconds(2.0), 90.0)]);
+        assert_eq!(m.bpm_at(Ticks::ZERO), 120.0);
+        assert_eq!(m.bpm_at(Ticks::from_seconds(1.0)), 120.0);
+        assert_eq!(m.bpm_at(Ticks::from_seconds(2.0)), 90.0, "the tempo changes AT the point");
+        assert_eq!(m.bpm_at(Ticks::from_seconds(5.0)), 90.0, "holds after the last point");
+        // Beat 4 sits exactly at the tempo change (4 beats at 120bpm = 2s).
+        assert_eq!(m.beat_to_tick(4.0), Ticks::from_seconds(2.0));
+        // Beat 5 is one MORE beat, but at 90bpm now (2s + 60/90s).
+        let beat5 = m.beat_to_tick(5.0);
+        assert!((beat5.to_seconds() - (2.0 + 60.0 / 90.0)).abs() < 1e-6);
+        // The round trip still holds across the boundary.
+        for beat in [0.0, 3.9, 4.0, 4.1, 10.0] {
+            let tick = m.beat_to_tick(beat);
+            assert!((m.tick_to_beat(tick) - beat).abs() < 1e-6, "beat {beat}");
+        }
+    }
+
+    #[test]
+    fn empty_and_non_positive_input_never_produces_a_broken_map() {
+        // No points at all -> a sensible default, not a panic or an
+        // unusable map with nothing to look up against.
+        let empty = TempoMap::new(vec![]);
+        assert_eq!(empty.points().len(), 1);
+        assert!(empty.bpm_at(Ticks::ZERO) > 0.0);
+        // Zero or negative BPM would divide by zero or run time backwards —
+        // floored rather than trusted.
+        let m = TempoMap::new(vec![(Ticks::ZERO, 0.0), (Ticks::from_seconds(1.0), -5.0)]);
+        assert!(m.points().iter().all(|(_, bpm)| *bpm >= MIN_BPM));
+        // Unsorted input is sorted on the way in.
+        let m2 = TempoMap::new(vec![(Ticks::from_seconds(2.0), 90.0), (Ticks::ZERO, 120.0)]);
+        assert_eq!(m2.points()[0].0, Ticks::ZERO);
+    }
+
+    #[test]
+    fn set_group_tempo_has_its_own_op_and_survives_rename_and_remove_undo() {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "A".into(), muted: false, locked: false, gain: 1.0, route: None },
+            at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
+            has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "Track 1".into(),
+                                clips: vec![ClipId(1)] }).unwrap();
+
+        assert!(matches!(p.apply(&Op::SetGroupTempo { id: GroupId(99), tempo: None }),
+                         Err(EditError::NoSuchGroup(GroupId(99)))));
+
+        let fast = TempoMap::constant(174.0);
+        let inv = p.apply(&Op::SetGroupTempo { id: GroupId(1), tempo: Some(fast.clone()) })
+            .unwrap();
+        assert_eq!(p.groups[&GroupId(1)].tempo, Some(fast.clone()));
+        assert_eq!(inv, Op::SetGroupTempo { id: GroupId(1), tempo: None });
+
+        // Rename must not reset it.
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "Drop".into(),
+                                clips: vec![ClipId(1)] }).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].tempo, Some(fast.clone()));
+
+        // A key AND a tempo both set, then removed: undo must restore both,
+        // bundled as one Group op — the generalised form of the same bug
+        // the key-only case already guards.
+        let dorian = Key { root: 2, scale: Scale::Dorian };
+        p.apply(&Op::SetGroupKey { id: GroupId(1), key: Some(dorian) }).unwrap();
+        let inv_remove = p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
+        p.apply(&inv_remove).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].key, Some(dorian));
+        assert_eq!(p.groups[&GroupId(1)].tempo, Some(fast),
+                   "undo-of-remove must not silently drop the song's tempo either");
     }
 }
 
