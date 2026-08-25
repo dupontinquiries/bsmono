@@ -41,6 +41,7 @@ use crate::CompletionRequest;
 /// code missing its opening brace.
 pub fn make_edit_request(instruction: &str, selection: &str, lang: &str, generation: u64, budget: usize) -> CompletionRequest {
     CompletionRequest {
+        path: None,
         generation,
         prefix: take_chars(instruction, budget),
         suffix: take_chars(selection, budget),

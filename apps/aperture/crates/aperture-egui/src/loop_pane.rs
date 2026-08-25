@@ -21,16 +21,58 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
     egui::ComboBox::from_label("provider")
         .selected_text(match state.provider_kind {
             ProviderKind::Ollama => "ollama",
+            ProviderKind::Logscope => "logscope",
             ProviderKind::Command => "command",
             ProviderKind::Demo => "demo (offline)",
         })
         .show_ui(ui, |ui| {
             changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Ollama, "ollama").changed();
+            changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Logscope, "logscope").changed();
             changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Command, "command").changed();
             changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Demo, "demo (offline)").changed();
         });
 
     match state.provider_kind {
+        ProviderKind::Logscope => {
+            // logscope-serve (apps/logscope/SERVING.md): POST /generate,
+            // prompt as the raw body, key in the Bearer header. Every
+            // knob that shapes the prompt lives HERE, and the preview
+            // below is assembled by the SAME function the provider calls
+            // — the pane shows exactly what the model will see.
+            let cfg = &mut state.logscope_cfg;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("host").color(colors.text_weak));
+                changed |= ui.text_edit_singleline(&mut cfg.host).lost_focus();
+                ui.label(RichText::new("key").color(colors.text_weak));
+                changed |= ui.add(egui::TextEdit::singleline(&mut cfg.key).password(true).desired_width(120.0)).lost_focus();
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("max tokens").color(colors.text_weak));
+                changed |= ui.add(egui::DragValue::new(&mut cfg.max_tokens).range(1..=8192)).changed();
+                ui.label(RichText::new("fanout").color(colors.text_weak));
+                changed |= ui
+                    .add(egui::DragValue::new(&mut cfg.fanout).range(1..=8))
+                    .on_hover_text("sample up to N times; first non-empty wins")
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(&mut cfg.read_siblings, "read sibling files")
+                    .on_hover_text("prepend the first 40 lines of neighboring files")
+                    .changed();
+                if cfg.read_siblings {
+                    changed |= ui.add(egui::DragValue::new(&mut cfg.sibling_files).range(1..=8)).changed();
+                }
+                changed |= ui
+                    .checkbox(&mut cfg.tool_calls, "tool calls")
+                    .on_hover_text("one round: a reply starting `@read <path>` fetches that file and asks again")
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("instruction").color(colors.text_weak));
+                changed |= ui.add(egui::TextEdit::singleline(&mut cfg.instruction).desired_width(f32::INFINITY)).lost_focus();
+            });
+        }
         ProviderKind::Ollama => {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("host").color(colors.text_weak));

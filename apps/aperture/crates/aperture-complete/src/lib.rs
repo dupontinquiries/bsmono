@@ -29,6 +29,10 @@ pub struct CompletionRequest {
     pub prefix: String,
     pub suffix: String,
     pub lang: String,
+    /// The file being edited, when it has one — providers that read
+    /// sibling files or honor `@read` tool calls resolve relative to its
+    /// directory; None disables both, structurally.
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// What comes back. `generation` echoes the request; the UI compares it to
@@ -98,7 +102,7 @@ pub fn make_request(
     };
     let prefix: String = format!("{ctx}{}", tail_chars(before, prefix_budget.saturating_sub(ctx.chars().count())));
     let suffix: String = after.chars().take(suffix_budget).collect();
-    CompletionRequest { generation, prefix, suffix, lang: lang.to_string() }
+    CompletionRequest { generation, prefix, suffix, lang: lang.to_string(), path: None }
 }
 
 fn tail_chars(s: &str, n: usize) -> String {

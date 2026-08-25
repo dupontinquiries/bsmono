@@ -238,6 +238,177 @@ pub fn build_streaming_request(cfg: &OllamaConfig, prefix: &str, suffix: &str) -
     build_request_shaped(cfg, prefix, suffix, true)
 }
 
+// ── logscope: the fleet's LAN inference endpoint ────────────────────────────
+//
+// `logscope-serve` (apps/logscope/SERVING.md) is the monorepo's own model
+// server: POST /generate with the PROMPT AS THE RAW BODY, `?max=N` tokens,
+// key in `Authorization: Bearer`, plain generated text back. No JSON, no
+// TLS on the LAN — the same raw-TcpStream HTTP this file already speaks to
+// ollama, one layer simpler.
+//
+// The parameters here are the visible-loop ethos applied to PROMPTING:
+// everything that shapes what the model sees is a field on this config, and
+// `assemble_prompt` is a pure(ish) function the F2 pane calls with the SAME
+// config to preview EXACTLY what would be sent — no hidden template.
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogscopeConfig {
+    /// "ip:port" or "host:port" — logscope-serve's default bind is :8080.
+    pub host: String,
+    /// Bearer key (logscope-serve prints one at startup if none given).
+    pub key: String,
+    /// `?max=N` — tokens to generate (server clamps to 1..=8192).
+    pub max_tokens: u32,
+    /// Instruction prepended to the prompt. Logscope serves base-ish chat
+    /// models, not FIM models, so completion rides as plain continuation
+    /// under an instruction — edit it live in the pane.
+    pub instruction: String,
+    /// Prepend context from sibling files (same directory as the file
+    /// being edited) so the model sees the neighborhood, not just the
+    /// caret window.
+    pub read_siblings: bool,
+    /// How many siblings (alphabetical, self excluded).
+    pub sibling_files: usize,
+    /// One tool round: if the reply's first line is `@read <path>`, read
+    /// that file (relative to the edited file's directory), append it to
+    /// the prompt, and ask ONCE more. A single round, by design — the
+    /// loop stays visible and bounded.
+    pub tool_calls: bool,
+    /// Sample up to N times, returning the first non-empty completion —
+    /// small LAN models sometimes return whitespace; fanout retries
+    /// within the same generation instead of surfacing an empty ghost.
+    pub fanout: u32,
+}
+
+impl Default for LogscopeConfig {
+    fn default() -> Self {
+        LogscopeConfig {
+            host: "127.0.0.1:8080".into(),
+            key: String::new(),
+            max_tokens: 96,
+            instruction: "Continue the code exactly from where it stops. Output only the continuation, no prose, no backticks.".into(),
+            read_siblings: false,
+            sibling_files: 2,
+            tool_calls: false,
+            fanout: 1,
+        }
+    }
+}
+
+/// First `n` lines of a file, size-capped — sibling and tool reads both go
+/// through this so no prompt can swallow a megabyte.
+fn head_of_file(p: &std::path::Path, n: usize) -> Option<String> {
+    let text = std::fs::read_to_string(p).ok()?;
+    if text.len() > 256 * 1024 {
+        return None; // not prompt material
+    }
+    Some(text.lines().take(n).collect::<Vec<_>>().join("\n"))
+}
+
+/// Build EXACTLY the text `LogscopeProvider` sends — the pane calls this
+/// with the live config to show the prompt before any request exists.
+/// Reads sibling files from disk when the config says to; otherwise pure.
+pub fn assemble_prompt(cfg: &LogscopeConfig, req: &CompletionRequest) -> String {
+    let mut out = String::new();
+    if !cfg.instruction.trim().is_empty() {
+        out.push_str(cfg.instruction.trim());
+        out.push_str("\n\n");
+    }
+    if cfg.read_siblings {
+        if let Some(dir) = req.path.as_ref().and_then(|p| p.parent()) {
+            let mut sibs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && Some(p.as_path()) != req.path.as_deref())
+                .collect();
+            sibs.sort();
+            for p in sibs.into_iter().take(cfg.sibling_files) {
+                if let Some(head) = head_of_file(&p, 40) {
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    out.push_str(&format!("── sibling file {name} (first 40 lines)\n{head}\n\n"));
+                }
+            }
+        }
+    }
+    out.push_str("── current file (continue from the end)\n");
+    out.push_str(&req.prefix);
+    out
+}
+
+pub struct LogscopeProvider {
+    pub cfg: LogscopeConfig,
+    pub timeout: Duration,
+}
+
+impl LogscopeProvider {
+    pub fn new(cfg: LogscopeConfig) -> Self {
+        LogscopeProvider { cfg, timeout: Duration::from_secs(120) }
+    }
+
+    fn post(&self, prompt: &str) -> Result<String, String> {
+        let path = format!("/generate?max={}", self.cfg.max_tokens.clamp(1, 8192));
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{prompt}",
+            self.cfg.host,
+            self.cfg.key,
+            prompt.len(),
+        );
+        let raw = http_roundtrip(&self.cfg.host, &req, self.timeout).map_err(|e| format!("io: {e}"))?;
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+        let status = head.lines().next().unwrap_or("");
+        if status.contains(" 200") {
+            Ok(body.to_string())
+        } else {
+            Err(format!("{}: {}", status.trim(), body.trim().lines().next().unwrap_or("")))
+        }
+    }
+}
+
+impl Provider for LogscopeProvider {
+    fn name(&self) -> &str {
+        "logscope"
+    }
+
+    fn complete(&mut self, req: &CompletionRequest) -> Result<String, String> {
+        let prompt = assemble_prompt(&self.cfg, req);
+        let tries = self.cfg.fanout.max(1);
+        let mut last: Result<String, String> = Err("no attempts".into());
+        for _ in 0..tries {
+            last = self.post(&prompt);
+            match &last {
+                Ok(text) if !text.trim().is_empty() => break,
+                Err(_) => break, // an ERROR is an answer; fanout retries emptiness, not failure
+                _ => {}
+            }
+        }
+        let text = last?;
+
+        // One tool round, opt-in: the model may ask for a file by making
+        // its FIRST line `@read <relative path>`. We read it (capped),
+        // extend the prompt, and ask exactly once more.
+        if self.cfg.tool_calls {
+            if let Some(rest) = text.trim_start().strip_prefix("@read ") {
+                let rel = rest.lines().next().unwrap_or("").trim();
+                let resolved = req
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|d| d.join(rel))
+                    .filter(|p| p.is_file());
+                let file_block = match resolved.as_ref().and_then(|p| head_of_file(p, 200)) {
+                    Some(head) => format!("── requested file {rel} (first 200 lines)\n{head}"),
+                    None => format!("── requested file {rel}: not readable"),
+                };
+                let followup = format!("{prompt}\n\n{file_block}\n\n── now continue the current file\n");
+                return self.post(&followup);
+            }
+        }
+        Ok(text)
+    }
+}
+
 /// JSON-escape for embedding in a request body. (logscope-fan's, verbatim.)
 pub fn json_escape(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -480,7 +651,138 @@ mod tests {
     use super::*;
 
     fn req(prefix: &str, suffix: &str) -> CompletionRequest {
-        CompletionRequest { generation: 0, prefix: prefix.into(), suffix: suffix.into(), lang: "rust".into() }
+        CompletionRequest { generation: 0, prefix: prefix.into(), suffix: suffix.into(), lang: "rust".into(), path: None }
+    }
+
+    // ── logscope provider ───────────────────────────────────────────────
+
+    /// A one-thread fake logscope-serve: answers each connection with the
+    /// next scripted body, records every raw request for assertions.
+    fn fake_logscope(responses: Vec<&'static str>) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut s, _) = match listener.accept() {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Read headers, then exactly Content-Length more.
+                let need = loop {
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break 0;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    if let Some(head_end) = text.find("\r\n\r\n") {
+                        let cl = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break head_end + 4 + cl;
+                    }
+                };
+                while raw.len() < need {
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&raw).into_owned());
+                let _ = s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                        .as_bytes(),
+                );
+            }
+        });
+        (host, rx)
+    }
+
+    #[test]
+    fn logscope_prompt_assembly_is_the_visible_contract() {
+        let dir = std::env::temp_dir().join(format!("aperture-ls-asm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aaa.rs"), "fn aaa() {}\n").unwrap();
+        std::fs::write(dir.join("bbb.rs"), "fn bbb() {}\n").unwrap();
+        std::fs::write(dir.join("ccc.rs"), "fn ccc() {}\n").unwrap();
+        let me = dir.join("me.rs");
+        std::fs::write(&me, "fn me() {}\n").unwrap();
+
+        let cfg = LogscopeConfig {
+            instruction: "Continue.".into(),
+            read_siblings: true,
+            sibling_files: 2,
+            ..LogscopeConfig::default()
+        };
+        let mut r = req("fn half(", "");
+        r.path = Some(me.clone());
+        let p = assemble_prompt(&cfg, &r);
+        let ia = p.find("Continue.").unwrap();
+        let sa = p.find("sibling file aaa.rs").unwrap();
+        let sb = p.find("sibling file bbb.rs").unwrap();
+        let cur = p.find("── current file").unwrap();
+        assert!(ia < sa && sa < sb && sb < cur, "instruction, siblings (alphabetical), then the file:\n{p}");
+        assert!(!p.contains("ccc.rs"), "capped at sibling_files=2");
+        assert!(!p.contains("sibling file me.rs"), "self is not its own sibling");
+        assert!(p.ends_with("fn half("), "the prompt ends where the model must continue");
+        // Siblings off: pure prefix under the instruction.
+        let p2 = assemble_prompt(&LogscopeConfig { instruction: String::new(), ..LogscopeConfig::default() }, &r);
+        assert!(p2.starts_with("── current file"), "{p2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logscope_speaks_the_serving_contract_and_fanout_retries_emptiness() {
+        // Script: two whitespace replies, then a real one — fanout=3 must
+        // walk through them and return the third.
+        let (host, rx) = fake_logscope(vec!["", "  \n", "let x = 1;"]);
+        let mut p = LogscopeProvider::new(LogscopeConfig {
+            host,
+            key: "sekrit".into(),
+            max_tokens: 64,
+            fanout: 3,
+            ..LogscopeConfig::default()
+        });
+        let out = p.complete(&req("fn f() { ", "")).unwrap();
+        assert_eq!(out, "let x = 1;");
+        let first = rx.recv().unwrap();
+        assert!(first.starts_with("POST /generate?max=64 HTTP/1.1\r\n"), "{first}");
+        assert!(first.contains("Authorization: Bearer sekrit\r\n"), "the key rides the header");
+        assert!(first.contains("fn f() {"), "the prompt is the body");
+        assert_eq!(rx.iter().take(2).count(), 2, "three requests total: fanout retried twice");
+    }
+
+    #[test]
+    fn logscope_tool_call_reads_one_file_and_asks_once_more() {
+        let dir = std::env::temp_dir().join(format!("aperture-ls-tool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = dir.join("me.rs");
+        std::fs::write(&me, "fn me() {}\n").unwrap();
+        std::fs::write(dir.join("helper.rs"), "pub fn helper_truth() -> u8 { 42 }\n").unwrap();
+
+        let (host, rx) = fake_logscope(vec!["@read helper.rs", "helper_truth()"]);
+        let mut p = LogscopeProvider::new(LogscopeConfig { host, tool_calls: true, ..LogscopeConfig::default() });
+        let mut r = req("let v = ", "");
+        r.path = Some(me);
+        let out = p.complete(&r).unwrap();
+        assert_eq!(out, "helper_truth()", "the SECOND reply is the completion");
+        let _first = rx.recv().unwrap();
+        let second = rx.recv().unwrap();
+        assert!(
+            second.contains("requested file helper.rs") && second.contains("helper_truth() -> u8"),
+            "the follow-up carries the file the model asked for: {second}"
+        );
+        assert!(rx.try_recv().is_err(), "ONE round, bounded by design");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -434,6 +434,7 @@ impl Viewer {
             prefix: prompt,
             suffix: String::new(),
             lang: "text".into(),
+            path: None,
         });
     }
 

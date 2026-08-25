@@ -202,6 +202,7 @@ pub struct Effects {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
     Ollama,
+    Logscope,
     Command,
     Demo,
 }
@@ -335,6 +336,7 @@ pub struct AppState {
     pub show_loop_pane: bool,
     pub provider_kind: ProviderKind,
     pub ollama_cfg: OllamaConfig,
+    pub logscope_cfg: aperture_complete::providers::LogscopeConfig,
     pub command_line: String,
 
     pub ghost_since: Option<u64>,
@@ -410,6 +412,7 @@ impl AppState {
             show_loop_pane: false,
             provider_kind: ProviderKind::Ollama,
             ollama_cfg: OllamaConfig::default(),
+            logscope_cfg: aperture_complete::providers::LogscopeConfig::default(),
             command_line: String::new(),
             ghost_since: None,
             palette: None,
@@ -563,7 +566,7 @@ impl AppState {
             rev.subject,
             stat.chars().take(600).collect::<String>()
         );
-        engine.request(CompletionRequest { generation: self.note_generation, prefix: prompt, suffix: String::new(), lang: "text".into() });
+        engine.request(CompletionRequest { generation: self.note_generation, prefix: prompt, suffix: String::new(), lang: "text".into(), path: None });
     }
 
     /// Drain the describe engine; call once per frame.
@@ -625,7 +628,7 @@ impl AppState {
         };
         self.route_generation += 1;
         self.route_pending_key = Some(taken_key);
-        engine.request(CompletionRequest { generation: self.route_generation, prefix: prompt, suffix: String::new(), lang: "text".into() });
+        engine.request(CompletionRequest { generation: self.route_generation, prefix: prompt, suffix: String::new(), lang: "text".into(), path: None });
     }
 
     /// Drain the route-AI engine; call once per frame, same as `poll_note`.
@@ -733,6 +736,9 @@ impl AppState {
     pub fn build_provider(&self) -> Box<dyn Provider> {
         match self.provider_kind {
             ProviderKind::Ollama => Box::new(OllamaProvider::new(self.ollama_cfg.clone())),
+            ProviderKind::Logscope => Box::new(aperture_complete::providers::LogscopeProvider::new(
+                self.logscope_cfg.clone(),
+            )),
             ProviderKind::Command => Box::new(CommandProvider::new(
                 self.command_line.split_whitespace().map(str::to_string).collect(),
             )),
@@ -1582,7 +1588,8 @@ impl AppState {
             Language::Rust => "rust",
             Language::Plain => "text",
         };
-        let req = make_request(&ctx, &before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
+        let mut req = make_request(&ctx, &before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
+        req.path = self.path.clone(); // sibling reads + @read resolve here
         self.ghost.request_sent(req.generation);
         engine.request(req);
     }

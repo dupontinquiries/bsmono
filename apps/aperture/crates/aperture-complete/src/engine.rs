@@ -157,7 +157,7 @@ mod tests {
     }
 
     fn req(generation: u64) -> CompletionRequest {
-        CompletionRequest { generation, prefix: String::new(), suffix: String::new(), lang: "rust".into() }
+        CompletionRequest { generation, prefix: String::new(), suffix: String::new(), lang: "rust".into(), path: None }
     }
 
     #[test]
