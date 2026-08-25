@@ -203,24 +203,42 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
 
     // ── input ───────────────────────────────────────────────────────────────
     let palette_open = state.palette.is_some();
+    // FOCUS DOES NOT SURVIVE THE PANE THAT OWNED IT. egui keeps the focused
+    // widget id in memory indefinitely, so clicking a field in the F2 pane
+    // and then CLOSING the pane left focus pointing at a widget that is no
+    // longer drawn — `mem.focused()` stayed `Some`, the guard below kept
+    // skipping the editor, and the editor was silently dead: no typing, no
+    // debounce, no completion. That is the "autocomplete does not work when
+    // the F2 pane is closed" report, and it needed no ghost-engine
+    // debugging at all. A focused widget that is not on screen is not
+    // focus; clear it.
+    if !state.show_loop_pane {
+        let stale = ui.ctx().memory(|m| m.focused());
+        if stale.is_some() {
+            ui.ctx().memory_mut(|m| m.surrender_focus(stale.unwrap()));
+        }
+    }
     let other_widget_focused = ui.ctx().memory(|mem| mem.focused().is_some());
-    if !palette_open && !other_widget_focused {
-        // THE TAB FIGHT, settled: when the editor owns input, Tab means
-        // indent / accept-ghost — but egui ALSO uses Tab for focus
-        // traversal, so with the F2 pane open a Tab would simultaneously
-        // edit AND yank keyboard focus into the pane's provider combo,
-        // sending the NEXT keystroke to the wrong place. Consuming Tab
-        // here removes it from egui's view before the focus system acts;
-        // once a pane field is genuinely focused (clicked), the guard
-        // above skips the editor and Tab field-hops in the pane as forms
-        // do.
-        // (Clone FIRST: consume_key strips the event, and the editor
-        // still needs its copy.)
-        let events = ui.ctx().input(|i| i.events.clone());
+    // THE TAB FIGHT, settled properly this time. Tab means indent /
+    // accept-ghost to the editor, but egui also uses it for focus
+    // traversal. The previous attempt consumed Tab INSIDE the
+    // `!other_widget_focused` branch — which is exactly the branch that
+    // does not run when the pane holds focus, so in the one situation the
+    // fix existed for, it never fired. Consume it out here, whenever the
+    // editor is the intended target (pane closed, or open but with nothing
+    // in it focused), so the focus system never sees it. When a pane field
+    // IS focused, Tab is left alone and field-hops as any form does.
+    let editor_owns_tab = !palette_open && (!state.show_loop_pane || !other_widget_focused);
+    if editor_owns_tab {
         ui.ctx().input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
             i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
         });
+    }
+    if !palette_open && !other_widget_focused {
+        // (Clone FIRST: consume_key above strips the event from egui's
+        // queue, and the editor still needs its own copy to indent with.)
+        let events = ui.ctx().input(|i| i.events.clone());
         for ev in events {
             let translated = match ev {
                 egui::Event::Text(t) => Some(Ev::Text(t)),
@@ -457,9 +475,37 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         let spans = syntax.spans_for(line, &editor.buffer);
         let mut job = LayoutJob::default();
         let mut cursor = 0usize;
+        // CLAMP SPANS TO THE RENDERED LINE. `text` is `Buffer::line`, which
+        // trims the terminator; a span source that measures a line as
+        // `line_to_byte(line + 1) - line_to_byte(line)` (tree-sitter's
+        // bound) or that returns a memo from a previous, longer buffer will
+        // hand back a range reaching past it. Either way the editor used to
+        // die on the spot:
+        //
+        //   panicked at view.rs: end byte index 43 is out of bounds for
+        //   string of length 42
+        //
+        // — on OPENING A FILE, which is not a failure a text editor may
+        // have. Clamped here, at the point of use, because this is the
+        // boundary every span crosses no matter which backend produced it
+        // and no matter how stale it is. `floor_char_boundary` because a
+        // byte clamp that lands mid-UTF-8 panics exactly as hard as the
+        // overflow it replaced.
+        let clamp = |i: usize| {
+            let i = i.min(text.len());
+            let mut i = i;
+            while i > 0 && !text.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        };
         for s in &spans {
-            if s.range.start > cursor {
-                job.append(&text[cursor..s.range.start], 0.0, fmt(&m.font, colors.text, false));
+            let (sa, sb) = (clamp(s.range.start), clamp(s.range.end));
+            if sa >= sb {
+                continue; // clamped to nothing: the span is past this line
+            }
+            if sa > cursor {
+                job.append(&text[cursor..sa], 0.0, fmt(&m.font, colors.text, false));
             }
             let color = match s.kind {
                 TokKind::Keyword => colors.accent,
@@ -472,8 +518,8 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
                 TokKind::Plain => colors.text,
             };
             let italics = s.kind == TokKind::Comment;
-            job.append(&text[s.range.clone()], 0.0, fmt(&m.font, color, italics));
-            cursor = s.range.end;
+            job.append(&text[sa..sb], 0.0, fmt(&m.font, color, italics));
+            cursor = sb;
         }
         if cursor < text.len() {
             job.append(&text[cursor..], 0.0, fmt(&m.font, colors.text, false));

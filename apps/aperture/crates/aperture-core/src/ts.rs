@@ -124,7 +124,25 @@ impl TsSyntax {
         }
         let Some(tree) = &self.tree else { return Vec::new() };
         let start = buf.line_to_byte(line);
-        let end = buf.line_to_byte(line + 1);
+        let raw_end = buf.line_to_byte(line + 1);
+        if raw_end <= start {
+            return Vec::new();
+        }
+        // EXCLUDE THE LINE TERMINATOR. `line_to_byte(line + 1)` is the start
+        // of the NEXT line, so the span it bounds includes this line's "\n"
+        // (and "\r\n"), but the renderer slices `buffer.line(line)`, which
+        // does not. Emitting spans in the wider coordinate space made
+        // `&text[s.range]` index one (or two) bytes past the end of a
+        // fully-highlighted line and panic — "end byte index 43 is out of
+        // bounds for string of length 42", on opening any file whose first
+        // visible line ends in a highlighted token.
+        //
+        // Trimmed HERE, at the one place the two coordinate systems meet,
+        // rather than clamped at each of the renderer's slice sites: the
+        // spans are cached and handed to anything that asks, so a span that
+        // is wrong by construction would have to be defended against
+        // everywhere it is read.
+        let end = start + buf.line(line).len();
         if end <= start {
             return Vec::new();
         }
@@ -358,4 +376,41 @@ mod tests {
         assert_eq!(o[1].sig, "pub struct Cfg n: u32 }".replace(" n", " { n"), "sig is the trimmed first line");
     }
 
+    #[test]
+    fn spans_never_reach_past_the_rendered_line() {
+        // THE OPEN-A-FILE CRASH. Spans were bounded by
+        // `line_to_byte(line + 1)` — the start of the NEXT line, which
+        // includes this line's newline — while the renderer slices
+        // `buffer.line(line)`, which excludes it. A line whose last token
+        // is highlighted therefore produced a span ending one byte past
+        // what the renderer indexes:
+        //   "end byte index 43 is out of bounds for string of length 42"
+        // Every line of a real file goes through this, so the guarantee is
+        // checked over the whole buffer rather than on one hand-picked line.
+        // Lines ENDING in a highlighted token are the trigger: the span
+        // runs to the line's last byte, so a one-past bound is one past
+        // the rendered text. A trailing `;` or `{` is Plain and hides it,
+        // which is why the original 4-line sample did not reproduce.
+        // A line-comment runs to end-of-line, and tree-sitter's comment
+        // node INCLUDES the newline in its byte range — that is the case
+        // where `.min(end)` with the untrimmed bound yields a span one
+        // past the rendered text. This is the shape that actually crashed
+        // (aperture opening any commented file), so it is the fixture.
+        let src = include_str!("syntax.rs"); // a real 900-line file, not a toy
+        let buf = Buffer::from_str(src);
+        let mut ts = TsSyntax::new(Language::Rust).expect("rust grammar");
+        for line in 0..buf.len_lines() {
+            let text = buf.line(line).into_owned();
+            for sp in ts.spans_for(line, &buf) {
+                assert!(
+                    sp.range.end <= text.len(),
+                    "line {line} ({:?}, {} bytes) got span {:?} — this is the panic",
+                    text, text.len(), sp.range
+                );
+                // And it must be sliceable, not merely in range: a span
+                // ending mid-UTF-8 would panic just as hard.
+                let _ = &text[sp.range.clone()];
+            }
+        }
+    }
 }
