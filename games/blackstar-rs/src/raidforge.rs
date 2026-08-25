@@ -274,6 +274,11 @@ pub fn forge_async(theme: String) -> mpsc::Receiver<Result<String, String>> {
             prefix: prompt_for(&theme),
             suffix: String::new(),
             lang: "raid".into(),
+            // No file: the forge prompts from a THEME string, not from a
+            // buffer on disk. `None` is the honest answer and disables the
+            // sibling-read and `@read` paths structurally — see the field's
+            // own doc in aperture-complete.
+            path: None,
         };
         let _ = tx.send(p.complete(&req));
     });

@@ -1775,7 +1775,13 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
         ball.pos += n * (ball.r - d);
         let vn = ball.vel.dot(n);
         if vn < 0.0 {
-            let vt = ball.vel - n * vn;
+            // NOTE: no tangential velocity is computed here any more. The
+            // old velocity-only bounce took `ball.vel - n * vn` as the
+            // slide direction; the rigid-sphere contact below supersedes
+            // it by deriving `slip` from the CONTACT POINT's material
+            // velocity (`v + w x r_c`), which is what lets spin change
+            // where the ball goes. The leftover binding was dead and the
+            // compiler said so.
             let e = (0.6 * cfg.ball.bounce * cfg.arena.bounce).clamp(0.05, 0.97);
             if vn < -0.8 {
                 if -vn > 2.0 {
