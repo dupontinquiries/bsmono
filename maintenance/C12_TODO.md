@@ -468,4 +468,26 @@ What's still needed, roughly in dependency order:
   independently and the album is an organizational container only?
   Affects `studio-app`'s export flow, not yet looked at.
 
+## 15. responsive_nav: two apps done, and a bug found along the way
+
+`3619091f`/`e77ba72a`: `uikit_egui::responsive_nav` (`NavLayout::{Tabs,
+Pages}`, decided from a real width fit rather than a device-class guess)
+is built and adopted in `ambient-learner-egui` (tab bar -> compact picker)
+and `bot-arena` (the hand-rolled `is_compact()` check it was written to
+replace). Both tested, both green.
+
+- **C12-15a** — not yet applied to any other app. `segmented_tabs`' own
+  module doc names snapclone and bo-suite as the other two hand-rollers
+  it was hoisted from; neither has been switched to `responsive_nav` yet.
+- **C12-15b — unrelated bug found while testing ambient-learner.**
+  `cargo test --no-default-features --features egui-app --doc` fails:
+  a stale doctest in `src/egui_lib.rs` calls `LiveState::ui`, a method
+  that does not exist (`error[E0599]: no method named 'ui' found for
+  struct 'LiveState'`). Confirmed pre-existing and unrelated to the
+  responsive_nav change by reverting it and reproducing the identical
+  failure on the clean tree. Either the doc example is stale (the method
+  was renamed/moved and the example never updated) or it needs a
+  `no_run`/`ignore` annotation if it was never meant to compile as
+  written. Not fixed — found by accident while verifying something else,
+  and worth its own look rather than a guessed one-line fix.
 
