@@ -1369,8 +1369,10 @@ pub struct App {
     /// playhead beside the rack, instead of export → import → watch.
     side_slot: SideSlot,
     frame_cache: viewport::FrameCache,
-    tune_root: u8,
-    tune_mode: studio_fx::retune::Mode,
+    /// `None` until the person picks a key — autotune has no sensible
+    /// default scale, and silently tuning to C minor because nobody chose
+    /// anything is a worse failure than making "tune take" wait.
+    tune_scale: Option<(u8, studio_fx::retune::Mode)>,
     /// Velocity source for playing mode. `NullAnalog` today; a Wooting
     /// binding drops in here (see playkeys' docs).
     analog: Box<dyn studio_egui::playkeys::AnalogSource>,
@@ -1492,7 +1494,7 @@ impl Default for App {
               export_run: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
-              tune_root: 0, tune_mode: studio_fx::retune::Mode::Minor,
+              tune_scale: None,
               analog: Box::new(analog),
               loaded: SinkContent::Nothing }
     }
@@ -1611,42 +1613,72 @@ impl eframe::App for App {
                 // noticing a flat take to hearing a tuned one.
                 if !self.studio.selection.is_empty() {
                     egui::ComboBox::from_id_salt("tune-key")
-                        .selected_text(format!("{} {}",
-                            ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-                                [self.tune_root as usize % 12],
-                            match self.tune_mode {
-                                studio_fx::retune::Mode::Minor => "min",
-                                studio_fx::retune::Mode::HarmonicMinor => "harm",
-                                studio_fx::retune::Mode::Chromatic => "chrom",
-                            }))
+                        .selected_text(match self.tune_scale {
+                            None => "no key".to_string(),
+                            Some((root, mode)) => format!("{} {}",
+                                ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+                                    [root as usize % 12],
+                                match mode {
+                                    studio_fx::retune::Mode::Minor => "min",
+                                    studio_fx::retune::Mode::HarmonicMinor => "harm",
+                                    studio_fx::retune::Mode::Chromatic => "chrom",
+                                }),
+                        })
                         .width(96.0)
                         .show_ui(ui, |ui| {
+                            // No default scale: the picker opens on "no
+                            // key" rather than pre-selecting one, so
+                            // choosing IS the action, not un-choosing
+                            // whatever happened to be selected already.
+                            ui.selectable_value(&mut self.tune_scale, None, "no key");
+                            ui.separator();
+                            let mode = self.tune_scale.map(|(_, m)| m)
+                                .unwrap_or(studio_fx::retune::Mode::Minor);
                             for (i, n) in ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
                                 .iter().enumerate() {
-                                ui.selectable_value(&mut self.tune_root, i as u8, *n);
+                                let picked = self.tune_scale.is_some_and(|(r, _)| r == i as u8);
+                                if ui.selectable_label(picked, *n).clicked() {
+                                    self.tune_scale = Some((i as u8, mode));
+                                }
                             }
                             ui.separator();
                             for (m, n) in [(studio_fx::retune::Mode::Minor, "minor"),
                                            (studio_fx::retune::Mode::HarmonicMinor, "harmonic"),
                                            (studio_fx::retune::Mode::Chromatic, "chromatic")] {
-                                ui.selectable_value(&mut self.tune_mode, m, n);
+                                let picked = self.tune_scale.is_some_and(|(_, sm)| sm == m);
+                                if ui.selectable_label(picked, n).clicked() {
+                                    // Picking a mode with no root yet reads
+                                    // as "chromatic" defaulting to C, which
+                                    // is the one case a mode choice alone
+                                    // can mean something (chromatic has no
+                                    // key); any other mode still needs a
+                                    // root before "tune take" enables.
+                                    let root = self.tune_scale.map(|(r, _)| r).unwrap_or(0);
+                                    self.tune_scale = Some((root, m));
+                                }
                             }
                         });
-                    if ui.button("tune take")
-                        .on_hover_text("print-side autotune → a new clip beside the dry one")
+                    let scale = self.tune_scale;
+                    if ui.add_enabled(scale.is_some(), egui::Button::new("tune take"))
+                        .on_hover_text(if scale.is_some() {
+                            "print-side autotune → a new clip beside the dry one".to_string()
+                        } else {
+                            "pick a key first — there is no default scale".to_string()
+                        })
                         .clicked()
                     {
-                        let scale = studio_fx::retune::Scale {
-                            root: self.tune_root, mode: self.tune_mode };
-                        if let Some((id, audio)) = self.studio.autotune_selected(&self.audio, scale) {
-                            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
-                            if let Ok(bytes) = studio_audio::export::export_wav_dithered_bytes(
-                                &audio.channels[0], audio.channels.len() as u16,
-                                audio.sample_rate, id.0)
-                            {
-                                self.studio.register_asset(id, &bytes);
+                        if let Some((root, mode)) = scale {
+                            let scale = studio_fx::retune::Scale { root, mode };
+                            if let Some((id, audio)) = self.studio.autotune_selected(&self.audio, scale) {
+                                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                                if let Ok(bytes) = studio_audio::export::export_wav_dithered_bytes(
+                                    &audio.channels[0], audio.channels.len() as u16,
+                                    audio.sample_rate, id.0)
+                                {
+                                    self.studio.register_asset(id, &bytes);
+                                }
+                                self.audio.insert(id, audio);
                             }
-                            self.audio.insert(id, audio);
                         }
                     }
                 }
