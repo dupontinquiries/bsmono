@@ -54,17 +54,27 @@ pub struct Key {
     /// Cardinal-swipe variants (MessagEase-style): tap emits `emit`, a swipe in a compass direction
     /// emits that direction's string. Empty = a plain key. Surfaced via `slide_menu::show_cardinal`.
     pub cardinal: Vec<(uikit_egui::slide_menu::Dir8, String)>,
+    /// Clockwise-rotation output — GTK's `KeyGestures.cw`, almost always a digit (each cardinal
+    /// key's rotation types the digit at its own numpad position: top-left rotates to "1", top-
+    /// right to "3", and so on). `None` when the key has no rotation output.
+    pub rotate_cw: Option<String>,
+    /// Counter-clockwise-rotation output — GTK's `KeyGestures.ccw`. On most cardinal keys this is
+    /// the tap letter's own capital (the ONE letter a hairpin cannot reach, since hairpin
+    /// capitalises whichever swipe DIRECTION it points toward and the tap letter has none); `a`'s
+    /// ccw is `,` instead, because a sentence-starting comma is common enough on the single most
+    /// frequent key to be worth the exception.
+    pub rotate_ccw: Option<String>,
 }
 
 impl Key {
     pub fn new(label: &str) -> Key {
-        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new() }
+        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None }
     }
     pub fn wide(label: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new() }
+        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None }
     }
     pub fn emitting(label: &str, emit: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new() }
+        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None }
     }
     /// Attach long-press variant characters (each emits itself).
     pub fn with_variants(mut self, vs: &[&str]) -> Key {
@@ -74,6 +84,13 @@ impl Key {
     /// Attach cardinal-swipe variants: `(direction, emitted string)` pairs. Tap still emits `emit`.
     pub fn with_cardinal(mut self, dirs: &[(uikit_egui::slide_menu::Dir8, &str)]) -> Key {
         self.cardinal = dirs.iter().map(|(d, s)| (*d, s.to_string())).collect();
+        self
+    }
+    /// Attach rotation outputs: GTK's `KeyGestures.cw`/`.ccw`. `None` leaves that direction
+    /// unbound, same as an absent field in GTK's layout data.
+    pub fn with_rotation(mut self, cw: Option<&str>, ccw: Option<&str>) -> Key {
+        self.rotate_cw = cw.map(str::to_string);
+        self.rotate_ccw = ccw.map(str::to_string);
         self
     }
 }
@@ -152,7 +169,7 @@ fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
         weight: r.weight,
         keys: r.keys.into_iter().map(|k| {
             let emit = k.action.as_ref().and_then(|a| emit_for_action(&a.kind)).unwrap_or(&k.label).to_string();
-            let mut key = Key { label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new() };
+            let mut key = Key { label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None };
             if !k.extended.is_empty() { key.variants = k.extended; }
             key
         }).collect(),
@@ -548,17 +565,40 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
             if pts.len() >= 3 {
                 let path = cardinal_gesture::path_from_samples(&pts);
                 let th = cardinal_gesture::CardinalThresholds::default();
-                if let cardinal_gesture::CardinalGesture::Hairpin(d) =
-                    cardinal_gesture::classify(&path, &th)
-                {
-                    // The hairpin's DIRECTION selects which variant to
-                    // capitalise, so an out-and-back toward the north variant
-                    // capitalises that letter rather than the key's own.
-                    let want = dir8_from(d);
-                    let target = key.cardinal.iter().find(|(k, _)| *k == want)
-                        .map(|(_, s)| s.clone())
-                        .unwrap_or_else(|| key.emit.clone());
-                    return Some(target.to_uppercase());
+                match cardinal_gesture::classify(&path, &th) {
+                    cardinal_gesture::CardinalGesture::Hairpin(d) => {
+                        // The hairpin's DIRECTION selects which variant to
+                        // capitalise, so an out-and-back toward the north variant
+                        // capitalises that letter rather than the key's own.
+                        let want = dir8_from(d);
+                        let target = key.cardinal.iter().find(|(k, _)| *k == want)
+                            .map(|(_, s)| s.clone())
+                            .unwrap_or_else(|| key.emit.clone());
+                        return Some(target.to_uppercase());
+                    }
+                    // Rotation reaches what neither tap nor a cardinal swipe
+                    // can: the tap letter's OWN capital (a hairpin needs a
+                    // direction to capitalise, and the tap letter has none —
+                    // GTK's `KeyGestures` doc comment says so directly) and,
+                    // clockwise, a digit — GTK's `default_cardinal_grid*`
+                    // maps each cell's CW rotation to a fixed digit at that
+                    // cell's own numpad position, so digits are reachable
+                    // without ever leaving the letter grid for a symbols
+                    // page. Ported here as plain data (`Key::rotate_cw`/
+                    // `rotate_ccw`) rather than a second lookup table, so a
+                    // layout with no rotation data (most keys, most
+                    // layouts) simply does nothing — the same "None is a
+                    // real answer" shape `key.cardinal` already uses.
+                    cardinal_gesture::CardinalGesture::Rotation(r) => {
+                        let out = match r {
+                            cardinal_gesture::Rotation::Cw => key.rotate_cw.clone(),
+                            cardinal_gesture::Rotation::Ccw => key.rotate_ccw.clone(),
+                        };
+                        if let Some(out) = out {
+                            return Some(out);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
