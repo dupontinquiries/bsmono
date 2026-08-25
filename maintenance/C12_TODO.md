@@ -584,3 +584,73 @@ concrete need — see `device-kit::source_plan`'s own history this session).
   audit is independent of that module — it's about their OWN update
   loops, not about adopting new nav chrome. Not started.
 
+## 17. The to-merge-c12unified archive: what landed, and the one thing that can't
+
+Five incoming items from a single archive (needs `zstd`, which the
+sandbox lacks by default — `apt-get install zstd` first).
+
+**Merged, all verified, failure sets diffed rather than counted:**
+- `da8f07b0` logscope physical UI (1043/0/4 — matches baseline exactly).
+  Every fix in it is a RENDERING fix and this sandbox has no display, so
+  the tests prove compilation and logic, not that the dock is on screen.
+- `77c03997` blackstar weapon+animation (1201 passed, same 13
+  arrival-state failures; pass count 1200 -> 1201).
+- `34907763` blackstar canon reconciliation. Also verified their claim
+  that `archive_gen.h` was regenerated: all four new finding ids appear
+  in BOTH archive.rs and the generated C header — worth checking because
+  nothing in the Rust suite compiles that header.
+- `d849a5d2` unendlich perf snapshot (a 2311-file TREE, not a bundle).
+- `c75fd165` / `281a7579` / `cd1568a7` — aperture patches 3, 5, 4.
+
+**Two docs in the archive were wrong; the code was right:**
+- unendlich's APPLY.md puts the headline INDEX_CAPACITY fix in
+  `mesher.rs` (it is in `render/gpu_meshing_octree.rs`) and calls itself
+  v0.24.NEXT+9 (the tree is NEXT+11, capacity already raised again to
+  262_144 — which we ALREADY had, so the headline change is not even in
+  the diff). What the 39 changed files actually carry is other perf
+  work: corner-cache generation invalidation replacing a memset-to-NaN
+  that evicted L1 on ARM every mesh call, a p90 pacer window widened
+  16 -> 32 samples, and an eviction budget defaulting to 16 sync saves
+  per frame instead of unlimited (a teleport used to freeze for
+  seconds). Read the code, not the doc.
+
+- **C12-17a — unendlich's two remaining test failures are OURS, not the
+  snapshot's.** `shader_artifacts::build_list_tracks_every_source_shader`
+  and `core_shaders_ship_precompiled_spirv` both trip on `clouds.frag`:
+  it is tracked at HEAD, absent from `build.rs` SHADERS[], and its
+  `.spv` has no `.spv.hash` sibling. None of those files is in the
+  snapshot's changed set, so the test's inputs are byte-identical at
+  HEAD and after — it fails identically either way. (Proven by inputs
+  rather than a clean-tree rerun, which exceeded the per-command budget
+  twice.) Fixing it means registering the shader in the build, which
+  belongs to whoever owns it. Not started.
+
+- **C12-17b — the aperture bundle cannot be merged, and it is not a
+  rename.** It forks from `dc33bb1e` ("aperture: TODO addendum —
+  corridor narrator recorded; count 381"), which this line does not
+  have. Checked properly rather than guessed: no commit with that
+  subject or any of its distinctive phrases exists here; our aperture
+  history is 15 commits and has no `NEXT_SESSION_TODO.md` at all; and
+  indexing the raw packfile with `--fix-thin` against our ENTIRE object
+  store still leaves 36 unresolved deltas. If it were a renamed commit,
+  the blobs and trees would resolve. It is a genuinely divergent base.
+  Patches 3/4/5 were applied by hand against our own anchors; patches
+  1, 2 and 6 are NOT applicable — 1 needs `gitspace::last_visited`
+  (zero occurrences here) and 2/6 edit the absent TODO file. Recovering
+  those needs the prerequisite bundle from whatever line produced it,
+  or a plain tarball.
+
+- **C12-17c — the logscope provider's F2 "prompt preview" panel is
+  omitted.** It borrows `state` for the live caret context while `cfg =
+  &mut state.logscope_cfg` is already mutably borrowed — a real borrow
+  conflict in our tree's shape, not a transcription slip. Needs the
+  borrow split or the caret context snapshotted before taking cfg.
+  `assemble_prompt` is public and pure, so nothing is blocked on it.
+
+- **C12-17d — rustdoc's implicit code block bit two unrelated sessions
+  in one day.** The incoming blackstar work fixed a `voyage.rs` doc
+  comment whose indented math was being compiled as Rust; this line
+  independently fixed the identical bug class in ambient-learner
+  (`b507439b`). Two sessions tripping over the same rustdoc rule
+  suggests a checker (scan doc comments for 4-space-indented blocks
+  that are not fenced) rather than a third one-off fix.
