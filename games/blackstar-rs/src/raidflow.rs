@@ -48,11 +48,12 @@ use crate::foothold::{self, Approach, Plan, Site};
 use crate::bigbody::BigBody;
 use crate::raidcon::{Arena, BOSSES, Boss};
 use crate::raidgen::{phase_raid, plan_for, strhash, EncKind, RaidPlan};
-use crate::raidrun::{Event, RaidRun, Unit};
+use crate::raidrun::{Beacon, Event, RaidRun, Unit};
 use crate::sections;
 use crate::skirmish::{fighter, OPEN_AT};
 use crate::stations;
 use crate::survival::{Body, Weather};
+use crate::weapons::Element;
 
 /// Kills are attributed to the nearest undone encounter inside this many
 /// metres of the shooter. A GUESS standing in for the C engine's zone
@@ -413,11 +414,17 @@ impl RaidFlow {
 
     /// THE KILL BRIDGE — see the module header. The shell's fire arrives
     /// here with the same converted damage the sortie's engagement gets;
-    /// it pools against the nearest undone encounter in reach.
-    pub fn strike(&mut self, dmg: f32, at: Vec3) {
+    /// it pools against the nearest undone encounter in reach. `elem` is
+    /// the Watch's attuned element at the moment of the hit — `None`
+    /// while mid-attune, same as every other advantage check in the
+    /// game — and runs through the warden's own `element` on the same
+    /// ring the regular bots use, so a matched attunement finally means
+    /// something against a boss instead of the ring staying flat.
+    pub fn strike(&mut self, dmg: f32, elem: Element, at: Vec3) {
         if self.stage != Stage::Assault {
             return;
         }
+        let dmg = dmg * elem.advantage(self.boss.element);
         let spec = &self.plan.phases[self.phase_i];
         let Some(pr) = self.run.phase_run() else { return };
         let mut best: Option<(f32, usize)> = None;
@@ -448,6 +455,15 @@ impl RaidFlow {
                 self.feed.push(format!("hostile down at encounter {}", i + 1));
             }
         }
+    }
+
+    /// Live encounter beacons for the shell to draw — `PhaseRun::beacons`'s
+    /// own doc calls this "for the shell to draw," but nothing in the
+    /// shell ever called it; the Assault stage had no in-world visual at
+    /// any encounter site, only the HUD text panel. Empty outside Assault
+    /// or before the plan's first phase starts.
+    pub fn live_beacons(&self) -> Vec<Beacon> {
+        self.run.phase_ref().map(|pr| pr.beacons()).unwrap_or_default()
     }
 
     /// A grapple toward the nearest live AIR node, if the line reaches.
@@ -501,7 +517,10 @@ impl RaidFlow {
         }
     }
 
-    pub fn hud_rows(&self) -> Vec<String> {
+    /// `grapple_key` labels whatever `Action::Grapple` is actually bound
+    /// to — the row used to hardcode "G", which went stale the moment
+    /// that stopped being the default (see `input::Bindings::classic`).
+    pub fn hud_rows(&self, grapple_key: &str) -> Vec<String> {
         let mut rows = Vec::new();
         match self.stage {
             Stage::Brief => {
@@ -572,7 +591,7 @@ impl RaidFlow {
                         rows.push(format!("{:?} {} — {}", e.mech, i + 1, state));
                     }
                 }
-                rows.push("G grapples at a node · ESC abandons".into());
+                rows.push(format!("{grapple_key} grapples at a node · ESC abandons"));
             }
             Stage::Between => {
                 rows.push("PHASE CLEARED".into());
@@ -647,7 +666,7 @@ mod tests {
         };
         let at = Vec3::new(e.x, 0.0, e.z);
         for _ in 0..200 {
-            f.strike(1.0e5, at);
+            f.strike(1.0e5, Element::None, at);
             f.tick(0.05, at, 0.0);
             if f.run.phase_run().map(|p| p.enc_done(i)).unwrap_or(false) {
                 return;

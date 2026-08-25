@@ -50,6 +50,14 @@ pub struct Save {
     pub armed: String,
     /// worn armor mods, comma-separated names
     pub worn: String,
+    /// weapon mods fitted per rail, `slot:name` pairs comma-separated —
+    /// added ahead of any drop source or equip UI (`weapons::Mod` has
+    /// neither yet): the effect logic and the three slots already exist
+    /// and are fully tested, but there was nowhere to remember one
+    /// across a save even if a future drop system granted it. This is
+    /// the plumbing only; where a mod comes from and how it's equipped
+    /// are real design decisions, not made here.
+    pub wep_mods: String,
     /// the bag, comma-separated item codes
     pub bag: String,
     /// the ship's chest, positional item codes (see vault.rs)
@@ -94,6 +102,7 @@ impl Default for Save {
             chi: String::new(),
             armed: String::new(),
             worn: String::new(),
+            wep_mods: String::new(),
             bag: String::new(),
             vault: String::new(),
             finds: String::new(),
@@ -145,6 +154,7 @@ pub fn parse(text: &str) -> (Save, Bindings, Config) {
             "chi" => s.chi = v.to_string(),
             "armed" => s.armed = v.to_string(),
             "worn" => s.worn = v.to_string(),
+            "wep_mods" => s.wep_mods = v.to_string(),
             "bag" => s.bag = v.to_string(),
             "vault" => s.vault = v.to_string(),
             "finds" => s.finds = v.to_string(),
@@ -218,7 +228,7 @@ pub fn render(s: &Save, b: &Bindings, cfg: &Config) -> String {
     if s.shipwear > 0.0 {
         let _ = writeln!(out, "shipwear {:.2}", s.shipwear);
     }
-    for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("bag", &s.bag), ("vault", &s.vault), ("finds", &s.finds), ("case", &s.case), ("watch", &s.watch), ("hotbar", &s.hotbar)] {
+    for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("wep_mods", &s.wep_mods), ("bag", &s.bag), ("vault", &s.vault), ("finds", &s.finds), ("case", &s.case), ("watch", &s.watch), ("hotbar", &s.hotbar)] {
         if !v.is_empty() {
             let _ = writeln!(out, "{k} {v}");
         }
@@ -281,6 +291,7 @@ mod tests {
             chi: "rock:15".into(),
             armed: "w:beam:ice".into(),
             worn: "plating".into(),
+            wep_mods: "0:long_barrel".into(),
             bag: "w:flak:fire".into(),
             vault: "w:push:water".into(),
             finds: "bunker_alloy,museum_specimen".into(),
@@ -328,6 +339,7 @@ mod tests {
         assert_eq!(got.chi, want.chi, "chi");
         assert_eq!(got.armed, want.armed, "armed");
         assert_eq!(got.worn, want.worn, "worn");
+        assert_eq!(got.wep_mods, want.wep_mods, "wep_mods");
         assert_eq!(got.bag, want.bag, "bag");
         assert_eq!(got.vault, want.vault, "vault");
         assert_eq!(got.finds, want.finds, "finds");

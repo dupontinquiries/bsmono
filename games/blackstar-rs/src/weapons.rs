@@ -878,6 +878,19 @@ impl Weapons {
 mod tests {
     use super::*;
 
+    #[test]
+    fn every_mod_code_round_trips_and_is_unique() {
+        // the save format's whole contract: every variant survives a
+        // code/from_code trip, and no two share a code (a collision would
+        // silently swap one mod for another on load)
+        let mut seen = std::collections::HashSet::new();
+        for m in MODS {
+            assert_eq!(Mod::from_code(m.code()), Some(m), "code for {:?} did not round-trip", m);
+            assert!(seen.insert(m.code()), "duplicate code: {}", m.code());
+        }
+        assert_eq!(MODS.len(), 16, "MODS list is missing a variant");
+    }
+
     fn flat() -> (impl Fn(Vec3) -> f32, impl Fn(Vec3) -> Vec3) {
         (|p: Vec3| p.y, |_p: Vec3| Vec3::Y)
     }
@@ -1312,6 +1325,13 @@ pub enum Mod {
 
 pub const MOD_SLOTS: usize = 3;
 
+pub const MODS: [Mod; 16] = [
+    Mod::LongBarrel, Mod::Scope, Mod::ExtMag, Mod::Underbarrel, Mod::Stabilizer,
+    Mod::Amplifier, Mod::ChainCoil, Mod::EnergonCell, Mod::RapidCoil, Mod::PierceCore,
+    Mod::ScatterBarrel, Mod::RippleCoil, Mod::CryoRounds, Mod::FlakCore, Mod::PlasmaCore,
+    Mod::SuppressCore,
+];
+
 impl Mod {
     pub fn name(self) -> &'static str {
         match self {
@@ -1332,6 +1352,35 @@ impl Mod {
             Mod::PlasmaCore => "PLASMA CORE",
             Mod::SuppressCore => "SUPPRESS CORE",
         }
+    }
+
+    /// The save-format identity, deliberately separate from `name()`:
+    /// that's display text and free to change wording without breaking
+    /// an existing save's `wep_mods` line, the way `gear::Item::code`
+    /// keeps its own codes apart from `label()` for the same reason.
+    pub fn code(self) -> &'static str {
+        match self {
+            Mod::LongBarrel => "long_barrel",
+            Mod::Scope => "scope",
+            Mod::ExtMag => "ext_mag",
+            Mod::Underbarrel => "underbarrel",
+            Mod::Stabilizer => "stabilizer",
+            Mod::Amplifier => "amplifier",
+            Mod::ChainCoil => "chain_coil",
+            Mod::EnergonCell => "energon_cell",
+            Mod::RapidCoil => "rapid_coil",
+            Mod::PierceCore => "pierce_core",
+            Mod::ScatterBarrel => "scatter_barrel",
+            Mod::RippleCoil => "ripple_coil",
+            Mod::CryoRounds => "cryo_rounds",
+            Mod::FlakCore => "flak_core",
+            Mod::PlasmaCore => "plasma_core",
+            Mod::SuppressCore => "suppress_core",
+        }
+    }
+
+    pub fn from_code(s: &str) -> Option<Mod> {
+        MODS.iter().copied().find(|m| m.code() == s)
     }
 
     /// The six that rebuild the gun rather than retuning it.

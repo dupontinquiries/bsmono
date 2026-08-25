@@ -16,6 +16,21 @@ use crate::render::UiVert;
 use crate::save::Save;
 use crate::world::World;
 
+/// The equipped form and the Watch's attunement, together — the two
+/// numbers that decide what a trigger pull actually does right now.
+#[derive(Clone, Copy)]
+pub struct WeaponHud {
+    pub name: &'static str,
+    /// 0 = ready, 1 = just fired
+    pub cool_frac: f32,
+    /// the attuned element's display name, or "attuning" mid-swap —
+    /// `Watch::active()` is `Element::None` during that window, and the
+    /// advantage table (`Element::advantage`) genuinely goes flat then,
+    /// so the HUD saying so is accurate, not decorative
+    pub element: &'static str,
+    pub attuning: bool,
+}
+
 pub struct HudInfo<'a> {
     pub aspect: f32,
     pub can_flip: bool,
@@ -40,6 +55,13 @@ pub struct HudInfo<'a> {
     pub cam_label: &'static str,
     /// first person wants a reticle and does not want a car-name card
     pub first_person: bool,
+    /// `anim::Gait::wounded` — badly hurt and either hunched or hugging
+    /// a wall. The gait logic already picks this correctly; it just had
+    /// no way out of `anim.rs` to reach a HUD until now.
+    pub wounded: bool,
+    /// the equipped form's name and how much of its cooldown remains
+    /// (0 = ready, 1 = just fired), or `None` out of robot mode entirely
+    pub weapon: Option<WeaponHud>,
     pub minimap: bool,
     pub air_roll: bool,
     pub map_name: &'a str,
@@ -58,6 +80,7 @@ const GOLD: [f32; 4] = [1.0, 0.84, 0.30, 0.95];
 const DIM: [f32; 4] = [1.0, 0.98, 0.94, 0.55];
 const SEL: [f32; 4] = [0.17, 0.21, 0.25, 0.92]; // soldier's button fill
 const CYAN: [f32; 4] = [0.59, 0.82, 0.92, 0.95];  // soldier's info color
+const WARN: [f32; 4] = [1.0, 0.35, 0.30, 0.95];
 const SHADOW: [f32; 4] = [0.02, 0.02, 0.05, 0.75];
 
 /// Drop-shadowed text: one dark offset copy under the real one.
@@ -1039,6 +1062,37 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
         quad(ui, g, -w, g + t, w, c);
         quad(ui, -w * ar, (g + t) * ar, w * ar, g * ar, c);
         quad(ui, -w * ar, -(g + t) * ar, w * ar, -g * ar, c);
+    }
+    // WEAPON READOUT. Sits under the reticle rather than the stat card —
+    // the stat card is about the car/robot, this is about the trigger.
+    // Ready reads gold; cooling reads dim with a shrinking bar so the
+    // player can eyeball the remaining wait without a number.
+    if let Some(w) = info.weapon {
+        let ready = w.cool_frac <= 0.0;
+        let c = if ready { GOLD } else { DIM };
+        label_c(ui, -0.11, 0.011, a, c, w.name);
+        if !ready {
+            let bw = 0.09;
+            let bx = -bw * 0.5;
+            let by = -0.128;
+            quad(ui, bx, by, bx + bw, by + 0.006, [0.2, 0.2, 0.24, 0.5]);
+            quad(ui, bx, by, bx + bw * (1.0 - w.cool_frac), by + 0.006, CYAN);
+        }
+        // ATTUNEMENT. Below the form name rather than beside it — the
+        // form is what fires, the element is what it's worth against
+        // whatever you're aimed at (`Element::advantage`, now live
+        // against raid wardens too). Dimmed to DIM while attuning since
+        // that window genuinely fights with no bonus at all — the label
+        // should read as a warning, not a status.
+        let ec = if w.attuning { DIM } else { CYAN };
+        label_c(ui, -0.148, 0.0085, a, ec, w.element);
+    }
+    // WOUNDED. Above the reticle rather than below it, clear of the
+    // weapon readout — this is about the body, not the trigger. Pulses
+    // rather than sitting solid so it reads as urgent without being a
+    // constant distraction while it's true for a while.
+    if info.wounded && (info.time * 4.0).sin() > -0.3 {
+        label_c(ui, 0.058, 0.011, a, WARN, "DAMAGED — TAKE COVER");
     }
     label(ui, -0.975, 0.864, 0.010, a, DIM, info.map_name);
     let mut y = 0.838;

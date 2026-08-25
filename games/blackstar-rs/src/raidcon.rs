@@ -24,6 +24,7 @@
 
 use crate::sun::{Orbit, StarClass};
 use crate::survival::Weather;
+use crate::weapons::Element;
 
 // ---------------------------------------------------------------- mech ---
 
@@ -170,6 +171,10 @@ pub struct Boss {
     pub name: &'static str,
     pub title: &'static str,
     pub mech: Mech,
+    /// what the warden is attuned to — the same ring `weapons::Element`
+    /// runs for the player's Watch, so a matched or countered element on
+    /// the trigger genuinely swings the fight (`Element::advantage`).
+    pub element: Element,
     /// the finale arena its own fight belongs to
     pub arena: &'static str,
     /// the line of fiction that decided the mechanic
@@ -183,7 +188,7 @@ pub struct Boss {
 
 pub const BOSSES: &[Boss] = &[
     Boss { id: "speakerman", name: "Astro Armor Titan Speakerman", title: "The Last Resonance",
-        mech: Mech::Sync, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
         premise: "sings across half a galaxy; fractures planets by matching tectonic resonance",
         relic: &[
             "a walking observatory that made moons into transmitters.",
@@ -192,7 +197,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it was not singing to anyone. it was holding a note." },
     Boss { id: "jhiaxus_omega", name: "Devastator Jhiaxus", title: "Prototype Omega",
-        mech: Mech::Purge, arena: "kuiper", tier: 3,
+        mech: Mech::Purge, element: Element::Fire, arena: "kuiper", tier: 3,
         premise: "destroying one only caused it to rebuild itself",
         relic: &[
             "the architect thought individuals obsolete. his answer:",
@@ -201,7 +206,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the foundries were not building it. they were reinforcing something." },
     Boss { id: "mechagodzilla", name: "Plasma's Mechagodzilla", title: "The Planet Burner",
-        mech: Mech::Ground, arena: "emberpit", tier: 3,
+        mech: Mech::Ground, element: Element::Fire, arena: "emberpit", tier: 3,
         premise: "its spinal plasma spine could ignite gas giants",
         relic: &[
             "built around a captured shard of a stellar core. it never",
@@ -210,7 +215,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the fire was never aimed outward. it was a furnace kept lit." },
     Boss { id: "cherno", name: "Cherno Alpha", title: "The Walking Reactor",
-        mech: Mech::Ground, arena: "frostline", tier: 2,
+        mech: Mech::Ground, element: Element::Electric, arena: "frostline", tier: 2,
         premise: "if it ever stops walking, the reactor reaches criticality",
         relic: &[
             "its armor is not armor. it is containment. every step",
@@ -219,7 +224,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the march has a route. the route is a circle around something." },
     Boss { id: "gigadrill", name: "Gigadrill", title: "The Core Piercer",
-        mech: Mech::Air, arena: "cybertron", tier: 2,
+        mech: Mech::Air, element: Element::Rock, arena: "cybertron", tier: 2,
         premise: "it drilled through moons, worlds, dwarf planets",
         relic: &[
             "built to learn why planets have metallic hearts. some worlds",
@@ -228,7 +233,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it stopped drilling down. the last bore was a way OUT for something." },
     Boss { id: "hardboil", name: "Hardboil", title: "The Pressure King",
-        mech: Mech::Purge, arena: "trench", tier: 2,
+        mech: Mech::Purge, element: Element::Water, arena: "trench", tier: 2,
         premise: "built for depths that crush ordinary alloys",
         relic: &[
             "gas-giant warfare: no missiles, only pressure. it compressed",
@@ -237,7 +242,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the pressure was a hand. the hand was holding a lid shut." },
     Boss { id: "hussar", name: "Hussar Tank", title: "The Charge",
-        mech: Mech::Ground, arena: "mars", tier: 1,
+        mech: Mech::Ground, element: Element::Fire, arena: "mars", tier: 1,
         premise: "it does not manoeuvre; it commits",
         relic: &[
             "built by an order of knights. it accelerates and does not",
@@ -246,7 +251,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the charge was never at an enemy. it was AWAY from a place." },
     Boss { id: "judgementor", name: "Judgementor", title: "Executor of Empires",
-        mech: Mech::Sync, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
         premise: "it did not fight wars, it ended them",
         relic: &[
             "not a tank. a mobile courtroom. civilizations stood trial",
@@ -255,7 +260,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "one verdict was never delivered. the case is still open." },
     Boss { id: "mantis", name: "Primitive Mantis Mech", title: "The First Hunter",
-        mech: Mech::Purge, arena: "frostline", tier: 1,
+        mech: Mech::Purge, element: Element::Vine, arena: "frostline", tier: 1,
         premise: "the oldest predator pattern Cybertron ever built",
         relic: &[
             "older than language, older than cities, older than elegant",
@@ -264,7 +269,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it was not hunting. it was patrolling a perimeter that predates it." },
     Boss { id: "pyrachnid", name: "Pyrachnid", title: "Forge Widow",
-        mech: Mech::Sync, arena: "unicron", tier: 2,
+        mech: Mech::Sync, element: Element::Fire, arena: "unicron", tier: 2,
         premise: "it spins its own foundry around its prey",
         relic: &[
             "born inside stellar furnaces. the web is superconducting",
@@ -273,7 +278,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the web is a weave. the weave is a patch over a tear." },
     Boss { id: "scorpion", name: "Scorpion Commander", title: "The Frontier Marshal",
-        mech: Mech::Ground, arena: "mars", tier: 1,
+        mech: Mech::Ground, element: Element::Vine, arena: "mars", tier: 1,
         premise: "held a border that no longer exists",
         relic: &[
             "not a soldier; a colonizer. its tail deployed factories,",
@@ -282,7 +287,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the border it held was not around territory. it was around a site." },
     Boss { id: "starlord", name: "Starlord", title: "Twin Hammers",
-        mech: Mech::Air, arena: "pluto", tier: 1,
+        mech: Mech::Air, element: Element::Electric, arena: "pluto", tier: 1,
         premise: "two hammers that are sentry guns",
         relic: &[
             "human-sized; almost overlooked. the ceremonial hammers unfold",
@@ -291,7 +296,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the hammers do not answer to it. they answer to the same thing it does." },
     Boss { id: "strider", name: "Strider Tank", title: "The Horizon Walker",
-        mech: Mech::Air, arena: "outer_rim", tier: 2,
+        mech: Mech::Air, element: Element::Air, arena: "outer_rim", tier: 2,
         premise: "it walks toward the horizon and the horizon moves",
         relic: &[
             "built for impossible terrain: ranges, trenches, asteroid",
@@ -300,7 +305,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it has a destination. it has been refusing to arrive for an age." },
     Boss { id: "tremor", name: "Tremor", title: "Planetbreaker",
-        mech: Mech::Ground, arena: "cybertron", tier: 2,
+        mech: Mech::Ground, element: Element::Rock, arena: "cybertron", tier: 2,
         premise: "the ground is its weapon",
         relic: &[
             "not seismic — gravitational. singularity oscillators in the",
@@ -309,7 +314,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the heartbeat is a countermeasure. it is jamming a deeper signal." },
     Boss { id: "trenchmaster", name: "Trenchmaster", title: "The Ocean King",
-        mech: Mech::Sync, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Water, arena: "unicron", tier: 3,
         premise: "the ocean king; the water rises to meet it",
         relic: &[
             "made for abyssal wars. it treats the deep as a highway and",
@@ -318,7 +323,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the flood was a moat. what it circled has no name in the record." },
     Boss { id: "sigillum", name: "Wuthering Waves Sigillum", title: "The Seal",
-        mech: Mech::Purge, arena: "shield_edge", tier: 2,
+        mech: Mech::Purge, element: Element::Ice, arena: "shield_edge", tier: 2,
         premise: "a seal is only a door that has not been opened",
         relic: &[
             "nobody knows what it is. it is not a warrior; it is a lock.",
@@ -327,7 +332,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "destroying it may not be victory. it may simply open the door." },
     Boss { id: "archivist", name: "Titan Cameraman 3.0 Armor", title: "Archivist",
-        mech: Mech::Air, arena: "pluto", tier: 2,
+        mech: Mech::Air, element: Element::Electric, arena: "pluto", tier: 2,
         premise: "it records everything; it has never stopped",
         relic: &[
             "the camera titans were never soldiers. every photon they",
@@ -336,7 +341,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the oldest frame in its memory is of the lock being built." },
     Boss { id: "observer", name: "Sphere Robot", title: "The Observer",
-        mech: Mech::Purge, arena: "kuiper", tier: 1,
+        mech: Mech::Purge, element: Element::Ice, arena: "kuiper", tier: 1,
         premise: "it watches, and being watched changes what you do",
         relic: &[
             "found drifting between galaxies. no engines, no weapons, no",
@@ -345,7 +350,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it does not watch events. it watches the thing that causes them." },
     Boss { id: "divergence", name: "Titan Cameraman 3.0 (What If...)", title: "The Divergence",
-        mech: Mech::Sync, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
         premise: "the recording and the event no longer agree",
         relic: &[
             "not from this timeline. its memory holds events that never",
