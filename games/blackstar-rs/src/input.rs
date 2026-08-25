@@ -40,9 +40,11 @@ pub enum Action {
     Fire,
     /// step the Watch to the next elemental form
     CycleForm,
+    /// raid-only: ask for a grapple toward the nearest live AIR node
+    Grapple,
 }
 
-pub const ACTIONS: [Action; 25] = [
+pub const ACTIONS: [Action; 26] = [
     Action::Forward,
     Action::Reverse,
     Action::SteerL,
@@ -68,6 +70,7 @@ pub const ACTIONS: [Action; 25] = [
     Action::AutoTarget,
     Action::Fire,
     Action::CycleForm,
+    Action::Grapple,
 ];
 
 impl Action {
@@ -98,6 +101,7 @@ impl Action {
             Action::AutoTarget => "AUTOTARGET",
             Action::Fire => "FIRE",
             Action::CycleForm => "WATCH: NEXT FORM",
+            Action::Grapple => "RAID: GRAPPLE TO NODE",
         }
     }
     pub fn id(self) -> &'static str {
@@ -127,6 +131,7 @@ impl Action {
             Action::AutoTarget => "autotarget",
             Action::Fire => "fire",
             Action::CycleForm => "cycle_form",
+            Action::Grapple => "grapple",
         }
     }
     pub fn from_id(s: &str) -> Option<Action> {
@@ -376,6 +381,11 @@ impl Bindings {
             // means a robot fight needs one hand less travel.
             (Fire, vec![Bind::Mouse(MouseButton::Left), Bind::Pad(crate::gamepad::PB_RT)]),
             (CycleForm, vec![ch("z"), Bind::Pad(crate::gamepad::PB_DUP)]),
+            // RAID-ONLY. Was a temp raw-key match on 'g'/'G' inside the
+            // Assault stage's input handler; "g" is already Transform's
+            // second binding here, so this gets its own key rather than
+            // fighting for one that's spoken for.
+            (Grapple, vec![ch("h")]),
         ];
         Bindings { map: m }
     }

@@ -828,6 +828,10 @@ struct Game {
     friend: String,
     toast: String,
     toast_t: f32,
+    /// counts down to the next beacon pulse during a raid Assault —
+    /// `RaidFlow::live_beacons` exists, nothing drew them, so this is
+    /// what actually makes an encounter site visible in the world
+    beacon_fx_t: f32,
     mode: Mode,
     menu_from_pause: bool,
     /// the ship's consoles, when the player is standing at one. The
@@ -1981,6 +1985,7 @@ fn main() {
         friend: String::new(),
         toast: String::new(),
         toast_t: 0.0,
+        beacon_fx_t: 0.0,
         mode: Mode::Splash,
         menu_from_pause: false,
         deck: None,
@@ -3170,14 +3175,14 @@ impl Game {
                 s.strike(p.impulse * IMPULSE_TO_DAMAGE, elem);
             }
         }
-        // the raid's kill bridge takes the same converted damage; no
-        // element table against warden mechs yet, so the ring stays flat
-        // inside `RaidFlow::strike` (labelled there)
+        // the raid's kill bridge now runs the same element advantage
+        // table the sortie and the live bots use (`RaidFlow::strike`)
         if self.raid.as_ref().map(|r| r.assaulting()).unwrap_or(false) {
             let p = self.wep.effective();
+            let elem = self.wep.watch.active();
             let at = self.car.pos;
             if let Some(r) = self.raid.as_mut() {
-                r.strike(p.impulse * IMPULSE_TO_DAMAGE, at);
+                r.strike(p.impulse * IMPULSE_TO_DAMAGE, elem, at);
             }
         }
 
@@ -4228,6 +4233,11 @@ impl Game {
         // to the console. Everything else is swallowed: a player at a
         // console is AT the console.
         if self.mode == Mode::Play {
+            // computed before the borrow below: the guard on Grapple
+            // needs `&self` (bindings live on the whole struct), and `r`
+            // holds `self.raid` mutably for the rest of this block, so
+            // this can't be evaluated inline inside the match arm.
+            let grapple_pressed = self.action_for_key(&key) == Some(Action::Grapple);
             // THE RAID EATS INPUT the way the sortie below does. Between
             // phases, Enter loads the next arena and briefs it — the map
             // swap needs the shell, which is why the stage exists at all.
@@ -4263,10 +4273,10 @@ impl Game {
                             self.toastf("raid abandoned — nothing recorded");
                             return;
                         }
-                        // TEMP BIND, labelled: G asks the machine for a
-                        // grapple toward the nearest live AIR node. Free in
-                        // Play mode today; a real binding belongs in chord.
-                        Key::Character(c) if c.as_str() == "g" || c.as_str() == "G" => {
+                        // Rebindable — see `Action::Grapple` (defaults to
+                        // H; still free of any other binding in Play mode
+                        // outside the raid Assault stage).
+                        _ if grapple_pressed => {
                             let at = self.car.pos;
                             if let Some(v) = r.grapple(at) {
                                 self.car.vel = Vec3::new(v[0], v[1], v[2]);
@@ -5488,6 +5498,31 @@ impl Game {
                         raid_ev = r.tick(FIXED_DT, self.car.pos, gy);
                     }
                 }
+                // BEACONS, ACTUALLY DRAWN. `RaidFlow::live_beacons` exists
+                // (via `PhaseRun::beacons`, "for the shell to draw"), but
+                // nothing ever called it — an Assault had no in-world
+                // marker at any encounter site, only the HUD text panel.
+                // A periodic particle pulse reuses `fx`'s existing,
+                // already-shipped confetti-burst code rather than adding
+                // a new persistent-marker rendering primitive I have no
+                // way to visually check from here; tinted per mech so an
+                // AIR node and a SYNC plate at least read differently.
+                self.beacon_fx_t -= FIXED_DT;
+                if self.beacon_fx_t <= 0.0 {
+                    self.beacon_fx_t = 0.6;
+                    if let Some(r) = self.raid.as_ref() {
+                        for b in r.live_beacons() {
+                            if b.done { continue; }
+                            let c = match b.mech {
+                                raidcon::Mech::Purge => [0.85, 0.35, 0.30, 1.0],
+                                raidcon::Mech::Ground => [0.55, 0.85, 0.35, 1.0],
+                                raidcon::Mech::Air => [0.55, 0.75, 1.0, 1.0],
+                                raidcon::Mech::Sync => [0.85, 0.65, 1.0, 1.0],
+                            };
+                            self.fx.ring_burst(Vec3::new(b.pos[0], b.pos[1], b.pos[2]), c, b.anchor);
+                        }
+                    }
+                }
                 for e in raid_ev {
                     match e {
                         raidrun::Event::Slam { vy, .. } => {
@@ -5512,8 +5547,9 @@ impl Game {
                 // LIVE SHOTS fly under the map's own medium and gravity;
                 // impacts land through the SAME conversion the instant
                 // path uses — same sections, same shove, a few frames
-                // later. Blast splash beyond the direct hit is named,
-                // not wired.
+                // later. Blast splash now reaches nearby bots too, not
+                // just the locked target or a struck bot's own limbs
+                // (see the splash loop inside the hits loop below).
                 if !self.shots.live.is_empty() {
                     let marks: Vec<shots::Mark> = self
                         .bots
@@ -5532,6 +5568,7 @@ impl Game {
                         &|x, z| self.world.ground_h(x, z),
                     );
                     for h in hits {
+                        let amount = h.dv.length() * IMPULSE_TO_DAMAGE;
                         match h.target {
                             Some(i) => {
                                 if let Some(b) = self.bots.get_mut(i) {
@@ -5539,7 +5576,6 @@ impl Game {
                                         ballistics::Delivery::Blast => sections::Kind::Blast,
                                         _ => sections::Kind::Kinetic,
                                     };
-                                    let amount = h.dv.length() * IMPULSE_TO_DAMAGE;
                                     let local = (h.at - b.car.pos) * 0.5;
                                     let _ = b.body.hit(kind, local, h.dv.normalize_or(Vec3::Y), amount, 1.0);
                                     b.car.vel += h.dv;
@@ -5547,6 +5583,35 @@ impl Game {
                                 }
                             }
                             None => self.fx.ring_burst(h.at, [0.85, 0.7, 0.45, 1.0], false),
+                        }
+                        // THE SPLASH, FINALLY WIRED. `Delivery::Blast` named
+                        // it and never touched anyone but the locked target
+                        // — not even `sections::Body::hit`'s own "spread"
+                        // reaches other bots, only a struck bot's own
+                        // neighbouring limbs. Runs for a ground miss too
+                        // (`h.target: None`): a rocket landing in the dirt
+                        // beside a bot should still be able to hurt it,
+                        // and `shots::step` now gives a ground impact the
+                        // same falloff'd `dv` a locked hit gets rather than
+                        // the dead zero vector it used to report. A fixed
+                        // radius rather than the firing weapon's own reach:
+                        // by the time a guided shot lands, the player may
+                        // have switched forms entirely, so there is no live
+                        // weapon state left to ask.
+                        const SPLASH_R: f32 = 4.0;
+                        if h.delivery == ballistics::Delivery::Blast && amount > 0.0 {
+                            for (j, other) in self.bots.iter_mut().enumerate() {
+                                if h.target == Some(j) { continue; }
+                                let d = (other.car.pos - h.at).length();
+                                if d > SPLASH_R { continue; }
+                                let falloff = 1.0 - (d / SPLASH_R);
+                                let splash = amount * falloff * 0.5;
+                                if splash <= 0.0 { continue; }
+                                let local = (h.at - other.car.pos) * 0.5;
+                                let _ = other.body.hit(
+                                    sections::Kind::Blast, local, Vec3::Y, splash, SPLASH_R,
+                                );
+                            }
                         }
                     }
                 }
@@ -5798,6 +5863,22 @@ impl Game {
         };
         // suspension bob: the body sits into its compression (draw + mirror)
         let rc = (rc.0 - rc.1 * Vec3::Y * (self.car.susp * 0.045), rc.1);
+        // THE LIMP FINALLY SHOWS. `loco_pose.roll` — "the counter-sway of
+        // a stride" per `anim::Pose`'s own doc, and the channel the hurt
+        // asymmetry leans into (`self.loco_pose.roll += limp * 0.12`) —
+        // was being computed every frame and never read anywhere. Scaled
+        // by `weight` so it fades in with the gait blend instead of
+        // snapping on the first walking frame; gated to robot mode since
+        // a car has no stride to counter-sway. `.bob` and `.lean` are
+        // left alone: the suspension line above already puts a vertical
+        // dip on `rc.0` from `car.susp`, and stacking a second, separate
+        // bob on top of it risks double-applying the same visual rather
+        // than adding a distinct one.
+        let rc = if self.car.robot {
+            (rc.0, rc.1 * Quat::from_rotation_z(self.loco_pose.roll * self.loco_pose.weight))
+        } else {
+            rc
+        };
         let (rts, rt_ids) = self.build_rt_shapes(rc, rb);
         self.gpu.set_rt_shapes(&rts);
         let aspect = self.gpu.aspect();
@@ -6436,6 +6517,27 @@ impl Game {
                 self.cam.mode.label()
             },
             first_person: self.cam.mode == camera::CamMode::First,
+            wounded: self.loco.gait.wounded(),
+            // only meaningful once transformed — vehicle mode has no
+            // trigger to read out
+            weapon: if self.car.robot {
+                let p = self.wep.profile();
+                let attuning = self.wep.watch.attuning();
+                // `active()` already reports `Element::None` mid-attune
+                // (that's the real flat-advantage window), but its name
+                // is "none" — accurate for the advantage table, wrong
+                // word for a HUD label, which should say what's actually
+                // happening rather than what the fight math falls back to
+                let element = if attuning { "attuning" } else { self.wep.watch.active().name() };
+                Some(hud::WeaponHud {
+                    name: p.name,
+                    cool_frac: (self.wep.cool / p.cooldown.max(0.001)).clamp(0.0, 1.0),
+                    element,
+                    attuning,
+                })
+            } else {
+                None
+            },
             scores: if matches!(self.game_mode, 1 | 3..=7) { Some((self.scores[0], self.scores[1])) } else { None },
             minimap: self.save.minimap,
             air_roll: !self.car.on_ground && self.roll_mix_s > 0.5,
@@ -6450,7 +6552,13 @@ impl Game {
             hud::sortie_panel(ui, aspect, &s.hud_rows());
         }
         if let Some(r) = self.raid.as_ref() {
-            hud::sortie_panel(ui, aspect, &r.hud_rows());
+            let gk = self
+                .binds
+                .binds(Action::Grapple)
+                .first()
+                .map(|b| b.label())
+                .unwrap_or_else(|| "GRAPPLE".to_string());
+            hud::sortie_panel(ui, aspect, &r.hud_rows(&gk));
         }
         // the action bar sits over the HUD, drawn last so nothing overlaps it
         hud::draw_hotbar(ui, aspect, &self.hotbar);

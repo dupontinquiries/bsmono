@@ -174,10 +174,16 @@ impl Shots {
                 }
             }
             if s.pos.y <= ground(s.pos.x, s.pos.z) {
+                // GROUND IMPACT — same falloff a locked hit gets, not the
+                // zero vector this used to report. A Blast landing in the
+                // dirt beside a bot should still be able to hurt it once
+                // the shell splashes it; a dead `dv` made that impossible
+                // however close the miss was.
+                let fall = ballistics::falloff(&s.spec, amb, s.travelled);
                 out.push(Impact {
                     target: None,
                     at: s.pos,
-                    dv: Vec3::ZERO,
+                    dv: s.vel.normalize_or(Vec3::NEG_Z) * (s.impulse * fall),
                     element: s.element,
                     delivery: s.spec.delivery,
                 });
