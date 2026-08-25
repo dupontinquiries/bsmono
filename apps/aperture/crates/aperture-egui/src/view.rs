@@ -209,13 +209,21 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     // longer drawn — `mem.focused()` stayed `Some`, the guard below kept
     // skipping the editor, and the editor was silently dead: no typing, no
     // debounce, no completion. That is the "autocomplete does not work when
-    // the F2 pane is closed" report, and it needed no ghost-engine
-    // debugging at all. A focused widget that is not on screen is not
-    // focus; clear it.
-    if !state.show_loop_pane {
+    // the F2 pane is closed" report. A focused widget that is not on screen
+    // is not focus; clear it.
+    //
+    // BUT ONLY THE PANE'S. The first version of this surrendered focus
+    // whenever the pane was closed, full stop — which also killed the
+    // PALETTE's own text box (Ctrl+P, and "AI: Edit Selection…", whose
+    // prompt is a palette mode). That box calls `request_focus()` on the
+    // frame it appears and then had it taken away again immediately, so it
+    // rendered but could not be typed into. The palette is a legitimate
+    // focus owner that is very much on screen, so it is excluded here
+    // rather than fought with.
+    if !state.show_loop_pane && state.palette.is_none() {
         let stale = ui.ctx().memory(|m| m.focused());
-        if stale.is_some() {
-            ui.ctx().memory_mut(|m| m.surrender_focus(stale.unwrap()));
+        if let Some(id) = stale {
+            ui.ctx().memory_mut(|m| m.surrender_focus(id));
         }
     }
     let other_widget_focused = ui.ctx().memory(|mem| mem.focused().is_some());

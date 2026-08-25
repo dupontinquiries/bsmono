@@ -18,6 +18,9 @@
 
 pub mod edit;
 pub mod engine;
+/// Reuse of completions across caret motion and typing — the decision
+/// layer that keeps identical requests from reaching the model at all.
+pub mod prefixcache;
 pub mod providers;
 pub mod route_ai;
 

@@ -373,6 +373,15 @@ pub struct AppState {
     /// What the pane reports about loading — a 15 GB load has to be
     /// visible, and a failure has to say what failed.
     pub engine_status: EngineStatus,
+    /// Completions already answered, so caret motion and typing along a
+    /// suggestion do not re-ask the model. See `aperture_complete::prefixcache`.
+    pub prefix_cache: aperture_complete::prefixcache::PrefixCache,
+    /// The (prefix, lang) an in-flight request was built from, so its
+    /// answer can be filed under the right key when it lands.
+    pending_prefix: Option<(String, String)>,
+    /// Line identities as of the last edit, for deciding which cached
+    /// entries an edit actually invalidated.
+    line_map: aperture_complete::prefixcache::LineMap,
     pub command_line: String,
 
     pub ghost_since: Option<u64>,
@@ -453,6 +462,9 @@ impl AppState {
             engine_models: Vec::new(),
             engine_backend: None,
             engine_status: EngineStatus::Idle,
+            prefix_cache: aperture_complete::prefixcache::PrefixCache::new(256),
+            pending_prefix: None,
+            line_map: aperture_complete::prefixcache::LineMap::new(),
             command_line: String::new(),
             ghost_since: None,
             palette: None,
@@ -1484,7 +1496,29 @@ impl AppState {
         self.dirty = true;
         self.syntax.absorb(&mut self.editor.buffer);
         self.follow_caret = true;
+        self.invalidate_cache_for_edit();
         let _ = now_ms;
+    }
+
+    /// Retire cached completions whose context genuinely left the buffer.
+    ///
+    /// Keyed on line CONTENT, not line numbers: deleting a line renumbers
+    /// everything below it, and an entry computed from an untouched region
+    /// is still correct however far it moved. Only text that is now absent
+    /// from the buffer entirely invalidates anything.
+    fn invalidate_cache_for_edit(&mut self) {
+        let next = aperture_complete::prefixcache::LineMap::from_lines(
+            (0..self.editor.buffer.len_lines())
+                .map(|i| self.editor.buffer.line(i).into_owned())
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|s| s.as_str()),
+        );
+        if !self.line_map.is_empty() {
+            let gone = self.line_map.diff(&next);
+            self.prefix_cache.invalidate_containing(&gone);
+        }
+        self.line_map = next;
     }
 
     fn arm_completion(&mut self, now_ms: u64) {
@@ -1685,6 +1719,31 @@ impl AppState {
         };
         let mut req = make_request(&ctx, &before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
         req.path = self.path.clone(); // sibling reads + @read resolve here
+
+        // ASK THE CACHE BEFORE THE MODEL. `req.prefix` is exactly what the
+        // provider would send, so it is exactly the right key — caret
+        // motion that changes no text produces the identical prefix and
+        // is served here without a request, and typing along an accepted
+        // suggestion is served from the tail the model already committed
+        // to. Only a real miss reaches the engine.
+        match self.prefix_cache.get(&req.prefix, &req.lang) {
+            Some(aperture_complete::prefixcache::Hit::Exact(text))
+            | Some(aperture_complete::prefixcache::Hit::Extended { completion: text, .. }) => {
+                // Straight to the ghost, at the CURRENT version, so the
+                // generation gate treats it exactly like a fresh answer.
+                // Same door a real answer comes through, so the
+                // generation gate and the version check apply identically
+                // — a cached suggestion must not bypass the staleness
+                // rules a fresh one obeys.
+                self.ghost.request_sent(req.generation);
+                self.ghost.on_outcome(req.generation, self.editor.version, &Ok(text));
+                let (h, m) = self.prefix_cache.stats();
+                self.status = Some((format!("completion from cache ({h} hit / {m} miss)"), 1_200));
+                return;
+            }
+            None => {}
+        }
+        self.pending_prefix = Some((req.prefix.clone(), req.lang.clone()));
         self.ghost.request_sent(req.generation);
         engine.request(req);
     }
@@ -1708,6 +1767,16 @@ impl AppState {
         // the whole point of streaming: the text grows on screen as it
         // arrives, not just once at the end.
         self.ghost.on_outcome(out.generation, self.editor.version, &out.result);
+        // FILE THE ANSWER. Keyed on the prefix the request was actually
+        // built from (captured at dispatch), not on the buffer as it looks
+        // now — by the time an answer lands the caret has often moved, and
+        // keying on the current state would file it under something the
+        // model never saw.
+        if let (Ok(text), Some((prefix, lang))) = (&out.result, self.pending_prefix.clone()) {
+            if !text.trim().is_empty() {
+                self.prefix_cache.insert(&prefix, &lang, text);
+            }
+        }
         if self.ghost.is_shown() && !was_shown {
             self.ghost_since = Some(now_ms);
         }
