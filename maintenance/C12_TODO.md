@@ -97,7 +97,42 @@ looks like "the match rate got worse" rather than an error.
   A fresh sandbox has NO Vulkan ICD at all, which C11_TODO §21 assumes it
   has; install `mesa-vulkan-drivers` before reaching for lavapipe.
 
-## 4. Not reached
+## 5. a11y/Semantics adoption is the widget metadata, not yet the apps
+
+`943cbec7` gave `uikit-egui::a11y` a stable `command_id` field, a bridge to
+`glove::Target` (`Item::as_glove_target`, `A11yScene::glove_targets`), and
+`semantic_text_edit` — the shared mechanism a person asked for "hinting...
+across all apps" for voice, AI integrations, smart tabbing, palette
+filtering, eye-tracking, cold-weather mode. That commit is the foundation
+only. Repo-wide, exactly two apps register anything with it at all
+(`gitmind`, `bo-suite`, both via the builder functions, neither touched by
+this change). Everything else — every other uikit-egui app's buttons and
+input fields — still renders with plain `ui.button`/`ui.text_edit_singleline`
+and is invisible to voice, glove mode, or any future consumer of this
+registry.
+
+- **C12-5a** — sweep apps for their button/text-field call sites one at a
+  time and switch them to `semantic_button`/`semantic_toggle`/
+  `semantic_text_edit`, or hand-call `A11yScene::add` where a widget's
+  shape does not fit the automatic wrappers (a custom-painted button,
+  for instance). Mechanical but real: this is dozens to hundreds of call
+  sites per app, and each needs a stable `id` (the wrappers take one, they
+  do not invent one), which is the part that cannot be done blind — a
+  hash of position or draw order is not stable across a resize or a
+  reorder, and `A11yScene::focus persists across frames BY ID` depends on
+  it being real.
+- **C12-5b** — no app currently calls `A11yScene::glove_targets()` from its
+  glove-mode wiring even where both a11y AND glove are already adopted
+  (checked: neither `gitmind` nor `bo-suite` uses `glove.rs` at all, so
+  there is no existing double-registration to consolidate yet — the
+  bridge is ready for the first app that adopts both, not fixing a
+  present duplication).
+- **C12-5c** — `command_id` has no reader yet. No command palette, no AI
+  integration, nothing walks `A11yScene`'s items looking for one. Adding
+  it was the cheap half; something has to actually want it before it is
+  more than a documented seam.
+
+## 6. Not reached
 
 C11's §21 perf hunt (the submit-cause counting around `generate_kv_stream`
 that this session was oriented to do), the whole hive/queen thread (§19–20),
