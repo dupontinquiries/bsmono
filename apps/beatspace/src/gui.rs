@@ -77,40 +77,27 @@ pub fn run(cfg: Config) -> Result<()> {
     };
 
     let app = App::new(cfg, shared.clone());
-    let mut opts = eframe::NativeOptions {
+    let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 500.0]),
         ..Default::default()
     };
-    // Ask the device for exactly what THIS adapter offers — never for wgpu's defaults.
-    //
-    // eframe 0.35 renders through wgpu by default (its default feature list carries
-    // `wgpu`, not `glow`), and its stock device_descriptor requests
-    // `wgpu::Limits::default()` on every non-GL backend. Those defaults include
-    // max_color_attachments = 8, so on an adapter that allows fewer, device creation
-    // fails before the first frame ever draws:
-    //     WGPU error: Limit 'max_color_attachments' value 8 is better than allowed 5
-    // The REQUEST is the bug, not the hardware: egui renders into a single color
-    // attachment and beatspace adds none. `adapter.limits()` is supported by
-    // definition, which is the same fix already carried in logscope's gpu-gemm
-    // ("Requesting the adapter's own limits is always valid") — see
-    // maintenance/ASAHI_VULKAN_LESSONS.md.
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut opts.wgpu_options.wgpu_setup {
-        setup.device_descriptor = Arc::new(|adapter: &eframe::wgpu::Adapter| {
-            let info = adapter.get_info();
-            // never-silent device selection (same lessons doc): print which GPU was
-            // actually chosen, so "it won't start" / "it's slow" is one line of output
-            // away from an answer instead of a guess.
-            eprintln!(
-                "[gpu] adapter: {} [{:?}] {:?}  driver: {} {}",
-                info.name, info.backend, info.device_type, info.driver, info.driver_info
-            );
-            eframe::wgpu::DeviceDescriptor {
-                label: Some("beatspace"),
-                required_limits: adapter.limits(),
-                ..Default::default()
-            }
-        });
-    }
+    // NOTE: no wgpu device-limits clamp here. beatspace renders through glow
+    // (Cargo.toml: `default-features = false, features = ["glow", ...]`,
+    // landed in 33b812ad after snapshot-cam's on-device crash — eframe 0.34
+    // defaults to wgpu, whose stock device_descriptor asks for
+    // wgpu::Limits::default() [max_color_attachments: 8] on every adapter,
+    // which fails outright on hardware that allows fewer). glow never
+    // requests device limits at all, so there is nothing here to clamp —
+    // that fix commit correctly removed this crate's wgpu path from
+    // Cargo.toml but missed that this exact block, written for the OLD
+    // wgpu-backed build, was still sitting in this file referencing
+    // `eframe::egui_wgpu`/`eframe::wgpu`, which eframe only re-exports
+    // behind its `wgpu`/`wgpu_no_default_features` features — neither of
+    // which this crate enables anymore. `cargo check` never caught it at
+    // the time because CLAUDE.md §3 (since corrected) listed ALSA as
+    // missing from this sandbox, so the `app` feature — the one gui.rs
+    // lives behind — could not be compiled here at all; the graph-only
+    // check that commit DID run cannot see inside a function body.
     let res = eframe::run_native("beatspace", opts, Box::new(move |_cc| Ok(Box::new(app))));
 
     stop.store(true, Ordering::Relaxed);
