@@ -97,7 +97,7 @@ looks like "the match rate got worse" rather than an error.
   A fresh sandbox has NO Vulkan ICD at all, which C11_TODO §21 assumes it
   has; install `mesa-vulkan-drivers` before reaching for lavapipe.
 
-## 5. a11y/Semantics adoption is the widget metadata, not yet the apps
+## 4. a11y/Semantics adoption is the widget metadata, not yet the apps
 
 `943cbec7` gave `uikit-egui::a11y` a stable `command_id` field, a bridge to
 `glove::Target` (`Item::as_glove_target`, `A11yScene::glove_targets`), and
@@ -111,7 +111,7 @@ input fields — still renders with plain `ui.button`/`ui.text_edit_singleline`
 and is invisible to voice, glove mode, or any future consumer of this
 registry.
 
-- **C12-5a** — sweep apps for their button/text-field call sites one at a
+- **C12-4a** — sweep apps for their button/text-field call sites one at a
   time and switch them to `semantic_button`/`semantic_toggle`/
   `semantic_text_edit`, or hand-call `A11yScene::add` where a widget's
   shape does not fit the automatic wrappers (a custom-painted button,
@@ -120,19 +120,133 @@ registry.
   do not invent one), which is the part that cannot be done blind — a
   hash of position or draw order is not stable across a resize or a
   reorder, and `A11yScene::focus persists across frames BY ID` depends on
-  it being real.
-- **C12-5b** — no app currently calls `A11yScene::glove_targets()` from its
+  it being real. `apps/bot-arena` is IN PROGRESS: the setup form's five
+  text fields are converted (stable ids via `egui::Id::new("bot_arena.
+  setup.*")`, not position-derived), uncommitted, and not yet built —
+  last known state before the tool budget ran out. Start/Stop (two
+  locations, both need `add_enabled`/`on_hover_text` so they need a
+  hand-called `A11yScene::add` rather than the automatic wrapper) and
+  four loop-based `text_edit_singleline` sites are untouched.
+- **C12-4b** — no app currently calls `A11yScene::glove_targets()` from its
   glove-mode wiring even where both a11y AND glove are already adopted
   (checked: neither `gitmind` nor `bo-suite` uses `glove.rs` at all, so
   there is no existing double-registration to consolidate yet — the
   bridge is ready for the first app that adopts both, not fixing a
   present duplication).
-- **C12-5c** — `command_id` has no reader yet. No command palette, no AI
+- **C12-4c** — `command_id` has no reader yet. No command palette, no AI
   integration, nothing walks `A11yScene`'s items looking for one. Adding
   it was the cheap half; something has to actually want it before it is
   more than a documented seam.
 
-## 6. Not reached
+## 5. blackstar-rs: 13 failures, ship-interior first
+
+Restated from §1, since it's the active thread: **1200 passed / 13 failed**,
+all attributed there with the evidence for calling them arrival state rather
+than merge damage. The ship-interior trio (`hullform`, `interior`, `aboard`
+x2 — four failures total) is the pick for next work: it's the feature the
+c5blackstar-008 series is named for (the exterior fitted to the rooms inside
+it), and the failure messages ("room bridge is outside the hull it was
+fitted to", "the ship is mostly corridor: 1484 open, 244 solid", "the hull
+corner is walkable — the ship is a shell with no walls") all point at one
+root — the fitted exterior does not enclose what it was fitted to — rather
+than four separate bugs.
+
+- **C12-5a** — `hullform::the_hull_contains_every_room_it_was_fitted_to`,
+  `interior::the_hull_between_rooms_is_still_solid`,
+  `aboard::the_camera_probe_finds_open_volume`,
+  `aboard::the_hull_is_solid_where_the_walls_are`. Not yet read past the
+  failure messages captured in §1.
+- **C12-5b — why is there both `games/blackstar` and `games/blackstar-rs`?**
+  Checked: they are NOT the same project in two languages. `games/blackstar`
+  is "Cybertron: Arena of Gods," a transforming-robot arena brawler on a
+  vendored C engine (`exengine`, CMake, PhysFS/MojoAL) — its own README,
+  own build, own tests, no mention of blackstar-rs anywhere in it.
+  `games/blackstar-rs` grew out of `skydribble` (a Rust wgpu/winit
+  Rocket-League-style sandbox) into an unrelated Transformers open-world
+  game — its own README says so directly and doesn't mention `blackstar`
+  or `exengine` either. The shared "blackstar" name is a coincidence (both
+  are Transformers-themed), not a port relationship; `-rs` here does not
+  mean "the Rust version of the other directory." Worth a one-line note in
+  each README saying so explicitly, since the naming collision is exactly
+  the kind of thing a future session (or the c5blackstar-NNN bundle
+  naming scheme itself) could misread as a merge target.
+
+## 6. Video library: the audio sidebar becomes the video one too
+
+Studio's clip library sidebar (`library.rs`) — the one that lets you add an
+audio file to the drum rack — is the intended UI for adding a video clip to
+the timeline and inserting it under the video track too, not a separate
+video-library screen. Recorded here rather than under §"video library
+management, not started" from the earlier snapclone/studio session, because
+the shape changed: this is "extend one sidebar to a second media kind and
+a second destination (drum rack vs. timeline+video track)," not "build a
+new library UI." `studio-video`/`studio-collab` already exist as the
+decode/asset side; nothing wires them into `library.rs`'s add-flow yet.
+
+- **C12-6a** — not started. Needs reading `library.rs`'s current add-to-
+  rack flow before touching it, so the video path reuses the same asset
+  registration (`register_asset`, the pattern `morph_pad`/`voice.rs`
+  already use) instead of inventing a second one.
+
+## 7. aperture / aperture-view: a semantic-navigation and marker system
+
+Design ask, not started. Two related asks:
+
+- **`apps/aperture` (aperture, the tool):**
+  - Create a new struct with boilerplate fill-in — a codegen/template
+    command, presumably keyed on struct name + field list, that writes a
+    real `.rs` file or inserts at a cursor.
+  - Go to next/previous CALLED struct via a marker, distinct from a plain
+    line-based "go back" — this wants a call-graph or reference index, not
+    a text-search jump.
+  - Markers settable on STRUCTS and FUNCTION NAMES, not source lines — a
+    marker needs to survive the function moving in the file, so it has to
+    be keyed on the symbol (name + kind), not a line number.
+- **`apps/aperture-view` (the spatial UI):** an extension of the same
+  system that abstracts files away entirely and shows data relationships
+  in physical (2D/3D?) space — symbols and their call/reference edges laid
+  out as a graph a person navigates visually instead of by file tree.
+
+Not investigated yet: what `apps/aperture` currently is (name suggests it
+already exists — needs a read before designing on top of it rather than
+next to it), whether an AST/symbol-index crate already exists in `shared/`
+that this should build on (`shared/` has had duplication problems this
+session already — check before writing a new one), and whether
+`nifty-core`'s graph/layout code (`graph_layout.rs`, force-directed
+positioning) is the right foundation for aperture-view's spatial layout
+rather than a fourth graph-rendering system.
+
+## 8. Fleet-wide bug and performance hunt
+
+Broad ask, not started, six named angles:
+
+- FPS / frame-time regressions across the app and game fleet.
+- Backend logic bugs that cost performance (not just visible bugs).
+- Documentation reorganization where subsystems have moved or merged and
+  the docs haven't caught up (this session alone found several: C11-2a's
+  lock finding was withdrawn, the §3 apt list was stale, blackstar-rs's
+  own README admits its title and package name are copied from skydribble
+  and never updated).
+- Searching for new shared kits — candidates for extraction the way
+  `device-kit`'s `source_plan` module was pulled out of `camera-bridge`
+  this session, or duplication the way `voiceprint-kit` shadows
+  voiceterm's own fingerprint code.
+- Bugs in existing kits, found via their own test suites — an audit pass,
+  not a rewrite.
+- Bugs in tooling/maintenance scripts themselves (this session found and
+  fixed one: `lock_check.py`'s relative-root bug produced a false
+  positive that stood unquestioned as C11-2a for a whole session).
+- Poor Linux-distro integration (packaging, desktop files, XDG paths —
+  `system/snapclone`'s `com.snapclone.SnapClone.desktop` naming fix from
+  an earlier session is the shape of bug this names).
+
+This is fleet-wide in scope and needs breaking into per-app or per-kit
+passes before it's actionable — recorded here as the standing direction
+rather than a single task, so a session picking a narrower slice
+(one app's FPS, one kit's test gaps) can cite this entry rather than
+re-deriving the mandate.
+
+
 
 C11's §21 perf hunt (the submit-cause counting around `generate_kv_stream`
 that this session was oriented to do), the whole hive/queen thread (§19–20),

@@ -65,6 +65,11 @@ pub struct Dashboard {
     pub studio: Studio,
     /// The corpus pipeline's process host.
     pub studio_host: StudioHost,
+    /// Voice/palette/glove-mode metadata for this frame's widgets. See
+    /// `uikit_egui::a11y` — registering here is what makes a control
+    /// reachable by voice, and (via `glove_targets()`) by cold-weather
+    /// glove mode, without a second hand-written list for each.
+    pub a11y: uikit_egui::a11y::A11yScene,
 }
 
 impl Default for Dashboard {
@@ -80,6 +85,7 @@ impl Default for Dashboard {
             replay_sel: None,
             studio: Studio::default(),
             studio_host: StudioHost::default(),
+            a11y: uikit_egui::a11y::A11yScene::new(),
         }
     }
 }
@@ -131,6 +137,7 @@ impl Dashboard {
     /// also shown (adaptive — the phone relies on the swipe).
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
         let colors = uikit_egui::palette_colors(&self.palette);
+        self.a11y.begin_frame();
 
         // swipe paging via the shared gesture layer
         let surface = ui.available_rect_before_wrap();
@@ -182,6 +189,7 @@ impl Dashboard {
         ui.heading("Setup");
         egui::ScrollArea::vertical().id_salt("setup").show(ui, |ui| {
             let f = &mut self.form;
+            let a11y = &mut self.a11y;
             egui::Grid::new("setup_core").num_columns(2).show(ui, |ui| {
                 ui.colored_label(c.text, "Population");
                 ui.add(egui::DragValue::new(&mut f.population).range(2..=2000));
@@ -205,22 +213,32 @@ impl Dashboard {
                     });
                 ui.end_row();
                 ui.colored_label(c.text, "Container image");
-                ui.text_edit_singleline(&mut f.image);
+                uikit_egui::a11y::semantic_text_edit(
+                    ui, &mut *a11y, egui::Id::new("bot_arena.setup.image").value(),
+                    "Container image", &mut f.image);
                 ui.end_row();
                 ui.colored_label(c.text, "Workspace (repo/crate)");
-                ui.text_edit_singleline(&mut f.workspace);
+                uikit_egui::a11y::semantic_text_edit(
+                    ui, &mut *a11y, egui::Id::new("bot_arena.setup.workspace").value(),
+                    "Workspace", &mut f.workspace);
                 ui.end_row();
                 ui.colored_label(c.text, "Corpus (latent purpose)");
-                ui.text_edit_singleline(&mut f.corpus);
+                uikit_egui::a11y::semantic_text_edit(
+                    ui, &mut *a11y, egui::Id::new("bot_arena.setup.corpus").value(),
+                    "Corpus", &mut f.corpus);
                 ui.end_row();
                 ui.colored_label(c.text, "Behavior niches");
                 ui.add(egui::DragValue::new(&mut f.niches).range(1..=32));
                 ui.end_row();
                 ui.colored_label(c.text, "Test command (auto = detect)");
-                ui.text_edit_singleline(&mut f.test_cmd);
+                uikit_egui::a11y::semantic_text_edit(
+                    ui, &mut *a11y, egui::Id::new("bot_arena.setup.test_cmd").value(),
+                    "Test command", &mut f.test_cmd);
                 ui.end_row();
                 ui.colored_label(c.text, "Seed (blank = random)");
-                ui.text_edit_singleline(&mut f.seed);
+                uikit_egui::a11y::semantic_text_edit(
+                    ui, &mut *a11y, egui::Id::new("bot_arena.setup.seed").value(),
+                    "Seed", &mut f.seed);
                 ui.end_row();
             });
             ui.checkbox(&mut self.form.turbo, "Turbo (skip generation animation pacing)");
