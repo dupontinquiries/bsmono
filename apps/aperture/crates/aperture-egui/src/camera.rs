@@ -93,6 +93,13 @@ impl Cam {
     }
 }
 
+/// Typewriter camera: the target that puts `caret_y` at the vertical
+/// center of a `view_h` viewport, clamped to scrollable range. Pure, so
+/// the centering rule is pinned headless like the rest of this module.
+pub fn typewriter_target(caret_y: f32, line_h: f32, view_h: f32, max_scroll: f32) -> f32 {
+    (caret_y - (view_h - line_h) * 0.5).clamp(0.0, max_scroll.max(0.0))
+}
+
 /// impakt-cam, distilled: keep the caret CENTERED, not merely visible — but
 /// only move when it's worth moving. Three rules, ported knob-for-knob from
 /// the Atom plugin that named this feature, minus its elastic ease (our
@@ -154,6 +161,17 @@ impl Follow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typewriter_target_centers_and_clamps_at_the_edges() {
+        // Mid-file: the caret line sits at the viewport's vertical center.
+        let t = typewriter_target(1000.0, 20.0, 600.0, 5000.0);
+        assert_eq!(t, 1000.0 - (600.0 - 20.0) * 0.5);
+        // Top of file: no negative scroll — the first lines rest naturally.
+        assert_eq!(typewriter_target(30.0, 20.0, 600.0, 5000.0), 0.0);
+        // Bottom: clamped to max — the last page doesn't overscroll.
+        assert_eq!(typewriter_target(4990.0, 20.0, 600.0, 4700.0), 4700.0);
+    }
 
     #[test]
     fn converges_without_overshoot_and_settles() {

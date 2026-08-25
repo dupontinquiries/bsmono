@@ -227,6 +227,21 @@ pub struct AppState {
     /// snap horizon live in `camera::Follow`). The view applies it only when
     /// the caret LINE changed, so wheel-browsing is free until you type.
     pub follow_mode: bool,
+    /// Typewriter camera: the caret line rides the vertical CENTER of the
+    /// viewport, film-style — the world moves, the caret holds. Strict
+    /// sibling of follow_mode (no dead zone), with a heavier, slower
+    /// convergence while on so the move reads as a camera dolly, not a
+    /// scroll.
+    pub typewriter_mode: bool,
+    /// Text motion: when an edit changes the line count, lines below the
+    /// edit slide from where they WERE into where they ARE. Measured in
+    /// LINES (unit-agnostic, so detection is headless-testable); the view
+    /// multiplies by line_h at paint. Snapped to ±d on the edit frame,
+    /// decays to 0.
+    pub line_shift: crate::camera::Smooth,
+    pub line_shift_from: usize,
+    last_motion_version: u64,
+    last_len_lines: usize,
     pub last_follow_line: usize,
     // ── gitspace ────────────────────────────────────────────────────────────
     git: Option<(GitRunner, String)>,
@@ -345,6 +360,11 @@ impl AppState {
             syntax: Syntax::new(lang),
             find: None,
             follow_mode: false,
+            typewriter_mode: false,
+            line_shift: crate::camera::Smooth::new(0.0, 14.0),
+            line_shift_from: 0,
+            last_motion_version: 0,
+            last_len_lines: 1,
             last_follow_line: usize::MAX,
             git: None,
             git_changed: Vec::new(),
@@ -771,6 +791,43 @@ impl AppState {
         self.last_follow_line = usize::MAX; // re-center immediately on the next frame
         let msg = if self.follow_mode { "follow camera: on" } else { "follow camera: off" };
         self.set_status(msg, now_ms);
+    }
+
+    pub fn toggle_typewriter(&mut self, now_ms: u64) {
+        self.typewriter_mode = !self.typewriter_mode;
+        // A camera dolly, not a scroll: while on, vertical convergence
+        // slows from 12/s to 7/s so the centering move has WEIGHT. The
+        // rate is restored on exit — browsing should stay snappy.
+        self.cam.scroll_y.rate = if self.typewriter_mode { 7.0 } else { 12.0 };
+        self.last_follow_line = usize::MAX; // re-center on the next frame
+        let msg = if self.typewriter_mode {
+            "typewriter camera: on — the line holds center, the world moves"
+        } else {
+            "typewriter camera: off"
+        };
+        self.set_status(msg, now_ms);
+    }
+
+    /// Per frame, from the view: detect line-count changes and arm the
+    /// slide. In LINES, so this is pure state — the view converts to px.
+    pub fn note_text_motion(&mut self) {
+        if self.editor.version != self.last_motion_version {
+            let now_lines = self.editor.buffer.len_lines();
+            let d = now_lines as i64 - self.last_len_lines as i64;
+            if d != 0 && d.unsigned_abs() <= 8 {
+                // Lines below the edit start offset by the OLD delta and
+                // decay home: an insert slides them down into place, a
+                // delete slides them up. Big multi-line pastes (>8) skip
+                // the effect — a page teleporting 40 lines reads as a
+                // glitch, not motion.
+                let caret_line = self.editor.caret_pos().line;
+                self.line_shift_from = if d > 0 { caret_line } else { caret_line + 1 };
+                self.line_shift.snap(-(d as f32));
+                self.line_shift.target = 0.0;
+            }
+            self.last_motion_version = self.editor.version;
+            self.last_len_lines = now_lines;
+        }
     }
 
     // ── symbol popup ────────────────────────────────────────────────────────
@@ -1664,6 +1721,50 @@ mod tests {
     }
     fn key(s: &mut AppState, k: K, ctrl: bool, t: u64) {
         s.handle(Ev::Key { key: k, ctrl, shift: false, alt: false }, t);
+    }
+
+    #[test]
+    fn toggle_typewriter_flips_mode_and_camera_weight() {
+        let mut s = AppState::new(None, false);
+        assert!(!s.typewriter_mode);
+        assert_eq!(s.cam.scroll_y.rate, 12.0, "default scroll weight");
+        s.toggle_typewriter(0);
+        assert!(s.typewriter_mode);
+        assert_eq!(s.cam.scroll_y.rate, 7.0, "on: heavier, dolly-like convergence");
+        let (msg, _) = s.status.clone().unwrap();
+        assert!(msg.contains("typewriter camera: on"), "{msg}");
+        s.toggle_typewriter(0);
+        assert!(!s.typewriter_mode);
+        assert_eq!(s.cam.scroll_y.rate, 12.0, "off: restored, browsing stays snappy");
+        let (msg, _) = s.status.clone().unwrap();
+        assert!(msg.contains("typewriter camera: off"), "{msg}");
+    }
+
+    #[test]
+    fn note_text_motion_arms_the_slide_on_insert_but_not_big_pastes() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("one\ntwo\nthree\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(4); // start of "two"
+        s.last_len_lines = s.editor.buffer.len_lines();
+        s.last_motion_version = s.editor.version;
+
+        // Insert a line at the caret: lines from here down slide DOWN from
+        // their old position (shift starts negative, decays to 0).
+        typed(&mut s, "NEW\n", 0);
+        s.note_text_motion();
+        assert_eq!(s.line_shift.target, 0.0);
+        assert_eq!(s.line_shift.pos, -1.0, "one line inserted: slide starts at -1");
+        assert_eq!(s.line_shift_from, 2,
+                   "post-edit caret line: only the lines that actually moved slide");
+
+        // A large multi-line paste (>8 lines) does NOT arm the effect —
+        // a page teleporting is a glitch, not motion.
+        s.line_shift.snap(0.0);
+        s.last_len_lines = s.editor.buffer.len_lines();
+        s.last_motion_version = s.editor.version;
+        s.handle(Ev::Paste("x\n".repeat(20)), 20);
+        s.note_text_motion();
+        assert_eq!(s.line_shift.pos, 0.0, "big paste: no slide armed");
     }
 
     /// The whole ghost session, headless: type → idle → request → outcome →

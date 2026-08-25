@@ -102,6 +102,7 @@ pub enum Cmd {
     CompleteNow,
     ToggleLoopPane,
     ToggleFollow,
+    ToggleTypewriter,
     OlderRevision,
     NewerRevision,
     BranchFromHere,
@@ -123,6 +124,7 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("AI: Complete now".to_string(), Cmd::CompleteNow),
         ("View: Toggle loop pane".to_string(), Cmd::ToggleLoopPane),
         ("View: Toggle follow camera (Ctrl+E)".to_string(), Cmd::ToggleFollow),
+        ("View: Typewriter camera (center the caret line)".to_string(), Cmd::ToggleTypewriter),
         ("Git: Older revision (Ctrl+,)".to_string(), Cmd::OlderRevision),
         ("Git: Newer revision (Ctrl+.)".to_string(), Cmd::NewerRevision),
         ("Git: Branch from previewed revision (Ctrl+B)".to_string(), Cmd::BranchFromHere),
@@ -193,6 +195,7 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
         }
         Cmd::CompleteNow => s.trigger_completion_now(now_ms),
         Cmd::ToggleFollow => s.toggle_follow(now_ms),
+        Cmd::ToggleTypewriter => s.toggle_typewriter(now_ms),
         Cmd::OlderRevision => s.rev_step(1, now_ms),
         Cmd::NewerRevision => s.rev_step(-1, now_ms),
         Cmd::BranchFromHere => s.branch_from_here(now_ms),

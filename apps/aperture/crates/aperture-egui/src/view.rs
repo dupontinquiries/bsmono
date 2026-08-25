@@ -307,7 +307,32 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     state.cam.caret_x.target = caret_visual_col as f32 * m.char_w;
     state.cam.caret_y.target = caret.line as f32 * m.line_h;
     let max_scroll = (total_h - rect.height()).max(0.0);
-    if state.follow_mode {
+    state.note_text_motion(); // arm the line-slide before rows paint
+    // The slide, in px for this frame: lines >= shift_from render offset
+    // by shift_px, decaying to 0 — an insert slides the tail down into
+    // place, a delete slides it up. Settled = exactly the old render.
+    let shift_px = if state.line_shift.settled() { 0.0 } else { state.line_shift.pos * m.line_h };
+    let shift_from = state.line_shift_from;
+    if state.typewriter_mode {
+        // Strict centering, film-style: every caret LINE change re-aims
+        // the center (no dead zone — the dead zone IS follow_mode; this
+        // mode is its strict sibling). Wheel browsing works between caret
+        // moves and the camera re-asserts on the next one, same event
+        // model as follow. Past ~120 lines, teleport: a dolly across a
+        // whole file is a blur, not a shot.
+        let dragging = ui.ctx().input(|i| i.pointer.primary_down());
+        if caret.line != state.last_follow_line && !dragging {
+            state.last_follow_line = caret.line;
+            let caret_y = caret.line as f32 * m.line_h;
+            let want = crate::camera::typewriter_target(caret_y, m.line_h, rect.height(), max_scroll);
+            if (want - state.cam.scroll_y.pos).abs() > 120.0 * m.line_h {
+                state.cam.scroll_y.snap(want);
+            } else {
+                state.cam.scroll_y.target = want;
+            }
+        }
+        state.follow_caret = false;
+    } else if state.follow_mode {
         // Only when the caret LINE moved (impakt-cam's event model): wheel
         // scrolling is free browsing until the next caret motion — and never
         // mid-drag, so selecting by mouse doesn't yank the world.
@@ -329,7 +354,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         state.cam.ensure_visible(y0, y0 + m.line_h, rect.height(), m.line_h * 2.0);
     }
     state.cam.clamp_scroll(max_scroll);
-    if state.cam.step(dt) {
+    if state.cam.step(dt) | state.line_shift.step(dt) {
         ui.ctx().request_repaint();
     }
     let scroll = state.cam.scroll_y.pos;
@@ -365,7 +390,8 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
             }
             let c0 = if line == pa.line { pa.col } else { 0 };
             let c1 = if line == pb.line { pb.col } else { state.editor.buffer.line_len(line) + 1 };
-            let y = rect.top() - scroll + line as f32 * m.line_h;
+            let y = rect.top() - scroll + line as f32 * m.line_h
+                + if line >= shift_from { shift_px } else { 0.0 };
             // Width-aware: a selection spanning a wide CJK glyph highlights
             // the full 2-cell glyph, not a narrow sliver. `_clamped` keeps
             // the existing "reaches one cell past EOL" convention for
@@ -388,7 +414,8 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     // syntax cache can pull line text while we hold the rest of state.
     let AppState { editor, syntax, find, git_changed, .. } = &mut *state;
     for line in first..last {
-        let y = rect.top() - scroll + line as f32 * m.line_h;
+        let y = rect.top() - scroll + line as f32 * m.line_h
+            + if line >= shift_from { shift_px } else { 0.0 };
         // Find-match slabs: every match a faint wash, the current one loud.
         if let Some(f) = find.as_ref() {
             let find_line_text = editor.buffer.line(line);
