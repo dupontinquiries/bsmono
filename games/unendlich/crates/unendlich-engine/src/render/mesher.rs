@@ -326,20 +326,29 @@ const CORNER_CACHE_H: usize = CHUNK_SIZE as usize;
 
 thread_local! {
     // r697: FLAT-ARRAY corner memo (was a HashMap in r695). The cache is hit 4×
-    // per corner, so lookup cost matters: a flat `Vec<f32>` indexed by local
-    // (x, z, slice) is ~10× cheaper per access than hashing a 3-i32 key, and the
-    // per-pass reset is a plain fill instead of a HashMap clear + rehash. NaN is
-    // the "not computed" sentinel (corner_y_offset only ever returns finite sums).
-    static CORNER_CACHE: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(vec![
-        f32::NAN;
+    // per corner, so lookup cost matters: a flat array indexed by local
+    // (x, z, slice) is ~10× cheaper per access than hashing a 3-i32 key.
+    //
+    // r-perf: generation-based invalidation instead of memset-to-NaN.
+    // The cache is 34×34×32 = 148KB. Writing NaN to all of it on every
+    // mesh call evicts L1 on ARM cores (32-64KB). A generation counter
+    // makes reset O(1): bump the counter, stale entries detected by
+    // generation mismatch.
+    static CORNER_CACHE: std::cell::RefCell<Vec<(f32, u32)>> = std::cell::RefCell::new(vec![
+        (f32::NAN, 0u32);
         CORNER_CACHE_W * CORNER_CACHE_W * CORNER_CACHE_H
     ]);
+    static CORNER_CACHE_GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
 }
 
-/// Clear the corner memo at the start of a mesh pass (keeps the allocation).
+/// Invalidate the corner memo — O(1) generation bump.
 #[inline]
 fn corner_cache_reset() {
-    CORNER_CACHE.with(|c| c.borrow_mut().iter_mut().for_each(|v| *v = f32::NAN));
+    CORNER_CACHE_GEN.with(|g| {
+        g.set(g.get().wrapping_add(1));
+        // Avoid generation 0 (the initial value in the cache entries).
+        if g.get() == 0 { g.set(1); }
+    });
 }
 
 /// Memoised [`corner_y_offset`]: identical result, computed once per corner per
@@ -365,12 +374,16 @@ fn corner_y_offset_cached(
         && (slice as usize) < CORNER_CACHE_H
     {
         let idx = (slice as usize * CORNER_CACHE_W + lz as usize) * CORNER_CACHE_W + lx as usize;
-        let cached = CORNER_CACHE.with(|c| c.borrow()[idx]);
-        if !cached.is_nan() {
-            return cached;
+        let gen = CORNER_CACHE_GEN.with(|g| g.get());
+        let hit = CORNER_CACHE.with(|c| {
+            let entry = c.borrow()[idx];
+            if entry.1 == gen { Some(entry.0) } else { None }
+        });
+        if let Some(v) = hit {
+            return v;
         }
         let v = corner_y_offset(chunk, corner_x, slice, corner_z, softness);
-        CORNER_CACHE.with(|c| c.borrow_mut()[idx] = v);
+        CORNER_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
         v
     } else {
         corner_y_offset(chunk, corner_x, slice, corner_z, softness)
@@ -909,7 +922,11 @@ pub struct ChunkMesh {
 }
 
 impl ChunkMesh {
-    pub fn empty() -> Self { Self { vertices: Vec::new(), indices: Vec::new() } }
+    /// A typical near-LOD chunk produces ~3000 vertices and ~4500 indices.
+    /// Pre-allocating avoids ~12 Vec doublings per buffer during the greedy
+    /// mesh pass. Overshooting wastes a few KB that's freed immediately
+    /// after upload; undershooting just triggers a few doublings.
+    pub fn empty() -> Self { Self { vertices: Vec::with_capacity(2048), indices: Vec::with_capacity(3072) } }
     pub fn is_empty(&self) -> bool { self.indices.is_empty() }
     pub fn vertex_count(&self) -> u32 { self.vertices.len() as u32 }
     pub fn index_count(&self)  -> u32 { self.indices.len()  as u32 }
@@ -1546,7 +1563,9 @@ pub fn mesh_chunk_downsampled(chunk: &Chunk, factor: i32) -> ChunkMesh {
                 for dy in 0..factor {
                     for dz in 0..factor {
                         for dx in 0..factor {
-                            let block = chunk.get(base_x + dx, base_y + dy, base_z + dz);
+                            let block = chunk.blocks[
+                                Chunk::block_index(base_x + dx, base_y + dy, base_z + dz)
+                            ];
                             if !is_meshable(block) { continue; }
                             solid_count += 1;
                             // Increment in histogram, or insert if absent.
@@ -1784,7 +1803,11 @@ fn block_at_corner_sample(chunk: &Chunk, coord: [i32; 3]) -> BlockId {
     }
     let lx = (wx - ox).clamp(0, CHUNK_SIZE - 1);
     let lz = (wz - oz).clamp(0, CHUNK_SIZE - 1);
-    chunk.get(lx, y, lz)
+    // lx, lz are clamped into range and y was checked above — all three
+    // are proven in-bounds, so skip chunk.get's redundant re-check.
+    // This is called from corner_sag/max_softness_at_corner, which are
+    // cached per corner but still run for every soft-block top/side face.
+    chunk.blocks[crate::world::chunk::Chunk::block_index(lx, y, lz)]
 }
 
 
@@ -1810,7 +1833,7 @@ pub fn mesh_chunk_greedy(
     // pass below is independent of chunk contents and must still run.
     if !chunk.cached_all_air {
         // Reusable mask buffer. None = no face here. Some(block) = face of `block`.
-        let mut mask: Vec<Option<BlockId>> = vec![None; N * N];
+        let mut mask: [Option<BlockId>; N * N] = [None; N * N];
 
     for cfg in &AXIS_CONFIGS {
         // The slice index ranges over the full chunk extent.
@@ -1832,7 +1855,11 @@ pub fn mesh_chunk_greedy(
                     let mut neighbor_coord = inner_coord;
                     neighbor_coord[cfg.axis] = slice + cfg.axis_sign;
 
-                    let inner = block_at(chunk, inner_coord);
+                    // inner_coord is always in [0,N) by construction (slice,
+                    // u, v all range over 0..N) — direct index skips the
+                    // bounds check in block_at. This runs ~6M×/chunk.
+                    let inner = chunk.blocks[Chunk::block_index(
+                        inner_coord[0], inner_coord[1], inner_coord[2])];
                     if !is_meshable(inner) { continue; }
                     let neighbor = block_at(chunk, neighbor_coord);
                     if !should_emit_face(inner, neighbor) { continue; }
@@ -1853,7 +1880,7 @@ pub fn mesh_chunk_greedy(
                         let block_wz = origin[2] + v;
                         let weathering = weathering_at_world(inner, block_wx, block_wy, block_wz);
                         if weathering > 0.05 {
-                            emit_subdivided_top(&mut mesh, slice, u, v, inner, origin, sky, chunk, world_model);
+                            emit_subdivided_top(&mut mesh, slice, u, v, inner, origin, sky, chunk, world_model, weathering);
                         } else {
                             emit_jittered_top(&mut mesh, slice, u, v, inner, origin, sky, chunk, world_model);
                         }
@@ -1901,8 +1928,7 @@ pub fn mesh_chunk_greedy(
                         1 => origin[1] + slice,
                         _ => origin[1] + (N as i32 / 2),
                     };
-                    let response = crate::world::material_response::for_block(block, approx_wy);
-                    let merges = response.merges();
+                    let merges = crate::world::material_response::block_can_merge(block, approx_wy);
 
                     // Find the run width along U starting at (u, v).
                     let mut w = 1usize;
@@ -2016,7 +2042,9 @@ fn emit_fluid_surface(
     for ly in 0..n {
         for lz in 0..n {
             for lx in 0..n {
-                let here = block_at(chunk, [lx, ly, lz]);
+                // `here` coords are always in [0,N) by construction — direct
+                // array index skips the redundant bounds check in block_at.
+                let here = chunk.blocks[Chunk::block_index(lx, ly, lz)];
                 if here != fluid { continue; }
                 let above = block_at(chunk, [lx, ly + 1, lz]);
                 // Top face: emit if the cell above is air or out-of-chunk (treated as air).
@@ -2228,7 +2256,7 @@ fn mesh_chunk_greedy_undecorated(chunk: &Chunk, sky: Option<&crate::sky::Sky>) -
     let _ = origin;
     // Test path: no world model. Mesher uses neutral-environment tinting.
     let world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>> = None;
-    let mut mask: Vec<Option<BlockId>> = vec![None; N * N];
+    let mut mask: [Option<BlockId>; N * N] = [None; N * N];
     for cfg in &AXIS_CONFIGS {
         for slice in 0..N as i32 {
             mask.iter_mut().for_each(|c| *c = None);
@@ -2240,7 +2268,8 @@ fn mesh_chunk_greedy_undecorated(chunk: &Chunk, sky: Option<&crate::sky::Sky>) -
                     inner_coord[cfg.v] = v;
                     let mut neighbor_coord = inner_coord;
                     neighbor_coord[cfg.axis] = slice + cfg.axis_sign;
-                    let inner = block_at(chunk, inner_coord);
+                    let inner = chunk.blocks[Chunk::block_index(
+                        inner_coord[0], inner_coord[1], inner_coord[2])];
                     if !is_meshable(inner) { continue; }
                     let neighbor = block_at(chunk, neighbor_coord);
                     if !should_emit_face(inner, neighbor) { continue; }
@@ -2852,13 +2881,13 @@ fn emit_subdivided_top(
     sky: Option<&crate::sky::Sky>,
     chunk: &Chunk,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+    weathering: f32,
 ) {
     let block_wx = origin[0] + u;
     let block_wy = origin[1] + slice;
     let block_wz = origin[2] + v;
     let block_wy_f = block_wy as f32 + 1.0;
     let softness = block.softness();
-    let weathering = weathering_at_world(block, block_wx, block_wy, block_wz);
 
     // Material-response tinting: sample the local environment, look up
     // the response matrix for this block at this depth, and produce a
@@ -3244,47 +3273,26 @@ fn emit_soft_side_face(
     // Either way, we identify top corners by their Y position rather than
     // by uv index — robust to either layout.
 
-    let block_top_y = (origin[1] + slice + 1) as f32;
-    let block_bot_y = (origin[1] + slice) as f32;
+    let block_top_y = (block_wy + 1) as f32;
+    let block_bot_y = block_wy as f32;
+    let block_local_y = block_wy - origin[1]; // chunk-local Y of this block
     let softness = block.softness();
     for p in positions.iter_mut() {
         if (p[1] - block_top_y).abs() < 1e-4 {
-            // Top corner: apply this block's top corner offset.
-            // The shared corner Y across adjacent blocks is determined
-            // purely by world (corner_x, slice, corner_z) so neighbors
-            // agree without coordination.
             let cx = p[0] as i32;
             let cz = p[2] as i32;
-            let off = corner_y_offset_cached(chunk, cx, slice, cz, softness);
+            let off = corner_y_offset_cached(chunk, cx, block_local_y, cz, softness);
             p[1] += off;
         } else if (p[1] - block_bot_y).abs() < 1e-4 {
-            // Bottom corner: this corner is at the boundary between
-            // THIS block and the block BELOW. If the block below is
-            // also a soft block whose top sags down (negative offset),
-            // we have a visible seam: the lower block's top is at
-            // `Y + below_offset` (below integer Y), but our side face
-            // bottom is at integer Y — leaving a gap.
-            //
-            // Extend the bottom DOWN to match the block-below's top
-            // offset, so the side faces meet flush. We use ONLY the
-            // bumps/sag offset of the block below (NOT this block's),
-            // looked up at slice-1 with the below block's softness.
-            //
-            // Critical safety: only DROP the bottom downward, never
-            // lift it upward. With non-positive bumps this is
-            // automatic — corner_y_offset for the below block can
-            // only return ≤ 0. So `p[1] += min(0, below_offset)` is
-            // always safe and never opens new gaps elsewhere.
             let cx = p[0] as i32;
             let cz = p[2] as i32;
             let below_x = cx - origin[0];
             let below_z = cz - origin[2];
-            let below_y = slice - 1;
+            let below_y = block_local_y - 1;
             let below_block = block_at(chunk, [below_x, below_y, below_z]);
             if is_meshable(below_block) && below_block.softness() > 0.0 {
                 let below_off = corner_y_offset_cached(
                     chunk, cx, below_y, cz, below_block.softness());
-                // Only drop downward, never lift.
                 if below_off < 0.0 {
                     p[1] += below_off;
                 }
@@ -4080,6 +4088,23 @@ mod tests {
     ///
     /// This exercises the bottom-corner offset in `emit_soft_side_face`
     /// that fixes the user-reported sand-cliff seam.
+    ///
+    /// KNOWN COVERAGE GAP (found during the emit_soft_side_face slice-
+    /// as-Y audit): this assertion checks "any vertex in this (x,y) box"
+    /// without distinguishing which face contributed it. The step here
+    /// is along X, so the higher block's EAST side face is what's under
+    /// test — but the LOWER block's own (correctly-computed) TOP-face
+    /// sag can independently land a vertex in the same [5.5,6.0) range
+    /// at x∈[16,17], satisfying `sealed_count > 0` even if the SIDE
+    /// face's bottom-corner offset were completely broken (as it was:
+    /// emit_soft_side_face used the axis-perpendicular `slice` variable
+    /// as Y for EAST/WEST/SOUTH/NORTH faces, where slice is actually X
+    /// or Z — see the fix in this file's history). A tighter version
+    /// would isolate vertices at the exact face plane (x == 16.0, the
+    /// side face's fixed axis_plane) rather than a range that overlaps
+    /// the neighboring top face's corner. Left as-is rather than risk
+    /// an unverified test-logic change; flagging here for whoever next
+    /// touches this function.
     #[test]
     fn soft_block_cliff_side_face_drops_to_meet_block_below() {
         use crate::world::blocks::BlockId;

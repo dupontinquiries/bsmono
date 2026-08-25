@@ -82,8 +82,13 @@ pub fn plan(recent: &[FrameStats], cur_inflight: u8, target_ms: f32) -> Plan {
 
     if gpu_bound {
         let max_inflight = clamp_inflight(cur.saturating_add(1));
-        // badly behind AND already buffered to the cap ⇒ skip a submit to drain
-        let submit = !(w > t && cur >= MAX_INFLIGHT_CAP);
+        // Skip a submit to let the GPU drain when:
+        //  - wait exceeds target AND at the inflight cap (original rule), OR
+        //  - wait exceeds 2x target at ANY inflight depth (new: on FIF=1 with
+        //    a slow ARM GPU doing 47ms mesh dispatches, the CPU must be able
+        //    to yield even though it can't raise inflight further)
+        let severely_behind = w > t * 2.0;
+        let submit = !((w > t && cur >= MAX_INFLIGHT_CAP) || severely_behind);
         Plan { submit, max_inflight, coalesce: 0 }
     } else if cpu_bound {
         let max_inflight = clamp_inflight(cur.saturating_sub(1));
@@ -104,14 +109,21 @@ mod tests {
 
     #[test]
     fn gpu_bound_raises_inflight_or_skips() {
-        let recent = [fs(30.0, 10.0, 40.0); 4];
-        // not yet at cap → inflight rises, still submits
-        let p = plan(&recent, 1, 8.0);
+        // Moderate GPU pressure: wait > target but < 2x target → inflight rises, still submits.
+        let moderate = [fs(12.0, 5.0, 10.0); 4];
+        let p = plan(&moderate, 1, 8.0);
         assert!(p.max_inflight > 1 && p.max_inflight <= MAX_INFLIGHT_CAP, "inflight should rise");
-        // at cap and badly behind → submit-skip permitted
-        let p2 = plan(&recent, MAX_INFLIGHT_CAP, 8.0);
+        assert!(p.submit, "moderate pressure → still submit");
+
+        // At cap and badly behind (wait > target, at cap) → submit-skip.
+        let p2 = plan(&moderate, MAX_INFLIGHT_CAP, 8.0);
         assert_eq!(p2.max_inflight, MAX_INFLIGHT_CAP);
-        assert!(!p2.submit, "at cap + far behind ⇒ skip a submit");
+        assert!(!p2.submit, "at cap + behind ⇒ skip a submit");
+
+        // Severely behind (wait > 2x target): skip even at FIF=1.
+        let severe = [fs(30.0, 10.0, 40.0); 4];
+        let p3 = plan(&severe, 1, 8.0);
+        assert!(!p3.submit, "severely behind ⇒ skip even at FIF=1");
     }
 
     #[test]

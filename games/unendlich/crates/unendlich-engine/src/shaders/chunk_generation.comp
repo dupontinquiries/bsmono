@@ -498,17 +498,8 @@ uint determine_biome(float temperature, float humidity, float erosion) {
 // (sea_level + 10) so biome boundaries respect actual surface position.
 // Matches `world_model::biome_at_2d`.
 uint biome_at_2d(float x, float z, uint world_seed) {
-    // r192: TRULY topographic veto (parity with cpu biome_at_3d): the
-    // biome-free base terrain (sea + continental + hills) decides
-    // Ocean/Beach before climate logic runs.
-    {
-        float sl = model_sea_level(x, z, world_seed);
-        float st = sl + model_continental(x, z, world_seed) * 30.0
-                      + model_hills(x, z, world_seed) * 15.0;
-        if (st < sl - 2.0) return BIOME_OCEAN;
-        if (st < sl + 2.0) return BIOME_BEACH;
-    }
-    float surface_y = model_sea_level(x, z, world_seed) + 10.0;
+    float sl = model_sea_level(x, z, world_seed);
+    float surface_y = sl + 10.0;
     float temp = model_temperature(x, surface_y, z, world_seed);
     float humid = model_humidity(x, surface_y, z, world_seed);
     // v0.24.NEXT-biome-jitter: small high-freq jitter so biome thresholds in
@@ -522,7 +513,27 @@ uint biome_at_2d(float x, float z, uint world_seed) {
     float erosion_raw = (fbm_2d(x * 0.0008, z * 0.0008,
                                  world_seed + SEED_EROSION, 2, 1.0, 1.0) - 0.5) * 2.0;
     float erosion_unit = (erosion_raw + 1.0) * 0.5;
-    return determine_biome(temp, humid, erosion_unit);
+    uint climate_verdict = determine_biome(temp, humid, erosion_unit);
+
+    // r192: TRULY topographic veto (parity with cpu biome_at_3d): the
+    // biome-free base terrain (sea + continental + hills) decides
+    // Ocean/Beach before climate logic runs.
+    //
+    // BUGFIX (mirrors the CPU fix in cpu_generator.rs::biome_at_3d, see
+    // topo_ocean_threshold there for the full rationale and a Rust-side
+    // regression test): climate_verdict's own height_modifier widens the
+    // immediate-Ocean threshold, so a column whose climate suggests a
+    // high-elevation biome (Skylands +80, MistyMountains +50,
+    // AlpineHighlands +35) isn't vetoed to Ocean before that modifier is
+    // ever applied. Biomes with height_modifier <= 0 (Ocean, Beach, Plains,
+    // Swamp, etc.) keep the exact original sl-2.0 threshold — bit-for-bit
+    // unchanged from before this fix.
+    float ocean_threshold = sl - 2.0 - max(biome_height_modifier(climate_verdict), 0.0);
+    float st = sl + model_continental(x, z, world_seed) * 30.0
+                  + model_hills(x, z, world_seed) * 15.0;
+    if (st < ocean_threshold) return BIOME_OCEAN;
+    if (st < sl + 2.0) return BIOME_BEACH;
+    return climate_verdict;
 }
 
 // ============================================================================

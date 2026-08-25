@@ -77,6 +77,23 @@ pub struct WorldGenerator {
     biome_registry: Option<std::sync::Arc<super::biome_loader::BiomeRegistry>>,
 }
 
+/// The immediate-Ocean threshold for `biome_at_3d`'s topographic veto.
+///
+/// Below this, a column's biome-free base (sea + continental + hills, no
+/// biome_height) is vetoed straight to Ocean with no refinement. The base
+/// threshold is `sea_level - 2.0`; `height_modifier` (>=0 only — Ocean/Beach/
+/// Swamp/etc's own negative modifiers don't widen it, since a column that's
+/// ALREADY climate-classified as one of those doesn't need extra margin to
+/// stay Ocean) widens the margin so a column whose climate suggests a high-
+/// elevation biome (Skylands +80, MistyMountains +50, AlpineHighlands +35)
+/// isn't vetoed before that modifier is ever applied — it instead falls
+/// through to the ambiguous-shelf refinement, which uses the true
+/// (biome-adjusted) surface via `surface_y_at`.
+#[inline]
+fn topo_ocean_threshold(sea_level: f64, height_modifier: f64) -> f64 {
+    sea_level - 2.0 - height_modifier.max(0.0)
+}
+
 /// The highest `y` in `[y_min, y_max]` that is solid AND has a non-solid block
 /// directly above it — i.e. a block a creature can stand on. Scans top-down, so
 /// it is correct for NON-MONOTONIC columns (caves): a buried cave's floor is not
@@ -210,18 +227,44 @@ impl WorldGenerator {
         // (biome-free base: sea + continental + hills — the biome height
         // modifier is a CONSEQUENCE of biome and must not decide it; the
         // GPU twin uses the identical three-term base for parity.)
+        //
+        // BUGFIX (found during audit): `st` above is deliberately the
+        // "biome-free base" (sea + continental + hills, NO biome_height) to
+        // avoid circularity — you can't know biome_height without already
+        // knowing the biome. But some biomes have large height_modifier
+        // values (Skylands: +80, MistyMountains: +50, AlpineHighlands: +35
+        // — see biomes.rs), and continental*30+hills*15 alone spans roughly
+        // [-45,45] (both documented [-1,1] noise fields). Since
+        // determine_biome's climate inputs are independent noise fields
+        // from continental/hills, a column can land on BOTH "erosion>0.85
+        // (Skylands)" AND "continental=-1,hills=-1 (deep valley)" at once —
+        // nothing prevents that correlation. Before this fix, the immediate-
+        // Ocean branch (`st < sl - 2.0`, no refinement) fired before
+        // biome_height was ever applied, permanently classifying such
+        // columns as Ocean even though the true surface could be 50-80
+        // blocks above water. Fixed below by widening the threshold using
+        // legacy_verdict's own height_modifier (already computed above, for
+        // free) — biomes with modifier <= 0 keep the exact original
+        // sl-2.0 threshold (r177/r188/r192 behavior is bit-for-bit
+        // unchanged; see topo_ocean_threshold_widens_only_for_positive_
+        // height_modifiers for the regression test), while high-modifier
+        // biomes route through the existing surface_y_at refinement — which
+        // DOES include the real biome height via surface_target — instead
+        // of an immediate, unrefined veto.
         let sl = self.model.sea_level(xf, zf, 0.0);
         let st = sl
             + self.model.continental(xf, zf) * 30.0
             + self.model.hills(xf, zf) * 15.0;
-        let topo_verdict = if st < sl - 2.0 {
+        let ocean_threshold = topo_ocean_threshold(sl, legacy_verdict.height_modifier());
+        let shelf_threshold = sl + 6.0;
+        let topo_verdict = if st < ocean_threshold {
             Some(Biome::Ocean)
-        } else if st < sl + 6.0 {
+        } else if st < shelf_threshold {
             // ambiguous shelf band: the base can sit near sea while noise
             // carves the REAL surface under it (probe: 2-9-block-deep
             // "submerged Plains"). Refine with the actual surface; ~8
             // density evals, only inside this band.
-            match self.surface_y_at(x, z, (sl - 40.0) as i32, (sl + 8.0) as i32) {
+            match self.surface_y_at(x, z, (sl - 120.0) as i32, (sl + 8.0) as i32) {
                 Some(sy) if (sy as f64) < sl - 2.0 => Some(Biome::Ocean),
                 Some(sy) if (sy as f64) < sl + 2.0 => Some(Biome::Beach),
                 _ => None,
@@ -1384,6 +1427,39 @@ mod tests {
         // Solid to the very top of the range → that top is standable (y_max+1 is
         // treated as sky).
         assert_eq!(topmost_standable(|_| true, 0, 64), Some(64));
+    }
+
+    #[test]
+    fn topo_ocean_threshold_widens_only_for_positive_height_modifiers() {
+        let sl = 64.0;
+        // Zero/negative modifiers (Plains=0, Ocean=-30, Beach=-5, Swamp=-8):
+        // threshold is exactly sea_level - 2.0, unchanged from before this
+        // fix — the r177/r188/r192 submerged-Plains/Ocean/Beach behavior at
+        // this threshold is bit-for-bit preserved.
+        assert_eq!(topo_ocean_threshold(sl, 0.0), sl - 2.0);
+        assert_eq!(topo_ocean_threshold(sl, -30.0), sl - 2.0);
+        assert_eq!(topo_ocean_threshold(sl, -5.0), sl - 2.0);
+
+        // Positive modifiers widen the threshold downward by exactly their
+        // magnitude, so a Skylands-climate column's biome-free base has to
+        // dip below sea_level-82 (not just sea_level-2) before the immediate
+        // Ocean veto fires — anything shallower than that falls through to
+        // the surface_y_at refinement, which sees the true (+80-adjusted)
+        // surface instead of the biome-free base.
+        assert_eq!(topo_ocean_threshold(sl, 80.0), sl - 82.0); // Skylands
+        assert_eq!(topo_ocean_threshold(sl, 50.0), sl - 52.0); // MistyMountains
+        assert_eq!(topo_ocean_threshold(sl, 35.0), sl - 37.0); // AlpineHighlands
+
+        // Reachability check: continental*30 + hills*15 (both documented
+        // [-1,1] noise fields) spans roughly [-45, 45] — comfortably inside
+        // the widened Skylands/MistyMountains margins, confirming a valley
+        // deep enough to fool the OLD threshold (sl-2.0) is NOT deep enough
+        // to fool the fixed one for these biomes.
+        let worst_case_valley = sl - 45.0;
+        assert!(worst_case_valley < sl - 2.0,
+            "a deep valley would have tripped the old immediate-Ocean veto");
+        assert!(worst_case_valley > topo_ocean_threshold(sl, 80.0),
+            "but the fixed Skylands threshold correctly lets it through to refinement");
     }
 
     #[test]

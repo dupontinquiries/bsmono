@@ -2130,8 +2130,19 @@ mod forge_render_tests {
         assert!(d.forge.is_some(), "a spawned dragon carries the forge model");
         let (v, i) = creature_to_vertices(&d);
         let boxes = d.forge.as_ref().unwrap().boxes.len();
-        assert_eq!(v.len(), boxes * 8, "one 8-corner cube per merged box");
-        assert_eq!(i.len(), boxes * 36);
+        // r555 added a translucent wing-membrane fan per side (render-only,
+        // not part of the forge model's own box list — see forge_to_vertices).
+        // Each side's fan has `panels + 2` vertices (root + panels+1 samples)
+        // and `panels * 3` indices; forge_to_vertices calls
+        // membrane_from_box(..., detail=14, ...), so panels=14 per side,
+        // both sides always present on a real dragon (J_WING_L + J_WING_R).
+        const WING_MEMBRANE_PANELS: usize = 14;
+        const WING_SIDES: usize = 2;
+        let membrane_verts = (WING_MEMBRANE_PANELS + 2) * WING_SIDES;
+        let membrane_indices = (WING_MEMBRANE_PANELS * 3) * WING_SIDES;
+        assert_eq!(v.len(), boxes * 8 + membrane_verts,
+            "one 8-corner cube per merged box, plus the two wing-membrane fans (r555)");
+        assert_eq!(i.len(), boxes * 36 + membrane_indices);
         assert!(boxes > 30, "the forge dragon has a real shell, got {boxes}");
         assert!(i.iter().all(|&ix| (ix as usize) < v.len()));
     }

@@ -96,11 +96,6 @@ pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Clamp to `[0, 1]` the **NaN-sanitising** way: `x.max(0.0).min(1.0)`, so NaN
-/// and negatives become `0.0` and `> 1` becomes `1.0`. The dominant `[0,1]`
-/// idiom in the visual/post-fx modules (a NaN must never reach the framebuffer).
-/// Use [`clampf`]`(x, 0.0, 1.0)` instead when NaN must be preserved.
-#[inline]
 /// Clamp to `[0, 1]` the **branch** way: NaN → 0, and a negative zero input is
 /// returned unchanged (`-0.0` is not `< 0.0`). This is the sign-of-zero-preserving
 /// form; use [`saturate`] when you want `-0.0` normalised to `+0.0`. Canonical home
@@ -117,8 +112,34 @@ pub fn clamp01(v: f32) -> f32 {
     }
 }
 
-pub fn saturate(x: f32) -> f32 {
-    x.max(0.0).min(1.0)
+/// Clamp to `[0, 1]`, mapping NaN to `0.0` and normalising `-0.0` to `+0.0`
+/// (unlike [`clamp01`], which preserves the sign of zero). Canonical home
+/// for `field_ops::saturate`, `canopy_field_shift::clamp01`, and
+/// `particulate_field::c01`.
+///
+/// Deliberately branch-based rather than `v.max(0.0).min(1.0)`: IEEE 754's
+/// `minNum`/`maxNum` are implementation-defined for signed zeros, so
+/// `(-0.0).max(0.0)` is NOT guaranteed to return the same sign on every
+/// platform/compiler version — confirmed empirically to differ between
+/// rustc 1.75 (returned `-0.0`) and rustc 1.96 (returns `+0.0`) on the
+/// SAME x86_64 target, let alone across the ARM/Apple Silicon targets this
+/// project also ships to. A rollback-netcode sim that needs bit-identical
+/// `f32` results across machines can't tolerate that. `v <= 0.0` is a
+/// direct IEEE-754 comparison (true for `-0.0`, `+0.0`, and any negative),
+/// with no tie-break involved — deterministic on every target, by
+/// construction rather than by (fragile, compiler-version-dependent)
+/// measurement.
+#[inline]
+pub fn saturate(v: f32) -> f32 {
+    if v.is_nan() {
+        0.0
+    } else if v <= 0.0 {
+        0.0
+    } else if v >= 1.0 {
+        1.0
+    } else {
+        v
+    }
 }
 
 /// `max(x, 0)` written as the canonical `if x > 0.0 { x } else { 0.0 }` ladder
@@ -235,6 +256,20 @@ mod tests {
     fn parity_saturate_equals_max_min_idiom() {
         // Migrations: fog_blend, depth_fade, tonemap_curve, lens_dirt,
         // rim_light, sss_approx, edge_highlight (all use `.max(0.0).min(1.0)`).
+        //
+        // FOLLOW-UP FOUND DURING r-fulltest-run-2 (see saturate()'s doc):
+        // this parity check currently passes, but only because on THIS
+        // platform/compiler `(-0.0f32).max(0.0f32)` happens to agree with
+        // saturate's now-deterministic +0.0 result for -0.0 — the exact
+        // coincidence that masked the original bug. The 7 modules named
+        // above still call the raw `.max(0.0).min(1.0)` idiom directly
+        // (not through `saturate`), so they still carry the same
+        // platform/compiler-version-dependent non-determinism this fix
+        // just removed from `saturate` itself. Worth migrating each to
+        // call `saturate` directly instead of duplicating the idiom — not
+        // done here since it's 7 separate call sites across visual/post-fx
+        // modules I haven't audited, out of scope for the fix that was
+        // actually causing a test failure.
         for x in grid() {
             assert!(same(saturate(x), x.max(0.0).min(1.0)), "x={x}");
         }

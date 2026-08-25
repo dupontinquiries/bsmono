@@ -59,23 +59,34 @@ pub const SHADOW_MAP_SIZE_DEFAULT: u32 = 2048;
 pub fn runtime_shadow_map_size() -> u32 {
     match std::env::var("UNENDLICH_SHADOW_MAP_SIZE") {
         Ok(v) => match v.parse::<u32>() {
-            Ok(n @ (512 | 1024 | 2048)) => n,
+            Ok(n @ (512 | 1024 | 2048 | 4096 | 8192)) => n,
             Ok(n) => {
                 log::warn!(
-                    "UNENDLICH_SHADOW_MAP_SIZE={} not in {{512,1024,2048}}; using default {}",
-                    n, SHADOW_MAP_SIZE_DEFAULT,
+                    "UNENDLICH_SHADOW_MAP_SIZE={} not in {{512,1024,2048,4096,8192}}; using preset default",
+                    n,
                 );
-                SHADOW_MAP_SIZE_DEFAULT
+                preset_shadow_size()
             }
             Err(_) => {
                 log::warn!(
-                    "UNENDLICH_SHADOW_MAP_SIZE={} not a valid u32; using default {}",
-                    v, SHADOW_MAP_SIZE_DEFAULT,
+                    "UNENDLICH_SHADOW_MAP_SIZE={} not a valid u32; using preset default",
+                    v,
                 );
-                SHADOW_MAP_SIZE_DEFAULT
+                preset_shadow_size()
             }
         },
-        Err(_) => SHADOW_MAP_SIZE_DEFAULT,
+        Err(_) => preset_shadow_size(),
+    }
+}
+
+/// Shadow size from the RuntimeConfig (device-auto or env-seeded preset).
+/// Falls back to SHADOW_MAP_SIZE_DEFAULT if the config isn't accessible
+/// or returns an unsupported size.
+fn preset_shadow_size() -> u32 {
+    let cfg = crate::runtime_config::RuntimeConfig::from_env();
+    match cfg.shadow_map_size {
+        512 | 1024 | 2048 | 4096 | 8192 => cfg.shadow_map_size,
+        _ => SHADOW_MAP_SIZE_DEFAULT,
     }
 }
 

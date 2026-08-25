@@ -91,20 +91,47 @@ impl RuntimeConfig {
         fn arr4(k: &str, d: [u32; 4]) -> [u32; 4] {
             parse_csv::<4>(k).unwrap_or(d)
         }
+        // Start from the device-recommended preset instead of hardcoded Medium.
+        // device_budget::recommend_preset() probes RAM, GPU class, thread count,
+        // and mobile flag to pick a tier; the env overrides below let the user
+        // override any individual field on top of that recommendation.
+        // UNENDLICH_PERF_PRESET=<name> forces a specific preset as the base.
+        let base = match std::env::var("UNENDLICH_PERF_PRESET").ok().as_deref() {
+            Some("battery_saver") | Some("BatterySaver") =>
+                Self::preset(PerfPreset::BatterySaver),
+            Some("low") | Some("Low") =>
+                Self::preset(PerfPreset::Low),
+            Some("medium") | Some("Medium") =>
+                Self::preset(PerfPreset::Medium),
+            Some("high") | Some("High") =>
+                Self::preset(PerfPreset::High),
+            Some("ultra") | Some("Ultra") =>
+                Self::preset(PerfPreset::Ultra),
+            _ => {
+                // Auto-detect from hardware.
+                let caps = crate::device_budget::DeviceCaps::detect();
+                let preset = crate::device_budget::recommend_preset(&caps);
+                log::info!(
+                    "device_budget: detected {:?} → preset {:?}",
+                    caps, preset
+                );
+                Self::preset(preset)
+            }
+        };
         RuntimeConfig {
-            render_distance: u32v("UNENDLICH_RENDER_DISTANCE", 6),
-            lod_bands: arr3("UNENDLICH_LOD_BANDS", [8, 16, 32]),
-            lod_factors: arr4("UNENDLICH_LOD_FACTORS", [1, 2, 4, 8]),
-            max_uploads_per_frame: u32v("UNENDLICH_MAX_UPLOADS_PER_FRAME", 64),
-            upload_budget_ms: f32v("UNENDLICH_UPLOAD_BUDGET_MS", 4.0),
-            frame_target_ms: f32v("UNENDLICH_FRAME_TARGET_MS", 16.67),
-            mesh_cache_size: u32v("UNENDLICH_MESH_CACHE_SIZE", 0) as usize,
-            gpu_gen_batch: u32v("UNENDLICH_GPU_GEN_BATCH", 16),
-            gpu_mesh_budget_us: u32v("UNENDLICH_GPU_MESH_BUDGET_US", 4000),
-            render_scale: f32v("UNENDLICH_RENDER_SCALE", 1.0),
-            shadow_map_size: u32v("UNENDLICH_SHADOW_MAP_SIZE", 2048),
-            vsync: u32v("UNENDLICH_VSYNC", 1),
-            gpu_mesher: u32v("UNENDLICH_GPU_MESHER", 0),
+            render_distance: u32v("UNENDLICH_RENDER_DISTANCE", base.render_distance),
+            lod_bands: arr3("UNENDLICH_LOD_BANDS", base.lod_bands),
+            lod_factors: arr4("UNENDLICH_LOD_FACTORS", base.lod_factors),
+            max_uploads_per_frame: u32v("UNENDLICH_MAX_UPLOADS_PER_FRAME", base.max_uploads_per_frame),
+            upload_budget_ms: f32v("UNENDLICH_UPLOAD_BUDGET_MS", base.upload_budget_ms),
+            frame_target_ms: f32v("UNENDLICH_FRAME_TARGET_MS", base.frame_target_ms),
+            mesh_cache_size: u32v("UNENDLICH_MESH_CACHE_SIZE", base.mesh_cache_size as u32) as usize,
+            gpu_gen_batch: u32v("UNENDLICH_GPU_GEN_BATCH", base.gpu_gen_batch),
+            gpu_mesh_budget_us: u32v("UNENDLICH_GPU_MESH_BUDGET_US", base.gpu_mesh_budget_us),
+            render_scale: f32v("UNENDLICH_RENDER_SCALE", base.render_scale),
+            shadow_map_size: u32v("UNENDLICH_SHADOW_MAP_SIZE", base.shadow_map_size),
+            vsync: u32v("UNENDLICH_VSYNC", base.vsync),
+            gpu_mesher: u32v("UNENDLICH_GPU_MESHER", base.gpu_mesher),
         }
     }
 
@@ -135,7 +162,7 @@ impl RuntimeConfig {
                 max_uploads_per_frame: 4,
                 upload_budget_ms: 2.0,
                 frame_target_ms: 33.3, // 30 fps cap to save power
-                mesh_cache_size: 0,
+                mesh_cache_size: 16,
                 gpu_gen_batch: 4,
                 gpu_mesh_budget_us: 2000,
                 render_scale: 0.6,
@@ -151,9 +178,18 @@ impl RuntimeConfig {
                 gpu_mesh_budget_us: 3000,
                 render_scale: 0.8,
                 shadow_map_size: 1024,
+                mesh_cache_size: 32,
                 ..base
             },
-            PerfPreset::Medium => base,
+            PerfPreset::Medium => RuntimeConfig {
+                // r-perf: a modest mesh cache avoids re-meshing on camera
+                // turnarounds. At render distance 6 the player's viewable
+                // shell is ~300 chunks; 64 cached slots cover ~20% of
+                // behind-the-camera evictions without meaningful memory cost
+                // (each cached entry is a MeshSlot handle, not the mesh data).
+                mesh_cache_size: 64,
+                ..base
+            },
             PerfPreset::High => RuntimeConfig {
                 render_distance: 10,
                 lod_bands: [12, 24, 48],
@@ -173,7 +209,7 @@ impl RuntimeConfig {
                 mesh_cache_size: 512,
                 gpu_gen_batch: 32,
                 gpu_mesh_budget_us: 8000,
-                shadow_map_size: 8192,
+                shadow_map_size: 4096, // 8192 = 256MB D32, risks OOM
                 ..base
             },
             PerfPreset::Custom => base,
@@ -215,7 +251,7 @@ mod tests {
         assert_eq!(m.render_distance, 6);
         assert_eq!(m.lod_bands, [8, 16, 32]);
         assert_eq!(m.gpu_mesher, 0); // r477: CPU mesher is the default
-        assert_eq!(m.mesh_cache_size, 0);
+        assert_eq!(m.mesh_cache_size, 64);
         assert_eq!(m.gpu_mesh_budget_us, 4000); // r708: budget on by default
     }
 

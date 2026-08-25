@@ -217,13 +217,15 @@ struct OctreeGpuMeshRequest {
     world_model: Option<Arc<crate::world::world_model::WorldModel>>,
 }
 
-/// v0.24.21-gpu-mesher-prod: how long the GPU dispatcher will linger
-/// after receiving its first request before forcing a dispatch. With
-/// a stream of workers feeding requests, this is the worst-case latency
-/// any individual chunk pays waiting for batchmates. Tuned to ~half a
-/// frame at 60 FPS: low enough to feel responsive, high enough to
-/// usefully batch.
-const GPU_BATCH_TIMEOUT: Duration = Duration::from_millis(8);
+/// How long the GPU dispatcher lingers after receiving its first request
+/// before forcing a dispatch. With a stream of workers feeding requests,
+/// this is the worst-case latency any individual chunk pays waiting for
+/// batchmates. Reduced from 8ms → 4ms: on ARM GPUs (Asahi/Mali) where
+/// per-chunk dispatch already takes 38-171ms, the 8ms accumulation window
+/// is a significant fraction of the frame budget for zero batching benefit
+/// (the adaptive batch target shrinks to 1-2 on those devices anyway). 4ms
+/// still lets a burst of 2-3 worker completions coalesce on fast GPUs.
+const GPU_BATCH_TIMEOUT: Duration = Duration::from_millis(4);
 
 
 pub struct MeshingPool {
@@ -448,13 +450,20 @@ impl MeshingPool {
     /// caller wants to bound per-frame work.
     pub fn drain_up_to(&self, limit: usize) -> Vec<MeshResult> {
         let mut out = Vec::with_capacity(limit);
+        self.drain_up_to_into(limit, &mut out);
+        out
+    }
+
+    /// Like `drain_up_to` but reuses a caller-owned Vec (clears it first).
+    /// Avoids per-frame allocation when called from the main loop.
+    pub fn drain_up_to_into(&self, limit: usize, out: &mut Vec<MeshResult>) {
+        out.clear();
         for _ in 0..limit {
             match self.result_rx.try_recv() {
                 Ok(r) => out.push(r),
                 Err(_) => break,
             }
         }
-        out
     }
 
     /// Size of the request queue. Useful for diagnostics.
@@ -574,6 +583,10 @@ fn worker_loop(
     // UNENDLICH_SKIP_AIR_CHUNKS=0 to force every chunk through the mesher (A/B).
     let skip_air_chunks = std::env::var("UNENDLICH_SKIP_AIR_CHUNKS")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
+    // T6: hoisted alongside the other env reads. Was inside the recv loop —
+    // one syscall per dequeued request for a launch-time flag.
+    let far_mesh_from_chunk = std::env::var("UNENDLICH_FAR_MESH_FROM_CHUNK")
+        .ok().as_deref() == Some("1");
     while let Ok(req) = req_rx.recv() {
         let t0 = Instant::now();
 
@@ -760,16 +773,7 @@ fn worker_loop(
         // materialized data the regen avoids using is already sitting right
         // there in `req.chunk`, unused.
         //
-        // Staged as an opt-in flag (UNENDLICH_FAR_MESH_FROM_CHUNK=1) rather
-        // than flipping the default — same promotion pattern this codebase
-        // already uses (R27's SUBMIT_SKIP/SLACK_SCHEDULER/etc: land opt-in,
-        // A/B through the harness, promote once green — see
-        // docs/PERF-LEVERS.md). This is a CPU-only code-path change (no
-        // shader/GPU involved) but still real render-output-affecting
-        // logic; I can't visually confirm far terrain looks identical
-        // between the two paths from this sandbox, so it doesn't default on.
-        let far_mesh_from_chunk = std::env::var("UNENDLICH_FAR_MESH_FROM_CHUNK")
-            .ok().as_deref() == Some("1");
+        // r-perf-far-regen: far_mesh_from_chunk was hoisted to thread start (T6).
         let is_virtual_eligible = matches!(req.lod, LodLevel::Far | LodLevel::VeryFar)
             && req.generator.is_some()
             && !far_mesh_from_chunk;
@@ -837,6 +841,8 @@ fn gpu_dispatcher_loop(
     log::info!("gpu-mesh-dispatcher: batch target = {}, timeout = {:?}",
         batch_target, GPU_BATCH_TIMEOUT);
 
+    let mut batch: Vec<GpuMeshRequest> = Vec::with_capacity(batch_target);
+
     loop {
         // Block-recv for the first request of a batch. Returns Err
         // when the channel is closed — that's our shutdown signal.
@@ -848,7 +854,7 @@ fn gpu_dispatcher_loop(
             }
         };
         let batch_start = Instant::now();
-        let mut batch: Vec<GpuMeshRequest> = Vec::with_capacity(batch_target);
+        batch.clear();
         batch.push(first);
 
         // Fill the batch up to `batch_target` or until `GPU_BATCH_TIMEOUT`
@@ -1103,6 +1109,11 @@ fn octree_gpu_dispatcher_loop(
     // This preserves the single-LOD invariant the shader needs
     // (push constants apply to the whole dispatch).
     let mut pending: Option<OctreeGpuMeshRequest> = None;
+    // Reuse batch and inputs vecs across iterations to avoid per-dispatch
+    // heap allocation. At adaptive batch target 1-2 (ARM GPUs), this
+    // eliminates ~2 allocs per dispatch.
+    let mut batch: Vec<OctreeGpuMeshRequest> = Vec::with_capacity(batch_cap);
+    let mut inputs: Vec<OctreeBatchInput> = Vec::with_capacity(batch_cap);
 
     loop {
         let first = match pending.take() {
@@ -1123,7 +1134,7 @@ fn octree_gpu_dispatcher_loop(
             LodLevel::VeryFar => 8,
         };
         let batch_start = Instant::now();
-        let mut batch: Vec<OctreeGpuMeshRequest> = Vec::with_capacity(cur_batch_target);
+        batch.clear();
         batch.push(first);
 
         while batch.len() < cur_batch_target {
@@ -1148,13 +1159,14 @@ fn octree_gpu_dispatcher_loop(
         // version so the pool can short-circuit redundant uploads.
         // v0.24.33-climate-tint: include per-chunk temperature and
         // humidity for shader-side color modulation.
-        let inputs: Vec<OctreeBatchInput> = batch.iter().map(|r| OctreeBatchInput {
+        inputs.clear();
+        inputs.extend(batch.iter().map(|r| OctreeBatchInput {
             coord: r.coord,
             octree: Arc::clone(&r.octree),
             version: r.version,
             temperature: r.temperature,
             humidity: r.humidity,
-        }).collect();
+        }));
 
         let t0 = Instant::now();
         let outputs = match mesher.mesh_chunks_batch(&inputs, batch_lod_stride) {

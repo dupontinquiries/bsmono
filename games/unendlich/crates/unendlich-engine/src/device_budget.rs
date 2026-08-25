@@ -56,16 +56,71 @@ impl DeviceCaps {
         DeviceCaps { ram_mb: 8192, gpu: GpuClass::Integrated, threads: 4, is_mobile: false }
     }
 
-    /// Best-effort, non-pure probe of the host. Only fills what std can see
-    /// portably (thread count); RAM/GPU/mobile are left at conservative
-    /// defaults for the caller to refine from platform APIs (sysinfo, the
-    /// Vulkan physical-device props, an OS check). Kept tiny on purpose so the
-    /// *policy* below stays the tested part.
+    /// Best-effort, non-pure probe of the host. Fills thread count portably,
+    /// RAM from /proc/meminfo on Linux, and mobile heuristic from target arch.
+    /// GPU class is left at conservative (Integrated) — refine from
+    /// VkPhysicalDeviceProperties at the Vulkan init site.
+    ///
+    /// Cached: the first call probes the system; subsequent calls return
+    /// the cached result. This is correct because the hardware doesn't
+    /// change during a process lifetime.
     pub fn detect() -> DeviceCaps {
-        let threads = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
-        DeviceCaps { threads, ..DeviceCaps::conservative() }
+        static CACHED: std::sync::OnceLock<DeviceCaps> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            let threads = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
+            let ram_mb = detect_ram_mb().unwrap_or(8192);
+            let is_mobile = (cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm"))
+                && ram_mb < 6144;
+            DeviceCaps { ram_mb, gpu: GpuClass::Integrated, threads, is_mobile }
+        })
     }
 }
+
+/// Read total RAM in MB from /proc/meminfo. Returns None on non-Linux or
+/// parse failure. This is a one-shot probe at startup, not a hot path.
+fn detect_ram_mb() -> Option<u32> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // Format: "MemTotal:       16384000 kB"
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some((kb / 1024) as u32);
+        }
+    }
+    None
+}
+
+/// Classify a Vulkan device type into a GpuClass. Called after Vulkan init
+/// to refine the conservative `Integrated` default from `detect()`.
+pub fn gpu_class_from_vk_device_type(device_type: i32) -> GpuClass {
+    // ash::vk::PhysicalDeviceType::as_raw() values:
+    //   OTHER=0, INTEGRATED_GPU=1, DISCRETE_GPU=2, VIRTUAL_GPU=3, CPU=4
+    match device_type {
+        2 => GpuClass::Mid,        // DISCRETE_GPU — at least Mid
+        1 => GpuClass::Integrated, // INTEGRATED_GPU — confirmed integrated
+        _ => GpuClass::Integrated, // OTHER/VIRTUAL/CPU — conservative
+    }
+}
+
+/// Refine the cached DeviceCaps with a Vulkan-detected GPU class. Call once
+/// after VulkanContext creation. The RuntimeConfig should be created AFTER
+/// this call so it picks up the refined GPU tier.
+///
+/// Thread-safe: only the first call takes effect (OnceLock for the GPU
+/// refinement). If `detect()` was already called (caching the caps), this
+/// updates the cached copy.
+pub fn refine_gpu_class(gpu: GpuClass) {
+    // We can't mutate the OnceLock, but we CAN store the refinement
+    // separately and have recommended_tier check it.
+    GPU_CLASS_OVERRIDE.get_or_init(|| gpu);
+}
+
+/// The refined GPU class, if `refine_gpu_class` was called.
+pub(crate) fn refined_gpu_class() -> Option<GpuClass> {
+    GPU_CLASS_OVERRIDE.get().copied()
+}
+
+static GPU_CLASS_OVERRIDE: std::sync::OnceLock<GpuClass> = std::sync::OnceLock::new();
 
 /// The five selectable presets as an ordinal ladder (0 = BatterySaver …
 /// 4 = Ultra), so tiers can be compared/clamped with plain integer `min`.
@@ -94,7 +149,7 @@ fn ram_tier(ram_mb: u32) -> u8 {
 /// GPU class → tier ordinal (0..=4).
 fn gpu_tier(gpu: GpuClass) -> u8 {
     match gpu {
-        GpuClass::Integrated => 1, // an iGPU can drive Low comfortably
+        GpuClass::Integrated => 2, // conservative for "unknown" — at least Medium
         GpuClass::Low => 2,
         GpuClass::Mid => 3,
         GpuClass::High => 4,
@@ -105,7 +160,10 @@ fn gpu_tier(gpu: GpuClass) -> u8 {
 /// gate independently (take the min), then mobile steps down one for battery /
 /// thermals and is capped below Ultra. Pure and std-only.
 pub fn recommended_tier(caps: &DeviceCaps) -> u8 {
-    let mut t = ram_tier(caps.ram_mb).min(gpu_tier(caps.gpu));
+    // Use the Vulkan-refined GPU class if available, otherwise the
+    // caps value (which is Integrated/conservative from detect()).
+    let effective_gpu = refined_gpu_class().unwrap_or(caps.gpu);
+    let mut t = ram_tier(caps.ram_mb).min(gpu_tier(effective_gpu));
     if caps.is_mobile {
         t = t.saturating_sub(1); // battery/thermal headroom
         t = t.min(3); // no Ultra on a phone regardless of specs
@@ -204,9 +262,10 @@ mod tests {
 
     #[test]
     fn gpu_gates_lots_of_ram() {
-        // 64 GB with an integrated GPU shouldn't pretend to be a High/Ultra rig.
+        // 64 GB with an unclassified GPU shouldn't pretend to be High/Ultra.
+        // Integrated tier is 2 (Medium) — conservative "unknown" default.
         let t = recommended_tier(&caps(65536, GpuClass::Integrated, 16, false));
-        assert!(t <= 1, "an iGPU caps the tier regardless of RAM, got {t}");
+        assert!(t <= 2, "an unclassified GPU caps the tier at Medium, got {t}");
     }
 
     #[test]

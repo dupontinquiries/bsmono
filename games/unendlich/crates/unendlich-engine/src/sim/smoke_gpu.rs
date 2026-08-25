@@ -267,14 +267,26 @@ mod tests {
         }
         let mut p = params();
         p.decay = 0.7;
-        let mut prev = total(&f);
+        let start = total(&f);
+        let mut prev = start;
         for _ in 0..20 {
             f = step_smoke(&f, &p, 0.3, &[]);
             let t = total(&f);
             assert!(t <= prev + 1e-5, "mass grew under pure decay: {prev}->{t}");
             prev = t;
         }
-        assert!(prev < 1.0, "should have decayed substantially");
+        // r-fulltest-run-3: was `prev < 1.0` — a magic absolute threshold that
+        // doesn't scale with grid size. This is a 5x5x5=125-cell grid starting
+        // at density 1.0/cell (total 125.0), not a single unit of mass; per-cell
+        // density DOES decay exactly as exp(-decay*dt) predicts (verified:
+        // 0.7*0.3*20 = 4.2, e^-4.2 ≈ 0.0150, matching the measured per-cell
+        // density at step 20 to 4 decimal places), but 125 * 0.015 ≈ 1.87,
+        // never dropping below the old flat 1.0 bound in only 20 steps. Fixed
+        // to check against a fraction of the STARTING total instead — robust
+        // to grid-size or step-count changes, and still verifies genuinely
+        // substantial (>98%) decay.
+        assert!(prev < start * 0.02,
+            "should have decayed substantially (start {start}, after 20 steps {prev})");
     }
 
     #[test]

@@ -1677,6 +1677,19 @@ pub fn lifecycle_handler() -> std::sync::Arc<
 mod tests {
     use super::*;
 
+    /// Serializes tests that override `UNENDLICH_*` env vars, since env
+    /// vars are process-global and `cargo test` runs tests in parallel
+    /// threads within one process. Mirrors the identical pattern in
+    /// `runtime_flags.rs`'s test module (kept separate since Rust test
+    /// modules in different files can't share a private helper).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn fresh_state_is_seedling() {
         let s = BlockInstanceState::default();
@@ -3085,6 +3098,15 @@ mod tests {
         use crate::world::ticks::{TickContext, TickId};
         use dashmap::DashMap;
 
+        // r295's POI-build phase spread (default divisor=8) defers a
+        // fresh chunk's first cache build to a chunk-hash-dependent tick
+        // within an 8-tick window — for this test's ChunkCoord(0,0,0)
+        // that's tick 0 or 8, not tick 1. Disable the spread so tick 1
+        // deterministically builds the cache, matching this test's
+        // stated intent ("after one lifecycle tick").
+        let _g = env_lock();
+        std::env::set_var("UNENDLICH_PLANT_BUILD_SPREAD", "0");
+
         let coord = ChunkCoord::new(0, 0, 0);
         let mut chunk = Chunk::empty(coord);
         // Dirt floor at y=3, oak trunk y=4..8.
@@ -3129,6 +3151,7 @@ mod tests {
         assert_eq!(cache.tree_pois.len(), 1);
         assert_eq!(cache.tree_pois[0].anchor_candidate, Some([8, 4, 8]));
         assert_eq!(cache.tree_pois[0].cluster_size, 5);
+        std::env::remove_var("UNENDLICH_PLANT_BUILD_SPREAD");
     }
 
     /// A tree floating in air (no anchorage) should NOT get an anchor
@@ -3141,6 +3164,11 @@ mod tests {
         use crate::world::chunk::{Chunk, ChunkCoord};
         use crate::world::ticks::{TickContext, TickId};
         use dashmap::DashMap;
+
+        // See poi_pass_discovers_root_marker_on_anchored_tree: r295's
+        // phase-spread defers tick-1's build for this coord.
+        let _g = env_lock();
+        std::env::set_var("UNENDLICH_PLANT_BUILD_SPREAD", "0");
 
         let coord = ChunkCoord::new(0, 0, 0);
         let mut chunk = Chunk::empty(coord);
@@ -3175,6 +3203,7 @@ mod tests {
         assert_eq!(cache.tree_pois.len(), 1, "tree should appear in cache");
         assert!(cache.tree_pois[0].anchor_candidate.is_none(),
             "floating tree should have no anchor candidate");
+        std::env::remove_var("UNENDLICH_PLANT_BUILD_SPREAD");
     }
 
     /// Once a marker is set on an anchored tree, subsequent ticks
@@ -3238,6 +3267,14 @@ mod tests {
         use crate::world::chunk::{Chunk, ChunkCoord};
         use crate::world::ticks::{TickContext, TickId};
         use dashmap::DashMap;
+
+        // See poi_pass_discovers_root_marker_on_anchored_tree: r295's
+        // phase-spread would prevent the "Tick 1: discover marker" step
+        // below from actually discovering anything for this coord,
+        // which then means the later removed-soil ticks have no marker
+        // to ever flag unanchored.
+        let _g = env_lock();
+        std::env::set_var("UNENDLICH_PLANT_BUILD_SPREAD", "0");
 
         let coord = ChunkCoord::new(0, 0, 0);
         let mut chunk = Chunk::empty(coord);
@@ -3310,6 +3347,7 @@ mod tests {
             }
         }
         assert!(saw_unanchored, "marker should be flagged unanchored after soil is removed");
+        std::env::remove_var("UNENDLICH_PLANT_BUILD_SPREAD");
     }
 
     /// Removing a wood block that carries a marker should

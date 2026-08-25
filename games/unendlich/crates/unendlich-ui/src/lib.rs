@@ -667,11 +667,11 @@ pub fn dest_button(ui: &mut egui::Ui, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
     let tt = ui.ctx().animate_bool(resp.id, resp.hovered());
     let p = ui.painter();
-    p.rect_filled(rect, egui::Rounding::same(3),
+    p.rect_filled(rect, egui::CornerRadius::same(3),
         egui::Color32::from_rgba_unmultiplied(24, 30, 38, (130.0 + 70.0 * tt) as u8));
     p.rect_filled(
         egui::Rect::from_min_size(rect.min, egui::vec2(3.0 + 9.0 * tt, rect.height())),
-        egui::Rounding::ZERO,
+        egui::CornerRadius::ZERO,
         egui::Color32::from_rgba_unmultiplied(150, 200, 230, (140.0 + 110.0 * tt) as u8));
     let spaced: String = label.to_uppercase().chars().flat_map(|c| [c, '\u{2009}']).collect();
     p.text(egui::pos2(rect.min.x + 18.0 + 4.0 * tt, rect.center().y),
@@ -687,7 +687,7 @@ pub fn glass_at(t01: f32) -> egui::Frame {
         .fill(egui::Color32::from_rgba_unmultiplied(14, 18, 24, (120.0 + 88.0 * t01) as u8))
         .stroke(egui::Stroke::new(1.0,
             egui::Color32::from_rgba_unmultiplied(120, 160, 190, (40.0 + 50.0 * t01) as u8)))
-        .rounding(egui::Rounding::same(8))
+        .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::same((6.0 + 8.0 * t01) as i8))
 }
 

@@ -49,18 +49,30 @@ pub fn flood_visible(
     in_range: impl Fn([i32; 3]) -> bool,
     is_opaque: impl Fn([i32; 3]) -> bool,
 ) -> HashSet<[i32; 3]> {
-    let mut visible: HashSet<[i32; 3]> = HashSet::new();
+    let mut visible = HashSet::new();
+    let mut queue = VecDeque::new();
+    flood_visible_into(camera, in_range, is_opaque, &mut visible, &mut queue);
+    visible
+}
+
+/// Like `flood_visible` but reuses caller-owned containers (clears them first).
+/// Avoids per-frame allocation when called from the main loop.
+pub fn flood_visible_into(
+    camera: [i32; 3],
+    in_range: impl Fn([i32; 3]) -> bool,
+    is_opaque: impl Fn([i32; 3]) -> bool,
+    visible: &mut HashSet<[i32; 3]>,
+    queue: &mut VecDeque<[i32; 3]>,
+) {
+    visible.clear();
+    queue.clear();
     if !in_range(camera) {
-        return visible;
+        return;
     }
-    let mut queue: VecDeque<[i32; 3]> = VecDeque::new();
     queue.push_back(camera);
     visible.insert(camera);
 
     while let Some(c) = queue.pop_front() {
-        // The camera chunk always sees out; any other chunk propagates only if it
-        // is see-through. Opaque chunks are already marked visible (drawn) but stop
-        // the flood here.
         let propagates = c == camera || !is_opaque(c);
         if !propagates {
             continue;
@@ -71,7 +83,6 @@ pub fn flood_visible(
             }
         }
     }
-    visible
 }
 
 /// Count how many in-range chunks the flood culled (were candidates but not

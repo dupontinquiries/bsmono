@@ -296,18 +296,32 @@ struct StagingState {
 /// copies. `0` disables spreading (drains all deferrable immediately,
 /// pre-v0.25 behavior). Default 1 MiB/frame — only bites on prefetch
 /// bursts; normal per-frame writes are far smaller.
+///
+/// Cached at first call — this is a launch-time knob, not a per-frame tunable.
 fn mesh_defer_budget_bytes() -> u64 {
-    std::env::var("UNENDLICH_MESH_DEFER_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1 << 20)
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("UNENDLICH_MESH_DEFER_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1 << 20)
+    })
 }
 
 /// r730: opt-in coalescing of contiguous buffer-copy regions in the mesh upload
 /// flush (UNENDLICH_COPY_COALESCE=1). Off by default so the recorded copies are
 /// bit-for-bit identical to prior builds.
+/// Copy coalescing is a byte-identical optimization (reduces driver-side
+/// per-region setup without changing any transferred byte). Default ON.
+/// Set UNENDLICH_COPY_COALESCE=0 to disable for A/B.
+///
+/// Cached at first call via `std::sync::OnceLock` — the old implementation
+/// did `std::env::var` every frame inside `flush_pending_copies`.
 fn copy_coalesce_enabled() -> bool {
-    std::env::var("UNENDLICH_COPY_COALESCE").as_deref() == Ok("1")
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("UNENDLICH_COPY_COALESCE").as_deref() == Ok("1")
+    })
 }
 
 /// Coalesce a vector of `vk::BufferCopy` in place via the pure

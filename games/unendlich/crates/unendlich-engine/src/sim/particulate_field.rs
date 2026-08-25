@@ -29,7 +29,11 @@ impl Default for ParticulateParams {
 
 #[inline]
 fn c01(x: f32) -> f32 {
-    if x.is_nan() { 0.0 } else { x.max(0.0).min(1.0) }
+    // r-fulltest-run-2: was its own `x.max(0.0).min(1.0)` copy, vulnerable to
+    // f32::max's implementation-defined negative-zero tie-break (see
+    // mathx::saturate's doc). Delegate to the canonical, deterministic
+    // version instead of keeping a second copy of the same fragile pattern.
+    crate::util::mathx::saturate(x)
 }
 #[inline]
 fn idx(x: usize, y: usize, w: usize) -> usize {

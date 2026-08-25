@@ -1595,8 +1595,8 @@ impl WorldRenderer {
             ui_leaf_stride: 2,
             ui_apply_budget: 8,
             ui_perf_preset: 2, // Medium
-            ui_fps_target: 500,
-            ui_autotune: false,
+            ui_fps_target: 60, // sensible default; overridden by persisted settings
+            ui_autotune: true,
             ui_gpu_mesh_yield: 0,
             ui_adaptive_rd: false,
             ui_octree_tile: true,
@@ -2509,6 +2509,10 @@ impl WorldRenderer {
     /// — the bin's eviction loop calls `evict_chunk` only for coords
     /// returned here. Including them ensures eviction cleans up
     /// stale empty records as the player moves.
+    ///
+    /// For per-frame occlusion scanning, prefer `drawn_chunk_coords` which
+    /// skips the octree_pool lock and empty-mesh merge — cheaper when you
+    /// only need the set of chunks that are actually being drawn.
     pub fn loaded_chunk_coords(&self) -> impl Iterator<Item = ChunkCoord> + '_ {
         let mut unique: std::collections::HashSet<ChunkCoord> =
             self.meshes.keys().map(|k| k.coord).collect();
@@ -2537,6 +2541,21 @@ impl WorldRenderer {
         for coord in pool_coords {
             unique.insert(coord);
         }
+        unique.into_iter()
+    }
+
+    /// Number of mesh slots in the draw set. Cheap O(1) — just a HashMap len.
+    pub fn mesh_count(&self) -> usize { self.meshes.len() }
+
+    /// Lightweight iterator over chunk coords that have actual meshes (are being
+    /// drawn). Unlike `loaded_chunk_coords`, this skips empty-mesh entries,
+    /// doesn't lock the octree_pool, and uses a simple dedup set — suitable for
+    /// per-frame occlusion scanning where we only need "what's in the draw set."
+    pub fn drawn_chunk_coords(&self) -> impl Iterator<Item = ChunkCoord> + '_ {
+        // MeshSlotKey includes LOD, so the same coord can appear multiple times
+        // (Near + Far slots). Dedup by collecting into a set.
+        let unique: std::collections::HashSet<ChunkCoord> =
+            self.meshes.keys().map(|k| k.coord).collect();
         unique.into_iter()
     }
 
@@ -5594,11 +5613,14 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         // (the GPU cull frustum) below — they stay in sync, so chunks don't pop at
         // frustum edges. Visual effect when on: terrain beyond the distance renders
         // unshadowed (lit). That is the intended A/B: distant-shadow feel vs cost.
-        let c0_far = match std::env::var("UNENDLICH_SHADOW_CULL_DIST")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|&v| v.is_finite() && v > 0.0)
-        {
+        static SHADOW_CULL_DIST: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        let shadow_cull_raw = *SHADOW_CULL_DIST.get_or_init(|| {
+            std::env::var("UNENDLICH_SHADOW_CULL_DIST")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|&v| v.is_finite() && v > 0.0)
+        });
+        let c0_far = match shadow_cull_raw {
             // Floor above near so a tiny value can't make a degenerate frustum.
             Some(d) => 200.0_f32.min(d).max(view.near + 1.0),
             None => 200.0_f32,
@@ -5682,8 +5704,11 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             )
         };
 
-        // Emit shadow_stride diagnostic event.
-        if self.shadow_chunk_stride > 1 {
+        // Emit shadow_stride diagnostic event. Throttled to once per 60
+        // frames (~1/sec at 60fps). The old per-frame emission did a
+        // serde_json::json!() heap alloc + mutex lock + file write every
+        // single frame — measurable jitter on ARM.
+        if self.shadow_chunk_stride > 1 && monotonic_frame % 60 == 0 {
             unendlich_shared::events::record(
                 "shadow_stride",
                 serde_json::json!({
@@ -6438,8 +6463,11 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             // To avoid event-log spam, only emit when the ratio is
             // interesting (shadow > 1.5× main). Steady-state non-spike
             // frames where the ratio is ~1 don't pollute the log.
-            let cull_diag_enabled = std::env::var("UNENDLICH_CULL_DIAG")
-                .ok().as_deref() == Some("1");
+            static CULL_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let cull_diag_enabled = *CULL_DIAG.get_or_init(|| {
+                std::env::var("UNENDLICH_CULL_DIAG")
+                    .ok().as_deref() == Some("1")
+            });
             if cull_diag_enabled {
             if let Some(cascade) = self.last_cascade {
                 let shadow_frustum_count = Frustum::from_view_projection(&cascade.view_proj);

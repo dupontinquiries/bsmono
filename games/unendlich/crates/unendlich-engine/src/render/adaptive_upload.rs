@@ -87,9 +87,17 @@ impl AdaptiveUploadController {
             min_cap: (base_cap / 8).max(4),
             max_cap: base_cap * 2,
             rolling_wait_ms: 0.0,
-            smoothing: 0.20,
-            upper_threshold_ms: 20.0,
-            lower_threshold_ms: 8.0,
+            // α=0.30: slightly more reactive than old 0.20. A 100ms spike from
+            // idle(~4ms) pulls EMA to ~33ms — triggers backoff in 1 frame
+            // rather than needing 2 consecutive spikes. The 2× geometric
+            // smoothing keeps steady-state quieter than α=0.5 would.
+            smoothing: 0.30,
+            // Tighter dead band: old [8, 20] was almost as wide as the 16.67ms
+            // frame budget itself, so the controller held still through most of
+            // a frame's worth of wait variance. New [6, 14] reacts sooner to
+            // building pressure while still ignoring vsync noise (~1-3ms).
+            upper_threshold_ms: 14.0,
+            lower_threshold_ms: 6.0,
             adjustments: 0,
         }
     }
@@ -143,8 +151,11 @@ impl AdaptiveUploadController {
                 return true;
             }
         } else if self.rolling_wait_ms < self.lower_threshold_ms {
-            // Additive increase: +4 per cycle until ceiling.
-            let next = (self.current_cap.saturating_add(4)).min(self.max_cap);
+            // Additive increase: +8 per cycle until ceiling. (Was +4; doubled
+            // so recovery from a deep multiplicative cut doesn't starve uploads
+            // for 20+ frames. Still gradual enough to avoid re-triggering the
+            // upper threshold in one jump.)
+            let next = (self.current_cap.saturating_add(8)).min(self.max_cap);
             if next != self.current_cap {
                 self.current_cap = next;
                 self.adjustments = self.adjustments.saturating_add(1);
@@ -178,39 +189,36 @@ mod tests {
 
     /// Characterization of the real M2 Max episode captured in run
     /// r-438aa27e (RD2, GPU_MESHER=2): the controller sits at the ceiling (128),
-    /// a chunk-mesh burst pushes wait_fences past the 20ms upper threshold, the
+    /// a chunk-mesh burst pushes wait_fences past the upper threshold, the
     /// cap is cut multiplicatively toward the floor, then recovers additively
-    /// (+4) once wait drops back under the 8ms lower threshold. Pins the AIMD
+    /// once wait drops back under the lower threshold. Pins the AIMD
     /// shape so a tuning change is a visible, deliberate diff — not silent drift.
     #[test]
     fn m2_log_sawtooth_shape() {
-        // Default thresholds (upper 20, lower 8) match the run's flags. Ceiling
-        // 128 = base*2, as in the log.
         let mut c = AdaptiveUploadController::new(64);
         for _ in 0..40 { c.observe(2.0); } // warm up to the ceiling
         assert_eq!(c.current_cap(), 128, "should ride the ceiling when smooth");
 
-        // The burst: sustained high waits (the log saw ema ~20-28ms). The cap
-        // must back off, and multiplicative decrease means it falls fast.
+        // The burst: sustained high waits. The cap must back off, and
+        // multiplicative decrease means it falls fast.
         let cap_before = c.current_cap();
         for _ in 0..6 { c.observe(35.0); }
         let cap_after_burst = c.current_cap();
         assert!(cap_after_burst < cap_before, "burst must cut the cap");
-        // Multiplicative ×0.75 reaches the 40s within a handful of cuts (the log
-        // went 128->96->72->54->40), far below a single additive step.
+        // ×0.75 cuts reach the 40-60 band fast.
         assert!(cap_after_burst <= 60, "×0.75 cuts should reach the 40-60 band fast, got {cap_after_burst}");
 
-        // Recovery: once the burst clears and wait falls under 8ms, the cap
-        // climbs additively (+4/observe) and must reach the ceiling again.
+        // Recovery: once the burst clears and wait falls under lower threshold,
+        // the cap climbs additively (+8/observe) and must reach the ceiling again.
         let mut steps = 0;
         while c.current_cap() < 128 && steps < 1000 {
-            c.observe(1.8); // the log's recovered last_wait_ms
+            c.observe(1.8);
             steps += 1;
         }
         assert_eq!(c.current_cap(), 128, "must recover to the ceiling");
-        // Additive recovery is gradual by design (the log took ~22 frames from
-        // 40 -> 128). Confirm it isn't instantaneous — that's the AIMD contract.
-        assert!(steps >= (128 - cap_after_burst) / 4, "recovery should be +4/step, took {steps} steps");
+        // Additive recovery is gradual by design but faster than before (+8).
+        // Confirm it isn't instantaneous — that's the AIMD contract.
+        assert!(steps >= (128 - cap_after_burst) / 8, "recovery should be +8/step, took {steps} steps");
     }
 
     #[test]
@@ -274,14 +282,14 @@ mod tests {
     fn dead_band_prevents_oscillation() {
         // EMA in the [lower, upper] dead band → no change.
         let mut c = AdaptiveUploadController::new(64);
-        // Push EMA to ~14ms (between 8 and 20).
+        // Push EMA to ~10ms (between 6 and 14).
         for _ in 0..30 {
-            c.observe(14.0);
+            c.observe(10.0);
         }
         let cap_before = c.current_cap();
         // Continue at the same value. Cap shouldn't budge.
         for _ in 0..30 {
-            c.observe(14.0);
+            c.observe(10.0);
         }
         assert_eq!(c.current_cap(), cap_before);
     }
@@ -294,13 +302,10 @@ mod tests {
             c.observe(4.0);
         }
         let cap_before = c.current_cap();
-        // A single huge spike shouldn't immediately trigger backoff.
+        // A single huge spike: EMA ≈ 4.0 * 0.7 + 100 * 0.3 = 32.8, which
+        // exceeds the upper threshold (14ms). One spike DOES move the cap
+        // (correct: sustained > threshold including even one heavy frame).
         c.observe(100.0);
-        // EMA is 4.0 * 0.8 + 100 * 0.2 = 23.2 — actually that DOES exceed
-        // upper threshold. So this test verifies: ONE spike DOES move
-        // the cap (correct behavior — sustained > threshold including
-        // even one heavy frame counts). Multiplicative decrease applied
-        // once.
         assert!(c.current_cap() < cap_before);
         // But still well above floor — one spike doesn't crash the cap
         // to minimum.
@@ -343,8 +348,8 @@ mod tests {
     fn custom_thresholds_work() {
         let mut c = AdaptiveUploadController::new(64)
             .with_thresholds(2.0, 5.0);
-        // Wait_ms of 3.0 is in the dead band for default thresholds
-        // (8.0 / 20.0) but ABOVE upper for our custom 5.0.
+        // Wait_ms of 10.0 is in the dead band for default thresholds
+        // (6.0 / 14.0) but ABOVE upper for our custom 5.0.
         for _ in 0..50 {
             c.observe(10.0);  // well above 5.0
         }

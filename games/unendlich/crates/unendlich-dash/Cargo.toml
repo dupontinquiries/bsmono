@@ -9,10 +9,7 @@ license = "MIT OR Apache-2.0"
 unendlich-ui = { path = "../unendlich-ui" }
 # Pinned to the current releases (verified May 2026). egui_plot 0.35 targets
 # egui 0.34, and eframe 0.34 also uses egui 0.34, so all three unify.
-# default-features = false: eframe defaults enable wgpu without glow, and the
-# backend must be a CHOICE (eframe_backend_check.py). This crate wants both —
-# main.rs tries Renderer::Wgpu and falls back to Glow — so both are listed.
-eframe = { version = "0.34", default-features = false, features = ["glow", "wgpu", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.34", features = ["glow"] }
 egui = "0.34"
 egui_plot = "0.35"
 regex = "1"

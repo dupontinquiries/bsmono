@@ -99,7 +99,9 @@ const UPLOAD_BYTES_BUDGET_DEFAULT: usize = 8 * 1024 * 1024;
 const UPLOAD_PRESSURE_EVENT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
 /// Number of mesh-worker threads. CPU-bound, so leave 2 cores for the OS
-/// + main thread. M2 Max has 12 perf+eco cores, so 8 is reasonable.
+/// + main thread. Default 4; override with UNENDLICH_MESH_WORKERS for
+/// devices with more/fewer cores (matches unendlich_fullgame.rs's pattern
+/// — this binary previously had no way to tune this without recompiling).
 const MESH_WORKERS: usize = 4;
 
 /// Mesh request queue capacity. ~4× per-frame upload cap so workers stay
@@ -617,8 +619,15 @@ fn main() {
     // Both Arcs declared, at most one populated. Drop order keeps
     // the chosen one alive past mesh_pool's drop so the dispatcher
     // exits cleanly.
-    let gpu_mesher_mode: u32 = std::env::var("UNENDLICH_GPU_MESHER")
-        .ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(2); // R27: default octree GPU mesher (=0 CPU fallback; failures degrade to CPU)
+    // r612: FORCED to CPU mesher. The GPU octree mesher (mode 2) causes
+    // "broken planes" — confirmed by r612 isolation test + debug_settings
+    // r635 comment (see unendlich_fullgame.rs history for the full
+    // investigation). CPU mesher is also faster (0.38ms/chunk CPU vs
+    // 7ms+ GPU on shared queue, see r734 diagnosis). This binary's
+    // default was unwrap_or(2) — the GPU mesher ran by default even
+    // with no env var set — while unendlich_fullgame.rs already had
+    // the r612 CPU-default fix applied. Bringing this binary in line.
+    let gpu_mesher_mode: u32 = 0;
 
     // Surface a known-bad setting at startup rather than letting the player
     // silently run the slow, rough experimental mesher.
@@ -678,37 +687,43 @@ fn main() {
             }
         } else { None };
 
+    // Overridable via UNENDLICH_MESH_WORKERS; default matches MESH_WORKERS.
+    let mesh_workers: usize = std::env::var("UNENDLICH_MESH_WORKERS")
+        .ok().and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MESH_WORKERS);
+
     // Declared second → dropped FIRST.
     let mesh_pool = if let Some(arc) = &_octree_gpu_mesher_for_cleanup {
         let pool = MeshingPool::with_octree_gpu_mesher(
-            MESH_WORKERS,
+            mesh_workers,
             MESH_QUEUE_CAPACITY,
             Arc::clone(&lod_settings),
             Arc::clone(arc),
         );
         log::info!(
             "MeshingPool ready ({} workers + Octree-GPU dispatcher, capacity {})",
-            MESH_WORKERS, MESH_QUEUE_CAPACITY
+            mesh_workers, MESH_QUEUE_CAPACITY
         );
         pool
     } else if let Some(arc) = &_gpu_mesher_for_cleanup {
         let pool = MeshingPool::with_gpu_mesher(
-            MESH_WORKERS,
+            mesh_workers,
             MESH_QUEUE_CAPACITY,
             Arc::clone(&lod_settings),
             Arc::clone(arc),
         );
         log::info!(
             "MeshingPool ready ({} workers + Sparse-GPU dispatcher, capacity {})",
-            MESH_WORKERS, MESH_QUEUE_CAPACITY
+            mesh_workers, MESH_QUEUE_CAPACITY
         );
         pool
     } else {
-        let pool = MeshingPool::new(MESH_WORKERS, MESH_QUEUE_CAPACITY, Arc::clone(&lod_settings));
+        let pool = MeshingPool::new(mesh_workers, MESH_QUEUE_CAPACITY, Arc::clone(&lod_settings));
         log::info!("MeshingPool ready ({} workers, capacity {}; CPU-only; \
                     UNENDLICH_GPU_MESHER=1 for sparse-records GPU mesher, \
                     =2 for octree GPU mesher)",
-            MESH_WORKERS, MESH_QUEUE_CAPACITY);
+            mesh_workers, MESH_QUEUE_CAPACITY);
         pool
     };
 
@@ -1010,7 +1025,7 @@ fn main() {
     let frame_target_ms: f64 = std::env::var("UNENDLICH_FRAME_TARGET_MS")
         .ok().and_then(|s| s.parse::<f64>().ok())
         .filter(|&v: &f64| v > 0.0)
-        .unwrap_or(8.33);
+        .unwrap_or(16.67); // 60fps; was 8.33 (120fps) — starved uploads below 120fps
     let upload_min_ms: f64 = std::env::var("UNENDLICH_UPLOAD_MIN_MS")
         .ok().and_then(|s| s.parse::<f64>().ok())
         .filter(|&v: &f64| v > 0.0)
@@ -1096,6 +1111,8 @@ fn main() {
 
     let mut last_frame = Instant::now();
     let mut frame_count = 0u64;
+    // Reusable buffer for mesh_pool.drain_up_to_into — avoids per-frame Vec alloc.
+    let mut drained_buf: Vec<unendlich_engine::render::meshing_pool::MeshResult> = Vec::new();
     // Throttle for sentinel reveal logging (frames between log lines).
     let mut last_reveal_log_frame = 0u64;
     // Player's last voxel cell, for movement-based loudness (still = quiet, so you
@@ -3164,13 +3181,13 @@ fn main() {
         } else {
             max_uploads_per_frame
         };
-        let mut drained = mesh_pool.drain_up_to(upload_cap);
+        mesh_pool.drain_up_to_into(upload_cap, &mut drained_buf);
 
         // v0.24.67-upload-priority: sort the drained results by
         // (LOD, chebyshev distance to player). Near chunks at small
         // distance land first; VeryFar at the back. Default off.
         if upload_priority_enabled {
-            drained.sort_by(|a, b| {
+            drained_buf.sort_by(|a, b| {
                 let a_dist = (a.coord.x - player_chunk.x).abs()
                     .max((a.coord.y - player_chunk.y).abs())
                     .max((a.coord.z - player_chunk.z).abs());
@@ -3183,10 +3200,10 @@ fn main() {
 
         // Clear in_flight for ALL drained results before any uploads,
         // so a budget-triggered early break can't leave stragglers.
-        for result in &drained {
+        for result in &drained_buf {
             meshing_in_flight.remove(&result.coord);
         }
-        for result in drained {
+        for result in drained_buf.drain(..) {
             // Skip if the chunk has been edited since the mesh was generated.
             // The chunk_manager will produce a fresh chunk; we'll re-mesh
             // next frame.

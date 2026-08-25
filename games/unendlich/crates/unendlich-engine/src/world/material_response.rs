@@ -194,6 +194,27 @@ impl MaterialResponse {
     }
 }
 
+/// Fast check: can two adjacent blocks of this type be greedy-merged?
+/// Equivalent to `for_block(block, world_y).merges()` but avoids
+/// constructing the full 76-byte MaterialResponse struct.
+#[inline]
+pub fn block_can_merge(block: BlockId, world_y: i32) -> bool {
+    use BlockId::*;
+    let sea_level = crate::constants::SEA_LEVEL as i32;
+    let is_deep = world_y < sea_level - 16;
+    match block {
+        // Blocks with unconditional position_variance > 0 → never merge.
+        Grass | Sand | Dirt | Gravel | Clay | Cobblestone
+        | Snow | SnowBlock | Moss
+        | OakLeaves | BirchLeaves => false,
+        // Stone: depth-dependent. Deep = variance 0 (merge), surface = variance 0.06 (no merge).
+        Stone => is_deep,
+        // Everything else falls through to the default MaterialResponse
+        // which has position_variance: 0.0 → always merges.
+        _ => true,
+    }
+}
+
 /// Look up the material response for a block at a given world depth.
 ///
 /// Depth-awareness lets the SAME BlockId have different responses at
@@ -674,6 +695,21 @@ mod tests {
             assert_eq!(r.bump_amplitude, 0.0, "{:?} bump base should be 0", block);
             assert_eq!(r.weathering_bump_scale, 0.0,
                 "{:?} weathering bump scale should be 0", block);
+        }
+    }
+
+    /// `block_can_merge` must agree with `for_block(block, wy).merges()`
+    /// for every block at both surface and deep Y values.
+    #[test]
+    fn block_can_merge_matches_for_block() {
+        for &block in BlockId::ALL.iter() {
+            for wy in [80, 30, -32] {
+                let expected = for_block(block, wy).merges();
+                let got = block_can_merge(block, wy);
+                assert_eq!(got, expected,
+                    "block_can_merge({:?}, {}) = {} but for_block().merges() = {}",
+                    block, wy, got, expected);
+            }
         }
     }
 }

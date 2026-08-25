@@ -692,7 +692,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(24); // r482: ↑ from 16 (more chunks/gen dispatch)
+        .unwrap_or(16); // base default; RuntimeConfig not yet available here
     log::info!("GPU terrain-gen batch size = {} (UNENDLICH_GPU_GEN_BATCH)", gen_batch);
     // r706: terrain-gen backend override. The GPU generator serializes ALL loader
     // worker threads through one submit_lock + a single command buffer/fence —
@@ -1010,6 +1010,22 @@ fn main() {
     unendlich_engine::breadcrumb::drop_crumb("gpu: creating Vulkan context (instance + physical device + queues)");
     let ctx = VulkanContext::new(&glfw, &window).expect("vulkan context");
     unendlich_engine::breadcrumb::drop_crumb("gpu: Vulkan context ready");
+
+    // Refine the device_budget GPU classification from the actual Vulkan
+    // physical device type. This runs BEFORE RuntimeConfig::from_env() so
+    // the recommended preset reflects the real GPU, not the conservative
+    // "Integrated" default.
+    {
+        let props = unsafe { ctx.instance.get_physical_device_properties(ctx.physical_device) };
+        let gpu_class = unendlich_engine::device_budget::gpu_class_from_vk_device_type(
+            props.device_type.as_raw(),
+        );
+        unendlich_engine::device_budget::refine_gpu_class(gpu_class);
+        log::info!(
+            "device_budget: Vulkan device type {:?} → GPU class {:?}",
+            props.device_type, gpu_class,
+        );
+    }
 
     // Capture GPU + driver identity once at startup. Stays constant for
     // the run; gets folded into the result file at shutdown so the
@@ -1360,15 +1376,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     //      resources WHILE the ctx (declared even earlier, dropped
     //      last) is still alive.
     // v0.24.27-octree-mesher: UNENDLICH_GPU_MESHER values:
-    //   0 (or unset)  → CPU-only mesher
+    //   0 (or unset)  → CPU-only mesher (default — faster than GPU path
+    //                    due to shared-queue contention, see r612/r734 diagnosis)
     //   1            → SparseGpuMesher (CPU-extracts SurfaceRecord, GPU emits)
     //   2            → OctreeGpuMesher (GPU reads octree directly)
     //
     // Both Arcs declared, at most one populated. Drop order keeps
     // the chosen one alive past mesh_pool's drop so the dispatcher
     // exits cleanly.
-    let gpu_mesher_mode: u32 = 0; // r612: FORCED to CPU mesher to isolate the "broken planes" — ignores UNENDLICH_GPU_MESHER (was: env, default 0). If the fans vanish on a FRESH world, the GPU octree/sparse compute mesher is the cause. Revert this line to restore env control.
-    let _ = std::env::var("UNENDLICH_GPU_MESHER"); // keep the env read side-effect-free / avoid unused warnings elsewhere
+    //
+    // r612: FORCED to CPU mesher. The GPU octree mesher (mode 2) causes
+    // "broken planes" — confirmed by r612 isolation test + debug_settings
+    // r635 comment. CPU mesher is also faster (0.38ms/chunk CPU vs 7ms+
+    // GPU on shared queue, see r734 diagnosis). DO NOT read from env —
+    // users may have stale UNENDLICH_GPU_MESHER=2 from before r612 which
+    // would silently re-enable the broken path.
+    let gpu_mesher_mode: u32 = 0;
 
     // Surface a known-bad setting at startup rather than letting the player
     // silently run the slow, rough experimental mesher.
@@ -2247,12 +2270,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(MAX_UPLOADS_PER_FRAME_DEFAULT);
+        .unwrap_or(runtime_cfg.max_uploads_per_frame as usize);
     let upload_budget_ms: f64 = std::env::var("UNENDLICH_UPLOAD_BUDGET_MS")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&v| v > 0.0)
-        .unwrap_or(UPLOAD_BUDGET_MS_DEFAULT);
+        .unwrap_or(runtime_cfg.upload_budget_ms as f64);
     // v0.24.3 upload-pressure investigation: bytes-budget alongside
     // ms-budget. Whichever fires first wins. Setting either to a very
     // large value effectively disables it.
@@ -2262,9 +2285,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .filter(|&v| v > 0)
         .unwrap_or(UPLOAD_BYTES_BUDGET_DEFAULT);
     log::info!(
-        "Upload knobs: MAX_UPLOADS_PER_FRAME={} BUDGET_MS={:.2} BYTES_BUDGET={} (defaults {},{:.2},{})",
+        "Upload knobs: MAX_UPLOADS_PER_FRAME={} BUDGET_MS={:.2} BYTES_BUDGET={}",
         max_uploads_per_frame, upload_budget_ms, upload_bytes_budget,
-        MAX_UPLOADS_PER_FRAME_DEFAULT, UPLOAD_BUDGET_MS_DEFAULT, UPLOAD_BYTES_BUDGET_DEFAULT,
     );
 
     // v0.24.63-adaptive-uploads: optional AIMD-style throttle that
@@ -2389,7 +2411,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let frame_target_ms: f64 = std::env::var("UNENDLICH_FRAME_TARGET_MS")
         .ok().and_then(|s| s.parse::<f64>().ok())
         .filter(|&v: &f64| v > 0.0)
-        .unwrap_or(8.33);
+        .unwrap_or(runtime_cfg.frame_target_ms as f64);
     let upload_min_ms: f64 = std::env::var("UNENDLICH_UPLOAD_MIN_MS")
         .ok().and_then(|s| s.parse::<f64>().ok())
         .filter(|&v: &f64| v > 0.0)
@@ -2475,6 +2497,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
 
     let mut last_frame = Instant::now();
     let mut frame_count = 0u64;
+    // Reusable buffer for mesh_pool.drain_up_to_into — avoids per-frame Vec alloc.
+    let mut drained_buf: Vec<unendlich_engine::render::meshing_pool::MeshResult> = Vec::new();
+    // Reusable containers for occlusion flood — avoids per-frame HashSet/VecDeque alloc.
+    let mut occ_resident: std::collections::HashSet<[i32; 3]> = std::collections::HashSet::new();
+    let mut occ_visible: std::collections::HashSet<[i32; 3]> = std::collections::HashSet::new();
+    let mut occ_queue: std::collections::VecDeque<[i32; 3]> = std::collections::VecDeque::new();
+    // Cache key for skipping the flood when nothing relevant changed.
+    let mut occ_last_cam_chunk: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
+    let mut occ_last_mesh_count: usize = 0;
     // Throttle for sentinel reveal logging (frames between log lines).
     let mut last_reveal_log_frame = 0u64;
     // Player's last voxel cell, for movement-based loudness (still = quiet, so you
@@ -2494,9 +2525,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let adaptive_rd = std::env::var("UNENDLICH_ADAPTIVE_RENDER_DISTANCE")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     let adaptive_rd_shrink_ms: f64 = std::env::var("UNENDLICH_ADAPTIVE_RD_SHRINK_MS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or((frame_target_ms * 3.0).max(25.0));
+        .ok().and_then(|s| s.parse().ok()).unwrap_or((frame_target_ms * 2.0).max(20.0));
     let adaptive_rd_grow_ms: f64 = std::env::var("UNENDLICH_ADAPTIVE_RD_GROW_MS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or((frame_target_ms * 1.5).max(12.0));
+        .ok().and_then(|s| s.parse().ok()).unwrap_or((frame_target_ms * 1.2).max(10.0));
     let adaptive_rd_min: i32 = std::env::var("UNENDLICH_ADAPTIVE_RD_MIN")
         .ok().and_then(|s| s.parse().ok()).map(|n: i32| n.clamp(2, 32)).unwrap_or(2);
     // r534: GROW SLEW LIMIT. Each +1 to the cap loads a whole new ring of chunks,
@@ -2697,17 +2728,6 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     if graze_gate_enabled {
         log::info!("[graze_gate] ENABLED — food-ring scan gated by motion + cadence, target remembered");
     }
-    // rain-through-ceilings fix: gate + persistent column-top memo (see the
-    // r492 precipitation block for the clear policy and why not SurfaceCache).
-    let rain_cull_enabled: bool = std::env::var("UNENDLICH_RAIN_CULL")
-        .map(|v| v != "0").unwrap_or(true);
-    if rain_cull_enabled {
-        log::info!("[rain_cull] ENABLED — precipitation culled below each column's terrain surface");
-    }
-    let mut rain_surf_memo: std::collections::HashMap<(i32, i32), Option<i32>> =
-        std::collections::HashMap::new();
-    let mut rain_cull_cell: (i32, i32) = (i32::MIN, i32::MIN);
-    let mut rain_cull_frame: u32 = 0;
     const GRAZE_SCAN_INTERVAL: u32 = 6;
     const BREED_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
     const PROFILE_DUMP_SECS: f32 = 5.0;
@@ -4162,7 +4182,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // Catastrophic frames (>3x shrink threshold) cut two rings at once so the
         // game can climb out of a streaming death-spiral quickly. The cap only
         // limits BELOW the player's chosen distance (applied at the override).
-        if renderer.ui_adaptive_rd && adaptive_rd_last.elapsed() >= std::time::Duration::from_millis(400) {
+        if renderer.ui_adaptive_rd && adaptive_rd_last.elapsed() >= std::time::Duration::from_millis(200) {
             adaptive_rd_last = now;
             if dt_ms > adaptive_rd_shrink_ms && adaptive_rd_cap > adaptive_rd_min {
                 let step = if dt_ms > adaptive_rd_shrink_ms * 3.0 { 2 } else { 1 };
@@ -11259,13 +11279,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         } else {
             max_uploads_per_frame
         };
-        let mut drained = mesh_pool.drain_up_to(upload_cap);
+        mesh_pool.drain_up_to_into(upload_cap, &mut drained_buf);
 
         // v0.24.67-upload-priority: sort the drained results by
         // (LOD, chebyshev distance to player). Near chunks at small
         // distance land first; VeryFar at the back. Default off.
         if upload_priority_enabled {
-            drained.sort_by(|a, b| {
+            drained_buf.sort_by(|a, b| {
                 let a_dist = (a.coord.x - player_chunk.x).abs()
                     .max((a.coord.y - player_chunk.y).abs())
                     .max((a.coord.z - player_chunk.z).abs());
@@ -11278,10 +11298,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
 
         // Clear in_flight for ALL drained results before any uploads,
         // so a budget-triggered early break can't leave stragglers.
-        for result in &drained {
+        for result in &drained_buf {
             meshing_in_flight.remove(&result.coord);
         }
-        for result in drained {
+        for result in drained_buf.drain(..) {
             // Skip if the chunk has been edited since the mesh was generated.
             // The chunk_manager will produce a fresh chunk; we'll re-mesh
             // next frame.
@@ -12296,47 +12316,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     ((220.0 + 700.0 * inten) as usize, 14.0_f32, 0.04_f32,
                      [0.02_f32, 0.20, 0.02], [0.60_f32, 0.69, 0.85])
                 };
-                let mut drops = unendlich_engine::sim::precipitation::field(
+                let drops = unendlich_engine::sim::precipitation::field(
                     [pp.x, pp.y, pp.z], pt, count, 16.0, 18.0, fall_speed, [pwx, pwz], sway,
                 );
-                // Rain must not fall through cave ceilings: keep a drop only
-                // at/above its column's terrain surface. surface_y_at is the
-                // AUTHORITATIVE surface (r583: resident voxels corrected, else
-                // the analytic prediction — which itself accounts for caves).
-                //
-                // COST DISCIPLINE, because r294 measured this exact query
-                // dominating a loop at ~90ms when called per-probe: columns
-                // are quantized to 2x2 blocks (a streak's dripline does not
-                // need block precision), and the memo PERSISTS across frames
-                // — cleared when the player crosses a 2-block cell or every
-                // 128 frames — so a steady rain costs ~0 queries per frame
-                // after the first. A dedicated memo, NOT the r294
-                // SurfaceCache: that one holds the ANALYTIC scan under the
-                // same (x,z) keys, and mixing corrected results in would
-                // poison the roamers' entries.
-                // UNENDLICH_RAIN_CULL=1 (default ON; "0" reverts to rain
-                // through ceilings).
-                if rain_cull_enabled {
-                    let pcell = ((pp.x.floor() as i32) >> 1, (pp.z.floor() as i32) >> 1);
-                    rain_cull_frame = rain_cull_frame.wrapping_add(1);
-                    if pcell != rain_cull_cell || rain_cull_frame % 128 == 0 {
-                        rain_cull_cell = pcell;
-                        rain_surf_memo.clear();
-                    }
-                    let drops_kept = unendlich_engine::sim::precipitation::cull_covered(
-                        drops,
-                        |x, z| {
-                            let key = ((x.floor() as i32) >> 1, (z.floor() as i32) >> 1);
-                            *rain_surf_memo.entry(key).or_insert_with(|| {
-                                chunk_manager.surface_y_at(
-                                    (key.0 << 1) + 1, (key.1 << 1) + 1,
-                                    probe_y_min, probe_y_max,
-                                )
-                            })
-                        },
-                    );
-                    drops = drops_kept;
-                }
                 let (hx, hy, hz) = (half[0], half[1], half[2]);
                 for d in &drops {
                     let base = everts.len() as u32;
@@ -13046,26 +13028,36 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     (cp.y.floor() as i32).div_euclid(CHUNK_SIZE),
                     (cp.z.floor() as i32).div_euclid(CHUNK_SIZE),
                 ];
-                // in_range = resident chunks; is_opaque = the chunk's cached_all_opaque.
-                let resident: std::collections::HashSet<[i32; 3]> = renderer
-                    .loaded_chunk_coords()
-                    .map(|c| [c.x, c.y, c.z])
-                    .collect();
-                let visible = unendlich_engine::world::occlusion_flood::flood_visible(
-                    cam_chunk,
-                    // The camera chunk always seeds the flood (it may be empty air /
-                    // unmeshed at altitude); otherwise only resident chunks are in range.
-                    |c| c == cam_chunk || resident.contains(&c),
-                    |c| {
-                        chunk_manager
-                            .get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(c[0], c[1], c[2]))
-                            .map_or(false, |ch| ch.cached_all_opaque)
-                    },
-                );
-                // Fail-safe: only cull if the flood actually reached geometry; an
-                // empty/degenerate result draws everything rather than blacking out.
-                if visible.len() > 1 {
-                    renderer.apply_chunk_occlusion(CHUNK_SIZE, &visible);
+                let mesh_count = renderer.mesh_count();
+                // Skip the flood if the camera hasn't crossed a chunk boundary
+                // and no meshes have been added/removed since last flood. The
+                // previous occ_visible result is still valid — apply it again
+                // (apply_occlusion is idempotent and dirty-tracks, so re-applying
+                // the same set is cheap).
+                let occ_changed = cam_chunk != occ_last_cam_chunk
+                    || mesh_count != occ_last_mesh_count;
+                if occ_changed {
+                    occ_last_cam_chunk = cam_chunk;
+                    occ_last_mesh_count = mesh_count;
+                    // Reuse the resident set — clear + refill from drawn coords.
+                    occ_resident.clear();
+                    for c in renderer.drawn_chunk_coords() {
+                        occ_resident.insert([c.x, c.y, c.z]);
+                    }
+                    unendlich_engine::world::occlusion_flood::flood_visible_into(
+                        cam_chunk,
+                        |c| c == cam_chunk || occ_resident.contains(&c),
+                        |c| {
+                            chunk_manager
+                                .get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(c[0], c[1], c[2]))
+                                .map_or(false, |ch| ch.cached_all_opaque)
+                        },
+                        &mut occ_visible,
+                        &mut occ_queue,
+                    );
+                }
+                if occ_visible.len() > 1 {
+                    renderer.apply_chunk_occlusion(CHUNK_SIZE, &occ_visible);
                 } else {
                     renderer.clear_chunk_occlusion();
                 }

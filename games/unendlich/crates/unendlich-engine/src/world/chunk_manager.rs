@@ -460,8 +460,14 @@ impl ChunkManager {
                 Err(_) => Some(1), // R27: default ON, margin 1
                 Ok(v) => v.parse::<i32>().ok().filter(|&m| m > 0), // explicit; 0/neg = off
             },
+            // Default 16: cap per-frame synchronous disk saves during eviction.
+            // A teleport stranding hundreds of edited chunks at budget=0
+            // (unlimited) does that many sync writes in one frame — a visible
+            // multi-second freeze. 16/frame drains a 400-chunk backlog in ~25
+            // frames (~400ms at 60fps), invisible to the player. Set
+            // UNENDLICH_EVICT_BUDGET=0 for the old unlimited behavior.
             evict_budget: std::env::var("UNENDLICH_EVICT_BUDGET")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16),
         }
     }
 

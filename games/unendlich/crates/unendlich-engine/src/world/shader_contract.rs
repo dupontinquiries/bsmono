@@ -66,8 +66,13 @@ fn vertex_inputs(vert_src: &str) -> Vec<(u32, String)> {
             .split("location=")
             .nth(1)
             .and_then(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u32>().ok());
-        // name is the last identifier before the ';'
-        let name = l
+        // name is the last identifier before the ';' — but strip any trailing
+        // `//` line comment FIRST. Without this, a declaration like
+        // `in uint in_pos_packed; // ...quirk)` (chunk.vert) has the comment's
+        // own last word as the line's last whitespace-separated token, so the
+        // naive rsplit grabbed "quirk)" instead of the actual identifier.
+        let code_only = l.split("//").next().unwrap_or(l).trim();
+        let name = code_only
             .trim_end_matches(';')
             .rsplit(|c: char| c.is_whitespace())
             .next()

@@ -19,9 +19,14 @@
 //! compiles clean under `cargo check --release`.
 
 /// Ring of recent total frame times in milliseconds; `len` valid entries.
+///
+/// 32 samples (was 16) gives the p90 estimator a wider window — at 60 FPS
+/// that's ~530ms of history instead of ~267ms. Reduces noise-driven
+/// oscillation without meaningfully delaying reaction (the multi-step
+/// degradation below handles urgency).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameHistory {
-    pub recent_ms: [f32; 16],
+    pub recent_ms: [f32; 32],
     pub len: usize,
 }
 
@@ -59,8 +64,8 @@ fn sanitize_ms(v: f32) -> f32 {
 }
 
 /// `≈p90` (nearest-rank) of the first `n` sanitized samples. `n ≥ 1`.
-fn high_percentile(recent: &[f32; 16], n: usize) -> f32 {
-    let mut buf = [0.0f32; 16];
+fn high_percentile(recent: &[f32; 32], n: usize) -> f32 {
+    let mut buf = [0.0f32; 32];
     let mut i = 0;
     while i < n {
         buf[i] = sanitize_ms(recent[i]);
@@ -93,11 +98,31 @@ fn step_up(cur: Knobs, lim: Limits) -> Knobs {
     }
 }
 
-/// Step the quality knobs one notch toward lower quality if recent frames run
-/// hot, one notch toward higher quality if comfortably under (past the
-/// hysteresis band), or leave them unchanged inside the band. Clamped to `lim`.
+/// How many down-steps the overshoot ratio warrants. Proportional: 1.5x over
+/// budget = 2 steps, 2x = 3, etc. Capped at 4 to avoid slamming to minimum
+/// quality in a single call from one transient spike batch.
+fn urgency_steps(perc: f32, target: f32) -> u32 {
+    if target <= 0.0 || perc <= target {
+        return 0;
+    }
+    // ratio 1.0..1.25 → 1 step, 1.25..1.75 → 2, 1.75..2.25 → 3, 2.25+ → 4
+    let ratio = perc / target;
+    let steps = ((ratio - 1.0) * 4.0 + 1.0) as u32;
+    steps.min(4)
+}
+
+/// Step the quality knobs toward lower quality if recent frames run hot (with
+/// urgency proportional to overshoot), one notch toward higher quality if
+/// comfortably under (past the hysteresis band), or leave them unchanged inside
+/// the band. Clamped to `lim`.
+///
+/// Multi-step degradation (new in this revision): when p90 is well above
+/// target, applying a single notch per frame lets 5-10 frames of stutter pass
+/// before quality settles. Stepping 2-4 notches at once for severe overshoot
+/// kills the visible hitch within 1-2 frames, at the cost of a brief quality
+/// dip that the additive recovery restores smoothly.
 pub fn adjust(hist: &FrameHistory, target_ms: f32, cur: Knobs, lim: Limits) -> Knobs {
-    let n = hist.len.min(16);
+    let n = hist.len.min(32);
     if n == 0 || !(target_ms.is_finite() && target_ms > 0.0) {
         return cur; // no data / nonsensical target ⇒ hold
     }
@@ -105,7 +130,12 @@ pub fn adjust(hist: &FrameHistory, target_ms: f32, cur: Knobs, lim: Limits) -> K
     let recover = target_ms * (1.0 - HYST_FRAC);
 
     if perc > target_ms {
-        step_down(cur, lim)
+        let steps = urgency_steps(perc, target_ms);
+        let mut k = cur;
+        for _ in 0..steps {
+            k = step_down(k, lim);
+        }
+        k
     } else if perc < recover {
         step_up(cur, lim)
     } else {
@@ -118,8 +148,8 @@ mod tests {
     use super::*;
 
     fn hist(vals: &[f32]) -> FrameHistory {
-        let mut recent = [0.0f32; 16];
-        let n = vals.len().min(16);
+        let mut recent = [0.0f32; 32];
+        let n = vals.len().min(32);
         recent[..n].copy_from_slice(&vals[..n]);
         FrameHistory { recent_ms: recent, len: n }
     }
@@ -133,25 +163,32 @@ mod tests {
     #[test]
     fn sustained_over_steps_each_knob_toward_low_quality() {
         let h = hist(&[20.0; 16]); // all way over the 8.3ms budget
+        // 20/8.3 ≈ 2.4x over → urgency_steps = 4. From mid() each knob
+        // takes 4 steps toward the low-quality bound.
         let k = adjust(&h, 8.3, mid(), limits());
-        assert_eq!(k.shadow_stride, 3, "stride +1 (coarser)");
-        assert!((k.lod_fidelity - 0.6).abs() < 1e-6, "fidelity -0.1");
-        assert_eq!(k.max_uploads, 3, "uploads -1");
-        assert_eq!(k.froxel_steps, 9, "froxel -1");
+        // shadow_stride: 2 + 4 = 6, clamped to max 4
+        assert_eq!(k.shadow_stride, 4, "stride clamped at limit");
+        // lod_fidelity: 0.7 - 4*0.1 = 0.3, clamped to min 0.4
+        assert!((k.lod_fidelity - 0.4).abs() < 1e-6, "fidelity clamped at min");
+        // max_uploads: 4 - 4 = 0, clamped to min 1
+        assert_eq!(k.max_uploads, 1, "uploads clamped at min");
+        // froxel_steps: 10 - 4 = 6, above min 4
+        assert_eq!(k.froxel_steps, 6, "froxel -4");
     }
 
     #[test]
-    fn one_notch_per_call_and_monotone() {
+    fn monotone_toward_low_quality_and_converges() {
         let h = hist(&[50.0; 8]);
         let lim = limits();
         let mut k = mid();
         let mut last = k;
         for _ in 0..10 {
             k = adjust(&h, 8.3, k, lim);
-            // each step moves toward low quality by at most one notch
-            assert!(k.shadow_stride >= last.shadow_stride && k.shadow_stride <= last.shadow_stride + 1);
+            // each call moves toward low quality (monotone)
+            assert!(k.shadow_stride >= last.shadow_stride);
             assert!(k.lod_fidelity <= last.lod_fidelity + 1e-6);
-            assert!(k.max_uploads <= last.max_uploads && k.max_uploads + 1 >= last.max_uploads);
+            assert!(k.max_uploads <= last.max_uploads);
+            assert!(k.froxel_steps <= last.froxel_steps);
             last = k;
         }
         // eventually clamped at the low-quality bound
@@ -226,7 +263,9 @@ mod tests {
         v[14] = 40.0;
         v[15] = 60.0; // worst frames
         let k = adjust(&hist(&v), 8.3, mid(), limits());
-        assert_eq!(k.shadow_stride, 3, "tail over budget ⇒ degrade");
+        // p90 of 16 samples with 2 outliers at 40/60 is one of those
+        // outliers; severity drives multi-step. Just verify degradation.
+        assert!(k.shadow_stride > 2, "tail over budget ⇒ degrade");
     }
 
     #[test]

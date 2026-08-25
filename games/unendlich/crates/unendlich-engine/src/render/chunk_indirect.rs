@@ -435,7 +435,8 @@ impl IndirectDrawSet {
     ) -> u32 {
         let cs = chunk_size.max(1) as f32;
         let mut occluded_total = 0u32;
-        for i in 0..self.cpu_shadow.len() {
+        let scan_end = self.high_water as usize;
+        for i in 0..scan_end {
             let c = self.cpu_shadow[i];
             if c.index_count == 0 {
                 continue; // inactive slot
@@ -468,7 +469,8 @@ impl IndirectDrawSet {
     /// r736: clear all occlusion flags (call when the pre-cull is turned off so no
     /// chunk stays hidden). Only touches slots that were occluded.
     pub fn clear_occlusion(&mut self) {
-        for i in 0..self.cpu_shadow.len() {
+        let scan_end = self.high_water as usize;
+        for i in 0..scan_end {
             if self.cpu_shadow[i].flags & FLAG_OCCLUDED != 0 {
                 self.cpu_shadow[i].flags &= !FLAG_OCCLUDED;
                 for d in &mut self.frame_dirty {
@@ -486,14 +488,12 @@ impl IndirectDrawSet {
         let f = frame_idx % self.frames;
         if self.frame_dirty[f].is_empty() { return; }
         let dst_base = self.metadata[f].ptr as *mut ChunkDraw;
-        // Drain into a temp so we don't hold a borrow on self.frame_dirty
-        // while reading self.cpu_shadow.
-        let dirty = std::mem::take(&mut self.frame_dirty[f]);
-        for slot in dirty {
+        for &slot in &self.frame_dirty[f] {
             let si = slot as usize;
             // SAFETY: persistent map, HOST_COHERENT; si < capacity.
             unsafe { std::ptr::write(dst_base.add(si), self.cpu_shadow[si]); }
         }
+        self.frame_dirty[f].clear(); // keeps allocation for next frame
     }
 
     /// Free a slot. Marks the GPU entry as inactive (cull shader skips

@@ -38,37 +38,35 @@ pub fn clamp01(v: f32) -> f32 {
     crate::util::mathx::clamp01(v)
 }
 
-/// Clamp to `[0, 1]`, mapping NaN to 0, via `v.max(0.0).min(1.0)`.
-/// **Byte-identical** to `sim::canopy_field_shift::clamp01` and
-/// `sim::particulate_field::c01`.
+/// Clamp to `[0, 1]`, mapping NaN to 0. **Byte-identical** to
+/// [`crate::util::mathx::saturate`], [`sim::canopy_field_shift::clamp01`]
+/// and [`sim::particulate_field::c01`]. Normalises `-0.0` to `+0.0`, unlike
+/// [`clamp01`] (which preserves the sign of zero).
 ///
-/// r-fulltest-run CORRECTION: this doc previously claimed `saturate(-0.0)`
-/// normalizes to `+0.0`, differing from [`clamp01`] (which preserves sign)
-/// at exactly that one input. Verified false on this platform (x86_64,
-/// rustc 1.75) with a direct, isolated reproduction:
-/// `(-0.0f32).max(0.0f32)` returns `-0.0`, not `+0.0` — so `clamp01` and
-/// `saturate` are actually bit-identical on EVERY input, including `-0.0`,
-/// not "every input but one." The real full test suite caught this: the
-/// test asserting the old (wrong) claim failed with
-/// `saturate(-0.0).to_bits() == 0x80000000`, not the expected `0x00000000`.
-///
-/// WORTH FLAGGING, not just fixing: IEEE 754's `minNum`/`maxNum` are
-/// implementation-defined for signed zeros — `max(-0.0, +0.0)` is NOT
-/// required to pick a consistent operand across platforms. This project
-/// targets both x86_64 (dev) and ARM/Apple Silicon (Asahi) and leans
-/// heavily on `f32` being bit-reproducible across machines for lockstep
-/// sim. If `saturate`'s sign-of-zero behavior ever DOES diverge between
-/// those targets — this fix doesn't prove it can't, only that x86_64
-/// currently agrees with `clamp01` — that's a genuine cross-platform
-/// determinism bug hiding in exactly this kind of "obviously equivalent"
-/// float rewrite. Worth an ARM-side check before trusting this is safe
-/// everywhere, not just here.
+/// r-fulltest-run-2 CORRECTION: a prior comment here (and the sibling test
+/// `the_two_forms_agree_everywhere_including_negative_zero`) claimed
+/// `saturate` and `clamp01` are bit-identical on every input, including
+/// `-0.0`, based on `(-0.0f32).max(0.0f32)` returning `-0.0` on rustc 1.75/
+/// x86_64. That measurement was real, but the underlying behavior it relied
+/// on — `f32::max`'s tie-break for equal-valued signed zeros — is IEEE 754
+/// implementation-defined, not guaranteed. Confirmed it silently flipped on
+/// rustc 1.96/the same x86_64 target: `(-0.0f32).max(0.0f32)` now returns
+/// `+0.0`. A rollback-netcode sim needing bit-identical `f32` results across
+/// machines can't rely on that. Rewrote `saturate` to normalise `-0.0` to
+/// `+0.0` via a direct comparison (`v <= 0.0`, true for both signs of zero)
+/// instead of `.max()/.min()` — deterministic by construction on every
+/// platform/compiler version, not by (now-falsified) measurement on one.
+/// See `mathx::saturate`'s doc for the full writeup.
 #[inline]
 pub fn saturate(v: f32) -> f32 {
     if v.is_nan() {
         0.0
+    } else if v <= 0.0 {
+        0.0
+    } else if v >= 1.0 {
+        1.0
     } else {
-        v.max(0.0).min(1.0)
+        v
     }
 }
 
@@ -266,25 +264,35 @@ mod tests {
     }
 
     #[test]
-    fn the_two_forms_agree_everywhere_including_negative_zero() {
-        // r-fulltest-run CORRECTION: this test previously asserted
-        // saturate(-0.0) == +0.0 (diverging from clamp01's sign-preserving
-        // -0.0). Verified false on this platform via a direct, isolated
-        // repro: (-0.0f32).max(0.0f32) returns -0.0, not +0.0. So the two
-        // forms are actually bit-identical on EVERY f32 input, not every
-        // input but one. See saturate()'s doc comment for the full
-        // correction and a note on why this might not hold on every
-        // target platform (IEEE 754 leaves max(-0.0,+0.0) implementation-
-        // defined) even though it holds here.
-        assert_eq!(clamp01(-0.0).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(saturate(-0.0).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(clamp01(-0.0).to_bits(), saturate(-0.0).to_bits());
+    fn the_two_forms_agree_everywhere_except_the_documented_negative_zero_case() {
+        // r-fulltest-run-2: this test previously claimed the two forms are
+        // bit-identical on EVERY input including -0.0, based on a
+        // measurement (`(-0.0f32).max(0.0f32)` returning `-0.0` on rustc
+        // 1.75/x86_64) that turned out to depend on IEEE 754's
+        // implementation-defined max/min tie-break for signed zeros — and
+        // that measurement silently flipped on rustc 1.96 on the SAME
+        // target. `saturate` is now rewritten (see its doc) to
+        // deterministically normalise -0.0 to +0.0 via direct comparison,
+        // independent of any platform/compiler-version-specific tie-break.
+        // That means clamp01 and saturate are BY DESIGN different at
+        // exactly -0.0 (clamp01 preserves sign, saturate normalises it) —
+        // matching each function's own doc comment, and now true on every
+        // target rather than true-by-coincidence on one.
+        assert_eq!(clamp01(-0.0).to_bits(), (-0.0f32).to_bits(),
+            "clamp01 preserves the sign of zero");
+        assert_eq!(saturate(-0.0).to_bits(), (0.0f32).to_bits(),
+            "saturate normalises -0.0 to +0.0, deterministically");
+        assert_ne!(clamp01(-0.0).to_bits(), saturate(-0.0).to_bits(),
+            "the two forms deliberately diverge at exactly this input");
         // Everywhere else (incl +0.0, 1.0, NaN→0, ±inf, in-range, out-of-range)
-        // they also agree bit-for-bit.
+        // they still agree bit-for-bit.
         let mut h = 99u32;
         for _ in 0..20_000 {
             h = h.wrapping_mul(0x9E37_79B9).wrapping_add(3);
             let v = f32::from_bits(h ^ (h << 11));
+            if v == 0.0 && v.is_sign_negative() {
+                continue; // the one documented, intentional divergence
+            }
             assert_eq!(clamp01(v).to_bits(), saturate(v).to_bits(), "diverged at v={v}");
         }
     }
