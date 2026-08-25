@@ -22,17 +22,99 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
         .selected_text(match state.provider_kind {
             ProviderKind::Ollama => "ollama",
             ProviderKind::Logscope => "logscope",
+            ProviderKind::Engine => "engine (in-process)",
             ProviderKind::Command => "command",
             ProviderKind::Demo => "demo (offline)",
         })
         .show_ui(ui, |ui| {
             changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Ollama, "ollama").changed();
             changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Logscope, "logscope").changed();
+            changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Engine, "engine (in-process)").changed();
             changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Command, "command").changed();
             changed |= ui.selectable_value(&mut state.provider_kind, ProviderKind::Demo, "demo (offline)").changed();
         });
 
     match state.provider_kind {
+        ProviderKind::Engine => {
+            // THE MODEL SELECTOR. The in-process engine's whole
+            // configuration starts with "which checkpoint", so that is the
+            // first control, and it lists what is actually on disk rather
+            // than asking someone to type a path from memory.
+            if state.engine_models.is_empty() {
+                state.rescan_models();
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("model").color(colors.text_weak));
+                let selected = if state.engine_cfg.model_path.is_empty() {
+                    "— pick a model —".to_string()
+                } else {
+                    std::path::Path::new(&state.engine_cfg.model_path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| state.engine_cfg.model_path.clone())
+                };
+                egui::ComboBox::from_id_salt("engine_model")
+                    .selected_text(selected)
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        if state.engine_models.is_empty() {
+                            ui.label(
+                                RichText::new("no .gguf found — set APERTURE_MODELS")
+                                    .color(colors.text_weak)
+                                    .small(),
+                            );
+                        }
+                        for m in &state.engine_models {
+                            let p = m.path.to_string_lossy().into_owned();
+                            let label = format!("{}  ({})", m.label, m.size_label());
+                            if ui
+                                .selectable_label(state.engine_cfg.model_path == p, label)
+                                .clicked()
+                            {
+                                state.engine_cfg.model_path = p;
+                                changed = true;
+                            }
+                        }
+                    });
+                if ui.button("rescan").on_hover_text("re-read the model directories").clicked() {
+                    state.rescan_models();
+                }
+            });
+            ui.horizontal(|ui| {
+                let busy = matches!(state.engine_status, crate::state::EngineStatus::Loading(_));
+                let can_load = !state.engine_cfg.model_path.is_empty() && !busy;
+                if ui
+                    .add_enabled(can_load, egui::Button::new("load model"))
+                    .on_hover_text("resident in THIS process — no server, no round-trip")
+                    .clicked()
+                {
+                    state.load_engine_model();
+                    changed = true;
+                }
+                ui.label(RichText::new(state.engine_status.line()).color(colors.text_weak).small());
+            });
+            let cfg = &mut state.engine_cfg;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("max tokens").color(colors.text_weak));
+                changed |= ui.add(egui::DragValue::new(&mut cfg.max_tokens).range(1..=4096)).changed();
+                ui.label(RichText::new("temp").color(colors.text_weak));
+                changed |= ui
+                    .add(egui::DragValue::new(&mut cfg.temperature).range(0.0..=2.0).speed(0.05))
+                    .on_hover_text("0 = greedy, which is what completions want")
+                    .changed();
+                ui.label(RichText::new("repeat").color(colors.text_weak));
+                changed |= ui
+                    .add(egui::DragValue::new(&mut cfg.repeat_penalty).range(1.0..=2.0).speed(0.01))
+                    .on_hover_text("discourages the model reciting your buffer back")
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("instruction").color(colors.text_weak));
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut cfg.instruction).desired_width(f32::INFINITY))
+                    .lost_focus();
+            });
+        }
         ProviderKind::Logscope => {
             // logscope-serve (apps/logscope/SERVING.md): POST /generate,
             // prompt as the raw body, key in the Bearer header. Every

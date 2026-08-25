@@ -115,6 +115,7 @@ version = "0.1.0"
 dependencies = [
  "aperture-complete",
  "aperture-core",
+ "aperture-engine",
  "eframe",
  "egui",
  "egui_kittest",

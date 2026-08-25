@@ -17,7 +17,23 @@ required-features = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs — see
 # manifest/projects.toml) produces the deploy binary directly, same convention
 # as bo-suite-egui / rusty-board-egui.
-default = ["app", "tree-sitter"]
+default = ["app", "tree-sitter", "engine"]
+# The IN-PROCESS wgpu inference engine (aperture-engine + gpu-gemm).
+#
+# DEFAULT-ON, and that is the requirement rather than a preference: aperture
+# has to be able to operate the backend ITSELF, as the only app open — no
+# logscope-serve running somewhere, no daemon yet, no second process at all.
+# `cargo build --release` (what manifest/projects.toml documents as the way
+# to get the bin) uses default features, so an engine left out of `default`
+# is an engine the shipped editor does not have.
+#
+# The cost is real and worth naming: this links wgpu/naga/pollster, so a
+# cold build is minutes rather than seconds. The fast edit-test loop is
+#   cargo test -p aperture-egui --no-default-features --features tree-sitter
+# which is what to use while working on the editor itself. The F2 engine
+# panel is present in both builds and says which one you are in, so a
+# no-engine build is visible rather than silently inert.
+engine = ["aperture-engine/gpu"]
 # Grammar highlighting + outline (context filler, symbol popup). Explicitly
 # default HERE and not merely inherited via workspace feature unification —
 # `cargo test -p aperture-egui` builds without sibling crates' features, and
@@ -29,6 +45,7 @@ app = ["dep:eframe"]
 [dependencies]
 aperture-core = { workspace = true }
 aperture-complete = { workspace = true }
+aperture-engine = { workspace = true }
 egui = { workspace = true }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }

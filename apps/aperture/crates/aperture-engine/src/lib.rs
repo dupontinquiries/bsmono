@@ -54,9 +54,12 @@ use aperture_complete::{CompletionRequest, Provider};
 /// owns it for everybody. Deliberately the same signature
 /// `logscope-serve` already collapses its engine into.
 ///
-/// `Send` because the completion worker runs providers off the UI thread;
-/// no `Sync` requirement, since a provider is owned by one worker.
-pub trait Backend: Send {
+/// `Send + Sync` because a loaded model is SHARED, not rebuilt: the editor
+/// holds one `Arc<dyn Backend>` and every provider the completion worker
+/// constructs clones that handle. A 15 GB checkpoint cannot be re-loaded
+/// per request, and `build_provider` is called freely — so the sharing has
+/// to be in the type, not in a convention someone has to remember.
+pub trait Backend: Send + Sync {
     /// A human name for the loop pane and logs.
     fn describe(&self) -> String;
     /// Generate at most `max_tokens` continuing `prompt`.
@@ -121,6 +124,92 @@ pub fn assemble_prompt(cfg: &EngineConfig, req: &CompletionRequest) -> String {
     out
 }
 
+/// A GGUF found on disk, for the model selector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundModel {
+    pub path: std::path::PathBuf,
+    /// File name without the extension — what the picker shows.
+    pub label: String,
+    pub bytes: u64,
+}
+
+impl FoundModel {
+    /// "7.2 GB" — the number that decides whether this one fits, so the
+    /// picker shows it rather than making someone guess from the name.
+    pub fn size_label(&self) -> String {
+        let gb = self.bytes as f64 / 1_073_741_824.0;
+        if gb >= 1.0 {
+            format!("{gb:.1} GB")
+        } else {
+            format!("{:.0} MB", self.bytes as f64 / 1_048_576.0)
+        }
+    }
+}
+
+/// Where to look for GGUFs when nobody has said. `APERTURE_MODELS` first
+/// (explicit beats guessed), then the conventional spots — the same
+/// `~/models` logscope-serve is usually pointed at, plus the caches
+/// llama.cpp and HF tooling actually write to.
+pub fn default_model_dirs() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(v) = std::env::var("APERTURE_MODELS") {
+        for part in v.split(':').filter(|p| !p.is_empty()) {
+            out.push(std::path::PathBuf::from(part));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let h = std::path::Path::new(&home);
+        out.push(h.join("models"));
+        out.push(h.join(".cache/huggingface/hub"));
+        out.push(h.join(".cache/llama.cpp"));
+    }
+    out
+}
+
+/// Every `.gguf` under these directories, one level deep plus one nested
+/// level (HF's hub layout puts the file inside a per-repo folder), sorted
+/// by label and de-duplicated by path.
+///
+/// Deliberately NOT a deep recursive walk: a home directory scan that
+/// wanders into a source tree costs seconds and surprises people. Two
+/// levels covers the real layouts; anything else is what `APERTURE_MODELS`
+/// is for.
+pub fn discover_models(dirs: &[std::path::PathBuf]) -> Vec<FoundModel> {
+    fn push_gguf(out: &mut Vec<FoundModel>, p: &std::path::Path) {
+        if p.extension().and_then(|e| e.to_str()) != Some("gguf") {
+            return;
+        }
+        let Ok(md) = std::fs::metadata(p) else { return };
+        if !md.is_file() {
+            return;
+        }
+        out.push(FoundModel {
+            label: p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            path: p.to_path_buf(),
+            bytes: md.len(),
+        });
+    }
+    let mut out: Vec<FoundModel> = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Ok(inner) = std::fs::read_dir(&p) {
+                    for e2 in inner.flatten() {
+                        push_gguf(&mut out, &e2.path());
+                    }
+                }
+            } else {
+                push_gguf(&mut out, &p);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label).then(a.path.cmp(&b.path)));
+    out.dedup_by(|a, b| a.path == b.path);
+    out
+}
+
 /// A [`Backend`] that owns the model in this process.
 ///
 /// Construction is split from use on purpose: [`load`](Self::load) does the
@@ -129,14 +218,26 @@ pub fn assemble_prompt(cfg: &EngineConfig, req: &CompletionRequest) -> String {
 /// happened, so a UI can show "loading…" and then a real error instead of
 /// freezing and then failing.
 pub struct LocalEngine {
-    inner: Box<dyn Backend>,
+    inner: std::sync::Arc<dyn Backend>,
 }
 
 impl LocalEngine {
     /// Wrap any backend — the constructor tests use, and the one a daemon
     /// client will use later without touching this crate's other half.
     pub fn with_backend(inner: Box<dyn Backend>) -> Self {
+        LocalEngine { inner: std::sync::Arc::from(inner) }
+    }
+
+    /// Share an already-loaded engine. This is the one a UI uses: load
+    /// once on a worker thread, keep the handle, hand a clone to every
+    /// provider the completion worker builds.
+    pub fn shared(inner: std::sync::Arc<dyn Backend>) -> Self {
         LocalEngine { inner }
+    }
+
+    /// The handle, for a caller that wants to keep it across rebuilds.
+    pub fn handle(&self) -> std::sync::Arc<dyn Backend> {
+        self.inner.clone()
     }
 
     /// Load a GGUF into this process and warm the pipelines.
@@ -151,7 +252,7 @@ impl LocalEngine {
     /// and no checkpoint in the tree. Compile-checked only.
     #[cfg(feature = "gpu")]
     pub fn load(cfg: EngineConfig) -> Result<Self, String> {
-        Ok(LocalEngine { inner: Box::new(gpu::GpuBackend::load(cfg)?) })
+        Ok(LocalEngine { inner: std::sync::Arc::new(gpu::GpuBackend::load(cfg)?) })
     }
 
     pub fn describe(&self) -> String {
@@ -374,8 +475,70 @@ mod tests {
     }
 
     #[test]
-    fn describe_reaches_through_the_wrapper() {
-        // The loop pane shows this; it must be the BACKEND's answer (which
+    fn discovery_finds_ggufs_one_and_two_levels_deep_and_ignores_the_rest() {
+        let dir = std::env::temp_dir().join(format!("aperture-eng-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo-a")).unwrap();
+        std::fs::create_dir_all(dir.join("deep/deeper")).unwrap();
+        std::fs::write(dir.join("zeta.gguf"), b"x").unwrap();          // top level
+        std::fs::write(dir.join("repo-a/alpha.gguf"), b"xx").unwrap(); // HF-style nesting
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();          // wrong extension
+        std::fs::write(dir.join("deep/deeper/buried.gguf"), b"x").unwrap(); // too deep
+
+        let found = discover_models(&[dir.clone()]);
+        let labels: Vec<&str> = found.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, vec!["alpha", "zeta"], "sorted by label, both depths, {found:?}");
+        assert!(!labels.contains(&"notes"), "only .gguf files are models");
+        assert!(!labels.contains(&"buried"),
+                "three levels deep is not scanned — a home-dir walk that wanders is the bug this avoids");
+
+        // A directory that does not exist is silently skipped, not an error:
+        // default_model_dirs() lists conventional paths that mostly will not
+        // exist on any given machine.
+        let missing = dir.join("nope");
+        assert_eq!(discover_models(&[missing]).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn size_label_switches_units_where_a_person_would() {
+        let m = |bytes| FoundModel { path: "x".into(), label: "x".into(), bytes };
+        assert_eq!(m(7_730_941_132).size_label(), "7.2 GB");
+        assert_eq!(m(400 * 1_048_576).size_label(), "400 MB");
+        // Exactly 1 GiB reads as GB, not "1024 MB".
+        assert_eq!(m(1_073_741_824).size_label(), "1.0 GB");
+    }
+
+    #[test]
+    fn explicit_model_dirs_come_before_the_guessed_ones() {
+        // APERTURE_MODELS is the escape hatch for a machine that keeps its
+        // models somewhere unconventional; it must WIN, not merely be
+        // included, or the picker leads with whatever ~/models happens to
+        // hold.
+        std::env::set_var("APERTURE_MODELS", "/tmp/first:/tmp/second");
+        let dirs = default_model_dirs();
+        std::env::remove_var("APERTURE_MODELS");
+        assert_eq!(dirs[0], std::path::PathBuf::from("/tmp/first"));
+        assert_eq!(dirs[1], std::path::PathBuf::from("/tmp/second"));
+    }
+
+    #[test]
+    fn a_loaded_engine_is_shared_not_rebuilt_per_provider() {
+        // The 15 GB fact, pinned: two providers built from one handle must
+        // point at the SAME backend, or every build_provider call would
+        // re-load a checkpoint.
+        let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(FakeBackend {
+            reply: "ok".into(),
+            seen: Default::default(),
+        });
+        let a = LocalEngine::shared(backend.clone());
+        let b = LocalEngine::shared(backend.clone());
+        assert!(std::sync::Arc::ptr_eq(&a.handle(), &b.handle()),
+                "both engines share one resident model");
+    }
+
+    #[test]
+    fn describe_reaches_through_the_wrapper() {        // The loop pane shows this; it must be the BACKEND's answer (which
         // names the real adapter) and not a constant from the wrapper.
         let e = LocalEngine::with_backend(Box::new(FakeBackend {
             reply: String::new(),

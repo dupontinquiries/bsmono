@@ -198,11 +198,36 @@ pub struct Effects {
     pub clipboard: Option<String>,
 }
 
+/// What the engine panel reports. Loading a multi-gigabyte checkpoint is
+/// slow enough that "nothing happened yet" and "it failed" must be
+/// distinguishable on screen.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EngineStatus {
+    Idle,
+    Loading(String),
+    Ready(String),
+    Failed(String),
+}
+
+impl EngineStatus {
+    pub fn line(&self) -> String {
+        match self {
+            EngineStatus::Idle => "no model loaded".into(),
+            EngineStatus::Loading(m) => format!("loading {m}…"),
+            EngineStatus::Ready(d) => format!("ready — {d}"),
+            EngineStatus::Failed(e) => format!("failed: {e}"),
+        }
+    }
+}
+
 /// Which provider the loop pane has selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
     Ollama,
     Logscope,
+    /// The in-process wgpu engine — the model resident in THIS process,
+    /// no HTTP, no second process. See `aperture_engine`.
+    Engine,
     Command,
     Demo,
 }
@@ -337,6 +362,17 @@ pub struct AppState {
     pub provider_kind: ProviderKind,
     pub ollama_cfg: OllamaConfig,
     pub logscope_cfg: aperture_complete::providers::LogscopeConfig,
+    pub engine_cfg: aperture_engine::EngineConfig,
+    /// GGUFs found on disk, for the model selector. Populated by
+    /// `rescan_models()` rather than on every frame — a directory walk
+    /// per frame is exactly the kind of thing that makes a UI feel bad.
+    pub engine_models: Vec<aperture_engine::FoundModel>,
+    /// The loaded model, shared: `build_provider` clones this handle
+    /// instead of re-loading a checkpoint it must never re-load.
+    pub engine_backend: Option<std::sync::Arc<dyn aperture_engine::Backend>>,
+    /// What the pane reports about loading — a 15 GB load has to be
+    /// visible, and a failure has to say what failed.
+    pub engine_status: EngineStatus,
     pub command_line: String,
 
     pub ghost_since: Option<u64>,
@@ -413,6 +449,10 @@ impl AppState {
             provider_kind: ProviderKind::Ollama,
             ollama_cfg: OllamaConfig::default(),
             logscope_cfg: aperture_complete::providers::LogscopeConfig::default(),
+            engine_cfg: aperture_engine::EngineConfig::default(),
+            engine_models: Vec::new(),
+            engine_backend: None,
+            engine_status: EngineStatus::Idle,
             command_line: String::new(),
             ghost_since: None,
             palette: None,
@@ -733,12 +773,67 @@ impl AppState {
         }
     }
 
+    /// Re-scan the model directories. Called from the pane's button and
+    /// once when the engine provider is first selected — not per frame.
+    pub fn rescan_models(&mut self) {
+        self.engine_models = aperture_engine::discover_models(&aperture_engine::default_model_dirs());
+    }
+
+    /// Load the configured model into this process.
+    ///
+    /// Synchronous and therefore BLOCKING, which is the honest shape for
+    /// now: it is called from a button, not from the frame loop, and the
+    /// status line says "loading" before it runs. Moving it to a worker
+    /// thread is the right next step (the handle is already an Arc, so
+    /// nothing else has to change) — but a background load that lies about
+    /// being done would be worse than a window that is visibly busy.
+    ///
+    /// Without the `engine` feature this reports what is true — the build
+    /// has no engine in it — rather than silently doing nothing.
+    pub fn load_engine_model(&mut self) {
+        #[cfg(feature = "engine")]
+        {
+            if self.engine_cfg.model_path.is_empty() {
+                self.engine_status = EngineStatus::Failed("no model selected".into());
+                return;
+            }
+            match aperture_engine::LocalEngine::load(self.engine_cfg.clone()) {
+                Ok(e) => {
+                    let d = e.describe();
+                    self.engine_backend = Some(e.handle());
+                    self.engine_status = EngineStatus::Ready(d);
+                }
+                Err(e) => {
+                    self.engine_backend = None;
+                    self.engine_status = EngineStatus::Failed(e);
+                }
+            }
+        }
+        #[cfg(not(feature = "engine"))]
+        {
+            self.engine_status = EngineStatus::Failed(
+                "built without the `engine` feature — rebuild with --features engine".into(),
+            );
+        }
+    }
+
     pub fn build_provider(&self) -> Box<dyn Provider> {
         match self.provider_kind {
             ProviderKind::Ollama => Box::new(OllamaProvider::new(self.ollama_cfg.clone())),
             ProviderKind::Logscope => Box::new(aperture_complete::providers::LogscopeProvider::new(
                 self.logscope_cfg.clone(),
             )),
+            ProviderKind::Engine => match &self.engine_backend {
+                // The shared handle, cloned — never a reload.
+                Some(b) => Box::new(aperture_engine::EngineProvider::new(
+                    self.engine_cfg.clone(),
+                    aperture_engine::LocalEngine::shared(b.clone()),
+                )),
+                // Nothing loaded: fall back to the offline demo rather
+                // than panicking or silently doing nothing. The pane says
+                // why, right above the dropdown.
+                None => Box::new(StaticProvider::new(&[])),
+            },
             ProviderKind::Command => Box::new(CommandProvider::new(
                 self.command_line.split_whitespace().map(str::to_string).collect(),
             )),
