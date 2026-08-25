@@ -133,7 +133,9 @@ impl LiveState {
     /// draws the big reading; this draws the SENSOR panel". It did not exist,
     /// so the binary did not compile:
     ///
-    ///     error[E0599]: no method named `ui` found for struct `LiveState`
+    /// ```text
+    /// error[E0599]: no method named `ui` found for struct `LiveState`
+    /// ```
     ///
     /// Deliberately NOT delegating to `LiveView::ui`, the crate's other Live
     /// implementation. That one eases through `ctx().animate_value_with_time`
