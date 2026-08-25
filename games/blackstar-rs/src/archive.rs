@@ -518,6 +518,11 @@ pub static SOURCES: &[Source] = &[
     Source { id: "personnel_rotation", what: "a rotation schedule, four revisions of it" },
     Source { id: "scholarship", what: "the specialists, who argue but broadly agree" },
     Source { id: "lived_through_it", what: "what the player watched happen in the campaign" },
+    // -- an uncredited first contact, decades before any record admits one --
+    Source { id: "whiteout_incident", what: "a Pluto outpost's last log, and the reactor-fault report that buried it" },
+    Source { id: "orbital_recovery", what: "a decaying orbital object recovered and quietly reclassified" },
+    Source { id: "kesswick_incident", what: "a mountain relay's unbelieved log, reopened eleven years later" },
+    Source { id: "mars_transfer_wreck", what: "a Mars transfer-stage wreck older than any admitted launch program" },
 ];
 
 pub fn source(id: &str) -> Option<&'static Source> {
@@ -1071,6 +1076,56 @@ pub static FINDINGS: &[Finding] = &[
                 solution, decades old, annotated. somebody worked this out a long time ago and \
                 has been waiting quietly ever since.",
         links: &[s("asteri_orbital_error"), s("archivist_collecting")],
+    },
+
+    // ================= BURIED HISTORY — an uncredited first contact =================
+    // Corroborates `convergence_was_not_first`: the Blackstar-era contact was
+    // not the first time humans handled this technology. None of these name
+    // a species or a faction — the point is that nobody involved had the
+    // vocabulary to, which is what makes it corroboration rather than lore.
+    Finding {
+        id: "whiteout_station_log",
+        site: "pluto",
+        source: "whiteout_incident",
+        medium: Medium::Terminal,
+        gate: None,
+        blurb: "a skeleton crew's last log, decades before the containment line existed. \
+                six names attached. the transport manifest that follows lists one survivor. \
+                the incident report filed with command runs two lines and calls it a reactor fault.",
+        links: &[s("convergence_was_not_first"), m("archivist_collecting")],
+    },
+    Finding {
+        id: "undelivered_manifest",
+        site: "earth",
+        source: "orbital_recovery",
+        medium: Medium::Artifact,
+        gate: None,
+        blurb: "a decaying object recovered from low orbit, predating every catalogued launch \
+                on record. filed under aircraft debris. it is not aircraft debris. the serial \
+                format matches no program, including the one that filed the report.",
+        links: &[s("convergence_was_not_first"), m("continuous_earth")],
+    },
+    Finding {
+        id: "kesswick_relay_log",
+        site: "earth",
+        source: "kesswick_incident",
+        medium: Medium::Terminal,
+        gate: None,
+        blurb: "a maintenance tech's log: three hours alone with a presence he has no \
+                vocabulary for. he describes the damage before he describes a shape -- torn \
+                plating first, a face second. marked unqualified observer, disregard.",
+        links: &[s("watchers_observed"), s("convergence_was_not_first")],
+    },
+    Finding {
+        id: "far_manifest_wreck",
+        site: "mars",
+        source: "mars_transfer_wreck",
+        medium: Medium::Site,
+        gate: None,
+        blurb: "a transfer-stage wreck a decade older than any admitted launch program. no \
+                nation ever files the loss, because no nation ever files the launch. the crew \
+                is simply not, and the wreck outlasts every account of how the war got here.",
+        links: &[s("convergence_was_not_first"), s("societies_existed")],
     },
 ];
 

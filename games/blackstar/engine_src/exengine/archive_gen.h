@@ -65,8 +65,12 @@ static const ex_link_t ex_gen_links_chart_observation_arc[2] = { { "asteri_orbit
 static const ex_link_t ex_gen_links_modern_solution[2] = { { "asteri_orbital_error", EX_BEARING_SUPPORTS }, { "asteri_existed", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_debris_stream[1] = { { "asteri_orbital_error", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_covenant_cache[2] = { { "asteri_orbital_error", EX_BEARING_SUPPORTS }, { "archivist_collecting", EX_BEARING_SUPPORTS }, };
+static const ex_link_t ex_gen_links_whiteout_station_log[2] = { { "convergence_was_not_first", EX_BEARING_SUPPORTS }, { "archivist_collecting", EX_BEARING_MENTIONS }, };
+static const ex_link_t ex_gen_links_undelivered_manifest[2] = { { "convergence_was_not_first", EX_BEARING_SUPPORTS }, { "continuous_earth", EX_BEARING_MENTIONS }, };
+static const ex_link_t ex_gen_links_kesswick_relay_log[2] = { { "watchers_observed", EX_BEARING_SUPPORTS }, { "convergence_was_not_first", EX_BEARING_SUPPORTS }, };
+static const ex_link_t ex_gen_links_far_manifest_wreck[2] = { { "convergence_was_not_first", EX_BEARING_SUPPORTS }, { "societies_existed", EX_BEARING_SUPPORTS }, };
 
-static const ex_finding_t ex_gen_findings[37] = {
+static const ex_finding_t ex_gen_findings[41] = {
   { "bunker_alloy", "earth", "la_bunker", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_bunker_alloy, 3 },
   { "bunker_roster", "earth", "la_bunker", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_bunker_roster, 2 },
   { "directorate_record", "earth", "the_record", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_directorate_record, 2 },
@@ -104,8 +108,12 @@ static const ex_finding_t ex_gen_findings[37] = {
   { "modern_solution", "earth", "observatory_solution", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_modern_solution, 2 },
   { "debris_stream", "uncharted", "debris_stream", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_debris_stream, 1 },
   { "covenant_cache", "titan", "covenant_cache", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_covenant_cache, 2 },
+  { "whiteout_station_log", "pluto", "whiteout_incident", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_whiteout_station_log, 2 },
+  { "undelivered_manifest", "earth", "orbital_recovery", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_undelivered_manifest, 2 },
+  { "kesswick_relay_log", "earth", "kesswick_incident", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_kesswick_relay_log, 2 },
+  { "far_manifest_wreck", "mars", "mars_transfer_wreck", EX_MEDIUM_SITE, NULL, ex_gen_links_far_manifest_wreck, 2 },
 };
-#define EX_GEN_FINDING_COUNT 37
+#define EX_GEN_FINDING_COUNT 41
 
 static const ex_received_t ex_gen_received[8] = {
   { "unicron_in_earth", EX_BEARING_SUPPORTS, "lived_through_it", 0.2000f, "the thing in the mantle -- you were there" },

@@ -8,7 +8,9 @@
 //! **A Hohmann transfer is the cheapest way between two circular orbits**
 //! and its duration is half the period of an ellipse touching both:
 //!
-//!     t = pi * sqrt(a^3 / mu),  a = (r1 + r2) / 2
+//! ```text
+//! t = pi * sqrt(a^3 / mu),  a = (r1 + r2) / 2
+//! ```
 //!
 //! Earth to Mars is about 8.5 months, Earth to Saturn about 6 years. Those
 //! ratios are what make the map a map. Scaled into game time they give the

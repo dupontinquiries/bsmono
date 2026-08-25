@@ -157,7 +157,10 @@ pub static PLACES: &[Place] = &[
         now: "a dish full of birds, and one drive that still spins.",
         home_for: &[],
         near: &[],
-        holds: &["station_drive", "station_pointing_log", "cold_war_manifest"],
+        holds: &[
+            "station_drive", "station_pointing_log", "cold_war_manifest",
+            "undelivered_manifest", "kesswick_relay_log",
+        ],
     },
     Place {
         id: "the_museum",
