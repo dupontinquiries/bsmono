@@ -223,6 +223,234 @@ impl Severity {
     }
 }
 
+
+// ---------------------------------------------------------------
+// Hardware kind (v1). Components on a board with millimetre
+// positions, named pins, traces, vias and zones.
+//
+// Two things are worth knowing about this implementation:
+//
+//  1. Coordinates are MILLIMETRES, per the spec — the one kind
+//     where absolute numbers carry meaning rather than being
+//     layout noise. They survive parsing unscaled.
+//
+//  2. It PROJECTS onto the graph AST. Every component also
+//     becomes a Node and every trace an Edge, with the mm
+//     position recorded as a Constraint::Pin. That means a
+//     hardware diagram renders through the existing graph
+//     pipeline immediately, instead of waiting for a dedicated
+//     board renderer, and a future renderer can read the richer
+//     `hardware` payload without the projection changing.
+// ---------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentClass {
+    Chip,
+    Connector,
+    Resistor,
+    Capacitor,
+    Inductor,
+    Antenna,
+    Crystal,
+    Led,
+    TestPoint,
+    Other,
+}
+
+impl ComponentClass {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "chip" | "ic" => Some(ComponentClass::Chip),
+            "connector" | "conn" => Some(ComponentClass::Connector),
+            "resistor" | "res" => Some(ComponentClass::Resistor),
+            "capacitor" | "cap" => Some(ComponentClass::Capacitor),
+            "inductor" | "ind" => Some(ComponentClass::Inductor),
+            "antenna" | "ant" => Some(ComponentClass::Antenna),
+            "crystal" | "xtal" => Some(ComponentClass::Crystal),
+            "led" => Some(ComponentClass::Led),
+            "testpoint" | "tp" => Some(ComponentClass::TestPoint),
+            "component" | "part" => Some(ComponentClass::Other),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ComponentClass::Chip => "chip",
+            ComponentClass::Connector => "connector",
+            ComponentClass::Resistor => "resistor",
+            ComponentClass::Capacitor => "capacitor",
+            ComponentClass::Inductor => "inductor",
+            ComponentClass::Antenna => "antenna",
+            ComponentClass::Crystal => "crystal",
+            ComponentClass::Led => "led",
+            ComponentClass::TestPoint => "testpoint",
+            ComponentClass::Other => "component",
+        }
+    }
+
+    /// Shape used when projecting onto the graph AST.
+    fn shape(&self) -> Shape {
+        match self {
+            ComponentClass::Chip => Shape::Rect,
+            ComponentClass::Connector => Shape::Parallelogram,
+            ComponentClass::Antenna => Shape::Hexagon,
+            ComponentClass::TestPoint => Shape::Circle,
+            _ => Shape::Rect,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinEdge {
+    Top, Bottom, Left, Right,
+    TopLeft, TopRight, BottomLeft, BottomRight,
+}
+
+impl PinEdge {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "top" | "north" => Some(PinEdge::Top),
+            "bottom" | "south" => Some(PinEdge::Bottom),
+            "left" | "west" => Some(PinEdge::Left),
+            "right" | "east" => Some(PinEdge::Right),
+            "top-left" | "topleft" | "north-west" => Some(PinEdge::TopLeft),
+            "top-right" | "topright" | "north-east" => Some(PinEdge::TopRight),
+            "bottom-left" | "bottomleft" | "south-west" => Some(PinEdge::BottomLeft),
+            "bottom-right" | "bottomright" | "south-east" => Some(PinEdge::BottomRight),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Pin {
+    pub name: String,
+    pub edge: PinEdge,
+    /// Offset along the edge from its default position, in mm.
+    pub offset_mm: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Component {
+    pub id: String,
+    pub class: ComponentClass,
+    /// Millimetres. `None` when the author omitted `at (x, y)` —
+    /// permitted, and left to the layout stage to place.
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub rotation_deg: f32,
+    /// Parenthesised value such as `(10kΩ)` or `(100nF)`.
+    pub value: Option<String>,
+    /// Layer name; empty means the default top copper.
+    pub layer: String,
+    pub pins: Vec<Pin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinRef {
+    pub component: String,
+    /// `None` for a component-level reference (`trace A → B`).
+    pub pin: Option<String>,
+}
+
+impl PinRef {
+    fn parse(s: &str) -> Self {
+        let s = s.trim();
+        match s.split_once('.') {
+            Some((c, p)) => PinRef {
+                component: c.trim().to_string(),
+                pin: Some(p.trim().to_string()),
+            },
+            None => PinRef { component: s.to_string(), pin: None },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Trace {
+    pub from: PinRef,
+    pub to: PinRef,
+    pub width_mm: Option<f32>,
+    /// Explicit layer via `on "name"`; inherits the source
+    /// component's layer when absent (resolved at render time,
+    /// not here — the parser records what was written).
+    pub layer: Option<String>,
+    pub ground: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum ViaAt {
+    Pin(PinRef),
+    Point { x: f32, y: f32 },
+}
+
+#[derive(Clone, Debug)]
+pub struct Via {
+    pub name: String,
+    pub at: ViaAt,
+    /// Ordered layer names. Empty vec with `all_layers` set means
+    /// "every declared layer", resolved by the renderer.
+    pub layers: Vec<String>,
+    pub all_layers: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum ZoneKind {
+    /// `zone fill copper on "ground plane"`
+    Fill { material: String },
+    /// `zone "keepout" : rect (x1,y1) to (x2,y2)`
+    Rect { x1: f32, y1: f32, x2: f32, y2: f32 },
+}
+
+#[derive(Clone, Debug)]
+pub struct Zone {
+    pub name: Option<String>,
+    pub kind: ZoneKind,
+    pub layer: Option<String>,
+}
+
+/// Hardware payload. Empty for non-hardware diagrams.
+#[derive(Clone, Debug, Default)]
+pub struct Hardware {
+    pub components: Vec<Component>,
+    pub traces: Vec<Trace>,
+    pub vias: Vec<Via>,
+    pub zones: Vec<Zone>,
+    /// Declared layer names in source order (top copper first).
+    pub layers: Vec<String>,
+}
+
+impl Hardware {
+    pub fn is_empty(&self) -> bool {
+        self.components.is_empty()
+            && self.traces.is_empty()
+            && self.vias.is_empty()
+            && self.zones.is_empty()
+    }
+
+    pub fn component(&self, id: &str) -> Option<&Component> {
+        self.components.iter().find(|c| c.id == id)
+    }
+}
+
+/// Parse `(12, 34)` / `(12.5,34)` into millimetres.
+fn parse_point(s: &str) -> Option<(f32, f32)> {
+    let inner = s.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let (a, b) = inner.split_once(',')?;
+    let x = a.trim().trim_end_matches("mm").trim().parse::<f32>().ok()?;
+    let y = b.trim().trim_end_matches("mm").trim().parse::<f32>().ok()?;
+    if x.is_finite() && y.is_finite() { Some((x, y)) } else { None }
+}
+
+/// Split a line on the first `(` that starts a coordinate pair,
+/// returning (before, "(x, y)", after).
+fn split_paren<'a>(s: &'a str, from: usize) -> Option<(&'a str, &'a str, &'a str)> {
+    let open = s[from..].find('(')? + from;
+    let close = s[open..].find(')')? + open;
+    Some((&s[..open], &s[open..=close], &s[close + 1..]))
+}
+
 /// The parsed contents of a niftyplot block (graph kind).
 /// Other kinds will get their own structs as they're implemented.
 #[derive(Clone, Debug, Default)]
@@ -239,6 +467,14 @@ pub struct GraphDoc {
     pub warnings: Vec<Warning>,
     /// Fast lookup by id.
     pub node_idx: HashMap<String, usize>,
+    /// `%units:` declaration (hardware kind uses `mm`). Recorded
+    /// so a renderer can label axes; the parser always stores
+    /// millimetres.
+    pub units: Option<String>,
+    /// Hardware-kind payload. Empty unless `%kind: hardware`.
+    /// Components/traces are ALSO projected into nodes/edges
+    /// above so existing consumers keep working untouched.
+    pub hardware: Hardware,
 }
 
 impl GraphDoc {
@@ -301,10 +537,310 @@ fn extract_body(s: &str) -> String {
     s.to_string()
 }
 
+
+/// Parse one hardware-kind line. Returns true if the line was
+/// consumed. `open_component` tracks whether we are inside a
+/// `component { ... }` block so `pin` lines attach correctly.
+fn parse_hardware_line(
+    doc: &mut GraphDoc,
+    line: &str,
+    line_no: usize,
+    open_component: &mut Option<String>,
+    current_layer: &mut String,
+) -> bool {
+    let lower = line.to_lowercase();
+
+    // `layer "top copper" {`  — begin a layer scope.
+    if let Some(rest) = lower.strip_prefix("layer ") {
+        let name = strip_quotes(rest.trim().trim_end_matches('{').trim());
+        if !doc.hardware.layers.iter().any(|l| l == &name) {
+            doc.hardware.layers.push(name.clone());
+        }
+        *current_layer = name;
+        return true;
+    }
+
+    // `pin NAME : edge [+ Nmm]` inside an open component block.
+    if let Some(rest) = line.strip_prefix("pin ") {
+        let Some(owner) = open_component.clone() else {
+            doc.warn(line_no, Severity::Warning,
+                "pin declared outside a component block", line);
+            return true;
+        };
+        let (name, spec) = match rest.split_once(':') {
+            Some((n, sp)) => (n.trim().to_string(), sp.trim().to_string()),
+            None => {
+                doc.warn(line_no, Severity::Warning,
+                    "pin needs `: <edge>` (e.g. `pin VCC : top-right`)", line);
+                return true;
+            }
+        };
+        // optional `+ 5mm` offset
+        let (edge_str, offset) = match spec.split_once('+') {
+            Some((e, off)) => {
+                let v = off.trim().trim_end_matches("mm").trim().parse::<f32>().ok();
+                if v.is_none() {
+                    doc.warn(line_no, Severity::Info,
+                        format!("unparseable pin offset '{}'; using 0", off.trim()), line);
+                }
+                (e.trim().to_string(), v.unwrap_or(0.0))
+            }
+            None => (spec.clone(), 0.0),
+        };
+        let Some(edge) = PinEdge::parse(&edge_str) else {
+            doc.warn(line_no, Severity::Warning,
+                format!("unknown pin edge '{}'", edge_str), line);
+            return true;
+        };
+        if let Some(c) = doc.hardware.components.iter_mut().find(|c| c.id == owner) {
+            c.pins.push(Pin { name, edge, offset_mm: offset });
+        }
+        return true;
+    }
+
+    // `trace A.PIN -> B.PIN [width 0.3mm] [ground] [on "layer"]`
+    if lower.starts_with("trace ") {
+        let orig = line[6..].to_string();
+        let arrow = if orig.contains('\u{2192}') { "\u{2192}" } else { "->" };
+        let Some((lhs, rhs_all)) = orig.split_once(arrow) else {
+            doc.warn(line_no, Severity::Warning,
+                "trace needs an arrow (`->` or `\u{2192}`)", line);
+            return true;
+        };
+        let mut rhs = rhs_all.trim().to_string();
+        let mut width = None;
+        let mut layer = None;
+        let mut ground = false;
+        // `on "layer"` suffix
+        if let Some(idx) = rhs.to_lowercase().find(" on ") {
+            layer = Some(strip_quotes(rhs[idx + 4..].trim()));
+            rhs.truncate(idx);
+        }
+        // `ground` keyword
+        if rhs.to_lowercase().trim_end().ends_with("ground") {
+            ground = true;
+            let cut = rhs.to_lowercase().rfind("ground").unwrap_or(rhs.len());
+            rhs.truncate(cut);
+        }
+        // `width 0.3mm`
+        if let Some(idx) = rhs.to_lowercase().find("width ") {
+            let w = rhs[idx + 6..].trim().trim_end_matches("mm").trim();
+            match w.parse::<f32>() {
+                Ok(v) if v.is_finite() && v > 0.0 => width = Some(v),
+                _ => doc.warn(line_no, Severity::Info,
+                    format!("unparseable trace width '{}'", w), line),
+            }
+            rhs.truncate(idx);
+        }
+        let from = PinRef::parse(lhs);
+        let to = PinRef::parse(&rhs);
+        if from.component.is_empty() || to.component.is_empty() {
+            doc.warn(line_no, Severity::Warning, "trace endpoint missing", line);
+            return true;
+        }
+        doc.hardware.traces.push(Trace {
+            from: from.clone(), to: to.clone(), width_mm: width,
+            layer, ground,
+        });
+        // project onto the graph AST
+        let label = match (&from.pin, &to.pin) {
+            (Some(a), Some(b)) if a == b => Some(a.clone()),
+            (Some(a), Some(b)) => Some(format!("{a}\u{2192}{b}")),
+            _ => None,
+        };
+        doc.ensure_node(&from.component, "");
+        doc.ensure_node(&to.component, "");
+        doc.edges.push(Edge {
+            from: from.component,
+            to: to.component,
+            style: if ground { EdgeStyle::Heavy } else { EdgeStyle::Solid },
+            label,
+        });
+        return true;
+    }
+
+    // `via "NAME" at <pin|point> through <layers|all layers>`
+    if lower.starts_with("via ") {
+        let orig = line[4..].trim().to_string();
+        let name_end = if orig.starts_with('"') {
+            orig[1..].find('"').map(|i| i + 2).unwrap_or(orig.len())
+        } else {
+            orig.find(" at ").unwrap_or(orig.len())
+        };
+        let name = strip_quotes(orig[..name_end].trim());
+        let tail = orig[name_end..].to_string();
+        let lower_tail = tail.to_lowercase();
+        let at_idx = lower_tail.find(" at ").map(|i| i + 4);
+        let through_idx = lower_tail.find(" through ");
+        let at_str = match (at_idx, through_idx) {
+            (Some(a), Some(t)) if t > a => tail[a..t].trim().to_string(),
+            (Some(a), _) => tail[a..].trim().to_string(),
+            _ => String::new(),
+        };
+        let at = if let Some(p) = parse_point(&at_str) {
+            ViaAt::Point { x: p.0, y: p.1 }
+        } else if !at_str.is_empty() {
+            ViaAt::Pin(PinRef::parse(&at_str))
+        } else {
+            doc.warn(line_no, Severity::Warning, "via has no `at` location", line);
+            return true;
+        };
+        let mut layers = Vec::new();
+        let mut all_layers = false;
+        if let Some(t) = through_idx {
+            let spec = tail[t + 9..].trim().to_string();
+            if spec.to_lowercase().contains("all layer") {
+                all_layers = true;
+            } else {
+                let arrow = if spec.contains('\u{2192}') { "\u{2192}" } else { "->" };
+                for part in spec.split(arrow) {
+                    let l = strip_quotes(part.trim());
+                    if !l.is_empty() { layers.push(l); }
+                }
+            }
+        }
+        doc.hardware.vias.push(Via { name, at, layers, all_layers });
+        return true;
+    }
+
+    // `zone fill copper on "ground plane"` |
+    // `zone "keepout" : rect (a,b) to (c,d) on "top copper"`
+    if lower.starts_with("zone ") {
+        let orig = line[5..].trim().to_string();
+        let mut layer = None;
+        let mut body = orig.clone();
+        if let Some(idx) = body.to_lowercase().rfind(" on ") {
+            layer = Some(strip_quotes(body[idx + 4..].trim()));
+            body.truncate(idx);
+        }
+        let (name, spec) = match body.split_once(':') {
+            Some((n, sp)) => (Some(strip_quotes(n.trim())), sp.trim().to_string()),
+            None => (None, body.trim().to_string()),
+        };
+        let lower_spec = spec.to_lowercase();
+        let kind = if let Some(r) = lower_spec.strip_prefix("fill") {
+            ZoneKind::Fill { material: r.trim().to_string() }
+        } else if lower_spec.starts_with("rect") {
+            let pts: Vec<(f32, f32)> = {
+                let mut v = Vec::new();
+                let mut from = 0usize;
+                while let Some((_, paren, after)) = split_paren(&spec, from) {
+                    if let Some(p) = parse_point(paren) { v.push(p); }
+                    let consumed = spec.len() - after.len();
+                    if consumed <= from { break; }
+                    from = consumed;
+                }
+                v
+            };
+            if pts.len() < 2 {
+                doc.warn(line_no, Severity::Warning,
+                    "zone rect needs two points: `rect (x1,y1) to (x2,y2)`", line);
+                return true;
+            }
+            ZoneKind::Rect { x1: pts[0].0, y1: pts[0].1, x2: pts[1].0, y2: pts[1].1 }
+        } else {
+            doc.warn(line_no, Severity::Warning,
+                format!("unrecognised zone spec '{}'", spec), line);
+            return true;
+        };
+
+        doc.hardware.zones.push(Zone { name, kind, layer });
+        return true;
+    }
+
+    // `chip MCU at (10, 20) rotated 90° {`  (class-led component)
+    let mut it = line.split_whitespace();
+    let Some(word0) = it.next() else { return false };
+    let Some(class) = ComponentClass::parse(word0) else { return false };
+    let Some(id) = it.next() else {
+        doc.warn(line_no, Severity::Warning,
+            format!("`{}` needs an identifier", word0), line);
+        return true;
+    };
+    let id = id.trim_end_matches('{').trim().to_string();
+    if id.is_empty() {
+        doc.warn(line_no, Severity::Warning, "component id missing", line);
+        return true;
+    }
+
+    let lower_line = lower.clone();
+    let mut x = None;
+    let mut y = None;
+    if let Some(at_idx) = lower_line.find(" at ") {
+        if let Some((_, paren, _)) = split_paren(line, at_idx) {
+            match parse_point(paren) {
+                Some(p) => { x = Some(p.0); y = Some(p.1); }
+                None => doc.warn(line_no, Severity::Warning,
+                    format!("unparseable position '{}' (want `at (x, y)` in mm)", paren.trim()),
+                    line),
+            }
+        }
+    }
+    let mut rotation = 0.0f32;
+    if let Some(idx) = lower_line.find("rotated ") {
+        let r = line[idx + 8..]
+            .split_whitespace().next().unwrap_or("")
+            .trim_end_matches('{').trim_end_matches('\u{b0}');
+        match r.parse::<f32>() {
+            Ok(v) if v.is_finite() => rotation = v,
+            _ => doc.warn(line_no, Severity::Info,
+                format!("unparseable rotation '{}'; using 0", r), line),
+        }
+    }
+    // value in parens that is NOT the position, e.g. `(10k\u{3a9})`
+    let mut value = None;
+    {
+        let mut from = 0usize;
+        while let Some((_, paren, after)) = split_paren(line, from) {
+            if parse_point(paren).is_none() {
+                let v = paren.trim_start_matches('(').trim_end_matches(')').trim();
+                if !v.is_empty() { value = Some(v.to_string()); }
+                break;
+            }
+            let consumed = line.len() - after.len();
+            if consumed <= from { break; }
+            from = consumed;
+        }
+    }
+
+    doc.hardware.components.push(Component {
+        id: id.clone(),
+        class,
+        x, y,
+        rotation_deg: rotation,
+        value: value.clone(),
+        layer: current_layer.clone(),
+        pins: Vec::new(),
+    });
+
+    // Projection: component -> node (+ pinned position when known).
+    let idx = doc.ensure_node(&id, "");
+    doc.nodes[idx].shape = class.shape();
+    let label = match &value {
+        Some(v) => format!("{id} ({v})"),
+        None => id.clone(),
+    };
+    doc.nodes[idx].label = Some(label);
+    if let (Some(px), Some(py)) = (x, y) {
+        // mm -> layout units. The factor is a display convention,
+        // not physics; the millimetre truth stays in `hardware`.
+        doc.constraints.push(Constraint::Pin { node: id.clone(), x: px * 10.0, y: py * 10.0 });
+    }
+
+    if line.trim_end().ends_with('{') {
+        *open_component = Some(id);
+    }
+    true
+}
+
 fn parse_body(body: &str) -> GraphDoc {
     let mut doc = GraphDoc::new();
     let mut current_plane = String::new();
     let mut brace_stack: Vec<String> = Vec::new();  // tracks plane/group names
+    // Hardware-kind state. `open_component` is Some while inside a
+    // `chip X { ... }` block so `pin` lines know their owner.
+    let mut open_component: Option<String> = None;
+    let mut current_layer = String::new();
 
     for (line_idx, raw_line) in body.lines().enumerate() {
         let line_no = line_idx + 1;
@@ -318,6 +854,12 @@ fn parse_body(body: &str) -> GraphDoc {
 
         // Brace handling for plane / group blocks.
         if line == "}" {
+            // A component block closes first — hardware nesting is
+            // one level deep by construction, so this cannot shadow
+            // a plane close.
+            if open_component.take().is_some() {
+                continue;
+            }
             if let Some(_popped) = brace_stack.pop() {
                 current_plane = brace_stack.last().cloned().unwrap_or_default();
             } else {
@@ -376,6 +918,29 @@ fn parse_body(body: &str) -> GraphDoc {
             doc.theme = Some(strip_quotes(rest.trim()));
             continue;
         }
+        // %units: — used by the hardware kind's spec examples.
+        if let Some(rest) = line.strip_prefix("%units:") {
+            let u = strip_quotes(rest.trim()).to_lowercase();
+            if u != "mm" {
+                doc.warn(line_no, Severity::Info,
+                    format!("units '{u}' recorded, but hardware coordinates are interpreted as mm"),
+                    line);
+            }
+            doc.units = Some(u);
+            continue;
+        }
+        // Hardware kind: try the hardware grammar first. It only
+        // claims lines it recognises (component classes, pin,
+        // trace, via, zone, layer), so anything else — including
+        // plain graph nodes and edges — still falls through to the
+        // graph parser below and keeps working.
+        if doc.kind == Some(Kind::Hardware)
+            && parse_hardware_line(&mut doc, line, line_no,
+                                   &mut open_component, &mut current_layer)
+        {
+            continue;
+        }
+
         // Unknown %directive
         if line.starts_with('%') {
             // Skip the %layout sentinel — it's a section marker,
@@ -1266,5 +1831,127 @@ mod tests {
         let buf = "plane outer {\nplane inner {\nA\n";
         let scope = scope_at(buf, buf.len());
         assert_eq!(scope, Some("inner".to_string()));
+    }
+
+    // ---- hardware kind (v1) ------------------------------------
+
+    fn hw(src: &str) -> GraphDoc { parse(src) }
+
+    #[test]
+    fn hardware_parses_components_with_mm_positions() {
+        let d = hw("%kind: hardware\nchip MCU at (10, 20) rotated 90\u{b0}\nconnector USB at (5, 5)\n");
+        assert_eq!(d.hardware.components.len(), 2);
+        let mcu = d.hardware.component("MCU").unwrap();
+        assert_eq!(mcu.class, ComponentClass::Chip);
+        assert_eq!((mcu.x, mcu.y), (Some(10.0), Some(20.0)));
+        assert_eq!(mcu.rotation_deg, 90.0);
+        assert_eq!(d.hardware.component("USB").unwrap().class, ComponentClass::Connector);
+    }
+
+    #[test]
+    fn hardware_parses_value_not_position() {
+        let d = hw("%kind: hardware\nresistor R1 at (25, 30) (10k\u{3a9})\ncapacitor C1 at (30, 30) (100nF)\n");
+        assert_eq!(d.hardware.component("R1").unwrap().value.as_deref(), Some("10k\u{3a9}"));
+        assert_eq!(d.hardware.component("C1").unwrap().value.as_deref(), Some("100nF"));
+        // the coordinate parens must NOT be mistaken for a value
+        assert_eq!(d.hardware.component("R1").unwrap().x, Some(25.0));
+    }
+
+    #[test]
+    fn hardware_parses_pins_in_component_block() {
+        let d = hw("%kind: hardware\nchip MCU at (10, 20) {\npin VCC : top-right\npin SDA : right\npin SCL : right + 5mm\n}\nchip EEPROM at (60, 20)\n");
+        let mcu = d.hardware.component("MCU").unwrap();
+        assert_eq!(mcu.pins.len(), 3);
+        assert_eq!(mcu.pins[0].edge, PinEdge::TopRight);
+        assert_eq!(mcu.pins[2].name, "SCL");
+        assert_eq!(mcu.pins[2].offset_mm, 5.0);
+        // the block must close so EEPROM is a sibling, not a pin owner
+        assert!(d.hardware.component("EEPROM").unwrap().pins.is_empty());
+        assert_eq!(d.hardware.components.len(), 2);
+    }
+
+    #[test]
+    fn hardware_parses_traces_with_width_and_ground() {
+        let d = hw("%kind: hardware\nchip A at (0,0)\nchip B at (10,0)\ntrace A.SDA -> B.SDA\ntrace A.GND -> B.GND width 0.5mm ground\n");
+        assert_eq!(d.hardware.traces.len(), 2);
+        let g = &d.hardware.traces[1];
+        assert_eq!(g.width_mm, Some(0.5));
+        assert!(g.ground);
+        assert_eq!(g.from.pin.as_deref(), Some("GND"));
+        assert_eq!(g.from.component, "A");
+    }
+
+    #[test]
+    fn hardware_accepts_unicode_arrow_and_layer_suffix() {
+        let d = hw("%kind: hardware\nchip A at (0,0)\nchip B at (9,0)\ntrace A.GND \u{2192} B.GND on \"ground plane\"\n");
+        assert_eq!(d.hardware.traces.len(), 1);
+        assert_eq!(d.hardware.traces[0].layer.as_deref(), Some("ground plane"));
+    }
+
+    #[test]
+    fn hardware_projects_onto_graph_ast() {
+        // The whole point of the projection: a hardware diagram is
+        // renderable by the existing graph pipeline today.
+        let d = hw("%kind: hardware\nchip MCU at (10, 20)\nchip EEPROM at (60, 20)\ntrace MCU.SDA -> EEPROM.SDA\n");
+        assert_eq!(d.nodes.len(), 2, "components must become nodes");
+        assert_eq!(d.edges.len(), 1, "traces must become edges");
+        assert_eq!(d.edges[0].from, "MCU");
+        assert_eq!(d.edges[0].label.as_deref(), Some("SDA"));
+        let pins: Vec<_> = d.constraints.iter().filter_map(|c| match c {
+            Constraint::Pin { node, x, y } => Some((node.clone(), *x, *y)),
+            _ => None,
+        }).collect();
+        assert_eq!(pins.len(), 2, "mm positions must become pin constraints");
+        assert!(pins.iter().any(|(n, x, y)| n == "MCU" && *x == 100.0 && *y == 200.0));
+    }
+
+    #[test]
+    fn hardware_parses_vias_and_zones() {
+        let d = hw("%kind: hardware\nchip MCU at (10,20)\nvia \"GND_1\" at MCU.GND through \"top copper\" -> \"ground plane\"\nvia \"thermal_1\" at (15, 25) through all layers\nzone fill copper on \"ground plane\"\nzone \"keepout\" : rect (40, 10) to (50, 30) on \"top copper\"\n");
+        assert_eq!(d.hardware.vias.len(), 2);
+        assert_eq!(d.hardware.vias[0].layers, vec!["top copper", "ground plane"]);
+        assert!(d.hardware.vias[1].all_layers);
+        match d.hardware.vias[1].at {
+            ViaAt::Point { x, y } => assert_eq!((x, y), (15.0, 25.0)),
+            _ => panic!("expected a point via"),
+        }
+        assert_eq!(d.hardware.zones.len(), 2);
+        match &d.hardware.zones[1].kind {
+            ZoneKind::Rect { x1, y1, x2, y2 } => assert_eq!((*x1, *y1, *x2, *y2), (40.0, 10.0, 50.0, 30.0)),
+            _ => panic!("expected a rect zone"),
+        }
+        assert_eq!(d.hardware.zones[1].layer.as_deref(), Some("top copper"));
+    }
+
+    #[test]
+    fn hardware_records_layers() {
+        let d = hw("%kind: hardware\nlayer \"top copper\" {\nchip A at (1,1)\n}\nlayer \"ground plane\" {\n}\n");
+        assert_eq!(d.hardware.layers, vec!["top copper", "ground plane"]);
+        assert_eq!(d.hardware.component("A").unwrap().layer, "top copper");
+    }
+
+    #[test]
+    fn hardware_is_permissive_on_garbage() {
+        // Per the spec's design principle: unknown lines warn, the
+        // diagram still parses, nothing panics.
+        let d = hw("%kind: hardware\nchip A at (nonsense)\nchip\npin VCC : top\ntrace A ->\nzone wobble\n");
+        assert!(!d.warnings.is_empty(), "garbage must produce warnings");
+        assert!(d.hardware.component("A").is_some(), "valid parts still parse");
+        assert_eq!(d.hardware.component("A").unwrap().x, None);
+    }
+
+    #[test]
+    fn graph_kind_ignores_hardware_grammar() {
+        // A graph diagram that happens to use the word "chip" as a
+        // node id must not be reinterpreted as a component.
+        let d = hw("%kind: graph\nchip: \"a node called chip\"\n");
+        assert!(d.hardware.is_empty(), "graph kind must not populate hardware");
+    }
+
+    #[test]
+    fn units_directive_is_recognised() {
+        let d = hw("%kind: hardware\n%units: mm\nchip A at (1,2)\n");
+        assert_eq!(d.units.as_deref(), Some("mm"));
+        assert!(d.warnings.is_empty(), "spec's own example must parse clean: {:?}", d.warnings);
     }
 }

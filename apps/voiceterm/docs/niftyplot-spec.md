@@ -1,7 +1,29 @@
-# Niftyplot Format Specification (Draft)
+# Niftyplot Format Specification
 
-Status: **DRAFT**, pre-implementation. Subject to revision until
-the first kind is implemented (target: v0.1.344+).
+Status: **v1 for `graph` and `hardware`**; DRAFT for `gantt`,
+`sequence`, `state`.
+
+Implemented in `shared/nifty-core/src/niftyplot.rs`:
+
+| Kind | Status | Notes |
+|------|--------|-------|
+| `graph` | v1 | nodes, edges, planes, constraints |
+| `hardware` | **v1 (parser)** | components, pins, traces, vias, zones, layers, `%units:` |
+| `gantt` | draft | recognised as a kind; grammar not parsed |
+| `sequence` | draft | recognised as a kind; grammar not parsed |
+| `state` | draft | recognised as a kind; grammar not parsed |
+
+**Hardware rendering note.** The hardware parser is complete and
+tested, but there is no dedicated board renderer yet. Hardware
+documents are PROJECTED onto the graph AST — each component also
+becomes a node (shape derived from its class, label including any
+value), each trace becomes an edge (heavy style when `ground`),
+and each `at (x, y)` becomes a `Constraint::Pin` at 10 units per
+millimetre. The consequence is that a hardware diagram renders
+sensibly today through the existing graph pipeline, and the
+millimetre truth stays available in `doc.hardware` for a real
+renderer later. Authors do not need to change anything when that
+lands.
 
 Niftyplot is the plain-text diagram format used by web2qml. It
 lives in fenced code blocks marked `niftyplot` in markdown files,
