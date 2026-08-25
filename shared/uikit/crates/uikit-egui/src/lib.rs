@@ -64,6 +64,9 @@ pub mod pager;   // pages as data: hysteretic mobile/dashboard plan + the shared
 pub mod icons;   // glyphs that actually render, or an honest word (c11 tofu report)
 pub mod path_picker;
 pub mod segmented_tabs;
+/// Tabs vs. pages, decided from width, as data — not a per-app
+/// `if adaptive.is_compact()` guess. See its own module docs.
+pub mod responsive_nav;
 pub mod scroll;
 pub mod fuzzy;
 pub mod fmt;

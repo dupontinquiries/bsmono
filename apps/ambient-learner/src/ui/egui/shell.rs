@@ -68,8 +68,38 @@ impl Shell {
         let glyphs_only = adaptive.class.is_compact();
 
         chrome::section_header(ui, self.router.current(), colors.accent);
-        if let Some(s) = router::tab_bar_ui(ui, self.router.current(), glyphs_only) {
-            self.router.go(s);
+        // `tab_bar_ui`'s own comment used to accept "wraps to two rows on a
+        // phone" as the tradeoff for showing all seven sections at once —
+        // exactly the cost `uikit_egui::responsive_nav` exists to avoid.
+        // Glyph-only labels are narrower than full-text ones, so the fit
+        // check uses a smaller minimum width in that mode; either way this
+        // is a real fit computation against `Section::ALL`'s actual count,
+        // not another device-class guess layered on top of the one that
+        // already picks `glyphs_only`.
+        let min_tab_width = if glyphs_only { 40.0 } else { 96.0 };
+        let layout = uikit_egui::responsive_nav::choose(
+            ui.available_width(), chrome::Section::ALL.len(), min_tab_width);
+        match layout {
+            uikit_egui::responsive_nav::NavLayout::Tabs => {
+                if let Some(s) = router::tab_bar_ui(ui, self.router.current(), glyphs_only) {
+                    self.router.go(s);
+                }
+            }
+            uikit_egui::responsive_nav::NavLayout::Pages => {
+                // One section at a time via a picker rather than a second
+                // row of icons — the vertical space the wrapped bar used
+                // to spend on row two goes back to the page underneath it.
+                let current = self.router.current();
+                egui::ComboBox::from_id_salt("section_picker")
+                    .selected_text(current.tab_label(false))
+                    .show_ui(ui, |ui| {
+                        for s in chrome::Section::ALL {
+                            if ui.selectable_label(s == current, s.tab_label(false)).clicked() {
+                                self.router.go(s);
+                            }
+                        }
+                    });
+            }
         }
         ui.separator();
 
