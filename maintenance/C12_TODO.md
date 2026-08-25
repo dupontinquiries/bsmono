@@ -417,3 +417,52 @@ video path, not a new screen), and native av1/fao-codec decode wiring
 with proxy pushback for other formats (the biggest of the four, spans
 `studio-video`, `apps/fao-codec`, `apps/av1tuner`, not started).
 
+## 14. studio: multiple songs (an album + its music videos) in one project
+
+`39c23c40` did the first slice — the timeline's zoom/scroll is per-song now
+(`Studio::song_views: BTreeMap<GroupId, View>` keyed by `active_song`), so
+that half of "the project scale has to become per-group aware" is real and
+tested. `GroupId`/`Group` (studio-core) already exist as "a named set of
+clips the timeline folds to one block" — the right existing primitive to
+build a song on, not a new concept.
+
+What's still needed, roughly in dependency order:
+
+- **C12-14a — per-song key.** `Project.key: Option<Key>` is project-wide
+  today; an album needs each song able to disagree. NOT a bare field on
+  `Group` — checked `Op::SetGroup`'s apply/invert (studio-core/src/lib.rs
+  ~745-755): undo reconstructs a full `Group` from `old.name`/
+  `old.clips`, so a third field would be silently NULLED by any undo of
+  an unrelated rename unless that reconstruction line is also updated.
+  The safe shape mirrors the existing project-wide `Op::SetKey`: a new
+  `Op::SetGroupKey { id: GroupId, key: Option<Key> }`, separate from
+  `SetGroup`, so existing serialized ops/patches and every existing
+  `SetGroup` call site stay exactly as they are.
+- **C12-14b — per-song markers, maybe per-song tempo.** `Project.markers`
+  is one flat `Vec<Marker>` today; whether an album wants markers scoped
+  per-song or shared across the whole project (a "verse" marker meaning
+  the same thing in every song) is a real design question, not
+  self-evident — needs a decision before touching the data model, since
+  it's the same undo-correctness shape as 14a either way.
+  `Ticks`/tempo — not checked yet whether tempo is per-project or
+  per-track/clip already; if project-wide, same problem as key.
+- **C12-14c — the music-video link.** No existing field anywhere
+  associates a `Group`/song with a video clip or a `studio-video` asset.
+  Needs the video pipeline this session already tracked as unstarted
+  (§13, av1/fao-codec wiring) to exist in some form first, or at minimum
+  a placeholder association (a `GroupId` -> `ClipId` map for "this
+  song's video") that doesn't depend on decode actually working yet.
+- **C12-14d — UI: switching the active song.** `Studio::switch_song()`
+  exists and is tested at the model layer; nothing calls it from the UI.
+  Needs a song-switcher affordance (tabs? a list in the sidebar?) in
+  `studio-app`'s timeline chrome, and probably belongs in the same
+  hamburger-menu unification already tracked in §13 rather than as a
+  fifth separate top-bar control.
+- **C12-14e — what "the whole project" means once songs exist.** Export
+  (`bounce`), the mixer, and anything that currently assumes one
+  timeline for the whole project need a decision: does exporting "the
+  album" concatenate every song's timeline, or is each song exported
+  independently and the album is an organizational container only?
+  Affects `studio-app`'s export flow, not yet looked at.
+
+
