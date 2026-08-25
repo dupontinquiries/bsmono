@@ -476,9 +476,33 @@ is built and adopted in `ambient-learner-egui` (tab bar -> compact picker)
 and `bot-arena` (the hand-rolled `is_compact()` check it was written to
 replace). Both tested, both green.
 
-- **C12-15a** — not yet applied to any other app. `segmented_tabs`' own
-  module doc names snapclone and bo-suite as the other two hand-rollers
-  it was hoisted from; neither has been switched to `responsive_nav` yet.
+- **C12-15a — checked, and neither is actually a fit.** `segmented_tabs`'
+  own module doc names snapclone and bo-suite as the other two hand-
+  rollers it was hoisted from, which read as "apply responsive_nav
+  there next." Read both before doing that, and neither has the problem
+  `responsive_nav` solves:
+  - **snapclone** shows a bottom `tab_bar` on compact and the top
+    `strip` on desktop — BOTH always show every page; the choice is
+    ergonomic placement (thumb reach vs. pointer reach), not a fit
+    collapse. Forcing `responsive_nav`'s Tabs/Pages binary on top of
+    this would remove a page from view on the "Pages" side for no
+    reason, since there was never a fit problem to solve.
+  - **bo-suite**'s `PageBar`/`page_bar_ui` already has its own answer
+    to "too many tabs to fit": `scrolls()` detects overflow and
+    `scroll_to_active()` keeps the current tab visible in a
+    horizontally-scrolling bar, rather than collapsing to one page at a
+    time. A working, different, equally legitimate strategy — not a gap.
+  - Also found along the way: snapclone's `nav_chrome::TabStrip` is a
+    SEPARATE copy of `uikit_egui::segmented_tabs::TabStrip`, not a user
+    of it — `segmented_tabs`' own doc says it was "hoisted FROM
+    snapclone's nav_chrome," and nothing ever switched snapclone over
+    to the hoisted version afterward. Same duplicated-kit shape as
+    voiceprint-kit/voiceterm and glove/a11y earlier this session. Worth
+    a dedup pass on its own, unrelated to responsive_nav.
+  `responsive_nav` stays a good fit for an app with NO existing overflow
+  strategy — which is what ambient-learner and bot-arena both were
+  before this session's changes — not a blanket replacement for every
+  app's tab row.
 - **C12-15b — closed (`b507439b`).** Not a stale example after all: the
   method is real. The doc comment quoted the compiler error `LiveState::
   ui`'s past absence used to produce, as a bare 4-space-indented block —
