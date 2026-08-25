@@ -6,6 +6,11 @@
 //! v4l2loopback. This crate is that, version-agnostic and testable; the actual PipeWire/v4l2
 //! capture is on-device behind a feature. Reference: snapclone's setup_v4l2loopback.sh.
 
+/// Ordered gstreamer-pipeline candidates for a camera, desktop (v4l2) and
+/// phone (pipewire/libcamera) alike. See the module docs for why this lives
+/// here rather than duplicated per consumer.
+pub mod source_plan;
+
 /// What a device is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
