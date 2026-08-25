@@ -23,6 +23,9 @@ use std::sync::OnceLock;
 
 mod qml_gen;
 mod qml_locate;
+// v-next: ```term fence rendering (command/output demo blocks) for
+// manpages + on-disk markdown. Pure; see src/term_scene.rs.
+mod term_scene;
 use qml_gen::{generate_safe_qml, RenderStyle, select_body, esc, resolve_url};
 
 mod ad_filter;

@@ -553,6 +553,10 @@ pub fn to_qml_with_source(
                 .next()
                 .unwrap_or("")
                 .to_lowercase();
+            // v-next: keep the FULL info string too — ```term fences
+            // carry key=value metadata (t=, title=) that the
+            // term_scene parser consumes.
+            let fence_info = trimmed.trim_start_matches('`').trim().to_string();
             i += 1;
             let mut code = String::new();
             while i < lines.len() && !lines[i].trim_start().starts_with("```") {
@@ -562,7 +566,16 @@ pub fn to_qml_with_source(
             }
             if i < lines.len() { i += 1; }
             let mut block_qml = String::with_capacity(code.len() + 128);
-            emit_code_block_qml(&code, sty, &mut block_qml);
+            if fence_lang == "term" {
+                // v-next: terminal-scene demo block (command/output
+                // structure, OCR-recovered sessions). Plain-code
+                // fallback everywhere else keeps the base readable;
+                // see src/term_scene.rs for the format.
+                let scene = crate::term_scene::parse(&fence_info, &code);
+                crate::term_scene::emit_qml(&scene, sty, &mut block_qml);
+            } else {
+                emit_code_block_qml(&code, sty, &mut block_qml);
+            }
             let plain_text = code.trim_end_matches('\n').to_string();
             out.push_str(&crate::qml_gen::maybe_wrap_extended(
                 block_qml,
