@@ -85,6 +85,12 @@ impl VoiceSession {
     /// this is whichever produced the most recent partial — good enough for one-speaker-at-a-time turns.
     pub fn partial(&self) -> &str { &self.partial }
 
+    /// Loudest current input level across every open capture (0..~unbounded), for driving physical
+    /// mic-indicator motion (`micresponse`) rather than a fixed animation. Max, not sum/average: with
+    /// LOGSCOPE_SPEAKERS running several mics, the indicator should react to whoever is actually
+    /// talking, not be diluted by everyone else's silence.
+    pub fn level(&self) -> f32 { self.captures.iter().map(|c| c.level()).fold(0.0, f32::max) }
+
     /// How many mics are currently active (1 in the common case; >1 under LOGSCOPE_SPEAKERS).
     pub fn speaker_count(&self) -> usize { self.captures.len() }
 

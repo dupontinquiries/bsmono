@@ -599,6 +599,15 @@ void main() {
     }
     col += v_color.rgb * emis * 2.5;               // self-illumination → blooms (runes, crystal, lit text)
 
+    // TOUCH GLOW — the physical-UI premise is that a surface answers a touch; `touch_response()` was
+    // computed and NEVER SAMPLED (physical-ui-findings.md's second finding: the uniform got wired up
+    // but nothing read the function back). One call, added here rather than a new pass: any surface
+    // near the last touch point brightens and settles over ~1.5s. Radius tuned to a plaque/pearl's
+    // scale (a touch should light the slab it landed on, not the whole room) and using v_color so a
+    // themed pearl glows its own hue instead of a flat white flash.
+    float tglow = touch_response(v_world, 1.1);
+    col += v_color.rgb * tglow * 1.8;
+
     float d = length(u_eye - v_world);
     float f = clamp(1.0 - exp(-u_fog * d), 0.0, 1.0);
     col = mix(col, u_fog_col, f);

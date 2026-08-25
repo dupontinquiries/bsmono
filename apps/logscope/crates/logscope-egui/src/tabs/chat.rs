@@ -249,6 +249,26 @@ fn screen_to_world(cam: &crate::spatial::OrbitCam, cen: crate::spatial::Vec3, ri
     crate::spatial::Vec3::new(cen.x + right.x * wr + up.x * wu, cen.y + right.y * wr + up.y * wu, cen.z + right.z * wr + up.z * wu)
 }
 
+/// Register a billboarded HUD panel with `hud_pack` and return its (possibly nudged) world centre.
+/// `world_c`/`world_w`/`world_h` are the panel's UNRESOLVED position and size, exactly as it would
+/// have rendered before this existed; this projects that footprint to screen pixels, lets `hud_pack`
+/// resolve it against everything already placed this frame, then un-projects the result back onto
+/// the same `right`/`up` plane the panel already lives on. Falls back to `world_c` unprojected/off-
+/// screen (same failure mode `screen_to_world` already has) rather than panicking.
+#[allow(clippy::too_many_arguments)]
+fn hud_place(
+    placed: &mut Vec<crate::hud_pack::Placed>, avail: egui::Rect,
+    cam: &crate::spatial::OrbitCam, right: crate::spatial::Vec3, up: crate::spatial::Vec3,
+    cx: f32, cy: f32, scale: f32,
+    world_c: crate::spatial::Vec3, world_w: f32, world_h: f32, pad: f32,
+) -> crate::spatial::Vec3 {
+    let Some((sx, sy, _)) = cam.project(world_c, cx, cy, scale) else { return world_c };
+    let (ppw_x, ppw_y) = px_per_world(cam, world_c, right, up, cx, cy, scale);
+    let desired = egui::Rect::from_center_size(egui::pos2(sx, sy), egui::vec2(world_w * ppw_x, world_h * ppw_y));
+    let resolved = crate::hud_pack::place(placed, avail, desired, pad);
+    screen_to_world(cam, world_c, right, up, cx, cy, scale, resolved.center().x, resolved.center().y)
+}
+
 /// Map a scene/theme name to its text-animation idiom, so each scene animates its UI text in character.
 fn text_anim_for(name: &str) -> crate::mesh3d::TextAnim {
     use crate::mesh3d::TextAnim::*;
@@ -1152,6 +1172,33 @@ pub struct Chat {
     /// the shader's u_touch (world xyz + age), which existed and was DEAD — nothing ever set it
     /// (physical-ui-findings.md). None once the response has faded.
     scene_touch: Option<([f32; 3], f32)>,
+    /// Node under the pointer in the 3D scene, from `scenepick` — drives the hover lift/glow (a node
+    /// now visibly answers before it's clicked, not just after; see the click-site comment for why
+    /// the pick itself moved to `scenepick` too).
+    scene_hover: Option<usize>,
+    /// Node currently PRESSED (pointer down + over it), for `scenepick::State::Pressed`'s sink+dim —
+    /// the click's camera-glide only starts on release, so without this a press had zero feedback
+    /// until the finger/button lifted. Same accessibility point `scenepick`'s own header makes about
+    /// hover: an object should answer attention, and a press is the most immediate attention there is.
+    scene_pressed: Option<usize>,
+    /// PEARL PULL — the focused-turn pearl's animated "pulled toward camera" amount, 0 (resting on
+    /// its strand) .. 1 (fully pulled, reading distance). Eased toward the target each frame rather
+    /// than snapped, so focusing a node reads as a physical pull-and-zoom (TODO.md "PHYSICAL UI —
+    /// pearl-as-message-box") rather than a teleport. Drives both the node's camera-ward offset and
+    /// the scene's depth-of-field (background defocuses as the pearl comes to hand).
+    focus_pull: f32,
+    /// Live multi-touch points (from raw egui Touch events), keyed by touch id — feeds `touch_nav`
+    /// for PINCH-ZOOM on touchscreens. Single-finger drag-orbit already works today because egui folds
+    /// one touch into its ordinary pointer/`Response::dragged()` path; a pinch does not fit that model
+    /// (it's two contacts, not one), which is the actual gap `touch_nav.rs`/`touchkit` exist to close —
+    /// built, tested (touchkit has its own suite), and never wired to a live touch feed in this crate.
+    touch_active: std::collections::HashMap<u64, egui::Pos2>,
+    touch_rec: touchkit::GestureRecognizer,
+    /// Mic pearl's PHYSICAL motion, driven by the real input level via `micresponse` rather than a
+    /// canned sine — the leaf inertia / rune onset / bead flux distinction actually means something
+    /// once the driver is real audio energy instead of a boolean "is speech happening".
+    mic_motion: crate::micresponse::Motion,
+    mic_prev_level: f32,
     pearl_variant: u8,     // pearl optical style: 0 balanced · 1 fine-crackle · 2 milky · 3 clear-glass
     backdrop: bool,        // render-as-full-window-backdrop: suppress spatial chrome, fill the whole rect
     glass_host: bool,      // app is in glass mode: the central canvas stays transparent (the backdrop draws the scene)
@@ -1345,6 +1392,13 @@ impl Default for Chat {
             pearl_input: Default::default(),
             pearl_on: false,
             scene_touch: None,
+            scene_hover: None,
+            scene_pressed: None,
+            focus_pull: 0.0,
+            touch_active: std::collections::HashMap::new(),
+            touch_rec: touchkit::GestureRecognizer::default(),
+            mic_motion: crate::micresponse::Motion::default(),
+            mic_prev_level: 0.0,
             pearl_variant: 0,
             backdrop: false,
             glass_host: false,
@@ -2063,6 +2117,33 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// App tells the chat whether it's hosted in glass mode (so the central canvas stays transparent and the
     /// full-window backdrop draws the scene instead — avoids a double scene render).
     pub fn set_glass(&mut self, g: bool) { self.glass_host = g; }
+
+    /// Test/verification hook: force the full-screen-spatial layout (composer + action row rendered as
+    /// in-scene physical slabs instead of the 2D bottom bar) without needing to click the toggle. Used by
+    /// `scene_preview`/`scene-view` so headless screenshot verification can reach those panels at all.
+    pub fn set_hide_bottom_bar(&mut self, v: bool) { self.hide_bottom_bar = v; }
+
+    /// Test/verification hook: populate the PLAN/WORKSPACE/candidates physical panels with sample data
+    /// so a headless screenshot can actually reach them — none of the three has any other way to appear
+    /// in `scene-view` (they're only ever filled by a live agent run), which meant they'd never been
+    /// visually verified at all, unlike the dock/PARAMS panels this session already found real off-
+    /// screen bugs in.
+    pub fn debug_fill_agent_panels(&mut self) {
+        self.agent_plan = vec![
+            ("scan the workspace for entry points".to_string(), true),
+            ("draft the fix in a scratch branch".to_string(), true),
+            ("run the test suite against it".to_string(), false),
+            ("write up findings".to_string(), false),
+        ];
+        self.agent_files = vec![
+            crate::workspace_exec::FileEvent { path: "src/lib.rs".into(), change: crate::workspace_exec::FileChange::Modified, bytes: 1024 },
+            crate::workspace_exec::FileEvent { path: "src/fix_patch.rs".into(), change: crate::workspace_exec::FileChange::Created, bytes: 512 },
+        ];
+        self.agent_candidates = vec![
+            crate::workspace_exec::BranchSummary { index: 0, label: "conservative patch".into(), files: 2, verified: true, finished: true, approved: Some(true), review_notes: "clean, minimal diff".into(), root: std::path::PathBuf::new() },
+            crate::workspace_exec::BranchSummary { index: 1, label: "broader refactor".into(), files: 5, verified: false, finished: true, approved: None, review_notes: "touches more than asked".into(), root: std::path::PathBuf::new() },
+        ];
+    }
 
     pub fn scene_backdrop(&mut self, ui: &mut egui::Ui, frost_a: f32, frost_b: f32) {
         let prev = self.spatial_view;
@@ -3846,6 +3927,45 @@ which file you read.\n\n",
             if sy.abs() > 0.0 { self.orbit.zoom(1.0 - sy * 0.0015); self.spatial_zoomed = true; ui.ctx().request_repaint(); }
         }
 
+        // PINCH-ZOOM — real multi-touch, which egui's ordinary Response drag/scroll path does not
+        // model (that path only ever sees "the pointer", i.e. one contact). Gated the same as the
+        // mouse controls above (hovered/dragged over the canvas) so a pinch starting on the composer
+        // or a dock button doesn't also spin the camera. Only Pinch is applied here — a one-finger
+        // Pan gesture is deliberately left alone since resp.dragged() already orbits from that same
+        // touch, and running both would double the motion.
+        if resp.hovered() || resp.dragged() {
+            let now_ms = ui.input(|i| i.time) * 1000.0;
+            ui.input(|i| {
+                for ev in &i.events {
+                    if let egui::Event::Touch { id, phase, pos, .. } = ev {
+                        match phase {
+                            egui::TouchPhase::Start | egui::TouchPhase::Move => { self.touch_active.insert(id.0, *pos); }
+                            egui::TouchPhase::End | egui::TouchPhase::Cancel => { self.touch_active.remove(&id.0); }
+                        }
+                    }
+                }
+            });
+            if self.touch_active.len() >= 2 {
+                let touches: Vec<touchkit::Touch> = self.touch_active.iter()
+                    .map(|(&id, p)| touchkit::Touch::new(id, touchkit::Vec2::new(p.x, p.y)))
+                    .collect();
+                for g in self.touch_rec.update(&touches, now_ms) {
+                    if matches!(g, touchkit::Gesture::Pinch { .. }) {
+                        crate::touch_nav::apply_gesture(&mut self.orbit, &g);
+                        self.spatial_zoomed = true;
+                        ui.ctx().request_repaint();
+                    }
+                }
+            } else if !self.touch_active.is_empty() {
+                // fewer than 2 contacts: nothing to pinch, but still feed the recognizer so it doesn't
+                // see a phantom multi-touch gesture spanning a lift-off it never observed.
+                let touches: Vec<touchkit::Touch> = self.touch_active.iter()
+                    .map(|(&id, p)| touchkit::Touch::new(id, touchkit::Vec2::new(p.x, p.y)))
+                    .collect();
+                self.touch_rec.update(&touches, now_ms);
+            }
+        }
+
         // FREECAM: free-flight through the scene. WASD move along the look basis, Q/E down/up, drag looks (above),
         // Shift boosts. Moving the target translates the eye with it (dist held), so you fly wherever you look.
         // Gated on hovering the canvas so WASD never leaks into the composer; repaints continuously to poll keys.
@@ -4257,6 +4377,33 @@ which file you read.\n\n",
             let tanim = text_anim_for(name); // per-scene text-animation idiom for all scene/UI labels
             let sheen = slab_sheen(tanim, t); // per-scene light-play multiplier for physical UI slabs
             let sun = m3::sun_dir_3d(); // world sun direction, for specular glints on physical slabs
+            // PEARL PULL — ease focus_pull toward 1 while a turn is focused, toward 0 otherwise. An
+            // exponential approach (not a linear lerp) so the pull decelerates into the reading pose
+            // instead of arriving at a constant speed — same shape as the plaque's scroll glide.
+            let focused_id = std::env::var("LOGSCOPE_FOCUS").ok().and_then(|s| s.trim().parse::<usize>().ok()).or(self.walk_focus).filter(|i| *i < n);
+            // PLAQUE TOUCH OVERRIDE — physical-ui-findings.md's open item: a click ON the reading
+            // plaque should light up the plaque (a real object at its own OVERLAY-biased world
+            // position), not whatever the floor/graph raycast happens to hit at that screen pixel
+            // behind it. Set below (inside the plaque's own hit-test, which knows `rc`) and consumed
+            // by the generic scene-touch handler further down, which otherwise always wins on a raw
+            // press. `None` means "no plaque claimed this press" → fall through to the raycast as before.
+            let mut touch_override: Option<[f32; 3]> = None;
+            // HUD PACKING — `hud_pack` (screen-space overlap resolution, its own 8 tests including the
+            // exact "bottom trio" collision below) existed fully built and was never called anywhere in
+            // the crate; the physical dock/composer/action-row conflict its header describes as already
+            // reported was still live. One shared list, filled in the SAME order these panels already
+            // render in (call order = priority, per hud_pack's own contract) — dock first, so a full
+            // window keeps the dock where it's always been, and the composer/action row slide out of its
+            // way on short windows instead of overlapping it.
+            let mut hud_placed: Vec<crate::hud_pack::Placed> = Vec::new();
+            {
+                let dt = ui.input(|i| i.stable_dt).min(0.1);
+                let target = if focused_id.is_some() { 1.0 } else { 0.0 };
+                let rate = 8.0; // higher = snappier settle; matches the walk-camera's damping feel
+                self.focus_pull += (target - self.focus_pull) * (1.0 - (-rate * dt).exp());
+                if (self.focus_pull - target).abs() > 0.002 { ui.ctx().request_repaint(); }
+            }
+            let eye_now = view_cam.eye_world();
             // VOICE LIVE-INTENT HIGHLIGHT: while an utterance is being heard, parse the running PARTIAL — if it
             // already resolves to an ACTIONABLE command (not plain dictation) we light up the mic (below), and
             // for "go to N" we glow the target node, so the user sees what will happen before whisper finalizes.
@@ -4313,12 +4460,54 @@ which file you read.\n\n",
                     let ph = nd.id as f32 * 1.7;
                     nm.offset = crate::spatial::Vec3::new(0.04 * (t * 0.30 + ph).sin(), 0.09 * (t * 0.24 + ph * 1.3).sin(), 0.04 * (t * 0.28 + ph * 0.7).cos());
                 }
+                // PEARL PULL: the focused turn's pearl leaves its strand and drifts toward the camera,
+                // eased in step with `focus_pull`. Reuses the same per-frame `offset` mechanism as the
+                // Atlantis drift above (additive, so the two combine rather than fight), just along the
+                // node→eye vector instead of a current. Distance is capped well short of the near plane
+                // so the pearl never clips into the lens even at max pull.
+                if focused_id == Some(nd.id) && self.focus_pull > 0.001 {
+                    let p = pos[nd.id];
+                    let to_eye = crate::spatial::Vec3::new(eye_now.x - p.x, eye_now.y - p.y, eye_now.z - p.z);
+                    let len = (to_eye.x * to_eye.x + to_eye.y * to_eye.y + to_eye.z * to_eye.z).sqrt().max(1e-4);
+                    let pull_dist = (view_cam.dist * 0.35).min(2.6) * self.focus_pull;
+                    let (dx, dy, dz) = (to_eye.x / len * pull_dist, to_eye.y / len * pull_dist, to_eye.z / len * pull_dist);
+                    nm.offset = crate::spatial::Vec3::new(nm.offset.x + dx, nm.offset.y + dy, nm.offset.z + dz);
+                    // NOTE: the glow rise used to be set HERE via nm.emissive.max(...), but the very next
+                    // statement below unconditionally overwrites nm.emissive (rune/star/base glow), so it
+                    // was clobbered every frame and never actually rendered. Moved past that cascade —
+                    // see the `.max()` call after the vhi pulse below.
+                }
+                // HOVER / PRESSED — a node the pointer is over lifts/brightens (Hover), and one actually
+                // being held down sinks/dims instead (Pressed) — the two `scenepick::State`s this scene
+                // renders, chosen so a press reads as "pushed in" rather than just "still hovered".
+                // Skipped on the focused/pulled node so the effects don't fight over the same offset.
+                if focused_id != Some(nd.id) {
+                    if self.scene_pressed == Some(nd.id) {
+                        let st = crate::scenepick::State::Pressed;
+                        nm.offset = crate::spatial::Vec3::new(nm.offset.x, nm.offset.y + st.lift(), nm.offset.z);
+                    } else if self.scene_hover == Some(nd.id) {
+                        let st = crate::scenepick::State::Hover;
+                        nm.offset = crate::spatial::Vec3::new(nm.offset.x, nm.offset.y + st.lift(), nm.offset.z);
+                    }
+                }
                 nm.emissive = if rune { 0.40 + 0.10 * (t * 1.3 + nd.id as f32 * 0.5).sin() }
                     else if name == "Frozen Bifrost" { 2.2 + 0.9 * (t * 2.0 + nd.id as f32 * 1.3).sin() } // stars twinkle
                     else { pearl_glow };
                 if active { nm.emissive = 0.9 + 0.35 * (t * 1.6).sin(); }
                 let vhi = voice_target == Some(nd.id);
                 if vhi { nm.emissive = 1.0 + 0.5 * (t * 6.0).sin(); } // the node the user is asking for — pulse hot
+                // pull glow + hover brightening, applied LAST so they ride on top of whatever the base/
+                // active/vhi cascade above landed on, instead of being computed then immediately lost.
+                if focused_id == Some(nd.id) { nm.emissive = nm.emissive.max(0.35 * self.focus_pull); }
+                if focused_id != Some(nd.id) {
+                    if self.scene_pressed == Some(nd.id) {
+                        let (bright, _sat) = crate::scenepick::State::Pressed.tint();
+                        nm.emissive *= bright; // dims — "pushed in", not lit up
+                    } else if self.scene_hover == Some(nd.id) {
+                        let (bright, _sat) = crate::scenepick::State::Hover.tint();
+                        nm.emissive = (nm.emissive + 0.12) * bright;
+                    }
+                }
                 graph.push(nm);
                 if vhi {
                     // a bright accent RING around the spoken-of node, so "go to twelve" visibly marks node 12 live
@@ -4625,7 +4814,30 @@ which file you read.\n\n",
                 let armed = self.voice.is_some() || matches!(debug.as_deref(), Some("armed") | Some("active"));
                 let active = self.voice.as_ref().map(|v| !v.partial().is_empty()).unwrap_or(false) || debug.as_deref() == Some("active");
                 let mcen = V3::new(cen.x + right.x * 2.22 + fwd.x * 0.06, cen.y + up.y * 0.02 + fwd.y * 0.06, cen.z + right.z * 2.22 + fwd.z * 0.06);
-                let breathe = if active { (t * 3.4).sin() * 0.5 + 0.5 } else { (t * 1.1).sin() * 0.5 + 0.5 };
+                let mshape = mic_shape(name, theme::active().material);
+                // PHYSICAL MIC RESPONSE — replaces a fixed-rate sine (identical whether the room is
+                // silent or someone is shouting) with `micresponse`, driven by the capture's real
+                // rolling RMS. The RESPONDER follows the shape's own substance: a leaf has mass and
+                // keeps moving after a word ends, a gem/stone/rune-adjacent body flashes on the onset,
+                // a bead ripples with the rate of change, and the plain pearl reads as a level meter.
+                let mic_level = self.voice.as_ref().map(|v| v.level()).unwrap_or(0.0);
+                let dt = ui.input(|i| i.stable_dt).min(0.1);
+                let mic_drivers = crate::micresponse::drivers((mic_level * 12.0).min(1.0), self.mic_prev_level, dt);
+                self.mic_prev_level = mic_drivers.level;
+                let mic_responder = match mshape {
+                    MicShape::Leaf => crate::micresponse::Responder::Leaf,
+                    MicShape::Gem | MicShape::Stone => crate::micresponse::Responder::Rune,
+                    MicShape::Bead => crate::micresponse::Responder::Bead,
+                    MicShape::Pearl => crate::micresponse::Responder::Pearl,
+                };
+                self.mic_motion.step(mic_responder, &mic_drivers, dt);
+                if self.mic_motion.value > crate::micresponse::REST_EPS { ui.ctx().request_repaint(); }
+                // debug/back-compat: LOGSCOPE_MIC_PEARL_DEBUG or no live capture (voice feature off,
+                // mic asleep) falls back to the old canned breathing so the shape stays visibly alive
+                // in headless/verification renders that have no real audio source.
+                let has_signal = self.voice.is_some() && std::env::var("LOGSCOPE_MIC_PEARL_DEBUG").is_err();
+                let breathe = if has_signal { self.mic_motion.value.clamp(0.0, 1.0) }
+                    else if active { (t * 3.4).sin() * 0.5 + 0.5 } else { (t * 1.1).sin() * 0.5 + 0.5 };
                 // LOGSCOPE_MIC_PEARL_SCALE (default 1.0) enlarges the pearl for per-scene SHAPE verification —
                 // the ship bead is small (its shape reads as a silhouette/material cue), so this debug hook
                 // (paired with LOGSCOPE_MIC_PEARL_DEBUG) lets the headless harness show the gem/pearl/stone/bead
@@ -4640,7 +4852,6 @@ which file you read.\n\n",
                 // SHAPE is the scene's physical substance (a second derivative beyond colour) — it holds
                 // across all states, so an asleep gem still reads as a gem. A stable per-scene seed varies the
                 // gem facets / stone lumps between worlds. Colour/material/emissive still track the mic state.
-                let mshape = mic_shape(name, theme::active().material);
                 let mseed = name.bytes().fold(0x811C_9DC5u32, |a, b| (a ^ b as u32).wrapping_mul(0x0100_0193));
                 let mut orb = match mshape {
                     MicShape::Gem   => m3::cracked_pearl(mcen, r, mseed, shell), // faceted iridescent crystal
@@ -4662,12 +4873,25 @@ which file you read.\n\n",
                     graph.push(m);
                 }
                 // ACCESSIBILITY OVERLAY on the mic object — the second in-scene UI control exposed to pointer +
-                // screen-reader, labelled by voice state. Sense::hover so it never steals scene clicks; a click
-                // handler will toggle voice once that backend is wired.
+                // screen-reader, labelled by voice state. Now CLICKABLE: pressing the physical pearl arms/
+                // disarms the mic, the same action as the 2D "🎙 Mic" toolbar button (same VoiceSession::start
+                // / drop-to-stop), so the object is a real control rather than a lit indicator you can only
+                // look at. Errors surface the same way the toolbar button does (self.voice_err).
                 if let Some(mrect) = project_slab_rect(&view_cam, mcen, right, up, r * 2.4, r * 2.4, cx, cy, scale) {
-                    let label = if active { "Voice mic — listening" } else if armed { "Voice mic — armed" } else { "Voice mic — off" };
-                    let mo = ui.interact(mrect, egui::Id::new("scene_mic_object"), egui::Sense::hover()).on_hover_text(label);
+                    let label = if active { "Voice mic — listening (click to stop)" }
+                        else if armed { "Voice mic — armed (click to stop)" }
+                        else { "Voice mic — off (click to start)" };
+                    let mo = ui.interact(mrect, egui::Id::new("scene_mic_object"), egui::Sense::click()).on_hover_text(label);
                     if mo.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                    if mo.clicked() {
+                        if self.voice.is_some() { self.voice = None; }
+                        else {
+                            match crate::voice_session::VoiceSession::start() {
+                                Ok(s) => { self.voice = Some(s); self.voice_err = None; ui.ctx().request_repaint(); }
+                                Err(e) => { self.voice_err = Some(format!("voice: {e}")); }
+                            }
+                        }
+                    }
                 }
                 if active {
                     // two tiny orbiting sparkle motes in the scene's accent colour — the pearl actively
@@ -4720,7 +4944,17 @@ which file you read.\n\n",
                     let vspan = { let (t, b) = (anchor(0.5, 0.0), anchor(0.5, 1.0));
                         ((t.x - b.x).powi(2) + (t.y - b.y).powi(2) + (t.z - b.z).powi(2)).sqrt() };
                     let dock_v = crate::physui::dock_center_v(0.26_f32 * ds, vspan, 0.045);
-                    let dock_c = anchor(0.5, dock_v);
+                    // Adjacent buttons' slabs were touching/fusing (screenshot comparison after the off-
+                    // screen fix above): at spread=1.5 rad over 5 buttons, the arc's chord spacing between
+                    // centres works out to ~0.373·radius while bw was ~0.305·radius — only an 18% gap,
+                    // which read as fused given the slabs' own drop-shadow/glint bleed. Narrowed the slabs
+                    // rather than widening the arc's spread, since widening also grows the arc's total
+                    // horizontal footprint and risks the same off-screen-edge failure just fixed above.
+                    let (bw, bh) = (0.29_f32 * ds * 0.76, 0.26_f32 * ds); // button slab size (world units)
+                    // HUD PACKING: register the dock's footprint FIRST (it renders first, so it wins any
+                    // conflict) — see the `hud_placed` declaration above for why this exists at all.
+                    let dock_c = hud_place(&mut hud_placed, rect, &view_cam, right, up, cx, cy, scale,
+                        anchor(0.5, dock_v), dock_radius * 1.9 + bw, bh * 1.4 + dock_radius * 2.2, 6.0);
                     let pos = crate::physui::dock_arc(
                         DOCK_IDS.len(),
                         [dock_c.x, dock_c.y, dock_c.z],
@@ -4728,7 +4962,6 @@ which file you read.\n\n",
                         [toward.x, toward.y, toward.z], // arc bulges toward the user
                         dock_radius, 1.5,
                     );
-                    let (bw, bh) = (0.29_f32 * ds, 0.26_f32 * ds); // button slab size (world units)
                     // Prunable churn (matches the 2D "Prune churn (N)" button): superseded turns not yet pruned.
                     let sup = g.superseded();
                     let prunable = sup.iter().filter(|id| !self.pruned.contains(id)).count();
@@ -4798,6 +5031,10 @@ which file you read.\n\n",
                         "UNDO",
                     ];
                     let mut animating = false;
+                    // OVERLAY BIAS: same mechanism as the reading plaque / PARAMS panel (pull toward camera in
+                    // world space so the fragment wins the depth test) — this dock never had it either, so a
+                    // scene prop nearer the camera than the dock's natural depth could render through it.
+                    let ov_dock = 0.9_f32;
                     for (i, &id) in DOCK_IDS.iter().enumerate() {
                         let vis = self.phys.visual(id);
                         self.phys_anim[i].tick(vis, dt);
@@ -4816,11 +5053,15 @@ which file you read.\n\n",
                             _ => true,
                         };
                         // springy press: pushes IN when pressed, pops slightly PROUD (press<0) on release.
-                        let push = a.press * 0.07;
+                        // Hover ALSO lifts it a touch proud — before now hover only brightened the slab
+                        // (emissive), giving no depth cue at all for the most common interaction (mouse
+                        // over, no click yet). Same push mechanism, just a smaller magnitude than the
+                        // press-release pop so the two states stay visually distinct.
+                        let push = a.press * 0.07 - a.hover * 0.03;
                         let bc = V3::new(pos[i][0] - toward.x * push, pos[i][1] - toward.y * push, pos[i][2] - toward.z * push);
                         let base = egui::Color32::from_rgb(pc[0], pc[1], pc[2]);
                         let mut btn = m3::panel(bc, right, up, bw, bh, base);
-                        btn.mat = pmat;
+                        btn.mat = pmat; btn.overlay = ov_dock;
                         let dim = if enabled { 1.0 } else { 0.4 };
                         // emissive: base + hover + active + a bright ACTUATION FLASH burst
                         btn.emissive = (0.12 + 0.55 * a.hover + 0.85 * a.active + 1.5 * a.flash) * tglow * dim * sheen;
@@ -4831,7 +5072,7 @@ which file you read.\n\n",
                         if a.flash > 0.02 {
                             let g = 1.0 + 0.28 * a.flash; // expands as it fires
                             let mut ring = m3::panel(bc, right, up, bw * g + 0.06, bh * g + 0.06, pip[i]);
-                            ring.mat = pmat;
+                            ring.mat = pmat; ring.overlay = ov_dock + 0.05;
                             ring.emissive = 2.2 * a.flash * tglow.max(0.6);
                             m3::set_alpha(&mut ring, (150.0 * a.flash) as u8);
                             graph.push(ring);
@@ -4843,7 +5084,8 @@ which file you read.\n\n",
                         let lscale = (bw * 0.86 / (lbl.len() as f32 * 6.0)).min(0.017) * (1.0 + 0.14 * a.flash);
                         let lcen = V3::new(bc.x - toward.x * 0.30, bc.y - toward.y * 0.30, bc.z - toward.z * 0.30);
                         let llit = if enabled { (0.55 + 0.5 * a.hover + 0.7 * a.active + 0.8 * a.flash).min(1.6) } else { 0.18 };
-                        for cell in m3::label_cells(lcen, right, up, toward, lbl, lscale, t, pip[i], llit, a.flash * 0.06, tanim, m3::SceneLight::Uniform, 0) {
+                        for mut cell in m3::label_cells(lcen, right, up, toward, lbl, lscale, t, pip[i], llit, a.flash * 0.06, tanim, m3::SceneLight::Uniform, 0) {
+                            cell.overlay = ov_dock + 0.15;
                             graph.push(cell);
                         }
                     }
@@ -4878,13 +5120,41 @@ which file you read.\n\n",
                         let panel_c = anchor(0.15, 0.60); // lower-left corner, adapts to window size
                         let plaque_w = (0.24 * win_w / ppw).clamp(0.9, 2.6);
                         let ps = plaque_w / 1.42; // scale the tuned layout by the window-derived plaque width
-                        let back = |o: f32| V3::new(panel_c.x - toward.x * o, panel_c.y - toward.y * o, panel_c.z - toward.z * o);
+                        // OVERLAY BIAS: physical UI floating in front of the world — same mechanism + value
+                        // (0.9) as the reading plaque. This panel never had it at all (only the reading plaque
+                        // did), so any scene prop that happened to sit nearer the camera rendered THROUGH it —
+                        // confirmed by screenshot comparison: a stone slab cut straight across REP/MINP/
+                        // BACKEND/PERSONA at a camera angle where the slab's natural depth was closer than the
+                        // panel's. Applied to every mesh this block pushes, same as the reading plaque does.
+                        let ov_p = 0.9_f32;
+                        // BACKING SIZE: content is the title + one row per PARAM_DIAL + one row per selector
+                        // (BACKEND/PERSONA/MODEL/ROLE — 4 slots reserved even when MODEL is hidden, since the
+                        // row loop below skips PUSHING that row's content without renumbering the rest, so the
+                        // vertical space stays fixed either way). Rows are spaced 0.26*ps apart, row i's centre
+                        // at (0.42 - i*0.26)*ps above `panel_c`. A plaque sized for a handful of dials alone
+                        // left the selector rows spilling out past its own bottom edge into whatever rendered
+                        // behind it (the PARAMS/PERSONA overlap from screenshot comparison — this is content
+                        // overflowing its own container, not two separate panels colliding, so `hud_pack`
+                        // doesn't apply here). Sized/centred from the actual row count instead of a fixed
+                        // constant that only ever matched however many rows existed when it was last tuned.
+                        let n_rows = PARAM_DIALS.len() + 4;
+                        let content_top = 0.42 * ps + 0.24 * ps;                          // clearance above row 0 for the title
+                        let content_bot = (0.42 - (n_rows as f32 - 1.0) * 0.26) * ps - 0.13 * ps; // clearance below the last row
+                        let plaque_h = (content_top - content_bot) + 0.10 * ps;
+                        let plaque_cy = (content_top + content_bot) * 0.5;
+                        let back_v = |o: f32, dy: f32| V3::new(panel_c.x - toward.x * o + up.x * dy, panel_c.y - toward.y * o + up.y * dy, panel_c.z - toward.z * o + up.z * dy);
                         // backing plaque (set back so the sliders sit proud of it)
-                        let mut plaque = m3::panel(back(-0.06 * ps), right, up, 1.42 * ps, 1.60 * ps, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
-                        plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150);
-                        graph.push(plaque); slab_glint(&mut graph, back(-0.06 * ps), right, up, toward, 0.71 * ps, 0.80 * ps, sun, tglow);
+                        // BACKING WIDTH: 1.42*ps was tuned for the dial rows' short numeric values ("0.35",
+                        // "4096") — the selector rows below them show longer strings (backend/persona names)
+                        // that ran straight off the right edge into the scene behind the panel. Widened to
+                        // give those values roughly a 10-character budget before they hit the edge; anything
+                        // longer still gets a hard ellipsis-truncate below rather than clipping unbounded.
+                        let bg_w = 2.10 * ps;
+                        let mut plaque = m3::panel(back_v(-0.06 * ps, plaque_cy), right, up, bg_w, plaque_h, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
+                        plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150); plaque.overlay = ov_p;
+                        graph.push(plaque); slab_glint(&mut graph, back_v(-0.06 * ps, plaque_cy), right, up, toward, 0.71 * ps, plaque_h * 0.5, sun, tglow);
                         let title_c = V3::new(panel_c.x - toward.x * 0.30 + up.x * 0.66 * ps, panel_c.y - toward.y * 0.30 + up.y * 0.66 * ps, panel_c.z - toward.z * 0.30 + up.z * 0.66 * ps);
-                        for cell in m3::label_cells(title_c, right, up, toward, "PARAMS", 0.010 * ps, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                        for mut cell in m3::label_cells(title_c, right, up, toward, "PARAMS", 0.010 * ps, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = ov_p + 0.15; graph.push(cell); }
 
                         let (p_down, p_pressed) = ui.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
                         let p_pos = ui.input(|i| i.pointer.interact_pos());
@@ -4915,21 +5185,21 @@ which file you read.\n\n",
                             let val = self.phys.value_of(id);
                             let frac = ((val - lo) / (hi - lo)).clamp(0.0, 1.0);
                             let mut trk = m3::panel(rc, right, up, tw, th, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
-                            trk.mat = pmat; trk.emissive = 0.12 * tglow * sheen; m3::set_alpha(&mut trk, 185);
+                            trk.mat = pmat; trk.emissive = 0.12 * tglow * sheen; m3::set_alpha(&mut trk, 185); trk.overlay = ov_p;
                             graph.push(trk);
                             let hx = (frac - 0.5) * tw;
                             let hc = V3::new(rc.x + right.x * hx, rc.y + right.y * hx, rc.z + right.z * hx);
                             let mut handle = m3::uv_sphere(hc, th * 1.7, 8, 6, egui::Color32::from_rgb(0x8a, 0xe0, 0xff));
-                            handle.mat = pmat; handle.emissive = (0.5 + if dragging_this { 0.9 } else { 0.35 }) * tglow.max(0.6);
+                            handle.mat = pmat; handle.emissive = (0.5 + if dragging_this { 0.9 } else { 0.35 }) * tglow.max(0.6); handle.overlay = ov_p + 0.1;
                             graph.push(handle);
                             // label to the left, value to the right (floated proud of the track)
                             let lx = -(tw * 0.5 + 0.20 * ps);
                             let lcen = V3::new(rc.x - toward.x * 0.30 + right.x * lx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * lx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * lx + up.z * 0.11 * ps);
-                            for cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            for mut cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = ov_p + 0.15; graph.push(cell); }
                             let vtxt = if isint { format!("{}", val.round() as i32) } else { format!("{val:.2}") };
                             let vx = tw * 0.5 + 0.10 * ps;
                             let vcen = V3::new(rc.x - toward.x * 0.30 + right.x * vx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * vx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * vx + up.z * 0.11 * ps);
-                            for cell in m3::label_cells(vcen, right, up, toward, &vtxt, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.72, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            for mut cell in m3::label_cells(vcen, right, up, toward, &vtxt, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.72, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = ov_p + 0.15; graph.push(cell); }
                             if let Some(tr) = track_rect {
                                 let hint = format!("{label}: {vtxt} — drag to change");
                                 let resp = ui.interact(tr, egui::Id::new(("scene_phys_param", id)), egui::Sense::click_and_drag()).on_hover_text(hint);
@@ -4973,13 +5243,26 @@ which file you read.\n\n",
                                 _ => String::new(),
                             };
                             let mut trk = m3::panel(rc, right, up, tw, th, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
-                            trk.mat = pmat; trk.emissive = 0.12 * tglow * sheen; m3::set_alpha(&mut trk, 185);
+                            trk.mat = pmat; trk.emissive = 0.12 * tglow * sheen; m3::set_alpha(&mut trk, 185); trk.overlay = ov_p;
                             graph.push(trk);
                             let lx = -(tw * 0.5 + 0.20 * ps);
                             let lcen = V3::new(rc.x - toward.x * 0.30 + right.x * lx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * lx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * lx + up.z * 0.11 * ps);
-                            for cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
-                            let vcen = V3::new(rc.x - toward.x * 0.30 + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + up.z * 0.11 * ps);
-                            for cell in m3::label_cells(vcen, right, up, toward, &cur, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.62, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            for mut cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = ov_p + 0.15; graph.push(cell); }
+                            // VALUE position was missing its right-axis offset entirely (`rc` with no `right * vx`
+                            // term), landing it at the row's centre — right where the label's own text also
+                            // reaches, which is the actual mechanism behind the BACKEND/PERSONA overlap found by
+                            // screenshot comparison (the earlier fix in this same panel corrected the backing
+                            // plaque's SIZE; this is the separate bug that fix didn't touch). Mirrors the param
+                            // dials' own value placement (`vx = tw*0.5 + 0.10*ps`) a few lines above this loop.
+                            let vx = tw * 0.5 + 0.10 * ps;
+                            let vcen = V3::new(rc.x - toward.x * 0.30 + right.x * vx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * vx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * vx + up.z * 0.11 * ps);
+                            // hard ellipsis-truncate: the widened backing (above) covers most real values, but
+                            // nothing should be able to run an unbounded distance off the panel's own edge —
+                            // a model/persona name is user data, not a tuned constant, so length isn't bounded.
+                            let cur_disp: String = if cur.chars().count() > 11 {
+                                cur.chars().take(10).chain(std::iter::once('.')).collect() // '…' has no glyph in glyph5x7; '.' does
+                            } else { cur.clone() };
+                            for mut cell in m3::label_cells(vcen, right, up, toward, &cur_disp, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.62, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = ov_p + 0.15; graph.push(cell); }
                             if let Some(tr) = track_rect {
                                 let resp = ui.interact(tr, egui::Id::new(("scene_phys_sel", id)), egui::Sense::click()).on_hover_text(format!("{label}: {cur} — click to cycle"));
                                 if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
@@ -5007,9 +5290,10 @@ which file you read.\n\n",
                 // ratios/window sizes. Only the text field + Enter-to-send are ported here; the fuller
                 // attach/mic/export row stays 2D-only for now (toggle the bar back on to reach those).
                 if self.hide_bottom_bar {
-                    let comp_c = anchor(0.5, 0.90); // bottom-centre, adapts to window size
                     let comp_w = (0.62 * win_w / ppw).clamp(2.2, 6.5);
                     let comp_h = (0.20 * win_h / ppw).clamp(0.55, 1.3);
+                    let comp_c = hud_place(&mut hud_placed, rect, &view_cam, right, up, cx, cy, scale,
+                        anchor(0.5, 0.90), comp_w, comp_h, 6.0); // bottom-centre, adapts to window size
                     if let Some(rect) = project_slab_rect(&view_cam, comp_c, right, up, comp_w, comp_h, cx, cy, scale) {
                         let pearl_t = ui.input(|i| i.time) as f32;
                         let vpartial = self.voice.as_ref().map(|v| v.partial().to_string()).unwrap_or_default();
@@ -5046,17 +5330,18 @@ which file you read.\n\n",
                             (if miced { "REC" } else { "MIC" }, if miced { "stop mic" } else { "dictate" }),
                             ("SEND", "send"),
                         ];
-                        let arow_c = anchor(0.5, 0.985); // just below the composer
                         let btn_w = (0.08 * win_w / ppw).clamp(0.35, 0.9);
                         let gap = btn_w * 1.35;
+                        let arow_c = hud_place(&mut hud_placed, rect, &view_cam, right, up, cx, cy, scale,
+                            anchor(0.5, 0.985), gap * 2.0 + btn_w, btn_w * 0.8, 6.0); // just below the composer
                         for (i, (glyph, hint)) in acts.iter().enumerate() {
                             let dx = (i as f32 - 1.0) * gap; // centre the middle button
                             let bc = V3::new(arow_c.x + right.x * dx, arow_c.y + right.y * dx, arow_c.z + right.z * dx);
                             let mut btn = m3::panel(bc, right, up, btn_w, btn_w * 0.8, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
-                            btn.mat = pmat; btn.emissive = 0.14 * tglow * sheen; m3::set_alpha(&mut btn, 200);
+                            btn.mat = pmat; btn.emissive = 0.14 * tglow * sheen; m3::set_alpha(&mut btn, 200); btn.overlay = 0.9;
                             graph.push(btn);
                             let gcen = V3::new(bc.x - toward.x * 0.30, bc.y - toward.y * 0.30, bc.z - toward.z * 0.30);
-                            for cell in m3::label_cells(gcen, right, up, toward, glyph, 0.013 * (btn_w / 0.6), t, egui::Color32::from_rgb(tc[0], tc[1], tc[2]), 0.8, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            for mut cell in m3::label_cells(gcen, right, up, toward, glyph, 0.013 * (btn_w / 0.6), t, egui::Color32::from_rgb(tc[0], tc[1], tc[2]), 0.8, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 1.05; graph.push(cell); }
                             if let Some(tr) = project_slab_rect(&view_cam, bc, right, up, btn_w * 1.15, btn_w * 0.95, cx, cy, scale) {
                                 let resp = ui.interact(tr, egui::Id::new(("scene_action_btn", i)), egui::Sense::click()).on_hover_text(*hint);
                                 if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
@@ -5090,19 +5375,35 @@ which file you read.\n\n",
                 // ── AGENT PLAN — the committed step list (2), rendered as a checklist that ticks off as
                 // the run progresses, so the agent's intent is visible and you can steer/interrupt. Sits
                 // just above the workspace-files feed on the right edge. Only when a plan exists.
+                //
+                // PLAN_BOTTOM_FRAC carries PLAN's actual last-row screen position out of this block so
+                // WORKSPACE (below) can anchor directly below it — see that block for why this replaced
+                // an attempt to route both through `hud_place`'s screen-space collision system: two rounds
+                // of tuning the footprint size there first under-corrected (still overlapping) then over-
+                // corrected (WORKSPACE pushed UP into PLAN from the other side) without converging, so this
+                // computes the real answer directly instead of iterating on a collision-system guess.
+                let mut plan_bottom_frac: Option<f32> = None;
                 if !self.backdrop && !self.agent_plan.is_empty() {
                     let pc0 = anchor(0.86, 0.13);
                     let pw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
                     let pscale = pw / 1.3;
                     let title_c = V3::new(pc0.x - toward.x * 0.30, pc0.y - toward.y * 0.30, pc0.z - toward.z * 0.30);
-                    for cell in m3::label_cells(title_c, right, up, toward, "PLAN", 0.010 * pscale, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    for mut cell in m3::label_cells(title_c, right, up, toward, "PLAN", 0.010 * pscale, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 0.9; graph.push(cell); }
+                    let n_rows = self.agent_plan.len().min(8);
                     for (row, (text, done)) in self.agent_plan.iter().take(8).enumerate() {
                         let off = -(row as f32 + 1.0) * 0.15 * pscale;
                         let rc = V3::new(pc0.x + up.x * off - toward.x * 0.30, pc0.y + up.y * off - toward.y * 0.30, pc0.z + up.z * off - toward.z * 0.30);
                         let mark = if *done { "[x] " } else { "[ ] " };
                         let col = if *done { egui::Color32::from_rgb(tc[0], tc[1], tc[2]) } else { egui::Color32::from_rgb(150, 160, 178) };
                         let line: String = format!("{mark}{}", text.chars().take(18).collect::<String>());
-                        for cell in m3::label_cells(rc, right, up, toward, &line, 0.008 * pscale, t, col, if *done { 0.75 } else { 0.5 }, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                        for mut cell in m3::label_cells(rc, right, up, toward, &line, 0.008 * pscale, t, col, if *done { 0.75 } else { 0.5 }, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 0.9; graph.push(cell); }
+                    }
+                    // Project the ACTUAL last row's world position back to screen space, rather than
+                    // estimating a footprint for a collision system: this is the exact, direct answer.
+                    let last_off = -(n_rows as f32) * 0.15 * pscale;
+                    let last_pos = V3::new(pc0.x + up.x * last_off, pc0.y + up.y * last_off, pc0.z + up.z * last_off);
+                    if let Some((_, sy, _)) = view_cam.project(last_pos, cx, cy, scale) {
+                        plan_bottom_frac = Some(((sy - rect.top()) / win_h).max(0.13));
                     }
                 }
 
@@ -5110,15 +5411,19 @@ which file you read.\n\n",
                 // is VISIBLE in the scene (the ask: "see file creation"). Right-edge plaque, newest last,
                 // colour-coded (created = accent, modified = dim). Only when a session has touched files.
                 if !self.backdrop && !self.agent_files.is_empty() {
-                    let fc = anchor(0.86, 0.42);
                     let fw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
                     let fs = fw / 1.3;
+                    // Anchored below PLAN's real (projected) bottom edge + a fixed margin, when PLAN is
+                    // showing; otherwise the original fixed fraction. A direct answer, not a guessed
+                    // footprint — see the comment on `plan_bottom_frac` above for why this replaced the
+                    // `hud_place` attempt.
+                    let fc = anchor(0.86, plan_bottom_frac.map(|f| f + 0.06).unwrap_or(0.42).min(0.85));
                     let back = |o: f32| V3::new(fc.x - toward.x * o, fc.y - toward.y * o, fc.z - toward.z * o);
                     let mut plaque = m3::panel(back(-0.06 * fs), right, up, 1.3 * fs, 1.7 * fs, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
-                    plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150);
+                    plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150); plaque.overlay = 0.9;
                     graph.push(plaque);
                     let title_c = V3::new(fc.x - toward.x * 0.30 + up.x * 0.72 * fs, fc.y - toward.y * 0.30 + up.y * 0.72 * fs, fc.z - toward.z * 0.30 + up.z * 0.72 * fs);
-                    for cell in m3::label_cells(title_c, right, up, toward, "WORKSPACE", 0.010 * fs, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    for mut cell in m3::label_cells(title_c, right, up, toward, "WORKSPACE", 0.010 * fs, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 1.05; graph.push(cell); }
                     let n = self.agent_files.len();
                     let show = self.agent_files.iter().rev().take(8).collect::<Vec<_>>();
                     for (row, ev) in show.iter().enumerate() {
@@ -5128,11 +5433,11 @@ which file you read.\n\n",
                         let col = if created { egui::Color32::from_rgb(tc[0], tc[1], tc[2]) } else { egui::Color32::from_rgb(150, 160, 178) };
                         let mark = if created { "+ " } else { "~ " };
                         let name: String = ev.path.rsplit('/').next().unwrap_or(&ev.path).chars().take(16).collect();
-                        for cell in m3::label_cells(rc, right, up, toward, &format!("{mark}{name}"), 0.008 * fs, t, col, if created { 0.75 } else { 0.5 }, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                        for mut cell in m3::label_cells(rc, right, up, toward, &format!("{mark}{name}"), 0.008 * fs, t, col, if created { 0.75 } else { 0.5 }, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 1.05; graph.push(cell); }
                     }
                     if n > 8 {
                         let mc = V3::new(fc.x + up.x * (0.52 - 8.0 * 0.15) * fs - toward.x * 0.30, fc.y + up.y * (0.52 - 8.0 * 0.15) * fs - toward.y * 0.30, fc.z + up.z * (0.52 - 8.0 * 0.15) * fs - toward.z * 0.30);
-                        for cell in m3::label_cells(mc, right, up, toward, &format!("+{} more", n - 8), 0.008 * fs, t, egui::Color32::from_rgb(120, 130, 148), 0.5, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                        for mut cell in m3::label_cells(mc, right, up, toward, &format!("+{} more", n - 8), 0.008 * fs, t, egui::Color32::from_rgb(120, 130, 148), 0.5, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 1.05; graph.push(cell); }
                     }
                 }
 
@@ -5141,12 +5446,19 @@ which file you read.\n\n",
                 // note; the reviewer-suggested branch is ringed. Click a card to LAND that branch (:pick).
                 // This is the fold/prune decision made visual — the keeper is one click, not a typed command.
                 if !self.backdrop && !self.agent_candidates.is_empty() {
-                    let cc = anchor(0.17, 0.22);
                     let cw = (0.30 * win_w / ppw).clamp(1.4, 3.6);
                     let cs = cw / 2.0;
+                    // Cards are centred ON cc but the anchor (0.17, near the left edge) never accounted for
+                    // half the card width extending further left — a wide card ran the panel's own title
+                    // ("PICK A BRANCH") off the left edge of the screen entirely (screenshot comparison).
+                    // hud_place's clamp-into-viewport (same mechanism protecting the dock/PARAMS panel) fixes
+                    // this the same way: give it the true footprint and let it push the centre clear of the edge.
+                    let n_rows = self.agent_candidates.len().min(6);
+                    let cc = hud_place(&mut hud_placed, rect, &view_cam, right, up, cx, cy, scale,
+                        anchor(0.17, 0.22), cw * 1.1, (n_rows as f32 + 1.0) * 0.30 * cs, 6.0);
                     let best = self.agent_candidates.iter().max_by_key(|b| (b.approved == Some(true), b.verified, b.files)).map(|b| b.index);
                     let title_c = V3::new(cc.x - toward.x * 0.30 + up.x * 0.5 * cs, cc.y - toward.y * 0.30 + up.y * 0.5 * cs, cc.z - toward.z * 0.30 + up.z * 0.5 * cs);
-                    for cell in m3::label_cells(title_c, right, up, toward, "PICK A BRANCH", 0.011 * cs, t, egui::Color32::from_rgb(232, 238, 252), 0.75, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    for mut cell in m3::label_cells(title_c, right, up, toward, "PICK A BRANCH", 0.011 * cs, t, egui::Color32::from_rgb(232, 238, 252), 0.75, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 1.05; graph.push(cell); }
                     let mut clicked_pick: Option<usize> = None;
                     let rowh = 0.30 * cs;
                     for (row, cand) in self.agent_candidates.iter().take(6).enumerate() {
@@ -5156,7 +5468,7 @@ which file you read.\n\n",
                         // card slab (accent-tinted for the suggested keeper)
                         let (cr, cg, cb) = if is_best { (tc[0], tc[1], tc[2]) } else { (pc[0], pc[1], pc[2]) };
                         let mut card = m3::panel(rc, right, up, cw, rowh * 0.82, egui::Color32::from_rgb(cr, cg, cb));
-                        card.mat = pmat; card.emissive = if is_best { 0.28 } else { 0.12 } * tglow * sheen; m3::set_alpha(&mut card, if is_best { 210 } else { 170 });
+                        card.mat = pmat; card.emissive = if is_best { 0.28 } else { 0.12 } * tglow * sheen; m3::set_alpha(&mut card, if is_best { 210 } else { 170 }); card.overlay = 0.9;
                         graph.push(card);
                         // status glyph + label
                         let (mark, mcol) = match cand.approved {
@@ -5167,12 +5479,12 @@ which file you read.\n\n",
                         };
                         let head = format!("{mark} {} · {}f", cand.label.chars().take(14).collect::<String>(), cand.files);
                         let hc = V3::new(rc.x - toward.x * 0.30 + up.x * 0.06 * cs, rc.y - toward.y * 0.30 + up.y * 0.06 * cs, rc.z - toward.z * 0.30 + up.z * 0.06 * cs);
-                        for cell in m3::label_cells(hc, right, up, toward, &head, 0.0085 * cs, t, mcol, 0.8, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                        for mut cell in m3::label_cells(hc, right, up, toward, &head, 0.0085 * cs, t, mcol, 0.8, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 1.05; graph.push(cell); }
                         // review note (one truncated line under the head)
                         if !cand.review_notes.is_empty() {
                             let note: String = cand.review_notes.lines().next().unwrap_or("").chars().take(28).collect();
                             let nc = V3::new(rc.x - toward.x * 0.30 - up.x * 0.06 * cs, rc.y - toward.y * 0.30 - up.y * 0.06 * cs, rc.z - toward.z * 0.30 - up.z * 0.06 * cs);
-                            for cell in m3::label_cells(nc, right, up, toward, &note, 0.0072 * cs, t, egui::Color32::from_rgb(150, 160, 178), 0.55, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            for mut cell in m3::label_cells(nc, right, up, toward, &note, 0.0072 * cs, t, egui::Color32::from_rgb(150, 160, 178), 0.55, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = 1.05; graph.push(cell); }
                         }
                         // click → land this branch
                         if let Some(tr) = project_slab_rect(&view_cam, rc, right, up, cw * 1.05, rowh * 0.9, cx, cy, scale) {
@@ -5192,8 +5504,7 @@ which file you read.\n\n",
                 // Clicking a node focuses it; its turn text then reads as a real in-world plaque (bezel + shadow
                 // + slab + wrapped label_cells text) carrying the scene's palette/material/emissive — an object,
                 // not a 2D overlay. (LOGSCOPE_FOCUS=<n> forces a focus for headless checks.)
-                let focus = std::env::var("LOGSCOPE_FOCUS").ok().and_then(|s| s.trim().parse::<usize>().ok()).or(self.walk_focus);
-                if let Some(fid) = focus.filter(|i| *i < self.msgs.len()) {
+                if let Some(fid) = focused_id.filter(|i| *i < self.msgs.len()) {
                     let (who, raw) = { let m = &self.msgs[fid]; (if m.role == Role::User { "you" } else { "assistant" }, m.text().to_string()) };
                     let head = format!("{who} · turn {}/{}", fid + 1, n);
                     // Reset the glide (don't inherit scroll position/animation) when focus moves to a
@@ -5215,14 +5526,24 @@ which file you read.\n\n",
                         format!("{head}{marks}  ⟨j/k to scroll⟩")
                     } else { head };
                     let rc = anchor(0.5, 0.17); // top-centre, adapts to window size
-                    let pw = (0.44 * win_w / ppw).clamp(1.6, 5.2);
-                    let ph = (pw * 0.42).min(0.30 * win_h / ppw); // cap by height so it fits short windows
+                    // SETTLE — the plaque doesn't just appear at rest; it arrives WITH the pearl (same
+                    // `focus_pull` driving the pull-toward-camera animation on the node itself), popping
+                    // in from a slightly smaller scale with its drop-shadow thrown further out, both
+                    // converging to their resting values as focus_pull reaches 1. A physical object that's
+                    // still settling casts a longer, softer-anchored shadow than one at rest — this is the
+                    // same depth cue, applied to the reading surface instead of the pearl. `settle` is 0
+                    // once fully arrived, so nothing here changes the at-rest appearance already verified.
+                    let settle = (1.0 - self.focus_pull).clamp(0.0, 1.0);
+                    let scale_pop = 1.0 - 0.10 * settle; // 0.90 on arrival → 1.0 at rest
+                    let pw = ((0.44 * win_w / ppw).clamp(1.6, 5.2)) * scale_pop;
+                    let ph = ((0.44 * win_w / ppw).clamp(1.6, 5.2) * 0.42).min(0.30 * win_h / ppw) * scale_pop; // cap by height so it fits short windows
                     let bscale = (pw / (24.0 * 6.0) * 0.90).clamp(0.006, 0.03); // body fits ~24 cols
                     let hscale = bscale * 0.82;
-                    // drop shadow (offset down-right, set back) for real depth
-                    let scen = V3::new(rc.x + fwd.x * 0.16 + right.x * 0.10 - up.x * 0.10, rc.y + fwd.y * 0.16 + right.y * 0.10 - up.y * 0.10, rc.z + fwd.z * 0.16 + right.z * 0.10 - up.z * 0.10);
+                    // drop shadow (offset down-right, set back) for real depth — separation grows while unsettled
+                    let shadow_mul = 1.0 + 0.8 * settle;
+                    let scen = V3::new(rc.x + fwd.x * 0.16 * shadow_mul + right.x * 0.10 * shadow_mul - up.x * 0.10 * shadow_mul, rc.y + fwd.y * 0.16 * shadow_mul + right.y * 0.10 * shadow_mul - up.y * 0.10 * shadow_mul, rc.z + fwd.z * 0.16 * shadow_mul + right.z * 0.10 * shadow_mul - up.z * 0.10 * shadow_mul);
                     let mut shadow = m3::panel(scen, right, up, pw + 0.5, ph + 0.4, egui::Color32::from_rgb(0, 0, 0));
-                    shadow.mat = crate::texgen::mat::STONE; shadow.emissive = 0.0; m3::set_alpha(&mut shadow, 96); graph.push(shadow);
+                    shadow.mat = crate::texgen::mat::STONE; shadow.emissive = 0.0; m3::set_alpha(&mut shadow, (96.0 * (1.0 - 0.35 * settle)) as u8); graph.push(shadow);
                     // bezel + slab in the scene palette/material
                     let bez = egui::Color32::from_rgb((pc[0] as f32 * 0.5) as u8, (pc[1] as f32 * 0.5) as u8, (pc[2] as f32 * 0.5) as u8);
                     let fcen = V3::new(rc.x + fwd.x * 0.05, rc.y + fwd.y * 0.05, rc.z + fwd.z * 0.05);
@@ -5231,6 +5552,29 @@ which file you read.\n\n",
                     // occlude it, while its own bezel→slab→text still layer correctly among themselves.
                     let ov = 0.9_f32;
                     let mut frame = m3::panel(fcen, right, up, pw + 0.28, ph + 0.24, bez); frame.mat = pmat; frame.emissive = pemis * 0.4; m3::set_alpha(&mut frame, (palpha as u16 + 50).min(255) as u8); frame.overlay = ov; graph.push(frame);
+                    // CORNER ORNAMENT — every reference concept image (Atlantis, Observatory, Mansion
+                    // Garden, Alley) frames its message plaques with a metal/gilt corner bracket, not a
+                    // flat monochrome bezel alone. Four small accent squares in the scene's own accent
+                    // colour, pulled a hair closer than the frame so they read as an inlay rather than
+                    // fighting it in the depth buffer. Cheap (4 extra quads) and purely decorative — no
+                    // interaction/hit-testing changes.
+                    {
+                        let acc = theme::accent();
+                        let (hw, hh) = (pw * 0.5 + 0.14, ph * 0.5 + 0.12); // just inside the frame's own edge
+                        let cs = (pw.min(ph) * 0.09).clamp(0.05, 0.18); // corner accent size, scales with the plaque
+                        let ccen = V3::new(fcen.x + fwd.x * 0.01, fcen.y + fwd.y * 0.01, fcen.z + fwd.z * 0.01);
+                        // ARRIVAL GLOW — the corners run brighter than their resting emissive while the plaque
+                        // is still settling (SAME `settle` signal as the scale-pop/shadow above), fading to
+                        // the normal resting glow once arrived — settle² so it falls away fast near the end
+                        // instead of a linear fade the eye reads as just "dimming slowly" rather than settling.
+                        let arrival_flare = settle * settle * 1.8;
+                        for (sx, sy) in [(-1.0_f32, 1.0_f32), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+                            let p = V3::new(ccen.x + right.x * hw * sx + up.x * hh * sy, ccen.y + right.y * hw * sx + up.y * hh * sy, ccen.z + right.z * hw * sx + up.z * hh * sy);
+                            let mut corner = m3::panel(p, right, up, cs, cs, acc);
+                            corner.mat = pmat; corner.emissive = (pemis * sheen).max(0.5) + arrival_flare; corner.overlay = ov + 0.01;
+                            graph.push(corner);
+                        }
+                    }
                     let mut slab = m3::panel(rc, right, up, pw, ph, egui::Color32::from_rgb(pc[0], pc[1], pc[2])); slab.mat = pmat; slab.emissive = pemis * sheen; m3::set_alpha(&mut slab, palpha); slab.overlay = ov; graph.push(slab); slab_glint(&mut graph, rc, right, up, toward, pw * 0.5, ph * 0.5, sun, tglow);
                     // left-edge origin: label_cells centres on its origin, so offset each line by +half its width
                     let left_edge = pw * 0.5 - pw * 0.06;
@@ -5254,6 +5598,13 @@ which file you read.\n\n",
                     if let Some(pr) = project_slab_rect(&view_cam, rc, right, up, pw, ph, cx, cy, scale) {
                         let resp = ui.interact(pr, egui::Id::new("scene_reader"), egui::Sense::click())
                             .on_hover_text(format!("{head}: {}", raw.chars().take(160).collect::<String>()));
+                        // Claim this press for the plaque's OWN world position (rc), not wherever the
+                        // floor/graph raycast lands behind it — checked against the same rect used for
+                        // hit-testing, at raw-press time (not `.clicked()`, which fires on release and
+                        // would miss the frame the generic handler below reads).
+                        if let Some(pp) = ui.input(|i| if i.pointer.primary_pressed() { i.pointer.interact_pos() } else { None }) {
+                            if pr.contains(pp) { touch_override = Some([rc.x, rc.y, rc.z]); }
+                        }
                         // RIGHT-CLICK CONTEXT MENU — the plaque is a real object, so a secondary click opens
                         // actions on the focused turn (copy, jump the composer to it, clear focus). This is the
                         // in-scene equivalent of a desktop context menu, driven off the same projected rect.
@@ -5360,7 +5711,14 @@ which file you read.\n\n",
                 // slab IS touching it — the physical UI should glow under every touch, not only the
                 // ones no control wanted. egui y grows DOWN, ndc-uv y grows UP: the flip lives here,
                 // at the screen boundary, so gpuscene stays in one convention.
-                if let Some(pp) = ui.input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None }) {
+                //
+                // `touch_override`, if set above, means the press landed on the reading plaque — an
+                // OVERLAY-biased object pulled toward the camera, which sits at a different depth than
+                // whatever the raycast would hit behind it. Honor that instead of the raycast so the
+                // plaque glows at its own surface, not the floor/graph seen through it.
+                if let Some(tv) = touch_override {
+                    self.scene_touch = Some((tv, t));
+                } else if let Some(pp) = ui.input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None }) {
                     if rect.contains(pp) {
                         let uv = [(pp.x - rect.left()) / rect.width().max(1.0),
                                   1.0 - (pp.y - rect.top()) / rect.height().max(1.0)];
@@ -5390,21 +5748,44 @@ which file you read.\n\n",
                         * std::env::var("LOGSCOPE_EXP").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
                     saturation: std::env::var("LOGSCOPE_SAT").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.18),
                     shoulder: std::env::var("LOGSCOPE_SHOULDER").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
-                    // per-scene BLOOM trim — Old Library + Cloudscape were over-blooming (detail washed out)
-                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, _ => 1.0 }, texscale: dtexscale, bump: dbump,
+                    // per-scene BLOOM trim — Old Library + Cloudscape were over-blooming (detail washed out).
+                    // Atlantis was missing from this list despite the same profile that earned the others a
+                    // trim (pale coral/marble surfaces filling most of frame) PLUS its own caustic + underwater-
+                    // tint passes stacking additional brightness on top — screenshot comparison (close-range
+                    // llvmpipe render) showed it blowing out to a near-solid cyan wash; disabling the tonemap
+                    // shoulder made it WORSE (near-white), which rules out the tonemap and points upstream, here.
+                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, "Atlantis" => 0.4, _ => 1.0 }, texscale: dtexscale, bump: dbump,
                     caustic, godray_amt: gr_amt, godray_weight: gr_w, godray_decay: gr_dec,
                     pearl, pearl_variant, pearl_pos, pearl_r, aspect: rect.width() / rect.height().max(1.0),
                     nacre: std::env::var("LOGSCOPE_NACRE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.4),
                     underwater,
-                    defocus: if self.backdrop { 0.85 } else { 0.0 }, // frost strength when it's the glass-UI backdrop
+                    // frost strength: the glass-UI backdrop's flat frost, OR — same knob, physical-UI use —
+                    // the background blurring away as a focused pearl is pulled to reading distance. The two
+                    // never overlap in practice (backdrop mode has no focused turn) so max() picks whichever
+                    // is asking; the pearl's own read is kept via `focus` below rather than the frost bands.
+                    defocus: (if self.backdrop { 0.85_f32 } else { 0.0 }).max(0.6 * self.focus_pull),
                     frost_a: self.frost_a, frost_b: self.frost_b,    // ...but only within the chrome bands
                     cam_warp: [view_cam.yaw, view_cam.pitch],         // 3D-aware underwater field follows the look angle
                     // backdrop is opaque so no undefined framebuffer shows through; fill empty sky with the theme bg
                     opaque: if self.backdrop { 1.0 } else { 0.0 },
                     bg: { let b = theme::active().bg; [b.r() as f32 / 255.0 * 0.7, b.g() as f32 / 255.0 * 0.7, b.b() as f32 / 255.0 * 0.7] },
-                    // DEPTH-OF-FIELD: focus on the content (orbit distance), defocus the far background. Tunable.
+                    // DEPTH-OF-FIELD: focus on the content (orbit distance), defocus the far background.
+                    // When a turn's pearl is pulled toward the camera, slide the focal plane toward IT
+                    // instead — the pearl stays crisp at its new, closer distance while the rest of the
+                    // room falls away, which is what sells "pulled out of the graph" rather than "zoomed".
                     dof: std::env::var("LOGSCOPE_DOF").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.7),
-                    focus: view_cam.dist,
+                    focus: {
+                        let base = view_cam.dist;
+                        match focused_id {
+                            Some(fid) if self.focus_pull > 0.001 => {
+                                let p = pos[fid];
+                                let d = ((eye_now.x - p.x).powi(2) + (eye_now.y - p.y).powi(2) + (eye_now.z - p.z).powi(2)).sqrt();
+                                let pulled_d = (d - (view_cam.dist * 0.35).min(2.6) * self.focus_pull).max(0.6);
+                                base + (pulled_d - base) * self.focus_pull
+                            }
+                            _ => base,
+                        }
+                    },
                     // SHADOWS: ortho shadow map along the sun, CENTERED ON THE CAMERA TARGET (follows the view)
                     // with a doubled radius for wider coverage. Toggle off with LOGSCOPE_SHADOWS=0.
                     light_viewproj: crate::gpuscene::light_view_proj(
@@ -5615,23 +5996,42 @@ which file you read.\n\n",
             }
         }
 
+        // Node picking, via `scenepick` — a pure, tested hit-tester (accessibility floor so a distant
+        // small node stays hittable, real-hit-vs-padding-only tie-breaking) that already existed and
+        // was never called anywhere in the crate. It replaces a fixed 26px-radius nearest-in-screen-
+        // space search that had no accessibility floor at all and no notion of depth ties.
+        let touch_target = uikit_egui::adaptive::Adaptive::detect(ui.ctx()).min_touch_target;
+        let pick_targets: Vec<crate::scenepick::Target> = proj.iter()
+            .map(|&(id, _, _, _)| crate::scenepick::Target { id: id as u32, at: pos[id], radius: 0.26, enabled: true })
+            .collect();
+        // HOVER — the node under the pointer, every frame (not just on click), so it can lift/glow
+        // before being pressed; the physical-UI premise this whole family of fixes is chasing is that
+        // an object answers *attention*, not only a click.
+        self.scene_hover = ui.ctx().pointer_hover_pos()
+            .filter(|_| !ui.input(|i| i.pointer.is_decidedly_dragging()))
+            .and_then(|hp| crate::scenepick::pick(&view_cam, &pick_targets, hp.x, hp.y, cx, cy, scale, touch_target))
+            .map(|id| id as usize);
+        if self.scene_hover.is_some() { ui.ctx().request_repaint(); }
+        // PRESSED — same pick, gated on the primary button actually being held over the node. Using
+        // the interact position (not the raw pointer position `scene_hover` uses) so this reflects
+        // where the button went down, matching what `resp` itself is tracking for the eventual click.
+        self.scene_pressed = ui.input(|i| i.pointer.primary_down())
+            .then(|| resp.interact_pointer_pos())
+            .flatten()
+            .and_then(|pp| crate::scenepick::pick(&view_cam, &pick_targets, pp.x, pp.y, cx, cy, scale, touch_target))
+            .map(|id| id as usize);
+
         // click → nearest node (focus it; opt out of auto-follow so it stays put)
         if resp.clicked() {
             if let Some(ptr) = resp.interact_pointer_pos() {
-                let mut best: Option<(usize, f32)> = None;
-                for &(id, sx, sy, _) in &proj {
-                    let d2 = (sx - ptr.x).powi(2) + (sy - ptr.y).powi(2);
-                    if best.map(|(_, bd)| d2 < bd).unwrap_or(true) { best = Some((id, d2)); }
-                }
-                if let Some((id, d2)) = best {
-                    if d2 < 26.0 * 26.0 {
-                        // glide along the graph's shortest path from the current focus to the clicked node
-                        let from = self.walk_focus.unwrap_or(id);
-                        let path = graph_path(&g, from, id);
-                        if path.len() > 1 { self.cam_pan_path = path; self.cam_pan_t0 = Some(std::time::Instant::now()); }
-                        else { self.orbit.target = pos[id]; }
-                        self.walk_focus = Some(id); self.spatial_auto = false; ui.ctx().request_repaint();
-                    }
+                let hit = crate::scenepick::pick(&view_cam, &pick_targets, ptr.x, ptr.y, cx, cy, scale, touch_target);
+                if let Some(id) = hit.map(|id| id as usize) {
+                    // glide along the graph's shortest path from the current focus to the clicked node
+                    let from = self.walk_focus.unwrap_or(id);
+                    let path = graph_path(&g, from, id);
+                    if path.len() > 1 { self.cam_pan_path = path; self.cam_pan_t0 = Some(std::time::Instant::now()); }
+                    else { self.orbit.target = pos[id]; }
+                    self.walk_focus = Some(id); self.spatial_auto = false; ui.ctx().request_repaint();
                 }
             }
         }
@@ -9251,7 +9651,15 @@ fn graph_path(g: &crate::convograph::Graph, from: usize, to: usize) -> Vec<usize
 fn scene_light(name: &str) -> (egui::Color32, egui::Color32, f32, f32) {
     let c = |r, g, b| egui::Color32::from_rgb(r, g, b);
     match name {
-        "Atlantis"     => (c(0x6a, 0xc6, 0xd2), c(0x10, 0x2a, 0x36), 0.62, 0.98), // aqua, cool floor bounce
+        // Atlantis was left at full exposure while its bright-scene peers (Reading Room, Cloudscape,
+        // Mansion Garden — see their comments above) all got trimmed for "blowing whites". Atlantis
+        // ALSO gets an extra +12% on top from the aquatic exposure bump below, making its untrimmed
+        // 0.98 the highest effective exposure of any theme once that stacks — confirmed by screenshot
+        // comparison (a close-range llvmpipe render washed to near-solid cyan) and by ruling out bloom
+        // and the sun-light colour first (changing either barely moved the result). Trimmed to land in
+        // the same ballpark as Reading Room's already-corrected total (~1.3) once the aquatic bump and
+        // the global grade multiplier are applied.
+        "Atlantis"     => (c(0x6a, 0xc6, 0xd2), c(0x10, 0x2a, 0x36), 0.62, 0.70), // aqua, cool floor bounce
         "Canopy"       => (c(0x9a, 0xb2, 0x6e), c(0x22, 0x30, 0x1c), 0.56, 0.88), // dim mossy library green
         "Mistfall"     => (c(0xb2, 0xc6, 0xd4), c(0x20, 0x2a, 0x30), 0.62, 0.95), // diffuse misty grey-blue
         "Archive"      => (c(0xe8, 0xc2, 0x80), c(0x2a, 0x20, 0x14), 0.56, 0.95), // dim warm amber (wood)

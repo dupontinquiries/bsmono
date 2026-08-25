@@ -322,6 +322,13 @@ mod imp {
             }
             submitted
         }
+
+        /// Current rolling RMS input level, 0..~ (unbounded above; callers should normalize/clamp for
+        /// display). This is the SAME measure the throttled meter log prints, exposed so the in-scene mic
+        /// indicator can be driven by the real signal (`micresponse`) instead of a canned breathing sine —
+        /// the "meter with a costume on" problem micresponse.rs's header names: a fixed animation runs
+        /// identically whether the room is silent or someone is shouting.
+        pub fn level(&self) -> f32 { self.last_rms }
     }
 
     /// Try to open an input stream on `dev`. Returns (stream, sample_rate, channels, format); the audio
@@ -391,5 +398,7 @@ mod stub {
         pub fn start(_speaker: impl Into<String>) -> Result<Self, String> { Err("built without the `voice` feature".into()) }
         pub fn start_with_mic(_speaker: impl Into<String>, _mic: Option<&str>) -> Result<Self, String> { Err("built without the `voice` feature".into()) }
         pub fn poll(&mut self) -> bool { false }
+        /// Stub build has no audio; always at rest (see the real impl's doc comment for what this drives).
+        pub fn level(&self) -> f32 { 0.0 }
     }
 }
