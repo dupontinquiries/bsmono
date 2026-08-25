@@ -1,4 +1,5 @@
-//! a11y — accessibility voice, shared across every uikit-egui app.
+//! a11y — shared on-screen affordance metadata: voice, and everything else
+//! that needs to know what a widget IS.
 //!
 //! The bet (see BIGSILICON TODO): because `voiced` already routes intents system-wide and
 //! uikit-egui is the shared UI layer, accessibility voice belongs *in the kit* — an app
@@ -6,12 +7,34 @@
 //! widgets with [`Semantics`] and (2) registering [`standard_grammar`] with voiced once.
 //! On by default, fully overridable.
 //!
+//! ## This is not only for voice any more
+//!
+//! [`glove`](crate::glove) needed the same thing — a labelled, kinded, positioned
+//! interactive thing on screen — and built its own [`Target`](crate::glove::Target)
+//! independently, because nothing here offered a conversion. Every app that wants both
+//! voice-a11y and cold-weather glove mode had to register each widget twice, by hand, into
+//! two separate lists that could silently drift (a button present in one and not the
+//! other). [`Item::as_glove_target`] closes that: register once with [`A11yScene::add`],
+//! feed the same list to both consumers.
+//!
+//! The same registration is the right foundation for smart tab order (widgets are already
+//! collected in on-screen call order), AI-driven UI description (`describe_screen`
+//! already produces one), smart command-palette filtering ([`Semantics::command_id`] gives
+//! a stable machine name distinct from a possibly-icon-only spoken label), and eye-tracking
+//! gaze targets (the same `rect` list [`A11yScene`] already carries). None of those
+//! consumers exist yet — this paragraph is the seam they attach to, not a claim they are
+//! built. Only two apps register anything here today (`gitmind`, `bo-suite`); making this
+//! the widget's problem rather than each call site's is `semantic_button`/
+//! `semantic_toggle`/`semantic_text_edit` below, and is the fastest path to changing that
+//! number.
+//!
 //! This module is the app-agnostic brain: an immediate-mode [`A11yScene`] collects the
 //! focusable widgets each frame, voice [`Action`]s move focus / activate / describe, and
 //! the descriptions are plain strings a TTS stage speaks. The only egui touch is painting
 //! the focus ring.
 
 use egui::{Color32, Rect, CornerRadius, Stroke, Ui};
+use crate::glove::{Target, TargetKind};
 
 /// The kind of a widget, for spoken descriptions ("Play, button").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,11 +75,20 @@ pub struct Semantics {
     pub value: Option<String>,
     /// A short usage hint.
     pub hint: Option<String>,
+    /// A stable, machine-readable name — "settings.toggle_dark_mode", not
+    /// "🌙" — for a command palette or an AI integration to match against.
+    /// `label` is what gets SPOKEN or displayed and can be an icon, an
+    /// abbreviation, or something translated; `command_id` is the thing
+    /// that does not change when either of those does. `None` for a
+    /// widget nobody will ever want to address by name (most labels and
+    /// headings): a required field here would make every existing call
+    /// site invent a name for something that does not need one.
+    pub command_id: Option<String>,
 }
 
 impl Semantics {
     pub fn new(role: Role, label: &str) -> Semantics {
-        Semantics { role, label: label.to_string(), value: None, hint: None }
+        Semantics { role, label: label.to_string(), value: None, hint: None, command_id: None }
     }
     pub fn button(label: &str) -> Semantics {
         Semantics::new(Role::Button, label)
@@ -86,6 +118,14 @@ impl Semantics {
 
     pub fn with_hint(mut self, hint: &str) -> Semantics {
         self.hint = Some(hint.to_string());
+        self
+    }
+
+    /// Attach the stable machine name a palette or an AI integration
+    /// matches against. See the field doc for why this is separate from
+    /// `label`.
+    pub fn with_command_id(mut self, id: &str) -> Semantics {
+        self.command_id = Some(id.to_string());
         self
     }
 
@@ -163,6 +203,35 @@ pub struct Item {
     pub rect: Option<Rect>,
 }
 
+impl Item {
+    /// Bridge to [`crate::glove`]'s independent snap-target model, so a widget registered
+    /// once here can also feed glove/cold-weather mode without a second hand-written list.
+    ///
+    /// `None` when either side cannot represent the other: no `rect` (glove needs a screen
+    /// point to snap to, and one was never laid out — this item is voice-only, e.g. it was
+    /// registered before paint), or a [`Role`] glove has no vocabulary for (`Label`,
+    /// `Heading`, `Image`, `Other` are not things a cursor "does" anything to — see
+    /// `glove::Vocab`, which only ever acts on Button/Field/ListItem/Slider/Toggle).
+    /// `Link` maps to `Button`: glove has no link-specific vocabulary, and "activate" is the
+    /// correct action for both.
+    pub fn as_glove_target(&self) -> Option<Target> {
+        let kind = match self.semantics.role {
+            Role::Button | Role::Link => TargetKind::Button,
+            Role::TextField => TargetKind::Field,
+            Role::Toggle => TargetKind::Toggle,
+            Role::Slider => TargetKind::Slider,
+            Role::Label | Role::Heading | Role::Image | Role::Other => return None,
+        };
+        let rect = self.rect?;
+        Some(Target {
+            id: self.id.to_string(),
+            kind,
+            at: (rect.center().x, rect.center().y),
+            label: self.semantics.label.clone(),
+        })
+    }
+}
+
 /// What the caller should do after applying an [`Action`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -211,6 +280,14 @@ impl A11yScene {
 
     pub fn focused(&self) -> Option<&Item> {
         self.focus_index().map(|i| &self.items[i])
+    }
+
+    /// Every registered item this frame that glove mode can snap to, in the
+    /// same call order they were registered — see [`Item::as_glove_target`]
+    /// for which roles that excludes. The single call a host needs to feed
+    /// cold-weather mode from the same registration voice already uses.
+    pub fn glove_targets(&self) -> Vec<Target> {
+        self.items.iter().filter_map(Item::as_glove_target).collect()
     }
 
     fn move_focus(&mut self, to: Option<usize>) -> Outcome {
@@ -296,9 +373,76 @@ pub fn semantic_toggle(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str,
     resp.changed()
 }
 
+/// Render an egui single-line text field and auto-register it. `label` is what gets
+/// spoken/searched ("Name", not the placeholder text) — pass a real label even for a field
+/// whose on-screen hint text serves as its only visual label, since `hint_text` is not
+/// necessarily `label` and this function has no way to infer one from the other.
+/// Returns true when the text changed this frame.
+pub fn semantic_text_edit(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str, text: &mut String) -> bool {
+    let resp = ui.text_edit_singleline(text);
+    scene.add(id, Semantics::field(label, text), Some(resp.rect));
+    resp.changed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_id_is_separate_from_the_spoken_label() {
+        let s = Semantics::button("🌙").with_command_id("settings.toggle_dark_mode");
+        // describe() is what gets SPOKEN — command_id must never leak into it,
+        // or a screen reader would announce a machine name.
+        assert_eq!(s.describe(), "🌙, button");
+        assert_eq!(s.command_id.as_deref(), Some("settings.toggle_dark_mode"));
+        // and a widget that never sets one stays None, not empty-string —
+        // "nobody named this" and "named the empty string" are different facts.
+        assert_eq!(Semantics::button("Play").command_id, None);
+    }
+
+    #[test]
+    fn glove_target_bridge_covers_every_interactive_role_and_excludes_the_rest() {
+        let rect = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(40.0, 12.0));
+        let cases: &[(Role, crate::glove::TargetKind)] = &[
+            (Role::Button, crate::glove::TargetKind::Button),
+            (Role::Link, crate::glove::TargetKind::Button),
+            (Role::TextField, crate::glove::TargetKind::Field),
+            (Role::Toggle, crate::glove::TargetKind::Toggle),
+            (Role::Slider, crate::glove::TargetKind::Slider),
+        ];
+        for (role, want_kind) in cases {
+            let item = Item { id: 7, semantics: Semantics::new(*role, "Widget"), rect: Some(rect) };
+            let t = item.as_glove_target().unwrap_or_else(|| panic!("{role:?} should bridge"));
+            assert_eq!(t.kind, *want_kind, "{role:?}");
+            assert_eq!(t.id, "7");
+            assert_eq!(t.label, "Widget");
+            // glove wants a screen-space centre point, not the whole rect.
+            assert_eq!(t.at, (rect.center().x, rect.center().y));
+        }
+        // Non-interactive roles have no glove vocabulary at all (see glove::Vocab) —
+        // bridging them would hand the cursor a target it can never act on.
+        for role in [Role::Label, Role::Heading, Role::Image, Role::Other] {
+            let item = Item { id: 1, semantics: Semantics::new(role, "x"), rect: Some(rect) };
+            assert!(item.as_glove_target().is_none(), "{role:?} should NOT bridge");
+        }
+        // No rect (voice-only registration before layout) — nothing to snap to.
+        let no_rect = Item { id: 2, semantics: Semantics::button("Save"), rect: None };
+        assert!(no_rect.as_glove_target().is_none());
+    }
+
+    #[test]
+    fn scene_collects_glove_targets_in_registration_order_skipping_non_interactive() {
+        let mut s = A11yScene::new();
+        s.begin_frame();
+        let r = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0));
+        s.add(1, Semantics::heading("Settings"), Some(r)); // excluded
+        s.add(2, Semantics::button("Save"), Some(r));
+        s.add(3, Semantics::toggle("Loop", true), Some(r));
+        let targets = s.glove_targets();
+        assert_eq!(targets.len(), 2, "the heading must not become a snap target");
+        assert_eq!(targets[0].id, "2");
+        assert_eq!(targets[1].id, "3");
+    }
 
     #[test]
     fn describe_reads_role_and_state() {
