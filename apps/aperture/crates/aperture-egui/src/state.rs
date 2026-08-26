@@ -379,6 +379,10 @@ pub struct AppState {
     /// How much context a completion sees. Function scope by default —
     /// right more often than not, and cheap enough on a long file.
     pub scope: aperture_complete::scope::Scope,
+    /// How many lines `Scope::Line` includes. Configurable per the
+    /// original request: a single line routinely misses the `if` guard
+    /// or loop header sitting right above the caret.
+    pub line_scope_lines: usize,
     /// The (prefix, lang) an in-flight request was built from, so its
     /// answer can be filed under the right key when it lands.
     pending_prefix: Option<(String, String)>,
@@ -467,6 +471,7 @@ impl AppState {
             engine_status: EngineStatus::Idle,
             prefix_cache: aperture_complete::prefixcache::PrefixCache::new(256),
             scope: aperture_complete::scope::Scope::default(),
+            line_scope_lines: aperture_complete::scope::DEFAULT_LINE_COUNT,
             pending_prefix: None,
             line_map: aperture_complete::prefixcache::LineMap::new(),
             command_line: String::new(),
@@ -1732,13 +1737,29 @@ impl AppState {
         // here rather than inside make_request so the prefix the cache is
         // keyed on is the prefix that gets sent — the two must not be able
         // to disagree.
-        let before = full_before[aperture_complete::scope::scope_start(&full_before, self.scope)..]
-            .to_string();
-        let after = self.editor.buffer.slice_to_string(head, self.editor.buffer.len_chars());
         let lang = match self.lang {
             Language::Rust => "rust",
             Language::Plain => "text",
         };
+        let scoped_start = aperture_complete::scope::scope_start(
+            &full_before, self.scope, self.line_scope_lines);
+        let scoped = &full_before[scoped_start..];
+        // QUICK CONTEXT, prepended as a plain `// ` comment line — not a
+        // new field on CompletionRequest. `path` grew the request's shape
+        // last time and an eighth construction site outside this
+        // workspace broke because of it (games/blackstar-rs's raid
+        // forge). A comment is just more text in `prefix`, which every
+        // existing provider and call site already handles by definition,
+        // so this cannot repeat that mistake. Rust-only: a `//` header in
+        // front of Markdown or plain text would read as literal text to
+        // continue, not as metadata.
+        let quick_ctx = if lang == "rust" {
+            aperture_complete::scope::QuickContext::gather(scoped, &full_before).render()
+        } else {
+            String::new()
+        };
+        let before = format!("{quick_ctx}{scoped}");
+        let after = self.editor.buffer.slice_to_string(head, self.editor.buffer.len_chars());
         let mut req = make_request(&ctx, &before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
         req.path = self.path.clone(); // sibling reads + @read resolve here
 
