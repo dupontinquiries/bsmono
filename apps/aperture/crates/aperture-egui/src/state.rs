@@ -376,6 +376,9 @@ pub struct AppState {
     /// Completions already answered, so caret motion and typing along a
     /// suggestion do not re-ask the model. See `aperture_complete::prefixcache`.
     pub prefix_cache: aperture_complete::prefixcache::PrefixCache,
+    /// How much context a completion sees. Function scope by default —
+    /// right more often than not, and cheap enough on a long file.
+    pub scope: aperture_complete::scope::Scope,
     /// The (prefix, lang) an in-flight request was built from, so its
     /// answer can be filed under the right key when it lands.
     pending_prefix: Option<(String, String)>,
@@ -463,6 +466,7 @@ impl AppState {
             engine_backend: None,
             engine_status: EngineStatus::Idle,
             prefix_cache: aperture_complete::prefixcache::PrefixCache::new(256),
+            scope: aperture_complete::scope::Scope::default(),
             pending_prefix: None,
             line_map: aperture_complete::prefixcache::LineMap::new(),
             command_line: String::new(),
@@ -904,6 +908,17 @@ impl AppState {
         self.last_follow_line = usize::MAX; // re-center immediately on the next frame
         let msg = if self.follow_mode { "follow camera: on" } else { "follow camera: off" };
         self.set_status(msg, now_ms);
+    }
+
+    /// Change how much context completions see. Clears the ghost and the
+    /// debounce: a suggestion computed at the old scope is an answer to a
+    /// different question, and leaving it on screen would make the change
+    /// look like it did nothing.
+    pub fn set_scope(&mut self, scope: aperture_complete::scope::Scope, now_ms: u64) {
+        self.scope = scope;
+        self.ghost.dismiss();
+        self.debounce.cancel();
+        self.set_status(&format!("context scope: {} — {}", scope.label(), scope.hint()), now_ms);
     }
 
     pub fn toggle_typewriter(&mut self, now_ms: u64) {
@@ -1711,7 +1726,14 @@ impl AppState {
             return;
         }
         let head = self.editor.sel.head;
-        let before = self.editor.buffer.slice_to_string(0, head);
+        let full_before = self.editor.buffer.slice_to_string(0, head);
+        // SCOPE THE CONTEXT. `before` is everything above the caret; the
+        // scope decides how much of it the model actually sees. Sliced
+        // here rather than inside make_request so the prefix the cache is
+        // keyed on is the prefix that gets sent — the two must not be able
+        // to disagree.
+        let before = full_before[aperture_complete::scope::scope_start(&full_before, self.scope)..]
+            .to_string();
         let after = self.editor.buffer.slice_to_string(head, self.editor.buffer.len_chars());
         let lang = match self.lang {
             Language::Rust => "rust",

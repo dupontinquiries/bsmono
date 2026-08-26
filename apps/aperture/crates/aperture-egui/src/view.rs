@@ -237,16 +237,22 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     // in it focused), so the focus system never sees it. When a pane field
     // IS focused, Tab is left alone and field-hops as any form does.
     let editor_owns_tab = !palette_open && (!state.show_loop_pane || !other_widget_focused);
-    if editor_owns_tab {
-        ui.ctx().input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
-            i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
-        });
-    }
     if !palette_open && !other_widget_focused {
-        // (Clone FIRST: consume_key above strips the event from egui's
-        // queue, and the editor still needs its own copy to indent with.)
+        // CLONE BEFORE CONSUMING — and this ordering is the whole bug the
+        // last two attempts got wrong. `consume_key` REMOVES the event
+        // from egui's queue; that is the point (it stops the focus system
+        // seeing Tab). But the editor reads its keys from this same queue,
+        // so consuming first meant the editor never saw Tab either: it no
+        // longer indented and no longer accepted the ghost. Snapshot the
+        // events, THEN consume from egui's copy. The editor works from the
+        // snapshot; the focus system works from the drained queue.
         let events = ui.ctx().input(|i| i.events.clone());
+        if editor_owns_tab {
+            ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+                i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+            });
+        }
         for ev in events {
             let translated = match ev {
                 egui::Event::Text(t) => Some(Ev::Text(t)),

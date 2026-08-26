@@ -22,6 +22,9 @@ pub mod engine;
 /// layer that keeps identical requests from reaching the model at all.
 pub mod prefixcache;
 pub mod providers;
+/// How much of the file a completion sees — several scopes, planned and
+/// batched together rather than one global budget.
+pub mod scope;
 pub mod route_ai;
 
 /// What the provider sees. `prefix`/`suffix` are already budget-trimmed

@@ -103,6 +103,7 @@ pub enum Cmd {
     ToggleLoopPane,
     ToggleFollow,
     ToggleTypewriter,
+    SetScope(aperture_complete::scope::Scope),
     OlderRevision,
     NewerRevision,
     BranchFromHere,
@@ -113,7 +114,7 @@ pub enum Cmd {
 }
 
 pub fn command_list() -> Vec<(String, Cmd)> {
-    let mut v = vec![
+    let mut v: Vec<(String, Cmd)> = vec![
         ("File: Save".to_string(), Cmd::Save),
         ("File: Open…".to_string(), Cmd::OpenFileMode),
         ("Find: In Project… (Ctrl+Shift+F)".to_string(), Cmd::ProjectSearchMode),
@@ -125,12 +126,22 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("View: Toggle loop pane".to_string(), Cmd::ToggleLoopPane),
         ("View: Toggle follow camera (Ctrl+E)".to_string(), Cmd::ToggleFollow),
         ("View: Typewriter camera (center the caret line)".to_string(), Cmd::ToggleTypewriter),
+    ];
+    // One entry per scope, generated from Scope::ALL so a new variant
+    // cannot be added and silently have no way to reach it.
+    for sc in aperture_complete::scope::Scope::ALL {
+        v.push((
+            format!("AI: Context scope — {} ({})", sc.label(), sc.hint()),
+            Cmd::SetScope(sc),
+        ));
+    }
+    v.extend([
         ("Git: Older revision (Ctrl+,)".to_string(), Cmd::OlderRevision),
         ("Git: Newer revision (Ctrl+.)".to_string(), Cmd::NewerRevision),
         ("Git: Branch from previewed revision (Ctrl+B)".to_string(), Cmd::BranchFromHere),
         ("Git: Materialize previewed revision as a worktree (Ctrl+M)".to_string(), Cmd::MaterializeHere),
         ("Find & Replace (Ctrl+H)".to_string(), Cmd::OpenFindReplace),
-    ];
+    ]);
     for id in PaletteId::all() {
         v.push((format!("Theme: {id:?}"), Cmd::Theme(*id)));
     }
@@ -196,6 +207,7 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
         Cmd::CompleteNow => s.trigger_completion_now(now_ms),
         Cmd::ToggleFollow => s.toggle_follow(now_ms),
         Cmd::ToggleTypewriter => s.toggle_typewriter(now_ms),
+        Cmd::SetScope(sc) => s.set_scope(sc, now_ms),
         Cmd::OlderRevision => s.rev_step(1, now_ms),
         Cmd::NewerRevision => s.rev_step(-1, now_ms),
         Cmd::BranchFromHere => s.branch_from_here(now_ms),
