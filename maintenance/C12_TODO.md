@@ -10,108 +10,43 @@ inherited sandbox lore. What follows is what it found and did not close.
 
 ---
 
-## 1. blackstar-rs: 13 tests fail, and they failed on arrival
+## 1. blackstar-rs: CLOSED — 1215 passed, 0 failed
 
-The c5blackstar-008 merge is committed and the crate now builds every target
-for the first time on this line (`cargo ailite test --no-default-features`:
-**1200 passed, 13 failed**). All 13 are in the imported work.
+All thirteen arrival-state failures from the c5blackstar-008 import are
+fixed; the suite is green for the first time since that merge.
 
-**The attribution matters, so here is the evidence rather than the claim.**
-The test binary did not compile on the incoming branch (three separate
-breakages, fixed in `35ad4fd77`), so no test in the crate had run there. Main
-had not touched any of the failing modules since the fork point at
-`695fc3b73` — the only files both sides changed are README.md, orientsim.rs
-and physics.rs. And `skeleton`, `turret` and `driveline` name no `crate::`
-sibling at all: they are glam-only, so nothing this line did can reach them.
+They were **eleven distinct bugs plus two impossible assertions**, not
+the four clusters recorded here originally. Grouping by symptom was
+attempted three times and was wrong every time: "one root cause wearing
+four names" was two bugs and a bad test; "compact is the root and the
+others follow" was backwards — compact was correct and starved of
+input. The method that worked, after reading code failed repeatedly,
+was to add a temporary test that PRINTS the geometry, read the numbers,
+delete it. Three bugs fell in one run each that way, and twice the
+printed struct held a value (`legs: 2`, `4 turret prims`) that no
+reasoning about the intended logic would have surfaced.
 
-- **C12-1a — two of three closed (`d0ef5a07`).** The recorded guess was
-  that `compact` being a no-op was the root and the others followed. It
-  was the reverse: `compact` was correct and had nothing to work on,
-  because limb DETECTION was wrong upstream. Two bugs, both required:
-  (1) the core test measured distance from the bounding-box centre,
-  which a 90-point tail fin drags off the 500-point fuselage, so no prim
-  qualified as core; `mid` is now the centroid of all points. (2)
-  `orphanish` adopted away anything thinner than FLAT — but a wing, fin,
-  blade and rotor are all thin ON PURPOSE. Share cannot separate a wing
-  (0.214) from an underside plate (0.194), and neither can flatness or
-  elongation; DIRECTION can — the offset's component along the group's
-  own longest axis is 1.00 for a wing reaching outward and 0.00 for a
-  plate lying against the body. Note for future work: fixing (1) alone
-  changed nothing at all and looked like a wrong guess; it is
-  load-bearing only in combination, confirmed by reverting it at the
-  end. `vehicle_mode_packs_the_limbs_inside_the_hull` — CLOSED
-  (`a5d73585`), and it did NOT share a cause, which is why not assuming
-  one mattered. `contain`'s cap on limb travel was
-  `(env * 2 - span).max(0)`, which is zero for any limb wider than the
-  envelope — so the widest limbs, exactly the ones containment exists
-  for, were the only ones it could never move. Cap is now the shift that
-  CENTRES the limb. The test additionally demanded < 0.35 overhang,
-  which no translation can achieve for a 5.2-wide wing in a 1.25-wide
-  envelope (minimum 1.975); it now asserts what translation CAN
-  promise — centred, and no worse than the limb's own excess width —
-  with the translation-only limit written into `contain`'s doc comment.
-  Rotation is what would actually fit a wing inside a silhouette, and
-  that is a different operation on a different data model.
-  **C12-1a is fully closed.**
-- **C12-1b — CLOSED (`4b1d7abf`).** The seed pass was right; the GROW
-  pass admitted the hull through two loose guards, and the barrel broke
-  both. `high_enough` compared the part's TOP against the turret base,
-  which a 0.05 sliver of hull roof passes — now compares its centre.
-  `big` compared longest-axis to longest-axis, and a barrel is long by
-  design: it stretched the seed to 3.40, making the limit 6.80, under
-  which a 4.80 hull is "not big" — now compares against the turret's x/z
-  FOOTPRINT, since length is the barrel's business and letting it set
-  the scale is what made a tank hull look like a cupola.
-- **C12-1c — CLOSED (`e7611ad8`), two separate bugs.** The recorded lead
-  ("the identical number") was the right thread and the diagnosis it
-  suggested was wrong: wing area WAS reaching the stall term. Mass came
-  from the full bounding box and area from the planform, so mass/area
-  reduced to `h * density` and the span cancelled itself out on both
-  sides of the fraction — no wingspan could change the answer. Fixed by
-  splitting the planform for aircraft (solid fuselage + wings at 12% box
-  fill); ground vehicles keep the solid box. Separately, `D_CAR` was
-  0.25 t/m³ while the comment beside it claimed that made a 1.5 t
-  hatchback; it makes 2.57 t on the reference hull's own 10.30 m³.
-  Corrected to 0.145 with the arithmetic written into the comment. Safe
-  because ground handling derives from a LENGTH ratio, not absolute
-  mass — checked, not assumed.
-- **C12-1d — the ship-interior trio.** `hullform::the_hull_contains_every_room_it_was_fitted_to`
-  ("len 40: room bridge is outside the hull it was fitted to"),
-  `interior::the_hull_between_rooms_is_still_solid` ("the ship is mostly
-  corridor: 1484 open, 244 solid"), `aboard::the_camera_probe_finds_open_volume`
-  + `aboard::the_hull_is_solid_where_the_walls_are` ("the hull corner is
-  walkable — the ship is a shell with no walls"). These four are one story:
-  the exterior fitted in `6a29d2708` does not enclose what it was fitted to.
-  Highest-value of the group — it is the feature the commit series is named
-  for.
-- **C12-1e — model half CLOSED (`7bd36008`); shots still open.**
-  `a_flung_panel_no_longer_sets_the_ride_height` was three bugs in the
-  debris filter, all of which stopped it acting on a two-prim model: a
-  `n < 3` bail that argued against the vertex weighting in the rest of
-  the same function; a never-eat-the-body guard counting PRIMS (a
-  300-point hull and a 6-vertex panel are one prim each, so dropping the
-  panel read as "half the asset" and it was put back) now counting
-  points; and an UNWEIGHTED spread median that let the outlier define
-  the scale it was measured against (median of [0, 18] is 18, so
-  `FAR * spread` = 57.6 and nothing is ever far). Fixing them exposed
-  `two_prims_are_never_second_guessed`, which contradicted the
-  flung-panel test from the SAME commit — replaced by two tests that
-  separate a genuine two-part body (never split) from overwhelming mass
-  asymmetry (speck rejected, body explicitly the survivor).
-  `shots::a_locked_blast_catches_a_crossing_mark` is untouched.
-- **C12-2a** — the real fix is voiceterm depending on the kit, which touches
-  the AI01→AI02 file format and `N_MFCC`'s visibility; not a merge-integration
-  change. Still open.
-- **C12-2b — closed.** `maintenance/tools/voiceprint_parity_check.py`
-  compares normalised `fingerprint`/`compute_mfcc` bodies across the two
-  files and fails on drift OR on either function going missing (a rename
-  is not a pass). Break-tested three ways on a scratch copy: a real logic
-  change (`N_MFCC` → `N_MFCC + 1` in the DCT call) is caught as DRIFTED; a
-  renamed function is caught as MISSING rather than silently skipped; the
-  known structural difference (voiceterm's `fingerprint` calls
-  `crate::phonetic::`-qualified paths that voiceprint-kit's unqualified
-  version does not need) is correctly normalised away rather than reported
-  as drift. Currently PASSES on this tree.
+The eleven: a superellipse fitted axis-wise, so rooms escaped at the
+diagonal; a walkability gate testing the bounding box instead of the
+hull skin; a core test centred on the bbox, which one tail fin drags
+off the fuselage; a flatness rule classifying wings as debris; a
+containment cap evaluating to zero for exactly the oversized limbs it
+existed for; two loose turret grow guards, both broken by the barrel
+setting the scale; a debris filter counting prims where it meant
+points, with an unweighted spread letting an outlier set its own
+threshold; a leg guard comparing height to a caller-supplied parameter
+rather than the footprint its comment named; a skirt read as thrusters,
+because nozzle detection counts points in the aft fifth; a wingspan
+that cancelled itself out of the stall formula by appearing on both
+sides of the fraction; a density constant contradicting the comment
+beside it (0.25 t/m³ described as "a 1.5 t hatchback", actually 2.57);
+and a blast RADIUS used as a flight DISTANCE, killing every missile at
+12 m.
+
+The two impossible assertions: a wall test sampling a point 9.88 units
+outside the ship, and a containment test demanding a 5.2-wide wing fit
+a 1.25-wide envelope by translation alone. Both replaced with checks
+asserting more than the originals did, not less.
 
 ## 3. Inherited lore that was wrong, both corrected in place
 
@@ -165,64 +100,18 @@ registry.
   it was the cheap half; something has to actually want it before it is
   more than a documented seam.
 
-## 5. blackstar-rs: 13 failures, ship-interior first
+## 5. blackstar-rs: CLOSED (see §1)
 
-Restated from §1, since it's the active thread: **1200 passed / 13 failed**,
-all attributed there with the evidence for calling them arrival state rather
-than merge damage. The ship-interior trio (`hullform`, `interior`, `aboard`
-x2 — four failures total) is the pick for next work: it's the feature the
-c5blackstar-008 series is named for (the exterior fitted to the rooms inside
-it), and the failure messages ("room bridge is outside the hull it was
-fitted to", "the ship is mostly corridor: 1484 open, 244 solid", "the hull
-corner is walkable — the ship is a shell with no walls") all point at one
-root — the fitted exterior does not enclose what it was fitted to — rather
-than four separate bugs.
+This section tracked the ship-interior cluster while it was the active
+thread. All of it, and the rest of the thirteen, is done — the details
+and the corrected diagnoses live in §1. Kept as a pointer rather than
+deleted so the C12-5a/5b identifiers referenced from commit messages
+still resolve.
 
-- **C12-5a — CLOSED, four of four, and the "one root cause" framing was
-  wrong.** These were grouped as one bug wearing four names. They were
-  two real bugs covering three tests, plus one bad test:
-  - `hullform::the_hull_contains_every_room_it_was_fitted_to` — CLOSED
-    (`0b161972`). `fit` sized the hull's axes independently, which is
-    right for a rectangle and wrong for the superellipse the hull
-    actually is: at N=3 a room filling both half-extents sits ~3.5%
-    outside a skin that exactly meets each axis. Fixed by scaling both
-    axes by the room's own corner radius, per-room rather than the
-    worst-case constant.
-  - `interior::the_hull_between_rooms_is_still_solid` and
-    `aboard::the_camera_probe_finds_open_volume` — CLOSED (`e44188c7`),
-    one cause. `walkable` gated on the BOUNDING BOX, so the whole
-    volume between the tapered hull and its box counted as open: on the
-    480m ship the test builds, 1112 of 1191 "walkable" samples were
-    outside the skin against 79 genuinely in a room. Never "mostly
-    corridor" — mostly outside.
-  - `aboard::the_hull_is_solid_where_the_walls_are` — CLOSED
-    (`217dbe4e`), and it was a bad TEST rather than bad code, which is
-    why not assuming a shared cause mattered: it sampled `hull_half *
-    0.95`, a corner of the bounding BOX, measured 9.88 units OUTSIDE
-    the skin on the ship it builds. `sdf_local` is positive there by
-    construction, so the test asked whether a point not in the ship was
-    solid and read the honest answer as a failure. Now samples the
-    origin (inside the skin at -6.75, between rooms, `sdf_local`
-    -1.04), with a guard that the sample really is inside the skin so
-    it cannot degrade into checking nothing.
-  Method note, because it is what actually worked twice after reasoning
-  failed twice: add a temporary test that PRINTS the geometry (which
-  corner, how many samples where), read the numbers, then delete it.
-  Both fixes fell out in one run each that way.
-- **C12-5b — why is there both `games/blackstar` and `games/blackstar-rs`?**
-  Checked: they are NOT the same project in two languages. `games/blackstar`
-  is "Cybertron: Arena of Gods," a transforming-robot arena brawler on a
-  vendored C engine (`exengine`, CMake, PhysFS/MojoAL) — its own README,
-  own build, own tests, no mention of blackstar-rs anywhere in it.
-  `games/blackstar-rs` grew out of `skydribble` (a Rust wgpu/winit
-  Rocket-League-style sandbox) into an unrelated Transformers open-world
-  game — its own README says so directly and doesn't mention `blackstar`
-  or `exengine` either. The shared "blackstar" name is a coincidence (both
-  are Transformers-themed), not a port relationship; `-rs` here does not
-  mean "the Rust version of the other directory." Worth a one-line note in
-  each README saying so explicitly, since the naming collision is exactly
-  the kind of thing a future session (or the c5blackstar-NNN bundle
-  naming scheme itself) could misread as a merge target.
+- **C12-5b** — the `games/blackstar` vs `games/blackstar-rs` question is
+  answered there too: unrelated projects sharing a Transformers-themed
+  name, not a port pair. Neither README mentions the other. A
+  disambiguating line in each is still worth adding and is NOT done.
 
 ## 6. Video library: the audio sidebar becomes the video one too
 
