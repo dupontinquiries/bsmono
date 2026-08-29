@@ -1549,6 +1549,29 @@ and the client.
   construct a `Life`, pass it to `serve_unix_tracked`, or spawn the
   janitor — so the policy is wired to the server and the server is not
   yet wired to the binary.
+
+- **C12-30c — CORRECTION to §30's own recommendation.** I wrote that the
+  daemon "owns the weights and the pipeline/autotune caches — the
+  expensive shareable things". The autotune cache is already shared
+  WITHOUT a daemon: `store::cache_root()` is
+  `$XDG_DATA_HOME/logscope/int8cache` (override `LOGSCOPE_CACHE_DIR`),
+  per-user and process-independent, and the startup log names the file
+  it writes there. Two apps on one machine already hit the same cache;
+  the second pays the 0.6s probe once and never again.
+
+  So the daemon's case rests on the WEIGHTS — 7.2 GiB resident, 86s to
+  load — plus the in-process pipeline warm-up, which IS duplicated per
+  process. Still overwhelming, but ONE reason rather than two. Worth
+  being exact about: "it shares the caches too" is the kind of claim
+  someone leans on when the memory argument does not apply — a small
+  model on a large machine — and it would be wrong there.
+
+  The general form, which is the reusable part: **state that is already
+  a file in a user-level directory is shared by construction; only
+  state held in a process needs a process to share it.** Weights are
+  resident memory. Autotune results are a file. That distinction, not
+  "expensive things", is what decides whether a daemon earns its
+  keep.
 - **C12-30b — DONE, and built before the daemon on purpose.**
   `Reach::{Daemon, InProcess}` plus `resolve(order, daemon, in_process)`:
   try each in order, take the first that constructs, report which one
