@@ -827,6 +827,19 @@ Build would believe the wrong thing about their own network. That rule
 lives in the flow, not a screen, so no UI can offer what the flow would
 not.
 
+- **C12-23e — CLOSED (`b3d4fd3f`), and it was a live defect.** Taking
+  the flow's rule and checking whether the existing UI obeyed it found
+  that it did not: the Models tab granted `Trust::Compute` — "sees
+  prompts and replies" — from a typed machine id, which carries no key.
+  Its comment argued that Compute was safe because it is not the
+  strongest level, but the meaningful line in `Trust` is between Build
+  and Compute (source vs conversation), not between Compute and
+  Handoff. Now caps at Build, with the status line saying what that
+  means. Pinned as an inequality (`may_grant(false) < Trust::Compute`)
+  so it survives a level being inserted later. Worth repeating as a
+  method: writing the rule down as testable code and then AUDITING the
+  paths that predate it is what surfaced this — the flow itself was
+  never wrong.
 - **C12-23b — no UI renders `adddevice` yet.** The state machine and its
   prompts exist; nothing draws them. This is the actual "device add
   workflow UI/UX" ask and it is now a rendering job rather than a design
