@@ -426,10 +426,20 @@ pub fn compact(sk: &Skeleton, prim_count: usize, factor: f32) -> Vec<Vec3> {
 /// bounding box with parts stuck to it rather than a vehicle.
 ///
 /// So this does not shorten by a ratio, it CONTAINS: every prim is pulled
-/// until its own bounds sit inside the hull envelope, which is the core's
-/// box grown by `slack` and no further. A prim already inside does not
-/// move at all, which is the important half — a car whose parts are where
-/// they belong is untouched, and only what pokes out gets pulled in.
+/// as far inside the hull envelope as TRANSLATION can put it, the
+/// envelope being the core's box grown by `slack` and no further. A prim
+/// already inside does not move at all, which is the important half — a
+/// car whose parts are where they belong is untouched, and only what
+/// pokes out gets pulled in.
+///
+/// WHAT THIS CANNOT DO, because it only moves things: a limb WIDER than
+/// the envelope cannot be made to fit inside it. The jet's wing spans 5.2
+/// against a 1.25-wide envelope, so the best any translation achieves is
+/// centring it — 1.98 of overhang on each side instead of 3.95 out one
+/// side. Fitting that wing inside the silhouette needs it ROTATED (a real
+/// fold: swing-wings hinge, they do not slide), which is a different
+/// operation on a different data model and is not what this function
+/// promises.
 ///
 /// The envelope is the CORE's box rather than the whole body's, because
 /// the whole body's box is exactly the thing the appendages defined: using
@@ -458,10 +468,22 @@ pub fn contain(sk: &Skeleton, prims: &[&[Vec3]], slack: f32) -> Vec<Vec3> {
         let over_hi = (hi - ehi).max(Vec3::ZERO);
         let over_lo = (elo - lo).max(Vec3::ZERO);
         let mut shift = over_lo - over_hi;
-        // never push a limb THROUGH the body: cap the pull at the distance
-        // to the core centre, or a long wing crosses to the far side
-        let span = hi - lo;
-        let cap = (env * 2.0 - span).max(Vec3::ZERO);
+        // Never push a limb THROUGH the body — but the cap has to be the
+        // shift that CENTRES it, not `envelope - span`. For any limb WIDER
+        // than the envelope that formula is zero, so the pull is clamped
+        // to nothing and the limb does not move at all: on the test jet
+        // the envelope is 1.25 across and a wing spans 5.2, so cap.x = 0
+        // and the widest limbs — exactly the ones containment is for —
+        // were the only ones it could never touch.
+        //
+        // Centring is the real limit. It is the furthest a limb can travel
+        // while still being pulled toward the body rather than past it, it
+        // is never zero, and for an oversized limb it splits the overhang
+        // evenly instead of driving one end out the far side (measured on
+        // the jet's wing: 1.98 each side, against 3.95 out one side if the
+        // raw shift is applied uncapped).
+        let centre_shift = sk.core_centre - (lo + hi) * 0.5;
+        let cap = centre_shift.abs();
         shift = shift.clamp(-cap, cap);
         if shift.length_squared() < 1e-8 {
             continue;
@@ -545,12 +567,36 @@ mod tests {
             let out_hi = (hi - (sk.core_centre + env)).max_element();
             let out_lo 
                 = ((sk.core_centre - env) - lo).max_element();
+            // What containment can promise for an oversized limb is
+            // CENTRING, not fitting: a 5.2-wide wing does not go inside a
+            // 1.25-wide envelope by being moved, only by being rotated,
+            // which `contain` does not do and does not claim to. So the
+            // check is that the limb is centred — the overhang is even on
+            // both sides and no worse than half its excess width — rather
+            // than a fixed slack that no translation could ever reach.
+            // PER-AXIS. The wing is wide in x while the envelope is
+            // largest in z, so comparing the two maxima compares
+            // different axes and reports no excess at all — my first
+            // version did exactly that and computed 0.00 for a limb
+            // overhanging by 1.96.
+            let span = hi - lo;
+            let excess = ((span - env * 2.0) * 0.5).max(Vec3::ZERO).max_element();
+            let allow = excess + 0.35;
             assert!(
-                out_hi < 0.35 && out_lo < 0.35,
-                "prim {i} still pokes out by {:.2}/{:.2} after containment",
+                out_hi < allow && out_lo < allow,
+                "prim {i} pokes out by {:.2}/{:.2}, more than its {:.2} excess allows",
                 out_hi,
-                out_lo
+                out_lo,
+                excess
             );
+            if excess > 0.35 {
+                assert!(
+                    (out_hi - out_lo).abs() < 0.35,
+                    "prim {i} is not centred: {:.2} one side, {:.2} the other",
+                    out_hi,
+                    out_lo
+                );
+            }
         }
     }
 
