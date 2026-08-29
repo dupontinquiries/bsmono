@@ -74,11 +74,8 @@ fn tbtn(ui: &mut egui::Ui, label: &str) -> bool {
     let accent = unendlich_ui::current_theme(ui.ctx()).accent;
     unendlich_ui::button(ui, label, accent).clicked()
 }
-#[cfg(feature = "ui-overlay")]
-fn tbtn_sized(ui: &mut egui::Ui, label: &str, w: f32, h: f32) -> bool {
-    let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-    unendlich_ui::button_sized(ui, label, accent, egui::vec2(w, h)).clicked()
-}
+// tbtn_sized moved to app::live_menu::pause_button with the pause body
+// (r-extract) — one implementation, drawn in-game and headless alike.
 
 impl From<vk::Result> for WorldRenderError {
     fn from(r: vk::Result) -> Self { WorldRenderError::Vulkan(r) }
@@ -3755,29 +3752,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         .title_bar(false)
                         .show(c, |ui| {
                             unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
-                            ui.set_min_width(300.0);
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new("unendlich")
-                                        .size(30.0)
-                                        .strong(),
-                                );
-                                ui.label(egui::RichText::new("\u{2014} paused \u{2014}").size(13.0).weak());
-                                ui.weak("menu build r171"); // r170: stale-binary detector
-                                ui.add_space(14.0);
-                                if tbtn_sized(ui, "Resume", 220.0, 32.0) { pause_pick = 1; }
-                                ui.add_space(6.0);
-                                if tbtn_sized(ui, "Settings", 220.0, 32.0) { pause_pick = 2; }
-                                ui.add_space(6.0);
-                                // r533: change character WITHOUT leaving the world — the
-                                // selector was previously only on the title screen.
-                                if tbtn_sized(ui, "Character", 220.0, 32.0) { open_character_local = true; }
-                                ui.add_space(6.0);
-                                ui.separator();
-                                ui.add_space(6.0);
-                                if tbtn_sized(ui, "Save & Quit to Title", 220.0, 32.0) { pause_pick = 3; }
-                            });
+                            // r-extract: pause body lives in app::live_menu
+                            // (headless-snapshotable, tested) — this window
+                            // is chrome + output mapping only.
+                            let p = crate::app::live_menu::pause_menu_body(ui, "menu build r171");
+                            if p.pick != 0 { pause_pick = p.pick; }
+                            if p.open_character { open_character_local = true; }
                         });
                 }
                 // r169: shared sparkline subcomponent (settings·video +

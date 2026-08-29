@@ -30,15 +30,21 @@ Vec<menu::Row>` builder, (b) a `match` on `menu::Event` applying results,
 (c) draw via `ui::menu_cmds`, mouse/touch via `ui::menu_hit`. Delete the
 screen's private sel/scroll/key-branch/draw quadruplet as it lands.
 
-1. **Pause** — currently 5 buttons + hotkeys, NO arrow-key navigation at all
-   (`hud::PAUSE_BTNS`/`hit_pause_btn`, hotkeys in `key_down` ~4665, taps at
-   ~3831). Migration ADDS arrow-nav to it for free. Keep Esc/Tab-resume and
-   the g/o/q hotkeys as fast paths that synthesize the same Events.
-2. **Maps** — `maps_key` + `MAPS_TOP`/`maps_row_h` geometry. The blocker
-   (draw-vs-hit split) is already fixed by `menu_rows`; this is the
-   demonstration that the fix pays.
-3. **Online** — same shape as Maps, plus the "row ≥ 2 activates" special case
-   becomes plain `Item::Action` rows.
+1. **Pause** — ✅ DONE (2026-08-29): arrow-nav added the lightweight way
+   (`Mode::Pause { sel }`, shared `pause_activate`, cyan keyboard rail) —
+   Pause is a horizontal button bar, not a list, so it got nav without being
+   forced into `menu.rs`'s vertical row model.
+2. **Maps** — AUDITED, STAYS BESPOKE (2026-08-29): each row carries real art
+   (grass/accent swatches of the map style, current-map marker, nets tags,
+   gold selected edge) that generic `menu_cmds` rows would erase, and its
+   input side already has wrap-nav, scroll, shared mouse + touch. Migrating
+   it would trade art for process. The draw-vs-hit geometry fix that once
+   blocked it (`menu_rows`/`menu_hit`) still stands available if its layout
+   ever simplifies.
+3. **Online** — the TRUE next migration: six generic rows (name, friend,
+   host, join, leave, back), no bespoke art, the exact shape `menu.rs` was
+   built for; the "row ≥ 2 activates" special case becomes plain
+   `Item::Action` rows.
 4. **Tweaks** — the big one, but `tweak_rows()` is ALREADY data-driven
    (Slider/Toggle rows with get/set fns); it maps ~1:1 onto `menu::Item`.
    The touch slider-scrub (`tscrub`/`bar_t`) must keep working: route the

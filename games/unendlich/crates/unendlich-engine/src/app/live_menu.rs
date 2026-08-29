@@ -145,6 +145,65 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
     }
 }
 
+/// What the pause menu decided this frame. `pick` uses the bin's r167 codes:
+/// 0 nothing, 1 Resume, 2 Settings, 3 Save & Quit to Title.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PauseOut {
+    pub pick: u8,
+    pub open_character: bool,
+}
+
+/// The pause menu's button — faithful to the original `tbtn_sized` art
+/// (kit `button_sized` at exactly 220×32; labels here are short and fixed,
+/// so no capping is needed).
+fn pause_button(ui: &mut egui::Ui, label: &str) -> bool {
+    #[cfg(feature = "unendlich-ui")]
+    {
+        let accent = unendlich_ui::current_theme(ui.ctx()).accent;
+        unendlich_ui::button_sized(ui, label, accent, egui::vec2(220.0, 32.0)).clicked()
+    }
+    #[cfg(not(feature = "unendlich-ui"))]
+    {
+        ui.add_sized([220.0, 32.0], egui::Button::new(label)).clicked()
+    }
+}
+
+/// The in-world PAUSE menu body (Esc), extracted from the renderer window
+/// like [`live_menu_body`] — same contract: the caller owns the window
+/// chrome, this is the content, drawn identically in-game and headless.
+/// `build_tag` is the r170 stale-binary detector line.
+pub fn pause_menu_body(ui: &mut egui::Ui, build_tag: &str) -> PauseOut {
+    let mut out = PauseOut::default();
+    ui.set_min_width(300.0);
+    ui.vertical_centered(|ui| {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("unendlich").size(30.0).strong());
+        ui.label(egui::RichText::new("\u{2014} paused \u{2014}").size(13.0).weak());
+        ui.weak(build_tag); // r170: stale-binary detector
+        ui.add_space(14.0);
+        if pause_button(ui, "Resume") {
+            out.pick = 1;
+        }
+        ui.add_space(6.0);
+        if pause_button(ui, "Settings") {
+            out.pick = 2;
+        }
+        ui.add_space(6.0);
+        // r533: change character WITHOUT leaving the world — the selector
+        // was previously only on the title screen.
+        if pause_button(ui, "Character") {
+            out.open_character = true;
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+        if pause_button(ui, "Save & Quit to Title") {
+            out.pick = 3;
+        }
+    });
+    out
+}
+
 /// Draw the title-menu body (hero title + the current screen) and return what
 /// was clicked. The caller owns the window/frame chrome (glass, fresnel,
 /// anchoring); this is the CONTENT — the part worth photographing and testing.
@@ -486,6 +545,25 @@ mod tests {
                 "screen kind {kind} produced no shapes — the menu did not draw"
             );
         }
+    }
+
+    /// The pause menu draws headless with a default (no-click) outcome —
+    /// same guarantee as the title screens, for the same reason.
+    #[test]
+    fn pause_menu_draws_headless_with_no_outputs() {
+        let ctx = test_ctx();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(720.0, 520.0),
+        ));
+        let out = ctx.run(input, |c| {
+            egui::CentralPanel::default().show(c, |ui| {
+                let p = pause_menu_body(ui, "menu build test");
+                assert_eq!(p, PauseOut::default(), "no clicks → no outputs");
+            });
+        });
+        assert!(!out.shapes.is_empty(), "the pause menu drew nothing");
     }
 
     /// Empty lists must not panic and must show their placeholder states.

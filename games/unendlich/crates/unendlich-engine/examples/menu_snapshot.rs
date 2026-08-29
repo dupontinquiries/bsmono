@@ -39,6 +39,7 @@ fn main() {
         "#4 · crafting · 9m ago · 12 chunks".to_string(),
         "#3 · long travel · 21m ago · 30 chunks".to_string(),
     ];
+    render_pause("/mnt/user-data/outputs/menu_live_pause.png");
     for (kind, name) in [
         (0u8, "live_title"),
         (1, "live_confirm_quit"),
@@ -48,6 +49,16 @@ fn main() {
     ] {
         render_live(kind, &mp, &worlds, &rb, &format!("/mnt/user-data/outputs/menu_{name}.png"));
     }
+}
+
+fn render_pause(out: &str) {
+    render_with(out, |c| {
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
+        egui::CentralPanel::default().show(c, |ui| {
+            let _ = unendlich_engine::app::live_menu::pause_menu_body(ui, "menu build snapshot");
+        });
+    });
 }
 
 fn render_live(kind: u8, mp: &[String], worlds: &[String], rb: &[String], out: &str) {
