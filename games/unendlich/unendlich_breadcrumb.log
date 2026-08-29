@@ -1,53 +1,44 @@
 --- unendlich breadcrumbs (fsync'd; LAST line = last stage reached before any crash) ---
-1788044127062 #0 main: startup
-1788044129412 #1 gpu: creating Vulkan context (instance + physical device + queues)
-1788044129422 #2 gpu: Vulkan context ready
-1788044129422 #3 gpu: creating WorldRenderer (Vulkan device/swapchain/pipelines)
-1788044129903 #4 gpu: WorldRenderer ready
-1788044131391 #5 gpu: first frame presented OK
-1788044132367 #6 gpu: first frame presented OK
-1788044134413 #7 gpu: first frame presented OK
-1788044135511 #8 gpu: first frame presented OK
-1788044137036 #9 gpu: first frame presented OK
-1788044138174 #10 gpu: first frame presented OK
-1788044139463 #11 gpu: first frame presented OK
-1788044140772 #12 gpu: first frame presented OK
-1788044141959 #13 gpu: first frame presented OK
-1788044143137 #14 gpu: first frame presented OK
-1788044144355 #15 gpu: first frame presented OK
-1788044145535 #16 gpu: first frame presented OK
-1788044146763 #17 gpu: first frame presented OK
-1788044147943 #18 gpu: first frame presented OK
-1788044149087 #19 gpu: first frame presented OK
-1788044150244 #20 gpu: first frame presented OK
-1788044151392 #21 gpu: first frame presented OK
-1788044152517 #22 gpu: first frame presented OK
-1788044153764 #23 gpu: first frame presented OK
-1788044155146 #24 gpu: first frame presented OK
-1788044156321 #25 gpu: first frame presented OK
-1788044157512 #26 gpu: first frame presented OK
-1788044158757 #27 gpu: first frame presented OK
-1788044160087 #28 gpu: first frame presented OK
-1788044162216 #29 gpu: first frame presented OK
-1788044163384 #30 gpu: first frame presented OK
-1788044164403 #31 gpu: first frame presented OK
-1788044165567 #32 gpu: first frame presented OK
-1788044166636 #33 gpu: first frame presented OK
-1788044167826 #34 gpu: first frame presented OK
-1788044169247 #35 gpu: first frame presented OK
-1788044170659 #36 gpu: first frame presented OK
-1788044172077 #37 gpu: first frame presented OK
-1788044173594 #38 gpu: first frame presented OK
-1788044175080 #39 gpu: first frame presented OK
-1788044176505 #40 gpu: first frame presented OK
-1788044177939 #41 gpu: first frame presented OK
-1788044179442 #42 gpu: first frame presented OK
-1788044180807 #43 gpu: first frame presented OK
-1788044182088 #44 gpu: first frame presented OK
-1788044182967 #45 gpu: first frame presented OK
-1788044184797 #46 gpu: first frame presented OK
-1788044187182 #47 gpu: first frame presented OK
-1788044188303 #48 gpu: first frame presented OK
-1788044189454 #49 gpu: first frame presented OK
-1788044190631 #50 gpu: first frame presented OK
-1788044191809 #51 gpu: first frame presented OK
+1788045306459 #0 main: startup
+1788045308892 #1 gpu: creating Vulkan context (instance + physical device + queues)
+1788045308902 #2 gpu: Vulkan context ready
+1788045308903 #3 gpu: creating WorldRenderer (Vulkan device/swapchain/pipelines)
+1788045309387 #4 gpu: WorldRenderer ready
+1788045310984 #5 gpu: first frame presented OK
+1788045311981 #6 gpu: first frame presented OK
+1788045313682 #7 gpu: first frame presented OK
+1788045314857 #8 gpu: first frame presented OK
+1788045316159 #9 gpu: first frame presented OK
+1788045317868 #10 gpu: first frame presented OK
+1788045321872 #11 gpu: first frame presented OK
+1788045322727 #12 gpu: first frame presented OK
+1788045324565 #13 gpu: first frame presented OK
+1788045326989 #14 gpu: first frame presented OK
+1788045328631 #15 gpu: first frame presented OK
+1788045330920 #16 gpu: first frame presented OK
+1788045332783 #17 gpu: first frame presented OK
+1788045334860 #18 gpu: first frame presented OK
+1788045336916 #19 gpu: first frame presented OK
+1788045339356 #20 gpu: first frame presented OK
+1788045340972 #21 gpu: first frame presented OK
+1788045344009 #22 gpu: first frame presented OK
+1788045347305 #23 gpu: first frame presented OK
+1788045351067 #24 gpu: first frame presented OK
+1788045354629 #25 gpu: first frame presented OK
+1788045358103 #26 gpu: first frame presented OK
+1788045361194 #27 gpu: first frame presented OK
+1788045364447 #28 gpu: first frame presented OK
+1788045367657 #29 gpu: first frame presented OK
+1788045371297 #30 gpu: first frame presented OK
+1788045374212 #31 gpu: first frame presented OK
+1788045377942 #32 gpu: first frame presented OK
+1788045381158 #33 gpu: first frame presented OK
+1788045383433 #34 gpu: first frame presented OK
+1788045386250 #35 gpu: first frame presented OK
+1788045389353 #36 gpu: first frame presented OK
+1788045391414 #37 gpu: first frame presented OK
+1788045393515 #38 gpu: first frame presented OK
+1788045395626 #39 gpu: first frame presented OK
+1788045397754 #40 gpu: first frame presented OK
+1788045399869 #41 gpu: first frame presented OK
+1788045402058 #42 gpu: first frame presented OK

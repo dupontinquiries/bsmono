@@ -11035,7 +11035,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         Some(c) => c,
                         None => continue, // not yet generated
                     };
-                    let chunk_ver = chunk.version;
+                    let chunk_ver = chunk_manager.effective_version(coord, chunk.version); // r599: virtual transition bump
 
                     // r703: FULLY-BURIED chunk cull (moved here from the submission
                     // site so buried chunks never consume candidate budget). If this
@@ -11137,7 +11137,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     Some(c) => c,
                     None => continue,
                 };
-                let chunk_ver = chunk.version;
+                let chunk_ver = chunk_manager.effective_version(coord, chunk.version); // r599: virtual transition bump
                 let needs_submit = match renderer.mesh_or_empty_version_for_lod(coord, lod) {
                     None => true,
                     Some(r) => r != chunk_ver,

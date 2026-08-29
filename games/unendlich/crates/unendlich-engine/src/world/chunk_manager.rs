@@ -107,6 +107,35 @@ pub fn transition_remesh_due(coord: ChunkCoord, tick: u64, stride: u64) -> bool 
     tick % stride == phase
 }
 
+/// r599 (clone-free transition remesh): how many remesh events
+/// `transition_remesh_due` has fired for `coord` in ticks `1..=tick` — a
+/// monotone counter that steps exactly when `due` is true, with the same
+/// per-coord phase. Added to a transitioning chunk's reported version, it
+/// makes the mesh scheduler see the chunk as stale on the same cadence the
+/// old sweep re-meshed it — WITHOUT the deep chunk clone the sweep paid per
+/// event. Pure + deterministic.
+#[inline]
+pub fn transition_remesh_count(coord: ChunkCoord, tick: u64, stride: u64) -> u64 {
+    if tick == 0 {
+        return 0;
+    }
+    if stride <= 1 {
+        return tick;
+    }
+    let h = (coord.x as i64).wrapping_mul(73_856_093)
+        ^ (coord.y as i64).wrapping_mul(19_349_663)
+        ^ (coord.z as i64).wrapping_mul(83_492_791);
+    let phase = (h as u64) % stride;
+    // Count of t in [1, tick] with t % stride == phase.
+    if phase == 0 {
+        tick / stride
+    } else if tick >= phase {
+        (tick - phase) / stride + 1
+    } else {
+        0
+    }
+}
+
 /// Whether a chunk is entirely empty sky and can be skipped from the load set.
 /// `surface_target` is the 2D-estimated terrain elevation (blocks) at the
 /// chunk's column; `chunk_y` is the chunk coordinate's Y; `margin_chunks` is
@@ -1562,32 +1591,18 @@ impl ChunkManager {
         // For 2a, per-tick re-mesh is the simplest path that gives
         // visible smooth transitions without shader work.
         if !self.chunks_with_transitions.is_empty() {
+            // r599: CLONE-FREE. The old sweep deep-cloned every due chunk
+            // (blocks Vec + metadata) purely to bump version+dirty so the
+            // mesh scheduler would re-run — the transition-set stutter. The
+            // version bump is now VIRTUAL: `effective_version` adds
+            // `transition_remesh_count` (same cadence, same phase) to a
+            // transitioning chunk's reported version at read time, so the
+            // scheduler sees staleness on the identical schedule with zero
+            // clones, zero Arc churn, zero apply-phase work here. This block
+            // only advances the clock and prunes evicted coords.
             self.transition_remesh_tick = self.transition_remesh_tick.wrapping_add(1);
-            let tick = self.transition_remesh_tick;
-            let stride = self.transition_remesh_stride;
-            // Clone-collect to avoid borrowing self twice (the get_mut
-            // below also borrows self via self.chunks).
-            let coords: Vec<ChunkCoord> =
-                self.chunks_with_transitions.iter().copied().collect();
-            for coord in coords {
-                // Stride gate: re-mesh each transitioning chunk every `stride`
-                // ticks, phase-offset by coord so the per-tick remesh count is
-                // ~1/stride of the transition set spread evenly (no bursts).
-                // stride==1 → always true → original every-tick behavior.
-                if !transition_remesh_due(coord, tick, stride) {
-                    continue;
-                }
-                if let Some(mut entry) = self.chunks.get_mut(&coord) {
-                    // clone_for_edit already bumps version + sets dirty.
-                    // We don't need to call bump_version_only afterwards.
-                    let new_chunk = entry.value().clone_for_edit();
-                    *entry = Arc::new(new_chunk);
-                } else {
-                    // Chunk was evicted while transitioning. Remove
-                    // from the index so we don't keep trying.
-                    self.chunks_with_transitions.remove(&coord);
-                }
-            }
+            self.chunks_with_transitions
+                .retain(|c| self.chunks.contains_key(c));
         }
 
         // Stash the per-handler timing for the diagnostic log to read.
@@ -2265,6 +2280,31 @@ impl ChunkManager {
         self.chunks.get(&coord).map(|r| Arc::clone(r.value()))
     }
 
+    /// r599: the version the MESH SCHEDULER should compare against — the
+    /// chunk's stored version plus the virtual transition-remesh counter for
+    /// chunks with active transitions (see `transition_remesh_count`). For
+    /// everything else this is exactly `base_version`. The submit path reads
+    /// versions through this so transitioning chunks re-mesh on the stride
+    /// cadence without the old per-event deep clone.
+    pub fn effective_version(&self, coord: ChunkCoord, base_version: u64) -> u64 {
+        if self.chunks_with_transitions.contains(&coord) {
+            base_version.wrapping_add(transition_remesh_count(
+                coord,
+                self.transition_remesh_tick,
+                self.transition_remesh_stride,
+            ))
+        } else {
+            base_version
+        }
+    }
+
+    /// r599 test hook: mark a coord as transitioning without walking the
+    /// full block-edit apply path.
+    #[cfg(test)]
+    pub(crate) fn test_mark_transitioning(&mut self, coord: ChunkCoord) {
+        self.chunks_with_transitions.insert(coord);
+    }
+
     /// Read the block at a world position. Returns Air if the chunk
     /// containing it isn't loaded.
     pub fn block_at(&self, world_x: i32, world_y: i32, world_z: i32) -> BlockId {
@@ -2625,6 +2665,67 @@ mod tests {
     use crate::world::chunk::Chunk;
     use crate::world::biomes::Biome;
     use crate::world::terrain_generator::TerrainGenerator;
+
+    #[test]
+    /// r599: the virtual counter steps exactly when `due` fires — same
+    /// cadence, same phase — so the clone-free path re-meshes on the old
+    /// sweep's schedule.
+    #[test]
+    fn transition_count_matches_due_cadence() {
+        for &stride in &[1u64, 2, 3, 5, 8] {
+            for cx in -3..=3 {
+                let c = ChunkCoord::new(cx, cx * 2, -cx);
+                let mut expect = 0u64;
+                for tick in 1..=64u64 {
+                    if transition_remesh_due(c, tick, stride) {
+                        expect += 1;
+                    }
+                    assert_eq!(
+                        transition_remesh_count(c, tick, stride),
+                        expect,
+                        "coord {c:?} stride {stride} tick {tick}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// r599: a transitioning chunk's EFFECTIVE version advances on the stride
+    /// cadence while the chunk itself is NEVER cloned (same Arc pointer, same
+    /// stored version) — the whole point of the clone-free sweep.
+    #[test]
+    fn transitioning_chunk_gets_virtual_bumps_without_cloning() {
+        let mgr = make_manager();
+        let coord = ChunkCoord::new(0, 0, 0);
+        insert_chunk_at(&mgr, coord);
+        // tick_simulation early-returns without a ticks registry — install an
+        // empty one so the transition clock actually runs in this test.
+        let mut mgr = mgr.with_ticks(std::sync::Arc::new(
+            crate::world::ticks::TickRegistry::new(),
+        ));
+        mgr.test_mark_transitioning(coord);
+        let before = mgr.get_chunk(coord).unwrap();
+        let base = before.version;
+        let v0 = mgr.effective_version(coord, base);
+        // Drive several sim ticks (each advances the transition clock since
+        // the set is non-empty).
+        for _ in 0..8 {
+            mgr.tick_simulation(0.6);
+        }
+        let after = mgr.get_chunk(coord).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "clone-free: the chunk Arc must be UNTOUCHED by the transition clock"
+        );
+        assert_eq!(after.version, base, "stored version untouched");
+        let v1 = mgr.effective_version(coord, after.version);
+        assert!(v1 > v0, "effective version must advance for a transitioning chunk ({v0} -> {v1})");
+        // A non-transitioning neighbour reports its base version verbatim.
+        let other = ChunkCoord::new(1, 0, 0);
+        insert_chunk_at(&mgr, other);
+        let oc = mgr.get_chunk(other).unwrap();
+        assert_eq!(mgr.effective_version(other, oc.version), oc.version);
+    }
 
     #[test]
     fn transition_stride_one_always_remeshes() {

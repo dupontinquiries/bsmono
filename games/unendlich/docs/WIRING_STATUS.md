@@ -11940,3 +11940,15 @@ DOES enter empty_mesh_versions via upload_prebuilt_mesh (backtrace inlined to ma
 Remaining suspects (narrow): LOD key/parent-snap math on a sane coord, or a completed-mesh race around cinematic-world
 settle (~45 s in). The traps will name it on the next firing — including on-device, where the same logs now exist.
 Meanwhile the harm is fully contained: eviction rejects+logs, set_block refuses, roamers self-heal, player snaps back.
+
+## r599 — PERF: clone-free transition remesh (the transition-set stutter)
+The per-tick transition sweep deep-cloned every due chunk (32³ blocks Vec + metadata, clone_for_edit) purely to bump
+version+dirty so the mesh scheduler would re-run — per strided tick, per transitioning chunk, for the whole 3-second
+animation. Replaced with a VIRTUAL version bump: `transition_remesh_count` (pure companion to transition_remesh_due —
+same cadence, same per-coord phase; parity pinned by test across strides 1..8) is added to a transitioning chunk's
+reported version at read time via `ChunkManager::effective_version`, which the bin's submit path now reads. The sweep
+body is now: advance the clock + prune evicted coords. Zero clones, zero Arc churn, identical remesh schedule.
+Tests: cadence parity vs due(); the clone-free proof (same Arc pointer + same stored version across 8 sim ticks while
+effective version advances; non-transitioning chunks report base verbatim). chunk_manager 32/0; fullgame gate clean;
+90 s in-world soak exit 0 / zero panics. NOTE: full shader-side animation (mesh once at to_stage, progress in the
+vertex shader) remains the deeper end-state — this lands the scheduling half without touching geometry emission.
