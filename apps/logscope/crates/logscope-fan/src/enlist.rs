@@ -68,6 +68,46 @@ pub enum Msg {
 /// then most models, then earliest-arrived (the input order is the arrival order — a stable tiebreak so
 /// the choice is deterministic and testable). Pure.
 pub fn select_invitees(offers: &[(PeerId, Capability)], want: usize) -> Vec<PeerId> {
+    select_invitees_for(offers, want, None, crate::workerkit::Duty::Build)
+}
+
+/// The same selection, GATED BY TRUST for the duty the fleet is being
+/// raised to do.
+///
+/// `Trust::permits` encodes the rule that matters — "everything that
+/// generates sees the prompt, which is conversation content" — and it had
+/// ZERO CALLERS anywhere in the repo. It was written, documented and
+/// tested, and nothing consulted it: `enlist` mentions trust nowhere, and
+/// `dispatch` explicitly delegates membership to `enlist`, so a peer
+/// registered as Build-only could be invited into a fleet and handed a
+/// Thinker slice carrying the prompt. The registry was doing bookkeeping,
+/// not enforcement.
+///
+/// This is that enforcement, at the admission point rather than deeper:
+/// once a peer is a member, `dispatch` hands it whatever the queue holds,
+/// so filtering at assignment would mean re-deciding per task with the
+/// membership already granted. A peer that may not do the work should
+/// never be invited to it.
+///
+/// `registry: None` keeps the old behaviour for callers that have no
+/// registry yet — deliberately explicit rather than defaulting to
+/// permissive silently, so the ungated path is visible at every call site
+/// instead of being what you get by forgetting.
+pub fn select_invitees_for(
+    offers: &[(PeerId, Capability)],
+    want: usize,
+    registry: Option<&crate::trustkit::Registry>,
+    duty: crate::workerkit::Duty,
+) -> Vec<PeerId> {
+    let offers: Vec<(PeerId, Capability)> = match registry {
+        Some(reg) => offers
+            .iter()
+            .filter(|(id, _)| reg.level(id).permits(duty))
+            .cloned()
+            .collect(),
+        None => offers.to_vec(),
+    };
+    let offers = &offers[..];
     let cap = want.min(MAX_FLEET);
     let mut idx: Vec<usize> = (0..offers.len()).collect();
     idx.sort_by(|&a, &b| {
@@ -415,6 +455,65 @@ mod tests {
 
     fn cap(kind: &str, n_models: usize, slots: u32) -> Capability {
         Capability { kind: kind.into(), models: (0..n_models).map(|i| format!("m{i}")).collect(), slots }
+    }
+
+    #[test]
+    fn a_build_only_peer_is_never_invited_to_generate() {
+        // THE GAP THIS CLOSES. `Trust::permits` says "everything that
+        // generates sees the prompt, which is conversation content" — and
+        // it had zero callers repo-wide. A Build-only machine could be
+        // invited into a fleet and handed a Thinker slice carrying the
+        // prompt, because enlist mentioned trust nowhere and dispatch
+        // delegates membership to enlist.
+        use crate::trustkit::{Registry, Trust};
+        use crate::workerkit::Duty;
+        let offers = vec![
+            ("buildbox".to_string(), cap("cpu", 2, 8)),   // most slots: would rank FIRST
+            ("trusted".to_string(), cap("gpu", 1, 2)),
+        ];
+        let mut reg = Registry::new();
+        reg.register("buildbox", Trust::Build);
+        reg.register("trusted", Trust::Compute);
+
+        // Ungated, the build box wins on capacity — which is exactly how
+        // it would have received conversation work.
+        assert_eq!(select_invitees(&offers, 2)[0], "buildbox");
+
+        // Gated for a generating duty, it is not invited at all.
+        let picked = select_invitees_for(&offers, 2, Some(&reg), Duty::Thinker);
+        assert_eq!(picked, vec!["trusted".to_string()], "a Build peer was invited to generate");
+
+        // But it IS invited for the duty it is trusted with, or the gate
+        // would be a ban rather than a boundary.
+        let picked = select_invitees_for(&offers, 2, Some(&reg), Duty::Build);
+        assert!(picked.contains(&"buildbox".to_string()), "a Build peer was refused a build");
+        assert_eq!(picked.len(), 2, "both may build: {picked:?}");
+    }
+
+    #[test]
+    fn an_unregistered_peer_is_invited_to_nothing() {
+        // Unknown is the level a machine has by merely existing on the
+        // network. It must not clear even the lowest duty, or discovery
+        // alone becomes admission.
+        use crate::trustkit::Registry;
+        use crate::workerkit::Duty;
+        let offers = vec![("stranger".to_string(), cap("gpu", 4, 16))];
+        let reg = Registry::new();
+        for duty in [Duty::Build, Duty::Thinker] {
+            assert!(
+                select_invitees_for(&offers, 4, Some(&reg), duty).is_empty(),
+                "an unregistered peer was invited to {duty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_registry_keeps_the_old_behaviour_visibly() {
+        // `None` is spelled at the call site rather than defaulting,
+        // so an ungated selection is something a reader can see.
+        use crate::workerkit::Duty;
+        let offers = vec![("a".to_string(), cap("cpu", 1, 4))];
+        assert_eq!(select_invitees_for(&offers, 4, None, Duty::Thinker).len(), 1);
     }
 
     #[test]
