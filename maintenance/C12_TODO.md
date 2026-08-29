@@ -1308,11 +1308,31 @@ screen, and it was the one that reaches the others.
 
 - **C12-29b — nothing renders `settings_panel` yet.** Same shape as the
   cmdstrip (§26a): the widget and its events exist, no app draws it.
-- **C12-29c — terminal / web / graph NOT yet audited against the
-  outline.** They exist and are substantial, which is exactly the
-  condition under which ChatPanel still turned out to be missing its
-  entire header. Substance is not coverage. main.qml is where their QML
-  lives, so the outline for them is the 1,300-element file rather than a
-  tidy per-screen one — the audit needs the outline sliced by screen
-  first, which `qml_outline.py --depth` partly does but not by named
-  region.
+- **C12-29c — region slicing DONE, and the first findings are that
+  there is less QML here than expected.** `qml_outline.py --region <id>`
+  now outlines the subtree under a named element, so a screen inside
+  main.qml can be audited the way a standalone .qml file can.
+
+  Fixing it required a real parser fix: QML allows
+  `id: termScreen; Layout.fillWidth: true; height: 200` on one line and
+  main.qml uses that form constantly, but the property reader only took
+  the FIRST pair per line — so most named regions had no id recorded and
+  slicing found nothing at all. Split on `;` only when the line has no
+  braces, since a `;` inside a binding or JS block is not a separator.
+
+  What the slices actually say, checked against the source rather than
+  trusted:
+  - `termScreen` is ONE element. The terminal is drawn, not composed —
+    its only children are FontMetrics/TextMetrics helpers. So there is
+    no element tree to port and the egui `term_grid` (435 lines) is not
+    missing structure; comparing them element-wise would be a category
+    error.
+  - `swipeView` is one element because the web page was REMOVED
+    (v0.1.839, per its own comment: "the terminal is the only page").
+    The egui `browser.rs` may therefore be ahead of the QML rather than
+    behind it — worth confirming before treating web as a port gap.
+  - `previewPanel` gives 19 elements and nests correctly, which is the
+    control showing the slicing works.
+
+  STILL TO AUDIT: the graph surfaces (`vSysGraph`, `sysGraphTab`) and
+  `fsResultsPanel`, plus confirming the web/browser direction above.

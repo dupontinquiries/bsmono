@@ -224,8 +224,21 @@ def parse(text: str, extra_visual=frozenset()):
             continue
 
         if pending is not None:
-            pm = PROP_RE.match(line)
-            if pm:
+            # SEMICOLON-SEPARATED PROPS ON ONE LINE. QML allows
+            # `id: termScreen; Layout.fillWidth: true; height: 200` and
+            # main.qml uses it constantly. Reading only the first pair
+            # lost every id declared that way — which is most of the
+            # named regions, so slicing by screen found nothing at all
+            # until this was fixed.
+            #
+            # Split on `;` only when the line has no braces: a `;` inside
+            # a binding expression or a JS block is not a separator, and
+            # treating it as one would invent properties.
+            parts = line.split(";") if "{" not in line and "}" not in line else [line]
+            for part in parts:
+                pm = PROP_RE.match(part.strip())
+                if not pm:
+                    continue
                 key, val = pm.group(1), pm.group(2).rstrip(";").strip()
                 if key in KEEP:
                     pending.props[key] = val
@@ -239,6 +252,27 @@ def parse(text: str, extra_visual=frozenset()):
 
 
     return roots, skipped
+
+
+def find_region(nodes, ident):
+    """The subtree rooted at the element whose `id:` is `ident`.
+
+    main.qml is 32k lines and one file, so "audit the terminal screen"
+    has no file to point at — the screens are regions inside it, named by
+    their `id`. Without this the outline for a screen is the whole app's
+    outline and the audit that worked on ChatPanel does not transfer.
+
+    Returns None when the id is absent rather than an empty list, so a
+    typo reads as "no such region" instead of "that screen is empty" —
+    the second would look like a finding.
+    """
+    for n in nodes:
+        if n.ident == ident:
+            return n
+        hit = find_region(n.children, ident)
+        if hit is not None:
+            return hit
+    return None
 
 
 def render(nodes, out, indent=0):
@@ -259,9 +293,15 @@ def summarise(nodes):
     return counts
 
 
-def outline_file(path: Path, max_depth=None) -> str:
+def outline_file(path: Path, max_depth=None, region=None) -> str:
     text = path.read_text(errors="replace")
     roots, skipped = parse(text, local_components(path))
+    if region is not None:
+        node = find_region(roots, region)
+        if node is None:
+            return "# " + path.name + ": no element with id '" + region + "'"
+        roots = [node]
+        skipped = {}  # counted for the whole file; misleading for a slice
     counts = summarise(roots)
     total = sum(counts.values())
     top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
@@ -299,9 +339,12 @@ def main(argv) -> int:
     depth = None
     if "--depth" in argv:
         depth = int(argv[argv.index("--depth") + 1])
+    region = None
+    if "--region" in argv:
+        region = argv[argv.index("--region") + 1]
     files = sorted(target.glob("*.qml")) if target.is_dir() else [target]
     for f in files:
-        print(outline_file(f, depth))
+        print(outline_file(f, depth, region))
         print()
     return 0
 
