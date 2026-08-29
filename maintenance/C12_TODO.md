@@ -906,3 +906,50 @@ these are only in commit messages where nobody will find them.
 - blackstar-rs `games/blackstar` vs `games/blackstar-rs`: READMEs now
   disambiguate, but the `c5blackstar-NNN` bundle series still carries
   the misleading name.
+
+## 25. Fleet run on 30 apps: 7 real test failures, and the disk was NOT the cause
+
+An uploaded `fleet-logs.zip` from a run that hit ENOSPC. Checked whether
+the failures were disk noise before treating them as bugs, and they are
+not: `grep -ilE "no space left|os error 28" *.test.log` matches NOTHING.
+Every ENOSPC is in a BUILD log; the 7 non-zero test return codes are
+genuine. Worth separating explicitly, because "the disk was full" is a
+very easy way to dismiss a real result.
+
+Failing: ambient-learner (4), bo-suite (5), bot-arena (3), fao-codec
+(8), gitmind (1), logscope (1), logscope+features (2).
+
+**C12-25a — fao-codec, PARTLY FIXED.** A quality gate (>= 50 vertices,
+non-degenerate PCA) was added to `add_web` default-ON and the tests were
+never updated, so every test that stores a web failed on a two-vertex
+fixture. Fixed by making the fixtures REALISTIC (`gate_passing_mesh`,
+64 vertices spread over three axes so the PCA has real eigenvalues)
+rather than by setting `FAO_LIB_QUALITY=0` — a test that switches the
+gate off stops covering the path real callers take. Also replaced the
+hardcoded `2` vertex assertions with `GATE_MESH_VERTS`, since a literal
+that the fixture already invalidated once will do it again. 65 -> 66
+passing.
+
+**C12-25b — fao-codec `manifest_persists_across_open` is a REAL bug,
+not a fixture problem. Diagnosed, not fixed.** After `add_web`, the
+log-db has the entry (`log_db opened (1 entries)`) and the reopened
+JSON manifest has ZERO. `add_web` does call `write_manifest` (line
+~431), and `open()` reads that file plainly, so the write is not
+reaching the file the reopen reads. The strong suspect is `Drop`: it
+rewrites the manifest only `if self.touch_dirty`, and `touch_dirty` is
+set in exactly ONE place (`touch`, line 470) — never by `add_web`. So
+the design comment "JSON gets rewritten on close via Drop" is true only
+for touches, and a library whose only operation was an add may never
+flush. Next step: assert the file's contents immediately after
+`add_web` returns, which separates "never written" from "written then
+lost".
+
+**C12-25c — the other five apps, unexamined.** bot-arena's
+`clean_repo_passes_and_broken_fails` and logscope's
+`verdict::compile_grades_real_code` both SHELL OUT TO CARGO, so those
+two plausibly ARE environment-caused even though the log has no ENOSPC
+line — a cargo that fails for lack of space reports its own error, not
+the OS one. gitmind's `repo_root_finds_monorepo_and_resolves_app_paths`
+builds a fixture tree under /tmp and is the same shape. Worth checking
+those three against a clean disk before spending time on them;
+ambient-learner (4) and bo-suite (5) have no such excuse.

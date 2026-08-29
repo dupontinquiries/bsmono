@@ -1619,6 +1619,43 @@ fn io_err(msg: &str) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    /// A mesh big enough to pass `add_web`'s quality gates.
+    ///
+    /// Those gates (>= 50 vertices, non-degenerate PCA) were added
+    /// default-ON and the tests were not updated, so every test that
+    /// stored a web has been failing on a two-vertex fixture ever since.
+    /// Fixed by making the fixtures REALISTIC rather than by setting
+    /// FAO_LIB_QUALITY=0: a test that switches the gate off stops
+    /// covering the path real callers take, and the gate is exactly the
+    /// kind of thing worth having under test.
+    ///
+    /// Points are spread over three axes with distinct extents so the
+    /// PCA has real eigenvalues — a collinear cloud would trip gate 2
+    /// even with enough vertices, which is its own bug to not write.
+    /// Vertex count of `gate_passing_mesh`. Named so tests assert
+    /// against the fixture rather than re-hardcoding a number that the
+    /// last change to the fixture already invalidated once.
+    const GATE_MESH_VERTS: usize = 64;
+
+    fn gate_passing_mesh() -> SceneMesh {
+        let n = GATE_MESH_VERTS;
+        let mut vertices = Vec::with_capacity(n);
+        let mut vertex_colors = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            vertices.push(Vec3 { x: t * 10.0, y: (t * 6.28).sin() * 3.0, z: (t * 3.14).cos() });
+            vertex_colors.push([t, 1.0 - t, 0.5]);
+        }
+        SceneMesh {
+            vertices,
+            vertex_colors,
+            indices: vec![],
+            normals: vec![],
+            vertex_hits: vec![1u32; n],
+            vertex_grid: HashMap::new(),
+        }
+    }
     use super::*;
     
     fn temp_dir() -> PathBuf {
@@ -1644,14 +1681,7 @@ mod tests {
         let mut lib = Library::open_writable(&p).expect("open_writable");
         
         // Build a synthetic mesh + signature.
-        let mesh = SceneMesh {
-            vertices: vec![Vec3 { x: 0.0, y: 0.0, z: 0.0 }, Vec3 { x: 1.0, y: 0.0, z: 0.0 }],
-            vertex_colors: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            indices: vec![],
-            normals: vec![],
-            vertex_hits: vec![1, 1],
-            vertex_grid: HashMap::new(),
-        };
+        let mesh = gate_passing_mesh();
         let mut sig = WebSignature::default();
         sig.extent = [10.0, 5.0, 1.0];
         sig.centroid = [0.5, 0.0, 0.0];
@@ -1681,8 +1711,8 @@ mod tests {
         
         // load_web roundtrip.
         let (loaded_mesh, _poses) = lib.load_web(&uuid).expect("load_web");
-        assert_eq!(loaded_mesh.vertices.len(), 2);
-        assert_eq!(loaded_mesh.vertex_colors.len(), 2);
+        assert_eq!(loaded_mesh.vertices.len(), GATE_MESH_VERTS);
+        assert_eq!(loaded_mesh.vertex_colors.len(), GATE_MESH_VERTS);
         
         drop(lib);
         let _ = std::fs::remove_dir_all(&p);
@@ -1698,14 +1728,10 @@ mod tests {
             sig.extent = [1.0, 1.0, 1.0];
             sig.eigenvalues = [1.0, 1.0, 1.0];
             sig.radial_histogram = [0.1; 10];
-            let mesh = SceneMesh {
-                vertices: vec![],
-                vertex_colors: vec![],
-                indices: vec![],
-                normals: vec![],
-                vertex_hits: vec![],
-                vertex_grid: HashMap::new(),
-            };
+            // This test is about PERSISTENCE, not the quality gate — the
+            // empty mesh was incidental and now trips gate 1, so it uses
+            // a realistic one and keeps testing what it means to test.
+            let mesh = gate_passing_mesh();
             lib.add_web(sig, &mesh, &[], "first.mp4", 0, 50).expect("add_web");
         }  // drops lib, releasing lock
         
@@ -1751,14 +1777,7 @@ mod tests {
         sig.extent = [3.0, 2.0, 1.0];
         sig.eigenvalues = [3.0, 2.0, 1.0];
         sig.radial_histogram = [0.1; 10];
-        let mesh = SceneMesh {
-            vertices: vec![Vec3 { x: 0.0, y: 0.0, z: 0.0 }],
-            vertex_colors: vec![[1.0, 1.0, 1.0]],
-            indices: vec![],
-            normals: vec![],
-            vertex_hits: vec![1],
-            vertex_grid: HashMap::new(),
-        };
+        let mesh = gate_passing_mesh();
         libw.add_web(sig, &mesh, &[], "synthetic.mp4", 0, 60).expect("add");
         drop(libw);
         
