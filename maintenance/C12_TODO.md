@@ -1185,11 +1185,25 @@ The port had ONE flat list of rows with star / size / Use / Download.
   click, a curated one costs a multi-gigabyte download — and a single
   list makes them look alike.
 
-  STILL MISSING: per-model `blurb` text (ModelRow has no field for it),
-  and the whole HuggingFace search-and-drill-down flow — a search box, a
-  result list, and a per-model FILE list behind a `‹ back to results`
-  affordance. That last is the real remaining feature: without it a
-  person cannot find a model that is not already in the curated list.
+  BLURB: done. `ModelRow::blurb` renders indented under its row and is
+  skipped when empty — an empty line under every model is worse than
+  none under some. It is what makes a curated list worth having over a
+  list of file names.
+
+  SEARCH: the STATE MACHINE is done and tested (`SearchState`), the UI
+  and the queries are not. One result list swapped by a `SearchView`
+  enum, matching the QML's single list with a `showingFiles` flag —
+  two lists would let both be populated and disagree about which is
+  current. Transitions clear the results, so repo names never appear
+  under a files heading while a fetch runs. `empty_hint` distinguishes
+  the three ways a list can be blank (nothing typed / searching / no
+  matches), because conflating them makes a pending search look like a
+  failed one.
+
+  STILL MISSING: the search PANE itself (text field, result rows,
+  `‹ back to results` affordance) and the HuggingFace queries behind it,
+  which need backend wiring. The pure half is done and testable; the
+  half that needs a network is not.
 
 **C12-28b — SetupWizard MEASURED, and it is better than the ratio
 suggested.** The four-phase skeleton (setup -> choose -> downloading ->

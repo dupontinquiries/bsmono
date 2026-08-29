@@ -26,6 +26,83 @@ pub struct ModelRow {
     pub recommended: bool,
     /// Currently the active model.
     pub active: bool,
+    /// One-line description from the curated list ("fast, good at code").
+    /// Empty when unknown — a row with no blurb renders without one
+    /// rather than with a placeholder, since an empty line under every
+    /// model is worse than none under some.
+    pub blurb: String,
+}
+
+/// What the HuggingFace search pane is showing.
+///
+/// The QML uses ONE result list for both, swapped by a `showingFiles`
+/// flag, with a `‹ back to results` affordance to return. Modelled the
+/// same way rather than as two lists: they occupy the same space, only
+/// one is ever visible, and two lists would let both be populated and
+/// disagree about which is current.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SearchView {
+    /// Repositories matching the query.
+    #[default]
+    Repos,
+    /// The GGUF files inside one repo — `repo` is what to go back from.
+    Files { repo: String },
+}
+
+/// The search pane's state. Pure; the host performs the queries.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    pub query: String,
+    pub view: SearchView,
+    /// Repo names, or file names once drilled in. One vector for the
+    /// same reason there is one view.
+    pub results: Vec<String>,
+    /// True while a query is in flight, so the pane can say so rather
+    /// than looking empty — an empty list and a pending search are
+    /// indistinguishable otherwise, and one of them is not a result.
+    pub searching: bool,
+}
+
+impl SearchState {
+    /// Drill into a repo. Clears the results, because the ones on screen
+    /// belong to the previous view: leaving them would show repo names
+    /// under a files heading for as long as the fetch takes.
+    pub fn open_repo(&mut self, repo: impl Into<String>) {
+        self.view = SearchView::Files { repo: repo.into() };
+        self.results.clear();
+        self.searching = true;
+    }
+
+    /// Return to the repo results. Also clears, for the same reason, and
+    /// the host re-runs the query — cheaper than holding two result sets
+    /// to keep one of them stale.
+    pub fn back(&mut self) {
+        self.view = SearchView::Repos;
+        self.results.clear();
+        self.searching = true;
+    }
+
+    /// Is the back affordance shown? Only when drilled in, matching the
+    /// QML's `visible: picker.showingFiles`.
+    pub fn can_go_back(&self) -> bool {
+        matches!(self.view, SearchView::Files { .. })
+    }
+
+    /// What the empty state should say. Distinguishes the three cases a
+    /// blank list can mean, which the QML also does: nothing typed yet,
+    /// a search running, and a search that genuinely found nothing.
+    pub fn empty_hint(&self) -> Option<&'static str> {
+        if !self.results.is_empty() {
+            return None;
+        }
+        Some(if self.searching {
+            "searching…"
+        } else if self.query.trim().is_empty() {
+            "Search HuggingFace GGUF models (Enter)…"
+        } else {
+            "no matches"
+        })
+    }
 }
 
 /// What the user asked to do with a row.
@@ -174,6 +251,16 @@ impl ModelPicker {
                         }
                     });
                 });
+                // The blurb sits UNDER the row, indented, as in the QML —
+                // it explains what the model is for, which is the thing
+                // that makes a curated list worth having over a list of
+                // file names. Skipped entirely when empty.
+                if !m.blurb.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        ui.label(RichText::new(&m.blurb).weak().small());
+                    });
+                }
                 ui.separator();
             }
             }
@@ -208,7 +295,49 @@ mod tests {
             downloaded,
             recommended,
             active: false,
+            blurb: String::new(),
         }
+    }
+
+    #[test]
+    fn drilling_in_and_back_never_shows_the_previous_view_s_rows() {
+        // The bug this prevents: repo names listed under a files heading
+        // (or the reverse) for as long as a fetch takes. One list, one
+        // view, cleared on every transition.
+        let mut s = SearchState { query: "qwen".into(), ..Default::default() };
+        s.results = vec!["TheBloke/Qwen".into(), "Qwen/Qwen2".into()];
+        assert!(!s.can_go_back(), "no back affordance at the top level");
+
+        s.open_repo("Qwen/Qwen2");
+        assert!(s.results.is_empty(), "stale repo names survived the drill-in");
+        assert!(s.searching);
+        assert!(s.can_go_back());
+        assert_eq!(s.view, SearchView::Files { repo: "Qwen/Qwen2".into() });
+
+        s.results = vec!["qwen2-7b-q4.gguf".into()];
+        s.searching = false;
+        s.back();
+        assert!(s.results.is_empty(), "stale file names survived going back");
+        assert!(!s.can_go_back());
+    }
+
+    #[test]
+    fn an_empty_list_says_which_kind_of_empty_it_is() {
+        // Three different situations render as a blank list, and only one
+        // of them means "there is nothing". Conflating them makes a
+        // pending search look like a failed one.
+        let mut s = SearchState::default();
+        assert_eq!(s.empty_hint(), Some("Search HuggingFace GGUF models (Enter)…"));
+
+        s.query = "llama".into();
+        s.searching = true;
+        assert_eq!(s.empty_hint(), Some("searching…"));
+
+        s.searching = false;
+        assert_eq!(s.empty_hint(), Some("no matches"), "a finished search that found nothing");
+
+        s.results = vec!["a".into()];
+        assert_eq!(s.empty_hint(), None, "results: no hint at all");
     }
 
     #[test]
