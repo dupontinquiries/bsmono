@@ -75,6 +75,27 @@ pub fn sorted_rows(rows: &[ModelRow]) -> Vec<ModelRow> {
     v
 }
 
+/// The QML shows models in TWO sections, not one list: "Downloaded:"
+/// first, then the curated "Quick picks". This splits them, preserving
+/// `sorted_rows`' order within each.
+///
+/// The distinction is not cosmetic. A downloaded model costs one click
+/// to use; a curated one costs a multi-gigabyte download. Presenting
+/// them in a single list — which the port did — makes those look like
+/// the same decision, and the star is the only hint otherwise. Someone
+/// scanning for "the one I already have" has to read every row.
+///
+/// Returns `(downloaded, picks)`. Either may be empty, and the caller
+/// renders a section only when it has rows — an empty "Downloaded:"
+/// heading on a fresh install is a promise of something that is not
+/// there.
+pub fn split_sections(rows: &[ModelRow]) -> (Vec<ModelRow>, Vec<ModelRow>) {
+    let sorted = sorted_rows(rows);
+    let (have, want): (Vec<ModelRow>, Vec<ModelRow>) =
+        sorted.into_iter().partition(|r| r.downloaded);
+    (have, want)
+}
+
 /// Browser state.
 #[derive(Default)]
 pub struct ModelPicker {
@@ -91,12 +112,6 @@ pub struct ModelPicker {
 impl ModelPicker {
     /// Render the picker; returns a [`ModelAction`] on the frame a row's button is clicked.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<ModelAction> {
-        // The heading the QML shows above the picks, explaining the star.
-        // Without it the star is unexplained decoration — a person cannot
-        // tell whether it means "popular", "newest" or "will actually run
-        // on this machine", and it means the third.
-        ui.label(RichText::new(picks_heading(self.detected_ram_gb)).weak().small());
-        ui.add_space(4.0);
         let mut action = None;
 
         if !self.download_status.is_empty() {
@@ -112,7 +127,28 @@ impl ModelPicker {
         }
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for m in sorted_rows(&self.rows) {
+            // TWO SECTIONS, as the QML has. A downloaded model costs one
+            // click; a curated one costs a multi-gigabyte download, and a
+            // single list makes those look like the same decision. Each
+            // heading is drawn only when its section has rows — an empty
+            // "Downloaded:" on a fresh install promises something that is
+            // not there.
+            let (have, picks) = split_sections(&self.rows);
+            let mut first = true;
+            for (heading, section) in [
+                ("Downloaded:".to_string(), have),
+                (picks_heading(self.detected_ram_gb), picks),
+            ] {
+                if section.is_empty() {
+                    continue;
+                }
+                if !first {
+                    ui.add_space(10.0);
+                }
+                first = false;
+                ui.label(RichText::new(heading).weak().small());
+                ui.add_space(4.0);
+            for m in section {
                 ui.horizontal(|ui| {
                     // star for the recommended quant
                     ui.label(if m.recommended { RichText::new("★").color(Color32::from_rgb(201, 185, 154)) } else { RichText::new("  ") });
@@ -139,6 +175,7 @@ impl ModelPicker {
                     });
                 });
                 ui.separator();
+            }
             }
             if self.rows.is_empty() {
                 ui.weak_label_compat("no models — search a repo or drop a .gguf in the models folder");
@@ -172,6 +209,37 @@ mod tests {
             recommended,
             active: false,
         }
+    }
+
+    #[test]
+    fn sections_separate_one_click_from_one_download() {
+        // The split exists because those are different decisions: a
+        // downloaded model costs a click, a curated one costs gigabytes.
+        // A single list makes them look alike, and the star is then the
+        // only hint — which is why the port read as a flat list of
+        // equivalent options when it is not.
+        let rows = vec![
+            row("zeta.gguf", true, false),
+            row("alpha.gguf", false, true),
+            row("beta.gguf", false, false),
+            row("aaa.gguf", true, false),
+        ];
+        let (have, picks) = split_sections(&rows);
+        assert_eq!(have.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                   vec!["aaa.gguf", "zeta.gguf"], "downloaded, still name-sorted");
+        assert_eq!(picks.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                   vec!["alpha.gguf", "beta.gguf"], "recommended leads the picks");
+        assert!(picks[0].recommended);
+    }
+
+    #[test]
+    fn a_fresh_install_has_no_downloaded_section_to_promise() {
+        // Every row is a candidate; nothing is on disk. The caller skips
+        // an empty section rather than drawing a heading over nothing.
+        let rows = vec![row("a.gguf", false, true), row("b.gguf", false, false)];
+        let (have, picks) = split_sections(&rows);
+        assert!(have.is_empty());
+        assert_eq!(picks.len(), 2);
     }
 
     #[test]

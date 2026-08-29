@@ -1176,11 +1176,20 @@ than cosmetic. The QML has THREE sections:
     (Enter)…"), a result list, and a drill-down into a model's FILES
     with a `‹ back to results` affordance
 
-The port has ONE flat list of rows with star / size / Use / Download.
-The RAM-aware guidance, the blurbs, the curated/downloaded split and
-the whole search-and-drill-down flow are absent. This is the largest
-known port gap in the fleet and it is a real feature, not chrome:
-without it a person cannot find a model they do not already have.
+The port had ONE flat list of rows with star / size / Use / Download.
+
+  PARTLY CLOSED. The RAM-aware heading is done (C12-28c) and the
+  DOWNLOADED/PICKS SPLIT is done: `split_sections` is pure and tested,
+  each heading drawn only when its section has rows. The split matters
+  because those are different decisions — a downloaded model costs one
+  click, a curated one costs a multi-gigabyte download — and a single
+  list makes them look alike.
+
+  STILL MISSING: per-model `blurb` text (ModelRow has no field for it),
+  and the whole HuggingFace search-and-drill-down flow — a search box, a
+  result list, and a per-model FILE list behind a `‹ back to results`
+  affordance. That last is the real remaining feature: without it a
+  person cannot find a model that is not already in the curated list.
 
 **C12-28b — SetupWizard MEASURED, and it is better than the ratio
 suggested.** The four-phase skeleton (setup -> choose -> downloading ->
