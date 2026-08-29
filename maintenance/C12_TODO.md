@@ -986,8 +986,23 @@ Two more read and fixed, one still unread:
     appears to be DEAD CODE for this schema. Either the column was
     meant to be non-unique, or the function is vestigial; worth
     deciding rather than leaving a function nothing can exercise.
-  - `screen_temp_hints::choose_resolution_scales_with_sensors` — still
-    unread.
+  - `screen_temp_hints::choose_resolution_scales_with_sensors` — the
+    test probed a range where its parameter cannot matter. At the
+    default sigma 0.35 the kernel cap is 2/0.35 = 5.71 per dimension,
+    giving (3, 6) before clamping, and MIN_COLS/MIN_ROWS are (4, 6) —
+    so EVERY sensor count from 1 to 100 returns exactly (4, 6). It
+    asserted strict growth from 1 to 10 sensors there, which is an
+    assertion against the clamp rather than against the behaviour.
+    Now probes sigma 0.05 (kernel cap 40) where the Nyquist term
+    governs and "more sensors, more resolution" is the actual rule, AND
+    pins the saturation as its own property: with a broad kernel, extra
+    sensors buy nothing because the kernel blurs away the detail they
+    would add. That second half is a real invariant that had no test.
+
+  **All four ambient-learner failures are now addressed** — one real
+  library bug (SecurityManager), three tests asserting things their own
+  fixtures/schema/clamps forbid. None compiled here; all need a run on
+  a machine with gdk-pixbuf-sys.
 
 **C12-25c — the other five apps, unexamined.** bot-arena's
 `clean_repo_passes_and_broken_fails` and logscope's

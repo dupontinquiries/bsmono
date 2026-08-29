@@ -408,11 +408,35 @@ mod tests {
 
     #[test]
     fn choose_resolution_scales_with_sensors() {
+        // THE KERNEL CAP AND THE FLOOR HAVE TO LEAVE ROOM, or sensor
+        // count cannot show through. At the default sigma of 0.35 the
+        // kernel limit is 2/0.35 = 5.71 per dimension, giving (3, 6)
+        // before clamping — and MIN_COLS/MIN_ROWS are (4, 6), so EVERY
+        // sensor count from 1 to 100 returns exactly (4, 6). This test
+        // used to probe 1 vs 10 at that sigma and assert strict growth,
+        // which the function cannot deliver there: it was asserting
+        // against the clamp, not against the behaviour.
+        //
+        // A tighter kernel (sigma 0.05 -> cap 40) lets the Nyquist term
+        // govern, which is where "more sensors, more resolution" is
+        // actually the rule being tested.
         let no_hints = AggregatedHints::NONE.clone();
-        let (c1, r1) = choose_resolution(1, 0.35, &no_hints);
-        let (c10, r10) = choose_resolution(10, 0.35, &no_hints);
-        assert!(c10 > c1, "more sensors → more cols");
-        assert!(r10 > r1, "more sensors → more rows");
+        let (c1, r1) = choose_resolution(1, 0.05, &no_hints);
+        let (c100, r100) = choose_resolution(100, 0.05, &no_hints);
+        assert!(c100 > c1, "more sensors → more cols ({c1} -> {c100})");
+        assert!(r100 > r1, "more sensors → more rows ({r1} -> {r100})");
+
+        // And the saturation itself is worth pinning, because it is a
+        // real property rather than an accident: with a broad kernel the
+        // resolution is decided by the kernel, not by how many sensors
+        // were thrown at it, so adding sensors buys nothing.
+        let broad_1 = choose_resolution(1, 0.35, &no_hints);
+        let broad_100 = choose_resolution(100, 0.35, &no_hints);
+        assert_eq!(
+            broad_1, broad_100,
+            "a broad kernel should saturate: extra sensors cannot add detail the kernel blurs away"
+        );
+        assert_eq!(broad_1, (MIN_COLS, MIN_ROWS), "and it saturates at the floor");
     }
 
     #[test]
