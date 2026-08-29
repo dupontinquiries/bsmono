@@ -1455,7 +1455,27 @@ anything (see its module docs). The missing pieces are a unix socket,
 a lifecycle (start on demand, idle-unload, one instance per model path),
 and the client.
 
-- **C12-30a — not built.** The socket, the lifecycle, the client.
+- **C12-30a — the CLIENT is built; the daemon side is not.**
+  `daemon::DaemonBackend` speaks to a unix socket using the SAME request
+  shape as `logscope-serve`'s HTTP endpoint (POST /generate, prompt as
+  the raw body, `?max=N`) — same shape on purpose, so the daemon is that
+  server with a second listener rather than a second protocol, and one
+  handler cannot drift from the other. No Bearer key: on a unix socket
+  the filesystem already answers who may connect, and a key here is
+  ceremony with a storage problem attached. `probe` fails fast and names
+  the path, since it is what `resolve` calls and "connection refused"
+  with no path is the least actionable error available.
+
+  `socket_path` prefers `$XDG_RUNTIME_DIR`, falling back to `$HOME`
+  rather than `/tmp` — a socket in a sticky shared directory is
+  world-visible and this one carries prompts.
+
+  4 tests against an in-process fake daemon on a real UnixListener.
+
+  STILL MISSING: the daemon SIDE. `logscope-serve` needs the second
+  listener, and it needs a lifecycle — start on demand, idle-unload, one
+  instance per model path. That is the part that has to run as a
+  process, and it is where the memory saving actually happens.
 - **C12-30b — DONE, and built before the daemon on purpose.**
   `Reach::{Daemon, InProcess}` plus `resolve(order, daemon, in_process)`:
   try each in order, take the first that constructs, report which one

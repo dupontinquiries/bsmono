@@ -440,7 +440,88 @@ mod gpu {
 ///
 /// Not built. Recorded here rather than in a planning document because
 /// this is the file whose shape has to accommodate it.
-pub mod daemon {}
+pub mod daemon {
+    use super::Backend;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    /// Where the daemon listens. One socket per user, under the runtime
+    /// dir when there is one — a socket in /tmp is world-visible and this
+    /// carries prompts.
+    pub fn socket_path() -> std::path::PathBuf {
+        if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+            return std::path::Path::new(&rt).join("logscope-engine.sock");
+        }
+        // No runtime dir (a bare container, some BSDs): fall back to the
+        // home directory rather than /tmp, so the permissions are the
+        // user's own rather than a sticky shared directory's.
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        std::path::Path::new(&home).join(".logscope-engine.sock")
+    }
+
+    /// A [`Backend`] that asks a daemon holding the weights.
+    ///
+    /// Speaks the SAME request shape as `logscope-serve`'s HTTP endpoint
+    /// (POST /generate, prompt as the raw body, `?max=N`) over a unix
+    /// socket instead of TCP. Same shape on purpose: the daemon is that
+    /// server with a second listener, not a second protocol, so one
+    /// handler serves both and they cannot drift.
+    ///
+    /// No Bearer key here. On a unix socket the filesystem already
+    /// answers "who may connect", and a key on a same-machine socket is
+    /// ceremony that also has to be stored somewhere.
+    pub struct DaemonBackend {
+        pub path: std::path::PathBuf,
+        pub timeout: std::time::Duration,
+    }
+
+    impl DaemonBackend {
+        pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+            DaemonBackend { path: path.into(), timeout: std::time::Duration::from_secs(120) }
+        }
+
+        /// Connect, or fail fast. Called by `resolve`'s daemon
+        /// constructor, so "the daemon is not running" costs one failed
+        /// connect rather than a timeout — the fallback should be quick
+        /// enough that nobody notices it happened.
+        pub fn probe(path: impl Into<std::path::PathBuf>) -> Result<Self, String> {
+            let me = DaemonBackend::new(path);
+            UnixStream::connect(&me.path).map_err(|e| format!("daemon at {}: {e}", me.path.display()))?;
+            Ok(me)
+        }
+    }
+
+    impl Backend for DaemonBackend {
+        fn describe(&self) -> String {
+            format!("daemon ({})", self.path.display())
+        }
+
+        fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
+            let mut sock = UnixStream::connect(&self.path).map_err(|e| format!("connect: {e}"))?;
+            sock.set_read_timeout(Some(self.timeout)).ok();
+            sock.set_write_timeout(Some(self.timeout)).ok();
+            let req = format!(
+                "POST /generate?max={} HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{prompt}",
+                max_tokens.clamp(1, 8192),
+                prompt.len(),
+            );
+            sock.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+            let mut raw = String::new();
+            sock.read_to_string(&mut raw).map_err(|e| format!("read: {e}"))?;
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+            let status = head.lines().next().unwrap_or("");
+            if status.contains(" 200") {
+                Ok(body.to_string())
+            } else {
+                // Carry the daemon's own first line rather than a generic
+                // failure: it is the only place that knows whether the
+                // model is missing, still loading, or out of memory.
+                Err(format!("{}: {}", status.trim(), body.trim().lines().next().unwrap_or("")))
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -475,6 +556,114 @@ mod tests {
 
     fn ok_backend() -> std::sync::Arc<dyn Backend> {
         std::sync::Arc::new(FakeBackend { reply: "x".into(), seen: Default::default() })
+    }
+
+    /// Serialises the tests that mutate PROCESS-GLOBAL env vars.
+    ///
+    /// `socket_path` reads XDG_RUNTIME_DIR/HOME and `default_model_dirs`
+    /// reads APERTURE_MODELS, and cargo runs tests on parallel threads —
+    /// so one test's `set_var` lands mid-run in another. They happen to
+    /// pass today, which is luck rather than isolation: this is the exact
+    /// shape of the bo-suite failure diagnosed earlier this session,
+    /// where a per-test tempdir looked like isolation while the shared
+    /// thing was the variable naming the directory. Serialising now is
+    /// cheaper than diagnosing it later from a flake.
+    ///
+    /// Poison ignored so one panicking test does not mask the rest.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A one-shot fake daemon on a unix socket: answers the next
+    /// connection with `body`, records the raw request.
+    fn fake_daemon(body: &'static str, status: &'static str)
+        -> (std::path::PathBuf, std::sync::mpsc::Receiver<String>)
+    {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("ap-daemon-{}-{:?}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = s.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()).as_bytes());
+            }
+        });
+        (path, rx)
+    }
+
+    #[test]
+    fn the_daemon_client_speaks_the_same_request_shape_as_logscope_serve() {
+        // Same shape on purpose: the daemon is logscope-serve with a
+        // second listener, not a second protocol. If this drifts, one
+        // handler stops serving both.
+        let (path, rx) = fake_daemon("let x = 1;", "200 OK");
+        let b = daemon::DaemonBackend::new(&path);
+        let out = b.generate("fn f() { ", 64).expect("generated");
+        assert_eq!(out, "let x = 1;");
+
+        let req = rx.recv().unwrap();
+        assert!(req.starts_with("POST /generate?max=64 HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("fn f() {"), "the prompt is the body: {req}");
+        // No Bearer key: on a unix socket the filesystem answers who may
+        // connect, and a key here would be ceremony with a storage
+        // problem attached.
+        assert!(!req.contains("Authorization"), "{req}");
+    }
+
+    #[test]
+    fn a_daemon_error_carries_its_own_words() {
+        // The daemon is the only party that knows whether the model is
+        // missing, still loading, or out of memory. Replacing that with a
+        // generic failure throws away the only useful diagnosis.
+        let (path, _rx) = fake_daemon("model still loading", "503 Service Unavailable");
+        let b = daemon::DaemonBackend::new(&path);
+        let err = b.generate("x", 8).err().expect("a 503 is an error");
+        assert!(err.contains("503"), "{err}");
+        assert!(err.contains("still loading"), "{err}");
+    }
+
+    #[test]
+    fn probing_an_absent_daemon_fails_fast_and_names_the_path() {
+        // This is what `resolve` calls, so it must be quick and it must
+        // say WHERE it looked — "connection refused" with no path is the
+        // least actionable error a person can be handed.
+        let missing = std::env::temp_dir().join("definitely-not-a-daemon.sock");
+        let _ = std::fs::remove_file(&missing);
+        let err = daemon::DaemonBackend::probe(&missing).err().expect("no daemon there");
+        assert!(err.contains("definitely-not-a-daemon.sock"), "{err}");
+    }
+
+    #[test]
+    fn the_socket_path_is_per_user_not_shared() {
+        // A socket in a sticky shared directory is world-visible, and
+        // this one carries prompts.
+        let _serial = env_lock();
+        let restore_rt = std::env::var("XDG_RUNTIME_DIR").ok();
+        let restore_home = std::env::var("HOME").ok();
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        assert_eq!(daemon::socket_path(),
+                   std::path::Path::new("/run/user/1000/logscope-engine.sock"));
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        // No runtime dir: the home directory, not /tmp.
+        std::env::set_var("HOME", "/home/someone");
+        assert_eq!(daemon::socket_path(),
+                   std::path::Path::new("/home/someone/.logscope-engine.sock"));
+        // Put the environment back: a test that leaves HOME pointing at a
+        // fiction breaks whatever runs next in this process.
+        match restore_rt { Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v), None => std::env::remove_var("XDG_RUNTIME_DIR") }
+        match restore_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
     }
 
     #[test]
@@ -632,6 +821,7 @@ mod tests {
         // models somewhere unconventional; it must WIN, not merely be
         // included, or the picker leads with whatever ~/models happens to
         // hold.
+        let _serial = env_lock();
         std::env::set_var("APERTURE_MODELS", "/tmp/first:/tmp/second");
         let dirs = default_model_dirs();
         std::env::remove_var("APERTURE_MODELS");
