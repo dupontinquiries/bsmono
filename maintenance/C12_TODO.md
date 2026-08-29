@@ -1394,3 +1394,71 @@ voiceterm 1106/1106.
   they are built rather than stubbed. That is worth stating because the
   earlier audits established that substance is not coverage — here it
   turns out to be, and saying so is the point of having checked.
+
+## 30. One GPU, several apps: daemon or per-app backend?
+
+Asked directly, and the honest answer is that the question splits into
+two that have different answers. Grounded in this fleet's own numbers
+rather than in general advice, because the general advice ("modern
+kernels schedule it") is true and not the constraint that bites here.
+
+**SCHEDULING is mostly fine; MEMORY is not.** The M2 Ultra run in
+`fleet-logs` reports the shape clearly:
+
+    resident memory: 7.2 GiB total = 2.5 anon + 4.7 file-backed
+    GPU budget 48.0 GiB clamped to 31.0 GiB
+    loaded in 86.0s
+    prewarmed 16 pipelines; 42 decode + 37 GEMM tiles from autotune cache
+
+Two apps each running their own backend on one 8B model is ~5 GiB of
+resident weights EACH, an 86-second load EACH, and two pipeline
+compilations. `gpu-gemm`'s own docs already record where this ends: a
+session touching three models held "~110 GiB of address space for one
+model's worth of work", and the fix was releasing page-cache residency
+because "on a machine where the GPU budget is already the binding
+constraint it is competing for exactly the memory the live model needs".
+That lesson was learned WITHIN one process. Across processes there is no
+equivalent lever at all — no app can release another's residency.
+
+So: per-app wgpu is fine when each app's resident set is small and its
+GPU work is bursty (a shader-based viewfinder, a graph layout, a
+spectrogram). It stops being fine the moment two apps each want a
+multi-gigabyte model resident, and that is exactly the aperture +
+logscope case that prompted the question.
+
+**Scheduling is the weaker argument for a daemon, but not zero.** Modern
+drivers do preempt, but compute dispatches preempt at coarse
+granularity, and this engine already fights that: the log shows
+`prefill chunk = 128 tokens/dispatch (auto-lowered from 256 ... a fixed
+token count means a bigger model gets a longer dispatch, which is what
+trips the GPU watchdog)`. Two uncoordinated consumers issuing long
+compute dispatches interleave badly — not incorrectly, just with each
+other's latency doubled and both closer to the watchdog. A daemon giving
+each consumer a longer uninterrupted run is a real improvement, but it
+is a second-order one next to not loading the model twice.
+
+**The recommendation: the daemon is a MODEL-RESIDENCY server, not a GPU
+scheduler.** That framing decides the design questions:
+  - It owns the weights and the pipeline/autotune caches — the expensive,
+    shareable things.
+  - It does NOT arbitrate every GPU call. Apps keep their own wgpu
+    device for their own rendering, which is bursty, small, and already
+    scheduled fine by the driver.
+  - Apps that want inference talk to it; apps that want to draw do not.
+
+**Most of it already exists.** `logscope-serve` is that daemon minus a
+socket: `netserve::serve(listener, keyring, gen)` where `gen` is
+`Fn(&str, usize) -> String`. `aperture-engine::Backend` was deliberately
+given that same shape so a `DaemonBackend` drops in beside `GpuBackend`
+without the provider, the prompt assembly or the loop pane learning
+anything (see its module docs). The missing pieces are a unix socket,
+a lifecycle (start on demand, idle-unload, one instance per model path),
+and the client.
+
+- **C12-30a — not built.** The socket, the lifecycle, the client.
+- **C12-30b — the fallback matters more than the daemon.** Whatever is
+  built, an app must work when the daemon is absent, refusing to start,
+  or holding a different model. `LocalEngine::with_backend` already
+  makes that a construction choice rather than a code path, so the
+  fallback is "construct GpuBackend instead" — but nothing tests it yet,
+  and a daemon whose absence breaks the editor is worse than no daemon.
