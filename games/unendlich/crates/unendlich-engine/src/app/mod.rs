@@ -18,6 +18,9 @@
 #[cfg(feature = "egui")]
 pub mod menu_view;
 
+#[cfg(feature = "egui")]
+pub mod live_menu;
+
 pub mod multiplayer_svc;
 
 use crate::sim::affinity_access::Fields;

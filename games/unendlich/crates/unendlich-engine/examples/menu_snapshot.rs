@@ -16,15 +16,65 @@ const H: usize = 520;
 const PPP: f32 = 3.0; // supersample: lay out in points, rasterize at 3x for crisp text
 
 fn main() {
-    // Title screen.
+    // App-core menu view (the future canonical menu).
     render(&MenuController::with_defaults(), "/mnt/user-data/outputs/menu_title.png");
-    // New-game wizard screen.
     let mut m = MenuController::with_defaults();
     m.select(MenuId::NewGame);
     render(&m, "/mnt/user-data/outputs/menu_wizard.png");
+
+    // THE LIVE MENU — the extracted `app::live_menu::live_menu_body`, i.e. the
+    // exact code the fullgame's title window draws. Photographed per screen
+    // kind with representative data, so menu work is visible in-sandbox.
+    let mp = vec![
+        "kessler — Vale (seed 7) @ 192.168.1.10:9878".to_string(),
+        "server — Highlands (seed 41) @ 192.168.1.20:9878".to_string(),
+    ];
+    let worlds = vec![
+        "Vale  ·  seed 7  ·  creative".to_string(),
+        "Highlands  ·  seed 41  ·  survival".to_string(),
+        "Testbed  ·  seed 1337  ·  creative".to_string(),
+    ];
+    let rb = vec![
+        "#5 · autosave · 2m ago · 14 chunks".to_string(),
+        "#4 · crafting · 9m ago · 12 chunks".to_string(),
+        "#3 · long travel · 21m ago · 30 chunks".to_string(),
+    ];
+    for (kind, name) in [
+        (0u8, "live_title"),
+        (1, "live_confirm_quit"),
+        (2, "live_multiplayer"),
+        (3, "live_load"),
+        (4, "live_singleplayer"),
+    ] {
+        render_live(kind, &mp, &worlds, &rb, &format!("/mnt/user-data/outputs/menu_{name}.png"));
+    }
+}
+
+fn render_live(kind: u8, mp: &[String], worlds: &[String], rb: &[String], out: &str) {
+    use unendlich_engine::app::live_menu::{live_menu_body, LiveMenuState};
+    render_with(out, |c| {
+        egui::CentralPanel::default().show(c, |ui| {
+            let s = LiveMenuState {
+                screen_kind: kind,
+                mp_list: mp,
+                world_list: worlds,
+                rollback_list: rb,
+                show_rollbacks: kind == 3,
+                world_delete_ask: -1,
+                dev_mode: kind == 3, // show the dev row on the load shot
+            };
+            let _ = live_menu_body(ui, &s);
+        });
+    });
 }
 
 fn render(menu: &MenuController, out: &str) {
+    render_with(out, |c| {
+        let _ = unendlich_engine::app::menu_view::menu_ui(c, menu);
+    });
+}
+
+fn render_with(out: &str, draw: impl Fn(&Context)) {
     let ctx = Context::default();
     ctx.set_pixels_per_point(PPP);
     let mut input = RawInput::default();
@@ -35,12 +85,8 @@ fn render(menu: &MenuController, out: &str) {
     // run twice: the FIRST frame uploads the font atlas (it appears in that
     // frame's textures_delta); the second frame has stable shapes. We must read
     // the atlas from the first frame — the second's delta is empty.
-    let first = ctx.run(input.clone(), |c| {
-        let _ = unendlich_engine::app::menu_view::menu_ui(c, menu);
-    });
-    let full = ctx.run(input, |c| {
-        let _ = unendlich_engine::app::menu_view::menu_ui(c, menu);
-    });
+    let first = ctx.run(input.clone(), |c| draw(c));
+    let full = ctx.run(input, |c| draw(c));
 
     // Grab the font atlas from the texture deltas. In egui 0.34 the atlas is a
     // ColorImage; glyph coverage lives in the alpha channel (and the solid

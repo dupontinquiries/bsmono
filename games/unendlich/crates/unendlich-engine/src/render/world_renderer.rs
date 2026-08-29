@@ -3660,259 +3660,47 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         .title_bar(false)
                         .show(c, |ui| {
                             unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
-                            ui.vertical_centered(|ui| {
-                                // r223: title in the blocky voxel game font
-                                // (UnendlichBlocks), letterspaced caps — the
-                                // mockup's hero treatment.
-                                ui.label(
-                                    egui::RichText::new("UNENDLICH")
-                                        .font(unendlich_ui::menu::blocks_font(34.0))
-                                        .color(unendlich_ui::INK)
-                                        .extra_letter_spacing(6.0),
-                                );
-                                ui.add_space(14.0);
-                                match menu_screen_kind {
-                                    1 => {
-                                        // r186: ConfirmQuit screen (was
-                                        // undrawn -> quit "did nothing").
-                                        ui.label("quit unendlich?");
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Quit") { menu_pick = 5; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-                                    2 => {
-                                        ui.label("multiplayer");
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Host World") { menu_pick = 2; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Join Server") { menu_pick = 3; }
-                                        ui.add_space(8.0);
-                                        // r394: LAN hosts discovered via the gossip beacon
-                                        // (display-only this slice; selecting → join is next).
-                                        ui.separator();
-                                        ui.label("LAN games");
-                                        if menu_mp_list.is_empty() {
-                                            ui.weak("(searching… none found yet)");
-                                        } else {
-                                            for (i, label) in menu_mp_list.iter().enumerate() {
-                                                // click a host → bin sends a JOIN to its candidate
-                                                if dest_button(ui, label) { menu_mp_pick_local = i as i32; }
-                                            }
-                                        }
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-                                    3 => {
-                                        // r197: LOAD WORLD — list saved worlds
-                                        // (was undrawn: "can't view previously
-                                        // created worlds"). Each row is a button;
-                                        // click sets menu_world_pick for the bin.
-                                        ui.label("load world");
-                                        ui.add_space(8.0);
-                                        if menu_world_list.is_empty() {
-                                            ui.weak("(no saved worlds yet)");
-                                        } else {
-                                            egui::ScrollArea::vertical()
-                                                .id_salt("world_list_scroll")
-                                                .max_height(180.0)
-                                                .show(ui, |ui| {
-                                                    for (i, label) in menu_world_list.iter().enumerate() {
-                                                        ui.horizontal(|ui| {
-                                                            if dest_button(ui, label) {
-                                                                menu_world_pick_local = i as i32;
-                                                            }
-                                                            // r203: peek this world's rollback
-                                                            // history without launching it.
-                                                            if ui.add_sized([70.0, 20.0],
-                                                                egui::Button::new("history")).clicked()
-                                                            {
-                                                                menu_rollback_peek_local = i as i32;
-                                                            }
-                                                            // r205: delete (with confirm). Lets
-                                                            // the dev prune accumulated test
-                                                            // worlds without leaving the menu.
-                                                            let del = egui::Button::new("\u{1f5d1}")
-                                                                .fill(egui::Color32::from_rgb(60, 24, 24));
-                                                            if ui.add_sized([28.0, 20.0], del)
-                                                                .on_hover_text("delete world")
-                                                                .clicked()
-                                                            {
-                                                                menu_world_delete_ask_local = i as i32;
-                                                            }
-                                                        });
-                                                    }
-                                                });
-                                            // r205: delete confirmation row — armed by the
-                                            // trash button, shows the world name and a
-                                            // confirm/cancel pair so a misclick can't wipe
-                                            // a world.
-                                            if menu_world_delete_ask >= 0
-                                                && (menu_world_delete_ask as usize) < menu_world_list.len()
-                                            {
-                                                ui.add_space(6.0);
-                                                ui.separator();
-                                                let idx = menu_world_delete_ask as usize;
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(230, 140, 140),
-                                                    format!("delete \u{201c}{}\u{201d}? this cannot be undone.",
-                                                        menu_world_list[idx]),
-                                                );
-                                                ui.horizontal(|ui| {
-                                                    let yes = egui::Button::new("  delete  ")
-                                                        .fill(egui::Color32::from_rgb(120, 30, 30));
-                                                    if ui.add(yes).clicked() {
-                                                        menu_world_delete_confirm_local = idx as i32;
-                                                    }
-                                                    if ui.button("  cancel  ").clicked() {
-                                                        menu_world_delete_cancel_local = true;
-                                                    }
-                                                });
-                                            }
-                                        }
-                                        // r203: ROLLBACK BROWSE. When a world's
-                                        // history is requested, the bin fills
-                                        // menu_rollback_list with its restore
-                                        // points (newest first). "Step backward
-                                        // through the rollback system" begins as
-                                        // visibility: see the points, their reason
-                                        // and size, then restore.
-                                        if menu_show_rollbacks {
-                                            ui.add_space(6.0);
-                                            ui.separator();
-                                            ui.horizontal(|ui| {
-                                                // r227: blocky header in the menu language
-                                                ui.label(
-                                                    egui::RichText::new("WORLD HISTORY")
-                                                        .font(unendlich_ui::menu::blocks_font(15.0))
-                                                        .color(egui::Color32::from_rgb(0xee, 0xf3, 0xe8))
-                                                        .extra_letter_spacing(3.0),
-                                                );
-                                                ui.weak("(newest first)");
-                                                // r206: a small "more info" hint —
-                                                // explains what history points are
-                                                // and how they're made.
-                                                ui.label("\u{2139}").on_hover_text(
-                                                    "World-history points snapshot your world so you can step back.\n\
-                                                     They're created on a timer, after long travel, and on crafting.\n\
-                                                     In dev mode (UNENDLICH_DEV=1) they're created far more often,\n\
-                                                     and you can force one with the button below. Restore loads a\n\
-                                                     point on next launch; delete prunes a bad one.",
-                                                );
-                                            });
-                                            ui.add_space(4.0);
-                                            if menu_rollback_list.is_empty() {
-                                                ui.weak("(no rollback points for this world yet)");
-                                            } else {
-                                                let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-                                                egui::ScrollArea::vertical()
-                                                    .id_salt("rollback_scroll")
-                                                    .max_height(140.0)
-                                                    .show(ui, |ui| {
-                                                        for (i, label) in menu_rollback_list.iter().enumerate() {
-                                                            ui.horizontal(|ui| {
-                                                                // r227: diamond marker (the menu's
-                                                                // history-point motif) before each row.
-                                                                let (drect, _) = ui.allocate_exact_size(
-                                                                    egui::vec2(16.0, 20.0), egui::Sense::hover());
-                                                                let c = drect.center();
-                                                                let h = 5.0;
-                                                                ui.painter().add(egui::Shape::convex_polygon(
-                                                                    vec![
-                                                                        egui::pos2(c.x, c.y - h),
-                                                                        egui::pos2(c.x + h, c.y),
-                                                                        egui::pos2(c.x, c.y + h),
-                                                                        egui::pos2(c.x - h, c.y),
-                                                                    ],
-                                                                    accent,
-                                                                    egui::Stroke::NONE,
-                                                                ));
-                                                                ui.add_sized([186.0, 20.0],
-                                                                    egui::Label::new(label.as_str()));
-                                                                if ui.add_sized([72.0, 20.0],
-                                                                    egui::Button::new("restore")).clicked()
-                                                                {
-                                                                    menu_rollback_restore_local = i as i32;
-                                                                }
-                                                                // r206: delete a bad point
-                                                                // (operator request).
-                                                                let del = egui::Button::new("\u{1f5d1}")
-                                                                    .fill(egui::Color32::from_rgb(60, 24, 24));
-                                                                if ui.add_sized([26.0, 20.0], del)
-                                                                    .on_hover_text("delete this point")
-                                                                    .clicked()
-                                                                {
-                                                                    menu_rollback_delete_local = i as i32;
-                                                                }
-                                                            });
-                                                        }
-                                                    });
-                                            }
-                                            // r206: dev-only "create history point now".
-                                            if dev_mode_on {
-                                                ui.add_space(4.0);
-                                                if ui.button("\u{2795} create history point now").clicked() {
-                                                    dev_make_point_local = true;
-                                                }
-                                            }
-                                        }
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-
-                                    4 => {
-                                        // r656: Singleplayer submenu — groups
-                                        // Create / Load / Bending Tutorial.
-                                        ui.label("singleplayer");
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Create World") { menu_pick = 1; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Load World") { menu_pick = 7; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Bending Tutorial") { menu_pick = 9; }
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-
-                                    _ => {
-                                        // r656: top level now groups play modes —
-                                        // Singleplayer (Create/Load/Tutorial) and
-                                        // Multiplayer (Host/Join) each open a submenu.
-                                        if dest_button(ui, "Singleplayer") { menu_pick = 8; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Multiplayer") { menu_pick = 2; }
-                                        ui.add_space(4.0);
-                                        // r203: Settings reachable from the MAIN MENU
-                                        // (was pause-menu only). Opens the tabbed
-                                        // settings window (Video/Audio/Gameplay/
-                                        // Controls/Performance) — which already
-                                        // renders over any screen and has its own
-                                        // "Done" close button.
-                                        if dest_button(ui, "Settings") { settings_menu_open_local = true; }
-                                        ui.add_space(4.0);
-                                        // r488: open the character-select / customizer.
-                                        if dest_button(ui, "Character") { open_character_local = true; }
-                                        ui.add_space(12.0);
-                                        if dest_button(ui, "Quit") { menu_pick = 4; }
-                                    }
-
-                                }
-                                fresnel(ui, ui.max_rect().expand(10.0), gt); // r190
-                                // r232: the mockup's "frame draws itself in" —
-                                // an outer→inner border ring that fills on each
-                                // navigation. animate_bool_with_time, keyed by
-                                // the screen kind, ramps 0→1 once when a screen
-                                // appears; border_fill wants 0=thick..1=gone, so
-                                // we pass 1.0 - that ramp and replay per screen.
-                                let bf_id = egui::Id::new(("menu_border_fill", menu_screen_kind));
-                                let ramp = ui.ctx().animate_bool_with_time(bf_id, true, 0.62);
-                                let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-                                if unendlich_ui::menu::border_fill(
-                                    ui, ui.max_rect().expand(10.0), accent, 1.0 - ramp,
-                                ) {
-                                    ui.ctx().request_repaint();
-                                }
-                            });
+                            // r-extract: the menu BODY now lives in
+                            // app::live_menu — library code, drawn identically
+                            // here and in the headless snapshot example, so the
+                            // ACTUAL menu is photographable + unit-tested. This
+                            // window keeps only the chrome (glass, fresnel,
+                            // border fill-in) and maps clicks onto the locals.
+                            let lm = crate::app::live_menu::live_menu_body(
+                                ui,
+                                &crate::app::live_menu::LiveMenuState {
+                                    screen_kind: menu_screen_kind,
+                                    mp_list: &menu_mp_list,
+                                    world_list: &menu_world_list,
+                                    rollback_list: &menu_rollback_list,
+                                    show_rollbacks: menu_show_rollbacks,
+                                    world_delete_ask: menu_world_delete_ask,
+                                    dev_mode: dev_mode_on,
+                                },
+                            );
+                            if lm.menu_pick != 0 { menu_pick = lm.menu_pick; }
+                            if lm.mp_pick >= 0 { menu_mp_pick_local = lm.mp_pick; }
+                            if lm.world_pick >= 0 { menu_world_pick_local = lm.world_pick; }
+                            if lm.rollback_peek >= 0 { menu_rollback_peek_local = lm.rollback_peek; }
+                            if lm.rollback_restore >= 0 { menu_rollback_restore_local = lm.rollback_restore; }
+                            if lm.rollback_delete >= 0 { menu_rollback_delete_local = lm.rollback_delete; }
+                            if lm.world_delete_ask >= 0 { menu_world_delete_ask_local = lm.world_delete_ask; }
+                            if lm.world_delete_confirm >= 0 { menu_world_delete_confirm_local = lm.world_delete_confirm; }
+                            if lm.world_delete_cancel { menu_world_delete_cancel_local = true; }
+                            if lm.dev_make_point { dev_make_point_local = true; }
+                            if lm.open_settings { settings_menu_open_local = true; }
+                            if lm.open_character { open_character_local = true; }
+                            // window chrome (unchanged): fresnel sheen + the
+                            // r232 "frame draws itself in" border ring.
+                            fresnel(ui, ui.max_rect().expand(10.0), gt); // r190
+                            let bf_id = egui::Id::new(("menu_border_fill", menu_screen_kind));
+                            let ramp = ui.ctx().animate_bool_with_time(bf_id, true, 0.62);
+                            let accent = unendlich_ui::current_theme(ui.ctx()).accent;
+                            if unendlich_ui::menu::border_fill(
+                                ui, ui.max_rect().expand(10.0), accent, 1.0 - ramp,
+                            ) {
+                                ui.ctx().request_repaint();
+                            }
                         });
                     } // r190: end gt scope
                 }
