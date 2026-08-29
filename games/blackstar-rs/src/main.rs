@@ -1,6 +1,7 @@
 //! SKYDRIBBLE — a Rocket-League-inspired open-world air-dribble playground.
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
+mod align;
 mod anim;
 mod approach;
 mod actuator;
