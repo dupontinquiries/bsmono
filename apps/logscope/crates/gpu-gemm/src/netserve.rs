@@ -232,15 +232,40 @@ pub fn serve_unix(
     path: &std::path::Path, keys: Keyring,
     gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync>,
 ) -> std::io::Result<()> {
+    serve_unix_tracked(path, keys, gen, None)
+}
+
+/// Shared lifecycle state, if the caller wants idle-unload.
+pub type LifeHandle = Arc<std::sync::Mutex<crate::daemonlife::Life>>;
+
+/// Same, but reporting each request to a [`crate::daemonlife::Life`] so a
+/// janitor can decide when the weights may be released.
+///
+/// `begin` and `end` bracket the HANDLER, not the connection: the window
+/// that must not be interrupted is the generation, and a client that
+/// opens a socket and never sends anything should not keep 7.2 GiB
+/// resident for it.
+///
+/// `end` runs even if the handler panics, via a guard — a panicked
+/// request that left `in_flight` raised would make the daemon immortal,
+/// which is the failure `Life`'s saturating decrement guards against
+/// from the other side.
+pub fn serve_unix_tracked(
+    path: &std::path::Path, keys: Keyring,
+    gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync>,
+    life: Option<LifeHandle>,
+) -> std::io::Result<()> {
     let _ = std::fs::remove_file(path);
     let listener = std::os::unix::net::UnixListener::bind(path)?;
     let keys = Arc::new(keys);
+    let start = std::time::Instant::now();
     for stream in listener.incoming().flatten() {
-        let (keys, gen) = (keys.clone(), gen.clone());
+        let (keys, gen, life) = (keys.clone(), gen.clone(), life.clone());
         std::thread::spawn(move || {
             let mut stream = stream;
             let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
             if let Some(req) = read_request(&mut stream) {
+                let _busy = life.as_ref().map(|l| Busy::begin(l.clone(), start));
                 let resp = handle(&req, &keys, gen.as_ref());
                 let _ = stream.write_all(&resp.bytes());
             }
@@ -248,6 +273,36 @@ pub fn serve_unix(
         });
     }
     Ok(())
+}
+
+/// Raises `in_flight` for as long as it lives. A guard rather than a
+/// matched pair of calls, so an early return or a panic in the handler
+/// cannot leave the count raised forever.
+struct Busy {
+    life: LifeHandle,
+    start: std::time::Instant,
+}
+
+impl Busy {
+    fn begin(life: LifeHandle, start: std::time::Instant) -> Busy {
+        if let Ok(mut l) = life.lock() {
+            l.begin();
+        }
+        Busy { life, start }
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        // Poison ignored: if another request's thread panicked while
+        // holding this lock, the count still has to come down or the
+        // daemon never unloads again.
+        let mut l = match self.life.lock() {
+            Ok(l) => l,
+            Err(e) => e.into_inner(),
+        };
+        l.end(self.start.elapsed());
+    }
 }
 
 pub fn serve(

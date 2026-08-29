@@ -127,6 +127,38 @@ pub fn should_start(existing: Option<&str>, want_model: &str) -> StartVerdict {
     }
 }
 
+/// Watch a [`Life`] and call `on_unload` once it says so.
+///
+/// Blocks, so callers spawn it. Polls rather than waiting on a condvar
+/// because the thing being waited for is a CLOCK, not an event — nothing
+/// signals "ten minutes of nothing happened", and a poll every few
+/// seconds costs nothing next to the weights it is guarding.
+///
+/// Returns after firing. The daemon's response to unload is to exit, and
+/// a janitor that kept running would be watching a `Life` nobody updates
+/// any more.
+pub fn janitor(
+    life: std::sync::Arc<std::sync::Mutex<Life>>,
+    start: std::time::Instant,
+    poll: Duration,
+    on_unload: impl FnOnce(),
+) {
+    loop {
+        std::thread::sleep(poll);
+        let decision = match life.lock() {
+            Ok(l) => l.decide(start.elapsed()),
+            // Poisoned: a request thread panicked. Staying is the safe
+            // read — unloading on the strength of state written by a
+            // panicking thread could drop weights mid-generation.
+            Err(_) => Decision::Stay,
+        };
+        if decision == Decision::Unload {
+            on_unload();
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +226,43 @@ mod tests {
         let mut l = Life::new(secs(10));
         l.end(secs(500));
         assert_eq!(l.decide(secs(100)), Decision::Stay);
+    }
+
+    #[test]
+    fn the_janitor_fires_once_the_window_passes_and_then_stops() {
+        use std::sync::{Arc, Mutex};
+        let life = Arc::new(Mutex::new(Life::new(Duration::from_millis(30))));
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (l2, f2) = (life.clone(), fired.clone());
+        let start = std::time::Instant::now();
+        let h = std::thread::spawn(move || {
+            janitor(l2, start, Duration::from_millis(5), || {
+                f2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+        h.join().unwrap();
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1,
+                   "fires exactly once, then returns rather than watching a dead Life");
+    }
+
+    #[test]
+    fn the_janitor_waits_while_a_request_is_in_flight() {
+        // The property that matters most: a long prefill must not be
+        // killed by the clock.
+        use std::sync::{Arc, Mutex};
+        let life = Arc::new(Mutex::new(Life::new(Duration::from_millis(10))));
+        life.lock().unwrap().begin();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (l2, f2) = (life.clone(), fired.clone());
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || {
+            janitor(l2, start, Duration::from_millis(5), || {
+                f2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 0,
+                   "unloaded while a request was in flight");
     }
 
     #[test]

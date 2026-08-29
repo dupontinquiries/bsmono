@@ -1527,9 +1527,28 @@ and the client.
   thing is the LOAD (86s + pipeline warm-up), not the process — it is
   not a politeness delay.
 
-  STILL MISSING: the WIRING of that policy — a janitor thread calling
-  `decide`, and `serve_unix` calling `begin`/`end` around each request.
-  The policy is decided and tested; nothing consults it yet.
+  The WIRING is in. `serve_unix_tracked` takes an optional `LifeHandle`
+  and brackets each HANDLER (not each connection — the window that must
+  not be interrupted is the generation, and a client that opens a socket
+  and sends nothing should not hold 7.2 GiB). It uses a `Busy` DROP
+  GUARD rather than paired calls, so a panicking handler cannot leave
+  `in_flight` raised forever; both the guard and `Life::end` ignore lock
+  poison, because a count that never comes down makes the daemon
+  immortal, which is worse than reading state a panicking thread wrote.
+
+  `daemonlife::janitor` polls rather than waiting on a condvar: the
+  thing being waited for is a CLOCK, not an event — nothing signals "ten
+  minutes of nothing happened" — and a poll every few seconds costs
+  nothing next to the weights it guards. It returns after firing, since
+  the daemon's response is to exit and a janitor watching a `Life`
+  nobody updates is just a thread. A poisoned lock reads as `Stay`:
+  unloading on the strength of state written by a panicking thread could
+  drop weights mid-generation.
+
+  gpu-gemm 1246/1246. STILL NOT DONE: `logscope-serve` does not yet
+  construct a `Life`, pass it to `serve_unix_tracked`, or spawn the
+  janitor — so the policy is wired to the server and the server is not
+  yet wired to the binary.
 - **C12-30b — DONE, and built before the daemon on purpose.**
   `Reach::{Daemon, InProcess}` plus `resolve(order, daemon, in_process)`:
   try each in order, take the first that constructs, report which one
