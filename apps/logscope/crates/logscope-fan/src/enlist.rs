@@ -137,13 +137,41 @@ pub struct Coordinator {
     invited: Vec<PeerId>,                  // invited, awaiting a reply
     members: Vec<PeerId>,                  // accepted — the live fleet
     declined: Vec<PeerId>,
+    /// The vouched-for machines, when the caller has a registry. `None` is the
+    /// ungated legacy path and is spelled at construction rather than defaulted,
+    /// so an ungated fleet is a choice someone made and not one they forgot.
+    registry: Option<crate::trustkit::Registry>,
+    /// What this fleet is being raised to DO. Admission is gated on it because
+    /// `Trust::permits` draws its meaningful line between source and conversation:
+    /// a Build-only box may compile, and must never be handed a prompt.
+    duty: crate::workerkit::Duty,
 }
 
 impl Coordinator {
     pub fn new(project: &str, id: &str, want: usize, nonce: u64) -> Self {
         Self { project: project.into(), id: id.into(), want: want.min(MAX_FLEET), nonce,
                phase: Phase::Announcing, offers: Vec::new(), invited: Vec::new(),
-               members: Vec::new(), declined: Vec::new() }
+               members: Vec::new(), declined: Vec::new(),
+               registry: None, duty: crate::workerkit::Duty::Build }
+    }
+
+    /// Gate admission on a trust registry for `duty`.
+    ///
+    /// THE GAP THIS CLOSES. `select_invitees_for` was written, documented and
+    /// tested with a registry parameter, and every caller in the fleet passed
+    /// `None` — so the rule could be enforced and was not. `Coordinator` is
+    /// where the fleet's membership is actually decided, so this is where the
+    /// registry has to arrive; anything downstream (`dispatch`) delegates
+    /// membership here and inherits whatever this admitted.
+    ///
+    /// Gating at ADMISSION rather than at assignment is deliberate and matches
+    /// `select_invitees_for`'s own reasoning: once a peer is a member, dispatch
+    /// hands it whatever the queue holds, so a peer that may not do the work
+    /// must never be invited to it.
+    pub fn with_trust(mut self, registry: crate::trustkit::Registry, duty: crate::workerkit::Duty) -> Self {
+        self.registry = Some(registry);
+        self.duty = duty;
+        self
     }
 
     /// Broadcast the opening; moves to `Gathering`.
@@ -162,7 +190,7 @@ impl Coordinator {
 
     /// Close gathering and emit invites to the selected machines; moves to `Inviting`.
     pub fn invite(&mut self) -> Vec<Msg> {
-        let picks = select_invitees(&self.offers, self.want);
+        let picks = select_invitees_for(&self.offers, self.want, self.registry.as_ref(), self.duty);
         self.invited = picks.clone();
         self.phase = Phase::Inviting;
         picks.into_iter().map(|peer| self.invite_msg(peer)).collect()
@@ -196,8 +224,30 @@ impl Coordinator {
         let pool: Vec<(PeerId, Capability)> = self.offers.iter()
             .filter(|(p, _)| !self.invited.contains(p) && !self.members.contains(p) && !self.declined.contains(p))
             .cloned().collect();
-        select_invitees(&pool, 1).into_iter().next()
+        // Gated identically to `invite`. A replacement promoted after a decline is
+        // an admission like any other; gating only the first round would mean a
+        // fleet could acquire an untrusted member by the side door of someone
+        // else declining.
+        select_invitees_for(&pool, 1, self.registry.as_ref(), self.duty).into_iter().next()
     }
+
+    /// Offers this coordinator will not invite, each with the reason.
+    ///
+    /// A filter that silently shortens a list is indistinguishable from a network
+    /// where nobody answered, and those want opposite responses from an operator:
+    /// one is "register that machine", the other is "go find out why it is down".
+    /// `Trust::why_refused` already writes the sentence; this is the seam a panel
+    /// reads it through. Empty when ungated — nothing is being refused.
+    pub fn refused(&self) -> Vec<(PeerId, String)> {
+        let Some(reg) = self.registry.as_ref() else { return Vec::new() };
+        self.offers.iter()
+            .filter(|(id, _)| !reg.level(id).permits(self.duty))
+            .map(|(id, _)| (id.clone(), reg.level(id).why_refused(self.duty)))
+            .collect()
+    }
+
+    /// The duty this fleet is gated for.
+    pub fn duty(&self) -> crate::workerkit::Duty { self.duty }
 
     pub fn phase(&self) -> Phase { self.phase }
     pub fn members(&self) -> &[PeerId] { &self.members }
@@ -692,5 +742,106 @@ mod tests {
         assert!(coord.members().contains(&"box2:1".to_string()));
         let joined = workers.iter().filter(|(w, _)| w.is_joined()).count();
         assert_eq!(joined, 3);
+    }
+
+    // ── the coordinator actually consults the registry (C12-23f's open half) ──
+    //
+    // `select_invitees_for` took a registry and every caller in the fleet passed
+    // `None`, so the rule could be enforced and was not. These pin that the
+    // COORDINATOR — where membership is really decided — now passes one.
+
+    /// A registry with the shape that matters: the biggest box is Build-only,
+    /// so ungated ranking puts it FIRST and a gate has to actively remove it.
+    fn build_box_ranks_first() -> (Vec<(PeerId, Capability)>, crate::trustkit::Registry) {
+        use crate::trustkit::{Registry, Trust};
+        let offers = vec![
+            ("buildbox".to_string(), cap("cpu", 2, 8)),   // most slots: ranks first ungated
+            ("trusted".to_string(), cap("gpu", 1, 2)),
+        ];
+        let mut reg = Registry::new();
+        reg.register("buildbox", Trust::Build);
+        reg.register("trusted", Trust::Compute);
+        (offers, reg)
+    }
+
+    fn gather(c: &mut Coordinator, offers: &[(PeerId, Capability)], nonce: u64) {
+        c.opening();
+        for (p, cp) in offers { c.on_available(p, cp, nonce); }
+    }
+
+    #[test]
+    fn a_gated_coordinator_refuses_to_invite_a_build_box_to_think() {
+        use crate::workerkit::Duty;
+        let (offers, reg) = build_box_ranks_first();
+        let mut c = Coordinator::new("p", "coord", 2, 9).with_trust(reg, Duty::Thinker);
+        gather(&mut c, &offers, 9);
+        let invited: Vec<PeerId> = c.invite().into_iter()
+            .filter_map(|m| match m { Msg::Invite { peer, .. } => Some(peer), _ => None }).collect();
+        assert_eq!(invited, vec!["trusted".to_string()],
+            "a Build-only peer must not be invited to a Thinker fleet even when it ranks first");
+    }
+
+    #[test]
+    fn the_same_build_box_is_welcome_on_a_build_fleet() {
+        // THE COMPLEMENT. A gate that refuses everything passes the test above
+        // for the wrong reason; this is the half that says the filter still
+        // discriminates rather than having simply stopped admitting anyone.
+        use crate::workerkit::Duty;
+        let (offers, reg) = build_box_ranks_first();
+        let mut c = Coordinator::new("p", "coord", 2, 9).with_trust(reg, Duty::Build);
+        gather(&mut c, &offers, 9);
+        let invited: Vec<PeerId> = c.invite().into_iter()
+            .filter_map(|m| match m { Msg::Invite { peer, .. } => Some(peer), _ => None }).collect();
+        assert_eq!(invited.len(), 2, "Build duty admits both; got {invited:?}");
+        assert_eq!(invited[0], "buildbox", "and ranking is unchanged inside the permitted set");
+    }
+
+    #[test]
+    fn an_untrusted_peer_cannot_arrive_by_the_side_door_of_a_decline() {
+        // Gating only `invite` would leave `on_decline`'s promotion ungated, so
+        // a fleet could acquire the very peer it refused the moment someone else
+        // dropped out. Ranking guarantees the refused box is the one promotion
+        // would reach for: it has the most slots.
+        use crate::workerkit::Duty;
+        let (offers, reg) = build_box_ranks_first();
+        let mut c = Coordinator::new("p", "coord", 2, 9).with_trust(reg, Duty::Thinker);
+        gather(&mut c, &offers, 9);
+        let _ = c.invite();
+        let replacement = c.on_decline(&"trusted".to_string(), "full");
+        assert!(replacement.is_none(),
+            "the only remaining offer is Build-only; promoting it would hand a prompt to a peer \
+             admission just refused, got {replacement:?}");
+    }
+
+    #[test]
+    fn refusals_are_reported_rather_than_silently_shortening_the_list() {
+        // A filtered list and an empty network look identical to an operator and
+        // want opposite responses: "register that machine" vs "find out why it
+        // is down". The reason string comes from Trust::why_refused, so the
+        // wording lives with the rule.
+        use crate::workerkit::Duty;
+        let (offers, reg) = build_box_ranks_first();
+        let mut c = Coordinator::new("p", "coord", 2, 9).with_trust(reg, Duty::Thinker);
+        gather(&mut c, &offers, 9);
+        let refused = c.refused();
+        assert_eq!(refused.len(), 1, "exactly one offer is impermissible, got {refused:?}");
+        assert_eq!(refused[0].0, "buildbox");
+        assert!(refused[0].1.contains("Build") && refused[0].1.contains("Compute"),
+            "the reason must name the level held and the level required: {}", refused[0].1);
+    }
+
+    #[test]
+    fn an_ungated_coordinator_behaves_exactly_as_before() {
+        // What did this change take away, and from whom? Callers with no
+        // registry: they must be untouched, and `refused` must not invent
+        // refusals for a coordinator that is not filtering.
+        let (offers, _) = build_box_ranks_first();
+        let mut c = Coordinator::new("p", "coord", 2, 9);
+        gather(&mut c, &offers, 9);
+        let invited: Vec<PeerId> = c.invite().into_iter()
+            .filter_map(|m| match m { Msg::Invite { peer, .. } => Some(peer), _ => None }).collect();
+        assert_eq!(invited.len(), 2);
+        assert_eq!(invited[0], "buildbox");
+        assert!(c.refused().is_empty(), "nothing is being refused when nothing is gating");
     }
 }
