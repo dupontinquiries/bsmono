@@ -882,11 +882,30 @@ mod tests {
         let a = Aboard::new(70.0);
         let bridge = a.ship.stand_in("bridge").expect("bridge");
         assert!(a.ship.sdf_local(bridge) > 0.0, "you cannot stand on the bridge");
-        // a corner of the hull box is structure, not a room
-        let corner = a.ship.hull_half * 0.95;
+        // A point INSIDE the skin but not in any room is structure — that
+        // is what "the hull between rooms is solid" means, and it is what
+        // this test was reaching for.
+        //
+        // It used to sample `hull_half * 0.95`, a corner of the bounding
+        // BOX. Measured: on this 70m ship that corner sits 9.88 units
+        // OUTSIDE the lofted skin, where `sdf_local` is positive by
+        // construction (it starts from `hull.sdf`, which is positive
+        // outside, and carving rooms can only raise it). So the assertion
+        // was asking whether a point that is not in the ship at all is
+        // solid, and reading the honest answer as a bug. A tapered hull
+        // never fills the corners of its own bounding box; that is what
+        // tapering IS.
+        //
+        // The origin is the real case: inside the skin (-6.75) and
+        // between rooms, so `sdf_local` is negative (-1.04) — structure.
+        let wall = Vec3::ZERO;
         assert!(
-            a.ship.sdf_local(corner) < 0.0,
-            "the hull corner is walkable — the ship is a shell with no walls"
+            a.ship.profile().sdf(wall) < 0.0,
+            "the sample must be inside the skin or it tests nothing"
+        );
+        assert!(
+            a.ship.sdf_local(wall) < 0.0,
+            "the hull between rooms is walkable — the ship is a shell with no walls"
         );
     }
 
@@ -934,3 +953,4 @@ mod tests {
         assert_eq!(a.pos, before, "a failed walk moved the player");
     }
 }
+
