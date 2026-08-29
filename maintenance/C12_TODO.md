@@ -1182,10 +1182,40 @@ the whole search-and-drill-down flow are absent. This is the largest
 known port gap in the fleet and it is a real feature, not chrome:
 without it a person cannot find a model they do not already have.
 
-**C12-28b — SetupWizard unmeasured.** 50 elements, 27 labelled texts,
-against 159 lines of Rust — the same ratio as ModelPicker, so it
-probably has the same shape of gap, but I did not read it element by
-element and will not claim it without doing so.
+**C12-28b — SetupWizard MEASURED, and it is better than the ratio
+suggested.** The four-phase skeleton (setup -> choose -> downloading ->
+done) is all there, with a real ProgressBar. Four specific features are
+not, and they are not chrome:
+
+  - **Voice models.** The QML has a whole section — "🎤 Voice input",
+    "Speech models aren't installed yet…", a "Download voice models"
+    button and a `downloadingWhisper` progress line. The port has no
+    mention of speech at all, so a person setting up voiceterm cannot
+    set up the VOICE half of it from the wizard.
+  - **The Ollama fallback.** `ollamaFallback` text plus an "Enable
+    Ollama" button shown when it is off. Absent, so the escape hatch
+    for a machine that cannot run a local GGUF is unreachable.
+  - **Dismissal.** The QML's last button reads "Later" when setup is
+    required and "Close" when it is not, and the downloading phase has
+    its own "Hide" plus "You can keep using the app — this continues in
+    the background". The port has "Done" only, on the final phase. So
+    during a multi-gigabyte download there is no way out of the wizard,
+    which is the moment someone most wants one.
+  - **RAM-aware recommendation.** "★ Recommended for <ram>" — the same
+    guidance missing from ModelPicker (C12-28a), from the same source.
+
+  **Dismissal is now FIXED.** `WizardEvent::Close`, with "Later"/"Close"
+  on Intro (the word changes on whether a model is active, as the QML
+  does — postponing and finishing are different promises) and "Hide" on
+  Downloading, under the QML's own reassurance line. `Close` has NO
+  phase transition on purpose: dismissing is the host hiding the view,
+  not the wizard forgetting what it was doing, so reopening a hidden
+  download lands back on Downloading rather than restarting at Intro.
+  That is what "continues in the background" promises, and it has a
+  test. uikit-egui 290/290, voiceterm checks clean.
+
+  Still open here: voice models, the Ollama fallback, and the RAM
+  recommendation.
 
 **Method note.** Three screens took minutes to audit because the spec is
 15-40 lines each. Doing this by reading QML was attempted before and

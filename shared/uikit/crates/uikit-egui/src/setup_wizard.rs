@@ -32,6 +32,11 @@ pub enum WizardEvent {
     DownloadDone,
     Change,
     Finish,
+    /// Dismiss the wizard. The HOST closes it; the wizard does not
+    /// change phase, so reopening lands where it was — a download hidden
+    /// mid-flight comes back to Downloading rather than restarting at
+    /// Intro, which is what "continues in the background" promises.
+    Close,
 }
 
 /// The pure phase transition. Returns the next phase for `event` from `current`. Unknown/no-op
@@ -42,6 +47,8 @@ pub fn next_phase(current: Phase, event: &WizardEvent) -> Phase {
         (Phase::Browse, WizardEvent::Download(_)) => Phase::Downloading,
         (Phase::Downloading, WizardEvent::DownloadDone) => Phase::Done,
         (Phase::Done, WizardEvent::Change) => Phase::Browse,
+        // Close deliberately has NO transition: dismissing is the host
+        // hiding the view, not the wizard forgetting what it was doing.
         _ => current,
     }
 }
@@ -70,9 +77,19 @@ impl SetupWizard {
                 ui.label("voiceterm runs a local llama.cpp model for on-device chat and command \
                           understanding. Pick one to download, or drop a .gguf in the models folder.");
                 ui.add_space(12.0);
-                if ui.button("Browse models →").clicked() {
-                    event = Some(WizardEvent::Browse);
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Browse models →").clicked() {
+                        event = Some(WizardEvent::Browse);
+                    }
+                    // "Later" rather than "Close" while setup is still
+                    // required, matching the QML: the word tells you
+                    // whether you are postponing something or finishing
+                    // it, and those are different promises.
+                    let dismiss = if self.active_model.is_none() { "Later" } else { "Close" };
+                    if ui.button(dismiss).clicked() {
+                        event = Some(WizardEvent::Close);
+                    }
+                });
             }
             Phase::Browse => {
                 ui.heading("Choose a model");
@@ -95,6 +112,19 @@ impl SetupWizard {
                 if !self.picker.download_status.is_empty() {
                     ui.add_space(4.0);
                     ui.weak(&self.picker.download_status);
+                }
+                // A WAY OUT OF A MULTI-GIGABYTE DOWNLOAD. The QML has
+                // this and the port did not: "You can keep using the app
+                // — this continues in the background" plus a Hide
+                // button. Being unable to leave the screen is worst
+                // exactly here, during the longest phase, and it is also
+                // the moment the reassurance matters — without the line,
+                // Hide reads like it might cancel the download.
+                ui.add_space(8.0);
+                ui.weak("You can keep using the app — this continues in the background.");
+                ui.add_space(4.0);
+                if ui.button("Hide").clicked() {
+                    event = Some(WizardEvent::Close);
                 }
             }
             Phase::Done => {
@@ -131,6 +161,17 @@ impl SetupWizard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hiding_a_download_keeps_the_phase_so_it_resumes_where_it_was() {
+        // "You can keep using the app — this continues in the
+        // background" is a promise: reopening must not restart the
+        // wizard at Intro and lose a half-finished multi-gigabyte
+        // download's context.
+        assert_eq!(next_phase(Phase::Downloading, &WizardEvent::Close), Phase::Downloading);
+        assert_eq!(next_phase(Phase::Intro, &WizardEvent::Close), Phase::Intro);
+        assert_eq!(next_phase(Phase::Done, &WizardEvent::Close), Phase::Done);
+    }
 
     #[test]
     fn opens_to_done_only_when_a_model_is_active() {
