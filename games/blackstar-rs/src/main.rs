@@ -7815,14 +7815,27 @@ impl Game {
             // vehicle mode contains them inside the hull envelope so the
             // fold reads as a solid object rather than a skeleton in a box
             // (`contain`). Both are zero for a body that never needed it.
+            //
+            // CROSSFADED, not switched. These used to flip on `robot` — a
+            // binary read of eased() > 0.5 — so mid-fold every prim with a
+            // different pack and tuck JUMPED by their difference in one
+            // frame, at exactly the moment the transformation has the
+            // player's eyes on the body. Blend by the same eased fold
+            // parameter the morph itself uses: pack at the vehicle end,
+            // tuck at the robot end, identical to the old values at both
+            // endpoints, continuous everywhere between.
             let base = match &settle_q {
                 Some(q) => base * Mat4::from_quat(*q),
                 None => base,
             };
-            let shift = if robot { active.tuck.get(pi) } else { active.pack.get(pi) };
-            let base = match shift {
-                Some(t) if *t != Vec3::ZERO => base * Mat4::from_translation(*t),
-                _ => base,
+            let fold_t = self.xf.eased().clamp(0.0, 1.0);
+            let pack = active.pack.get(pi).copied().unwrap_or(Vec3::ZERO);
+            let tuck = active.tuck.get(pi).copied().unwrap_or(Vec3::ZERO);
+            let shift = pack.lerp(tuck, fold_t);
+            let base = if shift.length_squared() > 1e-12 {
+                base * Mat4::from_translation(shift)
+            } else {
+                base
             };
             // DETECTED WHEELS SPIN TOO. `split_wheels` tags wheels it
             // recognises and the match below turns those; an imported bot
