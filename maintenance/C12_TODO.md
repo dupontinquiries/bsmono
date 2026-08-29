@@ -84,30 +84,21 @@ sibling at all: they are glam-only, so nothing this line did can reach them.
   the exterior fitted in `6a29d2708` does not enclose what it was fitted to.
   Highest-value of the group — it is the feature the commit series is named
   for.
-- **C12-1e — `shots::a_locked_blast_catches_a_crossing_mark`** ("the missile
-  spent itself without arriving") and
-  **`model::a_flung_panel_no_longer_sets_the_ride_height`** ("debris still
-  owns the ride height: 18"). The second is the same bug family as
-  `2cdd88a14` (bounds measured over debris, not over the body) — that commit
-  fixed it for bounds and orientation; the ride height still reads debris.
-
-Run them with `CARGO_TARGET_DIR=/tmp/bd-bs maintenance/tools/cargo-ailite test
---no-default-features` from `games/blackstar-rs`. Default features
-(audio/analog) now BUILD here too — `libasound2-dev` is apt-installable
-(§3, corrected this session) — but were not run.
-
-## 2. voiceprint-kit duplicates voiceterm, with nothing keeping them in step
-
-The c9-006g merge brought `shared/voiceprint-kit`, whose `fingerprint` and
-`compute_mfcc` are byte-identical to `apps/voiceterm/src/acoustic_index.rs`
-and `phonetic.rs` apart from `pub(crate)` → `pub`. Verified by diffing the
-function bodies, not by reading the commit subject.
-
-That identity is the whole point — studio compares against the same
-fingerprint voiceterm computes — and nothing enforces it. If either side
-drifts, cross-app comparison silently stops meaning anything, and the failure
-looks like "the match rate got worse" rather than an error.
-
+- **C12-1e — model half CLOSED (`7bd36008`); shots still open.**
+  `a_flung_panel_no_longer_sets_the_ride_height` was three bugs in the
+  debris filter, all of which stopped it acting on a two-prim model: a
+  `n < 3` bail that argued against the vertex weighting in the rest of
+  the same function; a never-eat-the-body guard counting PRIMS (a
+  300-point hull and a 6-vertex panel are one prim each, so dropping the
+  panel read as "half the asset" and it was put back) now counting
+  points; and an UNWEIGHTED spread median that let the outlier define
+  the scale it was measured against (median of [0, 18] is 18, so
+  `FAR * spread` = 57.6 and nothing is ever far). Fixing them exposed
+  `two_prims_are_never_second_guessed`, which contradicted the
+  flung-panel test from the SAME commit — replaced by two tests that
+  separate a genuine two-part body (never split) from overwhelming mass
+  asymmetry (speck rejected, body explicitly the survivor).
+  `shots::a_locked_blast_catches_a_crossing_mark` is untouched.
 - **C12-2a** — the real fix is voiceterm depending on the kit, which touches
   the AI01→AI02 file format and `N_MFCC`'s visibility; not a merge-integration
   change. Still open.
