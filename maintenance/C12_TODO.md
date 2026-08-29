@@ -706,3 +706,24 @@ cannot appear in the real candidate list (so a model copying it
 verbatim is obvious rather than plausible), and the real question comes
 last so the model finishes on it rather than on the demonstration.
 Both pinned by a test.
+
+## 19. gitmind fleet reporting: the header lied
+
+**CLOSED (`646638d5`).** The exported fleet report hard-coded
+`ok: 0, failed: none` at the Export call site, so every report claimed
+nothing failed — including the beatspace run pasted into this session,
+whose own log carried `error[E0433]` and `could not compile` ten lines
+below the header saying all was well. `build_report::tally` now derives
+both from the log, using the same `── name ──` section markers
+`times_by_crate` reads so "a crate" means the same thing in both halves
+of the report.
+
+Worth keeping as a pattern rather than a one-off: a reporting tool whose
+SUMMARY is not computed from the same data as its BODY will eventually
+disagree with itself, and the summary is the half people trust. Any
+future report field should be derived or absent, never a literal.
+
+- **C12-19a — not done.** `fleet_build.sh` has its own summary
+  (`OK`/`FAILED` counters) which IS computed, so it does not share this
+  bug — but nothing cross-checks the two tools against each other on the
+  same run. Worth a look if they ever disagree.
