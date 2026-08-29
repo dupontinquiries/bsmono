@@ -796,7 +796,12 @@ fn main() {
     };
     log::info!("Terrain generator ready (gpu={})", generator.has_gpu());
 
-    let num_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // Worker threads via device_budget: leaves headroom for the main/render
+    // threads, and on mobile an extra core for the OS (an 8-core phone running
+    // 8 worker threads plus render starves itself into thermal throttle).
+    let num_workers = unendlich_engine::device_budget::worker_threads(
+        &unendlich_engine::device_budget::DeviceCaps::detect(),
+    ) as usize;
     // World persistence path: pristine chunks aren't saved (no overhead);
     // only chunks with player edits write to disk.
     //
@@ -13736,16 +13741,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // seed/name and one-click launch through the FSM (drives MainMenu →
             // Loading → InGame properly), then arm the arena stamp at spawn.
             // r679: replaced by AppInput::StartTutorial (direct launch, no wizard).
-            let input = if renderer.menu_world_pick >= 0 {
-                // r385 LOAD FIX: a clicked saved-world row goes through the App FSM
-                // (SelectSlot → resolve_load → Launch(StartLocal) AND the state machine
-                // leaves the menu → InGame). The old bin bypass (fg_pending_load below)
-                // rebuilt the terrain but never drove the App state, so it bounced back
-                // to the menu with a fresh backdrop seed instead of entering the world.
-                let p = renderer.menu_world_pick as u8;
-                renderer.menu_world_pick = -1; // consume here so the bypass below can't double-fire
-                AppInput::SelectSlot(p)
-            } else if renderer.menu_choice != 0 {
+            let input = if renderer.menu_choice != 0 {
+                // r-loadfix: menu_world_pick is NO LONGER consumed here. The r385
+                // SelectSlot route resolved the click against the MENU's catalog,
+                // which is frozen at boot (r131 records new worlds FILE-only), so
+                // clicking a world created THIS session did nothing (resolve_load
+                // → None → Stay), and even for boot worlds the row order could
+                // diverge from the displayed list (built from the FILE catalog),
+                // loading the wrong world. The LoadSlots block below builds the
+                // display list from the file catalog AND consumes the click
+                // against those same entries (→ fg_pending_load → the full launch
+                // handler, which now drives the App via enter_game — the gap r385
+                // was actually fixing). One list, one consumer, one catalog.
                 let c = renderer.menu_choice;
                 renderer.menu_choice = 0;
                 // r385 MP FIX: menu_choice is screen-dependent. On the Multiplayer

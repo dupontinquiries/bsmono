@@ -51,16 +51,27 @@ pub const DEFAULT_INDEX_BUFFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 pub fn runtime_mesh_pool_bytes() -> (u64, u64) {
     const MIN_MB: u64 = 64;
     const MAX_MB: u64 = 16 * 1024;
+    // Device-sized defaults (device_budget). The old fixed defaults are
+    // 3 GiB + 2 GiB — fine on a 64 GB unified M2 (which keeps exactly those
+    // values through the budget policy), fatal on an 8 GB shared-memory
+    // phone. DeviceCaps::detect() is OnceLock-cached, so this is one probe
+    // per process. See device_budget::mesh_pool_mb.
+    let caps = crate::device_budget::DeviceCaps::detect();
+    let (v_mb, i_mb) = crate::device_budget::mesh_pool_mb(&caps);
     let vert = std::env::var("UNENDLICH_MESH_VERT_POOL_MB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .map(|m| m.clamp(MIN_MB, MAX_MB) * 1024 * 1024)
-        .unwrap_or(DEFAULT_VERT_BUFFER_SIZE);
+        .map(|m| m.clamp(MIN_MB, MAX_MB))
+        .unwrap_or(v_mb as u64)
+        * 1024
+        * 1024;
     let idx = std::env::var("UNENDLICH_MESH_INDEX_POOL_MB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .map(|m| m.clamp(MIN_MB, MAX_MB) * 1024 * 1024)
-        .unwrap_or(DEFAULT_INDEX_BUFFER_SIZE);
+        .map(|m| m.clamp(MIN_MB, MAX_MB))
+        .unwrap_or(i_mb as u64)
+        * 1024
+        * 1024;
     (vert, idx)
 }
 

@@ -108,7 +108,12 @@ pub fn runtime_octree_pool_bytes() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(|m| m.clamp(MIN_MB, MAX_MB) * 1024 * 1024)
-        .unwrap_or(DEFAULT_OCTREE_BUFFER_SIZE);
+        .unwrap_or_else(|| {
+            // No override: size for THIS device. The fixed desktop constant
+            // handed a phone the same pool as an M2 — see device_budget.
+            let caps = crate::device_budget::DeviceCaps::detect();
+            (crate::device_budget::octree_pool_mb(&caps) as u64) * 1024 * 1024
+        });
     mb
 }
 
