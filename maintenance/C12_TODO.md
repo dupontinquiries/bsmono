@@ -1492,9 +1492,22 @@ and the client.
   a test that skipped the socket would not have caught it.
   gpu-gemm 1237/1237.
 
+  The FLAG is in: `logscope-serve --unix [path]` opens the local door
+  ALONGSIDE the TCP one, on a thread, because both listeners block and a
+  daemon reachable only one way is what the flag exists to prevent. With
+  no value it takes the conventional path.
+
+  One rule, one place: `netserve::default_socket_path` is the single
+  definition, `logscope-serve` delegates to it, and
+  `aperture-engine::daemon::socket_path` delegates too under the `gpu`
+  feature (reimplementing it only in the dependency-free default build).
+  Two copies of that rule is exactly how a client and a server end up
+  looking in different places and each concluding the other is not
+  running.
+
   STILL MISSING: the LIFECYCLE — start on demand, idle-unload, one
-  instance per model path — and a `logscope-serve` flag to open the
-  unix door. The plumbing is in place; nothing runs it yet.
+  instance per model path. Everything else is now connected end to end;
+  what remains is who starts the process and when it lets go.
 - **C12-30b — DONE, and built before the daemon on purpose.**
   `Reach::{Daemon, InProcess}` plus `resolve(order, daemon, in_process)`:
   try each in order, take the first that constructs, report which one

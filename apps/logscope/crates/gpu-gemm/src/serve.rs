@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   logscope-serve --model <model.gguf> [--addr 0.0.0.0:8080] [--key <KEY> ...] [--keyfile <path>]
+//!                   [--unix [path]]   also serve local apps over a unix socket
 //!
 //! The model loads once into a shared `Arc<Model>`; the pipelines are warmed up front; then
 //! each connection is served on its own thread against that one resident model (the engine
@@ -74,7 +75,43 @@ fn main() {
         })
     };
 
+    // THE LOCAL DOOR, opened alongside the TCP one rather than instead of
+    // it. `--unix` with no value takes the conventional path, so an app
+    // and the daemon agree on where to meet without either being
+    // configured; a value overrides it for a second instance or a test.
+    //
+    // Served on a thread because both listeners block: a daemon that can
+    // only be reached one way is the thing this flag exists to stop.
+    let unix_path = args.iter().position(|a| a == "--unix").map(|i| {
+        args.get(i + 1)
+            .filter(|v| !v.starts_with("--"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_unix_path)
+    });
+    if let Some(path) = unix_path.clone() {
+        let (keys2, gen2) = (keys.clone(), gen.clone());
+        std::thread::spawn(move || {
+            eprintln!("serving on unix://{}  (local apps share these weights)", path.display());
+            // Empty keyring: the filesystem authorises local callers.
+            // `Keyring::accepts` returns true on an empty ring, so this
+            // is not a bypass bolted on — it is the ring being empty.
+            let _ = keys2;
+            if let Err(e) = netserve::serve_unix(&path, netserve::Keyring::new(vec![]), gen2) {
+                eprintln!("unix socket {}: {e}", path.display());
+            }
+        });
+    }
+
     let listener = std::net::TcpListener::bind(&addr).unwrap_or_else(|e| { eprintln!("bind {addr}: {e}"); std::process::exit(1); });
     eprintln!("serving on http://{addr}  (POST /generate, GET /health)");
     netserve::serve(listener, netserve::Keyring::new(keys), gen);
+}
+
+/// Where the unix socket lives when `--unix` is given no value.
+///
+/// Delegates to the library rather than repeating the rule: two copies
+/// is how the daemon and its clients end up looking in different places,
+/// each concluding the other is not running.
+fn default_unix_path() -> std::path::PathBuf {
+    netserve::default_socket_path()
 }

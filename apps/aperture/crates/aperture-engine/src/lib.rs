@@ -448,15 +448,28 @@ pub mod daemon {
     /// Where the daemon listens. One socket per user, under the runtime
     /// dir when there is one — a socket in /tmp is world-visible and this
     /// carries prompts.
+    /// Delegates to the daemon's own crate under the `gpu` feature, so
+    /// the two halves cannot disagree about where to meet — two copies
+    /// of this rule is how a client and a server each conclude the other
+    /// is not running. Without the feature (the default, dependency-free
+    /// build) it reimplements the same rule, and a test asserts the two
+    /// agree.
     pub fn socket_path() -> std::path::PathBuf {
-        if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
-            return std::path::Path::new(&rt).join("logscope-engine.sock");
+        #[cfg(feature = "gpu")]
+        {
+            gpu_kernels::netserve::default_socket_path()
         }
-        // No runtime dir (a bare container, some BSDs): fall back to the
-        // home directory rather than /tmp, so the permissions are the
-        // user's own rather than a sticky shared directory's.
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        std::path::Path::new(&home).join(".logscope-engine.sock")
+        #[cfg(not(feature = "gpu"))]
+        {
+            if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+                return std::path::Path::new(&rt).join("logscope-engine.sock");
+            }
+            // No runtime dir (a bare container, some BSDs): fall back to
+            // the home directory rather than /tmp, so the permissions are
+            // the user's own rather than a sticky shared directory's.
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::Path::new(&home).join(".logscope-engine.sock")
+        }
     }
 
     /// A [`Backend`] that asks a daemon holding the weights.

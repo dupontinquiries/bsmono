@@ -191,6 +191,24 @@ pub fn handle(
 
 /// Serve forever: accept connections, handle each on its own thread. `gen` is shared via
 /// `Arc`, so the engine's `Gpu` + `Model` back every connection with no reload.
+/// Where the daemon's unix socket lives by default.
+///
+/// Lives HERE, in the library, because two independent copies of this
+/// rule is how the daemon and its clients end up looking in different
+/// places and each concluding the other is not running. `logscope-serve`
+/// and `aperture-engine::daemon::socket_path` both resolve to this.
+///
+/// Prefers $XDG_RUNTIME_DIR; falls back to $HOME rather than /tmp, since
+/// a socket in a sticky shared directory is world-visible and this one
+/// carries prompts.
+pub fn default_socket_path() -> std::path::PathBuf {
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        return std::path::Path::new(&rt).join("logscope-engine.sock");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(".logscope-engine.sock")
+}
+
 /// Serve on a unix socket: the SAME endpoint, for consumers on this
 /// machine.
 ///
