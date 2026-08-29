@@ -19,6 +19,16 @@ pub enum Role {
 }
 
 /// One chat turn.
+/// What the header's buttons asked for. Returned rather than acted on:
+/// starting a new conversation and closing the panel are the HOST's
+/// calls — they touch the backend and the window — and a widget doing
+/// them itself would need both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatAction {
+    New,
+    Close,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ChatMessage {
     pub role: Role,
@@ -79,7 +89,54 @@ impl ChatPanel {
     /// Render the panel. Returns `Some(text)` on the frame the user sends a non-empty message (the
     /// host should dispatch it to the backend, set `busy`, then `reload`). Clears the input on send.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        self.ui_with(ui).0
+    }
+
+    /// Draw, returning `(sent, action)`.
+    ///
+    /// The header and the empty state come from the QML this is a port
+    /// OF, and were missing until `apps/voiceterm/docs/QML_OUTLINE.txt`
+    /// made the gap visible. That spec lists, in order: a header row
+    /// (title, a `[fill]` spacer, a "thinking…" label shown while busy,
+    /// a "New" button), a "✕" close button, the bubble list, an
+    /// "Ask the local model anything…" line shown when empty, then the
+    /// input row.
+    ///
+    /// The bubbles and the input row were already here. The header, both
+    /// buttons and the empty state were not — so the port rendered the
+    /// middle of the panel and none of its chrome, and a person could
+    /// neither start a new conversation nor close it.
+    pub fn ui_with(&mut self, ui: &mut egui::Ui) -> (Option<String>, Option<ChatAction>) {
         let mut sent = None;
+        let mut action = None;
+
+        // header — title, spacer, busy hint, New, close.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("💬 Chat").strong());
+            // The QML spacer is `Item [fill]`: it takes the slack so the
+            // controls sit hard right rather than beside the title.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("✕").on_hover_text("close").clicked() {
+                    action = Some(ChatAction::Close);
+                }
+                if ui.button("New").on_hover_text("new conversation").clicked() {
+                    action = Some(ChatAction::New);
+                }
+                if self.busy {
+                    ui.label(RichText::new("thinking…").weak());
+                }
+            });
+        });
+        ui.separator();
+
+        // empty state — the QML shows this INSTEAD of an empty list, so a
+        // fresh panel says what it is for rather than being a blank box.
+        if self.messages.is_empty() && !self.busy {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Ask the local model anything…").weak());
+            });
+        }
 
         // message list — role-aligned bubbles, newest at the bottom, auto-scrolled.
         ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
@@ -134,7 +191,7 @@ impl ChatPanel {
             }
         });
 
-        sent
+        (sent, action)
     }
 }
 

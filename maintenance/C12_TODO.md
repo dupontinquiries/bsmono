@@ -1104,10 +1104,24 @@ Sizes are CLASSIFIED, not computed, which is what makes it work offline:
 egui directly (`available_width`, a proportion, a literal, needs-a-human,
 size-to-content) and none of them need a running Qt.
 
-- **C12-27a — the outline is generated, no port has used it yet.** The
-  next real test is picking one screen (ChatPanel is the smallest real
-  one at 19 elements) and porting FROM the outline rather than from the
-  QML, then diffing the result back against it.
+- **C12-27a — DONE for ChatPanel, and the outline earned itself.**
+  Auditing the existing egui `chat_panel` against the spec found it
+  rendered the MIDDLE of the QML panel and none of its chrome: no header
+  row, no "New", no close button, no empty state. A person could not
+  start a new conversation or close the panel. All four are in the QML
+  and all four were absent, and reading 244 lines of QML had not
+  surfaced it — reading a 15-line spec did, immediately.
+
+  Added via `ui_with` returning `(sent, action)`; `ui` stays as the
+  one-value shim so existing callers are untouched. `ChatAction::{New,
+  Close}` is RETURNED rather than acted on, because both touch the
+  backend and the window and a widget doing them itself would need both.
+  uikit-egui 289/289.
+
+  The transferable finding: the outline is more valuable as an AUDIT of
+  a port that already exists than as a source to port from. A finished
+  port looks finished; diffing it against a structural spec is what
+  shows the parts that were quietly skipped.
 - **C12-27b — no `expr` review pass.** Elements whose size is an
   arbitrary binding are marked `expr` and shown verbatim; those are
   exactly the ones a port will get wrong silently. Counting and reading
