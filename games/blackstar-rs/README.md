@@ -2,6 +2,10 @@
 
 > **New here? Read `docs/START_HERE.md`, then `docs/PRIORITIES.md`.**
 >
+> **Not related to `games/blackstar`.** That is "Cybertron: Arena of Gods", a
+> separate C/exengine arena brawler; the shared name is a coincidence of both
+> being Transformers-themed, and neither is a port of the other.
+>
 > This is a Transformers open-world game built on the bones of **skydribble**,
 > the Rocket-League-like described below. That inheritance explains most of
 > what looks odd — the player is a car, the maps are named MEADOW and

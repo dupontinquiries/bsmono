@@ -3,6 +3,13 @@
 A "Smite meets Fall of Cybertron" transforming-robot arena brawler, built on the
 exengine engine (now rolled into this codebase and built with CMake).
 
+> **Not related to `games/blackstar-rs`.** The shared name is a coincidence of
+> both being Transformers-themed; that project is a separate Rust open-world
+> game grown from `skydribble`, on its own engine, with no code in common with
+> this one. Neither is a port of the other. (Checked and recorded because the
+> directory names invite the assumption — and because the `c5blackstar-NNN`
+> bundle series belongs to blackstar-rs, not to this.)
+
 ## Layout
 - engine_src/            the exengine engine, vendored as part of this codebase
   - exengine/            engine core + OUR new game modules:
