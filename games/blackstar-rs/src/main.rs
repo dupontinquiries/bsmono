@@ -2787,16 +2787,68 @@ impl Game {
         if dirs.len() < 2 {
             return;
         }
-        let mut poses: Vec<Vec<Vec<meshgen::Vertex>>> = Vec::new();
-        let mut idx: Vec<Vec<u32>> = Vec::new();
-        for (k, (d, target)) in dirs.iter().enumerate() {
+        let mut strip: Vec<Vec<model::RawPrim>> = Vec::new();
+        for (d, target) in dirs.iter() {
             let (raws, _) = model::load_raw(d, *target);
-            if k == 0 {
-                idx = raws.iter().map(|r| r.idx.clone()).collect();
-            }
-            poses.push(raws.into_iter().map(|r| r.verts).collect());
+            strip.push(raws);
         }
-        self.morph = xform::Morph::build(poses, idx);
+        // ALIGNMENT FIRST. No shipped strip agrees prim-for-prim — pose
+        // counts differ and orders permute — so handing raw poses to
+        // Morph::build refused every chassis and the game has been
+        // stepping the whole time (measured; see align.rs). unify finds
+        // the union-prim correspondence and emits exactly the
+        // uniform-shape input Morph requires. Its refusal is the same
+        // stepping fallback as before, so this path can only improve.
+        let Some(u) = crate::align::unify(strip) else {
+            self.morph = None;
+            self.toastf("strip mismatch — stepping");
+            return;
+        };
+        // UNION PRIMS BEYOND THE BASE MODEL NEED DRAW SLOTS. The blend
+        // path writes mesh `p` of the displayed model from union prim
+        // `p`, and pose-specific parts (present only mid-strip) have no
+        // mesh on the vehicle model to write. Append one per extra,
+        // seeded with its own pose-0 placeholder (a collapsed point —
+        // invisible until the fold brings it out). Idempotent: a second
+        // build_morph on the same chassis finds the slots already there.
+        //
+        // Extras are forced to Tag::Body whatever their source pose
+        // called them: the wheel-spin and roller paths key off tags, and
+        // a transitional panel that spins like a wheel mid-fold is worse
+        // than one that merely moves. Textures are not carried over —
+        // they live in the source POSE's directory and the base model's
+        // cache never saw them — so extras draw flat-coloured. Colour is
+        // kept; if flat panels read wrong on real hardware, the texture
+        // load belongs here, where `self.gpu` and `dirs` are both in
+        // scope.
+        let base = self.cars.chassis[cid].strip[0];
+        let have = self.cars.models[base].prims.len();
+        let want = u.base_prims + u.extras.len();
+        if have == u.base_prims {
+            for (e, extra) in u.extras.iter().enumerate() {
+                let p = u.base_prims + e;
+                let md = meshgen::MeshData {
+                    verts: u.poses[0][p].clone(),
+                    idx: u.idx[p].clone(),
+                };
+                let mesh_id = self.gpu.add_mesh(&md);
+                self.cars.models[base].prims.push(model::Prim {
+                    mesh_id,
+                    tex_id: None,
+                    color: extra.color,
+                    tag: model::Tag::Body,
+                    pivot: Vec3::ZERO,
+                });
+            }
+        } else if have != want {
+            // the base model's prim list is not what alignment mapped
+            // against — writing meshes by index would scramble parts, so
+            // refuse into the known fallback rather than blend garbage
+            self.morph = None;
+            self.toastf("strip slot mismatch — stepping");
+            return;
+        }
+        self.morph = xform::Morph::build(u.poses, u.idx);
         // COMPACTION ON, which it never has been: Morph::build sets
         // `compaction: None` and nothing assigned it, so compact.rs — 
         // written for exactly the "flat vehicle panels still hanging off the
