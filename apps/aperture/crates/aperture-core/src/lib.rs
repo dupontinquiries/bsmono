@@ -45,6 +45,8 @@
 
 pub mod buffer;
 pub mod editor;
+/// Modal motions and operators, active while typewriter mode is on.
+pub mod helix;
 /// Multi-cursor: `Selection` becomes `Vec<Selection>` and edits fan out.
 ///
 /// Declared late. The file sat in src/ with no `mod` line, so it was never

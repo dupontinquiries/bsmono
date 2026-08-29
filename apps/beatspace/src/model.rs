@@ -844,7 +844,48 @@ pub fn save_discriminator(d: &Discriminator, path: &std::path::Path) -> Result<(
 
 pub fn load_generator(g: &mut Generator, path: &std::path::Path, dev: &Device) -> Result<()> {
     let m = candle_core::safetensors::load(path, dev)?;
+    // SAY WHAT THE MISMATCH MEANS. A checkpoint carries the geometry it was
+    // TRAINED with; the running config decides the geometry the generator was
+    // BUILT with. When they differ, candle reports a raw tensor shape error —
+    //
+    //   shape mismatch in set, lhs: [8192, 128], rhs: [81920, 128]
+    //
+    // — which names neither the setting that is wrong nor the value to set,
+    // and repeated once per frame it says nothing new eight times. Those two
+    // numbers are `time_frames * latent`: 8192 is 64 frames, 81920 is 640.
+    // The config default is 64 and the checkpoint was trained at 640, so the
+    // fix is a config change and the error should say so.
+    if let Some(want) = checkpoint_time_frames(&m, g.latent) {
+        if want != g.time_frames {
+            return Err(candle_core::Error::Msg(format!(
+                "checkpoint was trained with time_frames = {want}, this generator is built \
+                 for {have}. Set `time_frames = {want}` in the config (or load a checkpoint \
+                 trained at {have}) — the weights are fine, the geometry does not match.",
+                have = g.time_frames,
+            )));
+        }
+    }
     g.load_state(&m)
+}
+
+/// Recover the `time_frames` a checkpoint was trained with, from the first
+/// projection's row count. Returns `None` when the tensor is absent or the
+/// row count is not a whole number of frames — in which case the raw
+/// candle error is still the honest thing to show, since the shape does not
+/// decompose the way this function assumes.
+fn checkpoint_time_frames(
+    m: &std::collections::HashMap<String, candle_core::Tensor>,
+    latent: usize,
+) -> Option<usize> {
+    if latent == 0 {
+        return None;
+    }
+    let t = m.get("proj.weight").or_else(|| m.get("g.proj.weight"))?;
+    let rows = t.dims().first().copied()?;
+    if rows % latent != 0 {
+        return None;
+    }
+    Some(rows / latent)
 }
 
 pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &Device) -> Result<()> {

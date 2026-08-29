@@ -379,6 +379,14 @@ pub struct AppState {
     /// How much context a completion sees. Function scope by default —
     /// right more often than not, and cheap enough on a long file.
     pub scope: aperture_complete::scope::Scope,
+    /// Modal mode, live only while typewriter mode is on — the two travel
+    /// together because a centred film-style caret is a navigating
+    /// posture and modal motion is what that posture wants.
+    pub helix: aperture_core::helix::Mode,
+    /// The last yank, for `p`. Editor-local rather than the system
+    /// clipboard: `y`/`p` are motions in a modal grammar, and routing
+    /// them through the OS would make them fight copy/paste.
+    pub yank: String,
     /// How many lines `Scope::Line` includes. Configurable per the
     /// original request: a single line routinely misses the `if` guard
     /// or loop header sitting right above the caret.
@@ -474,6 +482,8 @@ impl AppState {
             engine_status: EngineStatus::Idle,
             prefix_cache: aperture_complete::prefixcache::PrefixCache::new(256),
             scope: aperture_complete::scope::Scope::default(),
+            helix: aperture_core::helix::Mode::Normal,
+            yank: String::new(),
             line_scope_lines: aperture_complete::scope::DEFAULT_LINE_COUNT,
             pending_prefix: None,
             line_map: aperture_complete::prefixcache::LineMap::new(),
@@ -1446,7 +1456,22 @@ impl AppState {
             }
         }
         match ev {
-            Ev::Text(t) => self.type_text(&t, now_ms),
+            Ev::Text(t) => {
+                // MODAL FIRST, and only when typewriter mode is on. A
+                // single character goes to the keymap; anything longer is
+                // a paste or an IME commit and is always text — running a
+                // multi-char string through a single-key table would
+                // silently drop all but the first.
+                let mut chars = t.chars();
+                let one = match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => None,
+                };
+                match one {
+                    Some(c) if self.helix_key(c, c.is_uppercase(), now_ms) => {}
+                    _ => self.type_text(&t, now_ms),
+                }
+            }
             Ev::Paste(t) => {
                 self.ghost.dismiss();
                 self.debounce.cancel();
@@ -1658,6 +1683,12 @@ impl AppState {
             (Escape, _) => {
                 self.ghost.dismiss();
                 self.debounce.cancel();
+                // Escape is the way BACK to Normal, which is what makes
+                // Insert safe to enter: there is always one key that
+                // returns you to a known mode.
+                if self.typewriter_mode {
+                    self.helix = aperture_core::helix::Mode::Normal;
+                }
             }
             _ => {}
         }
@@ -1727,10 +1758,124 @@ impl AppState {
     }
 
     /// Ctrl+Space and the palette's "complete now" both land here.
+    /// Run one modal keystroke. Returns true when it was consumed, so the
+    /// caller knows not to insert the character as text.
+    ///
+    /// Only live while typewriter mode is on: with it off there is no
+    /// modal layer at all and every key is text, which is what makes the
+    /// feature safe to have — you cannot end up trapped in Normal mode in
+    /// an editor you thought was ordinary.
+    pub fn helix_key(&mut self, ch: char, shift: bool, now_ms: u64) -> bool {
+        use aperture_core::helix::{self, Act, Edge, Mode, Motion};
+        if !self.typewriter_mode || self.helix == Mode::Insert {
+            return false;
+        }
+        let act = helix::resolve(self.helix, ch, shift);
+        if act == Act::Pass {
+            return false;
+        }
+        let extend = self.helix == Mode::Visual;
+        match &act {
+            Act::Move(m) => match m {
+                Motion::Left => self.editor.move_left(extend),
+                Motion::Right => self.editor.move_right(extend),
+                Motion::Up => self.editor.move_vertical(-1, extend),
+                Motion::Down => self.editor.move_vertical(1, extend),
+                Motion::WordNext => self.editor.move_word(1, extend),
+                Motion::WordPrev => self.editor.move_word(-1, extend),
+                Motion::LineStart => self.editor.move_home(extend),
+                Motion::LineEnd => self.editor.move_end(extend),
+                Motion::DocStart => self.editor.move_doc(false, extend),
+                Motion::DocEnd => self.editor.move_doc(true, extend),
+            },
+            Act::Delete => {
+                if self.editor.sel.is_caret() {
+                    self.editor.delete_forward(now_ms);
+                } else {
+                    let (a, b) = (self.editor.sel.min(), self.editor.sel.max());
+                    self.yank = self.editor.selected_text();
+                    self.editor.replace_range(a, b, "");
+                }
+                self.after_edit(now_ms);
+            }
+            Act::Yank => {
+                if !self.editor.sel.is_caret() {
+                    self.yank = self.editor.selected_text();
+                    self.set_status(&format!("yanked {} chars", self.yank.chars().count()), now_ms);
+                }
+            }
+            Act::Paste => {
+                if !self.yank.is_empty() {
+                    let t = self.yank.clone();
+                    self.editor.insert_text(&t, now_ms);
+                    self.after_edit(now_ms);
+                }
+            }
+            Act::Insert { at } => {
+                // From a SELECTION these mean its edges, which is why the
+                // edge travels with the act rather than being a nudge the
+                // caller has to apply in the right direction.
+                if !self.editor.sel.is_caret() {
+                    let to = match at {
+                        Edge::Before => self.editor.sel.min(),
+                        Edge::After => self.editor.sel.max(),
+                    };
+                    self.editor.sel = aperture_core::editor::Selection::caret(to);
+                } else if *at == Edge::After {
+                    self.editor.move_right(false);
+                }
+            }
+            Act::OpenLine { above } => {
+                if *above {
+                    self.editor.move_home(false);
+                    self.editor.insert_text("\n", now_ms);
+                    self.editor.move_vertical(-1, false);
+                } else {
+                    self.editor.move_end(false);
+                    self.editor.newline_smart(now_ms);
+                }
+                self.after_edit(now_ms);
+            }
+            Act::EnterVisual | Act::EnterNormal | Act::Pass => {}
+            Act::Route => {
+                // `f` is the route palette, not find-char: this editor's
+                // useful "go somewhere" verb already exists and giving the
+                // best key the weaker meaning would be the worse trade.
+                self.open_palette(crate::palette_ui::Mode::GoToRoute);
+            }
+            Act::CycleCompletionSpeed => {
+                let next = helix::next_debounce(self.debounce.idle_ms);
+                self.debounce.idle_ms = next;
+                self.set_status(
+                    &format!("completion debounce: {next} ms{}", match next {
+                        250 => " (as you type — warmest)",
+                        1250 => " (only when you stop — coolest)",
+                        _ => "",
+                    }),
+                    now_ms,
+                );
+            }
+        }
+        self.helix = helix::next_mode(self.helix, &act);
+        true
+    }
+
     pub fn trigger_completion_now(&mut self, _now_ms: u64) {
         let ctx = self.fim_context();
         let Some(engine) = &self.engine else { return };
         if !self.ai_enabled {
+            return;
+        }
+        // THE STUTTER. Nothing checked whether a request was already in
+        // flight, so a typist faster than the model produced overlapping
+        // requests — each landing and replacing the ghost with a
+        // suggestion computed from an older buffer, which reads as text
+        // flickering between two answers. The debounce alone does not
+        // prevent it: it spaces requests by IDLE TIME, and a model slower
+        // than the idle window still has one outstanding when the next
+        // fires. Waiting for the pending one costs at most one round trip
+        // and the newer request will be armed again by the next edit.
+        if self.ghost.is_pending() {
             return;
         }
         // Only offer at a caret (not over a selection): a suggestion that
@@ -1784,6 +1929,21 @@ impl AppState {
         // instead of all of them. See kvplan's module docs.
         let before = aperture_complete::kvplan::assemble(scoped, &quick_ctx);
         let after = self.editor.buffer.slice_to_string(head, self.editor.buffer.len_chars());
+        // ONE REQUEST IN FLIGHT AT A TIME — the stutter fix. Nothing
+        // checked this, so a slow model plus a fast typist produced
+        // overlapping requests, each landing and REPLACING the ghost as it
+        // arrived: the suggestion visibly flickered between two or three
+        // answers to prompts you had already typed past. The generation
+        // gate drops STALE answers, but only once they arrive, which is
+        // too late to stop the flicker and wasted the GPU time either way.
+        //
+        // Skipping is right rather than queueing: the debounce re-arms on
+        // the next edit, so the newest context still gets asked about the
+        // moment the current answer lands. Queueing would guarantee the
+        // work is done and thrown away.
+        if self.ghost.is_pending() {
+            return;
+        }
         let mut req = make_request(&ctx, &before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
         req.path = self.path.clone(); // sibling reads + @read resolve here
 

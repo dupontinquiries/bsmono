@@ -770,3 +770,35 @@ arbitrary meshes with nobody to author an axis per part. 5 tests,
   silhouettes and the answer probably differs for a wing versus a leg.
   Worth deciding deliberately rather than by whichever is easier to
   write.
+
+## 22. aperture modal + the asks not yet built
+
+`helix.rs` (10 tests, aperture-core) is the keymap as a pure table:
+hjkl, w/b, 0/$/g/G, x/d/y/p, i/a/o/O, v, Escape, plus `f` routed to the
+Ctrl+G palette and `c` cycling the completion debounce. Live ONLY while
+typewriter mode is on, so an ordinary editor cannot trap you in Normal.
+Wired into `state.rs`; NOT compile-checked this pass (asked to hand over
+the bundle instead).
+
+- **C12-22a — the stutter fix is a guess that fits.** `trigger_completion
+  _now` never checked `ghost.is_pending()`, so a typist faster than the
+  model produced overlapping requests, each replacing the ghost with an
+  answer computed from an older buffer. That IS a stutter and the fix is
+  right, but it was found by reading rather than by reproducing — no
+  measurement here, no model. If flicker survives it, the next suspect
+  is the caret-move dismissal path, not the debounce.
+- **C12-22b — Ctrl+G tiles, not started.** Asked for: multiple results
+  rather than one, laid out as tiles with metadata rather than lines,
+  and reaching PAST the current crate into the wider cargo workspace.
+  `workspace_symbols` already indexes files; what is missing is the
+  workspace walk (read the root `Cargo.toml`'s `members`, follow path
+  deps) and a tile layout. The tile grid is the smaller half.
+- **C12-22c — AI `gg`, not started, and the interesting one.** "I wrote
+  a function, hit ESC gg, and the AI finds where it is useful" — that is
+  a retrieval problem before it is a generation one. The pieces exist:
+  `scope::QuickContext` extracts identifiers, `workspace_symbols` has
+  the index, `prefixcache` holds prior answers, and `route_ai` already
+  has the ask-and-rank shape with a batch seam (`take_pending_batch`).
+  What is missing is the RANKING PROMPT and the tile UI to show several
+  candidates, since there is rarely one right answer — which is also
+  why it should present alternatives rather than jumping.
