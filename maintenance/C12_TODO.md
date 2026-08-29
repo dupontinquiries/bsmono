@@ -727,3 +727,22 @@ future report field should be derived or absent, never a literal.
   (`OK`/`FAILED` counters) which IS computed, so it does not share this
   bug — but nothing cross-checks the two tools against each other on the
   same run. Worth a look if they ever disagree.
+
+## 20. snapclone camera: the plan exists, the capture does not
+
+**Half closed (`50a5f03d`).** `device_kit::source_plan` was hoisted out
+of camera-bridge for this app and then nothing here called it.
+`camera_source::pipelines_for` now answers HOW to open a chosen camera —
+chosen device leads, probe findings stay as fallbacks, libcamera
+outranks v4l2 on a phone without dropping it, front cameras flip to
+match the mirrored preview. 4 tests, snapclone-egui 1303/1303.
+
+- **C12-20a — `frame_pump` still runs no pipeline.** This is the
+  remaining half and the bigger one. The decision layer is complete and
+  tested; nothing executes it, so no frame has been captured. A capture
+  thread now has something to be handed, which it did not before —
+  that is the whole of what changed. Needs GStreamer at runtime and a
+  real camera to verify, neither of which this sandbox has, so it
+  should be written against the same `Backend`-style seam
+  `aperture-engine` uses (construct-and-inject) rather than reaching
+  for gstreamer inline, so the wiring stays testable with a fake.
