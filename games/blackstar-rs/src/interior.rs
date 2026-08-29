@@ -396,8 +396,20 @@ impl Interior {
 
     /// Can something stand here? Inside the hull, but in open volume.
     pub fn walkable(&self, p: Vec3) -> bool {
-        let inside_hull = (p.abs() - self.hull_half).max_element() < 0.0;
-        inside_hull && self.sdf_local(p) > 0.0
+        // INSIDE THE SKIN, not inside the bounding box. `sdf_local` starts
+        // from `hull.sdf(p)` and then carves rooms with `max(-box_sdf)`,
+        // so its sign says "in open space" only for a point that is
+        // actually within the hull: OUTSIDE the skin `hull.sdf` is already
+        // positive, and the carve cannot make it less so. A bounding-box
+        // test therefore reported the entire volume between the tapered
+        // hull and its box as walkable — measured on a 480m ship, 1112 of
+        // 1191 "walkable" samples were outside the skin against only 79
+        // genuinely in a room, which is what made the ship read as
+        // "mostly corridor" to `the_hull_between_rooms_is_still_solid`.
+        //
+        // The profile is cached (see `sdf_local`), so this is a second
+        // read of the same lofted shape, not a second fit.
+        self.profile().sdf(p) < 0.0 && self.sdf_local(p) > 0.0
     }
 
     /// Is there room to drive here — not merely to stand?
@@ -754,3 +766,4 @@ mod tests {
         assert!(open > 20, "there is barely any interior: {open}");
     }
 }
+
