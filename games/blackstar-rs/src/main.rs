@@ -7829,11 +7829,25 @@ impl Game {
                 None => base,
             };
             let fold_t = self.xf.eased().clamp(0.0, 1.0);
-            let pack = active.pack.get(pi).copied().unwrap_or(Vec3::ZERO);
+            let pack = active.pack.get(pi).copied().unwrap_or_default();
             let tuck = active.tuck.get(pi).copied().unwrap_or(Vec3::ZERO);
-            let shift = pack.lerp(tuck, fold_t);
+            let shift = pack.shift.lerp(tuck, fold_t);
             let base = if shift.length_squared() > 1e-12 {
                 base * Mat4::from_translation(shift)
+            } else {
+                base
+            };
+            // THE HINGE rides the same crossfade: full at the vehicle end,
+            // slerped away to identity as the body stands up — the wing
+            // that stowed along the hull swings back out through exactly
+            // the arc it stowed by. Rotation about the limb's own root,
+            // because rotating about the origin detaches the limb
+            // (`skeleton::fold_point`'s warning, honoured here).
+            let base = if pack.rot != Quat::IDENTITY {
+                let q = Quat::IDENTITY.slerp(pack.rot, 1.0 - fold_t);
+                base * Mat4::from_translation(pack.pivot)
+                    * Mat4::from_quat(q)
+                    * Mat4::from_translation(-pack.pivot)
             } else {
                 base
             };
