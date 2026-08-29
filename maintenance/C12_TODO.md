@@ -746,3 +746,27 @@ match the mirrored preview. 4 tests, snapclone-egui 1303/1303.
   should be written against the same `Backend`-style seam
   `aperture-engine` uses (construct-and-inject) rather than reaching
   for gstreamer inline, so the wiring stays testable with a fake.
+
+## 21. blackstar-rs transformations: limbs hinge now
+
+**`0bbd5501`.** Nothing on the fold path rotated anything — `compact`
+displaces vertices, `contain` translates whole limbs, `foldsim` drives
+both. So "vehicle mode" was a body with its limbs slid as far inboard as
+translation allows and still protruding, which is why the containment
+test had to be relaxed to "centred" rather than "contained".
+
+`skeleton::fold_rotation`/`fold_point` add the hinge: a quarter-turn
+about the limb's root, axis DERIVED from the geometry (perpendicular to
+the limb and to where it stows) because these skeletons come from
+arbitrary meshes with nobody to author an axis per part. 5 tests,
+1220/1220.
+
+- **C12-21a — nothing calls it.** `contain` still translates and its
+  test still asserts the centred property, correctly, since that is what
+  translation can promise. The open question is a design one, not an
+  edit: how a limb's rotation should COMPOSE with the containment
+  translation. Rotate first then translate the rotated bounds? Rotate
+  only what still overhangs after translating? They give different
+  silhouettes and the answer probably differs for a wing versus a leg.
+  Worth deciding deliberately rather than by whichever is easier to
+  write.
