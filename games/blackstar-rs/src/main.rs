@@ -187,7 +187,7 @@ enum Mode {
     Trials { sel: usize },
     Splash,
     Play,
-    Pause,
+    Pause { sel: usize },
     Binds { sel: usize, capturing: bool },
     Maps { sel: usize },
     Online { sel: usize },
@@ -3501,13 +3501,13 @@ impl Game {
     }
 
     fn open_menu(&mut self, m: Mode) {
-        self.menu_from_pause = self.mode == Mode::Pause;
+        self.menu_from_pause = matches!(self.mode, Mode::Pause { .. });
         self.mode = m;
         self.mscroll = 0.0;
         self.mfling = 0.0;
     }
     fn close_menu(&mut self) {
-        self.mode = if self.menu_from_pause { Mode::Pause } else { Mode::Splash };
+        self.mode = if self.menu_from_pause { Mode::Pause { sel: 0 } } else { Mode::Splash };
     }
 
     fn mouse_down(&mut self, b: MouseButton, win: &winit::window::Window) {
@@ -3590,7 +3590,7 @@ impl Game {
                     self.mode = Mode::Play;
                 }
             }
-            Mode::Pause => {
+            Mode::Pause { .. } => {
                 if b == MouseButton::Right {
                     self.mode = Mode::Play;
                 }
@@ -3821,26 +3821,16 @@ impl Game {
             return;
         }
         if let Some(b) = hud::hit_nav(self.cursor.0, self.cursor.1) {
-            if !matches!(self.mode, Mode::Splash | Mode::Play | Mode::Pause) {
+            if !matches!(self.mode, Mode::Splash | Mode::Play | Mode::Pause { .. }) {
                 self.nav_to(b, elwt);
                 return;
             }
         }
         match self.mode {
             Mode::Splash => self.mode = Mode::Play,
-            Mode::Pause => {
+            Mode::Pause { .. } => {
                 if let Some(b) = hud::hit_pause_btn(self.cursor.0, self.cursor.1) {
-                    match b {
-                        0 => self.mode = Mode::Play,
-                        1 => self.open_menu(Mode::Tweaks { menu: 0, sel: 0 }),
-                        2 => self.open_menu(Mode::Maps { sel: self.save.map }),
-                        3 => self.open_menu(Mode::Online { sel: 0 }),
-                        _ => {
-                            self.net.leave();
-                            self.persist();
-                            elwt.exit();
-                        }
-                    }
+                    self.pause_activate(b, elwt);
                 }
             }
             Mode::Tweaks { menu, sel } => {
@@ -3897,17 +3887,34 @@ impl Game {
         }
     }
 
+    /// Activate pause button `i` — ONE function for mouse taps, touch, and
+    /// the keyboard's Enter, so the input paths cannot diverge on what a
+    /// button does (the old code held this match twice).
+    fn pause_activate(&mut self, i: usize, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
+        match i {
+            0 => self.mode = Mode::Play,
+            1 => self.open_menu(Mode::Tweaks { menu: 0, sel: 0 }),
+            2 => self.open_menu(Mode::Maps { sel: self.save.map }),
+            3 => self.open_menu(Mode::Online { sel: 0 }),
+            _ => {
+                self.net.leave();
+                self.persist();
+                elwt.exit();
+            }
+        }
+    }
+
     /// Escape-equivalent for gestures: leave the current menu.
     fn menu_back(&mut self, _elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
         self.mode = match self.mode {
             Mode::Tweaks { .. } | Mode::Binds { .. } | Mode::Maps { .. } | Mode::Online { .. } => {
                 if self.menu_from_pause {
-                    Mode::Pause
+                    Mode::Pause { sel: 0 }
                 } else {
                     Mode::Splash
                 }
             }
-            Mode::Pause => Mode::Play,
+            Mode::Pause { .. } => Mode::Play,
             m => m,
         };
     }
@@ -4662,11 +4669,25 @@ impl Game {
                 (_, "o") => self.open_menu(Mode::Online { sel: 0 }),
                 _ => self.mode = Mode::Play, // any other key starts; press consumed
             },
-            Mode::Pause => match (&key, ch) {
+            Mode::Pause { sel } => match (&key, ch) {
                 (Key::Named(NamedKey::Escape), _) | (Key::Named(NamedKey::Tab), _) => {
                     self.mode = Mode::Play
                 }
-                (Key::Named(NamedKey::Enter), _) => self.open_menu(Mode::Tweaks { menu: 0, sel: 0 }),
+                // Arrow-key navigation across the button row (wraps). Up/Left
+                // and Down/Right are aliases so a d-pad or stick mapped to
+                // either axis walks the row — the same nav feel as the list
+                // menus, on the one screen that never had it.
+                (Key::Named(NamedKey::ArrowLeft), _) | (Key::Named(NamedKey::ArrowUp), _) => {
+                    let n = hud::PAUSE_BTNS.len();
+                    self.mode = Mode::Pause { sel: (sel + n - 1) % n };
+                }
+                (Key::Named(NamedKey::ArrowRight), _) | (Key::Named(NamedKey::ArrowDown), _) => {
+                    self.mode = Mode::Pause { sel: (sel + 1) % hud::PAUSE_BTNS.len() };
+                }
+                // Enter activates the SELECTED button (default RESUME). The
+                // old Enter-opens-Settings shortcut is superseded by the nav;
+                // g/o/q stay as fast paths.
+                (Key::Named(NamedKey::Enter), _) => self.pause_activate(sel, elwt),
                 (_, "g") => self.open_menu(Mode::Maps { sel: self.save.map }),
                 (_, "o") => self.open_menu(Mode::Online { sel: 0 }),
                 (_, "q") | (_, "x") => {
@@ -4687,7 +4708,7 @@ impl Game {
                             self.watching = None; // skip the replay
                             return;
                         }
-                        self.mode = Mode::Pause;
+                        self.mode = Mode::Pause { sel: 0 };
                         self.persist(); // checkpoint whenever the player pauses
                         return;
                     }
@@ -5284,9 +5305,9 @@ impl Game {
         self.last_pad = ps;
         if ps.start_pressed {
             match self.mode {
-                Mode::Splash | Mode::Pause => self.mode = Mode::Play,
+                Mode::Splash | Mode::Pause { .. } => self.mode = Mode::Play,
                 Mode::Play => {
-                    self.mode = Mode::Pause;
+                    self.mode = Mode::Pause { sel: 0 };
                     self.persist();
                 }
                 _ => {}
@@ -5335,7 +5356,7 @@ impl Game {
             // detent. Player only; bots keep raw controls.
             // the on-screen MENU button: a phone has no Escape key
             if self.tpad.enabled && self.tpad.menu_tapped() {
-                self.mode = Mode::Pause;
+                self.mode = Mode::Pause { sel: 0 };
                 self.mscroll = 0.0;
             }
             // GYRO DRIVE: device motion folded in beside the sticks
@@ -5929,9 +5950,9 @@ impl Game {
                 self.draw_hud(&mut ui, aspect);
                 self.draw_touch_ui(&mut ui, aspect);
             }
-            Mode::Pause => {
+            Mode::Pause { sel } => {
                 self.draw_hud(&mut ui, aspect);
-                hud::pause(&mut ui, aspect, &self.save, self.air_t, self.cursor);
+                hud::pause(&mut ui, aspect, &self.save, self.air_t, self.cursor, sel);
             }
             Mode::Binds { sel, capturing } => {
                 hud::bindings_menu(&mut ui, aspect, &self.binds, sel, capturing, self.mscroll.max(0.0) as usize, self.cursor)
@@ -5984,7 +6005,7 @@ impl Game {
         }
 
         // cinema bars
-        if self.cfg.video.letterbox && matches!(self.mode, Mode::Play | Mode::Pause) {
+        if self.cfg.video.letterbox && matches!(self.mode, Mode::Play | Mode::Pause { .. }) {
             let bar = [0.0, 0.0, 0.0, 1.0];
             let v = |x: f32, y: f32| UiVert { pos: [x, y], color: bar };
             for (y0, y1) in [(0.865_f32, 1.0_f32), (-1.0, -0.865)] {

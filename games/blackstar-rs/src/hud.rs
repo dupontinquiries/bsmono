@@ -1229,7 +1229,7 @@ fn minimap(ui: &mut Vec<UiVert>, a: f32, world: &World, car: &Car, ball: &Ball, 
 }
 
 // ---------------------------------------------------------------- pause ----
-pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: (f32, f32)) {
+pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: (f32, f32), sel: usize) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.78, -0.90, 0.78, 0.90);
     label_c(ui, 0.78, 0.024, a, PAPER, "PAUSED");
@@ -1261,19 +1261,26 @@ pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: 
     label_c(ui, -0.52, 0.0078, a, DIM, "MODELS: JAKO (FAIRLIGHT51) + 97MASON, CC-BY 4.0.  A FAN HOMAGE - ROCKET LEAGUE IS PSYONIX/EPIC'S.");
     label_c(ui, -0.56, 0.0078, a, DIM, "NETCODE, MAP MOODS + MENU KIT IDEAS FROM THE LOGSCOPE-C4 MONOREPO");
 
-    // tappable buttons: the whole pause menu works with a finger
+    // tappable buttons: the whole pause menu works with a finger — and now
+    // with arrows too (`sel` is the keyboard cursor; hover and selection
+    // share the highlight so the two input styles read as one).
     for (i, name) in PAUSE_BTNS.iter().enumerate() {
         let x0 = pbtn_x0(i);
         let (y0, y1) = (PBTN_Y - PBTN_H * 0.5, PBTN_Y + PBTN_H * 0.5);
-        let hot = hit_pause_btn(cur.0, cur.1) == Some(i);
+        let hot = hit_pause_btn(cur.0, cur.1) == Some(i) || i == sel;
         let bg = if hot { [0.24, 0.30, 0.38, 0.95 * a] } else { [0.13, 0.15, 0.20, 0.85 * a] };
         quad(ui, x0, y0, x0 + PBTN_W, y1, bg);
         quad(ui, x0, y1 - 0.006, x0 + PBTN_W, y1, [GOLD[0], GOLD[1], GOLD[2], (if hot { 0.9 } else { 0.35 }) * a]);
+        // the keyboard cursor gets a second rail on the bottom edge, so the
+        // selected button is findable even while the mouse hovers another
+        if i == sel {
+            quad(ui, x0, y0, x0 + PBTN_W, y0 + 0.006, [CYAN[0], CYAN[1], CYAN[2], 0.9 * a]);
+        }
         let k = ui_k(a);
         let txt = fit(name, PBTN_W * 0.86, 0.0105 * k, a);
         label_c_at(ui, x0 + PBTN_W * 0.5, PBTN_Y - 0.011 * k, 0.0105 * k, a, if hot { PAPER } else { DIM }, &txt);
     }
-    legend(ui, -0.80, a, 0.0098, &[("ESC", "RESUME"), ("ENTER", "SETTINGS"), ("TAP", "ANY BUTTON")]);
+    legend(ui, -0.80, a, 0.0098, &[("ARROWS", "SELECT"), ("ENTER", "ACTIVATE"), ("ESC", "RESUME"), ("TAP", "ANY BUTTON")]);
 }
 
 // ------------------------------------------------------------- controls ----
