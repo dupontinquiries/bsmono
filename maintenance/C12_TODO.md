@@ -518,13 +518,24 @@ concrete need — see `device-kit::source_plan`'s own history this session).
   `bo-suite`'s ANC/soundscape panels, `ambient-learner`'s sensor pages —
   neither audited yet for what their inactive pages actually compute per
   frame).
-- **C12-16b — logscope and studio-live specifically.** Neither has
-  been audited for whether ANY existing code already makes the mistake
-  this section warns against (gating sync/replay on tab visibility).
-  Given `responsive_nav` has no foothold into either app yet (§15's
-  C12-15a found neither app's tab problem is a `responsive_nav` fit), this
-  audit is independent of that module — it's about their OWN update
-  loops, not about adopting new nav chrome. Not started.
+- **C12-16b — AUDITED, both clean.** The concern was that either app
+  might gate op-log replay, presence or outbound edits on tab
+  visibility, which would stall a collaborator the moment the local
+  user looked away. Checked both update loops directly:
+  - **logscope** calls `drain_scan` and `drain_infer` as the first two
+    statements of `ui()`, before any tab dispatch or glass-mode
+    branching, and `autoload_if_changed` right after. Nothing about
+    which tab is showing reaches them.
+  - **studio-live**'s wire block (`carrier.poll()` -> `integrate_packet`
+    -> `drain_outbox`) is gated only on a carrier EXISTING, not on any
+    panel state, and it deliberately calls `request_repaint_after(50ms)`
+    so a peer's edit lands without waiting for a local one — the
+    opposite of the failure mode feared.
+  So the rule §16 documents was already being followed here; the doc
+  section is a guard against a regression rather than a description of
+  one. Recorded as a real result rather than left open, since "not
+  audited" and "audited and clean" are different states and the next
+  reader should not have to redo it.
 
 ## 17. The to-merge-c12unified archive: what landed, and the one thing that can't
 
