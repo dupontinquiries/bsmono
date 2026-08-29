@@ -802,3 +802,75 @@ the bundle instead).
   What is missing is the RANKING PROMPT and the tile UI to show several
   candidates, since there is rarely one right answer — which is also
   why it should present alternatives rather than jumping.
+
+## 23. logscope hive mind: a strong backend with no front door
+
+Surveyed `logscope-fan` (46 modules) against `logscope-egui`. The
+distributed-compute backend is substantial and largely finished —
+discovery, rendezvous, NAT pathing, peer auth, dispatch, consensus
+clustering, power budget, build farm, queen/worker roles. The gap is
+almost entirely at the UI seam.
+
+**C12-23a — the device-add flow (`3f0…`, this session).** `pairing`
+(typable checksummed codes, errors that name the misread character),
+`discovery`, and `trustkit` (ordered Trust levels) all existed and NOTHING
+JOINED THEM UP. `adddevice::Flow` is that join, as a pure state machine:
+scan -> found -> code -> trust -> done. 7 tests.
+
+The rule worth keeping wherever this is rendered: **discovery proves
+something answered on the network, a typed code proves someone can read
+the other machine's screen, and only the second justifies handing over
+conversation.** `Flow::may_grant` caps an unverified peer at `Build`
+(source only) and REFUSES a higher grant with an explanation rather than
+silently downgrading — a person who asked for Handoff and quietly got
+Build would believe the wrong thing about their own network. That rule
+lives in the flow, not a screen, so no UI can offer what the flow would
+not.
+
+- **C12-23b — no UI renders `adddevice` yet.** The state machine and its
+  prompts exist; nothing draws them. This is the actual "device add
+  workflow UI/UX" ask and it is now a rendering job rather than a design
+  one — `Prompt` already carries `needs_answer` so a screen knows when a
+  spinner is wrong.
+- **C12-23c — no UI renders `pairing::code_for` either.** The local
+  machine must SHOW its own code for another device to type. Without
+  that half, the flow above can only ever be driven from one side.
+- **C12-23d — dispatch/consensus have no operator view.** `dispatch`
+  tracks per-peer tasks and `consensus::cluster` groups divergent
+  outputs, which is exactly what a "what is my hive doing" panel needs,
+  and no panel reads either.
+
+## 24. Everything known-unfinished, in one place
+
+Recorded because it was asked for explicitly, and because several of
+these are only in commit messages where nobody will find them.
+
+**Verified-by-reasoning, not by running:**
+- `aperture-engine::LocalEngine::load` — compile-checked only. No GGUF
+  and no real adapter in this sandbox (lavapipe is a CPU rasteriser).
+- All aperture interaction fixes (Tab, focus, palette, stutter) — no
+  display here. The logic is tested; the FEEL is not, and feel is what
+  was reported wrong twice.
+- The KV prefix-stability work (§16): the property is pinned, the
+  millisecond saving is not measured.
+- This session's final aperture modal + beatspace commit was not
+  compile-checked at all, by request.
+
+**Built but with no consumer:**
+- `kvplan::order_for_kv` — the batch issuer does not exist.
+- `route_ai::take_pending_batch` — nothing calls the batch form.
+- `a11y::glove_targets` (C12-4b) — no app wires it.
+- `skeleton::fold_rotation` (C12-21a) — nothing folds with it, and how
+  rotation composes with `contain`'s translation is undecided.
+- `adddevice::Flow` — see §23 above.
+- snapclone `pipelines_for` (C12-20a) — `frame_pump` runs no pipeline.
+
+**Known-wrong and deliberately left:**
+- studio `has_video` is hard-coded false at four import sites (C12-6a).
+  Fixing it without a decoder just relocates the silent drop.
+- beatspace: the archive named epoch337 contains epoch 200, and
+  `gen_latest` is byte-identical to `gen_000200`. Either it stopped or
+  ~137 epochs were never persisted.
+- blackstar-rs `games/blackstar` vs `games/blackstar-rs`: READMEs now
+  disambiguate, but the `c5blackstar-NNN` bundle series still carries
+  the misleading name.
