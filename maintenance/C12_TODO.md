@@ -1148,3 +1148,46 @@ size-to-content) and none of them need a running Qt.
   `Pill`, `RadialBubble`, `ThoughtBubble`) declared inside main.qml
   rather than as files. Correct to report: they are real widgets the
   harness cannot resolve, and saying so beats pretending.
+
+## 28. Port audit: the other three voiceterm screens
+
+Ran the same outline-vs-port diff that found ChatPanel's missing header
+(§27a) against the other ported screens. One is complete, one is a
+third of its spec, one unmeasured.
+
+**ConfirmDialog — COMPLETE.** 15 elements in the spec and the port has
+all of it, including the two things easiest to skip: the shrinking
+progress border (`remaining_fraction` is pure and tested) and the
+auto-dismiss countdown, plus all three actions (confirm / "don't save
+yet" / discard). Nothing to do. Worth recording as a pass — an audit
+that only ever reports problems teaches people the passes were not
+checked.
+
+**C12-28a — ModelPicker is roughly a third of its spec.** 159 lines of
+Rust against 41 elements of QML, and the shortfall is structural rather
+than cosmetic. The QML has THREE sections:
+
+  - "Downloaded:" — local models, `✓` on the active one
+  - a curated list — per-model `label`, `blurb`, `★ Recommended`,
+    `~N GB`, download state, and a heading that varies on
+    `picker.detectedRam` (it recommends against models that will not
+    fit)
+  - HuggingFace search — a text field ("Search HuggingFace GGUF models
+    (Enter)…"), a result list, and a drill-down into a model's FILES
+    with a `‹ back to results` affordance
+
+The port has ONE flat list of rows with star / size / Use / Download.
+The RAM-aware guidance, the blurbs, the curated/downloaded split and
+the whole search-and-drill-down flow are absent. This is the largest
+known port gap in the fleet and it is a real feature, not chrome:
+without it a person cannot find a model they do not already have.
+
+**C12-28b — SetupWizard unmeasured.** 50 elements, 27 labelled texts,
+against 159 lines of Rust — the same ratio as ModelPicker, so it
+probably has the same shape of gap, but I did not read it element by
+element and will not claim it without doing so.
+
+**Method note.** Three screens took minutes to audit because the spec is
+15-40 lines each. Doing this by reading QML was attempted before and
+did not happen at all. The outline's value is concentrated here rather
+than in generating ports.
