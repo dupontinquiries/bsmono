@@ -383,6 +383,12 @@ pub struct AppState {
     /// together because a centred film-style caret is a navigating
     /// posture and modal motion is what that posture wants.
     pub helix: aperture_core::helix::Mode,
+    /// The mobile bottom strip: recents + pinned quick actions, and the
+    /// hold gesture that opens the palette without a keyboard. Off until
+    /// asked for — see `uikit_egui::cmdstrip`.
+    pub cmd_strip: uikit_egui::cmdstrip::Strip,
+    /// Hold detection for the strip's palette button.
+    pub cmd_hold: uikit_egui::cmdstrip::Hold,
     /// The last yank, for `p`. Editor-local rather than the system
     /// clipboard: `y`/`p` are motions in a modal grammar, and routing
     /// them through the OS would make them fight copy/paste.
@@ -483,6 +489,8 @@ impl AppState {
             prefix_cache: aperture_complete::prefixcache::PrefixCache::new(256),
             scope: aperture_complete::scope::Scope::default(),
             helix: aperture_core::helix::Mode::Normal,
+            cmd_strip: uikit_egui::cmdstrip::Strip::new(5),
+            cmd_hold: uikit_egui::cmdstrip::Hold::new(),
             yank: String::new(),
             line_scope_lines: aperture_complete::scope::DEFAULT_LINE_COUNT,
             pending_prefix: None,

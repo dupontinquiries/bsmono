@@ -1030,3 +1030,42 @@ the OS one. gitmind's `repo_root_finds_monorepo_and_resolves_app_paths`
 builds a fixture tree under /tmp and is the same shape. Worth checking
 those three against a clean disk before spending time on them;
 ambient-learner (4) and bo-suite (5) have no such excuse.
+
+## 26. Mobile: reaching the palette without a keyboard
+
+A command palette bound to Ctrl+P is unreachable on a phone, which makes
+every command in it desktop-only by accident rather than by decision.
+voiceterm solved this with a hold gesture on a bottom bar; the timing and
+the model are now in the kit (`uikit_egui::cmdstrip`) rather than in one
+app, so the second app to need it does not re-derive them.
+
+`Hold` reports the threshold crossing ONCE and mid-press, so the menu
+opens while the finger is still down — opening on release makes a hold
+feel like a slow tap. `HOLD_SECONDS` is matched to voiceterm's value
+deliberately: two apps in one fleet disagreeing about what a long press
+feels like is worse than either number being slightly off.
+
+`Strip` is recents-then-pinned, de-duplicated so a pinned command that
+was just used appears ONCE in its recents position — where the thumb
+last found it, rather than in a fixed slot and twice. Off by default: a
+bar that appears uninvited takes height from what the person came to
+look at. 9 tests.
+
+Aperture has the palette toggle ("View: Bottom command strip") and the
+state; `Strip::used` should be called from the palette's own dispatch so
+recents populate themselves.
+
+- **C12-26a — nothing DRAWS the strip yet.** The model, the gesture and
+  the toggle exist; there is no bottom bar in aperture's frame and no
+  hold target wired to `cmd_hold`. That is the remaining half and it is
+  a rendering job.
+- **C12-26b — voiceterm's Qt->egui port is still not faithful**, per the
+  original report, and `bars.rs` is now the place two apps disagree:
+  voiceterm has its own `BarState`/`HOLD_SECONDS` that duplicate
+  `cmdstrip`'s. Worth switching voiceterm onto the kit version so the
+  gesture cannot drift between them — the same
+  hoist-then-adopt shape as `segmented_tabs`.
+- **C12-26c — the strip should read the a11y registry.** `Cmd.id`
+  matches `Semantics::command_id` on purpose, so
+  `A11yScene::palette_matches` (§4c) could supply the strip's candidate
+  list instead of a hand-kept table. Not wired.

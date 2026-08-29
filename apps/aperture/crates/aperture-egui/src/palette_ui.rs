@@ -103,6 +103,7 @@ pub enum Cmd {
     ToggleLoopPane,
     ToggleFollow,
     ToggleTypewriter,
+    ToggleCmdStrip,
     SetScope(aperture_complete::scope::Scope),
     OlderRevision,
     NewerRevision,
@@ -126,6 +127,7 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("View: Toggle loop pane".to_string(), Cmd::ToggleLoopPane),
         ("View: Toggle follow camera (Ctrl+E)".to_string(), Cmd::ToggleFollow),
         ("View: Typewriter camera (center the caret line)".to_string(), Cmd::ToggleTypewriter),
+        ("View: Bottom command strip (recents + quick actions)".to_string(), Cmd::ToggleCmdStrip),
     ];
     // One entry per scope, generated from Scope::ALL so a new variant
     // cannot be added and silently have no way to reach it.
@@ -207,6 +209,10 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
         Cmd::CompleteNow => s.trigger_completion_now(now_ms),
         Cmd::ToggleFollow => s.toggle_follow(now_ms),
         Cmd::ToggleTypewriter => s.toggle_typewriter(now_ms),
+        Cmd::ToggleCmdStrip => {
+            let on = s.cmd_strip.toggle();
+            s.set_status(if on { "command strip: on" } else { "command strip: off" }, now_ms);
+        }
         Cmd::SetScope(sc) => s.set_scope(sc, now_ms),
         Cmd::OlderRevision => s.rev_step(1, now_ms),
         Cmd::NewerRevision => s.rev_step(-1, now_ms),

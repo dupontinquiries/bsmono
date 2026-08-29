@@ -63,6 +63,9 @@ pub mod nav;
 pub mod pager;   // pages as data: hysteretic mobile/dashboard plan + the shared swipe (c11)
 pub mod icons;   // glyphs that actually render, or an honest word (c11 tofu report)
 pub mod path_picker;
+/// Reaching the command palette on a touch screen: hold-to-open, plus a
+/// bottom strip of recents and quick actions.
+pub mod cmdstrip;
 pub mod segmented_tabs;
 /// Tabs vs. pages, decided from width, as data — not a per-app
 /// `if adaptive.is_compact()` guess. See its own module docs.
