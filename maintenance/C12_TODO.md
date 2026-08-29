@@ -840,6 +840,25 @@ not.
   method: writing the rule down as testable code and then AUDITING the
   paths that predate it is what surfaced this — the flow itself was
   never wrong.
+- **C12-23f — `Trust::permits` had ZERO CALLERS (`5f7658e1`).** The
+  bigger version of 23e, found by following the same audit. The function
+  encoding "everything that generates sees the prompt" was written,
+  documented and tested, and nothing consulted it: `enlist` mentions
+  trust nowhere and `dispatch` delegates membership to `enlist`, so a
+  Build-only machine could be invited into a fleet — ranking FIRST if it
+  had the most slots, which a build box usually does — and handed a
+  Thinker slice carrying the prompt. `select_invitees_for` gates at
+  ADMISSION (not assignment: once a member, dispatch hands it whatever
+  the queue holds). 3 tests; 404/404.
+  - **STILL OPEN: no caller passes a registry.** The gate exists and the
+    ungated path is explicit at every call site — `None` is spelled, not
+    defaulted — but the fleet code still calls the ungated form. That is
+    the difference between a rule that CAN be enforced and one that is.
+    Threading the registry through is the remaining work.
+  - Method note, now twice-proven: writing a rule as testable code and
+    then grepping for its callers is what found both 23e and this. A
+    predicate with no callers is the shape to look for — it reads as
+    finished and enforces nothing.
 - **C12-23b — no UI renders `adddevice` yet.** The state machine and its
   prompts exist; nothing draws them. This is the actual "device add
   workflow UI/UX" ask and it is now a rendering job rather than a design
