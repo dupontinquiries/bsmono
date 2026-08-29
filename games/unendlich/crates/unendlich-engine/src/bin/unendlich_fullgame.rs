@@ -2913,10 +2913,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r397: addresses of discovered hosts, parallel to renderer.menu_mp_list, so a
     // clicked index maps to a candidate to send a JOIN to.
     let mut lan_host_addrs: Vec<std::net::SocketAddrV4> = Vec::new();
-    // r399: peer-to-peer transform replication state. Each side is authoritative for
-    // its own player and sends it to the connected peer; the receiver newest-wins per
-    // entity id (`SnapshotGate`). The local entity id is the session port, distinct per
-    // process on a LAN, so host + joiner ids never collide.
+    // r399 → multi-peer: transform replication state. Each side is authoritative
+    // for its own player; the receiver newest-wins per entity id (`SnapshotGate`).
+    // `lan_peer_addr` is now the JOINER'S UPSTREAM HOST only (set when we click a
+    // host or direct-connect). When WE host, connected peers live in `lan_host`
+    // below — the old single-slot host tracking replaced a first joiner with the
+    // second, and its port-derived ids collided when two machines both bound 9878.
     let mut lan_peer_addr: Option<std::net::SocketAddrV4> = None;
     let mut lan_stamper = unendlich_engine::sim::net::entity_snapshot::AuthorityStamper::new();
     let mut lan_gate = unendlich_engine::sim::net::entity_snapshot::SnapshotGate::new();
@@ -2987,6 +2989,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .and_then(|s| s.local_addr().ok())
         .map(|a| a.port())
         .unwrap_or(0);
+    // Multi-peer host table (sim::net::lan_host). Replaces the old single
+    // `lan_peer_addr` HOST-side tracking — a second joiner used to silently
+    // REPLACE the first, and joiners never saw each other. The table assigns
+    // collision-free entity ids (both sides binding 9878 used to merge two
+    // joiners into one avatar), fans datagrams out to everyone-but-source
+    // (star relay through the host), and prunes silent peers.
+    let mut lan_host = unendlich_engine::sim::net::lan_host::LanHost::new(
+        &active_character.name,
+        lan_session_port as u64,
+    );
+    // The id WE stamp on outbound entity states. Hosts keep the legacy
+    // port-derived id; a joiner adopts the id its host assigned in Accept.
+    let mut lan_my_eid: u64 = lan_session_port as u64;
     let lan_local_ip: Option<[u8; 4]> = if lan_beacon.is_some() {
         let ip = unendlich_engine::sim::lan_discovery::local_lan_ipv4();
         match ip {
@@ -14168,41 +14183,81 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         match sock.recv_from(&mut buf) {
                             Ok((n, src)) if n >= 1 => {
                                 let payload = &buf[1..n];
+                                // v4 source + peer-table upkeep, shared by every arm. When WE
+                                // are the host (no upstream), non-handshake datagrams from a
+                                // peer are STAR-RELAYED verbatim to every other peer — that's
+                                // what lets joiner A see joiner B through the host.
+                                let src4: Option<std::net::SocketAddrV4> = match src {
+                                    std::net::SocketAddr::V4(a) => Some(a),
+                                    _ => None, // LAN sessions are v4-only today
+                                };
+                                if let Some(a) = src4 {
+                                    lan_host.note_seen(a, now_ms);
+                                }
+                                let relay_as_host = |from: std::net::SocketAddrV4,
+                                                     lan_host: &unendlich_engine::sim::net::lan_host::LanHost| {
+                                    if lan_peer_addr.is_none() {
+                                        for target in lan_host.fanout(Some(from)) {
+                                            let _ = sock.send_to(&buf[..n], target);
+                                        }
+                                    }
+                                };
                                 match buf[0] {
                                     CH_HANDSHAKE => match LanJoin::parse(payload) {
                                         Some(LanJoin::Join { name }) => {
-                                            // r518: enforce the access policy. Open hosts admit
-                                            // anyone; closed hosts admit only whitelisted names.
-                                            if !whitelist.admits(&name) {
-                                                log::info!("[lan-mp] join DENIED for '{name}' ({src}) — not on whitelist");
-                                                let deny = LanJoin::Deny {
-                                                    reason: "not on this server's whitelist".into(),
+                                            let src4 = match src {
+                                                std::net::SocketAddr::V4(a) => a,
+                                                _ => continue, // LAN sessions are v4-only today
+                                            };
+                                            let allowed = whitelist.admits(&name);
+                                            use unendlich_engine::sim::net::lan_host::{Admit, DenyReason};
+                                            match lan_host.admit(&name, src4, allowed, now_ms) {
+                                                Admit::Accepted { entity_id, rejoined } => {
+                                                    log::info!(
+                                                        "[lan-mp] join request from '{name}' ({src}) — admitted as entity {entity_id}{} ({} player(s))",
+                                                        if rejoined { " (rejoined)" } else { "" },
+                                                        lan_host.player_count()
+                                                    );
+                                                    whitelist.allow(&name); // remember joiners so the host can later close + keep them
+                                                    let reply = LanJoin::Accept {
+                                                        world_name: current_world_name
+                                                            .clone()
+                                                            .unwrap_or_else(|| "World".into()),
+                                                        world_seed: fg_world_seed,
+                                                        entity_id: Some(entity_id),
+                                                    }
+                                                    .encode();
+                                                    let mut dg = vec![CH_HANDSHAKE];
+                                                    dg.extend_from_slice(&reply);
+                                                    let _ = sock.send_to(&dg, src);
                                                 }
-                                                .encode();
-                                                let mut dg = vec![CH_HANDSHAKE];
-                                                dg.extend_from_slice(&deny);
-                                                let _ = sock.send_to(&dg, src);
-                                                continue;
+                                                Admit::Denied(reason) => {
+                                                    let text = match reason {
+                                                        DenyReason::NotAllowed => {
+                                                            "not on this server's whitelist"
+                                                        }
+                                                        DenyReason::Full => "world full",
+                                                    };
+                                                    log::info!(
+                                                        "[lan-mp] join DENIED for '{name}' ({src}) — {text}"
+                                                    );
+                                                    let deny =
+                                                        LanJoin::Deny { reason: text.into() }.encode();
+                                                    let mut dg = vec![CH_HANDSHAKE];
+                                                    dg.extend_from_slice(&deny);
+                                                    let _ = sock.send_to(&dg, src);
+                                                }
                                             }
-                                            log::info!("[lan-mp] join request from '{name}' ({src}) — admitted");
-                                            whitelist.allow(&name); // remember joiners so the host can later close + keep them
-                                            if let std::net::SocketAddr::V4(a) = src {
-                                                lan_peer_addr = Some(a); // host learns where to replicate
-                                            }
-                                            let reply = LanJoin::Accept {
-                                                world_name: current_world_name
-                                                    .clone()
-                                                    .unwrap_or_else(|| "World".into()),
-                                                world_seed: fg_world_seed,
-                                            }
-                                            .encode();
-                                            let mut dg = vec![CH_HANDSHAKE];
-                                            dg.extend_from_slice(&reply);
-                                            let _ = sock.send_to(&dg, src);
                                         }
-                                        Some(LanJoin::Accept { world_name, world_seed }) => {
+                                        Some(LanJoin::Accept { world_name, world_seed, entity_id }) => {
+                                            // Adopt the host-assigned id (fixes the both-bound-
+                                            // 9878 collision). An old host sends none → keep the
+                                            // legacy port-derived id.
+                                            if let Some(eid) = entity_id {
+                                                lan_my_eid = eid;
+                                            }
                                             log::info!(
-                                                "[lan-mp] accepted by host: joining world '{world_name}' seed {world_seed}"
+                                                "[lan-mp] accepted by host: joining world '{world_name}' seed {world_seed} as entity {lan_my_eid}"
                                             );
                                             // Adopt the host's seed and load via the existing
                                             // synthetic-StartLocal launch path (rebuild_for_seed →
@@ -14217,6 +14272,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     CH_ENTITY => {
                                         if let Some(states) = receive(&mut lan_gate, payload) {
                                             for s in &states {
+                                                if s.id == lan_my_eid {
+                                                    continue; // never avatar ourselves off a stray echo
+                                                }
                                                 let pos =
                                                     [s.x.to_f32(), s.y.to_f32(), s.z.to_f32()];
                                                 let yaw = s.yaw as f32 / 10000.0;
@@ -14247,6 +14305,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 }
                                             }
                                         }
+                                        if let Some(a) = src4 {
+                                            relay_as_host(a, &lan_host);
+                                        }
                                     }
                                     CH_WORLDCMD => {
                                         // r498: payload is packet_compress-framed.
@@ -14272,6 +14333,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 }
                                             }
                                         }
+                                        }
+                                        if let Some(a) = src4 {
+                                            relay_as_host(a, &lan_host);
                                         }
                                     }
                                     CH_AVATAR => {
@@ -14304,6 +14368,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 }
                                             }
                                         }
+                                        if let Some(a) = src4 {
+                                            relay_as_host(a, &lan_host);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -14328,13 +14395,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         lan_remote_last_seen.remove(&id);
                         log::info!("[lan-mp] remote entity {id} timed out — avatar removed");
                     }
+                    // Host-side peer prune: silent peers leave the table, so the star
+                    // relay + our outbound fanout stop addressing them, the advert
+                    // player count drops, and their roster slot parks for reconnect
+                    // (a rejoin from the same machine reclaims the same entity id).
+                    for eid in lan_host.prune(now_ms, PEER_TIMEOUT_MS) {
+                        lan_remote_creatures.remove(&eid);
+                        lan_remote_appearance.remove(&eid);
+                        lan_remote_last_seen.remove(&eid);
+                        log::info!("[lan-mp] peer entity {eid} left the host table (timeout)");
+                    }
 
                     // Outbound handshake: a clicked host → send a JOIN to its candidate.
                     if renderer.menu_mp_pick >= 0 {
                         let pick = renderer.menu_mp_pick as usize;
                         renderer.menu_mp_pick = -1;
                         if let Some(addr) = lan_host_addrs.get(pick).copied() {
-                            let join = LanJoin::Join { name: "joiner".to_string() }.encode();
+                            let join = LanJoin::Join { name: active_character.name.clone() }.encode(); // real name: whitelists match the joiner, not a placeholder
                             let mut dg = vec![CH_HANDSHAKE];
                             dg.extend_from_slice(&join);
                             match sock.send_to(&dg, addr) {
@@ -14353,7 +14430,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     if let Some(host) = lan_direct_host {
                         if lan_peer_addr.is_none() && now_ms.saturating_sub(lan_direct_last_ms) >= 2000 {
                             lan_direct_last_ms = now_ms;
-                            let join = LanJoin::Join { name: "joiner".to_string() }.encode();
+                            let join = LanJoin::Join { name: active_character.name.clone() }.encode(); // real name: whitelists match the joiner, not a placeholder
                             let mut dg = vec![CH_HANDSHAKE];
                             dg.extend_from_slice(&join);
                             match sock.send_to(&dg, host) {
@@ -14363,16 +14440,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
 
-                    // Outbound replication: in-game with a peer → send our player transform
-                    // ~15/sec (host-authoritative for our own entity; seal() stamps the seq).
+                    // Outbound replication: in-game → send our player transform ~15/sec
+                    // (authoritative for our own entity; seal() stamps the seq). Targets:
+                    // the upstream host when WE joined someone, else every peer in the
+                    // host table (the old code addressed exactly one peer, so with two
+                    // joiners the second silently starved the first of our updates).
                     if fg_app.state() == AppState::InGame {
-                        if let Some(peer) = lan_peer_addr {
+                        let out_targets: Vec<std::net::SocketAddrV4> = match lan_peer_addr {
+                            Some(up) => vec![up],
+                            None => lan_host.fanout(None),
+                        };
+                        if !out_targets.is_empty() {
                             if now_ms.saturating_sub(lan_repl_last_ms) >= 66 {
                                 lan_repl_last_ms = now_ms;
                                 lan_repl_tick += 1;
                                 let p = local_player.view.position;
                                 let me = EntityState {
-                                    id: lan_session_port as u64,
+                                    id: lan_my_eid,
                                     kind: EntityKind::Player,
                                     x: Fixed::from_f64(p.x as f64),
                                     y: Fixed::from_f64(p.y as f64),
@@ -14385,23 +14469,27 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 let bytes = seal(&mut lan_stamper, lan_repl_tick, &[me]);
                                 let mut dg = vec![CH_ENTITY];
                                 dg.extend_from_slice(&bytes);
-                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
+                                for t in &out_targets {
+                                    let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*t));
+                                }
                             }
 
                             // r494: broadcast our chosen-character appearance ~every 2s so
-                            // the peer renders us as our character, not a default avatar.
+                            // peers render us as our character, not a default avatar.
                             if now_ms.saturating_sub(lan_avatar_last_sent_ms) >= 2000 {
                                 lan_avatar_last_sent_ms = now_ms;
                                 let mut dg = vec![CH_AVATAR];
-                                dg.extend_from_slice(&(lan_session_port as u64).to_le_bytes());
+                                dg.extend_from_slice(&lan_my_eid.to_le_bytes());
                                 dg.extend_from_slice(&active_character.to_appearance_bytes());
-                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
+                                for t in &out_targets {
+                                    let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*t));
+                                }
                             }
 
                             // Outbound block edits: drain this frame's place/break edits
-                            // to the peer so building/mining propagates.
+                            // to every target so building/mining propagates.
                             if !session.lan_outgoing_edits.is_empty() {
-                                let pid = lan_session_port as u64;
+                                let pid = lan_my_eid;
                                 let batch: Vec<_> = session.lan_outgoing_edits
                                     .drain(..)
                                     .map(|cmd| (pid, cmd))
@@ -14413,12 +14501,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 dg.extend_from_slice(
                                     &unendlich_engine::sim::net::packet_compress::pack(&bytes, 48),
                                 );
-                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
+                                for t in &out_targets {
+                                    let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*t));
+                                }
                             }
+                        } else {
+                            // In game but nobody connected: don't let edits accumulate.
+                            session.lan_outgoing_edits.clear();
                         }
                     } else {
-                        // Not in game / no peer: don't let edits accumulate unbounded.
-                        if lan_peer_addr.is_none() {
+                        // Not in game: don't let edits accumulate unbounded.
+                        if lan_peer_addr.is_none() && lan_host.live_peer_count() == 0 {
                             session.lan_outgoing_edits.clear();
                         }
                     }
@@ -14441,9 +14534,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // While in-game we are a host: announce the live world on cadence.
                     if fg_app.state() == AppState::InGame {
                         let advert = unendlich_engine::sim::session_mode::WorldAdvert {
-                            host_username: "host".to_string(),
+                            host_username: active_character.name.clone(), // real name in the server browser
                             world_name: current_world_name.clone().unwrap_or_else(|| "World".into()),
-                            players: 1,
+                            players: lan_host.player_count() as u16,
                             max_players: 8,
                             last_seen_ms: now_ms,
                             candidates: match lan_local_ip {

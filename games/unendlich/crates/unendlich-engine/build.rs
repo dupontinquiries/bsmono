@@ -85,6 +85,10 @@ const SHADERS: &[&str] = &[
     // r68-07: analytic atmospheric sky pass (fullscreen triangle on the far plane).
     "src/shaders/sky.vert",
     "src/shaders/sky.frag",
+    // r336-weather-bonus: procedural cloud layer (fullscreen, after sky.frag).
+    // Shipped a committed .spv but was absent from this list — the same silent-
+    // stale mechanism the octree mesher had. Now hash-managed like the rest.
+    "src/shaders/clouds.frag",
 ];
 
 fn main() {
