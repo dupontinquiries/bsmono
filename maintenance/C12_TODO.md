@@ -1456,9 +1456,21 @@ a lifecycle (start on demand, idle-unload, one instance per model path),
 and the client.
 
 - **C12-30a — not built.** The socket, the lifecycle, the client.
-- **C12-30b — the fallback matters more than the daemon.** Whatever is
-  built, an app must work when the daemon is absent, refusing to start,
-  or holding a different model. `LocalEngine::with_backend` already
-  makes that a construction choice rather than a code path, so the
-  fallback is "construct GpuBackend instead" — but nothing tests it yet,
-  and a daemon whose absence breaks the editor is worse than no daemon.
+- **C12-30b — DONE, and built before the daemon on purpose.**
+  `Reach::{Daemon, InProcess}` plus `resolve(order, daemon, in_process)`:
+  try each in order, take the first that constructs, report which one
+  was used so a UI can say where answers come from. Takes CONSTRUCTORS
+  rather than doing the work, so the decision is testable with no
+  daemon, no model and no GPU — and the decision is the part worth
+  pinning.
+
+  Four tests: a missing daemon falls through to the local load; the
+  daemon wins when present (or the memory saving silently never
+  happens); total failure reports the LAST error, since "no such model
+  file" is more useful than "connection refused" from a service the
+  person may not know they were meant to have; and an empty order errors
+  rather than panicking.
+
+  Built first because it is what makes the daemon SAFE TO ADD. A daemon
+  whose absence breaks the editor is worse than no daemon: the failure
+  is invisible, intermittent, and looks like the editor's fault.

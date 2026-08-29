@@ -260,6 +260,57 @@ impl LocalEngine {
     }
 }
 
+/// How to reach a model, in the order to try.
+///
+/// The daemon (see the `daemon` module below) is the right answer when it
+/// is there: one resident copy of the weights instead of one per app, on
+/// a machine where the loader already clamps its own GPU budget from 48
+/// GiB to 31. But an editor whose completions stop working because a
+/// background service is not running is worse than an editor with no
+/// daemon at all — the failure is invisible, intermittent, and looks like
+/// the editor's fault.
+///
+/// So the fallback is not an error path. It is the ordinary path with a
+/// preferred first entry, and `resolve` returns the first backend that
+/// actually constructs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// A shared daemon holding the weights for every app on the machine.
+    Daemon,
+    /// This process loads its own copy.
+    InProcess,
+}
+
+/// Try each reach in order, returning the first that works, plus which
+/// one it was so a UI can say where the answer is coming from.
+///
+/// Takes CONSTRUCTORS rather than doing the work, so this is testable
+/// without a daemon, a model or a GPU — the decision is what is worth
+/// pinning, and the decision is "try, and carry on if it fails".
+///
+/// Returns the LAST error when everything fails, not the first: the last
+/// attempt is the in-process load, and "no such model file" is a more
+/// useful thing to show than "connection refused" from a daemon the
+/// person may not know they were supposed to have.
+pub fn resolve(
+    order: &[Reach],
+    mut daemon: impl FnMut() -> Result<std::sync::Arc<dyn Backend>, String>,
+    mut in_process: impl FnMut() -> Result<std::sync::Arc<dyn Backend>, String>,
+) -> Result<(LocalEngine, Reach), String> {
+    let mut last = Err("no reach was attempted".to_string());
+    for r in order {
+        let attempt = match r {
+            Reach::Daemon => daemon(),
+            Reach::InProcess => in_process(),
+        };
+        match attempt {
+            Ok(b) => return Ok((LocalEngine::shared(b), *r)),
+            Err(e) => last = Err(e),
+        }
+    }
+    last.map(|_: std::sync::Arc<dyn Backend>| unreachable!())
+}
+
 /// The [`Provider`] adapter: this is what the completion worker holds.
 pub struct EngineProvider {
     pub cfg: EngineConfig,
@@ -420,6 +471,72 @@ mod tests {
             lang: "rust".into(),
             path: None,
         }
+    }
+
+    fn ok_backend() -> std::sync::Arc<dyn Backend> {
+        std::sync::Arc::new(FakeBackend { reply: "x".into(), seen: Default::default() })
+    }
+
+    #[test]
+    fn a_missing_daemon_falls_through_to_the_local_load() {
+        // The property that decides whether a daemon is safe to add at
+        // all: an editor whose completions stop because a background
+        // service is not running is worse than one with no daemon. The
+        // failure would be invisible, intermittent, and look like the
+        // editor's fault.
+        let order = [Reach::Daemon, Reach::InProcess];
+        // Destructured with a match rather than `.expect`, because
+        // LocalEngine holds a trait object and deriving Debug on it just
+        // to satisfy unwrap would be the tail wagging the dog.
+        let (engine, used) = match resolve(
+            &order,
+            || Err("connection refused".into()),
+            || Ok(ok_backend()),
+        ) {
+            Ok(v) => v,
+            Err(e) => panic!("did not fall through to local: {e}"),
+        };
+        assert_eq!(used, Reach::InProcess);
+        assert_eq!(engine.describe(), "fake");
+    }
+
+    #[test]
+    fn the_daemon_wins_when_it_is_there() {
+        // The whole point: one resident copy of the weights instead of
+        // one per app. If the order were not honoured the daemon would
+        // never be used and the memory saving would silently not happen.
+        let (_e, used) = match resolve(
+            &[Reach::Daemon, Reach::InProcess],
+            || Ok(ok_backend()),
+            || panic!("local load ran while the daemon was available"),
+        ) {
+            Ok(v) => v,
+            Err(e) => panic!("daemon was available but resolve failed: {e}"),
+        };
+        assert_eq!(used, Reach::Daemon);
+    }
+
+    #[test]
+    fn total_failure_reports_the_LAST_error_not_the_first() {
+        // The last attempt is the in-process load, and "no such model
+        // file" is more useful to show than "connection refused" from a
+        // daemon the person may not know they were meant to have.
+        let err = resolve(
+            &[Reach::Daemon, Reach::InProcess],
+            || Err("connection refused".into()),
+            || Err("no such model file".into()),
+        )
+        .err()
+        .expect("both failed, so this must be an error");
+        assert_eq!(err, "no such model file");
+    }
+
+    #[test]
+    fn an_empty_order_is_an_error_rather_than_a_panic() {
+        let err = resolve(&[], || Ok(ok_backend()), || Ok(ok_backend()))
+            .err()
+            .expect("an empty order cannot succeed");
+        assert!(err.contains("no reach"), "{err}");
     }
 
     #[test]
