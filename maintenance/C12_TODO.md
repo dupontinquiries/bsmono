@@ -1004,6 +1004,23 @@ Two more read and fixed, one still unread:
   fixtures/schema/clamps forbid. None compiled here; all need a run on
   a machine with gdk-pixbuf-sys.
 
+**C12-25e — bo-suite's five: all one bug, a test-parallelism race.
+Fixed, NOT compiled (needs openssl-sys, absent here).** All five live in
+`audio_capture_dump`. The module has an `isolated_xdg` helper that gives
+each test its own tempdir, which READS like isolation and is not:
+`XDG_DATA_HOME` is a process-global env var and `state()` is a
+process-global Mutex, while cargo runs the six tests on parallel
+threads. One test's `set_var` and state reset land mid-run in another.
+
+The observed numbers say exactly this and are worth keeping as the
+signature: "disabled should produce no files" saw 1 (another test's
+file), and "second trigger should not start a new file" saw 11 (several
+tests' windows in a shared ring). A per-test tempdir cannot fix it,
+because the shared thing is not the directory — it is the variable
+naming which directory to use. Added a module-level serialising lock
+held for the whole body, ignoring poison so one panicking test does not
+mask the rest.
+
 **C12-25c — the other five apps, unexamined.** bot-arena's
 `clean_repo_passes_and_broken_fails` and logscope's
 `verdict::compile_grades_real_code` both SHELL OUT TO CARGO, so those

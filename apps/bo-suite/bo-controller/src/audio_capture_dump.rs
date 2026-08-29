@@ -331,7 +331,33 @@ pub fn list_captures() -> Vec<(PathBuf, u64)> {
 mod tests {
     use super::*;
 
+    /// Serialises the tests in this module.
+    ///
+    /// `isolated_xdg` gives each test its own directory, which reads like
+    /// isolation and is not: `XDG_DATA_HOME` is a PROCESS-GLOBAL env var
+    /// and `state()` is a process-global Mutex, while cargo runs these six
+    /// tests on parallel threads. So one test's `set_var` and state reset
+    /// land in the middle of another's run — which is exactly the observed
+    /// failures: "disabled should produce no files" saw 1 file (another
+    /// test's), and "second trigger should not start a new file" saw 11
+    /// (several tests' worth of windows in a shared ring).
+    ///
+    /// A per-test tempdir cannot fix that, because the thing being shared
+    /// is not the directory — it is the variable that says which directory
+    /// to use. Holding this lock for the whole body makes the isolation
+    /// real. Poison is ignored (`unwrap_or_else(|e| e.into_inner())`): if
+    /// one test panics, the rest should still run against clean state
+    /// rather than all reporting a poisoned mutex and hiding the original
+    /// failure.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn isolated_xdg<F: FnOnce()>(label: &str, f: F) {
+        let _serial = test_lock();
         let tmp = std::env::temp_dir().join(format!(
             "bo-cap-{}-{}", label,
             std::time::SystemTime::now()

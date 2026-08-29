@@ -212,6 +212,7 @@ dependencies = [
 name = "bo-controller"
 version = "0.1.0"
 dependencies = [
+ "audio-kit",
  "audiopus",
  "bliss-audio",
  "bo-core",
@@ -252,6 +253,7 @@ version = "0.1.0"
 dependencies = [
  "audiomix-kit",
  "mic-kit",
+ "net-kit",
  "serde",
  "serde_json",
  "signal-hook-registry",
@@ -1493,6 +1495,13 @@ dependencies = [
  "num-integer",
  "num-traits",
  "rand",
+]
+
+[[package]]
+name = "net-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
 ]
 
 [[package]]
