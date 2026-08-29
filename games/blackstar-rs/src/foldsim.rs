@@ -182,6 +182,324 @@ pub fn shapes(bot: &str) {
     println!("  (order_sig differing + sorted_sig matching = a permuted strip: the blend is off)");
 }
 
+/// THE KEY `shapes` NEVER TRIED: texture coordinates.
+///
+/// Three keys were probed above — colour, colour+count, rigid shape
+/// invariants — and each failed for a reason `shapes` documents. All
+/// three read attributes a fold CHANGES (colour re-merges, positions
+/// move, groups deform). UVs are the one per-vertex attribute a fold
+/// cannot touch: a triangle keeps its texture mapping while its corners
+/// travel, or the paint would swim during the animation. So a prim's
+/// UV MULTISET is a candidate identity that survives both regrouping
+/// order and geometric motion. This prints, per pose pair:
+///  * `key_uniq` — quantised-UV-multiset keys unique within a pose
+///  * `stable` — whether the key multiset matches the previous pose
+///  * `matched` — prims matched one-to-one by key across the pair
+///  * `order_ok` — matched prims whose intra-prim VERTEX ORDER also
+///    agrees (per-index UV sequence equal), i.e. lerp-ready as-is
+///  * `move` — mean centroid travel of matched prims (sanity: adjacent
+///    poses should move modestly, and a mismatch shows up as travel
+///    on the scale of the whole body)
+pub fn align_probe(bot: &str) {
+    let dirs = fold_poses(&bots_dir().join(bot));
+    if dirs.len() < 2 {
+        println!("{bot}: fewer than 2 fold poses");
+        return;
+    }
+    println!("{bot}");
+    let mut prev: Option<Vec<(u64, usize, glam::Vec3, Vec<u64>)>> = None;
+    for d in &dirs {
+        let name = d.file_name().unwrap().to_string_lossy().to_string();
+        let Ok((raws, _)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model::load_raw(d, 4.0)))
+        else {
+            println!("  {name}  LOAD PANICKED");
+            prev = None;
+            continue;
+        };
+        // Per prim: (uv-multiset key, vert count, centroid, per-vertex uv hashes IN ORDER).
+        // Quantised to 1/4096 so re-emitted floats differing in the last
+        // bits do not defeat exact matching (same reason `shapes`
+        // quantises colour).
+        let info: Vec<(u64, usize, glam::Vec3, Vec<u64>)> = raws
+            .iter()
+            .map(|r| {
+                let q = |x: f32| (x * 4096.0).round() as i64;
+                let mut seq: Vec<u64> = r
+                    .verts
+                    .iter()
+                    .map(|v| fnv(&format!("{},{}", q(v.uv[0]), q(v.uv[1]))))
+                    .collect();
+                let ordered = seq.clone();
+                seq.sort_unstable();
+                let key = fnv(&format!(
+                    "{}|{}",
+                    r.verts.len(),
+                    seq.iter().map(|h| format!("{h:x}")).collect::<Vec<_>>().join(",")
+                ));
+                let c = if r.verts.is_empty() {
+                    glam::Vec3::ZERO
+                } else {
+                    r.verts.iter().fold(glam::Vec3::ZERO, |a, v| a + glam::Vec3::from_array(v.pos))
+                        / r.verts.len() as f32
+                };
+                (key, r.verts.len(), c, ordered)
+            })
+            .collect();
+        let n = info.len();
+        let uniq = info.iter().map(|i| i.0).collect::<std::collections::HashSet<_>>().len();
+        let line = match &prev {
+            None => format!("  {name}  prims={n} key_uniq={uniq}/{n}"),
+            Some(p) => {
+                let mut a: Vec<u64> = p.iter().map(|i| i.0).collect();
+                let mut b: Vec<u64> = info.iter().map(|i| i.0).collect();
+                a.sort_unstable();
+                b.sort_unstable();
+                let stable = a == b;
+                // one-to-one match on key, first-come within duplicate classes
+                let mut used = vec![false; p.len()];
+                let mut matched = 0usize;
+                let mut order_ok = 0usize;
+                let mut travel = 0.0f32;
+                for cur in &info {
+                    if let Some((j, hit)) = p
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, q)| !used[*j] && q.0 == cur.0)
+                        // among duplicate keys, take the nearest centroid
+                        .min_by(|(_, x), (_, y)| {
+                            (x.2 - cur.2)
+                                .length_squared()
+                                .partial_cmp(&(y.2 - cur.2).length_squared())
+                                .unwrap()
+                        })
+                    {
+                        used[j] = true;
+                        matched += 1;
+                        travel += (hit.2 - cur.2).length();
+                        if hit.3 == cur.3 {
+                            order_ok += 1;
+                        }
+                    }
+                }
+                let mv = if matched > 0 { travel / matched as f32 } else { 0.0 };
+                // THE RESIDUE: prims without an exact partner. If a group
+                // SPLIT between poses, the two sides hold the same vertices
+                // under different grouping — their per-vertex UV multisets
+                // agree — and a merged prim's UV sequence is the
+                // CONCATENATION of its pieces' sequences (merging appends
+                // buffers). Both are checkable.
+                let mut p_used = vec![false; p.len()];
+                let mut c_used = vec![false; info.len()];
+                // re-run the same matching to mark used on both sides
+                for (ci, cur) in info.iter().enumerate() {
+                    if let Some((j, _)) = p
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, q)| !p_used[*j] && q.0 == cur.0)
+                        .min_by(|(_, x), (_, y)| {
+                            (x.2 - cur.2)
+                                .length_squared()
+                                .partial_cmp(&(y.2 - cur.2).length_squared())
+                                .unwrap()
+                        })
+                    {
+                        p_used[j] = true;
+                        c_used[ci] = true;
+                    }
+                }
+                let pl: Vec<&(u64, usize, glam::Vec3, Vec<u64>)> =
+                    p.iter().enumerate().filter(|(j, _)| !p_used[*j]).map(|(_, q)| q).collect();
+                let cl: Vec<&(u64, usize, glam::Vec3, Vec<u64>)> =
+                    info.iter().enumerate().filter(|(j, _)| !c_used[*j]).map(|(_, q)| q).collect();
+                let count_hashes = |side: &[&(u64, usize, glam::Vec3, Vec<u64>)]| {
+                    let mut m = std::collections::HashMap::new();
+                    for pr in side {
+                        for h in &pr.3 {
+                            *m.entry(*h).or_insert(0usize) += 1;
+                        }
+                    }
+                    m
+                };
+                let union_eq = count_hashes(&pl) == count_hashes(&cl);
+                // segment each prim on the merged side (fewer prims) into
+                // contiguous runs of whole sequences from the split side
+                let (merged, pieces) = if pl.len() <= cl.len() { (&pl, &cl) } else { (&cl, &pl) };
+                let mut seg_ok = 0usize;
+                let mut taken = vec![false; pieces.len()];
+                for m in merged.iter() {
+                    let seq = &m.3;
+                    let mut i = 0usize;
+                    let mut ok = true;
+                    while i < seq.len() {
+                        let hit = pieces.iter().enumerate().position(|(k, pc)| {
+                            !taken[k]
+                                && i + pc.3.len() <= seq.len()
+                                && seq[i..i + pc.3.len()] == pc.3[..]
+                        });
+                        match hit {
+                            Some(k) => {
+                                taken[k] = true;
+                                i += pieces[k].3.len();
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        seg_ok += 1;
+                    }
+                }
+                format!(
+                    "  {name}  prims={n} key_uniq={uniq}/{n} stable={} matched={matched}/{n} order_ok={order_ok}/{matched} move={mv:.3} residue={}v{} union_eq={} seg_ok={seg_ok}/{}",
+                    if stable { "YES" } else { "no" },
+                    pl.len(),
+                    cl.len(),
+                    if union_eq { "YES" } else { "no" },
+                    merged.len()
+                )
+            }
+        };
+        println!("{line}");
+        prev = Some(info);
+    }
+}
+
+/// The probe over every chassis with a strip, one verdict line each.
+pub fn align_probe_all() {
+    let Ok(rd) = std::fs::read_dir(bots_dir()) else { return };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    let (mut exact, mut unstable, mut thin) = (0usize, 0usize, 0usize);
+    for name in &names {
+        let dirs = fold_poses(&bots_dir().join(name));
+        if dirs.len() < 2 {
+            thin += 1;
+            continue;
+        }
+        let mut prev: Option<Vec<u64>> = None;
+        let mut all_stable = true;
+        let mut all_uniq = true;
+        for d in &dirs {
+            let Ok((raws, _)) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model::load_raw(d, 4.0)))
+            else {
+                all_stable = false;
+                break;
+            };
+            let q = |x: f32| (x * 4096.0).round() as i64;
+            let mut keys: Vec<u64> = raws
+                .iter()
+                .map(|r| {
+                    let mut seq: Vec<u64> = r
+                        .verts
+                        .iter()
+                        .map(|v| fnv(&format!("{},{}", q(v.uv[0]), q(v.uv[1]))))
+                        .collect();
+                    seq.sort_unstable();
+                    fnv(&format!(
+                        "{}|{}",
+                        r.verts.len(),
+                        seq.iter().map(|h| format!("{h:x}")).collect::<Vec<_>>().join(",")
+                    ))
+                })
+                .collect();
+            let uniq = keys.iter().collect::<std::collections::HashSet<_>>().len();
+            if uniq != keys.len() {
+                all_uniq = false;
+            }
+            keys.sort_unstable();
+            if let Some(p) = &prev {
+                if *p != keys {
+                    all_stable = false;
+                }
+            }
+            prev = Some(keys);
+        }
+        let verdict = match (all_stable, all_uniq) {
+            (true, true) => { exact += 1; "EXACT" }
+            (true, false) => { exact += 1; "EXACT-dup" }
+            _ => { unstable += 1; "unstable" }
+        };
+        println!("{verdict:>9}  {name}");
+    }
+    println!("---\n{} alignable by UV key, {} unstable, {} without a strip", exact, unstable, thin);
+}
+
+/// THE UNION, PER PRIM — which parts persist and which fade, with sizes.
+///
+/// A fade is the intended effect for a small transitional panel and a
+/// defect for a fuselage. The audit's POP fault cannot tell those apart;
+/// this table can: any entry with a `.` in its presence mask fades in or
+/// out across the adjacent segment, and `r` is how big a thing is doing
+/// the fading.
+pub fn union_table(bot: &str) {
+    let dirs = fold_poses(&bots_dir().join(bot));
+    if dirs.len() < 2 {
+        println!("{bot}: fewer than 2 fold poses");
+        return;
+    }
+    let mut strip: Vec<Vec<model::RawPrim>> = Vec::new();
+    for d in &dirs {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model::load_raw(d, 4.0))) {
+            Ok((raws, _)) => strip.push(raws),
+            Err(_) => {
+                println!("{bot}: load panicked");
+                return;
+            }
+        }
+    }
+    let Some(u) = crate::align::unify(strip) else {
+        println!("{bot}: alignment refused ({})", "stepping fallback");
+        return;
+    };
+    println!("{bot}: {} union prims ({} base + {} extra) — {}", u.poses[0].len(), u.base_prims, u.extras.len(), u.report.line());
+    // presence: a placeholder is a collapsed copy, detectable as all
+    // vertices within epsilon of each other
+    let collapsed = |vs: &[Vertex]| -> bool {
+        let Some(f) = vs.first() else { return true };
+        let f = glam::Vec3::from_array(f.pos);
+        vs.iter().all(|v| (glam::Vec3::from_array(v.pos) - f).length() < 1e-5)
+    };
+    let mut rows: Vec<(usize, String, usize, f32)> = (0..u.poses[0].len())
+        .map(|p| {
+            let mask: String = (0..u.poses.len())
+                .map(|k| if collapsed(&u.poses[k][p]) { '.' } else { '#' })
+                .collect();
+            let (mut nv, mut r) = (0usize, 0.0f32);
+            for k in 0..u.poses.len() {
+                let vs = &u.poses[k][p];
+                if collapsed(vs) {
+                    continue;
+                }
+                nv = vs.len();
+                let c = vs.iter().fold(glam::Vec3::ZERO, |a, v| a + glam::Vec3::from_array(v.pos))
+                    / vs.len() as f32;
+                let rr = vs
+                    .iter()
+                    .map(|v| (glam::Vec3::from_array(v.pos) - c).length())
+                    .fold(0.0f32, f32::max);
+                r = r.max(rr);
+            }
+            (p, mask, nv, r)
+        })
+        .collect();
+    // faders first, biggest first — the rows worth reading
+    rows.sort_by(|a, b| {
+        let fa = a.1.contains('.');
+        let fb = b.1.contains('.');
+        fb.cmp(&fa).then(b.3.partial_cmp(&a.3).unwrap())
+    });
+    for (p, mask, nv, r) in rows {
+        println!("  P{p:<3} {mask}  verts={nv:<6} r={r:.2}");
+    }
+}
+
 /// Reference values for the browser demo's JS port of `compact.rs`.
 ///
 /// The demo reimplements the compaction maths in JavaScript so it can
@@ -228,17 +546,17 @@ fn build(bot: &str) -> Option<Morph> {
     if dirs.len() < 2 {
         return None;
     }
-    let mut poses: Vec<Vec<Vec<Vertex>>> = Vec::new();
-    let mut idx: Vec<Vec<u32>> = Vec::new();
-    for (k, d) in dirs.iter().enumerate() {
+    let mut strip: Vec<Vec<model::RawPrim>> = Vec::new();
+    for d in dirs.iter() {
         let raws = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model::load_raw(d, 4.0))).ok()?;
-        let (raws, _) = raws;
-        if k == 0 {
-            idx = raws.iter().map(|r| r.idx.clone()).collect();
-        }
-        poses.push(raws.into_iter().map(|r| r.verts).collect());
+        strip.push(raws.0);
     }
-    Morph::build(poses, idx)
+    // Alignment first: no shipped strip agrees prim-for-prim, so calling
+    // Morph::build on the raw poses refuses every chassis (measured —
+    // see `align.rs`). Unify finds the union-prim correspondence; on ITS
+    // refusal the audit correctly reports no morph, same as before.
+    let u = crate::align::unify(strip)?;
+    Morph::build(u.poses, u.idx)
 }
 
 /// Pop tolerance scaled to the body: a truck-sized bot legitimately
@@ -267,6 +585,14 @@ pub fn run(argv: &[String]) {
         },
         Some("sweep") => sweep(with_compaction),
         Some("golden") => golden(),
+        Some("align") => match argv.get(i + 2) {
+            Some(bot) => align_probe(bot),
+            None => align_probe_all(),
+        },
+        Some("union") => match argv.get(i + 2) {
+            Some(bot) => union_table(bot),
+            None => println!("usage: --fold union <bot>"),
+        },
         Some("shapes") => match argv.get(i + 2) {
             Some(bot) => shapes(bot),
             None => println!("usage: --fold shapes <bot>"),
