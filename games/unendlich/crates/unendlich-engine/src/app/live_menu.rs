@@ -93,17 +93,26 @@ fn hero_title(ui: &mut egui::Ui) {
     }
 }
 
-/// The destiny-style full-width menu button (kit) or a plain button.
-fn dest_button(ui: &mut egui::Ui, label: &str) -> bool {
+/// The destiny-style menu button at an explicit width (kit) or a plain
+/// sized button — for rows that must budget horizontal space.
+fn dest_button_sized(ui: &mut egui::Ui, label: &str, w: f32) -> bool {
     #[cfg(feature = "unendlich-ui")]
     {
         let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-        unendlich_ui::button_sized(ui, label, accent, egui::vec2(220.0, 34.0)).clicked()
+        // capped, not sized: the kit's `sized` is a MINIMUM and long
+        // letterspaced labels outgrow any row budget (the off-screen delete
+        // button). Capped elides the label instead of breaking the row.
+        unendlich_ui::button_capped(ui, label, accent, egui::vec2(w, 34.0)).clicked()
     }
     #[cfg(not(feature = "unendlich-ui"))]
     {
-        ui.add_sized([220.0, 34.0], egui::Button::new(label)).clicked()
+        ui.add_sized([w, 34.0], egui::Button::new(label)).clicked()
     }
+}
+
+/// The destiny-style full-width menu button (kit) or a plain button.
+fn dest_button(ui: &mut egui::Ui, label: &str) -> bool {
+    dest_button_sized(ui, label, 220.0)
 }
 
 /// The theme accent (the menu's #6fc3ff), kit or fallback.
@@ -223,7 +232,16 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                         .show(ui, |ui| {
                             for (i, label) in s.world_list.iter().enumerate() {
                                 ui.horizontal(|ui| {
-                                    if dest_button(ui, label) {
+                                    // Snapshot-loop finding (kit pass): the
+                                    // letterspaced caps grow the world button
+                                    // with its label, shoving `history` to the
+                                    // edge and the delete button OFF-CANVAS.
+                                    // Budget the row instead: the world button
+                                    // takes what's left after the two fixed
+                                    // controls, so they always fit.
+                                    let fixed = 70.0 + 28.0 + ui.spacing().item_spacing.x * 3.0;
+                                    let btn_w = (ui.available_width() - fixed).max(160.0);
+                                    if dest_button_sized(ui, label, btn_w) {
                                         out.world_pick = i as i32;
                                     }
                                     // r203: peek this world's rollback history

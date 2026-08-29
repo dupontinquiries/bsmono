@@ -108,12 +108,35 @@ fn render_with(out: &str, draw: impl Fn(&Context)) {
     // Grab the font atlas from the texture deltas. In egui 0.34 the atlas is a
     // ColorImage; glyph coverage lives in the alpha channel (and the solid
     // WHITE_UV texel is opaque, so this path covers fills too).
-    let mut atlas = (1usize, 1usize, vec![1.0f32]);
+    //
+    // Deltas can be PARTIAL (delta.pos = Some(origin)): a growing atlas (new
+    // glyphs mid-run) patches a region rather than replacing the image.
+    // Treating a patch as the whole atlas is how the first capped-button run
+    // rendered as UV smears — apply patches at their position.
+    let mut atlas: (usize, usize, Vec<f32>) = (1, 1, vec![1.0f32]);
     for (id, delta) in first.textures_delta.set.iter().chain(full.textures_delta.set.iter()) {
         if *id == TextureId::Managed(0) {
             let ImageData::Color(img) = &delta.image;
-            let cov: Vec<f32> = img.pixels.iter().map(|c| c.a() as f32 / 255.0).collect();
-            atlas = (img.size[0], img.size[1], cov);
+            match delta.pos {
+                None => {
+                    // Full upload: replace.
+                    let cov: Vec<f32> = img.pixels.iter().map(|c| c.a() as f32 / 255.0).collect();
+                    atlas = (img.size[0], img.size[1], cov);
+                }
+                Some([ox, oy]) => {
+                    // Partial patch into the existing atlas.
+                    let (aw, ah, ref mut cov) = atlas;
+                    for py in 0..img.size[1] {
+                        for px in 0..img.size[0] {
+                            let (dx, dy) = (ox + px, oy + py);
+                            if dx < aw && dy < ah {
+                                cov[dy * aw + dx] =
+                                    img.pixels[py * img.size[0] + px].a() as f32 / 255.0;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     let (aw, ah, ref apx) = atlas;
