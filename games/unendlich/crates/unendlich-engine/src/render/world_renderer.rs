@@ -176,6 +176,14 @@ struct CameraUbo {
     /// r431: 16×16 water-depth cells (blocks), packed 4 per vec4. Drives real depth-color
     /// (shallow→clear, deep→dark) instead of the view-angle guess. Zero/disabled = unchanged.
     water_depth_grid: [[f32; 4]; 64],
+    /// r595 (disturber array): up to 8 foliage disturbers — the player, nearby
+    /// mobs/dragons, LAN avatars. xyz = world position, w = reach radius
+    /// (blocks). Appended LAST (house rule: offsets of everything above are
+    /// unchanged; shaders that don't declare this never see it).
+    disturbers: [[f32; 4]; 8],
+    /// x = live disturber count (0..=8); count 0 ⇒ chunk.vert falls back to
+    /// the r591 camera-only disturbance so the F3 slider still demos alone.
+    disturber_meta: [f32; 4],
 }
 
 /// Per-frame atmosphere/climate state, sampled by the bin and passed to
@@ -418,6 +426,9 @@ pub struct WorldRenderer {
     /// r499: current season phase [0,1) (spring→summer→autumn→winter), packed
     /// into fx_params.z for the foliage seasonal tint in chunk.frag.
     world_season01: f32,
+    /// r595: this frame's foliage disturbers (pos.xyz + reach.w), bin-fed.
+    foliage_disturbers: [[f32; 4]; 8],
+    foliage_disturber_count: usize,
     /// r431: water-depth grid + coverage for depth-color.
     water_depth_cov: [f32; 4],
     water_depth_grid: Box<[[f32; 4]; 64]>,
@@ -1543,6 +1554,8 @@ impl WorldRenderer {
             water_flow_grid: Box::new([[0.0; 4]; 128]),
             fx_params: [0.0; 4],
             world_season01: 0.0,
+            foliage_disturbers: [[0.0; 4]; 8],
+            foliage_disturber_count: 0,
             water_depth_cov: [0.0; 4],
             water_depth_grid: Box::new([[0.0; 4]; 64]),
             gbuffer,
@@ -3173,6 +3186,19 @@ impl WorldRenderer {
     /// r427: set the underwater screen-FX state for the next frame (submerged 0/1, time s).
     pub fn set_underwater(&mut self, submerged: f32, time: f32) {
         self.fx_params = [submerged, time, 0.0, 0.0];
+    }
+
+    /// r595: this frame's foliage disturbers (nearest-first from
+    /// `sim::foliage_sway::select_disturbers`); more than 8 are ignored.
+    pub fn set_foliage_disturbers(&mut self, list: &[[f32; 4]]) {
+        self.foliage_disturber_count = list.len().min(8);
+        for i in 0..8 {
+            self.foliage_disturbers[i] = if i < self.foliage_disturber_count {
+                list[i]
+            } else {
+                [0.0; 4]
+            };
+        }
     }
 
     /// r499: set the world season phase [0,1) for the foliage seasonal tint.
@@ -5654,6 +5680,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             },
             water_depth_cov: self.water_depth_cov,
             water_depth_grid: *self.water_depth_grid,
+            disturbers: self.foliage_disturbers,
+            disturber_meta: [self.foliage_disturber_count as f32, 0.0, 0.0, 0.0],
         };
         unsafe {
             std::ptr::copy_nonoverlapping(

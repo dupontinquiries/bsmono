@@ -50,6 +50,18 @@ layout(set = 0, binding = 0) uniform CameraUbo {
     vec4 wind_params;      // xy = wind vector at player, z = wind magnitude, w = unused
     vec4 viewport_rect;    // xy = viewport size px, zw = viewport offset px
     mat4 light_view_proj;  // light-space VP for shadow-map sampling (Phase 2 will read this)
+    // ── declared-through padding: these members exist in the CPU CameraUbo
+    // between light_view_proj and the disturber fields (water shaders read
+    // them); chunk.vert declares them ONLY to reach the disturbers at the
+    // right std140 offsets. Do not read them here.
+    vec4 flow_coverage;
+    vec4 flow_grid[128];
+    vec4 fx_params;
+    vec4 water_depth_cov;
+    vec4 water_depth_grid[64];
+    // r595: the foliage disturber array (player, mobs, dragons, LAN avatars).
+    vec4 disturbers[8];      // xyz = world pos, w = reach radius (blocks)
+    vec4 disturber_meta;     // x = live count (0 => camera-only fallback)
 } ubo;
 
 // v0.24.20-vertex-pack: chunks-metadata SSBO. Mirrors the layout of
@@ -140,14 +152,36 @@ void main() {
             // roots (tag 2) stay so plants pivot at the base.
             float dstr = ubo.sun_color.a;
             if (dstr > 0.001) {
-                vec2  d_xz  = world_pos.xz - ubo.camera_pos.xz;
-                float d_len = length(d_xz);
-                float reach = 3.0 + dstr * 0.3;                  // widens as you crank
-                if (d_len > 0.001 && d_len < reach) {
-                    float fall = 1.0 - d_len / reach;
-                    fall *= fall;
-                    world_pos.xz += (d_xz / d_len) * fall * 0.35 * dstr;
-                    world_pos.y  -= fall * 0.05 * dstr;
+                int dcount = int(ubo.disturber_meta.x + 0.5);
+                if (dcount > 0) {
+                    // r595: the disturber ARRAY — every nearby mover parts the
+                    // foliage, not just the camera. Same falloff per entry;
+                    // pushes accumulate (two dragons crossing = a wider part).
+                    for (int i = 0; i < 8; ++i) {
+                        if (i >= dcount) { break; }
+                        vec2  d_xz  = world_pos.xz - ubo.disturbers[i].xz;
+                        float dy    = abs(world_pos.y - ubo.disturbers[i].y);
+                        float d_len = length(d_xz);
+                        float reach = ubo.disturbers[i].w + dstr * 0.3;
+                        if (d_len > 0.001 && d_len < reach && dy < 5.0) {
+                            float fall = 1.0 - d_len / reach;
+                            fall *= fall;
+                            world_pos.xz += (d_xz / d_len) * fall * 0.35 * dstr;
+                            world_pos.y  -= fall * 0.05 * dstr;
+                        }
+                    }
+                } else {
+                    // r591 fallback: no array fed (older bin / menus) — the
+                    // camera alone disturbs, so the F3 slider still demos.
+                    vec2  d_xz  = world_pos.xz - ubo.camera_pos.xz;
+                    float d_len = length(d_xz);
+                    float reach = 3.0 + dstr * 0.3;
+                    if (d_len > 0.001 && d_len < reach) {
+                        float fall = 1.0 - d_len / reach;
+                        fall *= fall;
+                        world_pos.xz += (d_xz / d_len) * fall * 0.35 * dstr;
+                        world_pos.y  -= fall * 0.05 * dstr;
+                    }
                 }
             }
         }

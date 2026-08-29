@@ -11881,3 +11881,19 @@ r586) → the r591/r592 disturber.
 - TEST ON M2: foliage must RE-MESH to pick up the tag — walk to fresh chunks or reload the world. Then: (1) grass/plants/
   leaves visibly sway in wind (r586, now actually active); (2) with the F3 disturber slider up, foliage parts around you.
   If it now works, we set a sane default disturber strength and (next) add the mob/dragon disturber array.
+
+## r595 — WIRE: the foliage disturber ARRAY (mobs/dragons/LAN avatars part the grass)
+The r594 sway-tag fix made foliage react; r591's disturbance was still camera-only, and its own comment named the next
+step ("mobs become extra entries in a disturber array later"). Landed:
+- CameraUbo: `disturbers[8]` (xyz pos, w reach) + `disturber_meta.x` count, appended LAST per house rule. chunk.vert
+  declares the intermediate water/flow members as reach-through padding (offsets exact; it reads none of them).
+- chunk.vert: loop over the array — every nearby mover parts foliage with the r591 falloff; pushes accumulate; ±5-block
+  vertical gate so canopy doesn't part for ground walkers. count==0 keeps the r591 camera-only fallback so the F3 slider
+  demos alone. Slider (sun_color.a) remains the ONE strength knob for all disturbers. Validated (glslangValidator +
+  spirv-val); .spv + sidecar rebuilt via build.rs.
+- sim::foliage_sway::select_disturbers — pure nearest-first selection (cap 8, range 28) + 2 tests.
+- renderer: set_foliage_disturbers; bin feeds player (2.5) + roamers (dragon 4.0 / dino 3.0 / else 2.2) + LAN peer
+  avatars (2.5) each frame next to set_season.
+Gates: fullgame + lib clean; foliage_sway+shader_artifacts 21/0. TEST ON M2 (after r594's own re-mesh caveat): walk a
+tamed herd through tall grass — a multi-lane part should track each body, and a LAN friend's avatar should part grass
+with no local input.

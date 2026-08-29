@@ -12821,6 +12821,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             );
         }
         renderer.set_season(current_season01); // r499: foliage seasonal tint
+        // r595: feed the foliage disturber ARRAY — every nearby mover parts
+        // the grass, not just the camera. Candidates: the player, live
+        // roamers (dragons get a wider wake), and LAN peer avatars; the pure
+        // selector keeps the 8 nearest within 28 blocks of the camera.
+        {
+            let pp = local_player.view.position;
+            let mut cands: Vec<([f32; 3], f32)> = Vec::with_capacity(roamers.len() + 4);
+            cands.push(([pp.x, pp.y, pp.z], 2.5)); // the player
+            for r in &roamers {
+                let bp = r.creature.body.position; // [f32; 3]
+                let reach = match r.kind {
+                    unendlich_engine::item::CreatureKind::Dragon => 4.0,
+                    unendlich_engine::item::CreatureKind::Dinosaur => 3.0,
+                    _ => 2.2,
+                };
+                cands.push((bp, reach));
+            }
+            for c in lan_remote_creatures.values() {
+                cands.push((c.body.position, 2.5));
+            }
+            let picked = unendlich_engine::sim::foliage_sway::select_disturbers(
+                &cands,
+                [pp.x, pp.y, pp.z],
+                28.0,
+                8,
+            );
+            renderer.set_foliage_disturbers(&picked);
+        }
 
         // r476: timebend snapshot/scrub. While LIVE, record the player's vantage
         // on the capture cadence. While SCRUBBING, override the camera + world
