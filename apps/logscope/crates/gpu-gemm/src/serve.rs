@@ -2,7 +2,9 @@
 //!
 //! Usage:
 //!   logscope-serve --model <model.gguf> [--addr 0.0.0.0:8080] [--key <KEY> ...] [--keyfile <path>]
-//!                   [--unix [path]]   also serve local apps over a unix socket
+//!                   [--unix [path]] [--idle SECS]
+//!   --unix   also serve local apps over a unix socket (they share these weights)
+//!   --idle   seconds of no local request before releasing the weights (0 = never, default 600)
 //!
 //! The model loads once into a shared `Arc<Model>`; the pipelines are warmed up front; then
 //! each connection is served on its own thread against that one resident model (the engine
@@ -82,6 +84,7 @@ fn main() {
     //
     // Served on a thread because both listeners block: a daemon that can
     // only be reached one way is the thing this flag exists to stop.
+    let mut life_for_tcp: Option<netserve::LifeHandle> = None;
     let unix_path = args.iter().position(|a| a == "--unix").map(|i| {
         args.get(i + 1)
             .filter(|v| !v.starts_with("--"))
@@ -90,13 +93,45 @@ fn main() {
     });
     if let Some(path) = unix_path.clone() {
         let (keys2, gen2) = (keys.clone(), gen.clone());
+        // IDLE-UNLOAD, and only on the unix door. A daemon holding 7.2
+        // GiB after every local app has closed is worse than no daemon —
+        // it took the memory the loader already clamps and gave nothing
+        // back. `--idle 0` disables it, for a long-lived server where
+        // paying the 86-second load again is the worse trade.
+        let idle_secs: u64 = val("--idle").and_then(|v| v.parse().ok()).unwrap_or(600);
+        let life = std::sync::Arc::new(std::sync::Mutex::new(
+            gpu_kernels::daemonlife::Life::new(std::time::Duration::from_secs(idle_secs)),
+        ));
+        let life2 = life.clone();
+        life_for_tcp = Some(life.clone());
+        if idle_secs > 0 {
+            let started = std::time::Instant::now();
+            let sock = path.clone();
+            std::thread::spawn(move || {
+                gpu_kernels::daemonlife::janitor(
+                    life,
+                    started,
+                    std::time::Duration::from_secs(5),
+                    || {
+                        eprintln!("idle for {idle_secs}s — releasing the weights and exiting");
+                        // Remove the socket before exiting so the next
+                        // client's probe fails fast instead of connecting
+                        // to a path nothing is listening on.
+                        let _ = std::fs::remove_file(&sock);
+                        std::process::exit(0);
+                    },
+                );
+            });
+        }
         std::thread::spawn(move || {
             eprintln!("serving on unix://{}  (local apps share these weights)", path.display());
             // Empty keyring: the filesystem authorises local callers.
             // `Keyring::accepts` returns true on an empty ring, so this
             // is not a bypass bolted on — it is the ring being empty.
             let _ = keys2;
-            if let Err(e) = netserve::serve_unix(&path, netserve::Keyring::new(vec![]), gen2) {
+            if let Err(e) = netserve::serve_unix_tracked(
+                &path, netserve::Keyring::new(vec![]), gen2, Some(life2))
+            {
                 eprintln!("unix socket {}: {e}", path.display());
             }
         });
@@ -104,7 +139,11 @@ fn main() {
 
     let listener = std::net::TcpListener::bind(&addr).unwrap_or_else(|e| { eprintln!("bind {addr}: {e}"); std::process::exit(1); });
     eprintln!("serving on http://{addr}  (POST /generate, GET /health)");
-    netserve::serve(listener, netserve::Keyring::new(keys), gen);
+    // The TCP door reports to the same `Life`. A daemon that exited
+    // because its unix socket was quiet, while a LAN client was
+    // mid-conversation on the TCP port, would be a bug wearing a
+    // feature's clothes.
+    netserve::serve_tracked(listener, netserve::Keyring::new(keys), gen, life_for_tcp);
 }
 
 /// Where the unix socket lives when `--unix` is given no value.

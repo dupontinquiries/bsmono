@@ -1545,10 +1545,21 @@ and the client.
   unloading on the strength of state written by a panicking thread could
   drop weights mid-generation.
 
-  gpu-gemm 1246/1246. STILL NOT DONE: `logscope-serve` does not yet
-  construct a `Life`, pass it to `serve_unix_tracked`, or spawn the
-  janitor — so the policy is wired to the server and the server is not
-  yet wired to the binary.
+  **WIRED END TO END.** `logscope-serve --unix [path] [--idle SECS]`
+  constructs the `Life`, spawns the janitor, and on unload removes the
+  socket before exiting so the next client's probe fails fast rather
+  than connecting to a path nothing serves. `--idle 0` disables it.
+
+  A BUG CAUGHT BEFORE SHIPPING: the `Life` initially saw only unix
+  requests, but ONE PROCESS SERVES BOTH DOORS — so a busy LAN client on
+  the TCP port read as silence and the daemon would have exited
+  mid-conversation. Idle means the PROCESS is unused, not that one
+  listener is. `serve_tracked` now reports TCP requests to the same
+  `Life`, with a test that holds a handler open and asserts
+  `in_flight == 1` from outside. gpu-gemm 1247/1247.
+
+  The daemon is now complete: client, transport, both listeners, one
+  rendezvous path, lifecycle policy, and the binary that runs it.
 
 - **C12-30c — CORRECTION to §30's own recommendation.** I wrote that the
   daemon "owns the weights and the pipeline/autotune caches — the

@@ -309,13 +309,30 @@ pub fn serve(
     listener: TcpListener, keys: Keyring,
     gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync>,
 ) {
+    serve_tracked(listener, keys, gen, None)
+}
+
+/// Same, reporting to a [`crate::daemonlife::Life`].
+///
+/// BOTH DOORS MUST REPORT or idle-unload is a bug rather than a feature:
+/// one process serves TCP and unix together, so a `Life` fed only by the
+/// unix socket would see a busy LAN client as silence and exit
+/// mid-conversation. The idle window is about the PROCESS being unused,
+/// not about one of its listeners being unused.
+pub fn serve_tracked(
+    listener: TcpListener, keys: Keyring,
+    gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync>,
+    life: Option<LifeHandle>,
+) {
     let keys = Arc::new(keys);
+    let start = std::time::Instant::now();
     for stream in listener.incoming().flatten() {
-        let (keys, gen) = (keys.clone(), gen.clone());
+        let (keys, gen, life) = (keys.clone(), gen.clone(), life.clone());
         std::thread::spawn(move || {
             let mut stream = stream;
             let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
             if let Some(req) = read_request(&mut stream) {
+                let _busy = life.as_ref().map(|l| Busy::begin(l.clone(), start));
                 let resp = handle(&req, &keys, gen.as_ref());
                 let _ = stream.write_all(&resp.bytes());
             }
@@ -374,6 +391,53 @@ mod unix_tests {
         assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
         assert!(raw.contains("echo:fn f() { :32"), "prompt and max both arrived: {raw}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tcp_request_keeps_the_daemon_alive_too() {
+        // THE BUG THIS PREVENTS: one process serves both doors, so a
+        // `Life` fed only by the unix socket sees a busy LAN client as
+        // silence and exits mid-conversation. Idle means the PROCESS is
+        // unused, not that one listener is.
+        use std::io::{Read, Write};
+        let life: LifeHandle =
+            Arc::new(std::sync::Mutex::new(crate::daemonlife::Life::new(Duration::from_secs(600))));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let l2 = life.clone();
+        std::thread::spawn(move || {
+            let gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync> =
+                Arc::new(|_: &str, _: usize| {
+                    // Hold the handler open long enough to observe
+                    // in_flight from the test thread.
+                    std::thread::sleep(Duration::from_millis(120));
+                    "ok".into()
+                });
+            serve_tracked(listener, Keyring::new(vec![]), gen, Some(l2));
+        });
+
+        let mut sock = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::net::TcpStream::connect(addr) { sock = Some(s); break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut sock = sock.expect("tcp listener never came up");
+        let body = "hi";
+        let req = format!(
+            "POST /generate?max=4 HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}", body.len());
+        sock.write_all(req.as_bytes()).unwrap();
+
+        // While the handler sleeps, the TCP request must be visible.
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(life.lock().unwrap().in_flight, 1,
+                   "a TCP request did not register: the daemon could unload under it");
+
+        let mut raw = String::new();
+        sock.read_to_string(&mut raw).unwrap();
+        assert!(raw.contains("ok"), "{raw}");
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(life.lock().unwrap().in_flight, 0, "the guard did not release");
     }
 
     #[test]
