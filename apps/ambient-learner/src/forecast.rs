@@ -248,7 +248,24 @@ mod tests {
         assert!(forecast.is_some());
         
         let forecast = forecast.unwrap();
-        assert!(forecast.temperature > 19.0 && forecast.temperature < 25.0);
+        // The fixture RAMPS: 100 points from 20.0 to 29.9, so the last
+        // observation is 29.9 and `forecast` baselines on it. The old
+        // bound (19..25) could only have passed against a flat fixture —
+        // it was asserting a number the data cannot produce, which is why
+        // it failed rather than the model being wrong.
+        //
+        // Anchored to the CURRENT reading instead of to absolute degrees,
+        // so the test keeps meaning if the fixture is retuned: a one-hour
+        // forecast may drift from the last observation but must not
+        // wander off it, and a model that returned 20 for a series ending
+        // at 29.9 would be the actual bug.
+        let last = 20.0 + 99.0 * 0.1;
+        assert!(
+            (forecast.temperature - last).abs() < 5.0,
+            "a 1h forecast drifted {:.1} deg from the last reading of {last:.1}: {}",
+            (forecast.temperature - last).abs(),
+            forecast.temperature
+        );
         assert!(forecast.confidence > 0.0 && forecast.confidence <= 1.0);
     }
 }

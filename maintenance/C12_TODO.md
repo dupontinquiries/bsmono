@@ -944,6 +944,29 @@ flush. Next step: assert the file's contents immediately after
 `add_web` returns, which separates "never written" from "written then
 lost".
 
+**C12-25d — ambient-learner's four, and why they cannot be verified
+here.** All four (`forecast::test_forecast_model`,
+`dbmaint::test_deduplicate`,
+`screen_temp_hints::choose_resolution_scales_with_sensors`,
+`security::test_pairing`) live in modules of the GTK `main.rs`, not in
+a lib target. Building them needs `gdk-pixbuf-sys`, which this sandbox
+does not have — `cargo test --lib` reports 0 tests and the default
+feature set fails at the build script. So the fleet machine can run
+these and I cannot, which makes them exactly the failures worth
+reporting from a fleet run and the hardest to fix blind.
+
+Fixed one on arithmetic alone, and it needs a real run to confirm:
+`test_forecast_model` builds 100 points ramping 20.0 -> 29.9, then
+asserted the 1-hour forecast lands in 19..25. `forecast()` baselines on
+`self.history.back()` — 29.9 — so that bound cannot hold for this
+fixture; it was written against a flat one. Re-anchored to the LAST
+READING (drift < 5 deg) rather than to absolute degrees, so it keeps
+meaning if the fixture is retuned and still catches the real bug (a
+model returning 20 for a series ending at 29.9). NOT COMPILED.
+
+The other three are unread. `test_pairing` in an app with a
+`security.rs` is worth looking at before the cosmetic ones.
+
 **C12-25c — the other five apps, unexamined.** bot-arena's
 `clean_repo_passes_and_broken_fails` and logscope's
 `verdict::compile_grades_real_code` both SHELL OUT TO CARGO, so those
