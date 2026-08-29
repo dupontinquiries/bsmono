@@ -39,6 +39,52 @@ pub fn errors_only(lines: &[TimedLine]) -> String {
         .join("\n")
 }
 
+/// Derive `ok` and `failed` from the log itself.
+///
+/// The Export button used to construct its `ReportMeta` with `ok: 0,
+/// failed: Vec::new()` hard-coded, so every exported fleet report opened
+/// with "ok: 0 / failed: none" no matter what happened — including runs
+/// whose own log below carried `error[E0433]` and `could not compile`.
+/// A header that contradicts the body is worse than no header: it is the
+/// part a reader trusts and the part that was never true.
+///
+/// Sections come from the same `── name ──` boundary markers
+/// `times_by_crate` reads, so "a crate" means the same thing in both
+/// halves of the report. A section is FAILED if any line inside it starts
+/// with `error` (rustc/cargo's own convention, the same rule
+/// `errors_only` uses) or reports `could not compile`; everything else
+/// that ran is ok.
+///
+/// When there are no boundary markers — a single-app run rather than a
+/// build-all — there is one implicit section covering the whole log, so a
+/// failed single-app run reports 0 ok and 1 failed rather than pretending
+/// it had nothing to say.
+pub fn tally(lines: &[TimedLine]) -> (usize, Vec<String>) {
+    let mut sections: Vec<(String, bool)> = Vec::new();
+    for l in lines {
+        let t = l.text.trim();
+        if let Some(name) = t.strip_prefix("── ").and_then(|r| r.strip_suffix(" ──")) {
+            sections.push((name.trim().to_string(), false));
+            continue;
+        }
+        let is_err = t.starts_with("error") || t.contains("could not compile");
+        if is_err {
+            match sections.last_mut() {
+                Some(sec) => sec.1 = true,
+                // An error before any boundary marker: a single-app run,
+                // or a failure in whatever ran first. Either way it is a
+                // failure and must not be silently dropped.
+                None => sections.push(("(run)".to_string(), true)),
+            }
+        }
+    }
+    if sections.is_empty() && !lines.is_empty() {
+        sections.push(("(run)".to_string(), false));
+    }
+    let failed: Vec<String> = sections.iter().filter(|(_, f)| *f).map(|(n, _)| n.clone()).collect();
+    (sections.len() - failed.len(), failed)
+}
+
 /// Per-section/per-crate timing. Two heuristics, tried in order:
 ///
 /// 1. `── name ──` boundary lines — the exact format
@@ -248,5 +294,52 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("# gitmind report: test all"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tally_reads_failures_out_of_the_log_instead_of_being_told() {
+        // The bug this exists for: the Export button hard-coded
+        // `ok: 0, failed: none`, so a report whose own log said
+        // `error[E0433]` still opened by claiming nothing failed.
+        let l = |t: &str| TimedLine { ms: 0, text: t.to_string() };
+        let lines = vec![
+            l("── alpha ──"),
+            l("   Compiling alpha v0.1.0"),
+            l("    Finished dev profile"),
+            l("── beta ──"),
+            l("   Compiling beta v0.1.0"),
+            l("error[E0433]: cannot find `wgpu` in `eframe`"),
+            l("error: could not compile `beta` (bin \"beta\")"),
+            l("── gamma ──"),
+            l("    Finished dev profile"),
+        ];
+        let (ok, failed) = tally(&lines);
+        assert_eq!(failed, vec!["beta".to_string()], "only the crate that errored");
+        assert_eq!(ok, 2, "alpha and gamma");
+    }
+
+    #[test]
+    fn a_single_app_run_with_no_markers_still_reports_its_failure() {
+        // No `── name ──` boundaries at all, which is what a one-app run
+        // looks like. Reporting "0 sections, nothing failed" would be the
+        // same silent lie in a different shape.
+        let l = |t: &str| TimedLine { ms: 0, text: t.to_string() };
+        let (ok, failed) = tally(&[
+            l("   Compiling beatspace v0.1.0"),
+            l("error: could not compile `beatspace`"),
+        ]);
+        assert_eq!(ok, 0);
+        assert_eq!(failed, vec!["(run)".to_string()]);
+
+        // And a clean single-app run is one section, none failed.
+        let (ok, failed) = tally(&[l("   Compiling beatspace"), l("    Finished")]);
+        assert_eq!((ok, failed.len()), (1, 0));
+    }
+
+    #[test]
+    fn an_empty_log_tallies_to_nothing_rather_than_a_phantom_success() {
+        let (ok, failed) = tally(&[]);
+        assert_eq!(ok, 0);
+        assert!(failed.is_empty());
     }
 }

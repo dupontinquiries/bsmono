@@ -541,7 +541,15 @@ fn run_fleet_action(action: crate::fleet_actions::FleetAction, app: &mut App, ui
             if lines.is_empty() {
                 app.fleet.note = "nothing to export — run build/test first".to_string();
             } else {
-                let meta = cockpit::build_report::ReportMeta { title: "fleet run".to_string(), ok: 0, failed: Vec::new() };
+                // Derived from the log, not hard-coded. These were
+                // `ok: 0, failed: Vec::new()`, so every exported report
+                // opened with "ok: 0 / failed: none" even when the log
+                // below it carried `error[E0433]` and `could not
+                // compile` — a header contradicting its own body, and
+                // the half a reader trusts.
+                let (ok, failed) = cockpit::build_report::tally(&lines);
+                let meta = cockpit::build_report::ReportMeta {
+                    title: "fleet run".to_string(), ok, failed };
                 match cockpit::build_report::export(&cockpit::build_report::default_export_dir(), &meta, &lines) {
                     Ok(path) => {
                         let shown = path.display().to_string();
