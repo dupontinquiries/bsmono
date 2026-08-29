@@ -98,6 +98,11 @@ const ROLLS_AT: usize = 3;
 const FLIES_AT: usize = 2;
 /// How flat-and-broad an underside must read to be a skirt.
 const SKIRT_AT: f32 = 0.55;
+/// How tall a body must be relative to its own stance width before the
+/// columns under it read as legs rather than as a skirt. A walker is at
+/// least as tall as it is wide across the feet; a hovertank on the test
+/// fixture is 0.20.
+const LEG_ASPECT: f32 = 0.55;
 /// How far aft thrusters must cluster to read as propulsion rather than
 /// as attitude jets scattered over a hull.
 const AFT_AT: f32 = 0.15;
@@ -135,7 +140,17 @@ pub fn decide(wheels: usize, thrusters: usize, legs: usize, skirt: f32, thrust_a
     // THRUST, AFT, AND NOTHING TOUCHING THE GROUND. All three: nozzles
     // scattered over a hull are attitude jets, and thrust on a legged
     // walker is a jetpack, not a flight model.
-    if thrusters >= FLIES_AT && thrust_aft > AFT_AT && legs == 0 && wheels == 0 {
+    // A SKIRT IS SOMETHING TO STAND ON. The rule already excludes legs
+    // and wheels for exactly this reason — thrust plus running gear is a
+    // jetpack, not a flight model — and a broad flat underside is
+    // running gear too. It has to be named, because nozzle detection
+    // counts point clusters in the aft fifth and a skirt that runs the
+    // full length of the hull fills that region: the hovertank fixture
+    // reads 4 "thrusters" with 0.84 aft bias off its own skirt, and
+    // without this it flies.
+    if thrusters >= FLIES_AT && thrust_aft > AFT_AT && legs == 0 && wheels == 0
+        && skirt <= SKIRT_AT
+    {
         return d(Mode::Flight, "aft thrust and nothing to stand on: it flies");
     }
     // A BROAD FLAT UNDERSIDE with nothing to roll or walk on is a skirt.
@@ -256,8 +271,21 @@ pub fn from_cloud(cloud: &[Vec3], up: Vec3, forward: Vec3, half_h: f32) -> Decis
             legs += 1;
         }
     }
-    // a legged body is TALL for its footprint; a low broad one is a skirt
-    if height < half_h.max(1e-3) * 0.9 {
+    // A LEGGED BODY IS TALL FOR ITS FOOTPRINT; a low broad one is a
+    // skirt. That is what this guard says and it was not what it did: it
+    // compared `height` against `half_h`, a value the CALLER passes in,
+    // which says nothing about the body's proportions. On the hovertank
+    // fixture height is 0.65 against a half_h of 0.35, so the guard never
+    // fired, and the leg test — which counts low points near the spine —
+    // read the continuous skirt as two legs. `decide` checks legs before
+    // it checks the skirt, so a hovertank came out Wheeled ("legs: it
+    // walks") with a skirt score of 0.87 sitting unused right beside it.
+    //
+    // Compared against the FOOTPRINT now, which is the thing "tall for
+    // its footprint" is about: 0.65 tall on a 3.2-wide stance is 0.20,
+    // nothing like a walker.
+    let footprint = skirt_span.max(1e-3) * 2.0;
+    if height < footprint * LEG_ASPECT {
         legs = 0;
     }
 
