@@ -83,6 +83,21 @@ pub struct SecurityManager {
 impl SecurityManager {
     /// Initialize security manager (loads or creates identity)
     pub fn new(data_dir: PathBuf) -> Result<Self, String> {
+        // CREATE THE DIRECTORY WE ARE ABOUT TO WRITE INTO. Every path
+        // below joins onto `data_dir` and then writes — the identity, the
+        // private key, the trusted-device list — but nothing ever made it,
+        // so `new` succeeded only for a caller who had already created the
+        // directory by some other means. The pairing test hands it
+        // `<tmp>/device2`, which nothing creates, and it failed with a
+        // bare "No such file or directory (os error 2)" that names neither
+        // the path nor the operation.
+        //
+        // Creating it here rather than in the caller because this function
+        // is what decides the layout inside it: a caller cannot know to
+        // pre-create a directory for files it does not know about.
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| format!("could not create the security data directory {}: {e}",
+                                 data_dir.display()))?;
         let identity = Self::load_or_create_identity(&data_dir)?;
         let mut manager = Self {
             identity,

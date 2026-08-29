@@ -578,19 +578,32 @@ mod tests {
         let conn = create_test_db();
         
         // Insert duplicates
+        // THE SCHEMA MAKES DUPLICATES IMPOSSIBLE. `calibrations.timestamp`
+        // is INTEGER PRIMARY KEY — in the test helper AND in production
+        // (main.rs and db_writer.rs both declare it that way) — so a
+        // second row at timestamp 1000 is a UNIQUE violation, not a
+        // duplicate to clean up. This test used to insert one and unwrap,
+        // which is why it failed: it was asserting behaviour the database
+        // will not permit.
+        //
+        // So the test now pins what is actually true, which is the more
+        // useful fact: the constraint holds, and dedup is a no-op against
+        // a table that cannot hold duplicates.
         conn.execute(
             "INSERT INTO calibrations (timestamp, sensors, target) VALUES (?, ?, ?)",
             params![1000, "[]", 20.0],
         ).unwrap();
-        
-        conn.execute(
+
+        let dup = conn.execute(
             "INSERT INTO calibrations (timestamp, sensors, target) VALUES (?, ?, ?)",
             params![1000, "[]", 21.0],
-        ).unwrap();
-        
+        );
+        assert!(dup.is_err(), "the PRIMARY KEY on timestamp stopped constraining duplicates");
+
+        // Nothing to remove, because nothing duplicate can exist.
         let removed = deduplicate_calibrations(&conn).unwrap();
-        assert_eq!(removed, 1);
-        
+        assert_eq!(removed, 0, "dedup removed a row from a table with a unique timestamp");
+
         let stats = get_stats(&conn).unwrap();
         assert_eq!(stats.calibration_count, 1);
     }

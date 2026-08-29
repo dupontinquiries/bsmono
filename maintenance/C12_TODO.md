@@ -964,8 +964,30 @@ READING (drift < 5 deg) rather than to absolute degrees, so it keeps
 meaning if the fixture is retuned and still catches the real bug (a
 model returning 20 for a series ending at 29.9). NOT COMPILED.
 
-The other three are unread. `test_pairing` in an app with a
-`security.rs` is worth looking at before the cosmetic ones.
+Two more read and fixed, one still unread:
+
+  - `security::test_pairing` — A REAL LIBRARY BUG, not a test bug.
+    `SecurityManager::new(data_dir)` writes the identity, the private
+    key and the trusted-device list into `data_dir` and NEVER CREATES
+    IT, so it worked only for a caller who had made the directory by
+    some other means. The test passes `<tmp>/device2`, nothing creates
+    that, and it failed with a bare "No such file or directory (os
+    error 2)" naming neither the path nor the operation. `new` now
+    creates its own directory and its error names the path — the
+    function decides the layout inside that directory, so a caller
+    cannot know to pre-create it.
+  - `dbmaint::test_deduplicate` — the test asserted something the
+    schema forbids. `calibrations.timestamp` is INTEGER PRIMARY KEY in
+    the test helper AND in production (main.rs, db_writer.rs), so the
+    second insert at timestamp 1000 is a UNIQUE violation, not a
+    duplicate to clean. Rewritten to pin what is true: the constraint
+    holds, and dedup is a no-op against a table that cannot hold
+    duplicates. NOTE the larger finding — `deduplicate_calibrations`
+    appears to be DEAD CODE for this schema. Either the column was
+    meant to be non-unique, or the function is vestigial; worth
+    deciding rather than leaving a function nothing can exercise.
+  - `screen_temp_hints::choose_resolution_scales_with_sensors` — still
+    unread.
 
 **C12-25c — the other five apps, unexamined.** bot-arena's
 `clean_repo_passes_and_broken_fails` and logscope's
