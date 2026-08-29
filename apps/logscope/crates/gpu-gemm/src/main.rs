@@ -2496,7 +2496,20 @@ fn main() {
         let sep = gpu.forward_kv(&mdl, &ids);
         std::env::remove_var("LOGSCOPE_FUSED_QKV"); // unset → default = fused
         let fus = gpu.forward_kv(&mdl, &ids);
-        ck("fused decode (default) == separate-projection decode, bit-exact end-to-end", sep == fus);
+        // A BARE `sep == fus` CANNOT SAY WHAT IS WRONG. Bit-exactness is the right bar, but when it
+        // fails the next question is always "by how much, and where" — a one-ulp drift in the last
+        // layer and a structurally different result read identically here, and they are different
+        // bugs. Report the magnitude and the first divergent index alongside the verdict.
+        let (ls, lf) = (sep.len(), fus.len());
+        let e = sep.iter().zip(&fus).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let first = sep.iter().zip(&fus).position(|(x, y)| x != y);
+        let rel = {
+            let mag = sep.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(f32::MIN_POSITIVE);
+            e / mag
+        };
+        ck(&format!("fused decode (default) == separate-projection decode, bit-exact end-to-end \
+                     (len {ls} vs {lf}, max|Δ|={e:.3e}, rel={rel:.3e}, first differing index {first:?})"),
+            sep == fus);
 
         println!("gate-qkv: {}", if ok { "fused QKV is bit-exact vs separate — safe to wire into the loader \u{2713}" } else { "FAIL \u{2717}" });
         return;
