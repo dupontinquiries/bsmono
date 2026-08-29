@@ -281,12 +281,24 @@ impl Dashboard {
         ui.horizontal(|ui| {
             ui.heading("Arena");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // The run control is the one button a voice or glove user
+                // most needs to reach, so it registers even though its
+                // label CHANGES between states — the id is stable and the
+                // label is not, which is exactly the split `Semantics`
+                // exists for: focus survives the state flip, the spoken
+                // text follows it.
                 if self.engine.running() {
-                    if ui.button("Stop").clicked() {
+                    if uikit_egui::a11y::semantic_button(
+                        ui, &mut self.a11y,
+                        egui::Id::new("bot_arena.run.stop").value(), "Stop")
+                    {
                         self.engine.stop();
                     }
                     ui.colored_label(c.accent, "running");
-                } else if ui.button("Start run").clicked() {
+                } else if uikit_egui::a11y::semantic_button(
+                    ui, &mut self.a11y,
+                    egui::Id::new("bot_arena.run.start").value(), "Start run")
+                {
                     self.engine.start(self.form.to_config(), &mut self.model);
                     self.replay_sel = None;
                 }
@@ -423,18 +435,21 @@ impl Dashboard {
             let editable = !self.studio_host.worker_running();
             ui.add_enabled_ui(editable, |ui| {
                 let cfg = &mut self.studio_host.cfg;
+                let a11y = &mut self.a11y;
                 egui::Grid::new("studio_cfg").num_columns(2).show(ui, |ui| {
                     ui.colored_label(c.text, "Corpus folder");
-                    path_edit(ui, &mut cfg.corpus);
+                    path_edit(ui, a11y, egui::Id::new("bot_arena.studio.corpus").value(), "Corpus folder", &mut cfg.corpus);
                     ui.end_row();
                     ui.colored_label(c.text, "CORPUS_EXT (comma-sep, blank = .md)");
-                    ui.text_edit_singleline(&mut cfg.corpus_ext);
+                    uikit_egui::a11y::semantic_text_edit(
+                        ui, a11y, egui::Id::new("bot_arena.studio.corpus_ext").value(),
+                        "Corpus extensions", &mut cfg.corpus_ext);
                     ui.end_row();
                     ui.colored_label(c.text, "Binaries dir");
-                    path_edit(ui, &mut cfg.bin_dir);
+                    path_edit(ui, a11y, egui::Id::new("bot_arena.studio.bin_dir").value(), "Binaries dir", &mut cfg.bin_dir);
                     ui.end_row();
                     ui.colored_label(c.text, "Output dir");
-                    path_edit(ui, &mut cfg.out_dir);
+                    path_edit(ui, a11y, egui::Id::new("bot_arena.studio.out_dir").value(), "Output dir", &mut cfg.out_dir);
                     ui.end_row();
                 });
                 ui.checkbox(&mut cfg.preprocess, "Run preprocessing first");
@@ -448,7 +463,14 @@ impl Dashboard {
                                 .as_ref()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_default();
-                            if ui.text_edit_singleline(&mut t).changed() {
+                            // One field, one id: this is not a list, it is
+                            // a single optional tool path that happens to
+                            // be edited through a temporary String.
+                            if uikit_egui::a11y::semantic_text_edit(
+                                ui, a11y,
+                                egui::Id::new("bot_arena.studio.tool").value(),
+                                "Preprocessing tool", &mut t)
+                            {
                                 let t = t.trim();
                                 cfg.tool = if t.is_empty() {
                                     None
@@ -492,9 +514,16 @@ impl Dashboard {
 }
 
 /// A PathBuf editor: text in, trimmed path out.
-fn path_edit(ui: &mut Ui, p: &mut std::path::PathBuf) {
+///
+/// Takes the a11y scene and a caller-supplied id rather than inventing
+/// one: this helper is used at several places, and an id derived here
+/// would be the same for all of them — `A11yScene`'s focus persists
+/// across frames BY ID, so colliding ids would make focus jump between
+/// unrelated fields.
+fn path_edit(ui: &mut Ui, a11y: &mut uikit_egui::a11y::A11yScene, id: u64,
+             label: &str, p: &mut std::path::PathBuf) {
     let mut s = p.display().to_string();
-    if ui.text_edit_singleline(&mut s).changed() {
+    if uikit_egui::a11y::semantic_text_edit(ui, a11y, id, label, &mut s) {
         *p = std::path::PathBuf::from(s.trim());
     }
 }
@@ -502,6 +531,35 @@ fn path_edit(ui: &mut Ui, p: &mut std::path::PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_registered_widget_id_is_distinct() {
+        // `A11yScene` keeps focus across frames BY ID, so two widgets
+        // sharing an id make focus jump between unrelated fields — and
+        // because the ids here are string-derived, a copy-paste of a
+        // nearby line is exactly how that would happen. This lists every
+        // id this app registers and asserts they are all different, which
+        // is a check the compiler cannot make for us.
+        let ids = [
+            "bot_arena.setup.image",
+            "bot_arena.setup.workspace",
+            "bot_arena.setup.corpus",
+            "bot_arena.setup.test_cmd",
+            "bot_arena.setup.seed",
+            "bot_arena.run.stop",
+            "bot_arena.run.start",
+            "bot_arena.studio.corpus",
+            "bot_arena.studio.corpus_ext",
+            "bot_arena.studio.bin_dir",
+            "bot_arena.studio.out_dir",
+            "bot_arena.studio.tool",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            assert!(seen.insert(egui::Id::new(id).value()), "duplicate a11y id: {id}");
+        }
+        assert_eq!(seen.len(), ids.len());
+    }
 
     #[test]
     fn paging_clamps_at_ends() {
