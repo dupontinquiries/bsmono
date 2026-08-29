@@ -145,16 +145,28 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
                             // nothing saved — a machine "added" in the UI was trusted by no code and gone on
                             // restart, which is worse than no button: the operator believes the step is done.
                             //
-                            // Compute is the default level. It can run inference and cannot receive a workspace
-                            // handoff — granting the strongest level from a typed id would make one keystroke the
-                            // whole authorisation.
-                            self.trusted.register(&id, logscope_fan::trustkit::Trust::Compute);
+                            // BUILD, not Compute. The old comment argued that Compute was safe because it
+                            // is not the STRONGEST level — but the line that matters in `Trust` is not
+                            // between Compute and Handoff, it is between Build and Compute: Build "sees
+                            // source, not conversation" and Compute "sees prompts and replies". A typed
+                            // machine id carries no key and proves nothing about who is listening, so
+                            // granting it a level that reads conversation makes one keystroke the whole
+                            // authorisation for exactly the data worth protecting.
+                            //
+                            // This is the rule `adddevice::Flow::may_grant` encodes — an unverified peer
+                            // caps at Build — applied at the one place in the UI that was already
+                            // granting trust. Raising it later is a deliberate act once the machine has
+                            // announced itself with a key; that path exists (`register_keyed`) and this
+                            // one should not pre-empt it.
+                            self.trusted.register(&id, logscope_fan::trustkit::Trust::Build);
                             self.machines.push(id.clone());
                             self.add_id.clear();
                             // UNVERIFIED, not "added": an id alone carries no key, so the machine is listed and
                             // cannot yet be authenticated. "added" would overstate what just happened.
                             self.machine_note = match self.trusted.save(&trust_path()) {
-                                Ok(()) => format!("added {id} — unverified until it announces itself"),
+                                Ok(()) => format!(
+                                    "added {id} as a BUILD worker — it may see source, not conversation. \
+                                     Unverified until it announces itself with a key; raise it then."),
                                 Err(e) => format!("added {id} FOR THIS SESSION ONLY — could not save: {e}"),
                             };
                         }

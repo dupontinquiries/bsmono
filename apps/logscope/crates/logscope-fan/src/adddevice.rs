@@ -306,6 +306,30 @@ mod tests {
     }
 
     #[test]
+    fn the_unverified_ceiling_is_below_anything_that_reads_conversation() {
+        // The line that matters in `Trust` is not between Compute and
+        // Handoff — it is between Build and Compute. Build "sees source,
+        // not conversation"; Compute "sees prompts and replies". Any
+        // grant path that starts from something unverified (a typed
+        // machine id, a discovery hit) must stop below that line, or one
+        // keystroke authorises reading the conversation.
+        //
+        // Asserted as an inequality rather than as `== Build` so it keeps
+        // meaning if a level is inserted between them later.
+        assert!(
+            Flow::may_grant(false) < Trust::Compute,
+            "an unverified peer may reach a level that reads conversation"
+        );
+        assert!(Flow::allows(false, Trust::Build));
+        assert!(!Flow::allows(false, Trust::Compute));
+        assert!(!Flow::allows(false, Trust::Handoff));
+        // Verified clears everything, which is the point of typing a code.
+        for want in [Trust::Build, Trust::Compute, Trust::Handoff] {
+            assert!(Flow::allows(true, want), "{want:?} refused after verification");
+        }
+    }
+
+    #[test]
     fn cancel_works_from_every_step_and_says_so() {
         for setup in 0..3 {
             let mut f = Flow::new();
