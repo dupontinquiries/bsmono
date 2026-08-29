@@ -90,6 +90,11 @@ const CORE_R: f32 = 0.42;
 const ORPHAN_SHARE: f32 = 0.035;
 /// ...or is flat enough: thinnest axis under this fraction of its longest.
 const FLAT: f32 = 0.14;
+/// How much of a flat group's offset from the core must run along its own
+/// LONGEST axis for it to count as reaching outward (a wing) rather than
+/// lying against the body (an underside plate). Measured on the fixtures:
+/// 1.00 for a wing, 0.00 for a plate, so half-way is a real gap.
+const REACHES_OUT: f32 = 0.5;
 /// Adoption range, in multiples of the adopting group's own size.
 const ADOPT_R: f32 = 1.35;
 /// Give up after this many passes. The recursion converges quickly (each
@@ -114,14 +119,54 @@ fn centroid(pts: &[Vec3]) -> Vec3 {
 }
 
 /// Is this segment small or flat enough to be somebody's else's problem?
-fn orphanish(pts: &[Vec3], share: f32) -> bool {
+///
+/// SHARE OUTRANKS FLATNESS. The flatness rule is for debris — a panel, a
+/// skirt, a splinter — but "thin in one axis" is also the definition of a
+/// WING, a fin, a blade and a rotor, which are appendages and the whole
+/// reason this module exists. Measured on the test jet: each wing is 21%
+/// of the model by point count and has flatness 0.031 against FLAT 0.14,
+/// so the flatness rule adopted both wings away and a two-winged jet
+/// reported ONE limb ("the wings did not read as limbs"). `compact` then
+/// looked like a no-op for the same reason — with the wings absorbed into
+/// their neighbour there was no overhang left to shorten.
+///
+/// So a group carrying a real share of the body is never orphaned on
+/// flatness alone. It can still be orphaned by being small, which is what
+/// the share test is for, and that is the test debris actually fails.
+fn orphanish(pts: &[Vec3], share: f32, core_c: Vec3) -> bool {
     if share < ORPHAN_SHARE {
         return true;
     }
     let (lo, hi) = bounds(pts);
     let e = hi - lo;
     let long = e.max_element().max(1e-5);
-    e.min_element() / long < FLAT
+    if e.min_element() / long >= FLAT {
+        return false; // chunky: nobody's debris
+    }
+    // FLAT, so ask WHICH WAY IT LIES rather than how thin it is. A wing
+    // and an underside plate are both thin, both ~20% of the body, and
+    // both similarly elongated — share and shape cannot tell them apart
+    // (measured: 0.194 vs 0.214 share, 0.011 vs 0.031 flatness). What
+    // separates them is DIRECTION. A wing reaches away from the core
+    // along its own long axis; a plate lies flat against the core, so its
+    // offset runs along its THIN axis. Measured on the two fixtures the
+    // tests use, this fraction is 1.00 for a wing and 0.00 for a plate —
+    // a clean split, not a threaded needle.
+    let c = centroid(pts);
+    let off = c - core_c;
+    let d = off.length();
+    if d < 1e-4 {
+        return true; // sitting on the core's own centre: not reaching anywhere
+    }
+    let long_axis = if e.x >= e.y && e.x >= e.z {
+        Vec3::X
+    } else if e.y >= e.z {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    let along = (off / d).dot(long_axis).abs();
+    along < REACHES_OUT
 }
 
 /// Decompose a body into a core and appendages, joining orphan segments
@@ -141,7 +186,24 @@ pub fn skeletonize(prims: &[&[Vec3]]) -> Skeleton {
     let total = all.len() as f32;
     let (lo, hi) = bounds(&all);
     let half = (hi - lo) * 0.5;
-    let mid = (lo + hi) * 0.5;
+    // THE MIDDLE IS WHERE THE MASS IS, not the centre of the bounding box.
+    // A bbox centre is dragged by whatever sticks out furthest, however
+    // little of the body that is. Measured on the test jet: a 90-point
+    // tail fin at y=0.9 pulls mid.y to 0.55, so the 500-point fuselage —
+    // dead centre in x and z, half the model by point count — scores
+    // d_norm 0.524 against CORE_R 0.42 and is NOT core. Nothing is, so
+    // the "biggest prim is the core" fallback fires, both wings are then
+    // adopted as orphans of that one prim, and a jet with two wings
+    // reports ONE limb. That is the whole of "the wings did not read as
+    // limbs" — and it is why `compact` looked like a no-op too: with the
+    // wings swallowed into the core there was no overhang left to shorten.
+    //
+    // The centroid of all points moves with the bulk instead of with the
+    // extremities, which is what "prims whose mass sits near the middle"
+    // meant in the first place. `half` stays bbox-derived: it is the
+    // SCALE the distance is normalised by, and the body's true extent is
+    // exactly what that should be.
+    let mid = centroid(&all);
     let scale = half.max_element().max(1e-4);
 
     // THE CORE: prims whose mass sits near the middle. Everything else is
@@ -252,7 +314,7 @@ fn join_orphans(
         let mut into_core: Vec<usize> = Vec::new();
         for (i, (c, _, share)) in info.iter().enumerate() {
             let pts: Vec<Vec3> = groups[i].iter().flat_map(|k| prims[*k].iter().copied()).collect();
-            if !orphanish(&pts, *share) {
+            if !orphanish(&pts, *share, core_c) {
                 continue;
             }
             // the core adopts first when it is closest — a flat underside
@@ -275,7 +337,7 @@ fn join_orphans(
                             // makes drifting clumps instead of a body
                             let jpts: Vec<Vec3> =
                                 groups[*j].iter().flat_map(|k| prims[*k].iter().copied()).collect();
-                            if orphanish(&jpts, jshare) {
+                            if orphanish(&jpts, jshare, core_c) {
                                 continue;
                             }
                             let d = (jc - *c).length();
