@@ -24,13 +24,24 @@ had not touched any of the failing modules since the fork point at
 and physics.rs. And `skeleton`, `turret` and `driveline` name no `crate::`
 sibling at all: they are glam-only, so nothing this line did can reach them.
 
-- **C12-1a — skeleton, three failures.** `a_vehicle_decomposes_the_same_way_a_body_does`
-  ("the wings did not read as limbs: core 1 prims, 1 limbs (reach 1.20), 2
-  orphans joined"), `compaction_halves_the_overhang_without_detaching_it`
-  ("the wing barely moved: 1.2005669 -> 1.2005669" — the compaction is a
-  no-op), `vehicle_mode_packs_the_limbs_inside_the_hull` ("prim 1 still pokes
-  out by -0.55/5.35 after containment"). The middle one looks like the root:
-  if `compact` moves nothing, the other two follow. `read`, not diagnosed.
+- **C12-1a — two of three closed (`d0ef5a07`).** The recorded guess was
+  that `compact` being a no-op was the root and the others followed. It
+  was the reverse: `compact` was correct and had nothing to work on,
+  because limb DETECTION was wrong upstream. Two bugs, both required:
+  (1) the core test measured distance from the bounding-box centre,
+  which a 90-point tail fin drags off the 500-point fuselage, so no prim
+  qualified as core; `mid` is now the centroid of all points. (2)
+  `orphanish` adopted away anything thinner than FLAT — but a wing, fin,
+  blade and rotor are all thin ON PURPOSE. Share cannot separate a wing
+  (0.214) from an underside plate (0.194), and neither can flatness or
+  elongation; DIRECTION can — the offset's component along the group's
+  own longest axis is 1.00 for a wing reaching outward and 0.00 for a
+  plate lying against the body. Note for future work: fixing (1) alone
+  changed nothing at all and looked like a wrong guess; it is
+  load-bearing only in combination, confirmed by reverting it at the
+  end. Still open: `vehicle_mode_packs_the_limbs_inside_the_hull`, which
+  is containment after compaction, not detection, and is not assumed to
+  share a cause.
 - **C12-1b — turret: `the_whole_turret_follows_the_barrel`** — "the hull was
   swept into the turret: fittings: 4 turret prims (ring 0.00,0.10,0.23), 2
   tread prims". The ring test is admitting hull prims. `read`.
