@@ -1323,7 +1323,22 @@ reachable from `shell::settings_panel`, which is a preferences screen.
 So the gap was real but narrower than "settings is missing": it is the
 LAUNCHER that was missing, not the settings.
 
-- **C12-29b — nothing renders `quick_launcher` yet.** Same shape as the
+- **C12-29b — CLOSED, the launcher renders.** Wired into voiceterm's
+Settings surface, above the preferences panel — doors first, because
+that is what someone opening this menu usually wants; the sliders are
+for a visit made on purpose.
+
+All four doors currently report "not ported yet" through the existing
+toast system, and that is deliberate rather than a stub: `Surface` has
+Blocks, MissingPkg, Workspaces, Settings, Favorites, CmdSheet and
+Palette — no Setup, Chat, Recipes or Sessions. A button that silently
+does nothing reads as a bug in the app; one that says what it is reads
+as the truth. Two of the four widgets (setup_wizard, chat_panel) EXIST
+in the kit and are unhosted, so adding those Surface variants is the
+next step and is a separate change from putting the launcher on screen.
+voiceterm 1106/1106.
+
+**OLD ENTRY:** Same shape as the
   cmdstrip (§26a): the widget and its events exist, no app draws it.
 - **C12-29c — region slicing DONE, and the first findings are that
   there is less QML here than expected.** `qml_outline.py --region <id>`

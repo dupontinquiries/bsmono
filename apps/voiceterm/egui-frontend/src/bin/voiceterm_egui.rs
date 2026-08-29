@@ -550,6 +550,9 @@ struct VoicetermApp {
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
     toasts: uikit_egui::toast::Toasts,
+    /// The QML settingsPopup's launcher half — four doors plus voice
+    /// activation and theme. Preferences live in `app.prefs`.
+    launcher: uikit_egui::quick_launcher::LauncherState,
     /// Document ingest: diagnose a captured page, repair it, confirm or revert.
     ingest: voiceterm_egui::docingest::Ingest,
     /// WHICH SURFACE the central panel shows. voiceterm had twelve ported
@@ -1460,6 +1463,46 @@ impl eframe::App for VoicetermApp {
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    // THE LAUNCHER, above the preferences. The QML's
+                    // settingsPopup is mostly four doors — model setup,
+                    // chat, recipes, sessions — and until now none of
+                    // them had a route from this port: the panel below
+                    // is preferences, and preferences do not open
+                    // screens. Doors first because that is what someone
+                    // opening this menu is usually after; the sliders
+                    // are for a visit you made on purpose.
+                    use uikit_egui::quick_launcher::{quick_launcher_ui, LauncherEvent};
+                    if let Some(ev) = quick_launcher_ui(ui, &mut self.launcher) {
+                        // NONE of the four doors has a Surface in this
+                        // port yet — `Surface` has Blocks, MissingPkg,
+                        // Workspaces, Settings, Favorites, CmdSheet and
+                        // Palette, and no Setup, Chat, Recipes or
+                        // Sessions. So every door reports honestly rather
+                        // than opening nothing: a button that silently
+                        // does nothing is read as a bug in the app, while
+                        // one that says "not ported yet" is read as the
+                        // truth, which it is.
+                        //
+                        // The widgets for two of them EXIST in the kit
+                        // (setup_wizard, chat_panel) and are unhosted —
+                        // adding the Surface variants is the wiring that
+                        // turns these into real doors, and it is a
+                        // separate change from putting the launcher on
+                        // screen.
+                        let what = match ev {
+                            LauncherEvent::OpenSetup => Some("model setup"),
+                            LauncherEvent::OpenChat => Some("chat"),
+                            LauncherEvent::OpenRecipes => Some("recipes"),
+                            LauncherEvent::OpenSessions => Some("sessions"),
+                            LauncherEvent::VoiceActivationChanged
+                            | LauncherEvent::ThemeChanged => None,
+                        };
+                        if let Some(w) = what {
+                            self.toasts.info(format!("{w}: not ported yet"), ui.input(|i| i.time));
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.separator();
                     if settings_panel(ui, &mut self.app.prefs) {
                         // palette is owned by prefs; keep the frame-applied theme in sync
                         self.theme = snapclone_theme::PaletteId::from_str(&self.app.prefs.palette);
@@ -3372,6 +3415,7 @@ fn main() -> eframe::Result<()> {
                 blocks: blocks,
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
+                launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 view: CentralView::Terminal,
                 mail: Default::default(),
                 browser: Default::default(),
