@@ -1432,13 +1432,22 @@ impl WorldRenderer {
             format!("Failed to create cascade-fit pipeline: {}", e)
         ))?;
 
-        // Indirect drawing kill-switch. UNENDLICH_INDIRECT=0 falls back
-        // to the v0.19 per-chunk draw loop (preserved as a fallback for
-        // diagnostic A/B testing).
+        // Indirect drawing kill-switch — and (v0.24.110, re-landed as
+        // AUTOMATIC) the device-capability gate. Calling
+        // cmd_draw_indexed_indirect_count on a device that didn't enable
+        // drawIndirectCount is the MoltenVK failure mode: a validation flood
+        // and invisible terrain. The context negotiated the feature at device
+        // creation; without it we take the v0.19 per-chunk CPU-cull loop
+        // without the operator having to remember UNENDLICH_INDIRECT=0.
         let use_indirect = std::env::var("UNENDLICH_INDIRECT")
             .map(|v| v != "0")
-            .unwrap_or(true);
-        if !use_indirect {
+            .unwrap_or(true)
+            && ctx.draw_indirect_count_enabled;
+        if !ctx.draw_indirect_count_enabled {
+            log::info!(
+                "Indirect drawing DISABLED: device lacks drawIndirectCount — per-chunk draw loop (CPU cull)"
+            );
+        } else if !use_indirect {
             log::info!("UNENDLICH_INDIRECT=0: using v0.19 per-chunk draw loop fallback");
         } else {
             log::info!("Indirect drawing ENABLED (set UNENDLICH_INDIRECT=0 for fallback)");

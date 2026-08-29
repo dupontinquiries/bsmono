@@ -51,6 +51,12 @@ pub struct VulkanContext {
     pub present_queue_family: u32,
     pub graphics_queue: vk::Queue,
     pub present_queue: vk::Queue,
+    /// v0.24.110 (re-landed, made automatic): whether the negotiated device
+    /// actually enabled `drawIndirectCount`. When false (older MoltenVK /
+    /// non-1.2 drivers) the renderer must take the per-chunk CPU-cull draw
+    /// loop — calling cmd_draw_indexed_indirect_count without the feature is
+    /// the macOS "draw-count flood" + invisible terrain.
+    pub draw_indirect_count_enabled: bool,
     /// v0.24.3 Ship A: queue family chosen for async compute work
     /// (mesher dispatches, world generation). May be the same as
     /// `graphics_queue_family` if no dedicated compute family exists
@@ -133,7 +139,7 @@ impl VulkanContext {
             compute_dedicated,
         );
 
-        let device = create_device(
+        let (device, draw_indirect_count_enabled) = create_device(
             &instance, physical_device,
             graphics_queue_family, present_queue_family,
             compute_queue_family, compute_dedicated,
@@ -199,6 +205,7 @@ impl VulkanContext {
             physical_device, device,
             graphics_queue_family, present_queue_family,
             graphics_queue, present_queue,
+            draw_indirect_count_enabled,
             compute_queue_family, compute_queue, compute_queue_is_distinct,
             swapchain_loader,
             queue_submit_lock: Arc::new(Mutex::new(())),
@@ -246,7 +253,7 @@ impl VulkanContext {
             graphics_queue_family, compute_queue_family, compute_dedicated,
         );
 
-        let device = create_device(
+        let (device, draw_indirect_count_enabled) = create_device(
             &instance, physical_device,
             graphics_queue_family, present_queue_family,
             compute_queue_family, compute_dedicated,
@@ -275,6 +282,7 @@ impl VulkanContext {
             physical_device, device,
             graphics_queue_family, present_queue_family,
             graphics_queue, present_queue,
+            draw_indirect_count_enabled,
             compute_queue_family, compute_queue, compute_queue_is_distinct,
             swapchain_loader,
             queue_submit_lock: Arc::new(Mutex::new(())),
@@ -768,7 +776,7 @@ fn create_device(
     present_qf: u32,
     compute_qf: u32,
     compute_dedicated: bool,
-) -> Result<Device> {
+) -> Result<(Device, bool)> {
     let priorities_one = [1.0f32];
     // For the graphics family, if compute shares it and we need a
     // second queue, request 2 queues with priorities [graphics=1.0,
@@ -891,14 +899,39 @@ fn create_device(
         .shader_draw_parameters(want_shader_draw_parameters)
         .build();
 
+    // v0.24.111 (re-landed): on MoltenVK, enabling the VK_KHR_portability_subset
+    // EXTENSION is not enough — any portability FEATURE not explicitly chained
+    // into device creation defaults to FALSE, including
+    // mutableComparisonSamplers, which the chunk shader's sampler2DShadow
+    // (comparison sampler) needs. Query the device's supported portability
+    // feature set and chain it back verbatim: exactly what the hardware
+    // offers, nothing more. Linux never sees this block.
+    #[cfg(target_os = "macos")]
+    let mut portability_feats = {
+        let mut supported = vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
+        let mut probe = vk::PhysicalDeviceFeatures2::builder()
+            .push_next(&mut supported)
+            .build();
+        unsafe { instance.get_physical_device_features2(pdev, &mut probe) };
+        log::info!(
+            "[gpu] portability features: mutableComparisonSamplers={} imageViewFormatSwizzle={}",
+            supported.mutable_comparison_samplers,
+            supported.image_view_format_swizzle,
+        );
+        supported
+    };
+
     let info = vk::DeviceCreateInfo::builder()
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&device_exts)
         .enabled_features(&features)
         .push_next(&mut vulkan11)
         .push_next(&mut vulkan12);
+    #[cfg(target_os = "macos")]
+    let info = info.push_next(&mut portability_feats);
 
-    Ok(unsafe { instance.create_device(pdev, &info, None)? })
+    let device = unsafe { instance.create_device(pdev, &info, None)? };
+    Ok((device, want_draw_indirect_count))
 }
 
 #[cfg(all(test, feature = "headless"))]

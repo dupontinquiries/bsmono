@@ -348,8 +348,28 @@ fn create_instance(entry: &Entry) -> Result<Instance> {
         .engine_name(unsafe { CStr::from_bytes_with_nul_unchecked(b"Meinkraft\0") })
         .engine_version(vk::make_api_version(0, 0, 2, 0))
         .api_version(vk::make_api_version(0, 1, 2, 0));
-    let info = vk::InstanceCreateInfo::builder().application_info(&app_info);
-    Ok(unsafe { entry.create_instance(&info, None)? })
+    // v0.24.112 (re-landed): macOS/MoltenVK — this HEADLESS compute context
+    // builds its own VkInstance, and without portability enumeration the
+    // loader refuses to expose the Metal device (ERROR_INCOMPATIBLE_DRIVER →
+    // the silent "GPU unavailable … Using CPU" fallback on Mac). Same proven
+    // treatment as render/context.rs; Linux is byte-for-byte unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let exts = [
+            vk::KhrPortabilityEnumerationFn::name().as_ptr(),
+            vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr(),
+        ];
+        let info = vk::InstanceCreateInfo::builder()
+            .application_info(&app_info)
+            .enabled_extension_names(&exts)
+            .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+        return Ok(unsafe { entry.create_instance(&info, None)? });
+    }
+    #[allow(unreachable_code)]
+    {
+        let info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+        Ok(unsafe { entry.create_instance(&info, None)? })
+    }
 }
 
 fn pick_physical_device(instance: &Instance) -> Result<vk::PhysicalDevice> {
@@ -383,6 +403,27 @@ fn find_compute_queue_family(instance: &Instance, dev: vk::PhysicalDevice) -> Re
 }
 
 fn create_device(instance: &Instance, dev: vk::PhysicalDevice, queue_family: u32) -> Result<Device> {
+    // v0.24.112 (re-landed): MoltenVK advertises VK_KHR_portability_subset and
+    // the spec REQUIRES enabling it when present. FP32-only compute, no
+    // swapchain, no gated features — the extension alone suffices here.
+    #[cfg(target_os = "macos")]
+    let mac_portability: Vec<*const std::os::raw::c_char> = {
+        let has = unsafe { instance.enumerate_device_extension_properties(dev) }
+            .map(|exts| {
+                exts.iter().any(|e| {
+                    unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) }
+                        .to_bytes()
+                        == b"VK_KHR_portability_subset"
+                })
+            })
+            .unwrap_or(false);
+        if has {
+            vec![b"VK_KHR_portability_subset\0".as_ptr() as *const std::os::raw::c_char]
+        } else {
+            Vec::new()
+        }
+    };
+
     let priorities = [1.0f32];
     let queue_info = vk::DeviceQueueCreateInfo::builder()
         .queue_family_index(queue_family)
@@ -398,6 +439,9 @@ fn create_device(instance: &Instance, dev: vk::PhysicalDevice, queue_family: u32
     let info = vk::DeviceCreateInfo::builder()
         .queue_create_infos(std::slice::from_ref(&queue_info))
         .enabled_features(&features);
+    #[cfg(target_os = "macos")]
+    let info = if mac_portability.is_empty() { info } else { info.enabled_extension_names(&mac_portability) };
+
 
     Ok(unsafe { instance.create_device(dev, &info, None)? })
 }
