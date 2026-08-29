@@ -918,6 +918,45 @@ these are only in commit messages where nobody will find them.
   disambiguate, but the `c5blackstar-NNN` bundle series still carries
   the misleading name.
 
+## 27. Worker creation mode: two of C11-20's four pieces exist now
+
+- **C11-20c — CLOSED (`ab20b46e`).** `workermem::WorkerMemory`: append-only,
+  provenance-tagged (Observation | Decision | Inference), capped, fenced on the
+  way out. Built to `docs/12-queen-and-workers.md`, not from guesswork. Three
+  decisions where the obvious implementation inverts the intent, each pinned by
+  a test: the cap REFUSES rather than evicting (a ring buffer keeps the worker's
+  newest guesses and discards the operator's oldest instructions);
+  `summarize_with` collapses PER PROVENANCE (one blob would destroy the
+  distinction at exactly the moment a revived worker reads it first); and
+  `established()` excludes inferences (recording provenance and then handing
+  consumers one flat list would store the distinction without acting on it).
+  The fencer is INJECTED because `read_harness::fence` lives in logscope-egui,
+  which depends on this crate — copying it is the voiceprint-kit mistake.
+- **C11-20b — HALF DONE (`56d28956`).** `roster::Roster` + `Staffing` +
+  `queen_request`. `QUEEN_PROMPT` always ended with "reuse before creating" and
+  nothing ever gave the Queen a roster to reuse from; it does now. Staffing is
+  by LANE (`owns`) rather than purpose, most-specific-wins, with equal claims
+  returning `Ambiguous` instead of a tiebreak.
+  **Still open from 20b:** the seed workers the doc suggests (reader,
+  test-runner, patcher) are not shipped, so a cold system is still
+  every-task-is-a-Queen-call — which the doc names as an open question
+  ("who writes the first roster?") rather than something already decided.
+- **C12-27a — the two new modules do not know about each other.**
+  `WorkerSpec.name` is documented as the memory directory and nothing joins a
+  roster entry to a `WorkerMemory`. Neither module is constructed at runtime by
+  anything, so both are built-with-no-consumer in the sense of section 24.
+  The join is small; what it needs first is a decision about persistence, since
+  `workermem` is deliberately pure (no I/O) and a memory directory implies
+  someone owns the reading and writing of it.
+- **C12-27b — `continuation::Command` is still not the Delegator's.** The doc
+  says the post-turn question ("keep going linearly / fan out / verify / stop")
+  belongs here, answered by cheap rules first. `roster` answers the STAFFING
+  question only; nothing answers the continuation one.
+- **C11-20a remains the experiment that decides the thesis** and is untouched:
+  same 1B, same task, with and without a lane + two-tool whitelist. Everything
+  in doc 12 — and therefore both modules above — is speculation until that
+  number exists, and it needs a device.
+
 ## 26. logscope: flush_every was inert, and what that leaves open
 
 Closed this session (`adf1ecfd`, `1bcec8eb`): `Frame.passes` was never
