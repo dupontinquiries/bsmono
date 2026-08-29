@@ -1292,7 +1292,22 @@ Survey of the egui side: `term_grid` (435), `browser` (362),
 exist with real substance. **Settings did not exist at all** — no module,
 no re-export, nothing.
 
-**C12-29a — settings, DONE (`settings_panel`).** Ported from
+**C12-29a — CORRECTION: settings was NOT missing.** I recorded that it
+"did not exist at all — no module, no re-export, nothing". That was
+wrong, and wrong because of how I looked: I searched `uikit-egui` and
+the front-end's module names, not `shell.rs`. voiceterm HAS a settings
+panel (`shell::settings_panel`, L194) and it IS rendered
+(voiceterm_egui.rs L1463). It covers animation, palette, display and
+gestures — real preferences, backed by `settings_kit::Prefs`.
+
+What I ported is a DIFFERENT surface: the QML `settingsPopup` is four
+navigation doors (model setup, chat, recipes, sessions) plus voice
+activation and theme. The two are complementary — one is preferences,
+the other is a launcher — and the kit's `settings_panel` should
+probably be renamed to say so, since two things called settings_panel
+in one app is how the next reader repeats my mistake.
+
+**The original C12-29a entry, kept for what it built:** Ported from
 `main.qml`'s `settingsPopup` (L27729). Six entries: four DOORS (model
 setup, chat, recipes, sessions) and two actual settings (voice
 activation, theme). Returns a `SettingsEvent` rather than mutating a
@@ -1301,10 +1316,11 @@ handle to it, the setup wizard and the session store — most of the app.
 The QML's trailing `→` on the doors is kept and is in the type too: a
 test asserts no event is both a door and a setting. 4 tests.
 
-Consequence worth stating: everything behind that popup — model setup,
-chat, recipes, session history — had NO ROUTE from the egui port. The
-other audits found screens missing pieces; this one was a missing
-screen, and it was the one that reaches the others.
+Consequence, restated correctly: the four DOORS had no route from the
+egui port — model setup, chat, recipes and session history are not
+reachable from `shell::settings_panel`, which is a preferences screen.
+So the gap was real but narrower than "settings is missing": it is the
+LAUNCHER that was missing, not the settings.
 
 - **C12-29b — nothing renders `settings_panel` yet.** Same shape as the
   cmdstrip (§26a): the widget and its events exist, no app draws it.
