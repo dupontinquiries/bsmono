@@ -507,8 +507,6 @@ pub fn maps_row_h() -> f32 {
     // fixed: the map list scrolls rather than squeezing 30 rooms onto one page
     0.058
 }
-pub const ONL_TOP: f32 = 0.60;
-pub const ONL_ROW_H: f32 = 0.105;
 
 /// The replay banner: what the game decided you just did.
 pub fn replay_banner(ui: &mut Vec<UiVert>, a: f32, title: &str, t: f32, total: f32) {
@@ -1374,56 +1372,27 @@ pub fn maps_menu(ui: &mut Vec<UiVert>, a: f32, sel: usize, current: usize, seed:
 }
 
 // --------------------------------------------------------------- online ----
-pub struct OnlineUi<'a> {
-    pub sel: usize,
-    pub name: &'a str,
-    pub friend: &'a str,
-    pub status: &'a str,
-    pub players: Vec<String>,
-    pub online: bool,
-}
+// OnlineUi retired: the Online screen is a menu::Menu now (online_screen.rs)
+// drawn via draw_menu + online_footer.
 
-pub const ONLINE_ROWS: usize = 6; // name, friend, host, join, leave, back
 
-pub fn online_menu(ui: &mut Vec<UiVert>, a: f32, o: &OnlineUi, blink: f32) {
-    quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
-    panel(ui, a, -0.70, -0.985, 0.70, 0.955);
-    label_c(ui, 0.885, 0.019, a, PAPER, "ONLINE");
+/// The Online screen's live footer — status line + pilots-in-session list —
+/// drawn UNDER the shared `draw_menu` output (the rows themselves are a
+/// `menu::Menu` now; see main's Mode::Online arm and `online_screen.rs`).
+pub fn online_footer(ui: &mut Vec<UiVert>, a: f32, status: &str, players: &[String], online: bool) {
     label_c(ui, 0.825, 0.0088, a, DIM, "SESSIONS RIDE THE FLEET NETCODE STORE - SAME MACHINE OR A SHARED TEMP DIR");
-
-    let row_h = ONL_ROW_H;
-    let top = ONL_TOP;
-    let cursor = if (blink * 2.5).sin() > 0.0 { "_" } else { " " };
-    let rows: [String; ONLINE_ROWS] = [
-        format!("NAME:   {}{}", o.name, if o.sel == 0 { cursor } else { "" }),
-        format!("FRIEND: {}{}", o.friend, if o.sel == 1 { cursor } else { "" }),
-        "> HOST A SESSION".to_string(),
-        "> JOIN FRIEND".to_string(),
-        "> LEAVE / GO OFFLINE".to_string(),
-        "BACK".to_string(),
-    ];
-    for (i, row) in rows.iter().enumerate() {
-        let y = top - i as f32 * row_h;
-        if i == o.sel {
-            quad(ui, -0.62, y - row_h + 0.045, 0.62, y + 0.028, SEL);
-            quad(ui, -0.635, y - row_h + 0.045, -0.62, y + 0.028, GOLD);
-        }
-        font::text(ui, -0.55, y, 0.0112, a, if i == o.sel { GOLD } else { PAPER }, row);
-    }
-
-    if !o.status.is_empty() {
-        label_c(ui, -0.16, 0.0105, a, GOLD, o.status);
+    if !status.is_empty() {
+        label_c(ui, -0.16, 0.0105, a, GOLD, status);
     }
     let mut y = -0.26;
-    if o.online {
+    if online {
         label_c(ui, y, 0.0105, a, PAPER, "PILOTS IN SESSION:");
         y -= 0.048;
-        for p in o.players.iter().take(8) {
+        for p in players.iter().take(8) {
             label_c(ui, y, 0.0095, a, DIM, p);
             y -= 0.042;
         }
     }
-
     label_c(ui, -0.86, 0.0085, a, DIM, "HOSTING ANNOUNCES YOU AS <NAME> FOR FRIENDS TO JOIN BY THAT NAME");
     legend(ui, -0.93, a, T_HINT, &[("TYPE", "EDIT FIELD"), ("CLICK / ENTER", "ACTIVATE"), ("ESC", "BACK")]);
 }

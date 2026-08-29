@@ -59,6 +59,10 @@ pub enum Item {
     Choice { idx: usize, of: Vec<String> },
     /// opens another screen
     Submenu,
+    /// editable text (name / friend-code entry). `max` caps length; the
+    /// caller receives Changed(id, Value::Text) on every edit and writes it
+    /// through to wherever the string lives.
+    Field { text: String, max: usize },
     /// a heading: drawn, never selectable
     Heading,
     /// blank space: drawn, never selectable
@@ -80,6 +84,7 @@ impl Item {
             Item::Slider { v, fmt, .. } => fmt.write(*v),
             Item::Choice { idx, of } => of.get(*idx).cloned().unwrap_or_default(),
             Item::Submenu => ">".into(),
+            Item::Field { text, .. } => text.clone(),
             _ => String::new(),
         }
     }
@@ -103,6 +108,9 @@ impl Row {
     }
     pub fn toggle(id: &'static str, label: &str, on: bool) -> Row {
         Row { id, label: label.into(), item: Item::Toggle(on), enabled: true, hint: None }
+    }
+    pub fn field(id: &'static str, label: &str, text: &str, max: usize) -> Row {
+        Row { id, label: label.into(), item: Item::Field { text: text.into(), max }, enabled: true, hint: None }
     }
     pub fn slider(id: &'static str, label: &str, v: f32, min: f32, max: f32, step: f32, fmt: Fmt) -> Row {
         Row { id, label: label.into(), item: Item::Slider { v, min, max, step, fmt }, enabled: true, hint: None }
@@ -158,6 +166,7 @@ pub enum Value {
     Bool(bool),
     Num(f32),
     Index(usize),
+    Text(String),
 }
 
 pub struct Menu {
@@ -274,6 +283,40 @@ impl Menu {
             Item::Choice { .. } => self.adjust(1),
             _ => None,
         }
+    }
+
+    /// Type a character into the selected row, if it's a Field with room.
+    /// Printable ASCII only (the game's font). Returns Changed(id, Text) so
+    /// the caller writes the new value through.
+    pub fn input_char(&mut self, c: char) -> Option<Event> {
+        if !c.is_ascii_graphic() && c != ' ' {
+            return None;
+        }
+        let i = self.sel;
+        let row = self.rows.get_mut(i)?;
+        if !row.enabled {
+            return None;
+        }
+        if let Item::Field { text, max } = &mut row.item {
+            if text.len() < *max {
+                text.push(c);
+                return Some(Event::Changed(row.id, Value::Text(text.clone())));
+            }
+        }
+        None
+    }
+
+    /// Backspace in the selected Field. Returns Changed(id, Text) when a
+    /// character was removed.
+    pub fn backspace(&mut self) -> Option<Event> {
+        let i = self.sel;
+        let row = self.rows.get_mut(i)?;
+        if let Item::Field { text, .. } = &mut row.item {
+            if text.pop().is_some() {
+                return Some(Event::Changed(row.id, Value::Text(text.clone())));
+            }
+        }
+        None
     }
 
     /// Point at a row by index, for mouse hover and click.

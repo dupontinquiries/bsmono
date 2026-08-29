@@ -41,10 +41,18 @@ screen's private sel/scroll/key-branch/draw quadruplet as it lands.
    it would trade art for process. The draw-vs-hit geometry fix that once
    blocked it (`menu_rows`/`menu_hit`) still stands available if its layout
    ever simplifies.
-3. **Online** — the TRUE next migration: six generic rows (name, friend,
-   host, join, leave, back), no bespoke art, the exact shape `menu.rs` was
-   built for; the "row ≥ 2 activates" special case becomes plain
-   `Item::Action` rows.
+3. **Online** — ✅ MIGRATED (2026-08-29): the FIRST live `menu::Menu`
+   consumer (the machinery was built + tested but had zero callers until
+   now). `online_screen.rs` builds the six rows (two `Item::Field` — a new
+   item added to menu.rs with input_char/backspace ops + Value::Text — and
+   four Actions, LEAVE properly disabled while offline instead of the old
+   no-op toast); `online_key` shrank to key-routing + event application;
+   mouse hover/click go through `ui::menu_hit` so draw and hit share ONE
+   geometry; the status/players list stayed as a bespoke live footer
+   (`hud::online_footer`). Old `hud::online_menu`, `OnlineUi`, and the
+   ONL_* geometry consts deleted. Suite 1222/0 (2 new). VISUALLY UNVERIFIED
+   in-sandbox — eyeball pass on device, plus: hover highlight now follows
+   the MENU's selection (mode.sel is a legacy mirror only).
 4. **Tweaks** — the big one, but `tweak_rows()` is ALREADY data-driven
    (Slider/Toggle rows with get/set fns); it maps ~1:1 onto `menu::Item`.
    The touch slider-scrub (`tscrub`/`bar_t`) must keep working: route the

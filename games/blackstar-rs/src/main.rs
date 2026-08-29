@@ -76,6 +76,7 @@ mod menu;
 mod meshgen;
 mod model;
 mod net;
+mod online_screen;
 mod physics;
 mod powers;
 mod platform;
@@ -826,6 +827,10 @@ struct Game {
     analog: analog::Analog,
     bots: Vec<bots::Bot>,
     friend: String,
+    /// The Online screen's live menu (first `menu::Menu` consumer). Built on
+    /// open, dropped on close; sel/scroll live inside it, so Mode::Online's
+    /// `sel` remains only as a legacy mirror for the shared draw tables.
+    online_menu: Option<menu::Menu>,
     toast: String,
     toast_t: f32,
     /// counts down to the next beacon pulse during a raid Assault —
@@ -1983,6 +1988,7 @@ fn main() {
         analog: analog::Analog::new(),
         bots: Vec::new(),
         friend: String::new(),
+        online_menu: None,
         toast: String::new(),
         toast_t: 0.0,
         beacon_fx_t: 0.0,
@@ -3501,6 +3507,13 @@ impl Game {
     }
 
     fn open_menu(&mut self, m: Mode) {
+        if let Mode::Online { .. } = m {
+            self.online_menu = Some(online_screen::build(
+                &self.save.name,
+                &self.friend,
+                self.net.role != net::Role::Offline,
+            ));
+        }
         self.menu_from_pause = matches!(self.mode, Mode::Pause { .. });
         self.mode = m;
         self.mscroll = 0.0;
@@ -3624,9 +3637,16 @@ impl Game {
             Mode::Online { sel } => match b {
                 MouseButton::Left => {
                     if let Some(i) = self.hover_row() {
-                        self.mode = Mode::Online { sel: i };
-                        if i >= 2 {
-                            self.online_key(&enter, "", i);
+                        if let Some(mut m) = self.online_menu.take() {
+                            m.point_at(i);
+                            self.mode = Mode::Online { sel: m.sel() };
+                            // Clicking an Action row activates it; clicking a
+                            // Field row just focuses it for typing — the Menu
+                            // decides (activate is a no-op on fields).
+                            if let Some(ev) = m.activate() {
+                                self.apply_online_event(ev, &mut m);
+                            }
+                            self.online_menu = Some(m);
                         }
                     }
                 }
@@ -4116,7 +4136,12 @@ impl Game {
                 let start = self.mscroll.max(0.0) as usize;
                 hud::hit_row_scrolled(hud::MAPS_TOP, hud::maps_row_h(), n, vis, start, y)
             }
-            Mode::Online { .. } => hud::hit_row(hud::ONL_TOP, hud::ONL_ROW_H, hud::ONLINE_ROWS, y),
+            Mode::Online { .. } => {
+                // shared-menu geometry (draw_menu ⇄ menu_hit stay in lockstep)
+                let m = self.online_menu.as_ref()?;
+                let scr = ui::Screen::new(self.gpu.aspect());
+                ui::menu_hit(&scr, m, hud::T_BODY, (self.cursor.0, y))
+            }
             // These three had no arm at all, so `hover_row` returned None and
             // every click on them did nothing.
             Mode::Trials { .. } => {
@@ -4973,71 +4998,86 @@ impl Game {
             self.follow_selection();
     }
 
-    fn online_key(&mut self, key: &Key, ch: &str, sel: usize) {
-        match key {
+    fn online_key(&mut self, key: &Key, ch: &str, _sel: usize) {
+        // First live menu::Menu consumer (see online_screen.rs): nav, text
+        // entry, and activation are the Menu's own ops; this fn only routes
+        // keys in and applies the events that come back.
+        let Some(mut m) = self.online_menu.take() else {
+            self.online_menu = Some(online_screen::build(
+                &self.save.name,
+                &self.friend,
+                self.net.role != net::Role::Offline,
+            ));
+            return;
+        };
+        let ev = match key {
             Key::Named(NamedKey::Escape) => {
                 self.persist();
                 self.close_menu();
+                self.online_menu = None;
                 return;
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.mode = Mode::Online { sel: (sel + hud::ONLINE_ROWS - 1) % hud::ONLINE_ROWS };
-                return;
+                m.step(-1);
+                None
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.mode = Mode::Online { sel: (sel + 1) % hud::ONLINE_ROWS };
-                return;
+                m.step(1);
+                None
             }
-            Key::Named(NamedKey::Backspace) => {
-                match sel {
-                    0 => {
-                        self.save.name.pop();
-                    }
-                    1 => {
-                        self.friend.pop();
-                    }
-                    _ => {}
+            Key::Named(NamedKey::Backspace) => m.backspace(),
+            Key::Named(NamedKey::Enter) => m.activate(),
+            _ => {
+                if let Some(c) = ch.chars().next() {
+                    m.input_char(c)
+                } else {
+                    None
                 }
-                return;
             }
-            Key::Named(NamedKey::Enter) => {
-                match sel {
-                    2 => {
-                        let n = self.save.name.clone();
-                        let s = self.net.host(&n);
-                        self.toastf(&s);
-                    }
-                    3 => {
-                        let n = self.save.name.clone();
-                        let f = self.friend.clone();
-                        let s = self.net.join(&n, &f);
-                        self.toastf(&s);
-                    }
-                    4 => {
-                        self.net.leave();
-                        self.toastf("OFFLINE");
-                    }
-                    5 => {
-                        self.persist();
-                        self.close_menu();
-                    }
-                    _ => {}
-                }
-                return;
+        };
+        // Mirror the Menu's selection into Mode::Online{sel} so the shared
+        // hover/draw tables keep working until they migrate too.
+        self.mode = Mode::Online { sel: m.sel() };
+        if let Some(ev) = ev {
+            self.apply_online_event(ev, &mut m);
+        }
+        self.online_menu = Some(m);
+    }
+
+    /// Apply an Online-screen menu event. Split out so mouse clicks and
+    /// touch can route through the same arm as the keyboard.
+    fn apply_online_event(&mut self, ev: menu::Event, m: &mut menu::Menu) {
+        use online_screen as os;
+        match ev {
+            menu::Event::Changed(os::ID_NAME, menu::Value::Text(t)) => self.save.name = t,
+            menu::Event::Changed(os::ID_FRIEND, menu::Value::Text(t)) => self.friend = t,
+            menu::Event::Pressed(os::ID_HOST) => {
+                let n = self.save.name.clone();
+                let st = self.net.host(&n);
+                self.toastf(&st);
+                set_row_enabled(m, os::ID_LEAVE, self.net.role != net::Role::Offline);
+            }
+            menu::Event::Pressed(os::ID_JOIN) => {
+                let n = self.save.name.clone();
+                let f = self.friend.clone();
+                let st = self.net.join(&n, &f);
+                self.toastf(&st);
+                set_row_enabled(m, os::ID_LEAVE, self.net.role != net::Role::Offline);
+            }
+            menu::Event::Pressed(os::ID_LEAVE) => {
+                self.net.leave();
+                self.toastf("OFFLINE");
+                set_row_enabled(m, os::ID_LEAVE, false);
+            }
+            menu::Event::Pressed(os::ID_BACK) | menu::Event::Close => {
+                self.persist();
+                self.close_menu();
+                self.online_menu = None;
             }
             _ => {}
         }
-        // text entry into the selected field
-        if (sel == 0 || sel == 1) && !ch.is_empty() {
-            let c = ch.chars().next().unwrap_or(' ');
-            if c.is_ascii_graphic() {
-                let field = if sel == 0 { &mut self.save.name } else { &mut self.friend };
-                if field.len() < 16 {
-                    field.push(c);
-                }
-            }
-        }
     }
+
 
     /// Movement axis with the Wooting wind-in: full press = 1.0 and any press
     /// lands high (still snappy), but a feathered key trims the output — the
@@ -5985,22 +6025,28 @@ impl Game {
                     .collect();
                 hud::tweaks_menu(&mut ui, aspect, menu_title(menu), &trs, sel, self.mscroll.max(0.0) as usize, self.cursor, nav_here(menu));
             }
-            Mode::Online { sel } => {
-                let players: Vec<String> = std::iter::once(format!(
-                    "{} (YOU)",
-                    if self.save.name.is_empty() { "PILOT" } else { &self.save.name }
-                ))
-                .chain(self.net.peers().map(|p| p.name.clone()))
-                .collect();
-                let o = hud::OnlineUi {
-                    sel,
-                    name: &self.save.name,
-                    friend: &self.friend,
-                    status: if self.toast.is_empty() { &self.net.status } else { &self.toast },
-                    players,
-                    online: self.net.online(),
-                };
-                hud::online_menu(&mut ui, aspect, &o, self.time);
+            Mode::Online { .. } => {
+                // First live consumer of the shared menu draw path
+                // (menu::Menu → ui::menu_cmds → draw). The status line and
+                // players list stay as a bespoke footer under it — they're
+                // live data, not rows.
+                if let Some(m) = &self.online_menu {
+                    hud::draw_menu(&mut ui, aspect, m);
+                }
+                let status =
+                    if self.toast.is_empty() { &self.net.status } else { &self.toast };
+                hud::online_footer(
+                    &mut ui,
+                    aspect,
+                    status,
+                    &std::iter::once(format!(
+                        "{} (YOU)",
+                        if self.save.name.is_empty() { "PILOT" } else { &self.save.name }
+                    ))
+                    .chain(self.net.peers().map(|p| p.name.clone()))
+                    .collect::<Vec<_>>(),
+                    self.net.online(),
+                );
             }
         }
 
@@ -8011,5 +8057,14 @@ mod tweak_reach_tests {
                 menu_title(m)
             );
         }
+    }
+}
+
+
+/// Row-enable helper for the Online screen (menu::Menu has no setter; rows
+/// are public data).
+fn set_row_enabled(m: &mut menu::Menu, id: &str, on: bool) {
+    if let Some(r) = m.rows.iter_mut().find(|r| r.id == id) {
+        r.enabled = on;
     }
 }
