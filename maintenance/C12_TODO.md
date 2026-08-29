@@ -53,9 +53,15 @@ sibling at all: they are glam-only, so nothing this line did can reach them.
   Rotation is what would actually fit a wing inside a silhouette, and
   that is a different operation on a different data model.
   **C12-1a is fully closed.**
-- **C12-1b — turret: `the_whole_turret_follows_the_barrel`** — "the hull was
-  swept into the turret: fittings: 4 turret prims (ring 0.00,0.10,0.23), 2
-  tread prims". The ring test is admitting hull prims. `read`.
+- **C12-1b — CLOSED (`4b1d7abf`).** The seed pass was right; the GROW
+  pass admitted the hull through two loose guards, and the barrel broke
+  both. `high_enough` compared the part's TOP against the turret base,
+  which a 0.05 sliver of hull roof passes — now compares its centre.
+  `big` compared longest-axis to longest-axis, and a barrel is long by
+  design: it stretched the seed to 3.40, making the limit 6.80, under
+  which a 4.80 hull is "not big" — now compares against the turret's x/z
+  FOOTPRINT, since length is the barrel's business and letting it set
+  the scale is what made a tank hull look like a cupola.
 - **C12-1c — CLOSED (`e7611ad8`), two separate bugs.** The recorded lead
   ("the identical number") was the right thread and the diagnosis it
   suggested was wrong: wing area WAS reaching the stall term. Mass came
