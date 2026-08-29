@@ -36,7 +36,7 @@
 //! `Skeleton::report` prints what was decided so it can be judged on real
 //! assets rather than argued about.
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
 /// One connected group: a core, or something hanging off it.
 #[derive(Clone, Debug)]
@@ -444,6 +444,77 @@ pub fn compact(sk: &Skeleton, prim_count: usize, factor: f32) -> Vec<Vec3> {
 /// The envelope is the CORE's box rather than the whole body's, because
 /// the whole body's box is exactly the thing the appendages defined: using
 /// it would contain nothing.
+/// FOLD a limb toward the body by HINGING it at its root, which is the
+/// thing `contain` cannot do.
+///
+/// `contain` translates, and translation cannot make an oversized limb
+/// fit: a 5.2 m wing does not go inside a 1.25 m envelope by sliding,
+/// only by swinging. Real transforming vehicles agree — swing-wings
+/// hinge, undercarriage retracts on an arm, a robot's forearm folds at
+/// the elbow. Nothing was rotating anywhere in this codebase's fold path,
+/// so a "vehicle mode" was a body with its limbs shoved as far inboard as
+/// translation allowed and still sticking out.
+///
+/// Returns a per-limb rotation about `root`, as an axis-angle `Quat`, at
+/// fold parameter `t` (0 = robot/extended, 1 = vehicle/stowed). The
+/// caller applies it to that limb's prims — this returns the transform
+/// rather than moving points, so the same answer drives the renderer, a
+/// collision rebuild and a test without three copies of the arithmetic.
+///
+/// The hinge axis is the limb's own reach crossed with the body's up:
+/// a wing sticking out sideways swings BACKWARD (its axis is vertical),
+/// a leg hanging down swings UP AND FORWARD. That falls out of the
+/// geometry rather than needing a per-part authored axis, which matters
+/// because these skeletons are DERIVED from arbitrary meshes and nobody
+/// is there to author one.
+pub fn fold_rotation(limb: &Limb, up: Vec3, t: f32) -> Quat {
+    let reach = limb.tip - limb.root;
+    let len = reach.length();
+    if len < 1e-4 {
+        return Quat::IDENTITY; // a limb with no extent has nothing to swing
+    }
+    let dir = reach / len;
+    let up = up.normalize_or(Vec3::Y);
+    // The axis is perpendicular to the limb AND TO WHERE IT IS GOING, not
+    // to the limb and up — that was the first version's mistake and it
+    // swung a sideways wing straight upward (measured: tip (5.2,0,0)
+    // landed at (0.6,4.6,0), a wing standing on end). A limb stows ALONG
+    // the body, so the destination is the body's long axis: the component
+    // of "not up" that the limb is not already using.
+    //
+    // `along` is the body direction most orthogonal to the limb, chosen
+    // from the two non-up axes so a wing (out along x) swings into z and a
+    // limb already along z swings into x. Deriving it beats authoring it:
+    // these skeletons come from arbitrary meshes with nobody to annotate
+    // them.
+    let cands = [Vec3::X, Vec3::Y, Vec3::Z];
+    let along = cands
+        .iter()
+        .copied()
+        .filter(|c| c.dot(up).abs() < 0.9) // not the up axis: stow flat, not vertical
+        .min_by(|a, b| dir.dot(*a).abs().partial_cmp(&dir.dot(*b).abs()).unwrap())
+        .unwrap_or(Vec3::Z);
+    let axis = {
+        let c = dir.cross(along);
+        // Limb already lying along its destination, or straight up a
+        // degenerate cross: any perpendicular will do, and picking one
+        // beats returning identity — the part most in need of stowing
+        // would otherwise be the one part that never moves.
+        if c.length() > 1e-3 { c.normalize() } else { dir.any_orthonormal_vector() }
+    };
+    // A quarter turn stows a limb alongside the body; that is the whole
+    // useful range, and going further swings it out the other side.
+    Quat::from_axis_angle(axis, t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2)
+}
+
+/// Where a point ends up after its limb folds — the caller-side half of
+/// [`fold_rotation`], kept here so the rotate-about-root convention lives
+/// in one place. Rotating about the ORIGIN instead is the obvious mistake
+/// and detaches the limb from the body.
+pub fn fold_point(p: Vec3, limb: &Limb, up: Vec3, t: f32) -> Vec3 {
+    limb.root + fold_rotation(limb, up, t) * (p - limb.root)
+}
+
 pub fn contain(sk: &Skeleton, prims: &[&[Vec3]], slack: f32) -> Vec<Vec3> {
     let mut out = vec![Vec3::ZERO; prims.len()];
     if sk.core_half.max_element() <= 1e-4 {
@@ -550,6 +621,95 @@ mod tests {
         let wing_before = centroid(&j[1]).length();
         let wing_after = centroid(&moved[1]).length();
         assert!(wing_after < wing_before, "the wing was pushed outward");
+    }
+
+    #[test]
+    fn a_hinged_wing_fits_where_a_slid_one_could_not() {
+        // The point of the whole thing. `contain` can only translate, and
+        // a 5.2-long wing cannot be translated inside a narrow envelope —
+        // the containment test had to be relaxed to "centred" for exactly
+        // this reason. Hinging it removes the excess instead of splitting
+        // it: a wing swung a quarter turn occupies its own LENGTH along
+        // the body rather than across it.
+        let limb = Limb {
+            prims: vec![1],
+            root: Vec3::new(0.6, 0.0, 0.0),
+            tip: Vec3::new(5.2, 0.0, 0.0),
+            reach: 4.6,
+        };
+        let tip_out = limb.tip;
+        let tip_folded = fold_point(tip_out, &limb, Vec3::Y, 1.0);
+        assert!(
+            tip_folded.x.abs() < tip_out.x.abs(),
+            "the wingtip did not come inboard: {tip_out:?} -> {tip_folded:?}"
+        );
+        // It swung about the vertical axis, so it moved in Z (along the
+        // body) and stayed level — a wing folding DOWN through the hull
+        // would be worse than not folding.
+        assert!(tip_folded.z.abs() > 1.0, "it did not swing back: {tip_folded:?}");
+        assert!(tip_folded.y.abs() < 1e-3, "it dropped out of plane: {tip_folded:?}");
+    }
+
+    #[test]
+    fn the_root_never_moves_and_t_zero_changes_nothing() {
+        // A fold that detaches the limb from the body is the obvious
+        // failure of rotating about the origin instead of the root.
+        let limb = Limb {
+            prims: vec![0],
+            root: Vec3::new(1.0, 2.0, 3.0),
+            tip: Vec3::new(1.0, 2.0, 8.0),
+            reach: 5.0,
+        };
+        for t in [0.0, 0.25, 0.5, 1.0] {
+            let r = fold_point(limb.root, &limb, Vec3::Y, t);
+            assert!((r - limb.root).length() < 1e-4, "the root moved at t={t}: {r:?}");
+        }
+        // Robot mode is the identity: nothing should shift before the
+        // transformation starts.
+        let p = Vec3::new(1.0, 2.0, 8.0);
+        assert!((fold_point(p, &limb, Vec3::Y, 0.0) - p).length() < 1e-4);
+    }
+
+    #[test]
+    fn folding_preserves_the_limb_length() {
+        // A hinge rotates; it does not stretch or crush. If this drifts,
+        // the fold is a scale in disguise and the model will visibly
+        // deform mid-transformation.
+        let limb = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::new(3.0, 1.0, 0.0),
+            reach: 3.16,
+        };
+        let before = (limb.tip - limb.root).length();
+        for t in [0.1, 0.5, 0.9, 1.0] {
+            let after = (fold_point(limb.tip, &limb, Vec3::Y, t) - limb.root).length();
+            assert!((after - before).abs() < 1e-3, "length drifted at t={t}: {before} -> {after}");
+        }
+    }
+
+    #[test]
+    fn a_limb_lying_along_up_still_folds() {
+        // A mast or a dorsal fin points the same way as `up`, so the
+        // obvious axis (reach x up) vanishes. Returning identity there
+        // would mean the one part most obviously in need of stowing is
+        // the one part that never moves.
+        let limb = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::new(0.0, 4.0, 0.0),
+            reach: 4.0,
+        };
+        let folded = fold_point(limb.tip, &limb, Vec3::Y, 1.0);
+        assert!(folded.y.abs() < 3.9, "the mast never came down: {folded:?}");
+        assert!((folded.length() - 4.0).abs() < 1e-3, "and it kept its length");
+    }
+
+    #[test]
+    fn a_degenerate_limb_is_not_a_panic() {
+        let limb = Limb { prims: vec![], root: Vec3::ONE, tip: Vec3::ONE, reach: 0.0 };
+        assert_eq!(fold_rotation(&limb, Vec3::Y, 1.0), Quat::IDENTITY);
+        assert!((fold_point(Vec3::ONE, &limb, Vec3::Y, 1.0) - Vec3::ONE).length() < 1e-4);
     }
 
     #[test]
