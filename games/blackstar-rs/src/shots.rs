@@ -33,6 +33,10 @@ use crate::weapons::Element;
 const SLUG: (f32, f32, f32) = (0.02, 3.0e-4, 0.30);
 /// A launched charge: heavier, blunter, draggier. GUESS.
 const ROCKET: (f32, f32, f32) = (1.2, 8.0e-3, 0.50);
+/// How long a rocket motor burns, in seconds. Its flight distance is this
+/// times its speed — a separate question from its blast radius, which is
+/// what `ballistics::range_m` answers for a Blast.
+const ROCKET_BURN_S: f32 = 8.0;
 /// A missile's turn budget, m/s² lateral. GUESS sized so a crossing car is
 /// catchable and a jinking one is work.
 const TURN: f32 = 60.0;
@@ -97,7 +101,24 @@ impl Shots {
             _ => SLUG,
         };
         let spec = ballistics::Shot { delivery, speed_ms: speed.max(1.0), mass_kg, area_m2, cd };
-        let range = ballistics::range_m(&spec, amb).max(30.0);
+        // HOW FAR IT FLIES, not how far it hurts. `ballistics::range_m`
+        // answers "where has the shot lost most of what it had" — and for
+        // a BLAST that is the medium's ability to carry a pressure wave,
+        // i.e. the damage radius, about 12 m in air. Using it as the
+        // distance the projectile may travel killed every missile at 12 m:
+        // a rocket fired at a target 120 m away spent itself a tenth of
+        // the way there, which is "the missile spent itself without
+        // arriving".
+        //
+        // A guided rocket's flight distance is what its motor and its life
+        // give it, so that is what it gets: speed times burn time. The
+        // blast radius stays exactly what it was and is still what
+        // `falloff` reads — the two are different questions and this was
+        // one function answering both.
+        let range = match delivery {
+            Delivery::Blast => spec.speed_ms * ROCKET_BURN_S,
+            _ => ballistics::range_m(&spec, amb).max(30.0),
+        };
         self.live.push(Live {
             pos: origin,
             vel: aim.normalize_or(Vec3::NEG_Z) * spec.speed_ms,
