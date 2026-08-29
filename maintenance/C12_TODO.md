@@ -654,3 +654,57 @@ sandbox lacks by default — `apt-get install zstd` first).
   (`b507439b`). Two sessions tripping over the same rustdoc rule
   suggests a checker (scan doc comments for 4-space-indented blocks
   that are not fenced) rather than a third one-off fix.
+
+## 18. aperture: two review questions from the field
+
+Both arrived as `// KESS:` comments in a patch. One was a correct
+criticism of code I wrote and is fixed; one is a design idea worth more
+than a quick implementation.
+
+**C12-18a — `LineMap::rebuild`, "why is this the architecture?" —
+answered, and the answer was "it shouldn't be" (`0b161972`+).** It was
+called from `after_edit`, i.e. every keystroke, and did a full O(lines)
+rebuild that allocated twice over: a `Vec<String>` of every line at the
+call site, plus a `HashMap<u64, String>` entry per distinct line so
+`diff` could return vanished TEXT. Nothing downstream needed the text —
+the cache invalidates by line identity and identity is the hash.
+Now: `LineMap` is hashes only; `diff` returns `Vec<u64>`; entries
+record their own line hashes once at insert so invalidation is a
+binary-search intersection rather than `prefix.contains(text)` per
+entry per vanished line (which was O(entries x gone x prefix_len) on
+every edit); and the map is rebuilt in place through a swapped scratch
+buffer so a steady edit loop stops allocating for the hash side
+entirely. Same behaviour, 64/64 still green.
+
+**C12-18b — the word-graph typing buffer. NOT started, and deliberately
+not rushed.** The idea: build a graph from model output tokens and let
+a person assemble words from it via home-row chords (`aoeu`/`htns`),
+splitting by space and by syllable, seeded from surrounding lines and
+compiler errors so the buffer is useful immediately and gets better as
+AI tokens arrive. Ordering free-form, so you type the words you want in
+the order you want them.
+
+Why it is worth recording rather than half-building: this is not an
+autocomplete variant, it is a different INPUT METHOD, and the hard part
+is not the graph — it is the ordering/coherence tradeoff named in the
+proposal (maximise words-per-keystroke without the result drifting into
+incoherence). That needs a real corpus to tune against and a way to
+measure keystrokes-saved, neither of which exists here yet. The pieces
+that would feed it DO exist now: `prefixcache` already holds prior
+completions, `scope::QuickContext` already extracts surrounding
+identifiers, and `kvplan::order_for_kv` is the batching seam for
+sampling several continuations cheaply.
+
+Related and smaller, from the same comment: **"can we make this
+threaded for smaller models?"** — `route_ai`'s summary path is
+single-flight per key today. Threading it is genuinely easy (the store
+is already behind a lock and requests are idempotent per key) and the
+win is real on small models where several short prompts beat one long
+one. Worth doing before the graph, as it is the same batching the graph
+would need.
+
+**C12-18c — `route_prompt` has no example in it.** Correct: it tells
+the model the output format in prose and shows nothing. Small models
+follow a demonstrated format far more reliably than a described one.
+The fix is a one-shot example in the prompt — cheap, and the kind of
+thing that changes whether a 3B model is usable at all. Not done.

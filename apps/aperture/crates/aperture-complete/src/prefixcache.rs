@@ -86,6 +86,11 @@ pub struct Entry {
     /// baffling bug, and the string is already in memory.
     pub prefix: String,
     pub completion: String,
+    /// Hashes of the lines this prefix is built from, computed ONCE here
+    /// rather than re-derived by substring search at every edit. Sorted,
+    /// so invalidation is a merge against the (also sorted) gone-set
+    /// instead of `prefix.contains(text)` per entry per vanished line.
+    lines: Vec<u64>,
     /// Monotonic counter, for eviction. Not a clock: this crate is pure
     /// and a wall clock would make its tests time-dependent.
     pub stamp: u64,
@@ -151,9 +156,17 @@ impl PrefixCache {
         if self.entries.contains_key(&key) {
             self.order.retain(|k| k != &key);
         }
+        let mut lines: Vec<u64> = prefix.lines().map(hash64).collect();
+        lines.sort_unstable();
+        lines.dedup();
         self.entries.insert(
             key.clone(),
-            Entry { prefix: prefix.to_string(), completion: completion.to_string(), stamp },
+            Entry {
+                prefix: prefix.to_string(),
+                completion: completion.to_string(),
+                stamp,
+                lines,
+            },
         );
         self.order.push(key);
         while self.order.len() > self.cap {
@@ -239,13 +252,26 @@ impl PrefixCache {
     /// identity — see [`LineMap::diff`]. An entry survives when the edit
     /// happened somewhere its prefix never covered.
     pub fn invalidate_containing(&mut self, gone: &[String]) {
+        let hashes: Vec<u64> = gone
+            .iter()
+            .filter(|g| !g.trim().is_empty())
+            .map(|g| hash64(g))
+            .collect();
+        self.invalidate_line_hashes(&hashes);
+    }
+
+    /// The same thing keyed on hashes, which is what callers actually
+    /// have: an edit knows which line CONTENTS vanished, and hashing them
+    /// once is cheaper than handing every entry a string to substring-scan
+    /// for. Old shape kept above for callers that hold texts.
+    pub fn invalidate_line_hashes(&mut self, gone: &[u64]) {
         if gone.is_empty() {
             return;
         }
         let doomed: Vec<Key> = self
             .entries
             .iter()
-            .filter(|(_, e)| gone.iter().any(|g| !g.trim().is_empty() && e.prefix.contains(g.as_str())))
+            .filter(|(_, e)| gone.iter().any(|g| e.lines.binary_search(g).is_ok()))
             .map(|(k, _)| k.clone())
             .collect();
         for k in doomed {
@@ -262,10 +288,17 @@ impl PrefixCache {
 /// everything below it, which would invalidate the whole file if entries
 /// were keyed on position. Keyed on content, an entry computed from an
 /// untouched region stays valid no matter how far it moved.
+/// HASHES ONLY — no line texts. The first version kept a
+/// `HashMap<u64, String>` of every distinct line so `diff` could return
+/// the vanished TEXT, and `rebuild` ran on every keystroke: an
+/// allocation per distinct line, per edit, for a file that is mostly
+/// unchanged. Nothing downstream actually needed the text — the cache
+/// invalidates by line identity, and identity is the hash. Dropping the
+/// map removes the per-edit allocation entirely and makes `diff` return
+/// what the caller can use directly.
 #[derive(Debug, Default, Clone)]
 pub struct LineMap {
     hashes: Vec<u64>,
-    texts: HashMap<u64, String>,
 }
 
 impl LineMap {
@@ -279,13 +312,23 @@ impl LineMap {
         m
     }
 
+    /// Reuses the existing allocation (`clear` keeps capacity), so a
+    /// steady-state edit loop on one file stops allocating entirely
+    /// after the first pass.
     pub fn rebuild<'a>(&mut self, lines: impl Iterator<Item = &'a str>) {
         self.hashes.clear();
-        self.texts.clear();
-        for l in lines {
-            let h = hash64(l);
-            self.hashes.push(h);
-            self.texts.entry(h).or_insert_with(|| l.to_string());
+        self.hashes.extend(lines.map(hash64));
+    }
+
+    /// Rebuild from an indexed line source without the caller having to
+    /// materialise a Vec of every line first. `get` returns anything that
+    /// derefs to `str`, so a rope's `Cow` passes through untouched when
+    /// it happens to be borrowed.
+    pub fn rebuild_from<S: AsRef<str>>(&mut self, n_lines: usize, get: impl Fn(usize) -> S) {
+        self.hashes.clear();
+        self.hashes.reserve(n_lines);
+        for i in 0..n_lines {
+            self.hashes.push(hash64(get(i).as_ref()));
         }
     }
 
@@ -309,22 +352,16 @@ impl LineMap {
     /// removed anywhere in the file, which in real code is constantly.
     /// Caught by its own test rather than reasoned about: the first
     /// version compared counts and was wrong for exactly this case.
-    pub fn diff(&self, next: &LineMap) -> Vec<String> {
-        let mut still: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for h in &next.hashes {
-            still.insert(*h);
-        }
-        let mut gone = Vec::new();
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for h in &self.hashes {
-            if still.contains(h) || !seen.insert(*h) {
-                continue;
-            }
-            if let Some(t) = self.texts.get(h) {
-                gone.push(t.clone());
-            }
-        }
-        gone.sort();
+    pub fn diff(&self, next: &LineMap) -> Vec<u64> {
+        let still: std::collections::HashSet<u64> = next.hashes.iter().copied().collect();
+        let mut gone: Vec<u64> = self
+            .hashes
+            .iter()
+            .copied()
+            .filter(|h| !still.contains(h))
+            .collect();
+        gone.sort_unstable();
+        gone.dedup();
         gone
     }
 }
@@ -453,12 +490,12 @@ mod tests {
         let before = LineMap::from_lines(["fn a() {}", "fn doomed() {}", "fn b() {}"].into_iter());
         let after = LineMap::from_lines(["fn a() {}", "fn b() {}"].into_iter());
         let gone = before.diff(&after);
-        assert_eq!(gone, vec!["fn doomed() {}"], "only the line that truly left");
+        assert_eq!(gone, vec![super::hash64("fn doomed() {}")], "only the line that truly left");
 
         let mut k = c();
         k.insert("fn a() {}\nfn doomed() {}\n", "rust", "X");
         k.insert("fn a() {}\n", "rust", "Y");
-        k.invalidate_containing(&gone);
+        k.invalidate_line_hashes(&gone);
         assert!(k.peek("fn a() {}\nfn doomed() {}\n", "rust").is_none(), "contained the dead line");
         assert!(k.peek("fn a() {}\n", "rust").is_some(), "untouched region survives the renumber");
     }
@@ -469,7 +506,7 @@ mod tests {
         // on content, nothing else is considered lost.
         let before = LineMap::from_lines(["one", "two", "three"].into_iter());
         let after = LineMap::from_lines(["two", "three"].into_iter());
-        assert_eq!(before.diff(&after), vec!["one"]);
+        assert_eq!(before.diff(&after), vec![super::hash64("one")]);
     }
 
     #[test]
@@ -482,6 +519,6 @@ mod tests {
         assert!(before.diff(&after).is_empty(), "one copy remains, so the text is not gone");
 
         let all_gone = LineMap::from_lines(["y"].into_iter());
-        assert_eq!(before.diff(&all_gone), vec!["x"]);
+        assert_eq!(before.diff(&all_gone), vec![super::hash64("x")]);
     }
 }

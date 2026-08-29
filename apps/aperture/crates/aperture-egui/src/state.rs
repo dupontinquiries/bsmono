@@ -389,6 +389,9 @@ pub struct AppState {
     /// Line identities as of the last edit, for deciding which cached
     /// entries an edit actually invalidated.
     line_map: aperture_complete::prefixcache::LineMap,
+    /// Swapped with `line_map` each edit so the Vec's capacity is reused
+    /// instead of a fresh allocation per keystroke.
+    line_map_scratch: aperture_complete::prefixcache::LineMap,
     pub command_line: String,
 
     pub ghost_since: Option<u64>,
@@ -474,6 +477,7 @@ impl AppState {
             line_scope_lines: aperture_complete::scope::DEFAULT_LINE_COUNT,
             pending_prefix: None,
             line_map: aperture_complete::prefixcache::LineMap::new(),
+            line_map_scratch: aperture_complete::prefixcache::LineMap::new(),
             command_line: String::new(),
             ghost_since: None,
             palette: None,
@@ -1527,18 +1531,22 @@ impl AppState {
     /// is still correct however far it moved. Only text that is now absent
     /// from the buffer entirely invalidates anything.
     fn invalidate_cache_for_edit(&mut self) {
-        let next = aperture_complete::prefixcache::LineMap::from_lines(
-            (0..self.editor.buffer.len_lines())
-                .map(|i| self.editor.buffer.line(i).into_owned())
-                .collect::<Vec<_>>()
-                .iter()
-                .map(|s| s.as_str()),
-        );
+        // Rebuild in place: `LineMap` keeps its Vec's capacity across
+        // clears, so a steady edit loop on one file stops allocating for
+        // the hash side entirely after the first pass. The per-line
+        // `into_owned()` remains — `Buffer::line` returns a Cow and a
+        // rope chunk boundary can force an owned String — but it is one
+        // short-lived allocation rather than the two (Vec<String> plus a
+        // per-distinct-line map entry) this used to do every keystroke.
+        let mut next = std::mem::take(&mut self.line_map_scratch);
+        next.rebuild_from(self.editor.buffer.len_lines(), |i| self.editor.buffer.line(i));
         if !self.line_map.is_empty() {
             let gone = self.line_map.diff(&next);
-            self.prefix_cache.invalidate_containing(&gone);
+            self.prefix_cache.invalidate_line_hashes(&gone);
         }
-        self.line_map = next;
+        // Swap rather than assign: the OLD map's allocation becomes next
+        // frame's scratch instead of being dropped and re-made.
+        self.line_map_scratch = std::mem::replace(&mut self.line_map, next);
     }
 
     fn arm_completion(&mut self, now_ms: u64) {
