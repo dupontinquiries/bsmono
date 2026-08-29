@@ -11952,3 +11952,11 @@ Tests: cadence parity vs due(); the clone-free proof (same Arc pointer + same st
 effective version advances; non-transitioning chunks report base verbatim). chunk_manager 32/0; fullgame gate clean;
 90 s in-world soak exit 0 / zero panics. NOTE: full shader-side animation (mesh once at to_stage, progress in the
 vertex shader) remains the deeper end-state — this lands the scheduling half without touching geometry emission.
+
+## r600 — SOAK-WITH-MOVEMENT: autoplay walks a spiral
+Under UNENDLICH_AUTOPLAY, once InGame (and not paused), a steady forward push + slow yaw drift (~14°/s) is injected at
+the SAME seam keyboard input lands — everything downstream (controller, physics body, streaming, eviction, foliage
+disturbance, creature encounters) is the real player path under real motion, not a parallel one. 150 s soak: exit 0,
+zero panics; ecosystem anchor crossed chunk boundaries (0,0)→(-1,0)→(0,0) proving the walk; armed NaN traps unchanged
+(the wild coord remains a title-screen, pre-autoplay event). Movement soaks are now the default deepest rung of the
+in-sandbox ladder: unit suite → GPU probe → title soak → in-world soak → MOVING in-world soak.

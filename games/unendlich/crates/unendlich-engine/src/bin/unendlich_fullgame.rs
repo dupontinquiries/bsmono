@@ -7069,6 +7069,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         if bindings.is_action_pressed(GameAction::MoveRight, &input)    { move_local.z += 1.0; }
         if bindings.is_action_pressed(GameAction::MoveLeft, &input)     { move_local.z -= 1.0; }
 
+        // r600 (soak-with-movement): under UNENDLICH_AUTOPLAY, once in-world,
+        // walk. A steady forward push with a slow yaw drift traces a wide
+        // spiral: chunk streaming, eviction, physics, foliage disturbance and
+        // creature encounters all run under real motion instead of a
+        // statue-at-spawn. Injected at the SAME seam keyboard input lands, so
+        // everything downstream is the player path, not a parallel one.
+        if fg_autoplay && matches!(fg_app.state(), unendlich_engine::sim::game_flow::AppState::InGame)
+            && !game_paused
+        {
+            move_local.x += 1.0; // forward
+            local_player.view.yaw += 0.25 * dt; // ~14°/s — a lazy arc
+        }
+
         match body.as_mut() {
             None => {
                 // Fly mode: direct camera control, no physics. The Jump and
