@@ -176,12 +176,33 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                 if s.mp_list.is_empty() {
                     ui.weak("(searching… none found yet)");
                 } else {
-                    for (i, label) in s.mp_list.iter().enumerate() {
-                        // click a host → bin sends a JOIN to its candidate
-                        if dest_button(ui, label) {
-                            out.mp_pick = i as i32;
-                        }
-                    }
+                    // Snapshot-loop finding: without a scroll window, every
+                    // discovered host grew the window taller — a LAN party's
+                    // worth of hosts walked the menu off the screen. Same
+                    // treatment as the world list.
+                    egui::ScrollArea::vertical()
+                        .id_salt("mp_host_scroll")
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for (i, label) in s.mp_list.iter().enumerate() {
+                                // Snapshot-loop finding: the full advert label
+                                // ("name — world (seed) @ ip:port") overflows
+                                // the letterspaced caps button. The human part
+                                // rides the button; the address sits small
+                                // beneath it. Click = join, either way.
+                                let (head, addr) = match label.split_once(" @ ") {
+                                    Some((h, a)) => (h, Some(a)),
+                                    None => (label.as_str(), None),
+                                };
+                                if dest_button(ui, head) {
+                                    out.mp_pick = i as i32;
+                                }
+                                if let Some(a) = addr {
+                                    ui.weak(a);
+                                }
+                                ui.add_space(2.0);
+                            }
+                        });
                 }
                 ui.add_space(8.0);
                 if dest_button(ui, "Back") {
@@ -390,8 +411,26 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
 mod tests {
     use super::*;
 
-    fn run_screen(kind: u8, lists: (&[String], &[String], &[String])) -> egui::FullOutput {
+    /// A headless Context with the kit fonts bound when the kit is compiled
+    /// in — every test draws through it, so the SAME test bodies cover both
+    /// the plain-egui fallback build and the real art-style build. (Without
+    /// the install, any blocks_font label panics — the exact hazard the
+    /// snapshot loop caught on its first kit run.)
+    fn test_ctx() -> egui::Context {
         let ctx = egui::Context::default();
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::menu::install_fonts(
+            &ctx,
+            include_bytes!("../../../../docs/design/UnendlichBlocks-Regular.ttf"),
+            include_bytes!("../../../../docs/design/UnendlichGlyphs-Regular.ttf"),
+        );
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(&ctx, unendlich_ui::Theme::DARK);
+        ctx
+    }
+
+    fn run_screen(kind: u8, lists: (&[String], &[String], &[String])) -> egui::FullOutput {
+        let ctx = test_ctx();
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
@@ -439,11 +478,50 @@ mod tests {
         }
     }
 
+    /// ART-STYLE REGRESSION GUARD (kit path). With the unendlich-ui feature,
+    /// the menu must draw through the REAL art — blocks font, destiny
+    /// buttons, theme accent — on a headless Context with the theme applied,
+    /// exactly as the renderer applies it. A missing font registration or a
+    /// broken kit call panics or draws nothing here BEFORE it ships blank
+    /// in-game. (The plain-egui fallback is covered by the tests above; this
+    /// one exists so the reingest can't silently lose the style.)
+    #[cfg(feature = "unendlich-ui")]
+    #[test]
+    fn kit_path_draws_the_real_art_headless() {
+        let ctx = test_ctx(); // fonts + theme bound, as EguiOverlay::new does in-game
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(720.0, 520.0),
+        ));
+        let worlds = vec!["Vale  ·  seed 7".to_string()];
+        for kind in [0u8, 1, 2, 3, 4] {
+            let out = ctx.run(input.clone(), |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    let s = LiveMenuState {
+                        screen_kind: kind,
+                        mp_list: &worlds,
+                        world_list: &worlds,
+                        rollback_list: &worlds,
+                        show_rollbacks: kind == 3,
+                        world_delete_ask: -1,
+                        dev_mode: false,
+                    };
+                    let _ = live_menu_body(ui, &s);
+                });
+            });
+            assert!(
+                !out.shapes.is_empty(),
+                "kit-styled screen kind {kind} drew nothing"
+            );
+        }
+    }
+
     /// The delete-ask index is bounds-checked against the CURRENT list — a
     /// stale index (world deleted, list shrank) must not panic.
     #[test]
     fn a_stale_delete_ask_index_is_ignored() {
-        let ctx = egui::Context::default();
+        let ctx = test_ctx();
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),

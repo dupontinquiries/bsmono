@@ -3384,14 +3384,9 @@ impl WorldRenderer {
             let mut wizard_preview_click_out: Option<(f32, f32, bool)> = None;
             let loading_fade = self.loading_fade;
             let loading_label = self.loading_label.clone();
-            // r187: destiny-esque menu button — full-width hit area, an
-            // accent bar that grows on hover (animate_bool), letterspaced
-            // caps. Kit v1; sounds + sweep shaders join at frosted.
-fn dest_button(ui: &mut egui::Ui, label: &str) -> bool {
-                // r317: the front/title menu uses the candidate button (style 1 default).
-                let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-                unendlich_ui::button_sized(ui, label, accent, egui::vec2(220.0, 34.0)).clicked()
-            }
+            // r187 destiny-esque menu button — MOVED to app::live_menu with
+            // the rest of the menu body (r-extract), so the in-game menu and
+            // the headless snapshot draw through literally one implementation.
             // r181: shared translucent window chrome ("glass" until the
             // frosted-blur PostFx pass lands).
             // r190: glass v2 — per-window open interpolation (margin grows

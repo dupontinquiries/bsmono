@@ -11,8 +11,8 @@ use egui::{Color32, Context, ImageData, RawInput, Rect, TextureId};
 use unendlich_engine::sim::menu_controller::MenuController;
 use unendlich_engine::sim::title_flow::MenuId;
 
-const W: usize = 720;
-const H: usize = 520;
+const W: usize = 960;
+const H: usize = 720;
 const PPP: f32 = 3.0; // supersample: lay out in points, rasterize at 3x for crisp text
 
 fn main() {
@@ -53,6 +53,12 @@ fn main() {
 fn render_live(kind: u8, mp: &[String], worlds: &[String], rb: &[String], out: &str) {
     use unendlich_engine::app::live_menu::{live_menu_body, LiveMenuState};
     render_with(out, |c| {
+        // With the kit compiled in, photograph the REAL art style — theme +
+        // fonts applied exactly as the renderer applies them. Build with
+        //   cargo run --example menu_snapshot --features egui,unendlich-ui
+        // for kit shots; plain `egui` gives structural (fallback) shots.
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
         egui::CentralPanel::default().show(c, |ui| {
             let s = LiveMenuState {
                 screen_kind: kind,
@@ -76,6 +82,17 @@ fn render(menu: &MenuController, out: &str) {
 
 fn render_with(out: &str, draw: impl Fn(&Context)) {
     let ctx = Context::default();
+    // Mirror EguiOverlay::new: the blocky/glyph fonts must be REGISTERED on
+    // the context or every blocks_font label panics ("blocks is not bound").
+    // In-game the overlay installs them at init; headless we do it here. This
+    // is the art-style reingest hazard in one line — the body and its fonts
+    // must travel together.
+    #[cfg(feature = "unendlich-ui")]
+    unendlich_ui::menu::install_fonts(
+        &ctx,
+        include_bytes!("../../../docs/design/UnendlichBlocks-Regular.ttf"),
+        include_bytes!("../../../docs/design/UnendlichGlyphs-Regular.ttf"),
+    );
     ctx.set_pixels_per_point(PPP);
     let mut input = RawInput::default();
     input.screen_rect = Some(Rect::from_min_size(
