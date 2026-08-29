@@ -98,8 +98,42 @@ impl Profile {
             // what the interior needs at this station
             for c in cells {
                 if (z - c.centre.z).abs() <= c.half.z + station_gap_half {
-                    a[i] = a[i].max(c.centre.x.abs() + c.half.x + PLATE);
-                    b[i] = b[i].max(c.centre.y.abs() + c.half.y + PLATE);
+                    // THE DIAGONAL. Sizing each axis to its own extent is
+                    // correct for a RECTANGLE and wrong for a superellipse:
+                    // `|x/a|^N + |y/b|^N <= 1` is not satisfied at the
+                    // corner just because it is satisfied at (x,0) and
+                    // (0,y). At N=3 a room filling both half-extents sits
+                    // ~3.5% outside the skin that exactly meets each axis —
+                    // which is precisely how `bridge` escaped a hull it had
+                    // just been fitted to, on the two corners at max-x AND
+                    // max-y together (the four z-face corners were all
+                    // comfortably inside, which is why axis-wise fitting
+                    // looked right).
+                    //
+                    // Fix: size the axes as before, then scale BOTH by the
+                    // corner's own superelliptic radius, so the corner
+                    // lands on the skin rather than through it.
+                    let need_a = c.centre.x.abs() + c.half.x + PLATE;
+                    let need_b = c.centre.y.abs() + c.half.y + PLATE;
+                    // A corner at (need_a, need_b) against axes sized
+                    // exactly (need_a, need_b) has superelliptic radius
+                    // (1^N + 1^N)^(1/N) = 2^(1/N). Scaling both axes by
+                    // that puts the corner exactly ON the skin; the
+                    // `.max` against the running value keeps the widest
+                    // room at this station winning, as before.
+                    // Scale by the corner's radius against the CURRENT
+                    // candidate axes, not by the worst case 2^(1/N): a
+                    // room that is wide but short does not need the tall
+                    // axis inflated. Start from the axis-wise requirement
+                    // and grow only until this room's own corner is on
+                    // the skin.
+                    let (ca, cb) = (a[i].max(need_a), b[i].max(need_b));
+                    let r = ((need_a / ca.max(1e-3)).powf(N)
+                        + (need_b / cb.max(1e-3)).powf(N))
+                    .powf(1.0 / N)
+                    .max(1.0);
+                    a[i] = ca * r;
+                    b[i] = cb * r;
                     has_room[i] = true;
                 }
             }
@@ -295,3 +329,4 @@ mod tests {
         }
     }
 }
+
