@@ -1334,5 +1334,31 @@ screen, and it was the one that reaches the others.
   - `previewPanel` gives 19 elements and nests correctly, which is the
     control showing the slicing works.
 
-  STILL TO AUDIT: the graph surfaces (`vSysGraph`, `sysGraphTab`) and
-  `fsResultsPanel`, plus confirming the web/browser direction above.
+- **C12-29d — the graph audit is done, and it inverts the assumption.**
+  `vSysGraph` and `sysGraphTab` turned out to be tab BUTTONS (2 and 4
+  elements). The real surface is `graphRoot` (L25469): an Item sized
+  from `cardsCanvas`'s bounds with a Repeater of node cards — so edges
+  are canvas-drawn and nodes are elements, and the whole QML graph is
+  4 visual elements.
+
+  The egui side is `graph_view` (323) + `layered_graph` (384) +
+  `connections_graph` (317), and `layered_graph` does layered assignment,
+  back-edge detection, barycentre/median ordering and CROSSING
+  MINIMISATION. main.qml contains no equivalent — grepping it for
+  layer/crossing/sweep/barycentre near "graph" returns zero. The egui
+  graph is substantially AHEAD of the QML, not behind it.
+
+  **Conclusion for §29 as a whole.** Of the four areas asked about:
+  settings was genuinely missing and is now ported; the terminal is
+  canvas-drawn and has no element tree to port; the web page was
+  DELETED from the QML in v0.1.839; and the graph is more capable in
+  egui than in Qt. Only settings was a port gap. The other three are
+  cases where "faithful port" is the wrong frame — two because there is
+  nothing to be faithful TO, one because faithfulness would be a
+  downgrade.
+
+  These five surfaces carry 65 tests between them (term_grid 16,
+  connections_graph 15, browser 13, layered_graph 13, graph_view 8), so
+  they are built rather than stubbed. That is worth stating because the
+  earlier audits established that substance is not coverage — here it
+  turns out to be, and saying so is the point of having checked.
