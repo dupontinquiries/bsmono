@@ -125,10 +125,30 @@ a second destination (drum rack vs. timeline+video track)," not "build a
 new library UI." `studio-video`/`studio-collab` already exist as the
 decode/asset side; nothing wires them into `library.rs`'s add-flow yet.
 
-- **C12-6a** — not started. Needs reading `library.rs`'s current add-to-
-  rack flow before touching it, so the video path reuses the same asset
-  registration (`register_asset`, the pattern `morph_pad`/`voice.rs`
-  already use) instead of inventing a second one.
+- **C12-6a — READ, and the gap is much narrower than this section
+  assumed.** Nothing needs building from scratch; the video path is
+  three-quarters wired already:
+  - `library::Media` has a `Video` variant, `media_of` classifies by
+    `VIDEO_EXTS`, and `Focus::rank` deliberately ranks video FIRST on
+    the Timeline focus and merely deprioritises (never hides) it in the
+    Rack — with a comment explaining why refusing a video's audio to a
+    sampler would be the tool overruling the musician.
+  - `LibraryAction::ToTimeline` already exists and the sidebar already
+    emits it for a video entry.
+  - `studio_core::Source` already carries `has_video: bool`.
+  What is missing is the JOIN: the `ToTimeline` handler decodes with
+  `studio_media::decode_bytes` and constructs its `Source` with
+  `has_video: false` hard-coded at every call site in `studio-app`
+  (lib.rs:341, 1162, 1211, 2446). `has_video: true` appears only in
+  tests and in `studio-engine`'s device fixture. So a video dropped on
+  the timeline today becomes an audio-only source and the video half is
+  silently dropped on the floor.
+  The honest fix is small — set `has_video` from the entry's `Media`
+  when importing, and give the timeline a video track to put it on —
+  but it should NOT be done until there is something that can decode
+  and display a frame, or it just moves the silent drop one layer
+  later. That is §13's av1/fao-codec item, which is the real blocker
+  and is still not started.
 
 ## 7. aperture / aperture-view: a semantic-navigation and marker system
 
