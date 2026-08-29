@@ -74,14 +74,21 @@ fn quad(ui: &mut Vec<UiVert>, x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 4]) {
     ui.extend_from_slice(&[v(x0, y0), v(x1, y0), v(x1, y1), v(x0, y0), v(x1, y1), v(x0, y1)]);
 }
 
-const INK: [f32; 4] = [0.10, 0.09, 0.13, 0.85];
-const PAPER: [f32; 4] = [1.0, 0.98, 0.94, 0.95];
-const GOLD: [f32; 4] = [1.0, 0.84, 0.30, 0.95];
-const DIM: [f32; 4] = [1.0, 0.98, 0.94, 0.55];
-const SEL: [f32; 4] = [0.17, 0.21, 0.25, 0.92]; // soldier's button fill
-const CYAN: [f32; 4] = [0.59, 0.82, 0.92, 0.95];  // soldier's info color
-const WARN: [f32; 4] = [1.0, 0.35, 0.30, 0.95];
-const SHADOW: [f32; 4] = [0.02, 0.02, 0.05, 0.75];
+// ── THEME: "neon glass" — cyberpunk × unendlich (operator-directed mix) ──
+// The custom blackstar art style arrives later; until then, unendlich's
+// frosted-glass language (deep blue-glass panels, ice text, the #6fc3ff
+// accent) crossed with cyberpunk neon (electric amber for the pick, hot
+// magenta for warnings, harder darks). One palette block so every screen
+// — pause, tweaks, maps, catalog, the shipboard consoles — shifts together
+// and cannot disagree with itself. Previous "warm paper" palette in git.
+const INK: [f32; 4] = [0.045, 0.060, 0.105, 0.88]; // deep glass backdrop
+const PAPER: [f32; 4] = [0.874, 0.902, 0.957, 0.97]; // unendlich ice text (223,230,244)
+const GOLD: [f32; 4] = [1.0, 0.80, 0.22, 0.97]; // electric amber — the pick
+const DIM: [f32; 4] = [0.72, 0.77, 0.86, 0.55]; // ice text, faded
+const SEL: [f32; 4] = [0.24, 0.35, 0.53, 0.62]; // unendlich glass-blue button fill
+const CYAN: [f32; 4] = [0.435, 0.765, 1.0, 0.97]; // the unendlich accent, #6fc3ff
+const WARN: [f32; 4] = [1.0, 0.24, 0.55, 0.97]; // hot magenta — cyber warn
+const SHADOW: [f32; 4] = [0.01, 0.02, 0.05, 0.80];
 
 /// Drop-shadowed text: one dark offset copy under the real one.
 /// A filled circle in NDC (aspect-corrected), for the touch controls.
@@ -286,7 +293,7 @@ pub fn draw_deck(ui: &mut Vec<UiVert>, a: f32, v: &crate::deck::DeckView) {
 pub fn draw_menu(ui: &mut Vec<UiVert>, a: f32, m: &crate::menu::Menu) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.55]);
     let scr = ui_layout::Screen::new(a);
-    let cmds = ui_layout::menu_cmds(&scr, m, T_BODY, PAPER, DIM, [0.22, 0.34, 0.58, 0.55]);
+    let cmds = ui_layout::menu_cmds(&scr, m, T_BODY, PAPER, DIM, [0.27, 0.45, 0.66, 0.55]);
     draw_cmds(ui, a, &cmds);
 }
 
