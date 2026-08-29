@@ -1081,3 +1081,39 @@ recents populate themselves.
   matches `Semantics::command_id` on purpose, so
   `A11yScene::palette_matches` (§4c) could supply the strip's candidate
   list instead of a hand-kept table. Not wired.
+
+## 27. Qt -> egui porting: the middle artifact
+
+Screen-to-screen QML reading was tried and failed. The measurement says
+why: voiceterm's `main.qml` is 32,111 lines holding 1,364 visual
+elements. That is not a reading problem to push harder at — it is the
+wrong pathway.
+
+`maintenance/tools/qml_outline.py` makes it three steps:
+
+    QML  ->  outline (plaintext)  ->  egui code
+
+The middle artifact is the point. `apps/voiceterm/docs/QML_OUTLINE.txt`
+is 34,708 lines of QML across 8 files reduced to 1,551 lines of
+structure — holdable, reviewable by someone who knows what the screen
+should look like WITHOUT their reading QML, diffable when the QML
+changes, and auditable against a finished port.
+
+Sizes are CLASSIFIED, not computed, which is what makes it work offline:
+`fill` / `frac` / `fixed` / `expr` / `implicit`. Those five map onto
+egui directly (`available_width`, a proportion, a literal, needs-a-human,
+size-to-content) and none of them need a running Qt.
+
+- **C12-27a — the outline is generated, no port has used it yet.** The
+  next real test is picking one screen (ChatPanel is the smallest real
+  one at 19 elements) and porting FROM the outline rather than from the
+  QML, then diffing the result back against it.
+- **C12-27b — no `expr` review pass.** Elements whose size is an
+  arbitrary binding are marked `expr` and shown verbatim; those are
+  exactly the ones a port will get wrong silently. Counting and reading
+  them per screen is a small job that would de-risk the port.
+- **C12-27c — the harness is voiceterm-shaped.** `VISUAL` and `KEEP`
+  are lists chosen from what voiceterm uses. Another Qt app may use
+  elements not in `VISUAL` and they will be invisible in its outline,
+  which fails silently. A "what did I skip" report — unrecognised
+  capitalised element names with counts — would catch that.
