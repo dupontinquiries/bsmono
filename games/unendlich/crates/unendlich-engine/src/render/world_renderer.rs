@@ -77,6 +77,9 @@ fn tbtn(ui: &mut egui::Ui, label: &str) -> bool {
 // tbtn_sized moved to app::live_menu::pause_button with the pause body
 // (r-extract) — one implementation, drawn in-game and headless alike.
 
+// r330-items tooltip painter lives in app::live_menu (snapshotable +
+// tested like the rest of the menu bodies); the hover sites below call it.
+
 impl From<vk::Result> for WorldRenderError {
     fn from(r: vk::Result) -> Self { WorldRenderError::Vulkan(r) }
 }
@@ -4209,10 +4212,11 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 ui.horizontal(|ui| {
                                     ui.add_enabled_ui(*can, |ui| {
                                         let b = ui.button(format!("  craft  {name}  "));
-                                        // r176: canonical tooltip (doc
-                                        // format: effects, italic lore,
-                                        // attribution) on hover.
-                                        let b = b.on_hover_text(tip.clone());
+                                        // r176 → r330 wiring: canonical tooltip,
+                                        // now COMPOSED (item_tooltip core) and
+                                        // painted with roles — strong title,
+                                        // italic lore — not one grey blob.
+                                        let b = b.on_hover_ui(|ui| crate::app::live_menu::item_tooltip_from_tip(ui, tip));
                                         if b.clicked() {
                                             craft_pick = (i + 1) as u8;
                                         }
@@ -5044,7 +5048,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                                     ui.add_enabled_ui(*can, |ui| {
                                                         if ui
                                                             .button(format!("craft  {name}"))
-                                                            .on_hover_text(tip.clone())
+                                                            .on_hover_ui(|ui| crate::app::live_menu::item_tooltip_from_tip(ui, tip))
                                                             .clicked()
                                                         {
                                                             craft_pick = (i + 1) as u8;

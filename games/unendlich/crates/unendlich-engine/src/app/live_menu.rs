@@ -145,6 +145,73 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
     }
 }
 
+/// r330-items wiring: rarity tier → title tint. Tier 0 stays body-colored;
+/// higher tiers use the familiar ramp. Saturates like `rarity_name`.
+pub fn rarity_color(tier: u8) -> egui::Color32 {
+    match tier {
+        0 => egui::Color32::from_rgb(0xdf, 0xe6, 0xf4), // common — ice body
+        1 => egui::Color32::from_rgb(0x7f, 0xd0, 0x8a), // uncommon — green
+        2 => egui::Color32::from_rgb(0x6f, 0xc3, 0xff), // rare — the accent blue
+        3 => egui::Color32::from_rgb(0xc0, 0x8a, 0xf0), // epic — violet
+        4 => egui::Color32::from_rgb(0xf0, 0xa8, 0x4a), // legendary — ember
+        _ => egui::Color32::from_rgb(0xf0, 0x6a, 0x8a), // mythic — rose
+    }
+}
+
+/// r330-items wiring: paint `item_tooltip::compose` lines with their roles —
+/// strong title, rarity-tinted subtitle, plain affixes, ITALIC lore, muted
+/// attribution — replacing the one flat grey `on_hover_text` blob (r176).
+pub fn item_tooltip_ui(ui: &mut egui::Ui, lines: &[crate::sim::item_tooltip::TooltipLine], tier: u8) {
+    use crate::sim::item_tooltip::{Emphasis, TooltipRole};
+    ui.set_max_width(260.0);
+    for l in lines {
+        if l.text.is_empty() {
+            ui.add_space(4.0); // the blank separator before lore
+            continue;
+        }
+        let mut t = egui::RichText::new(l.text.as_str());
+        t = match (l.role, l.emphasis) {
+            (TooltipRole::Title, Emphasis::Strong) => t.strong().size(15.0),
+            (TooltipRole::Title, _) => t.color(rarity_color(tier)).size(12.0),
+            (TooltipRole::Lore, _) => t.italics().weak(),
+            (TooltipRole::Flavor, _) => t.weak().size(11.0),
+            (TooltipRole::Affix, _) => t,
+        };
+        ui.label(t);
+    }
+}
+
+/// r330-items wiring: build the composed tooltip from the bin's canonical tip
+/// string ("Name\nEffect…\nLore" — `tip_for`) until items carry structured
+/// affix/rarity data (item_modifier is still unwired; rarity arrives with it).
+/// First line = title; last line (of ≥3) = lore; the middle = effect lines.
+pub fn item_tooltip_from_tip(ui: &mut egui::Ui, tip: &str) {
+    use crate::sim::item_tooltip::{compose, AffixView, ItemTooltipView};
+    let mut it = tip.split('\n');
+    let name = it.next().unwrap_or("");
+    let rest: Vec<&str> = it.collect();
+    let (effects, lore) = if rest.len() >= 2 {
+        (&rest[..rest.len() - 1], rest[rest.len() - 1])
+    } else {
+        (&rest[..], "")
+    };
+    let affixes: Vec<AffixView> =
+        effects.iter().map(|s| AffixView { label: s, magnitude: 0.0 }).collect();
+    let tier = 0u8; // crafted items carry no rarity yet — see item_modifier
+    let view = ItemTooltipView {
+        name,
+        rarity: tier,
+        kind_label: None,
+        slot_label: None,
+        affixes: &affixes,
+        lore,
+        attribution: None,
+        lore_cols: 34,
+    };
+    item_tooltip_ui(ui, &compose(&view), tier);
+}
+
+
 /// What the pause menu decided this frame. `pick` uses the bin's r167 codes:
 /// 0 nothing, 1 Resume, 2 Settings, 3 Save & Quit to Title.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -545,6 +612,41 @@ mod tests {
                 "screen kind {kind} produced no shapes — the menu did not draw"
             );
         }
+    }
+
+    /// The composed item tooltip paints every rarity tier headless — the
+    /// r330 wiring's guarantee (and the tip-string parser handles the
+    /// 2-line "no canonical entry" fallback without inventing lore).
+    #[test]
+    fn item_tooltips_paint_every_tier_and_the_short_tip() {
+        use crate::sim::item_tooltip::{compose, AffixView, ItemTooltipView};
+        let ctx = test_ctx();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(720.0, 520.0),
+        ));
+        let out = ctx.run(input, |c| {
+            egui::CentralPanel::default().show(c, |ui| {
+                for tier in 0u8..=5 {
+                    let affixes = [AffixView { label: "+1 test", magnitude: 1.0 }];
+                    let v = ItemTooltipView {
+                        name: "T",
+                        rarity: tier,
+                        kind_label: Some("Kind"),
+                        slot_label: None,
+                        affixes: &affixes,
+                        lore: "lore line",
+                        attribution: Some("— attr"),
+                        lore_cols: 20,
+                    };
+                    item_tooltip_ui(ui, &compose(&v), tier);
+                }
+                item_tooltip_from_tip(ui, "Greatsword\nHeavy two-hander\n3 ingots");
+                item_tooltip_from_tip(ui, "Crafted item\n(no canonical entry yet)");
+            });
+        });
+        assert!(!out.shapes.is_empty());
     }
 
     /// The pause menu draws headless with a default (no-click) outcome —

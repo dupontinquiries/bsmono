@@ -40,6 +40,7 @@ fn main() {
         "#3 · long travel · 21m ago · 30 chunks".to_string(),
     ];
     render_pause("/mnt/user-data/outputs/menu_live_pause.png");
+    render_tooltips("/mnt/user-data/outputs/menu_live_tooltips.png");
     for (kind, name) in [
         (0u8, "live_title"),
         (1, "live_confirm_quit"),
@@ -49,6 +50,47 @@ fn main() {
     ] {
         render_live(kind, &mp, &worlds, &rb, &format!("/mnt/user-data/outputs/menu_{name}.png"));
     }
+}
+
+fn render_tooltips(out: &str) {
+    use unendlich_engine::app::live_menu::{item_tooltip_from_tip, item_tooltip_ui, rarity_color};
+    use unendlich_engine::sim::item_tooltip::{compose, AffixView, ItemTooltipView};
+    let _ = rarity_color(0);
+    render_with(out, |c| {
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
+        egui::CentralPanel::default().show(c, |ui| {
+            ui.columns(2, |cols| {
+                // Left: the bin's canonical tip strings, composed + painted.
+                cols[0].strong("from tip_for strings");
+                cols[0].group(|ui| {
+                    item_tooltip_from_tip(ui, "Greatsword\nHeavy two-hander; big swing\n3 Iron Ingot + a plank handle");
+                });
+                cols[0].group(|ui| {
+                    item_tooltip_from_tip(ui, "Cooked Meat\nRaw meat seared over coal\nRestores far more than raw — and won't turn");
+                });
+                // Right: the full structured view (what item_modifier unlocks).
+                cols[1].strong("full view (future affixed item)");
+                let affixes = [
+                    AffixView { label: "+0.14 to effective S threshold", magnitude: 0.14 },
+                    AffixView { label: "+6% swing speed", magnitude: 0.06 },
+                ];
+                for tier in [1u8, 3, 5] {
+                    let view = ItemTooltipView {
+                        name: "Seismic Focus Stone",
+                        rarity: tier,
+                        kind_label: Some("Bending Instrument"),
+                        slot_label: Some("Off-hand"),
+                        affixes: &affixes,
+                        lore: "Hold it long enough and you feel the mountain's pulse answer yours.",
+                        attribution: Some("— Teaching inscription, Earthbound Dojo"),
+                        lore_cols: 34,
+                    };
+                    cols[1].group(|ui| item_tooltip_ui(ui, &compose(&view), tier));
+                }
+            });
+        });
+    });
 }
 
 fn render_pause(out: &str) {
