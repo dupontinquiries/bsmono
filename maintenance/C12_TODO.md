@@ -696,15 +696,26 @@ identifiers, and `kvplan::order_for_kv` is the batching seam for
 sampling several continuations cheaply.
 
 Related and smaller, from the same comment: **"can we make this
-threaded for smaller models?"** — `route_ai`'s summary path is
-single-flight per key today. Threading it is genuinely easy (the store
-is already behind a lock and requests are idempotent per key) and the
-win is real on small models where several short prompts beat one long
-one. Worth doing before the graph, as it is the same batching the graph
-would need.
+threaded for smaller models?" — half done, and the premise needed
+correcting.** I first wrote that `route_ai` was "single-flight per
+key". That was imprecise: requests are idempotent per key, but
+`pending` has always been a QUEUE holding many, so the queue was never
+the obstacle. What is single-file is the CALLER, which drains one per
+frame via `take_pending`. Added `take_pending_batch(n)` as the seam a
+threaded or batching worker actually needs (newest-first, since a query
+just typed outranks one already navigated past). Deliberately does NOT
+order for KV reuse itself — these prompts share a preamble but differ
+in their candidate listings, and the caller that knows which engine it
+feeds should run `kvplan::order_for_kv` over the batch; baking it in
+here would assume an engine this module cannot see. STILL TO DO: the
+caller in `state.rs` that would use it.
 
-**C12-18c — `route_prompt` has no example in it.** Correct: it tells
-the model the output format in prose and shows nothing. Small models
-follow a demonstrated format far more reliably than a described one.
-The fix is a one-shot example in the prompt — cheap, and the kind of
-thing that changes whether a 3B model is usable at all. Not done.
+**C12-18c — closed. `route_prompt` had no example in it.** Correct as
+reported: it described the output format in prose and showed nothing,
+and small models follow a shown format far more reliably. Added a
+one-shot example, with the two properties that keep a demonstration
+from becoming a trap: it uses a visibly different query and files that
+cannot appear in the real candidate list (so a model copying it
+verbatim is obvious rather than plausible), and the real question comes
+last so the model finishes on it rather than on the demonstration.
+Both pinned by a test.

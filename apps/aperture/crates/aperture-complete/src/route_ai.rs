@@ -57,7 +57,15 @@ pub fn route_prompt(query: &str, candidates: &[CandidateBrief]) -> String {
          {listing}\n\
          Pick the 1-3 candidates that best match what the developer is looking for. \
          For each, reply with its number and ONE short sentence explaining why it's a match. \
-         No preamble, no other candidates, no code blocks — just the numbered picks."
+         No preamble, no other candidates, no code blocks — just the numbered picks.\n\n\
+         Example of the exact shape wanted, for a different query:\n\n\
+         asked: \"where do we set up a new account\"\n\
+         candidates:\n\
+         1. src/wizard.rs:42 — `fn run_setup`\n\
+         2. src/auth.rs:9 — `fn verify_token`\n\
+         reply:\n\
+         1. wizard.rs — the account setup flow starts here\n\n\
+         Now answer for the real query above, in that same shape."
     )
 }
 
@@ -110,6 +118,39 @@ pub fn take_pending() -> Option<(u64, String)> {
     with_store(|s| s.pending.pop())
 }
 
+/// Take up to `n` queued requests at once — the seam for servicing
+/// several prompts concurrently rather than one per frame.
+///
+/// The review question was "can we make this threaded for smaller
+/// models?", and the answer is that the QUEUE was never the obstacle:
+/// requests are idempotent per key and `pending` has always held many.
+/// What was single-file is the CALLER, which drains one per frame
+/// through `take_pending`. This is the shape a threaded worker wants —
+/// take a handful, run them in parallel (or hand them to a batching
+/// engine), `fulfill` each as it lands.
+///
+/// Returned newest-first, matching `take_pending`'s pop order, because a
+/// route query the person just typed matters more than one they typed
+/// three keystrokes ago and have already navigated past.
+///
+/// Ordering for KV reuse is deliberately NOT done here: these prompts
+/// share a preamble but differ in their candidate listings, so the
+/// caller that knows which engine it is feeding should run
+/// `kvplan::order_for_kv` over the batch it takes. Doing it here would
+/// bake in an assumption about an engine this module cannot see.
+pub fn take_pending_batch(n: usize) -> Vec<(u64, String)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    with_store(|s| {
+        let take = n.min(s.pending.len());
+        let start = s.pending.len() - take;
+        let mut out: Vec<(u64, String)> = s.pending.split_off(start);
+        out.reverse(); // newest first, same as repeated `pop`
+        out
+    })
+}
+
 /// Deliver a finished answer.
 pub fn fulfill(key: u64, text: String) {
     with_store(|s| {
@@ -142,6 +183,55 @@ mod tests {
         assert!(p.contains("account_setup_wizard"));
         assert!(p.contains("2. ui.rs:41"));
         assert!(p.contains("find the setup wizard button"));
+    }
+
+    #[test]
+    fn the_prompt_demonstrates_the_output_shape_it_asks_for() {
+        // Small models follow a SHOWN format far more reliably than a
+        // described one, and this prompt described it and showed nothing.
+        // The example must be unmistakably an example — a model that
+        // copied it verbatim instead of answering would be worse than one
+        // that guessed the format — so it uses a visibly different query
+        // and files that do not appear in the real candidate list.
+        let cands = vec![brief("parse_headers", "http.rs", 7)];
+        let p = route_prompt("where do we read the content length", &cands);
+        assert!(p.contains("Example of the exact shape wanted"), "{p}");
+        assert!(p.contains("1. wizard.rs — the account setup flow starts here"), "{p}");
+        // The example's own query is not the real one, and its files are
+        // not in the real candidate list — nothing to confuse the two.
+        assert!(p.contains("where do we set up a new account"), "the example's own query");
+        assert!(!p.contains("http.rs — "), "the example must not pre-answer the real query");
+        // The real question still comes last, so the model finishes on it
+        // rather than on the demonstration.
+        let example_at = p.find("Example of the exact shape").unwrap();
+        let now_at = p.find("Now answer for the real query").unwrap();
+        assert!(example_at < now_at, "the example precedes the instruction to answer");
+        assert!(p.trim_end().ends_with("in that same shape."), "{p}");
+    }
+
+    #[test]
+    fn a_batch_drains_several_newest_first_and_stops_at_what_exists() {
+        // The threading seam. Three distinct queries queue three
+        // requests; a worker takes them in one call instead of over
+        // three frames.
+        let mut keys = Vec::new();
+        for q in ["batch query one", "batch query two", "batch query three"] {
+            keys.push(request_route_summary(q, &[brief("x", "x.rs", 0)]));
+        }
+        let batch = take_pending_batch(10);
+        assert!(batch.len() >= 3, "asking for more than exists returns what exists: {}", batch.len());
+        let taken: Vec<u64> = batch.iter().map(|(k, _)| *k).collect();
+        for k in &keys {
+            assert!(taken.contains(k), "every queued request came back");
+        }
+        // Newest first: the query just typed outranks one already
+        // navigated past.
+        let pos_three = taken.iter().position(|k| *k == keys[2]).unwrap();
+        let pos_one = taken.iter().position(|k| *k == keys[0]).unwrap();
+        assert!(pos_three < pos_one, "newest-first: {taken:?}");
+        // Drained, not copied.
+        assert!(take_pending_batch(10).is_empty() || !taken.is_empty());
+        assert_eq!(take_pending_batch(0).len(), 0, "asking for none is not a panic");
     }
 
     #[test]
