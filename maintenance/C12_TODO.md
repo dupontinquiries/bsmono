@@ -34,11 +34,19 @@ sibling at all: they are glam-only, so nothing this line did can reach them.
 - **C12-1b — turret: `the_whole_turret_follows_the_barrel`** — "the hull was
   swept into the turret: fittings: 4 turret prims (ring 0.00,0.10,0.23), 2
   tread prims". The ring test is admitting hull prims. `read`.
-- **C12-1c — driveline, two failures.** `the_reference_car_is_left_alone`
-  ("a hatchback weighs 2.574 t") and `wing_loading_is_actual_aerodynamics`
-  ("the big wing stalls faster" — both configs report an identical
-  `stall_ms` of 57.400238, so wing area is not reaching the stall term).
-  The identical number across two very different masses is the lead.
+- **C12-1c — CLOSED (`e7611ad8`), two separate bugs.** The recorded lead
+  ("the identical number") was the right thread and the diagnosis it
+  suggested was wrong: wing area WAS reaching the stall term. Mass came
+  from the full bounding box and area from the planform, so mass/area
+  reduced to `h * density` and the span cancelled itself out on both
+  sides of the fraction — no wingspan could change the answer. Fixed by
+  splitting the planform for aircraft (solid fuselage + wings at 12% box
+  fill); ground vehicles keep the solid box. Separately, `D_CAR` was
+  0.25 t/m³ while the comment beside it claimed that made a 1.5 t
+  hatchback; it makes 2.57 t on the reference hull's own 10.30 m³.
+  Corrected to 0.145 with the arithmetic written into the comment. Safe
+  because ground handling derives from a LENGTH ratio, not absolute
+  mass — checked, not assumed.
 - **C12-1d — the ship-interior trio.** `hullform::the_hull_contains_every_room_it_was_fitted_to`
   ("len 40: room bridge is outside the hull it was fitted to"),
   `interior::the_hull_between_rooms_is_still_solid` ("the ship is mostly
