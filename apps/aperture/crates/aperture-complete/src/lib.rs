@@ -20,6 +20,9 @@ pub mod edit;
 pub mod engine;
 /// Reuse of completions across caret motion and typing — the decision
 /// layer that keeps identical requests from reaching the model at all.
+/// Keeping the prompt's PREFIX stable so a KV-cached engine can skip
+/// re-prefilling context that did not change — where the latency is.
+pub mod kvplan;
 pub mod prefixcache;
 pub mod providers;
 /// How much of the file a completion sees — several scopes, planned and

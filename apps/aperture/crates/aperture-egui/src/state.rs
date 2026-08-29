@@ -1743,7 +1743,14 @@ impl AppState {
         };
         let scoped_start = aperture_complete::scope::scope_start(
             &full_before, self.scope, self.line_scope_lines);
-        let scoped = &full_before[scoped_start..];
+        // ANCHORED TRIM, not a sliding window. File scope on a large
+        // file exceeds any sane budget, and the obvious fix ("keep the
+        // last N bytes") moves the prompt's start on EVERY keystroke —
+        // so no two consecutive prompts share a prefix and the KV cache
+        // never hits. Quantising the start to a line-boundary grid keeps
+        // it still while you type and jumps only when it must.
+        let scoped = aperture_complete::kvplan::anchored_trim(
+            &full_before[scoped_start..], PREFIX_BUDGET);
         // QUICK CONTEXT, prepended as a plain `// ` comment line — not a
         // new field on CompletionRequest. `path` grew the request's shape
         // last time and an eighth construction site outside this
@@ -1758,7 +1765,16 @@ impl AppState {
         } else {
             String::new()
         };
-        let before = format!("{quick_ctx}{scoped}");
+        // VOLATILE LAST. The previous commit put this header at byte 0,
+        // which is the worst place for it on a KV-cached engine: the LOC
+        // figure changes whenever the file grows a line, so every such
+        // keystroke changed the FIRST bytes of the prompt and invalidated
+        // the entire cached prefix — a full re-prefill of the whole
+        // context, with nothing to notice it by except the editor feeling
+        // slow. `kvplan::assemble` puts it immediately above the caret's
+        // line instead: same information, a few tokens of re-prefill
+        // instead of all of them. See kvplan's module docs.
+        let before = aperture_complete::kvplan::assemble(scoped, &quick_ctx);
         let after = self.editor.buffer.slice_to_string(head, self.editor.buffer.len_chars());
         let mut req = make_request(&ctx, &before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
         req.path = self.path.clone(); // sibling reads + @read resolve here
