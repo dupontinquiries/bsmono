@@ -2108,13 +2108,46 @@ fn main() {
         // of 30 uploads. This reduction is hardware-independent (it's a buffer-creation count).
         let (dh, dm) = (gpu_kernels::dims_cache_hits(), gpu_kernels::dims_cache_misses());
         ck(&format!("dims-uniform upload churn eliminated: {} dispatches → {dm} buffer create(s) + {dh} reuse(s)", dh + dm), dm <= 1 && dh >= 29);
-        let (ph, pm) = (gpu_kernels::pool_hits(), gpu_kernels::pool_misses());
-        ck(&format!("output-buffer alloc churn eliminated: {} allocs → {pm} create(s) + {ph} recycle(s)", ph + pm), pm <= 2 && ph >= 28);
+        // POOL CHURN IS FLUSH-REGIME DEPENDENT, and this asserted one regime's number while
+        // sampling the other's. The claim "a dependent chain ping-pongs two buffers" is true when
+        // the frame is NOT flushing mid-chain; under a tight flush every boundary keeps its
+        // buffers alive for the submit, so a few extra creates are correct behaviour and not
+        // churn. These counters were read after run(4) — the tight run — so the strict threshold
+        // was being applied to the regime it was never measured in.
+        //
+        // It read 30 creates + 0 recycles before flush_every was repaired, which is the pool
+        // genuinely not recycling; it reads 6 + 24 now. Both fail `pm <= 2`, and only one of them
+        // is a bug, which is exactly what a single threshold across two regimes cannot say.
+        let (ph4, pm4) = (gpu_kernels::pool_hits(), gpu_kernels::pool_misses());
         let (r64, s64) = run(64);
+        let (ph64, pm64) = (gpu_kernels::pool_hits(), gpu_kernels::pool_misses());
+        // AND THE DIRECTION IS THE OPPOSITE OF THE OBVIOUS GUESS, which is why it is measured
+        // here rather than asserted from the design. Recycling requires a buffer to be RETURNED,
+        // and buffers return at flush. So the TIGHT flush is the one that recycles (each boundary
+        // hands its intermediates back for the next four dispatches to reuse), while a LOOSE flush
+        // holds all 30 alive to the end of the frame and can reuse almost nothing.
+        //
+        // That makes `pm <= 2 && ph >= 28` unreachable in either regime, and it was measuring the
+        // tight run while being written for an ideal neither produces. Both halves below are
+        // statements about the mechanism, bounded on both sides so either drifting is caught.
+        ck(&format!("a tight flush returns buffers, so the pool recycles: {pm4} create(s) + {ph4} recycle(s)"),
+            ph4 >= 20 && (2..=10).contains(&pm4));
+        ck(&format!("a loose flush holds intermediates to end_frame, so it cannot: {pm64} create(s) + {ph64} recycle(s)"),
+            pm64 >= 20 && ph64 <= 10);
         ck(&format!("higher flush_every → fewer submits for the same work ({s4} at flush=4 vs {s64} at flush=64)"), s64 < s4 && s4 > 0);
         let e = r4.iter().zip(&r64).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         ck(&format!("framed dependent chain is BIT-EXACT across flush_every (max|Δ|={e:.2e})"), e == 0.0);
-        ck("set_flush_every clamps + reports the value in effect", gpu.set_flush_every(99999) == 1024 && gpu.set_flush_every(32) == 32);
+        // WAS `set_flush_every(99999) == 1024`, and the 1024 went stale: the cap is 65536, and has
+        // to be, because the decode window pins `k * per_tok` and a 32-layer model at k=4 asks for
+        // 2048. The code was right and this line was asserting a constant nobody had updated.
+        //
+        // Rewritten as the PROPERTY rather than a fresh literal that will go stale the same way:
+        // an absurd request saturates at whatever the cap is, the cap is reported back rather than
+        // the request, and an in-range value round-trips untouched.
+        let cap = gpu.set_flush_every(u32::MAX);
+        ck(&format!("set_flush_every saturates at the cap and reports it ({cap})"),
+            cap == gpu.set_flush_every(u32::MAX - 1) && cap > 1024);
+        ck("set_flush_every round-trips an in-range value", gpu.set_flush_every(32) == 32);
 
         println!("gate-submit: {} | submits {s4}→{s64} (flush 4→64), SUBMIT_PROFILES={:?}", if ok { "submit-batching matrix + tuner validated \u{2713}" } else { "FAIL \u{2717}" }, gpu_kernels::SUBMIT_PROFILES);
         return;
