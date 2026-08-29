@@ -151,9 +151,9 @@ corner is walkable — the ship is a shell with no walls") all point at one
 root — the fitted exterior does not enclose what it was fitted to — rather
 than four separate bugs.
 
-- **C12-5a — three of four closed, and the "one root cause" framing was
+- **C12-5a — CLOSED, four of four, and the "one root cause" framing was
   wrong.** These were grouped as one bug wearing four names. They were
-  two bugs wearing three names, plus one still unexamined:
+  two real bugs covering three tests, plus one bad test:
   - `hullform::the_hull_contains_every_room_it_was_fitted_to` — CLOSED
     (`0b161972`). `fit` sized the hull's axes independently, which is
     right for a rectangle and wrong for the superellipse the hull
@@ -168,9 +168,16 @@ than four separate bugs.
     480m ship the test builds, 1112 of 1191 "walkable" samples were
     outside the skin against 79 genuinely in a room. Never "mostly
     corridor" — mostly outside.
-  - `aboard::the_hull_is_solid_where_the_walls_are` — STILL OPEN, and
-    deliberately not assumed to share either cause, since assuming a
-    shared cause is exactly what was wrong the first time.
+  - `aboard::the_hull_is_solid_where_the_walls_are` — CLOSED
+    (`217dbe4e`), and it was a bad TEST rather than bad code, which is
+    why not assuming a shared cause mattered: it sampled `hull_half *
+    0.95`, a corner of the bounding BOX, measured 9.88 units OUTSIDE
+    the skin on the ship it builds. `sdf_local` is positive there by
+    construction, so the test asked whether a point not in the ship was
+    solid and read the honest answer as a failure. Now samples the
+    origin (inside the skin at -6.75, between rooms, `sdf_local`
+    -1.04), with a guard that the sample really is inside the skin so
+    it cannot degrade into checking nothing.
   Method note, because it is what actually worked twice after reasoning
   failed twice: add a temporary test that PRINTS the geometry (which
   corner, how many samples where), read the numbers, then delete it.
