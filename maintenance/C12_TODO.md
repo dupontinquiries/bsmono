@@ -1059,12 +1059,24 @@ recents populate themselves.
   the toggle exist; there is no bottom bar in aperture's frame and no
   hold target wired to `cmd_hold`. That is the remaining half and it is
   a rendering job.
-- **C12-26b — voiceterm's Qt->egui port is still not faithful**, per the
-  original report, and `bars.rs` is now the place two apps disagree:
-  voiceterm has its own `BarState`/`HOLD_SECONDS` that duplicate
-  `cmdstrip`'s. Worth switching voiceterm onto the kit version so the
-  gesture cannot drift between them — the same
-  hoist-then-adopt shape as `segmented_tabs`.
+- **C12-26b — TIMING converged, state deliberately not.** voiceterm's
+  `HOLD_SECONDS` is now a re-export of `cmdstrip::HOLD_SECONDS`, so the
+  two apps cannot drift on what a long press feels like, with a test
+  asserting the equality — which is not a tautology, it is the guard
+  that keeps it a re-export if someone re-declares a local constant to
+  "just tweak voiceterm".
+
+  The GESTURE STATE was NOT merged, and that is the finding rather than
+  a shortcut: `cmdstrip::Hold` is one button with a threshold;
+  voiceterm's `BarState` is a bar of buttons with a fan-out and a
+  hovered option inside it. Collapsing the richer into the simpler
+  would lose the hover — the part that makes sliding onto an option and
+  back off again select nothing. Sharing the timing and not the state
+  machine is the honest split, and "two things look similar" is not on
+  its own a reason to merge them. voiceterm 1106/1106.
+
+  Still open from the original report: the Qt->egui port's FAITHFULNESS
+  more broadly, which is a per-screen comparison and was not attempted.
 - **C12-26c — the strip should read the a11y registry.** `Cmd.id`
   matches `Semantics::command_id` on purpose, so
   `A11yScene::palette_matches` (§4c) could supply the strip's candidate

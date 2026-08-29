@@ -38,7 +38,23 @@ pub use bottom_bar::{BarButton, BarButtonKind, BarOption, BottomBar};
 /// Long enough that a tap is unambiguous, short enough not to feel stuck. Below
 /// about 0.2s a normal tap starts triggering it; above about 0.6s the bar feels
 /// broken.
-pub const HOLD_SECONDS: f32 = 0.32;
+/// How long a press must last to fan out.
+///
+/// RE-EXPORTED from the kit rather than declared here. This value was
+/// duplicated: `uikit_egui::cmdstrip::HOLD_SECONDS` carries the same
+/// 0.32, and two apps in one fleet disagreeing about what a long press
+/// feels like is worse than either number being slightly off — a person
+/// moving between voiceterm and aperture should not have to retrain
+/// their thumb. Changing it in one place now changes it everywhere,
+/// which is the only way that stays true.
+///
+/// The GESTURE STATE is deliberately NOT shared. `cmdstrip::Hold` is
+/// one button with a threshold; `BarState` below is a bar of buttons
+/// with a fan-out and a hovered option inside it, and collapsing the
+/// richer one into the simpler one would lose the hover — the part that
+/// makes sliding onto an option and off again work. Sharing the timing
+/// and not the state machine is the honest split.
+pub use uikit_egui::cmdstrip::HOLD_SECONDS;
 
 /// The bar's live gesture state.
 #[derive(Debug, Clone, Default)]
@@ -278,6 +294,15 @@ mod tests {
         assert!(!s.tick(HOLD_SECONDS * 0.4));
         assert!(!s.is_open());
         assert_eq!(s.release(), Some(BarEvent::Primary(0)));
+    }
+
+    #[test]
+    fn the_hold_threshold_is_the_kit_s_and_cannot_drift() {
+        // Not a tautology now that it is a re-export — it is the guard
+        // that keeps it one. If someone re-declares a local constant to
+        // "just tweak voiceterm", this stops being equal and says so.
+        assert_eq!(HOLD_SECONDS, uikit_egui::cmdstrip::HOLD_SECONDS);
+        assert!(HOLD_SECONDS > 0.0 && HOLD_SECONDS < 1.0, "a plausible long-press: {HOLD_SECONDS}");
     }
 
     #[test]
