@@ -194,6 +194,16 @@ pub fn standard_grammar() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// One palette-offerable widget, ranked against what was typed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaletteHit {
+    /// The registered widget id — hand this back to the app to activate.
+    pub id: u64,
+    pub label: String,
+    pub command_id: Option<String>,
+    pub score: i32,
+}
+
 /// One focusable widget registered this frame.
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -288,6 +298,62 @@ impl A11yScene {
     /// cold-weather mode from the same registration voice already uses.
     pub fn glove_targets(&self) -> Vec<Target> {
         self.items.iter().filter_map(Item::as_glove_target).collect()
+    }
+
+    /// What a command palette can offer for what is ON SCREEN right now.
+    ///
+    /// This is `command_id`'s reader — the thing that was missing when the
+    /// field was added, and without which registering ids was a documented
+    /// seam rather than a feature. A palette built from a static command
+    /// table can only offer what someone remembered to list; this offers
+    /// whatever the app actually drew this frame, in the state it is
+    /// currently in, which is strictly more honest: a disabled button that
+    /// is not on screen cannot be offered, and a field that only appears
+    /// in one tab appears in the palette only from that tab.
+    ///
+    /// Ranked by [`crate::fuzzy::score`], the same matcher the rest of the
+    /// kit's pickers use, so typing feels identical wherever it happens.
+    /// An entry matches on EITHER its `command_id` or its spoken label,
+    /// and takes the better of the two: the id is what a person who knows
+    /// the app types ("settings.dark"), the label is what someone reading
+    /// the screen types ("Dark mode"), and refusing either would make the
+    /// palette worse for one of them.
+    ///
+    /// Items with no `command_id` are still offered when their LABEL
+    /// matches — a button nobody named is still a button on screen, and
+    /// omitting it would make the palette quietly incomplete.
+    pub fn palette_matches(&self, needle: &str) -> Vec<PaletteHit> {
+        let mut out: Vec<PaletteHit> = self
+            .items
+            .iter()
+            .filter(|it| matches!(it.semantics.role, Role::Button | Role::Toggle | Role::Link | Role::TextField))
+            .filter_map(|it| {
+                let by_id = it
+                    .semantics
+                    .command_id
+                    .as_deref()
+                    .and_then(|c| crate::fuzzy::score(needle, c));
+                let by_label = crate::fuzzy::score(needle, &it.semantics.label);
+                let score = match (by_id, by_label) {
+                    (Some(a), Some(b)) => a.max(b),
+                    (Some(a), None) => a,
+                    (None, Some(b)) => b,
+                    (None, None) => return None,
+                };
+                Some(PaletteHit {
+                    id: it.id,
+                    label: it.semantics.label.clone(),
+                    command_id: it.semantics.command_id.clone(),
+                    score,
+                })
+            })
+            .collect();
+        // Best first; ties keep REGISTRATION order, which is the order the
+        // app drew them, which is the order they appear on screen. A
+        // stable sort is load-bearing here, not incidental: an unstable
+        // one would reshuffle equally-good matches as you type.
+        out.sort_by(|a, b| b.score.cmp(&a.score));
+        out
     }
 
     fn move_focus(&mut self, to: Option<usize>) -> Outcome {
@@ -442,6 +508,75 @@ mod tests {
         assert_eq!(targets.len(), 2, "the heading must not become a snap target");
         assert_eq!(targets[0].id, "2");
         assert_eq!(targets[1].id, "3");
+    }
+
+    #[test]
+    fn the_palette_offers_what_is_on_screen_now() {
+        // command_id's reader, and the reason the field exists. A palette
+        // built from a static table can only offer what someone remembered
+        // to list; this offers what the app actually drew this frame.
+        let mut s = A11yScene::new();
+        s.begin_frame();
+        let r = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0));
+        s.add(1, Semantics::button("Dark mode").with_command_id("settings.toggle_dark"), Some(r));
+        s.add(2, Semantics::button("Start run").with_command_id("run.start"), Some(r));
+        s.add(3, Semantics::heading("Settings"), Some(r));
+
+        // By machine name: what someone who knows the app types.
+        let hits = s.palette_matches("dark");
+        assert_eq!(hits[0].id, 1, "{hits:?}");
+        // By SPOKEN label: what someone reading the screen types.
+        let hits = s.palette_matches("Start");
+        assert_eq!(hits[0].id, 2, "{hits:?}");
+        // A heading is not actionable and is never offered, however well
+        // it matches — it would be a palette entry that does nothing.
+        assert!(
+            s.palette_matches("Settings").iter().all(|h| h.id != 3),
+            "a heading was offered as a command"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_widget_is_still_offered_by_its_label() {
+        // Most widgets will never be given a command_id. Dropping them
+        // would make the palette quietly incomplete, which is worse than
+        // useless: a person cannot tell "not offered" from "not there".
+        let mut s = A11yScene::new();
+        s.begin_frame();
+        let r = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0));
+        s.add(7, Semantics::button("Rescan"), Some(r));
+        let hits = s.palette_matches("resc");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 7);
+        assert_eq!(hits[0].command_id, None);
+    }
+
+    #[test]
+    fn a_widget_gone_from_the_screen_is_gone_from_the_palette() {
+        // The property a static command table cannot have.
+        let mut s = A11yScene::new();
+        s.begin_frame();
+        let r = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0));
+        s.add(1, Semantics::button("Stop").with_command_id("run.stop"), Some(r));
+        assert_eq!(s.palette_matches("stop").len(), 1);
+        s.begin_frame(); // next frame: the run ended, the button is not drawn
+        assert!(s.palette_matches("stop").is_empty(), "a vanished button was still offered");
+    }
+
+    #[test]
+    fn an_empty_needle_offers_every_actionable_widget_in_screen_order() {
+        // `fuzzy::score` returns Some(0) for an empty needle, so every
+        // entry ties and the STABLE sort preserves registration order.
+        // That tie-break is load-bearing: an unstable sort would reshuffle
+        // the list as you type.
+        let mut s = A11yScene::new();
+        s.begin_frame();
+        let r = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0));
+        s.add(1, Semantics::button("First"), Some(r));
+        s.add(2, Semantics::toggle("Second", true), Some(r));
+        s.add(3, Semantics::button("Third"), Some(r));
+        let ids: Vec<u64> = s.palette_matches("").iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "screen order, not shuffled");
     }
 
     #[test]
