@@ -1452,6 +1452,10 @@ impl eframe::App for VoicetermApp {
         // change that on device.
         let open_t = overlay::openness(ctx, Surface::Settings, self.surfaces.is(Surface::Settings));
         if open_t > 0.0 {
+            // Deferred because the surface switch happens INSIDE the
+            // Settings overlay's own closure — opening another surface
+            // mid-draw would tear down the panel being drawn.
+            let mut next_view: Option<CentralView> = None;
             let out = overlay::show(ctx, Surface::Settings, open_t, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Settings");
@@ -1489,16 +1493,31 @@ impl eframe::App for VoicetermApp {
                         // turns these into real doors, and it is a
                         // separate change from putting the launcher on
                         // screen.
-                        let what = match ev {
-                            LauncherEvent::OpenSetup => Some("model setup"),
-                            LauncherEvent::OpenChat => Some("chat"),
-                            LauncherEvent::OpenRecipes => Some("recipes"),
-                            LauncherEvent::OpenSessions => Some("sessions"),
+                        // BOTH DESTINATIONS ALREADY EXIST — as CentralView
+                        // tabs (Models hosts the setup wizard, Chat hosts
+                        // the chat panel), not as overlay surfaces. I
+                        // first added Surface::Setup/Chat and duplicate
+                        // widget fields for them; the compiler rejected
+                        // the duplicates and that was the right answer.
+                        // The launcher's job is to NAVIGATE to what
+                        // exists, not to grow a second copy of it.
+                        match ev {
+                            LauncherEvent::OpenSetup => {
+                                next_view = Some(CentralView::Models);
+                            }
+                            LauncherEvent::OpenChat => {
+                                next_view = Some(CentralView::Chat);
+                            }
+                            // These two genuinely have no destination, so
+                            // they say so rather than opening a blank one.
+                            LauncherEvent::OpenRecipes => {
+                                self.toasts.info("recipes: not ported yet", ui.input(|i| i.time));
+                            }
+                            LauncherEvent::OpenSessions => {
+                                self.toasts.info("sessions: not ported yet", ui.input(|i| i.time));
+                            }
                             LauncherEvent::VoiceActivationChanged
-                            | LauncherEvent::ThemeChanged => None,
-                        };
-                        if let Some(w) = what {
-                            self.toasts.info(format!("{w}: not ported yet"), ui.input(|i| i.time));
+                            | LauncherEvent::ThemeChanged => {}
                         }
                     }
                     ui.add_space(10.0);
@@ -1513,6 +1532,12 @@ impl eframe::App for VoicetermApp {
                 });
             });
             if out.closed { self.surfaces.close(); }
+            if let Some(v) = next_view {
+                // Close the launcher on the way: leaving it over the
+                // destination would hide what the door just opened.
+                self.surfaces.close();
+                self.view = v;
+            }
         }
 
         // the blocks drawer slides in at the left edge (QML blocksDrawer,
