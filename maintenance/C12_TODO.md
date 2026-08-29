@@ -39,9 +39,20 @@ sibling at all: they are glam-only, so nothing this line did can reach them.
   plate lying against the body. Note for future work: fixing (1) alone
   changed nothing at all and looked like a wrong guess; it is
   load-bearing only in combination, confirmed by reverting it at the
-  end. Still open: `vehicle_mode_packs_the_limbs_inside_the_hull`, which
-  is containment after compaction, not detection, and is not assumed to
-  share a cause.
+  end. `vehicle_mode_packs_the_limbs_inside_the_hull` — CLOSED
+  (`a5d73585`), and it did NOT share a cause, which is why not assuming
+  one mattered. `contain`'s cap on limb travel was
+  `(env * 2 - span).max(0)`, which is zero for any limb wider than the
+  envelope — so the widest limbs, exactly the ones containment exists
+  for, were the only ones it could never move. Cap is now the shift that
+  CENTRES the limb. The test additionally demanded < 0.35 overhang,
+  which no translation can achieve for a 5.2-wide wing in a 1.25-wide
+  envelope (minimum 1.975); it now asserts what translation CAN
+  promise — centred, and no worse than the limb's own excess width —
+  with the translation-only limit written into `contain`'s doc comment.
+  Rotation is what would actually fit a wing inside a silhouette, and
+  that is a different operation on a different data model.
+  **C12-1a is fully closed.**
 - **C12-1b — turret: `the_whole_turret_follows_the_barrel`** — "the hull was
   swept into the turret: fittings: 4 turret prims (ring 0.00,0.10,0.23), 2
   tread prims". The ring test is admitting hull prims. `read`.
