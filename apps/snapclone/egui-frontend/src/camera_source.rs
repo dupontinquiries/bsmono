@@ -58,6 +58,33 @@ pub fn choose(devices: &[Device], supported: &[VideoFormat],
     Some(CameraChoice { device, format, front })
 }
 
+/// The ordered pipelines to try for a chosen camera, narrowest guess first.
+///
+/// `choose` above answers WHICH DEVICE; this answers HOW TO OPEN IT, and
+/// they are different questions with different answers per platform. The
+/// viewfinder needs both and until now had only the first: a `Device` with
+/// a name and a path, and no notion that a phone wants pipewire/libcamera
+/// tried before v4l2 while a desktop has only v4l2 and no libcamera nodes
+/// at all. That gap is why `device_kit::source_plan` was hoisted out of
+/// camera-bridge — this is the consumer it was hoisted FOR.
+///
+/// The chosen device's path becomes the override, so the plan leads with
+/// the camera the person actually picked in settings rather than with
+/// whatever the probe happened to enumerate first. Everything else the
+/// probe found stays in the list behind it, because a saved preference
+/// pointing at an unplugged webcam must degrade to "try the others"
+/// rather than to nothing.
+///
+/// `front` cameras get a horizontal flip, matching the mirrored preview
+/// the viewfinder already draws for them — a selfie preview that is
+/// mirrored on screen and unmirrored in the pipeline would record the
+/// opposite of what the person saw.
+pub fn pipelines_for(choice: &CameraChoice, pw_nodes: &[String],
+                     v4l2_list_output: &str) -> Vec<device_kit::source_plan::SourceCandidate> {
+    let flip = if choice.front { Some("horizontal-flip") } else { None };
+    device_kit::source_plan::plan(pw_nodes, v4l2_list_output, Some(&choice.device.path), flip)
+}
+
 /// A one-line description for the settings row: "HD Webcam — 1280×720 @30".
 pub fn describe(c: &CameraChoice) -> String {
     format!("{} — {}×{} @{}", c.device.name, c.format.width, c.format.height, c.format.fps)
@@ -72,6 +99,69 @@ mod tests {
     }
 
     fn fmt(w: u32, h: u32, fps: u32) -> VideoFormat { VideoFormat::new(w, h, fps, "YUYV") }
+
+    const DESKTOP_V4L2: &str = "\
+Integrated Camera: Integrated C (usb-0000:00:14.0-8):\n\
+\t/dev/video0\n\
+\t/dev/video1\n";
+
+    #[test]
+    fn a_desktop_gets_a_v4l2_pipeline_where_it_used_to_get_nothing() {
+        // The gap this closes: `choose` returned a device and the
+        // viewfinder had no idea how to open it. A desktop has no
+        // libcamera nodes at all, so a pipewire-only path — which is what
+        // the phone-first code assumed — finds nothing on it.
+        let c = choose(&[dev("0", "Integrated Camera")], &[], &fmt(1280, 720, 30), None)
+            .expect("a camera");
+        let plan = pipelines_for(&c, &[], DESKTOP_V4L2);
+        assert!(!plan.is_empty(), "a desktop webcam produced no pipeline at all");
+        assert_eq!(plan[0].kind, device_kit::source_plan::SourceKind::V4l2);
+        assert!(plan[0].pipeline.contains("device=/dev/video0"), "{:?}", plan[0]);
+    }
+
+    #[test]
+    fn the_chosen_device_leads_and_the_others_stay_as_fallbacks() {
+        // A saved preference pointing at an unplugged webcam must degrade
+        // to "try the others", not to nothing — so the choice leads the
+        // list rather than replacing it.
+        let c = choose(&[dev("1", "Second Camera")], &[], &fmt(640, 480, 30), None)
+            .expect("a camera");
+        let plan = pipelines_for(&c, &[], DESKTOP_V4L2);
+        assert!(plan[0].pipeline.contains("device=/dev/video1"), "chosen first: {:?}", plan[0]);
+        assert!(plan.len() > 1, "the probe's own findings remain as fallbacks: {plan:?}");
+    }
+
+    #[test]
+    fn a_phone_prefers_libcamera_but_still_carries_v4l2() {
+        // Same call, different machine: the libcamera node a phone
+        // reports outranks v4l2, which stays behind it rather than being
+        // dropped.
+        let c = choose(&[dev("0", "Integrated Camera")], &[], &fmt(1280, 720, 30), None)
+            .expect("a camera");
+        let plan = pipelines_for(&c, &["libcamera_input_2_1".to_string()], DESKTOP_V4L2);
+        let kinds: Vec<_> = plan.iter().map(|p| p.kind).collect();
+        assert!(kinds.contains(&device_kit::source_plan::SourceKind::PipewireLibcamera),
+                "the phone's own node is missing: {plan:?}");
+        assert!(kinds.contains(&device_kit::source_plan::SourceKind::V4l2),
+                "v4l2 was dropped rather than kept as a fallback: {plan:?}");
+    }
+
+    #[test]
+    fn a_front_camera_flips_the_pipeline_to_match_the_mirrored_preview() {
+        // The viewfinder already mirrors a selfie preview. If the pipeline
+        // does not flip too, the recording is the opposite of what the
+        // person watched themselves do.
+        let front = choose(&[dev("2", "Integrated Front Camera")], &[], &fmt(640, 480, 30), None)
+            .expect("a camera");
+        assert!(front.front, "the name should read as front-facing");
+        let plan = pipelines_for(&front, &[], DESKTOP_V4L2);
+        assert!(plan[0].pipeline.contains("videoflip"), "{:?}", plan[0]);
+
+        let back = choose(&[dev("0", "Integrated Camera")], &[], &fmt(640, 480, 30), None)
+            .expect("a camera");
+        let plan = pipelines_for(&back, &[], DESKTOP_V4L2);
+        assert!(!plan[0].pipeline.contains("videoflip"), "a rear camera must not be flipped");
+    }
 
     #[test]
     fn no_camera_is_reported_rather_than_shown_as_an_empty_preview() {
