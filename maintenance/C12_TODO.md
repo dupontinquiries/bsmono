@@ -850,11 +850,22 @@ not.
   Thinker slice carrying the prompt. `select_invitees_for` gates at
   ADMISSION (not assignment: once a member, dispatch hands it whatever
   the queue holds). 3 tests; 404/404.
-  - **STILL OPEN: no caller passes a registry.** The gate exists and the
-    ungated path is explicit at every call site — `None` is spelled, not
-    defaulted — but the fleet code still calls the ungated form. That is
-    the difference between a rule that CAN be enforced and one that is.
-    Threading the registry through is the remaining work.
+  - **CLOSED (`b41ad86c`): the caller now passes a registry.** `Coordinator`
+    takes `registry` + `duty` via `with_trust()`; `new()` stays ungated so no
+    existing caller changed. BOTH admission paths are gated — `invite()` and
+    `best_untried()`, the latter because gating only the first would let a
+    fleet acquire the refused peer by the side door of someone else declining.
+    `refused()` reports who and why. 409/409; each gate broken in turn to
+    confirm its test is the one that catches it.
+    The original wording of this bullet — "the fleet code still calls the
+    ungated form ... threading the registry through is the remaining work" —
+    is no longer true and is replaced rather than left standing, since a
+    stale open item reads exactly like a real one.
+    What IS still open: no CALLER of `Coordinator` opts in yet. `with_trust`
+    exists and nothing in the app constructs a coordinator with it, so the
+    fleet is gated only where someone asks for it. That is a smaller gap than
+    before (the mechanism now reaches the decision point) but it is the same
+    shape of gap, and worth naming as such rather than calling 23f finished.
   - Method note, now twice-proven: writing a rule as testable code and
     then grepping for its callers is what found both 23e and this. A
     predicate with no callers is the shape to look for — it reads as
@@ -906,6 +917,59 @@ these are only in commit messages where nobody will find them.
 - blackstar-rs `games/blackstar` vs `games/blackstar-rs`: READMEs now
   disambiguate, but the `c5blackstar-NNN` bundle series still carries
   the misleading name.
+
+## 26. logscope: flush_every was inert, and what that leaves open
+
+Closed this session (`adf1ecfd`, `1bcec8eb`): `Frame.passes` was never
+incremented, so `over_flush` could not fire and the whole `flush_every`
+mechanism did nothing — including the watchdog-prone `clamp(1, 64)` that
+exists so a mobile driver is not handed one enormous submit. Details in the
+commit; `--gate-submit` is green for the first time (lavapipe).
+
+Also corrected: **C11-21a names the wrong function.** The field path is
+`stream_session_window` (`logscope-egui/src/backend.rs:1543`, `:2103`), not
+`generate_kv_stream`, which has two non-test callers and is not the chat path.
+
+- **C12-26a — the mobile submit bound is now LIVE and unmeasured on real
+  hardware.** Turning the mechanism on changes submit counts wherever a frame
+  reaches its bound. Measured on lavapipe at k=4, 16 layers: desktop path 5
+  submits per 8 tokens, watchdog path 29. That is the intended trade (bounded
+  submit duration vs throughput) but nobody has run it on an actual Asahi or
+  Adreno device since it started working. The field's own numbers were taken
+  while it was inert, so every previous submits/token figure describes the
+  unbounded path and should not be compared against a new run without saying so.
+- **C12-26b — `LOGSCOPE_FORCE_WATCHDOG=1`** forces `watchdog_prone()` on (never
+  off, deliberately) so the mobile decode branch runs on any device. It is what
+  showed the bound was inert. Nothing in CI uses it yet; a regression test that
+  pins "the watchdog path submits more than the desktop path" would be cheap and
+  does not exist.
+- **C12-26c — `per_tok` is now `n_layers * 16`, derived from a lavapipe
+  measurement** (12.5–14.7 dispatches per layer-token across 3/8/16-layer
+  fixtures). That ratio is measured on ONE driver with tiny fixtures; a real
+  model on real hardware may sit elsewhere, and the constant 16 is a generous
+  round-up rather than a law. `count-dispatch <model> <n> <k>` reports it.
+- **C12-26d — two gates fail on lavapipe and predate this work.** Verified
+  pre-existing by re-running with the flush pinned high (the old inert
+  behaviour) and getting identical failures. `--gate-matvec`: the subgroup
+  matvec is wrong on lavapipe (rel 2.0 on attn-kv-gqa and vocab>32768) — a
+  FOURTH driver for the known subgroup problem WORKPLAN-next records.
+  `--gate-qkv`: fused decode is not bit-exact against separate-projection
+  decode. Neither is diagnosed.
+- **C12-26e — the tiny fixtures only go to 3 layers.** `gen3.py` hardcodes
+  `L` per architecture. Depth is what makes the dispatch-per-token figure
+  interesting, so the generator taking a layer count as an argument would be
+  worth doing rather than patching a copy into /tmp as this session did.
+
+**Sandbox lore, both cost time:** cargo cannot run its rustc probe in this
+harness ("couldn't read from stdin, as it did not contain valid UTF-8")
+regardless of `< /dev/null`, `exec 0</dev/null` or RUSTFLAGS, while the same
+probe by hand succeeds — so any workspace without a populated
+`target/.rustc_info.json` is unbuildable. gpu-gemm is a SEPARATE workspace from
+apps/logscope and had a truncated 524-byte cache; copying the good 986-byte one
+from `apps/logscope/target/` fixed it (fingerprints match). This is CLAUDE.md
+5d's "cached poisoned rustc probe" and the transplant is the workaround. Second:
+backgrounded builds (`nohup ... &`) do NOT survive between tool calls; builds
+must run in the foreground.
 
 ## 25. Fleet run on 30 apps: 7 real test failures, and the disk was NOT the cause
 
