@@ -151,11 +151,30 @@ corner is walkable — the ship is a shell with no walls") all point at one
 root — the fitted exterior does not enclose what it was fitted to — rather
 than four separate bugs.
 
-- **C12-5a** — `hullform::the_hull_contains_every_room_it_was_fitted_to`,
-  `interior::the_hull_between_rooms_is_still_solid`,
-  `aboard::the_camera_probe_finds_open_volume`,
-  `aboard::the_hull_is_solid_where_the_walls_are`. Not yet read past the
-  failure messages captured in §1.
+- **C12-5a — three of four closed, and the "one root cause" framing was
+  wrong.** These were grouped as one bug wearing four names. They were
+  two bugs wearing three names, plus one still unexamined:
+  - `hullform::the_hull_contains_every_room_it_was_fitted_to` — CLOSED
+    (`0b161972`). `fit` sized the hull's axes independently, which is
+    right for a rectangle and wrong for the superellipse the hull
+    actually is: at N=3 a room filling both half-extents sits ~3.5%
+    outside a skin that exactly meets each axis. Fixed by scaling both
+    axes by the room's own corner radius, per-room rather than the
+    worst-case constant.
+  - `interior::the_hull_between_rooms_is_still_solid` and
+    `aboard::the_camera_probe_finds_open_volume` — CLOSED (`e44188c7`),
+    one cause. `walkable` gated on the BOUNDING BOX, so the whole
+    volume between the tapered hull and its box counted as open: on the
+    480m ship the test builds, 1112 of 1191 "walkable" samples were
+    outside the skin against 79 genuinely in a room. Never "mostly
+    corridor" — mostly outside.
+  - `aboard::the_hull_is_solid_where_the_walls_are` — STILL OPEN, and
+    deliberately not assumed to share either cause, since assuming a
+    shared cause is exactly what was wrong the first time.
+  Method note, because it is what actually worked twice after reasoning
+  failed twice: add a temporary test that PRINTS the geometry (which
+  corner, how many samples where), read the numbers, then delete it.
+  Both fixes fell out in one run each that way.
 - **C12-5b — why is there both `games/blackstar` and `games/blackstar-rs`?**
   Checked: they are NOT the same project in two languages. `games/blackstar`
   is "Cybertron: Arena of Gods," a transforming-robot arena brawler on a
