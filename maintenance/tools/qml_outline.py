@@ -67,7 +67,23 @@ VISUAL = {
     "SpinBox", "ProgressBar", "BusyIndicator", "Switch", "Canvas", "Popup",
     "Dialog", "MenuItem", "Menu", "TabBar", "TabButton", "StackLayout",
     "SwipeView", "Page", "Pane", "Frame", "GroupBox", "Loader",
+    # Found by the skip report on voiceterm's own QML — every one of these
+    # holds layout and was silently absent from the outline until the
+    # report named it. TextInput especially: 14 of them, and an outline
+    # that omits the text fields is not a description of the screen.
+    "TextInput", "Drawer", "RadioButton", "ToolTip", "FocusScope",
+    "ApplicationWindow", "DropArea",
 }
+
+# Project-local components: capitalised, hold layout, but are defined in
+# the app's own .qml files rather than by Qt. Detected by file name so the
+# harness does not need a hardcoded per-app list — a component is anything
+# with a matching `<Name>.qml` beside the file being read.
+def local_components(path: Path) -> set:
+    try:
+        return {p.stem for p in path.parent.glob("*.qml")}
+    except OSError:
+        return set()
 
 # Properties worth carrying into a port. Chosen rather than "all of them":
 # an outline that reproduces every binding is just the QML again.
@@ -128,11 +144,33 @@ class Node:
         return " ".join(bits)
 
 
-def parse(text: str):
+# Capitalised names that are QML machinery rather than missing widgets.
+# Listed so the skip report stays signal: a Timer in the output would
+# train people to ignore it, which is how a genuinely missing widget gets
+# ignored too.
+NON_VISUAL_KNOWN = {
+    "Timer", "Connections", "Component", "QtObject", "Behavior",
+    "PropertyAnimation", "NumberAnimation", "ColorAnimation",
+    "SequentialAnimation", "ParallelAnimation", "PropertyChanges",
+    "State", "Transition", "MouseArea", "TapHandler", "DragHandler",
+    "PinchHandler", "HoverHandler", "Shortcut", "FileDialog", "Settings",
+    "SoundEffect", "MediaPlayer", "Binding", "Instantiator",
+    "SystemPalette", "FontLoader", "Gradient", "GradientStop", "Qt",
+    "ListModel", "ListElement", "PauseAnimation", "ScriptAction",
+    "SmoothedAnimation", "SpringAnimation", "TextMetrics", "FontMetrics",
+    "Translate", "Rotation", "Scale", "Matrix4x4", "WheelHandler",
+    "PointHandler", "FolderDialog", "PathView", "Path", "PathLine",
+    "Math", "JSON", "Object", "Array", "String", "Number", "Boolean",
+    "Date", "RegExp", "Promise", "Error", "Item2",
+}
+
+
+def parse(text: str, extra_visual=frozenset()):
     """Structural read. Brace depth is the tree; indentation is not trusted."""
     roots = []
     stack = []
     pending = None
+    skipped = {}
 
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.split("//")[0]
@@ -140,7 +178,20 @@ def parse(text: str):
         if m:
             kind = m.group(2)
             node = Node(kind=kind, line=lineno)
-            visual = kind in VISUAL
+            # NAMESPACED WIDGETS (PlasmaExtras.Menu, Kirigami.Icon,
+            # QtCharts.ChartView) are one import prefix away from a name
+            # we know. Matching on the last segment covers whole widget
+            # libraries without listing them: hatch uses Plasma and
+            # Kirigami and would otherwise outline as a handful of bare
+            # Items. Reported in the skip list either way, so an unknown
+            # namespaced widget still surfaces rather than being guessed
+            # at silently.
+            bare = kind.rsplit(".", 1)[-1]
+            visual = kind in VISUAL or kind in extra_visual \
+                or bare in VISUAL or bare in extra_visual
+            if not visual and kind not in NON_VISUAL_KNOWN \
+                    and bare not in NON_VISUAL_KNOWN:
+                skipped[kind] = skipped.get(kind, 0) + 1
             if visual:
                 parent = next((n for n in reversed(stack) if n.kind in VISUAL), None)
                 if parent is not None:
@@ -187,7 +238,7 @@ def parse(text: str):
             pending = None
 
 
-    return roots
+    return roots, skipped
 
 
 def render(nodes, out, indent=0):
@@ -210,7 +261,7 @@ def summarise(nodes):
 
 def outline_file(path: Path, max_depth=None) -> str:
     text = path.read_text(errors="replace")
-    roots = parse(text)
+    roots, skipped = parse(text, local_components(path))
     counts = summarise(roots)
     total = sum(counts.values())
     top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
@@ -220,6 +271,17 @@ def outline_file(path: Path, max_depth=None) -> str:
         "# most used: " + ", ".join(k + "x" + str(v) for k, v in top),
         "",
     ]
+    # WHAT WAS SKIPPED, and why this is not optional. `VISUAL` is a list
+    # chosen from what voiceterm happens to use; another Qt app will use
+    # elements that are not in it, and those vanish from the outline with
+    # no complaint — a port built from a silently incomplete spec is worse
+    # than no spec, because it looks finished. Anything capitalised that
+    # was neither rendered nor recognised as machinery is reported here.
+    if skipped:
+        lines.append("# NOT RENDERED (add to VISUAL if these hold layout): "
+                     + ", ".join(k + "x" + str(v)
+                                 for k, v in sorted(skipped.items(), key=lambda kv: -kv[1])))
+        lines.append("")
     body = []
     render(roots, body)
     if max_depth is not None:

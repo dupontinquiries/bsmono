@@ -1112,8 +1112,25 @@ size-to-content) and none of them need a running Qt.
   arbitrary binding are marked `expr` and shown verbatim; those are
   exactly the ones a port will get wrong silently. Counting and reading
   them per screen is a small job that would de-risk the port.
-- **C12-27c — the harness is voiceterm-shaped.** `VISUAL` and `KEEP`
-  are lists chosen from what voiceterm uses. Another Qt app may use
-  elements not in `VISUAL` and they will be invisible in its outline,
-  which fails silently. A "what did I skip" report — unrecognised
-  capitalised element names with counts — would catch that.
+- **C12-27c — CLOSED, and it paid immediately.** Added a NOT RENDERED
+  report: every capitalised name that was neither drawn nor recognised
+  as machinery, with counts. On voiceterm's own QML it found real
+  missing widgets — `TextInput` x14, `ToolBtn` x26, `Drawer` x5,
+  `RadioButton` x4 — that had been silently absent from the outline the
+  previous commit shipped. An outline that omits the text fields is not
+  a description of the screen, and nothing would have said so.
+
+  Three fixes followed from what it found: the genuinely-missing Qt
+  widgets joined `VISUAL`; project-local components resolve by scanning
+  for a matching `<Name>.qml` beside the file, so `ChatPanel`,
+  `SlidePopup` and `GestureHost` no longer read as unknown; and
+  NAMESPACED widgets match on their last segment, so hatch's
+  `PlasmaExtras.Menu` and `Kirigami.Icon` resolve without listing every
+  KDE widget. Verified on a second app: hatch went from outlining as a
+  few bare Items to 39 elements on its main page, with the genuinely
+  unknown KDE types still reported rather than guessed at.
+
+  voiceterm's residue is four inline-defined components (`ToolBtn`,
+  `Pill`, `RadialBubble`, `ThoughtBubble`) declared inside main.qml
+  rather than as files. Correct to report: they are real widgets the
+  harness cannot resolve, and saying so beats pretending.
