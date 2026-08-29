@@ -100,10 +100,19 @@ registry.
   there is no existing double-registration to consolidate yet — the
   bridge is ready for the first app that adopts both, not fixing a
   present duplication).
-- **C12-4c** — `command_id` has no reader yet. No command palette, no AI
-  integration, nothing walks `A11yScene`'s items looking for one. Adding
-  it was the cheap half; something has to actually want it before it is
-  more than a documented seam.
+- **C12-4c — CLOSED (`7a62206a`).** `A11yScene::palette_matches` is the
+  reader. It ranks the actionable widgets drawn THIS FRAME by
+  `fuzzy::score`, matching on either the `command_id` or the spoken
+  label and taking the better — the id is what someone who knows the
+  app types, the label is what someone reading the screen types.
+  Unnamed widgets are still offered by label (dropping them would make
+  the palette quietly incomplete); headings and labels never are (an
+  entry that does nothing when chosen is a bug). The property a static
+  command table cannot have, and the one the tests pin hardest: a
+  button stops being offerable the moment the app stops drawing it.
+  4 tests. NOTE: no app has wired a palette to this yet — what changed
+  is that adopting `command_id` now yields something instead of filling
+  in a field nothing reads.
 
 ## 5. blackstar-rs: CLOSED (see §1)
 
