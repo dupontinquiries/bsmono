@@ -1237,9 +1237,20 @@ not, and they are not chrome:
   That is what "continues in the background" promises, and it has a
   test. uikit-egui 290/290, voiceterm checks clean.
 
-  Still open here: voice models and the Ollama fallback. The RAM
-  recommendation is done (below) and reaches both screens, since
-  SetupWizard embeds the same `ModelPicker`.
+  **Voice models and the Ollama fallback are now DONE.** Both are side
+  offers on the Intro screen with their own events
+  (`DownloadVoice`, `EnableOllama`), and a test pins that NEITHER moves
+  the phase — advancing for them would skip someone past choosing a
+  model because they enabled a fallback. The voice section is gated on
+  `!voice_installed` (an offer to install what is installed is noise)
+  and shows a disabled "Downloading voice models…" while fetching, since
+  an ~88 MB download behind a live-looking button reads as a click that
+  did nothing. Both flags default FALSE: the wizard must not claim voice
+  is present or Ollama is on until the host says so, because guessing
+  optimistically hides the offers this screen exists to make.
+
+  **SetupWizard is now complete against its outline.** The RAM
+  recommendation arrived via the shared `ModelPicker` (C12-28c).
 
 **C12-28c — the RAM heading, DONE and shared.** It appeared in BOTH
 audits, which is the signal it should be written once. `picks_heading`

@@ -6,6 +6,7 @@
 //! and unit-tested; each phase's rendering is egui.
 
 use crate::model_picker::{ModelAction, ModelPicker};
+use egui::RichText;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -37,6 +38,11 @@ pub enum WizardEvent {
     /// mid-flight comes back to Downloading rather than restarting at
     /// Intro, which is what "continues in the background" promises.
     Close,
+    /// Fetch the speech models (~88 MB, recommended pair).
+    DownloadVoice,
+    /// Turn on the Ollama fallback for a machine that cannot run a
+    /// local GGUF.
+    EnableOllama,
 }
 
 /// The pure phase transition. Returns the next phase for `event` from `current`. Unknown/no-op
@@ -59,11 +65,34 @@ pub struct SetupWizard {
     pub picker: ModelPicker,
     /// Active model name, when one is set.
     pub active_model: Option<String>,
+    /// Speech models present on disk. The wizard sets up the VOICE half
+    /// of voiceterm as well as the text half, and the port had no
+    /// mention of speech at all — so this was unreachable from the one
+    /// screen whose job is setup.
+    pub voice_installed: bool,
+    /// True while the speech download runs, so the button can say so
+    /// rather than looking unresponsive on an ~88 MB fetch.
+    pub voice_downloading: bool,
+    /// Ollama fallback enabled. The escape hatch for a machine that
+    /// cannot run a local GGUF at all — without it such a machine
+    /// finishes setup with nothing working.
+    pub ollama_fallback: bool,
 }
 
 impl SetupWizard {
     pub fn new(has_active_model: bool) -> Self {
-        Self { phase: initial_phase(has_active_model), picker: ModelPicker::default(), active_model: None }
+        Self {
+            phase: initial_phase(has_active_model),
+            picker: ModelPicker::default(),
+            active_model: None,
+            // Default FALSE for both: the wizard must not claim voice is
+            // installed or Ollama is on until the host says so. Guessing
+            // optimistically here would hide the very offers this screen
+            // exists to make.
+            voice_installed: false,
+            voice_downloading: false,
+            ollama_fallback: false,
+        }
     }
 
     /// Render the current phase. Returns a [`WizardEvent`] the host should act on (start a download,
@@ -76,6 +105,43 @@ impl SetupWizard {
                 ui.add_space(8.0);
                 ui.label("voiceterm runs a local llama.cpp model for on-device chat and command \
                           understanding. Pick one to download, or drop a .gguf in the models folder.");
+                ui.add_space(12.0);
+                // VOICE INPUT — the other half of setting up voiceterm,
+                // and absent from the port entirely. Shown only when the
+                // models are missing: an offer to install what is already
+                // installed is noise, and the QML gates it the same way.
+                if !self.voice_installed {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(RichText::new("🎤 Voice input").strong().small());
+                    ui.label("Speech models aren't installed yet. Download the recommended pair \
+                              (~88 MB) to enable voice.");
+                    ui.add_space(4.0);
+                    if self.voice_downloading {
+                        // An 88 MB fetch with a live-looking button reads
+                        // as a click that did nothing.
+                        ui.add_enabled(false, egui::Button::new("Downloading voice models…"));
+                    } else if ui.button("Download voice models").clicked() {
+                        event = Some(WizardEvent::DownloadVoice);
+                    }
+                }
+
+                // OLLAMA FALLBACK — for a machine that cannot run a local
+                // GGUF at all. Without it such a machine finishes setup
+                // with nothing working and no hint that anything else
+                // exists.
+                ui.add_space(12.0);
+                ui.separator();
+                if self.ollama_fallback {
+                    ui.label(RichText::new("Ollama fallback is on.").weak().small());
+                } else {
+                    ui.label(RichText::new("Already run Ollama? Enable it as a fallback.")
+                        .weak().small());
+                    if ui.button("Enable Ollama").clicked() {
+                        event = Some(WizardEvent::EnableOllama);
+                    }
+                }
+
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("Browse models →").clicked() {
@@ -161,6 +227,18 @@ impl SetupWizard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_and_ollama_do_not_move_the_model_setup_along() {
+        // Both are SIDE offers on the Intro screen, not steps in the
+        // model flow. Advancing the phase for them would skip the person
+        // past choosing a model because they enabled a fallback, which is
+        // the opposite of what they asked for.
+        for e in [WizardEvent::DownloadVoice, WizardEvent::EnableOllama] {
+            assert_eq!(next_phase(Phase::Intro, &e), Phase::Intro, "{e:?}");
+            assert_eq!(next_phase(Phase::Downloading, &e), Phase::Downloading, "{e:?}");
+        }
+    }
 
     #[test]
     fn hiding_a_download_keeps_the_phase_so_it_resumes_where_it_was() {
