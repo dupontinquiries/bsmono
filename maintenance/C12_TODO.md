@@ -1472,10 +1472,29 @@ and the client.
 
   4 tests against an in-process fake daemon on a real UnixListener.
 
-  STILL MISSING: the daemon SIDE. `logscope-serve` needs the second
-  listener, and it needs a lifecycle — start on demand, idle-unload, one
-  instance per model path. That is the part that has to run as a
-  process, and it is where the memory saving actually happens.
+  The DAEMON SIDE now has its listener: `netserve::serve_unix`. The
+  change that unlocked it was one signature — `read_request` was typed
+  to `&mut TcpStream` and never used anything TCP-specific, so making it
+  generic over `Read` let the same parser and the same `handle` serve
+  both doors. That is why this is a second listener rather than a second
+  protocol: nothing about the endpoint is duplicated.
+
+  No keyring on the unix door, and it is safe BY CONSTRUCTION rather
+  than by a flag: `Keyring::accepts` returns true on an empty ring
+  (verified, not assumed), so passing `Keyring::default()` authorises
+  local callers through the filesystem's own permissions. The TCP path
+  keeps its keyring for the LAN case. A stale socket file is removed
+  before binding — a daemon that will not start because its predecessor
+  was killed is a daemon people stop running.
+
+  2 end-to-end tests over a real UnixListener rather than calling
+  `handle` directly, because the thing in the way WAS the transport and
+  a test that skipped the socket would not have caught it.
+  gpu-gemm 1237/1237.
+
+  STILL MISSING: the LIFECYCLE — start on demand, idle-unload, one
+  instance per model path — and a `logscope-serve` flag to open the
+  unix door. The plumbing is in place; nothing runs it yet.
 - **C12-30b — DONE, and built before the daemon on purpose.**
   `Reach::{Daemon, InProcess}` plus `resolve(order, daemon, in_process)`:
   try each in order, take the first that constructs, report which one

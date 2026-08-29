@@ -110,7 +110,13 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Read and parse one HTTP/1.1 request: request line, headers (Authorization / X-API-Key /
 /// Content-Length), and a length-bounded body. Returns None on malformed/oversized input.
-pub fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
+/// Generic over the stream so ONE parser serves both transports.
+///
+/// Was `&mut TcpStream`. The daemon needs the same endpoint over a unix
+/// socket — same requests, same handler, different door — and the only
+/// thing standing in the way was this signature naming a concrete type
+/// it never used anything specific from.
+pub fn read_request<S: Read>(stream: &mut S) -> Option<HttpRequest> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let head_end = loop {
@@ -185,6 +191,47 @@ pub fn handle(
 
 /// Serve forever: accept connections, handle each on its own thread. `gen` is shared via
 /// `Arc`, so the engine's `Gpu` + `Model` back every connection with no reload.
+/// Serve on a unix socket: the SAME endpoint, for consumers on this
+/// machine.
+///
+/// Why this exists rather than pointing local apps at the TCP port: on
+/// one machine the expensive thing is not the transport, it is that each
+/// app otherwise loads its own copy of the weights — 7.2 GiB resident
+/// and 86 seconds, per app. This is the door through which they share
+/// one.
+///
+/// NO KEYRING. The filesystem already answers who may connect to a
+/// socket in the user's own runtime directory, and a key on a
+/// same-machine socket is ceremony with a storage problem attached. The
+/// TCP path keeps its keyring for the across-the-LAN case, which is a
+/// genuinely different threat — so this passes an empty one and the
+/// handler's auth check is bypassed for local callers by construction
+/// rather than by a flag someone can flip the wrong way.
+///
+/// Removes a stale socket first. A daemon that will not start because
+/// its predecessor was killed is a daemon people stop running.
+pub fn serve_unix(
+    path: &std::path::Path, keys: Keyring,
+    gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync>,
+) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    let keys = Arc::new(keys);
+    for stream in listener.incoming().flatten() {
+        let (keys, gen) = (keys.clone(), gen.clone());
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            if let Some(req) = read_request(&mut stream) {
+                let resp = handle(&req, &keys, gen.as_ref());
+                let _ = stream.write_all(&resp.bytes());
+            }
+            let _ = stream.flush();
+        });
+    }
+    Ok(())
+}
+
 pub fn serve(
     listener: TcpListener, keys: Keyring,
     gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync>,
@@ -201,5 +248,83 @@ pub fn serve(
             }
             let _ = stream.flush();
         });
+    }
+}
+
+#[cfg(test)]
+mod unix_tests {
+    use super::*;
+
+    /// End-to-end over the real socket: bind, connect, generate.
+    ///
+    /// Worth doing for real rather than calling `handle` directly,
+    /// because the thing that was in the way was the TRANSPORT — a
+    /// `read_request` typed to TcpStream — and a test that skips the
+    /// socket would not have caught that.
+    #[test]
+    fn the_unix_door_serves_the_same_endpoint_as_the_tcp_one() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("gg-unix-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("engine.sock");
+        let p2 = path.clone();
+
+        std::thread::spawn(move || {
+            // Empty keyring: local callers are authorised by the
+            // filesystem, and `accepts` returns true on an empty ring.
+            let gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync> =
+                Arc::new(|prompt: &str, max: usize| format!("echo:{prompt}:{max}"));
+            let _ = serve_unix(&p2, Keyring::default(), gen);
+        });
+
+        // Wait for the bind rather than sleeping a fixed time.
+        let mut sock = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::os::unix::net::UnixStream::connect(&path) {
+                sock = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut sock = sock.expect("daemon socket never appeared");
+
+        let body = "fn f() { ";
+        let req = format!(
+            "POST /generate?max=32 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut raw = String::new();
+        sock.read_to_string(&mut raw).unwrap();
+
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        assert!(raw.contains("echo:fn f() { :32"), "prompt and max both arrived: {raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_socket_file_does_not_stop_the_daemon_starting() {
+        // A daemon that will not start because its predecessor was killed
+        // is a daemon people stop running.
+        let dir = std::env::temp_dir().join(format!("gg-stale-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("stale.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        assert!(path.exists());
+
+        let p2 = path.clone();
+        std::thread::spawn(move || {
+            let gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync> =
+                Arc::new(|_: &str, _: usize| String::new());
+            let _ = serve_unix(&p2, Keyring::default(), gen);
+        });
+        let mut ok = false;
+        for _ in 0..200 {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() { ok = true; break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ok, "the stale file was not cleared");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
