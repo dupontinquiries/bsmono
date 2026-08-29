@@ -1303,9 +1303,10 @@ gestures — real preferences, backed by `settings_kit::Prefs`.
 What I ported is a DIFFERENT surface: the QML `settingsPopup` is four
 navigation doors (model setup, chat, recipes, sessions) plus voice
 activation and theme. The two are complementary — one is preferences,
-the other is a launcher — and the kit's `settings_panel` should
-probably be renamed to say so, since two things called settings_panel
-in one app is how the next reader repeats my mistake.
+the other is a launcher — and the kit's widget is now named
+`quick_launcher` rather than `settings_panel`, since two things called
+settings_panel in one app is how the next reader repeats my mistake and
+concludes one is a duplicate.
 
 **The original C12-29a entry, kept for what it built:** Ported from
 `main.qml`'s `settingsPopup` (L27729). Six entries: four DOORS (model
@@ -1322,7 +1323,7 @@ reachable from `shell::settings_panel`, which is a preferences screen.
 So the gap was real but narrower than "settings is missing": it is the
 LAUNCHER that was missing, not the settings.
 
-- **C12-29b — nothing renders `settings_panel` yet.** Same shape as the
+- **C12-29b — nothing renders `quick_launcher` yet.** Same shape as the
   cmdstrip (§26a): the widget and its events exist, no app draws it.
 - **C12-29c — region slicing DONE, and the first findings are that
   there is less QML here than expected.** `qml_outline.py --region <id>`

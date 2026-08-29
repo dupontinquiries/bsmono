@@ -1,4 +1,11 @@
-//! settings_panel — egui port of `main.qml`'s `settingsPopup` (L27729).
+//! quick_launcher — egui port of `main.qml`'s `settingsPopup` (L27729).
+//!
+//! NAMED FOR WHAT IT IS, not for the QML element it came from. The QML
+//! calls it a settings popup and it is mostly a LAUNCHER: four of its six
+//! entries open another screen. voiceterm already has a real settings
+//! panel (`shell::settings_panel` — animation, palette, display,
+//! gestures), and two things called settings_panel in one app is how the
+//! next reader concludes one of them is a duplicate and deletes it.
 //!
 //! The one screen with no egui counterpart at all. Every other audited
 //! surface existed and was missing pieces; this one was absent, so
@@ -10,7 +17,7 @@
 //! Four of the six entries are DOORS: they open another screen and
 //! nothing more. Only voice activation and theme are settings in the
 //! sense of a value the panel owns. That shape is why this returns a
-//! [`SettingsEvent`] rather than mutating a config struct — a widget
+//! [`LauncherEvent`] rather than mutating a config struct — a widget
 //! that opened the chat panel itself would need a handle to it, and to
 //! the model setup, and to the session store, which is most of the app.
 //!
@@ -23,7 +30,7 @@ use egui::{RichText, Ui};
 
 /// What the panel asked the host to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsEvent {
+pub enum LauncherEvent {
     /// "⚡ Set up models (LLM + voice)" — opens the setup wizard.
     OpenSetup,
     /// "💬 Chat with local model".
@@ -32,7 +39,7 @@ pub enum SettingsEvent {
     OpenRecipes,
     /// "Sessions — what you've done".
     OpenSessions,
-    /// Voice activation was toggled; the new value is in [`Settings`].
+    /// Voice activation was toggled; the new value is in [`LauncherState`].
     VoiceActivationChanged,
     /// Theme index changed.
     ThemeChanged,
@@ -40,7 +47,7 @@ pub enum SettingsEvent {
 
 /// The values the panel owns. Everything else it only navigates to.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Settings {
+pub struct LauncherState {
     /// Wake-word listening on.
     pub voice_activation: bool,
     /// Selected theme index into `themes`.
@@ -51,9 +58,9 @@ pub struct Settings {
     pub themes: Vec<String>,
 }
 
-impl Default for Settings {
+impl Default for LauncherState {
     fn default() -> Self {
-        Settings {
+        LauncherState {
             voice_activation: false,
             theme: 0,
             themes: vec!["dark".into(), "light".into()],
@@ -61,7 +68,7 @@ impl Default for Settings {
     }
 }
 
-impl Settings {
+impl LauncherState {
     /// Clamp the theme index to the list. A stored index from a build
     /// with more themes must not panic or silently select nothing — it
     /// falls back to the first, which always exists when the list does.
@@ -87,7 +94,7 @@ impl Settings {
 /// Draw the panel. Returns at most one event per frame — the first
 /// thing clicked, since these open exclusive screens and two at once is
 /// not a state the host can honour.
-pub fn settings_ui(ui: &mut Ui, s: &mut Settings) -> Option<SettingsEvent> {
+pub fn quick_launcher_ui(ui: &mut Ui, s: &mut LauncherState) -> Option<LauncherEvent> {
     let mut event = None;
 
     ui.label(RichText::new("Settings").heading().strong());
@@ -96,10 +103,10 @@ pub fn settings_ui(ui: &mut Ui, s: &mut Settings) -> Option<SettingsEvent> {
     // The doors. Each carries a trailing arrow, as the QML does, so a
     // navigation reads differently from a toggle at a glance.
     for (label, ev) in [
-        ("⚡ Set up models (LLM + voice)", SettingsEvent::OpenSetup),
-        ("💬 Chat with local model", SettingsEvent::OpenChat),
-        ("✨ Recipes — what web2qml can do", SettingsEvent::OpenRecipes),
-        ("⏱ Sessions — what you've done", SettingsEvent::OpenSessions),
+        ("⚡ Set up models (LLM + voice)", LauncherEvent::OpenSetup),
+        ("💬 Chat with local model", LauncherEvent::OpenChat),
+        ("✨ Recipes — what web2qml can do", LauncherEvent::OpenRecipes),
+        ("⏱ Sessions — what you've done", LauncherEvent::OpenSessions),
     ] {
         ui.horizontal(|ui| {
             if ui.button(label).clicked() && event.is_none() {
@@ -119,7 +126,7 @@ pub fn settings_ui(ui: &mut Ui, s: &mut Settings) -> Option<SettingsEvent> {
     if ui.checkbox(&mut s.voice_activation, "listen for the wake word").changed()
         && event.is_none()
     {
-        event = Some(SettingsEvent::VoiceActivationChanged);
+        event = Some(LauncherEvent::VoiceActivationChanged);
     }
 
     ui.add_space(6.0);
@@ -127,7 +134,7 @@ pub fn settings_ui(ui: &mut Ui, s: &mut Settings) -> Option<SettingsEvent> {
         ui.label(RichText::new("Theme").weak().small());
         if ui.button(s.theme_name().to_string()).clicked() && event.is_none() {
             s.cycle_theme();
-            event = Some(SettingsEvent::ThemeChanged);
+            event = Some(LauncherEvent::ThemeChanged);
         }
     });
 
@@ -140,7 +147,7 @@ mod tests {
 
     #[test]
     fn cycling_themes_wraps_and_never_leaves_the_list() {
-        let mut s = Settings { themes: vec!["a".into(), "b".into(), "c".into()], ..Default::default() };
+        let mut s = LauncherState { themes: vec!["a".into(), "b".into(), "c".into()], ..Default::default() };
         assert_eq!(s.theme_name(), "a");
         s.cycle_theme();
         assert_eq!(s.theme_name(), "b");
@@ -153,13 +160,13 @@ mod tests {
     fn a_stored_index_past_the_end_falls_back_rather_than_selecting_nothing() {
         // A config written by a build with more themes must not leave the
         // panel showing nothing, or panic on the index.
-        let s = Settings { theme: 99, themes: vec!["only".into()], ..Default::default() };
+        let s = LauncherState { theme: 99, themes: vec!["only".into()], ..Default::default() };
         assert_eq!(s.theme_name(), "only");
     }
 
     #[test]
     fn an_empty_theme_list_is_not_a_panic() {
-        let mut s = Settings { theme: 0, themes: vec![], ..Default::default() };
+        let mut s = LauncherState { theme: 0, themes: vec![], ..Default::default() };
         assert_eq!(s.theme_name(), "default");
         s.cycle_theme(); // must not divide by zero
         assert_eq!(s.theme, 0);
@@ -172,12 +179,12 @@ mod tests {
         // owns. A host routing these does not have to guess which is
         // which.
         let navigations = [
-            SettingsEvent::OpenSetup,
-            SettingsEvent::OpenChat,
-            SettingsEvent::OpenRecipes,
-            SettingsEvent::OpenSessions,
+            LauncherEvent::OpenSetup,
+            LauncherEvent::OpenChat,
+            LauncherEvent::OpenRecipes,
+            LauncherEvent::OpenSessions,
         ];
-        let changes = [SettingsEvent::VoiceActivationChanged, SettingsEvent::ThemeChanged];
+        let changes = [LauncherEvent::VoiceActivationChanged, LauncherEvent::ThemeChanged];
         for n in navigations {
             assert!(!changes.contains(&n), "{n:?} is both a door and a setting");
         }
