@@ -9394,9 +9394,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // When the scene is disabled, build_debug_mesh returns empty,
         // and upload_prebuilt_mesh evicts any prior mesh — clean.
         let debug_mesh = unendlich_engine::debug_overlay::build_debug_mesh(&debug_scene);
-        let debug_coord = unendlich_engine::world::chunk::ChunkCoord {
-            x: i32::MIN, y: i32::MIN, z: i32::MIN,
-        };
+        let debug_coord = unendlich_engine::world::chunk::ChunkCoord::DEBUG_OVERLAY;
         if let Err(e) = renderer.upload_prebuilt_mesh(&ctx, debug_coord, debug_mesh, 0) {
             log::warn!("debug overlay upload failed: {}", e);
         }
@@ -10780,13 +10778,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // per loaded chunk); shell-iterator for submit (walks outward
         // from the player in Chebyshev order and short-circuits).
         let in_render_distance = |c: ChunkCoord| -> bool {
-            // The first headless lavapipe soak crashed HERE: a chunk coord
-            // near i32::MIN entered the loaded set, and (i32::MIN)² overflows
-            // even i64 when summed — so wild coords are rejected BEFORE any
-            // distance math (unsigned_abs: abs(i32::MIN) itself panics).
-            // Rejecting = evicting, exactly the right treatment for corrupt
-            // coords; the one-shot log names the evidence for the producer
-            // hunt.
+            // r601: the debug-overlay sentinel is a DESIGNED out-of-band key
+            // (see ChunkCoord::DEBUG_OVERLAY) — always "in range", never
+            // evicted, never warned about. The r596 hunt started from this
+            // very coord crashing the distance math below.
+            if c == ChunkCoord::DEBUG_OVERLAY {
+                return true;
+            }
+            // Genuine wild coords (any other saturation pattern) are rejected
+            // BEFORE any distance math ((i32::MIN)² overflows even i64;
+            // abs(i32::MIN) panics — unsigned_abs) and get evicted, with a
+            // one-shot log naming the evidence.
             let wild = c.x.unsigned_abs() > 1_000_000
                 || c.y.unsigned_abs() > 1_000_000
                 || c.z.unsigned_abs() > 1_000_000;
@@ -11553,6 +11555,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     log::warn!("Deferrable upload failed for {:?} at {:?}: {}", result.coord, result.lod, e);
                     continue;
                 }
+            } else if {
+                // r601 producer trap (drain side): fingerprint a wild-coord
+                // mesh RESULT before upload — version/lod/vertex counts tell
+                // a default-constructed placeholder apart from an echoed
+                // wild request.
+                if result.coord != unendlich_engine::world::chunk::ChunkCoord::DEBUG_OVERLAY
+                    && result.coord.x.unsigned_abs() > 1_000_000
+                    || result.coord.y.unsigned_abs() > 1_000_000
+                    || result.coord.z.unsigned_abs() > 1_000_000
+                {
+                    static TRAP_DRAIN_ONCE: std::sync::Once = std::sync::Once::new();
+                    TRAP_DRAIN_ONCE.call_once(|| {
+                        log::error!(
+                            "[watchdog] WILD mesh RESULT drained: coord=({},{},{}) lod={:?} version={} verts={} — a poisoned request or a placeholder result",
+                            result.coord.x, result.coord.y, result.coord.z,
+                            result.lod, result.version, result.mesh.vertices.len()
+                        );
+                    });
+                }
+                false
+            } {
+                unreachable!()
             } else if let Err(e) = renderer.upload_prebuilt_mesh_at_lod(&ctx, result.coord, result.lod, result.mesh, result.version) {
                 log::warn!("Upload failed for {:?} at {:?}: {}", result.coord, result.lod, e);
                 continue;

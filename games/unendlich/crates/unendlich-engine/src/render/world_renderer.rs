@@ -1889,9 +1889,10 @@ impl WorldRenderer {
             // request fires only when chunk.version changes.
             // r598 producer trap (empty-mesh path — the meshes-map trap
             // stayed silent, so the wild coord arrives as an EMPTY mesh).
-            if key.coord.x.unsigned_abs() > 1_000_000
-                || key.coord.y.unsigned_abs() > 1_000_000
-                || key.coord.z.unsigned_abs() > 1_000_000
+            if key.coord != crate::world::chunk::ChunkCoord::DEBUG_OVERLAY
+                && (key.coord.x.unsigned_abs() > 1_000_000
+                    || key.coord.y.unsigned_abs() > 1_000_000
+                    || key.coord.z.unsigned_abs() > 1_000_000)
             {
                 static TRAP_EMPTY_ONCE: std::sync::Once = std::sync::Once::new();
                 TRAP_EMPTY_ONCE.call_once(|| {
@@ -1904,9 +1905,10 @@ impl WorldRenderer {
             }
             // r598 producer trap (empty-mesh path — the meshes-map trap
         // stayed silent, so the wild coord arrives as an EMPTY mesh).
-        if key.coord.x.unsigned_abs() > 1_000_000
-            || key.coord.y.unsigned_abs() > 1_000_000
-            || key.coord.z.unsigned_abs() > 1_000_000
+        if key.coord != crate::world::chunk::ChunkCoord::DEBUG_OVERLAY
+            && (key.coord.x.unsigned_abs() > 1_000_000
+                || key.coord.y.unsigned_abs() > 1_000_000
+                || key.coord.z.unsigned_abs() > 1_000_000)
         {
             static TRAP_EMPTY_ONCE: std::sync::Once = std::sync::Once::new();
             TRAP_EMPTY_ONCE.call_once(|| {
@@ -2199,9 +2201,10 @@ impl WorldRenderer {
         // entering the loaded set per run (menu phase). The eviction guard
         // rejects it downstream; THIS one-shot names the producer — the
         // captured backtrace is the whole hunt.
-        if coord.x.unsigned_abs() > 1_000_000
-            || coord.y.unsigned_abs() > 1_000_000
-            || coord.z.unsigned_abs() > 1_000_000
+        if coord != crate::world::chunk::ChunkCoord::DEBUG_OVERLAY
+            && (coord.x.unsigned_abs() > 1_000_000
+                || coord.y.unsigned_abs() > 1_000_000
+                || coord.z.unsigned_abs() > 1_000_000)
         {
             static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
             TRAP_ONCE.call_once(|| {

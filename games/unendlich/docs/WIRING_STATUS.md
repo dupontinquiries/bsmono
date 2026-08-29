@@ -11960,3 +11960,15 @@ disturbance, creature encounters) is the real player path under real motion, not
 zero panics; ecosystem anchor crossed chunk boundaries (0,0)→(-1,0)→(0,0) proving the walk; armed NaN traps unchanged
 (the wild coord remains a title-screen, pre-autoplay event). Movement soaks are now the default deepest rung of the
 in-sandbox ladder: unit suite → GPU probe → title soak → in-world soak → MOVING in-world soak.
+
+## r601 — CASE CLOSED: the "wild coord" was the debug-overlay SENTINEL (by design), now named + exempted
+The r596-598 hunt's conclusion, revising those entries' narrative: the (i32::MIN)³ chunk was never a NaN producer. It
+is the F4 debug-overlay system's DELIBERATE out-of-band mesh key — an inline literal at the upload site ("the world
+renderer skips frustum culling for this coord"), uploaded every frame, entering empty_mesh_versions whenever the scene
+is disabled. The original r596 crash was still real (the sentinel meeting unguarded i32 distance math in eviction) and
+every guard added remains correct and NECESSARY — they now protect against GENUINE saturation (any +inf/mixed-axis
+pattern). Landed: ChunkCoord::DEBUG_OVERLAY (named constant, documented ambiguity: a true -inf triple would look
+identical; everything else still trips), the upload site uses it, eviction treats it as always-in-range (never evicted,
+never churned), and all five traps + the drain fingerprint exempt exactly it. PROOF: 90 s moving in-world soak with a
+COMPLETELY CLEAN log — exit 0, zero panics, zero watchdog lines. The armed traps stay in-tree for real NaN classes.
+Elimination work retained: roamer sanity sweep, player-pose watchdog, set_block wild-write refusal — all real nets.
