@@ -938,16 +938,49 @@ Also corrected: **C11-21a names the wrong function.** The field path is
   Adreno device since it started working. The field's own numbers were taken
   while it was inert, so every previous submits/token figure describes the
   unbounded path and should not be compared against a new run without saying so.
-- **C12-26b — `LOGSCOPE_FORCE_WATCHDOG=1`** forces `watchdog_prone()` on (never
-  off, deliberately) so the mobile decode branch runs on any device. It is what
-  showed the bound was inert. Nothing in CI uses it yet; a regression test that
-  pins "the watchdog path submits more than the desktop path" would be cheap and
-  does not exist.
+- **C12-26b — PARTLY CLOSED (`8d0e53f4`).** `LOGSCOPE_FORCE_WATCHDOG=1` forces
+  `watchdog_prone()` on (never off, deliberately) so the mobile decode branch
+  runs on any device; it is what showed the bound was inert. The DECISION is now
+  a pure seam — `window_flush_plan(k, n_layers, bounded, saved)` — and is tested
+  without a GPU, including that the mobile branch is bounded above regardless of
+  k and strictly tighter than the collapsing branch.
+  **Still open:** nothing tests the env var or the end-to-end submit COUNT. An
+  env-based test would mutate process-global state while 1236 tests run in
+  parallel, so it wants a serial-test mechanism (or a `Gpu` constructor taking
+  the flag) rather than `set_var` in a `#[test]`. The arithmetic is pinned; the
+  wiring from `watchdog_prone()` to the plan is not.
 - **C12-26c — `per_tok` is now `n_layers * 16`, derived from a lavapipe
   measurement** (12.5–14.7 dispatches per layer-token across 3/8/16-layer
   fixtures). That ratio is measured on ONE driver with tiny fixtures; a real
   model on real hardware may sit elsewhere, and the constant 16 is a generous
   round-up rather than a law. `count-dispatch <model> <n> <k>` reports it.
+- **C12-26f — `--gate-qkv`'s end-to-end failure is ONE ULP, and the gate now
+  says so (`f125064f`).** It read `len 48 vs 48, max|Δ|=2.384e-6, rel=5.712e-7`
+  after the diagnostic was added — floating-point reassociation, not a fusion
+  that concatenates wrongly. The evidence is in the same gate: every isolated
+  fusion comparison is EXACTLY zero (int8 m=1/m=4, q4 m=1/m=4, fused bias), and
+  a wrong q/k/v block order produces garbage rather than a last-place bit.
+  NOT diagnosed and deliberately NOT "fixed" by relaxing to a tolerance —
+  lavapipe is documented here as departing from the WGSL spec in four ways
+  including FMA contraction, which would make bit-exactness correct on
+  conformant hardware and unreachable in this sandbox. Telling "the engine
+  reassociates" (fails everywhere) from "this driver contracts differently"
+  (fails only here) needs a second driver. Whoever runs this on real hardware
+  next sees 0.00e0 or 2.4e-6 immediately and the question answers itself.
+- **C12-26g — `forward_kv_q8_fused`'s doc cites `--gate-qkv-e2e`, which does not
+  exist** in `kernel-validate`'s gate list. Its claim ("bit-exact to it") is
+  unverified by anything in the tree. Same class as C11-19b's dangling
+  HiveMind_Strategy citation.
+- **C12-26h — the physical UI's `u_touch` is still dead, and wiring it is a
+  design task, not a fix.** `gpuscene.rs` declares the uniform and
+  `glow_scene.rs` uploads it every frame from `Uniforms::touch`, which nothing
+  outside that file ever sets, so it is `None` forever and the shader helper's
+  first line returns immediately on every fragment. Confirmed further this
+  session: there is NO picking/raycast anywhere in the crate (no `unproject`,
+  no `hit_test`, no ray code), so producing a world-space touch point needs
+  screen-to-world picking that does not exist. `docs/physical-ui-findings.md`
+  is right that this is small ONCE the UV attribute lands; it is not small
+  today, and it cannot be visually verified in this sandbox at all.
 - **C12-26d — two gates fail on lavapipe and predate this work.** Verified
   pre-existing by re-running with the flush pinned high (the old inert
   behaviour) and getting identical failures. `--gate-matvec`: the subgroup
