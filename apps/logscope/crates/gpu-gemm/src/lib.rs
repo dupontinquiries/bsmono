@@ -709,6 +709,48 @@ const POST_READBACK_FLUSH_CAP: u32 = 32;
 /// Metal, large enough that the flush cost amortizes over many dispatches. The `pre` logits the replay
 /// needs are held by the caller, not the frame, so they survive the flush.
 const SLOT_FLUSH: usize = 16;
+
+/// A generous upper bound on DISPATCHES per decoded token, from the model's depth.
+///
+/// Measured with `count-dispatch` on `stream_session_window` (the path the app actually
+/// decodes through): 12.5–14.7 dispatches per LAYER-token across 3, 8 and 16-layer fixtures
+/// on lavapipe. 16 rounds that up; the floor preserves the previous constant for models too
+/// shallow to reach it.
+///
+/// This was the bare constant 64, described in its own comment as a "generous upper bound on
+/// dispatches/token" — true only for a model of about five layers. Nothing noticed, because
+/// the comparison it feeds (`Frame.passes >= flush_every`) was dead until the counter it reads
+/// started being incremented.
+pub fn window_dispatches_per_token(n_layers: usize) -> u32 {
+    (n_layers as u32).saturating_mul(16).max(64)
+}
+
+/// How large a flush bound the decode window should run under.
+///
+/// Pure, and extracted from `stream_session_window` so it can be tested without a GPU. The
+/// mobile/Asahi branch of this decision existed for a long time and bounded nothing at all
+/// (see `Frame.passes`), which is precisely the class of bug an inline `if` inside a 200-line
+/// GPU loop hides: the only way to observe it was to own the hardware and read a submit
+/// profile.
+///
+/// * `bounded` — the device kills long submits (`watchdog_prone`, or already degraded). The
+///   window is deliberately NOT collapsed into one submit: completion callbacks are unreliable
+///   there, so the submit governor disables itself and nothing backpressures queue depth, and
+///   one unflushed window is a job the firmware watchdog can kill. Bound it instead and accept
+///   the per-token submit overhead.
+/// * otherwise — pin the flush above a whole window's dispatch cost, so `begin_frame` batches
+///   the entire window into one encoder. That is the window's entire purpose.
+///
+/// `saved` is the caller's pacing, honoured as a floor in the collapsing case (never pin
+/// LOWER than what the caller already chose) and as a ceiling in the bounded case (never pin
+/// higher than the caller's own bound).
+pub fn window_flush_plan(k: usize, n_layers: usize, bounded: bool, saved: u32) -> u32 {
+    if bounded {
+        saved.clamp(1, 64)
+    } else {
+        (k as u32).saturating_mul(window_dispatches_per_token(n_layers)).clamp(saved, 65536)
+    }
+}
 /// Content-cache cap: distinct (shape) dims that get their own permanent buffer. Sized to comfortably
 /// hold every stable per-shape uniform a model uses after warmup; per-position dims spill to the ring.
 /// Upper bound on the dims content cache. The EFFECTIVE cap is
@@ -16781,7 +16823,7 @@ LOWER bound — KV and resident weights are not pooled and are covered by baseli
             //
             // 16 per layer against a measured 12.5–14.7 keeps the "generous" the old comment
             // claimed, and the floor keeps the previous value for models too small to reach it.
-            let per_tok = (m.n_layers as u32).saturating_mul(16).max(64);
+            let per_tok = window_dispatches_per_token(m.n_layers);
             // On the conservative (Asahi/Honeykrisp) path, completion callbacks are unreliable — the submit
             // governor disables itself, leaving NO backpressure on queue depth. Batching a whole window into
             // ONE unflushed submit then hands the firmware one huge job the watchdog can kill (a decode hang
@@ -16794,10 +16836,11 @@ LOWER bound — KV and resident weights are not pooled and are covered by baseli
             // WATCHDOG-PRONE, not Apple. Mobile drivers kill long dispatches the same way Honeykrisp
             // does, and this guard bounds the decode window precisely to avoid that — so keying it on
             // an Apple-only flag left a phone taking the unbounded path.
-            if (self.watchdog_prone() || self.degraded()) && !force_collapse {
-                self.set_flush_every(saved_flush.clamp(1, 64));
+            let bounded = (self.watchdog_prone() || self.degraded()) && !force_collapse;
+            if bounded {
+                self.set_flush_every(window_flush_plan(k, m.n_layers, true, saved_flush));
             } else {
-                self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
+                self.set_flush_every(window_flush_plan(k, m.n_layers, false, saved_flush));
             }
         }
         let mut logits_t = Some(self.upload(&s.logits, 1, s.logits.len()));
@@ -21900,6 +21943,46 @@ mod verify_slicing_tests {
 mod window_batching_tests {
     use super::*;
     use std::sync::atomic::Ordering::Relaxed;
+
+    /// The decode window's flush decision, tested without a GPU.
+    ///
+    /// The bounded (mobile / Asahi) branch of this is the one that spent a long time bounding
+    /// nothing, and it could not be observed without owning the hardware. Now it is arithmetic.
+    #[test]
+    fn the_window_flush_plan_bounds_mobile_and_collapses_desktop() {
+        // Desktop: the pin must exceed a WHOLE window's dispatch cost, or the frame flushes
+        // mid-window and the window stops being one submit — which is all it is for.
+        for &(k, layers) in &[(4usize, 16usize), (4, 32), (8, 16), (2, 3)] {
+            let plan = window_flush_plan(k, layers, false, 1);
+            let window_cost = k as u32 * window_dispatches_per_token(layers);
+            assert!(plan >= window_cost,
+                "k={k} layers={layers}: pin {plan} is below the window's own cost {window_cost}, \
+                 so the flush fires inside the window");
+        }
+        // The regression that motivated deriving per_tok: the old constant 64 is below a
+        // 16-layer window's cost, so a fixed pin of k*64 could not have held it.
+        assert!(4 * 64 < 4 * window_dispatches_per_token(16),
+            "a 16-layer window must cost more than the old k*64 pin, or the fix changed nothing");
+        // Shallow models keep the previous value — the floor, not an accident.
+        assert_eq!(window_dispatches_per_token(1), 64);
+        assert_eq!(window_dispatches_per_token(4), 64);
+        assert!(window_dispatches_per_token(16) > 64);
+
+        // Mobile: bounded ABOVE, regardless of how large a window was asked for. This is the
+        // half that must never grow with k, or a big window hands the firmware a job its
+        // watchdog can kill.
+        for &k in &[2usize, 4, 8, 64] {
+            let plan = window_flush_plan(k, 32, true, 1024);
+            assert!((1..=64).contains(&plan),
+                "k={k}: the watchdog bound must stay within 64 dispatches, got {plan}");
+        }
+        // And it honours a caller who already paces tighter than the bound.
+        assert_eq!(window_flush_plan(4, 32, true, 8), 8);
+        // Bounded is strictly tighter than collapsing for any real model — the property the
+        // whole branch exists to provide, asserted as a comparison rather than a constant so
+        // it survives either side being retuned.
+        assert!(window_flush_plan(4, 32, true, 1024) < window_flush_plan(4, 32, false, 1024));
+    }
 
     /// `flush_every` MUST actually bound submits.
     ///
