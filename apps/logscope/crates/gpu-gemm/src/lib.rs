@@ -171,6 +171,8 @@ pub mod gemmadiffcpu; // DiffusionGemma whole-model CPU forward + block-AR denoi
 #[allow(dead_code)] pub mod expert_predict; // context-conditioned MoE expert predictor for SSD-streaming prefetch
 #[allow(dead_code)] pub mod expert_cache; // MoE expert-streaming policy: pin store + per-layer LRU slots + prefetch
 #[allow(dead_code)] pub mod llama4;  // Llama 4 iRoPE attention temperature tuning (long-context length gen)
+/// When the shared-weights daemon lets go, and who gets to be it.
+pub mod daemonlife;
 pub mod netserve;
 pub mod store;
 

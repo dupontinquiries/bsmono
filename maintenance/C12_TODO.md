@@ -1505,9 +1505,31 @@ and the client.
   looking in different places and each concluding the other is not
   running.
 
-  STILL MISSING: the LIFECYCLE — start on demand, idle-unload, one
-  instance per model path. Everything else is now connected end to end;
-  what remains is who starts the process and when it lets go.
+  The LIFECYCLE POLICY is now `daemonlife`, pure and tested (7 tests).
+  Both decisions take the clock rather than read it, so the awkward
+  cases are testable without a process, a socket or a model:
+  - `Life::decide` never unloads with a request in flight, however long
+    the idle window says — a prefill can take a minute and a daemon that
+    unloads mid-generation turns a slow answer into a lost one.
+  - Overlapping requests both have to finish; a stray `end` saturates
+    rather than wrapping, since `in_flight` at four billion would be a
+    memory leak with no symptom until the machine swaps.
+  - A backwards clock reads as "no time passed" rather than unloading
+    immediately.
+  - `should_start` names the third case rather than folding it into the
+    other two: a daemon running a DIFFERENT model must not be joined and
+    must not be duplicated, because two daemons hold two models' weights
+    — the exact situation this whole design exists to prevent.
+
+  Default idle is 10 minutes: long enough to cover reading a reply,
+  switching windows and a compile, short enough that a machine left
+  alone gets its memory back. The window exists because the expensive
+  thing is the LOAD (86s + pipeline warm-up), not the process — it is
+  not a politeness delay.
+
+  STILL MISSING: the WIRING of that policy — a janitor thread calling
+  `decide`, and `serve_unix` calling `begin`/`end` around each request.
+  The policy is decided and tested; nothing consults it yet.
 - **C12-30b — DONE, and built before the daemon on purpose.**
   `Reach::{Daemon, InProcess}` plus `resolve(order, daemon, in_process)`:
   try each in order, take the first that constructs, report which one
