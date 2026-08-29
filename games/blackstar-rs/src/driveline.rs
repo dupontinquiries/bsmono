@@ -108,10 +108,24 @@ impl Default for Handling {
 }
 
 /// Hull densities in tonnes per cubic metre of BOUNDING BOX — not of
-/// material. A car is mostly air inside its box (~0.25 t/m³ works out to a
-/// 1.5 t hatchback), armour is dense, aircraft are deliberately light.
-/// GUESSES, chosen so the reference vehicles land on plausible tonnages.
-const D_CAR: f32 = 0.25;
+/// material. A car is mostly air inside its box, armour is dense,
+/// aircraft are deliberately light. Chosen so the reference vehicles land
+/// on plausible tonnages — and now actually CHECKED against the
+/// arithmetic rather than asserted:
+///
+///   reference hull 4.4 x 1.8 x 1.3 m = 10.30 m³ of bounding box
+///   0.145 t/m³  ->  1.49 t, a hatchback
+///
+/// The comment here used to claim 0.25 "works out to a 1.5 t hatchback".
+/// It works out to 2.57 t, which is a loaded van, and
+/// `the_reference_car_is_left_alone` had been failing on exactly that
+/// figure. The prose was aspirational and nobody had multiplied it out.
+///
+/// Safe to change: ground accel/top/grip are derived from `size` (a
+/// LENGTH ratio against REF_LEN), not from absolute mass, so the tuned
+/// roster does not move. Only aircraft use mass directly, via thrust to
+/// weight and stall speed, and they have their own density.
+const D_CAR: f32 = 0.145;
 const D_TRACKED: f32 = 0.75;
 const D_HOVER: f32 = 0.18;
 const D_AIR: f32 = 0.12;
@@ -135,9 +149,36 @@ const CL_MAX: f32 = 1.4;
 /// MANY nozzles, never how strong.
 const THRUST_PER_NOZZLE_T: f32 = 0.55;
 
+/// How much of a wing's bounding box is actually structure. Wings are
+/// spar, skin and air; 12% is the rough figure that makes a flying wing
+/// weigh less than the same planform in solid aluminium without making
+/// it weigh nothing.
+const WING_FILL: f32 = 0.12;
+
 pub fn derive(s: Shape) -> Handling {
     let (l, w, h) = (s.half_len * 2.0, s.half_w * 2.0, s.half_h * 2.0);
-    let vol = (l * w * h).max(0.05);
+    // A WING IS NOT A SOLID BOX. Treating the whole planform as filled
+    // makes mass scale with span exactly as area does, and the two cancel
+    // in `v_stall = sqrt(2W / (rho S CLmax))`: mass/area reduces to
+    // `h * density`, independent of `w`. That is why a dart and a flying
+    // wing of the same fuselage reported an IDENTICAL 57.400238 — the
+    // span was reaching the formula on both sides of the fraction and
+    // cancelling itself out, so no wingspan could ever change the answer.
+    //
+    // So for an aircraft, split the planform: a fuselage of solid box
+    // (no wider than ~1.5x its own height, the widest a body plausibly
+    // is) plus wings that contribute their AREA in full but only ~12% of
+    // their box volume, wings being mostly skin and air. Ground vehicles
+    // keep the solid box they always had — a car IS roughly its bounding
+    // volume, and changing that would move every mass in the game to fix
+    // an aircraft bug.
+    let vol = if s.flying {
+        let fuse_w = w.min(h * 1.5);
+        let span = (w - fuse_w).max(0.0);
+        (l * fuse_w * h + l * span * h * WING_FILL).max(0.05)
+    } else {
+        (l * w * h).max(0.05)
+    };
     let density = if s.flying {
         D_AIR
     } else if s.tracked {
