@@ -3007,6 +3007,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // The id WE stamp on outbound entity states. Hosts keep the legacy
     // port-derived id; a joiner adopts the id its host assigned in Accept.
     let mut lan_my_eid: u64 = lan_session_port as u64;
+    // Join-at-any-time: per-joiner catch-up plans (the host streams its edit
+    // overlay in the timebending storage layout — join_sync records, paced),
+    // and the world clock a joiner adopts from its host's Accept so it lands
+    // in the host's evening rather than a fresh dawn.
+    let mut lan_join_syncs: Vec<(std::net::SocketAddrV4, unendlich_engine::sim::net::join_sync::SyncPlan)> = Vec::new();
+    let mut lan_adopt_time_ms: Option<u64> = None;
     let lan_local_ip: Option<[u8; 4]> = if lan_beacon.is_some() {
         let ip = unendlich_engine::sim::lan_discovery::local_lan_ipv4();
         match ip {
@@ -14151,7 +14157,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                     fg_app.enter_game();
-                    renderer.ui_pointer_active = false;
+
+                // Join-at-any-time: land at the HOST's time of day, not a fresh
+                // dawn — the clock rode the Accept (world_time_ms) and applies
+                // once, after this world (the host's world) finished loading.
+                if let Some(t_ms) = lan_adopt_time_ms.take() {
+                    sky_state.time_seconds = (t_ms as f64) / 1000.0;
+                    log::info!(
+                        "[lan-mp] adopted host world clock: {:.0}s into the day cycle",
+                        sky_state.time_seconds
+                    );
+                }                    renderer.ui_pointer_active = false;
                     window.set_cursor_mode(CursorMode::Disabled);
                     log::info!("fullgame: launch {plan:?} — entering game");
                 }
@@ -14182,6 +14198,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     const CH_ENTITY: u8 = 2;
                     const CH_WORLDCMD: u8 = 3;
                     const CH_AVATAR: u8 = 4; // r494: peer character appearance
+                    const CH_JOINSYNC: u8 = 5; // join-at-any-time: host→joiner edit catch-up (timebending layout)
                     use unendlich_engine::sim::net::world_cmd_wire::{decode_batch, encode_batch};
 
                     // Inbound: drain pending datagrams (non-blocking), route by channel.
@@ -14232,11 +14249,32 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                             .unwrap_or_else(|| "World".into()),
                                                         world_seed: fg_world_seed,
                                                         entity_id: Some(entity_id),
+                                                        // join at any time = join at the host's NOW
+                                                        world_time_ms: Some(
+                                                            (sky_state.time_seconds.max(0.0) * 1000.0) as u64,
+                                                        ),
                                                     }
                                                     .encode();
                                                     let mut dg = vec![CH_HANDSHAKE];
                                                     dg.extend_from_slice(&reply);
                                                     let _ = sock.send_to(&dg, src);
+                                                    // Queue the edit catch-up: the joiner regenerates
+                                                    // the seed's base; everything we DIVERGED from it
+                                                    // streams over in the timebending storage layout
+                                                    // (tick-0 = today's timeless overlay). Paced so a
+                                                    // built-up world doesn't stall the frame.
+                                                    if !rejoined || !lan_join_syncs.iter().any(|(a, _)| *a == src4) {
+                                                        let records = chunk_manager.edited_chunk_records();
+                                                        if !records.is_empty() {
+                                                            let plan = unendlich_engine::sim::net::join_sync::SyncPlan::new(&records, 4);
+                                                            log::info!(
+                                                                "[lan-mp] join-sync for '{name}': {} edited chunk record(s), {} batch(es)",
+                                                                records.len(), plan.total_batches()
+                                                            );
+                                                            lan_join_syncs.retain(|(a, _)| *a != src4);
+                                                            lan_join_syncs.push((src4, plan));
+                                                        }
+                                                    }
                                                 }
                                                 Admit::Denied(reason) => {
                                                     let text = match reason {
@@ -14256,13 +14294,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 }
                                             }
                                         }
-                                        Some(LanJoin::Accept { world_name, world_seed, entity_id }) => {
+                                        Some(LanJoin::Accept { world_name, world_seed, entity_id, world_time_ms }) => {
                                             // Adopt the host-assigned id (fixes the both-bound-
                                             // 9878 collision). An old host sends none → keep the
                                             // legacy port-derived id.
                                             if let Some(eid) = entity_id {
                                                 lan_my_eid = eid;
                                             }
+                                            // Adopt the host's world clock after the world loads —
+                                            // joining at any time lands at the host's time of day.
+                                            lan_adopt_time_ms = world_time_ms;
                                             log::info!(
                                                 "[lan-mp] accepted by host: joining world '{world_name}' seed {world_seed} as entity {lan_my_eid}"
                                             );
@@ -14379,6 +14420,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                             relay_as_host(a, &lan_host);
                                         }
                                     }
+                                    CH_JOINSYNC => {
+                                        // World-edit catch-up from OUR host only — targeted state,
+                                        // never relayed, ignored from anyone but the upstream.
+                                        if src4.is_some() && src4 == lan_peer_addr {
+                                            if let Some(raw) = unendlich_engine::sim::net::packet_compress::unpack(payload, 256 * 1024) {
+                                                if let Some(records) = unendlich_engine::sim::net::join_sync::decode_records(&raw) {
+                                                    let n = chunk_manager.apply_edit_records(&records);
+                                                    if n > 0 {
+                                                        log::info!("[lan-mp] join-sync applied {n} edit(s) from host");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -14412,6 +14467,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         lan_remote_last_seen.remove(&eid);
                         log::info!("[lan-mp] peer entity {eid} left the host table (timeout)");
                     }
+                    // Drain join-sync catch-up plans, a few batches per frame per
+                    // joiner. A peer that vanished mid-sync gets dropped with its
+                    // table entry (send_to just fails silently either way).
+                    lan_join_syncs.retain_mut(|(addr, plan)| {
+                        for batch in plan.drain_frame() {
+                            let mut dg = vec![CH_JOINSYNC];
+                            dg.extend_from_slice(
+                                &unendlich_engine::sim::net::packet_compress::pack(batch, 48),
+                            );
+                            let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*addr));
+                        }
+                        !plan.is_done()
+                    });
 
                     // Outbound handshake: a clicked host → send a JOIN to its candidate.
                     if renderer.menu_mp_pick >= 0 {

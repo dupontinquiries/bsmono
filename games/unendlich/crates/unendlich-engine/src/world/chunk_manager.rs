@@ -524,6 +524,64 @@ impl ChunkManager {
         self.world_edit_tick.load(Ordering::Relaxed)
     }
 
+    /// Join-at-any-time support: the current edit overlay of every LOADED
+    /// chunk, in the timebending storage layout (`sim::net::join_sync`
+    /// records; `tick: 0` = today's timeless overlay, per the storage-
+    /// integration doc's backward-compat rule). Deterministically ordered.
+    ///
+    /// Carried edits for UNLOADED chunks are not included: they materialise
+    /// when the host loads those chunks, and until then a joiner regenerates
+    /// the identical procedural base — nothing to hand over yet.
+    pub fn edited_chunk_records(&self) -> Vec<crate::sim::net::join_sync::ChunkEditRecord> {
+        use crate::sim::net::join_sync::{ChunkEditRecord, StampedEdit};
+        let mut out = Vec::new();
+        for entry in self.chunks.iter() {
+            let chunk = entry.value();
+            if chunk.explicit_indices.is_empty() {
+                continue;
+            }
+            let edits = chunk
+                .explicit_indices
+                .iter()
+                .map(|&idx| StampedEdit {
+                    tick: 0,
+                    index: idx,
+                    block: chunk.blocks[idx as usize] as u8,
+                })
+                .collect();
+            out.push(ChunkEditRecord { coord: chunk.coord, edits });
+        }
+        out.sort_by_key(|r| (r.coord.x, r.coord.y, r.coord.z));
+        out
+    }
+
+    /// Joiner side of join-sync: overlay received edit records onto the
+    /// regenerated base. Records for chunks not yet loaded flow through the
+    /// normal set_block carry path and apply when the chunk loads. Returns
+    /// how many edits were applied (or carried).
+    pub fn apply_edit_records(
+        &self,
+        records: &[crate::sim::net::join_sync::ChunkEditRecord],
+    ) -> usize {
+        let cs = crate::constants::CHUNK_SIZE;
+        let mut applied = 0usize;
+        for r in records {
+            for e in &r.edits {
+                let i = e.index as i32;
+                // Inverse of Chunk::block_index: x + z*S + y*S*S.
+                let (lx, lz, ly) = (i % cs, (i / cs) % cs, i / (cs * cs));
+                let (wx, wy, wz) =
+                    (r.coord.x * cs + lx, r.coord.y * cs + ly, r.coord.z * cs + lz);
+                if let Ok(b) = crate::world::blocks::BlockId::try_from(e.block) {
+                    if self.set_block(wx, wy, wz, b) {
+                        applied += 1;
+                    }
+                }
+            }
+        }
+        applied
+    }
+
     /// B1 (r102): the current world epoch. Incremented on every world reset
     /// (`reset_with_generator`/`rebuild_for_seed`). The renderer/mesher should
     /// read this when a mesh job is issued and again when its result returns,

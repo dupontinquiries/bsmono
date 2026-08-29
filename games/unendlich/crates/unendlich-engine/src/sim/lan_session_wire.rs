@@ -36,7 +36,16 @@ pub enum LanJoin {
     /// rides as a trailing field: old parsers stop after the seed and ignore
     /// it, old hosts simply don't send it (`None` on parse) and the joiner
     /// falls back to its legacy port-derived id. Wire-compatible both ways.
-    Accept { world_name: String, world_seed: u64, entity_id: Option<u64> },
+    Accept {
+        world_name: String,
+        world_seed: u64,
+        entity_id: Option<u64>,
+        /// Host's world clock (sky time, milliseconds) — "join at any time"
+        /// means arriving in the host's EVENING, not at a fresh dawn. Trails
+        /// entity_id with the same compatibility rule: old parsers stop
+        /// early, old hosts simply don't send it.
+        world_time_ms: Option<u64>,
+    },
     /// Host → joiner: rejected.
     Deny { reason: String },
 }
@@ -78,12 +87,18 @@ impl LanJoin {
                 o.push(TAG_JOIN);
                 put_str(&mut o, name);
             }
-            LanJoin::Accept { world_name, world_seed, entity_id } => {
+            LanJoin::Accept { world_name, world_seed, entity_id, world_time_ms } => {
                 o.push(TAG_ACCEPT);
                 put_str(&mut o, world_name);
                 o.extend_from_slice(&world_seed.to_le_bytes());
+                // Trailing optionals are positional: world_time_ms requires
+                // entity_id (a new host always sends both; encoding a time
+                // without an id would misparse on new readers).
                 if let Some(eid) = entity_id {
                     o.extend_from_slice(&eid.to_le_bytes());
+                    if let Some(t) = world_time_ms {
+                        o.extend_from_slice(&t.to_le_bytes());
+                    }
                 }
             }
             LanJoin::Deny { reason } => {
@@ -110,7 +125,8 @@ impl LanJoin {
                 // Optional trailing host-assigned entity id (new hosts send it;
                 // an old host's datagram simply ends here).
                 let entity_id = get_u64(data, &mut i);
-                Some(LanJoin::Accept { world_name, world_seed, entity_id })
+                let world_time_ms = get_u64(data, &mut i);
+                Some(LanJoin::Accept { world_name, world_seed, entity_id, world_time_ms })
             }
             TAG_DENY => Some(LanJoin::Deny { reason: get_str(data, &mut i)? }),
             _ => None,
@@ -133,11 +149,19 @@ mod tests {
             world_name: "Overworld".into(),
             world_seed: 0xDEAD_BEEF_1234,
             entity_id: None,
+            world_time_ms: None,
         });
         roundtrip(LanJoin::Accept {
             world_name: "Overworld".into(),
             world_seed: 0xDEAD_BEEF_1234,
             entity_id: Some((1 << 32) + 7),
+            world_time_ms: None,
+        });
+        roundtrip(LanJoin::Accept {
+            world_name: "Overworld".into(),
+            world_seed: 0xDEAD_BEEF_1234,
+            entity_id: Some((1 << 32) + 7),
+            world_time_ms: Some(600_000), // joined in the host's evening
         });
         roundtrip(LanJoin::Deny { reason: "world full".into() });
     }
@@ -145,8 +169,13 @@ mod tests {
     #[test]
     fn accept_preserves_seed_exactly() {
         let seed = 0xFEDC_BA98_7654_3210u64;
-        let enc = LanJoin::Accept { world_name: "w".into(), world_seed: seed, entity_id: None }
-            .encode();
+        let enc = LanJoin::Accept {
+            world_name: "w".into(),
+            world_seed: seed,
+            entity_id: None,
+            world_time_ms: None,
+        }
+        .encode();
         match LanJoin::parse(&enc) {
             Some(LanJoin::Accept { world_seed, .. }) => assert_eq!(world_seed, seed),
             other => panic!("expected Accept, got {other:?}"),
@@ -162,9 +191,10 @@ mod tests {
         put_str(&mut enc, "Overworld");
         enc.extend_from_slice(&42u64.to_le_bytes());
         match LanJoin::parse(&enc) {
-            Some(LanJoin::Accept { world_seed, entity_id, .. }) => {
+            Some(LanJoin::Accept { world_seed, entity_id, world_time_ms, .. }) => {
                 assert_eq!(world_seed, 42);
                 assert_eq!(entity_id, None);
+                assert_eq!(world_time_ms, None);
             }
             other => panic!("expected Accept, got {other:?}"),
         }
@@ -179,6 +209,7 @@ mod tests {
             world_name: "w".into(),
             world_seed: 7,
             entity_id: Some(0xABCD_0000_0001),
+            world_time_ms: Some(123_456),
         }
         .encode();
         let mut i = 5; // MAGIC + tag

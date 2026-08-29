@@ -40,6 +40,7 @@ pub mod lag_compensation; // r639-mp: server-side hit rewind — rewind targets 
 pub mod chunk_pool; // r640-mp: distributed worldgen dispatch across host + trusted admins (fault-tolerant)
 pub mod lan_host; // multi-peer host table: addr↔assigned-eid, fanout, liveness (over player_roster)
 pub mod lan_host_pump; // reusable host endpoint IO: socket + channel mux + star relay (loopback-tested)
+pub mod join_sync; // join-at-any-time catch-up: tick-stamped chunk edit records (the timebending storage layout), TimeSet scoops, paced batching
 pub mod world_cmd_wire; // r391-mp: WorldCmd reliable-channel codec + remote apply
 pub mod presence_loop; // r392-mp: host re-announce + browser classify/evict over WorldAdvert
 pub mod client_join; // r393-mp: client join driver (mailbox handshake → hole-punch → connected)

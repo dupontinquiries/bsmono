@@ -74,7 +74,8 @@ fn main() {
     // roster entry: a headless server has no player entity, and 0 can't
     // collide with either host-assigned ids (>= 1<<32) or legacy port-derived
     // ids (nonzero u16 ports).
-    use unendlich_engine::sim::net::lan_host_pump::{HostPump, PumpEvent, CH_WORLDCMD};
+    use unendlich_engine::sim::net::join_sync::SyncPlan;
+    use unendlich_engine::sim::net::lan_host_pump::{HostPump, PumpEvent, CH_JOINSYNC, CH_WORLDCMD};
     use unendlich_engine::sim::world_authority::WorldCmd;
     use unendlich_engine::world::blocks::BlockId;
     let mut pump = match HostPump::bind(cfg.port, &cfg.name, 0) {
@@ -117,6 +118,9 @@ fn main() {
     // that keep their surroundings resident and ticking.
     let mut player_pos: std::collections::HashMap<u64, (i32, i32, i32)> =
         std::collections::HashMap::new();
+    // Join-at-any-time: per-joiner edit catch-up (timebending storage layout,
+    // paced a few datagrams per tick so a built world doesn't stall the loop).
+    let mut join_syncs: Vec<(std::net::SocketAddrV4, SyncPlan)> = Vec::new();
     let net_start = Instant::now();
 
     // Fixed-rate tick loop.
@@ -139,16 +143,35 @@ fn main() {
 
         // -- Network drain: admissions, entity intake, edits, relay, prune. --
         if let Some(pump) = pump.as_mut() {
-            let events = pump.pump(now_ms, &cfg.name, cfg.seed, &|name| whitelist.admits(name));
+            // The server's world clock: sim ticks over tick_hz, in ms — the
+            // joiner adopts it so everyone shares the same time of day.
+            let world_time_ms = (tick as f64 / cfg.tick_hz.max(1) as f64 * 1000.0) as u64;
+            let events = pump.pump(now_ms, &cfg.name, cfg.seed, world_time_ms, &|name| {
+                whitelist.admits(name)
+            });
             let mut edits_applied: Vec<(u64, WorldCmd)> = Vec::new();
             for ev in events {
                 match ev {
-                    PumpEvent::PeerJoined { name, entity_id, rejoined } => {
+                    PumpEvent::PeerJoined { name, entity_id, rejoined, addr } => {
                         log::info!(
                             "[server] '{name}' joined (entity {entity_id}{}) — {} player(s)",
                             if rejoined { ", rejoined" } else { "" },
                             pump.host.live_peer_count()
                         );
+                        // Queue the edit catch-up unless this is a lost-Accept
+                        // retry with a plan already draining.
+                        if !join_syncs.iter().any(|(a, _)| *a == addr) {
+                            let records = chunks.edited_chunk_records();
+                            if !records.is_empty() {
+                                let plan = SyncPlan::new(&records, 4);
+                                log::info!(
+                                    "[server] join-sync for '{name}': {} record(s), {} batch(es)",
+                                    records.len(),
+                                    plan.total_batches()
+                                );
+                                join_syncs.push((addr, plan));
+                            }
+                        }
                     }
                     PumpEvent::PeerDenied { name, reason } => {
                         log::info!("[server] join denied for '{name}': {reason:?}");
@@ -199,6 +222,14 @@ fn main() {
                 log::debug!("[server] applied {} edit(s)", edits_applied.len());
             }
             let _ = CH_WORLDCMD; // channel byte re-exported for future host-originated edits
+            // Drain join-sync catch-up plans (paced).
+            join_syncs.retain_mut(|(addr, plan)| {
+                for batch in plan.drain_frame() {
+                    let packed = unendlich_engine::sim::net::packet_compress::pack(batch, 48);
+                    pump.send_to_peer(CH_JOINSYNC, &packed, *addr);
+                }
+                !plan.is_done()
+            });
 
             // -- Announce on the discovery beacon (2 s cadence). --
             if let Some(beacon) = &beacon {

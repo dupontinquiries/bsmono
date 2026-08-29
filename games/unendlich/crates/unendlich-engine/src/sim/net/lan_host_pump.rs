@@ -43,6 +43,9 @@ pub const CH_HANDSHAKE: u8 = 1;
 pub const CH_ENTITY: u8 = 2;
 pub const CH_WORLDCMD: u8 = 3;
 pub const CH_AVATAR: u8 = 4;
+/// Host → joiner world-edit catch-up (join_sync records, packed). Joiners
+/// apply; the pump does NOT relay it (it is per-peer targeted state).
+pub const CH_JOINSYNC: u8 = 5;
 
 /// Peers silent this long are pruned (matches the fullgame's avatar timeout).
 pub const PEER_TIMEOUT_MS: u64 = 5000;
@@ -54,7 +57,9 @@ const WORLDCMD_MAX_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, PartialEq)]
 pub enum PumpEvent {
     /// A joiner was admitted (or re-admitted after a lost Accept / timeout).
-    PeerJoined { name: String, entity_id: u64, rejoined: bool },
+    /// `addr` is the peer's session address — the target for join-sync
+    /// catch-up sends (`send_to_peer`).
+    PeerJoined { name: String, entity_id: u64, rejoined: bool, addr: SocketAddrV4 },
     /// A join was refused (already replied with the Deny).
     PeerDenied { name: String, reason: DenyReason },
     /// A peer went silent past the ttl and was dropped.
@@ -101,6 +106,7 @@ impl HostPump {
         now_ms: u64,
         world_name: &str,
         world_seed: u64,
+        world_time_ms: u64,
         admit: &dyn Fn(&str) -> bool,
     ) -> Vec<PumpEvent> {
         let mut events = Vec::new();
@@ -112,7 +118,10 @@ impl HostPump {
                     match buf[0] {
                         CH_HANDSHAKE => {
                             if let Some(LanJoin::Join { name }) = LanJoin::parse(payload) {
-                                self.handle_join(&name, src, now_ms, world_name, world_seed, admit, &mut events);
+                                self.handle_join(
+                                    &name, src, now_ms, world_name, world_seed,
+                                    world_time_ms, admit, &mut events,
+                                );
                             }
                         }
                         CH_ENTITY => {
@@ -165,6 +174,7 @@ impl HostPump {
         events
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_join(
         &mut self,
         name: &str,
@@ -172,6 +182,7 @@ impl HostPump {
         now_ms: u64,
         world_name: &str,
         world_seed: u64,
+        world_time_ms: u64,
         admit: &dyn Fn(&str) -> bool,
         events: &mut Vec<PumpEvent>,
     ) {
@@ -181,10 +192,11 @@ impl HostPump {
                     world_name: world_name.to_string(),
                     world_seed,
                     entity_id: Some(entity_id),
+                    world_time_ms: Some(world_time_ms),
                 }
                 .encode();
                 self.send_framed(CH_HANDSHAKE, &reply, src);
-                events.push(PumpEvent::PeerJoined { name: name.to_string(), entity_id, rejoined });
+                events.push(PumpEvent::PeerJoined { name: name.to_string(), entity_id, rejoined, addr: src });
             }
             Admit::Denied(reason) => {
                 let text = match reason {
@@ -214,6 +226,13 @@ impl HostPump {
         for target in self.host.fanout(None) {
             let _ = self.sock.send_to(&dg, target);
         }
+    }
+
+    /// Send a payload on a channel to ONE peer — the join-sync catch-up path
+    /// (targeted, unlike broadcast). Public so the embedder can drain a
+    /// `join_sync::SyncPlan` at its own pace.
+    pub fn send_to_peer(&self, channel: u8, payload: &[u8], to: SocketAddrV4) {
+        self.send_framed(channel, payload, to);
     }
 
     fn send_framed(&self, channel: u8, payload: &[u8], to: SocketAddrV4) {
@@ -273,7 +292,7 @@ mod tests {
         client.send(CH_HANDSHAKE, &LanJoin::Join { name: "alice".into() }.encode());
         // Give loopback a moment, then drain.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let events = pump.pump(0, "TestWorld", 1234, &|_| true);
+        let events = pump.pump(0, "TestWorld", 1234, 777_000, &|_| true);
         assert!(
             matches!(events.as_slice(), [PumpEvent::PeerJoined { name, rejoined: false, .. }] if name == "alice"),
             "expected one PeerJoined, got {events:?}"
@@ -282,11 +301,12 @@ mod tests {
         let (ch, payload) = client.recv().expect("no Accept received");
         assert_eq!(ch, CH_HANDSHAKE);
         match LanJoin::parse(&payload) {
-            Some(LanJoin::Accept { world_name, world_seed, entity_id }) => {
+            Some(LanJoin::Accept { world_name, world_seed, entity_id, world_time_ms }) => {
                 assert_eq!(world_name, "TestWorld");
                 assert_eq!(world_seed, 1234);
                 let eid = entity_id.expect("Accept must carry the assigned entity id");
                 assert!(eid >= crate::sim::net::lan_host::ASSIGNED_EID_BASE);
+                assert_eq!(world_time_ms, Some(777_000), "join-at-any-time: the host's clock rides the Accept");
             }
             other => panic!("expected Accept, got {other:?}"),
         }
@@ -298,7 +318,7 @@ mod tests {
         let client = Client::connect(pump.port());
         client.send(CH_HANDSHAKE, &LanJoin::Join { name: "mallory".into() }.encode());
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let events = pump.pump(0, "W", 1, &|_| false);
+        let events = pump.pump(0, "W", 1, 0, &|_| false);
         assert!(matches!(
             events.as_slice(),
             [PumpEvent::PeerDenied { reason: DenyReason::NotAllowed, .. }]
@@ -317,7 +337,7 @@ mod tests {
             c.send(CH_HANDSHAKE, &LanJoin::Join { name: "p".into() }.encode());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let joins = pump.pump(0, "W", 1, &|_| true);
+        let joins = pump.pump(0, "W", 1, 0, &|_| true);
         assert_eq!(joins.len(), 2, "both should join: {joins:?}");
         let eid_a = match &joins[0] {
             PumpEvent::PeerJoined { entity_id, .. } => *entity_id,
@@ -341,7 +361,7 @@ mod tests {
         };
         a.send(CH_ENTITY, &seal(&mut stamper, 1, &[me]));
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let events = pump.pump(100, "W", 1, &|_| true);
+        let events = pump.pump(100, "W", 1, 0, &|_| true);
 
         // The pump surfaced the state to the embedder…
         let surfaced = events.iter().any(|e| {
@@ -372,7 +392,7 @@ mod tests {
             c.send(CH_HANDSHAKE, &LanJoin::Join { name: "p".into() }.encode());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
-        pump.pump(0, "W", 1, &|_| true);
+        pump.pump(0, "W", 1, 0, &|_| true);
         a.recv().unwrap();
         b.recv().unwrap();
 
@@ -380,7 +400,7 @@ mod tests {
         let bytes = super::super::packet_compress::pack(&encode_batch(&batch), 48);
         a.send(CH_WORLDCMD, &bytes);
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let events = pump.pump(100, "W", 1, &|_| true);
+        let events = pump.pump(100, "W", 1, 0, &|_| true);
         assert!(
             events.iter().any(|e| matches!(e, PumpEvent::WorldCmds(c) if c == &batch)),
             "world cmd not surfaced: {events:?}"
@@ -390,18 +410,52 @@ mod tests {
     }
 
     #[test]
+    fn join_sync_batches_reach_the_targeted_peer_only() {
+        use crate::sim::net::join_sync::{decode_records, encode_records, ChunkEditRecord, StampedEdit};
+        use crate::world::chunk::ChunkCoord;
+        let mut pump = pump_on_loopback();
+        let a = Client::connect(pump.port());
+        let b = Client::connect(pump.port());
+        for c in [&a, &b] {
+            c.send(CH_HANDSHAKE, &LanJoin::Join { name: "p".into() }.encode());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let joins = pump.pump(0, "W", 1, 0, &|_| true);
+        let addr_a = match &joins[0] {
+            PumpEvent::PeerJoined { addr, .. } => *addr,
+            other => panic!("{other:?}"),
+        };
+        a.recv().unwrap(); // drain Accepts
+        b.recv().unwrap();
+
+        // The host's divergence from the seed, in the timebending layout.
+        let records = vec![ChunkEditRecord {
+            coord: ChunkCoord::new(2, 1, -3),
+            edits: vec![StampedEdit { tick: 0, index: 1234, block: 7 }],
+        }];
+        let packed = super::super::packet_compress::pack(&encode_records(&records), 48);
+        pump.send_to_peer(CH_JOINSYNC, &packed, addr_a);
+
+        let (ch, payload) = a.recv().expect("targeted peer must receive the sync");
+        assert_eq!(ch, CH_JOINSYNC);
+        let raw = super::super::packet_compress::unpack(&payload, 256 * 1024).expect("unpack");
+        assert_eq!(decode_records(&raw).as_deref(), Some(&records[..]), "layout survives the wire");
+        assert!(b.recv().is_none(), "join-sync is targeted state — never fanned out");
+    }
+
+    #[test]
     fn silent_peers_are_pruned_with_a_leave_event() {
         let mut pump = pump_on_loopback();
         let a = Client::connect(pump.port());
         a.send(CH_HANDSHAKE, &LanJoin::Join { name: "a".into() }.encode());
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let joins = pump.pump(0, "W", 1, &|_| true);
+        let joins = pump.pump(0, "W", 1, 0, &|_| true);
         let eid = match &joins[0] {
             PumpEvent::PeerJoined { entity_id, .. } => *entity_id,
             other => panic!("{other:?}"),
         };
         // No traffic past the ttl → pruned.
-        let events = pump.pump(PEER_TIMEOUT_MS + 1, "W", 1, &|_| true);
+        let events = pump.pump(PEER_TIMEOUT_MS + 1, "W", 1, 0, &|_| true);
         assert!(events.contains(&PumpEvent::PeerLeft { entity_id: eid }), "{events:?}");
         assert_eq!(pump.host.live_peer_count(), 0);
     }
