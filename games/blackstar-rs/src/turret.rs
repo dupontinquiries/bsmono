@@ -179,9 +179,24 @@ pub fn find(prims: &[&[Vec3]]) -> Fittings {
             // must OVERLAP the turret box and sit at or above its base:
             // a part hanging below the ring is hull, not turret
             let overlaps = plo.x <= ghi.x && phi.x >= glo.x && plo.z <= ghi.z && phi.z >= glo.z;
-            let high_enough = phi.y > tlo.y;
-            // and it must not be most of the body: that is the hull
-            let big = (phi - plo).max_element() > (thi - tlo).max_element() * 2.0;
+            // MOSTLY above the ring, not merely poking over it. `phi.y >
+            // tlo.y` passes on a sliver: the test tank's hull roof clears
+            // the turret base by 0.05 and was adopted on that alone. A
+            // part belongs to the turret when the bulk of it rides above
+            // the ring, so compare its CENTRE.
+            let high_enough = (plo.y + phi.y) * 0.5 > tlo.y;
+            // and it must not be most of the body: that is the hull.
+            //
+            // Compare against the turret's WIDTH, not its longest axis. A
+            // barrel is long by design and stretches the seed box down z,
+            // which inflates this threshold until the hull slips under
+            // it — measured on the test tank: the barrel makes the seed
+            // 3.40 long, so the limit becomes 6.80 and a 4.80 hull reads
+            // as "not big". The turret's x/z footprint is what a part has
+            // to be comparable to; length is the barrel's business.
+            let seed_span = thi - tlo;
+            let seed_w = seed_span.x.max(seed_span.z).max(1e-3);
+            let big = (phi - plo).max_element() > seed_w * 2.0;
             if overlaps && high_enough && !big {
                 out.turret.push(i);
             }
