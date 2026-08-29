@@ -82,13 +82,18 @@ registry.
   do not invent one), which is the part that cannot be done blind — a
   hash of position or draw order is not stable across a resize or a
   reorder, and `A11yScene::focus persists across frames BY ID` depends on
-  it being real. `apps/bot-arena` is IN PROGRESS: the setup form's five
-  text fields are converted (stable ids via `egui::Id::new("bot_arena.
-  setup.*")`, not position-derived), uncommitted, and not yet built —
-  last known state before the tool budget ran out. Start/Stop (two
-  locations, both need `add_enabled`/`on_hover_text` so they need a
-  hand-called `A11yScene::add` rather than the automatic wrapper) and
-  four loop-based `text_edit_singleline` sites are untouched.
+  it being real. `apps/bot-arena` is DONE (`d6fa56bb`): all twelve
+  widgets — five setup fields, Start/Stop, and the studio-host config
+  including the shared `path_edit` helper — register with stable
+  string-derived ids. Two notes for the next app: a shared widget
+  HELPER must take the id from its caller, since an id derived inside
+  it collides across every call site and `A11yScene` keeps focus by id
+  (silent focus-jumping, easily misblamed on egui); and a control whose
+  LABEL changes with state (Start/Stop) still wants one stable id —
+  that split is what `Semantics` is for. `every_registered_widget_id_is
+  _distinct` guards the collision case, which the compiler cannot.
+  bot-arena is the first app fully legible to the registry. Every other
+  uikit-egui app is still untouched.
 - **C12-4b** — no app currently calls `A11yScene::glove_targets()` from its
   glove-mode wiring even where both a11y AND glove are already adopted
   (checked: neither `gitmind` nor `bo-suite` uses `glove.rs` at all, so
