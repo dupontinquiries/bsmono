@@ -103,8 +103,8 @@ fn median(v: &mut [f32]) -> f32 {
 pub fn classify(prims: &[&[Vec3]]) -> Mass {
     let n = prims.len();
     let mut keep = vec![true; n];
-    if n < 3 {
-        // two prims cannot outvote each other; nothing to reject against
+    if n < 2 {
+        // one prim is the body by definition: nothing to reject against
         return Mass { keep, centre: Vec3::ZERO, spread: 0.0, dropped: 0 };
     }
     let total: usize = prims.iter().map(|p| p.len()).sum();
@@ -141,11 +141,25 @@ pub fn classify(prims: &[&[Vec3]]) -> Mass {
         axis_median(&|v: &Vec3| v.y),
         axis_median(&|v: &Vec3| v.z),
     );
-    let mut dists: Vec<f32> = cents
-        .iter()
-        .filter(|(_, w)| *w > 0)
-        .map(|(c, _)| (*c - centre).length())
-        .collect();
+    // WEIGHTED, like the centre above, and for the same reason. An
+    // unweighted median of per-prim distances lets an outlier define the
+    // scale it is then measured against: with a 300-point hull at
+    // distance 0 and a 6-vertex panel at distance 18, the median of
+    // [0, 18] is 18, so `FAR * spread` is 57.6 and the panel — the whole
+    // reason this filter exists — is not far from anything. Weighting by
+    // vertex count puts the median where the mass is, which is what
+    // "spread" was always supposed to mean.
+    let mut dists: Vec<f32> = Vec::with_capacity(total.min(4096));
+    for (c, w) in &cents {
+        if *w == 0 {
+            continue;
+        }
+        let d = (*c - centre).length();
+        let reps = (*w).min(512).max(1) / 8 + 1;
+        for _ in 0..reps {
+            dists.push(d);
+        }
+    }
     let spread = median(&mut dists).max(1e-4);
 
     let mut dropped = 0;
@@ -164,7 +178,23 @@ pub fn classify(prims: &[&[Vec3]]) -> Mass {
     // handed, the assumption behind it is wrong for this asset — a pose
     // built from many small pieces has no single lump — and dropping is
     // then far worse than the bad bounds it was fixing.
-    if dropped * 3 > n {
+    //
+    // Counted in POINTS, not prims. Prim count is the wrong measure of
+    // "most of the body": a 300-point hull and a 6-vertex flung panel are
+    // one prim each, so by count dropping the panel is dropping half the
+    // asset and this guard fired and put the panel back — which is
+    // exactly the case the filter exists for, and why it appeared to do
+    // nothing on a two-prim model. By mass the panel is 2%, which is what
+    // "most" should mean. This also removes the need for a separate
+    // small-`n` bail: the guard now scales correctly at any prim count,
+    // so only a single prim (nothing to compare against) short-circuits.
+    let dropped_pts: usize = cents
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !keep[*i])
+        .map(|(_, (_, w))| *w)
+        .sum();
+    if dropped_pts * 3 > total {
         return Mass { keep: vec![true; n], centre, spread, dropped: 0 };
     }
     Mass { keep, centre, spread, dropped }
@@ -270,10 +300,34 @@ mod tests {
     }
 
     #[test]
-    fn two_prims_are_never_second_guessed() {
+    fn a_two_part_body_is_never_split() {
+        // The real thing worth protecting at two prims: a body that IS
+        // two comparable pieces — a chassis and a trailer, a torso and a
+        // cockpit — must survive whole however far apart they sit,
+        // because neither one is debris and dropping either is dropping
+        // half the asset.
         let a = blob(Vec3::ZERO, 1.0, 100);
-        let b = blob(Vec3::new(30.0, 0.0, 0.0), 0.1, 4);
+        let b = blob(Vec3::new(30.0, 0.0, 0.0), 1.0, 80);
         let m = classify(&[&a, &b]);
-        assert_eq!(m.dropped, 0, "with two prims there is no majority to appeal to");
+        assert_eq!(m.dropped, 0, "a two-part body was split: {} dropped", m.dropped);
+    }
+
+    #[test]
+    fn overwhelming_mass_asymmetry_still_rejects_debris_at_two_prims() {
+        // This test replaces `two_prims_are_never_second_guessed`, which
+        // asserted that a 4-vertex speck 30 units from a 100-vertex body
+        // must be KEPT, on the reasoning that "with two prims there is no
+        // majority to appeal to". That reasoning does not survive its own
+        // commit: `classify` weights everything by vertex count precisely
+        // so a large prim outvotes a small one, and 100 against 4 is that
+        // majority. The two tests were mutually unsatisfiable — a flung
+        // panel beside one body prim is the exact case the filter was
+        // written for (physics seating a chassis on debris), and it could
+        // not be fixed while the other test stood.
+        let body = blob(Vec3::ZERO, 1.0, 100);
+        let speck = blob(Vec3::new(30.0, 0.0, 0.0), 0.1, 4);
+        let m = classify(&[&body, &speck]);
+        assert_eq!(m.dropped, 1, "the speck is both far and slight");
+        assert!(m.keep[0] && !m.keep[1], "the BODY survives, the speck does not");
     }
 }
