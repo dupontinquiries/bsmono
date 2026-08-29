@@ -596,6 +596,20 @@ impl ChunkManager {
     /// stay in sync.
     fn install_chunk(&self, chunk: Chunk, octree: OctreeArray) {
         let coord = chunk.coord;
+        // r598 producer trap: name whoever inserts a wild-coord chunk.
+        if coord.x.unsigned_abs() > 1_000_000
+            || coord.y.unsigned_abs() > 1_000_000
+            || coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD chunk INSERTED into the manager at ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         self.chunks.insert(coord, Arc::new(chunk));
         self.octrees.insert(coord, Arc::new(octree));
     }
@@ -640,6 +654,20 @@ impl ChunkManager {
             }
         };
 
+        // r598 producer trap: name whoever inserts a wild-coord chunk.
+        if coord.x.unsigned_abs() > 1_000_000
+            || coord.y.unsigned_abs() > 1_000_000
+            || coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD chunk INSERTED into the manager at ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         self.chunks.insert(coord, Arc::new(new_chunk));
         self.octrees.insert(coord, Arc::new(new_octree));
     }
@@ -727,6 +755,20 @@ impl ChunkManager {
             }
         };
 
+        // r598 producer trap: name whoever inserts a wild-coord chunk.
+        if coord.x.unsigned_abs() > 1_000_000
+            || coord.y.unsigned_abs() > 1_000_000
+            || coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD chunk INSERTED into the manager at ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         self.chunks.insert(coord, Arc::new(new_chunk));
         self.octrees.insert(coord, Arc::new(new_octree));
     }
@@ -2360,6 +2402,22 @@ impl ChunkManager {
 
     /// Set a block via copy-on-write. Returns true if the chunk was loaded.
     pub fn set_block(&self, world_x: i32, world_y: i32, world_z: i32, block: BlockId) -> bool {
+        // r598 producer trap: a set_block at wild world coords is the NaN
+        // position signature entering the world model — name the caller.
+        if world_x.unsigned_abs() > 30_000_000
+            || world_y.unsigned_abs() > 30_000_000
+            || world_z.unsigned_abs() > 30_000_000
+        {
+            static TRAP_SB_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_SB_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD set_block at world ({}, {}, {}) block={:?} — producer backtrace:\n{}",
+                    world_x, world_y, world_z, block,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+            return false; // refuse the write — a NaN must not edit the world
+        }
         let coord = block_to_chunk(world_x, world_y, world_z);
         let lx = world_x.rem_euclid(CHUNK_SIZE);
         let ly = world_y.rem_euclid(CHUNK_SIZE);

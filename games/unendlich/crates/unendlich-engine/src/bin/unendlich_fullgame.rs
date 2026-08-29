@@ -12891,6 +12891,27 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 start.elapsed().as_secs_f32(),
             );
         }
+        // r598: ROAMER SANITY SWEEP — the wild-chunk producer hunt points at
+        // an entity position going non-finite during the menu-phase ecosystem
+        // tick (NaN position → streamed chunk at (i32::MIN)³ → generated,
+        // meshed, uploaded, evicted). Catch it AT the animal: log the species
+        // + state once per event and snap the body back to its home column
+        // instead of letting a NaN walk the world into the chunk manager.
+        for r in roamers.iter_mut() {
+            let bp = r.creature.body.position;
+            let bad = !(bp[0].is_finite() && bp[1].is_finite() && bp[2].is_finite())
+                || bp[0].abs() > 3.0e7 || bp[1].abs() > 3.0e7 || bp[2].abs() > 3.0e7;
+            if bad {
+                let v = r.creature.body.velocity;
+                log::error!(
+                    "[watchdog] roamer position went wild: kind={:?} pos=({:?},{:?},{:?}) vel=({:?},{:?},{:?}) home={:?} — snapping to home",
+                    r.kind, bp[0], bp[1], bp[2], v[0], v[1], v[2], r.home
+                );
+                r.creature.body.position =
+                    [r.home.0 as f32 + 0.5, 96.0, r.home.1 as f32 + 0.5];
+                r.creature.body.velocity = [0.0; 3];
+            }
+        }
         renderer.set_season(current_season01); // r499: foliage seasonal tint
         // r595: feed the foliage disturber ARRAY — every nearby mover parts
         // the grass, not just the camera. Candidates: the player, live

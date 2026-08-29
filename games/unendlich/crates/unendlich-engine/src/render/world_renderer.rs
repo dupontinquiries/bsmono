@@ -1887,7 +1887,37 @@ impl WorldRenderer {
             // dispatcher doesn't re-mesh this coord on every dispatch
             // round just because `meshes` has no entry. The next mesh
             // request fires only when chunk.version changes.
-            self.empty_mesh_versions.insert(key, version);
+            // r598 producer trap (empty-mesh path — the meshes-map trap
+            // stayed silent, so the wild coord arrives as an EMPTY mesh).
+            if key.coord.x.unsigned_abs() > 1_000_000
+                || key.coord.y.unsigned_abs() > 1_000_000
+                || key.coord.z.unsigned_abs() > 1_000_000
+            {
+                static TRAP_EMPTY_ONCE: std::sync::Once = std::sync::Once::new();
+                TRAP_EMPTY_ONCE.call_once(|| {
+                    log::error!(
+                        "[watchdog] WILD coord entering empty_mesh_versions: ({}, {}, {}) — producer backtrace:\n{}",
+                        key.coord.x, key.coord.y, key.coord.z,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                });
+            }
+            // r598 producer trap (empty-mesh path — the meshes-map trap
+        // stayed silent, so the wild coord arrives as an EMPTY mesh).
+        if key.coord.x.unsigned_abs() > 1_000_000
+            || key.coord.y.unsigned_abs() > 1_000_000
+            || key.coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_EMPTY_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_EMPTY_ONCE.call_once(|| {
+                log::error!(
+                "[watchdog] WILD coord entering empty_mesh_versions: ({}, {}, {}) — producer backtrace:\n{}",
+                key.coord.x, key.coord.y, key.coord.z,
+                std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
+        self.empty_mesh_versions.insert(key, version);
             return Ok(());
         }
 
@@ -2165,6 +2195,23 @@ impl WorldRenderer {
 
         // Defer-free the old mesh's slots (mesh + draw) so the GPU
         // finishes any in-flight draw using them before reuse.
+        // r598 PRODUCER TRAP: the soaks show one wild (i32::MIN)³ coord
+        // entering the loaded set per run (menu phase). The eviction guard
+        // rejects it downstream; THIS one-shot names the producer — the
+        // captured backtrace is the whole hunt.
+        if coord.x.unsigned_abs() > 1_000_000
+            || coord.y.unsigned_abs() > 1_000_000
+            || coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD coord entering the mesh set: ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         if let Some(old) = self.meshes.insert(crate::world::lod::MeshSlotKey::at(coord, lod), new) {
             self.pending_destroy.push(PendingDestroy {
                 slot: old.slot,

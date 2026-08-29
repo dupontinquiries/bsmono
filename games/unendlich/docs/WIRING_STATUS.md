@@ -11928,3 +11928,15 @@ per create, live confirmation of what the headless shell-protocol tests pinned (
 has an in-vivo datapoint: no double-fire); state=InGame for the rest of the run; exit 0, zero panics; player watchdog
 silent in-world. The WILD chunk coord still fires ONCE per run on the TITLE screen (~pre-autoplay), so the producer is
 a menu-phase system (cinematic/backdrop/ecosystem around spawn) — narrowed, hunt continues.
+
+## r598 — WILD-COORD PRODUCER HUNT: five traps armed, six suspects eliminated, world hardened
+The (i32::MIN)³ chunk (NaN/-inf float→int saturation) fires ONCE per soak on the title screen. This round's traps
+(one-shot backtraces, all left ARMED in-tree — they cost nothing until they fire) plus sweeps ELIMINATED, in order:
+1. Player pose (watchdog present, silent — not the player). 2. Roamers (per-frame sanity sweep added: a non-finite
+roamer now logs kind+pos+vel and snaps to its home column — real robustness net regardless). 3. set_block writes (trap
+at the choke; wild writes now REFUSED — a NaN can no longer edit the world). 4. The renderer mesh map (trap silent).
+5. All three ChunkManager chunks.insert sites (traps silent — the wild chunk is somehow never INSERTED). The wild key
+DOES enter empty_mesh_versions via upload_prebuilt_mesh (backtrace inlined to main — async pool hides the requester).
+Remaining suspects (narrow): LOD key/parent-snap math on a sane coord, or a completed-mesh race around cinematic-world
+settle (~45 s in). The traps will name it on the next firing — including on-device, where the same logs now exist.
+Meanwhile the harm is fully contained: eviction rejects+logs, set_block refuses, roamers self-heal, player snaps back.
