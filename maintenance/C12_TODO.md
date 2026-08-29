@@ -1279,3 +1279,40 @@ is a guess wearing a measurement's clothes. uikit-egui 291/291.
 15-40 lines each. Doing this by reading QML was attempted before and
 did not happen at all. The outline's value is concentrated here rather
 than in generating ports.
+
+## 29. Port audit, second pass: terminals / web / graph / settings
+
+Redirected here by the operator: ModelPicker's remaining search pane is
+deferred (that screen is likely to become a logscope backend, like
+aperture's), and the terminal, web, graph and settings surfaces matter
+more.
+
+Survey of the egui side: `term_grid` (435), `browser` (362),
+`layered_graph` (384), `graph_view` (323), `connections_graph` (317) all
+exist with real substance. **Settings did not exist at all** — no module,
+no re-export, nothing.
+
+**C12-29a — settings, DONE (`settings_panel`).** Ported from
+`main.qml`'s `settingsPopup` (L27729). Six entries: four DOORS (model
+setup, chat, recipes, sessions) and two actual settings (voice
+activation, theme). Returns a `SettingsEvent` rather than mutating a
+config, because a widget that opened the chat panel itself would need a
+handle to it, the setup wizard and the session store — most of the app.
+The QML's trailing `→` on the doors is kept and is in the type too: a
+test asserts no event is both a door and a setting. 4 tests.
+
+Consequence worth stating: everything behind that popup — model setup,
+chat, recipes, session history — had NO ROUTE from the egui port. The
+other audits found screens missing pieces; this one was a missing
+screen, and it was the one that reaches the others.
+
+- **C12-29b — nothing renders `settings_panel` yet.** Same shape as the
+  cmdstrip (§26a): the widget and its events exist, no app draws it.
+- **C12-29c — terminal / web / graph NOT yet audited against the
+  outline.** They exist and are substantial, which is exactly the
+  condition under which ChatPanel still turned out to be missing its
+  entire header. Substance is not coverage. main.qml is where their QML
+  lives, so the outline for them is the 1,300-element file rather than a
+  tidy per-screen one — the audit needs the outline sliced by screen
+  first, which `qml_outline.py --depth` partly does but not by named
+  region.

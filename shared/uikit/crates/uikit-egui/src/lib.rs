@@ -66,6 +66,9 @@ pub mod path_picker;
 /// Reaching the command palette on a touch screen: hold-to-open, plus a
 /// bottom strip of recents and quick actions.
 pub mod cmdstrip;
+/// The settings popup ported from voiceterm's main.qml — four doors and
+/// two actual settings.
+pub mod settings_panel;
 pub mod segmented_tabs;
 /// Tabs vs. pages, decided from width, as data — not a per-app
 /// `if adaptive.is_compact()` guess. See its own module docs.
