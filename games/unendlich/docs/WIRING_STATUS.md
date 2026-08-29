@@ -11897,3 +11897,22 @@ step ("mobs become extra entries in a disturber array later"). Landed:
 Gates: fullgame + lib clean; foliage_sway+shader_artifacts 21/0. TEST ON M2 (after r594's own re-mesh caveat): walk a
 tamed herd through tall grass — a multi-lane part should track each body, and a LAN friend's avatar should part grass
 with no local input.
+
+## r596 — BUGHUNT: the full game now RUNS in-sandbox (xvfb + lavapipe); two real crashes found + fixed
+Infrastructure: mesa lavapipe (software Vulkan) + Xvfb run the ACTUAL unendlich-fullgame binary headless, bounded by
+UNENDLICH_MAX_DURATION_MS. gpu-headless-probe GREEN (headless ctx, offscreen targets, GPU meshing 36 chunks, all shader
+modules). The checkable loop now covers the live render/sim loop, not just unit tests.
+Soak findings (60 s title-screen run):
+1) WILD CHUNK COORDS: eviction membership crashed on i32 subtract-overflow — a chunk coord of (i32::MIN)³ (the NaN/-inf
+   float→int saturation signature) entered the loaded set ~45 s in, right after ecosystem/rest events. FIXED the crash
+   class: wild coords are rejected BEFORE distance math (abs(i32::MIN) itself panics; (i32::MIN)² overflows even i64 —
+   both hit during the fix) and get EVICTED, with a one-shot [watchdog] WILD log naming the coords. Producer hunt OPEN:
+   the log fires once per run; suspect a creature/ecosystem position going non-finite. Player-pose watchdog also added
+   (snaps to last sane pose with forensics; player was NOT the source this time).
+2) OCTREE POOL OVERRUN (render/octree_buffer.rs): span offsets are 256-aligned, nodes 40 B ⇒ gcd 8 ⇒ head pad up to 32 B,
+   which the payload-only span request did not reserve — debug panic, SILENT neighbour-slot corruption in release
+   (masked on M2 by the huge pool; exposed by the r-budget-scaled pool). FIXED: request includes the worst-case pad;
+   invariant is now a hard assert; regression test walks all offset residues and proves node alignment + no payload
+   overlap. This may explain any historical "corrupt/flickering chunk" reports under memory pressure.
+Result: 60 s soak exits 0 with zero panics. Ledger note: soaks run the title-screen world (no input); an input-script
+harness (synthetic clicks → in-world soak) is the natural next escalation.

@@ -1318,6 +1318,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         unendlich_engine::physics::BodyId::LOCAL_PLAYER,
         spawn_pos,
     );
+    // Watchdog memory: the last finite, in-bounds player pose (pos, yaw,
+    // pitch). Seeded from the spawn pose; refreshed every sane frame; used to
+    // snap back if the position ever goes non-finite (see the frame-loop
+    // watchdog — found by the first headless lavapipe soak).
+    let mut fg_last_sane_pose: (glm::Vec3, f32, f32) =
+        (local_player.view.position, local_player.view.yaw, local_player.view.pitch);
     if survival_mode {
         // r124: survival revokes creative flight (set after construction —
         // the flag itself is read near the feature banner, before this point).
@@ -4150,6 +4156,38 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // every animation by 1.3s, jerking the camera/gait on top of the low FPS.
         // Was `dt_ms/1000` (unclamped); now the clamped `dt`. Identical below 100ms.
         let frame_dt_s = dt;
+        // POSITION WATCHDOG (found by the first headless lavapipe soak: the
+        // player's position went non-finite, its chunk coord collapsed to
+        // i32::MIN, and the eviction membership check crashed on i32
+        // subtraction — in release the same state silently wraps and evicts
+        // the world instead). A wild pose logs its forensics ONCE per event
+        // and snaps back to the last sane pose with zeroed velocity; the
+        // session survives and the log points at the polluting system.
+        {
+            let p = local_player.view.position;
+            let sane = p.x.is_finite() && p.y.is_finite() && p.z.is_finite()
+                && p.x.abs() < 3.0e7 && p.y.abs() < 3.0e7 && p.z.abs() < 3.0e7;
+            if sane {
+                fg_last_sane_pose = (p, local_player.view.yaw, local_player.view.pitch);
+            } else {
+                let v = body.as_ref().map(|b| b.velocity).unwrap_or([0.0; 3]);
+                log::error!(
+                    "[watchdog] player position went wild: pos=({:?},{:?},{:?}) vel=({:?},{:?},{:?}) — snapping back to last sane pose {:?}",
+                    p.x, p.y, p.z, v[0], v[1], v[2], fg_last_sane_pose.0
+                );
+                local_player.view.position = fg_last_sane_pose.0;
+                local_player.view.yaw = fg_last_sane_pose.1;
+                local_player.view.pitch = fg_last_sane_pose.2;
+                if let Some(b) = body.as_mut() {
+                    b.velocity = [0.0; 3];
+                    b.position = [
+                        fg_last_sane_pose.0.x,
+                        fg_last_sane_pose.0.y,
+                        fg_last_sane_pose.0.z,
+                    ];
+                }
+            }
+        }
 
         // ── r526: MOB AI + MOVEMENT ──────────────────────────────────────
         // Tick each test mob's brain (wander / seek / flee) and advance it with
@@ -10718,10 +10756,32 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // per loaded chunk); shell-iterator for submit (walks outward
         // from the player in Chebyshev order and short-circuits).
         let in_render_distance = |c: ChunkCoord| -> bool {
-            let dx = c.x - player_chunk.x;
-            let dy = c.y - player_chunk.y;
-            let dz = c.z - player_chunk.z;
-            dx*dx + dy*dy + dz*dz <= rd_sq
+            // The first headless lavapipe soak crashed HERE: a chunk coord
+            // near i32::MIN entered the loaded set, and (i32::MIN)² overflows
+            // even i64 when summed — so wild coords are rejected BEFORE any
+            // distance math (unsigned_abs: abs(i32::MIN) itself panics).
+            // Rejecting = evicting, exactly the right treatment for corrupt
+            // coords; the one-shot log names the evidence for the producer
+            // hunt.
+            let wild = c.x.unsigned_abs() > 1_000_000
+                || c.y.unsigned_abs() > 1_000_000
+                || c.z.unsigned_abs() > 1_000_000;
+            if wild {
+                static WILD_ONCE: std::sync::Once = std::sync::Once::new();
+                WILD_ONCE.call_once(|| {
+                    log::error!(
+                        "[watchdog] WILD chunk coord in the loaded set: ({}, {}, {}) — \
+                         some system fed a non-finite/absurd world position into \
+                         chunk lookup (evicting it; hunt the producer)",
+                        c.x, c.y, c.z
+                    );
+                });
+                return false;
+            }
+            let dx = (c.x - player_chunk.x) as i64;
+            let dy = (c.y - player_chunk.y) as i64;
+            let dz = (c.z - player_chunk.z) as i64;
+            dx * dx + dy * dy + dz * dz <= rd_sq as i64
         };
 
         // Evict any meshes that are no longer desired. v0.24.67: only when the
