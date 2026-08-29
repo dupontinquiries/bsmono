@@ -11916,3 +11916,15 @@ Soak findings (60 s title-screen run):
    overlap. This may explain any historical "corrupt/flickering chunk" reports under memory pressure.
 Result: 60 s soak exits 0 with zero panics. Ledger note: soaks run the title-screen world (no input); an input-script
 harness (synthetic clicks → in-world soak) is the natural next escalation.
+
+## r597 — SOAKS GO IN-WORLD: UNENDLICH_AUTOPLAY + the double-world question answered LIVE
+UNENDLICH_AUTOPLAY=1 auto-creates a world from the title screen through the SAME one-click r186 spree path the UI uses
+(two stages: request wizard, then arm the spree only once the panel shows it — the panel reflects the app one frame
+late, and under lavapipe a frame is SECONDS, so a same-frame arm self-cancelled). Found along the way: presented-frame
+counters (frame_count) stay 0 under Xvfb — the swapchain never presents — so anything gated on frames never fires in
+soaks; autoplay gates on wall clock. A 1 Hz [autoplay-dbg] heartbeat (screen/state/spree/panel) stays in, soak-only.
+RESULT (120 s soak): Confirm → Launch(StartLocal, Survival, "Soak"); [diag] rebuild_for_seed CALL #1 — EXACTLY ONE call
+per create, live confirmation of what the headless shell-protocol tests pinned (the "Create fires twice" question now
+has an in-vivo datapoint: no double-fire); state=InGame for the rest of the run; exit 0, zero panics; player watchdog
+silent in-world. The WILD chunk coord still fires ONCE per run on the TITLE screen (~pre-autoplay), so the producer is
+a menu-phase system (cinematic/backdrop/ecosystem around spawn) — narrowed, hunt continues.

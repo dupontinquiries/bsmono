@@ -2878,6 +2878,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         whitelist.len()
     );
     let mut fg_create_spree: u8 = 0; // r186: Create World presses-through
+    // r597 soak harness: UNENDLICH_AUTOPLAY=1 auto-creates a world from the
+    // title screen through the SAME one-click spree path the UI uses, so
+    // headless soaks run IN-WORLD (physics, creatures, streaming). Fires
+    // once, after boot settles.
+    let fg_autoplay: bool = std::env::var("UNENDLICH_AUTOPLAY").map(|v| v == "1").unwrap_or(false);
+    // 0 = idle, 1 = wizard requested (waiting for the panel to show it),
+    // 2 = spree armed. Two stages because the panel reflects the app ONE
+    // frame late and the spree self-cancels when the panel lags (each frame
+    // is seconds long under lavapipe, so "one frame" is a long time).
+    let mut fg_autoplay_stage: u8 = 0;
+    let mut fg_autoplay_dbg_ms: u64 = 0;
     let mut fg_rebuild_call_count: u32 = 0; // DIAGNOSTIC (temporary) — see the log at rebuild_for_seed's call site
     let mut ocean_diag_logged: u32 = 0; // DIAGNOSTIC (temporary) — caps the [diag-surface] formula-term dump
     // r661: (removed fg_host_pending — Host World now opens the wizard normally)
@@ -13818,6 +13829,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             use unendlich_engine::sim::new_world_config::SeedChoice;
             use unendlich_engine::sim::title_flow::{MenuId, Screen};
 
+            // r597: AUTOPLAY — open the wizard and arm the r186 spree exactly
+            // as a Create World click would. The launch then flows through the
+            // NORMAL path (Launch handler, world build, enter_game), so the
+            // soak exercises the same code a player does. Gated on WALL CLOCK,
+            // not frame_count: under Xvfb the swapchain never presents, so
+            // presented-frame counters stay 0 while the sim runs fine.
+            if fg_autoplay && fg_autoplay_stage == 0 && renderer.menu_open
+                && start.elapsed().as_millis() > 2500
+            {
+                fg_autoplay_stage = 1;
+                let _ = fg_app.tick(AppInput::Select(MenuId::NewGame), 0);
+                let _ = fg_app.tick(AppInput::WizardSetName("Soak".into()), 0);
+                log::info!("[autoplay] wizard requested for world 'Soak'");
+            }
+            if fg_autoplay && fg_autoplay_stage == 1 && renderer.wizard_open {
+                // The panel caught up — NOW the spree can survive its own
+                // wizard_open check.
+                fg_autoplay_stage = 2;
+                fg_create_spree = 6;
+                log::info!("[autoplay] wizard visible — arming the one-click spree");
+            }
+            // r597: autoplay flight recorder — once per second under
+            // UNENDLICH_AUTOPLAY only. Soak logs WANT this heartbeat: it
+            // proved the launch flow live (one rebuild call per create) and
+            // shows at a glance whether a soak is in-world or stuck.
+            let ap_now_ms = start.elapsed().as_millis() as u64;
+            if fg_autoplay && ap_now_ms > 2500 && ap_now_ms.saturating_sub(fg_autoplay_dbg_ms) >= 1000 {
+                fg_autoplay_dbg_ms = ap_now_ms;
+                log::info!(
+                    "[autoplay-dbg] screen={:?} state={:?} spree={} wizard_open={} at_confirm={} menu_open={}",
+                    fg_app.screen(), fg_app.state(), fg_create_spree,
+                    renderer.wizard_open, renderer.wizard_at_confirm, renderer.menu_open
+                );
+            }
             // r401: Host World opened the wizard; once it's actually open, fire the
             // proven one-click Create (wizard_action 9) so a single Host World click
             // launches a world without manual wizard steps.
