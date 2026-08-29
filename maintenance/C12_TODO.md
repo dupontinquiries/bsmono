@@ -1214,8 +1214,32 @@ not, and they are not chrome:
   That is what "continues in the background" promises, and it has a
   test. uikit-egui 290/290, voiceterm checks clean.
 
-  Still open here: voice models, the Ollama fallback, and the RAM
-  recommendation.
+  Still open here: voice models and the Ollama fallback. The RAM
+  recommendation is done (below) and reaches both screens, since
+  SetupWizard embeds the same `ModelPicker`.
+
+**C12-28c — the RAM heading, DONE and shared.** It appeared in BOTH
+audits, which is the signal it should be written once. `picks_heading`
+is now in `model_picker` and renders above the list, so the star is
+explained rather than being unexplained decoration — a person cannot
+otherwise tell whether it means "popular", "newest" or "will actually
+run on this machine", and it means the third. Fixing it in the shared
+widget fixes SetupWizard too, since the wizard embeds the same picker.
+
+What it deliberately does NOT do: decide WHICH model is recommended.
+That logic already exists and is good — `hf_hub::recommend_curated` in
+voiceterm is reserve-aware (it subtracts resident whisper), speed-first
+(smallest that fits, not biggest), and falls back to the smallest rather
+than to nothing. It needs the curated list and a whisper-reserve
+estimate that a shared widget has no business knowing, so the host keeps
+setting `ModelRow::recommended` and the widget only explains what the
+star means. Duplicating the fit arithmetic to avoid passing a bool would
+be two answers to one question, and they would drift.
+
+The wording distinction is tested: with no RAM figure the heading
+promises ORDERING ("fastest first") rather than suitability, because
+claiming a recommendation "for your machine" when nothing was measured
+is a guess wearing a measurement's clothes. uikit-egui 291/291.
 
 **Method note.** Three screens took minutes to audit because the spec is
 15-40 lines each. Doing this by reading QML was attempted before and

@@ -37,6 +37,32 @@ pub enum ModelAction {
     Use(String),
 }
 
+/// The heading above the list, which the QML varies on detected RAM.
+///
+/// `ram_gb` is 0 when detection failed or has not run. The two audits
+/// that found this missing (ModelPicker and SetupWizard, C12-28a/b)
+/// wanted the same string, so it lives here once rather than being
+/// written twice with two wordings.
+///
+/// This deliberately does NOT decide WHICH model is recommended. That is
+/// `hf_hub::recommend_curated` in voiceterm — reserve-aware, speed-first,
+/// falling back to the smallest rather than to nothing — and it needs the
+/// curated list and a whisper-reserve estimate that a shared widget has
+/// no business knowing. The host sets `ModelRow::recommended`; this only
+/// explains what the star MEANS, which is the part that was missing.
+/// Duplicating the fit arithmetic here to avoid passing a bool would be
+/// two answers to one question, and they would drift.
+pub fn picks_heading(ram_gb: u32) -> String {
+    if ram_gb > 0 {
+        format!("Quick picks (★ = recommended for your {ram_gb}GB machine):")
+    } else {
+        // No RAM figure: promise ordering, not suitability. Claiming a
+        // recommendation "for your machine" when nothing was measured
+        // would be a guess wearing a measurement's clothes.
+        "Quick picks (fastest first):".to_string()
+    }
+}
+
 /// Sort rows for display: downloaded first, then recommended, then by name. Pure — the tested core.
 pub fn sorted_rows(rows: &[ModelRow]) -> Vec<ModelRow> {
     let mut v = rows.to_vec();
@@ -57,11 +83,20 @@ pub struct ModelPicker {
     pub download_status: String,
     /// 0..=100 while a download is in flight.
     pub download_percent: u8,
+    /// Detected system RAM in GB, or 0 when unknown. Set by the host —
+    /// the widget reports it, the host measures it.
+    pub detected_ram_gb: u32,
 }
 
 impl ModelPicker {
     /// Render the picker; returns a [`ModelAction`] on the frame a row's button is clicked.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<ModelAction> {
+        // The heading the QML shows above the picks, explaining the star.
+        // Without it the star is unexplained decoration — a person cannot
+        // tell whether it means "popular", "newest" or "will actually run
+        // on this machine", and it means the third.
+        ui.label(RichText::new(picks_heading(self.detected_ram_gb)).weak().small());
+        ui.add_space(4.0);
         let mut action = None;
 
         if !self.download_status.is_empty() {
@@ -137,6 +172,23 @@ mod tests {
             recommended,
             active: false,
         }
+    }
+
+    #[test]
+    fn the_heading_only_claims_a_recommendation_when_ram_was_measured() {
+        // The star means "will actually run on this machine" — not
+        // "popular" or "newest" — and the heading is the only place that
+        // is said. With no RAM figure it must promise ORDERING instead,
+        // because claiming a recommendation "for your machine" when
+        // nothing was measured is a guess wearing a measurement's
+        // clothes.
+        let known = picks_heading(16);
+        assert!(known.contains("16GB"), "{known}");
+        assert!(known.contains("★"), "the star is explained: {known}");
+
+        let unknown = picks_heading(0);
+        assert!(!unknown.contains("your"), "claimed a fit with no measurement: {unknown}");
+        assert!(unknown.contains("fastest first"), "{unknown}");
     }
 
     #[test]
