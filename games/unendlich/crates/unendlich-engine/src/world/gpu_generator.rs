@@ -629,9 +629,14 @@ fn bake_biome_def_table(reg: Option<&crate::world::biome_loader::BiomeRegistry>)
             climate.extend_from_slice(&0f32.to_le_bytes());
             let sb = d.resolve_surface_block().map(|b| b as u32).unwrap_or(SENTINEL);
             let ub = d.resolve_subsurface_block().map(|b| b as u32).unwrap_or(SENTINEL);
+            // r613: the def's legacy Biome id, for the shader's mirror of
+            // biome_at_3d's "registry owns the land biomes" step.
+            // to_legacy() is TOTAL (Plains for unmapped/themed), exactly
+            // like the CPU's own use of it — no sentinel needed.
+            let lb = d.to_legacy() as u32;
             blocks.extend_from_slice(&sb.to_le_bytes());
             blocks.extend_from_slice(&ub.to_le_bytes());
-            blocks.extend_from_slice(&0u32.to_le_bytes());
+            blocks.extend_from_slice(&lb.to_le_bytes());
             blocks.extend_from_slice(&0u32.to_le_bytes());
         } else {
             climate.extend_from_slice(&[0u8; 16]);

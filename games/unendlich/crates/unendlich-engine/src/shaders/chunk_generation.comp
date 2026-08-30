@@ -574,6 +574,72 @@ uint biome_at_2d(float x, float z, uint world_seed) {
     return climate_verdict;
 }
 
+// ── r613: FULL mirror of cpu_generator::biome_at_3d — the classifier the
+// CPU uses for trees, surface blocks, and legacy fallbacks. Differences
+// from the veto'd biome_at_2d above (kept for any legacy call sites):
+// climate sampled at the CALLER'S y (not sl+10), NO biome jitter (the CPU
+// 3D path has none), the r192 shelf band gets the CPU's surface-refinement
+// with a fall-through-to-climate case, and — the big one — the r177
+// "registry owns the LAND biomes" step: land columns re-fit against the
+// baked def table and map through each def's legacy Biome id
+// (blocks[].z; to_legacy is total, Plains for themed). Registry presence
+// == biome_def_count > 0, matching the CPU's Option<registry>.
+// Forward declarations (defined later in the file).
+float model_density(float x, float y, float z, uint world_seed);
+bool model_is_cave(float x, float y, float z, uint world_seed);
+int registry_best_fit(float temp, float humid);
+
+uint biome_at_3d_gpu(float x, float y, float z, uint world_seed) {
+    float temp = model_temperature(x, y, z, world_seed);
+    float humid = model_humidity(x, y, z, world_seed);
+    float erosion_raw = (fbm_2d(x * 0.0008, z * 0.0008,
+                                 world_seed + SEED_EROSION, 2, 1.0, 1.0) - 0.5) * 2.0;
+    float erosion_unit = (erosion_raw + 1.0) * 0.5;
+    uint legacy_verdict = determine_biome(temp, humid, erosion_unit);
+
+    float sl = model_sea_level(x, z, world_seed);
+    float st = sl + model_continental(x, z, world_seed) * 30.0
+                  + model_hills(x, z, world_seed) * 15.0;
+    float ocean_threshold = sl - 2.0 - max(biome_height_modifier(legacy_verdict), 0.0);
+    float shelf_threshold = sl + 6.0;
+
+    // topo verdict: 0 = none, else the biome+1 (poor man's Option).
+    uint topo = 0u;
+    if (st < ocean_threshold) {
+        topo = BIOME_OCEAN + 1u;
+    } else if (st < shelf_threshold) {
+        // Shelf refinement — mirror surface_y_at's solidity terms
+        // (full-model density + is_cave; NO cave_field, matching the CPU's
+        // solid_at closure) over the CPU's [sl-120, sl+8] scan window.
+        int scan_hi = int(floor(sl + 8.0));
+        int scan_lo = int(floor(sl - 120.0));
+        int sy = -100000;
+        bool prev_air = true;
+        for (int yy = scan_hi; yy >= scan_lo; yy--) {
+            float dens = model_density(x, float(yy), z, world_seed);
+            bool solid = (dens > DENSITY_THRESHOLD)
+                && !model_is_cave(x, float(yy), z, world_seed);
+            if (solid && prev_air) { sy = yy; break; }
+            prev_air = !solid;
+        }
+        if (sy != -100000) {
+            if (float(sy) < sl - 2.0)      topo = BIOME_OCEAN + 1u;
+            else if (float(sy) < sl + 2.0) topo = BIOME_BEACH + 1u;
+        }
+        // no standable surface, or land: topo stays none — fall through.
+    }
+
+    if (topo != 0u) return topo - 1u;
+    if (biome_def_count > 0u) {
+        if (legacy_verdict == BIOME_OCEAN || legacy_verdict == BIOME_BEACH)
+            return legacy_verdict;
+        int i = registry_best_fit(temp, humid);
+        if (i >= 0) return biome_def_blocks[i].z;
+        return legacy_verdict;
+    }
+    return legacy_verdict;
+}
+
 // ============================================================================
 // RC40: Tree placement plumbing.
 //
@@ -1662,6 +1728,17 @@ void main() {
         // these too, but it's cheap and uncomplicates the layout.
         float wx = float(chunk_origin.x + lx_nb);
         float wz = float(chunk_origin.z + lz_nb);
+        // r613 REVERTED at this site: switching the tree column's classify
+        // to biome_at_3d_gpu(surface_target) regressed tree mass hard
+        // (ratios 0.92→2.35 and 1.37→2.68, phantom trees back on the
+        // ocean seed) while the SAME classifier at the Pass B sites cut
+        // terrain diffs 94% on seed 90210. Why the aligned classifier
+        // over-plants here is the open question for the next round —
+        // suspects: profile/density keyed off registry-mapped biomes whose
+        // GPU-side interplay with the u32 spawn hashes differs, or a
+        // shelf-refinement edge in biome_at_3d_gpu that land seeds hit at
+        // scale. Until answered, the tree site keeps the r612 form (the
+        // best-measured state for tree mass).
         uint  biome = biome_at_2d(wx, wz, world_seed);
         float surface_y_f = model_sea_level(wx, wz, world_seed) + 10.0;
         float temp = model_temperature(wx, surface_y_f, wz, world_seed);
@@ -1765,7 +1842,9 @@ void main() {
                     // Surface.
                     float h = model_humidity(dxf, dyf, dzf, world_seed);
                     float t = model_temperature(dxf, dyf, dzf, world_seed);
-                    uint sbiome = biome_at_2d(dxf, dzf, world_seed); // r462: biome→surface map
+                    // r613: CPU Phase 2 classifies with biome_at_3d at the
+                    // CHUNK ORIGIN's y (one sample per column) — mirror it.
+                    uint sbiome = biome_at_3d_gpu(dxf, float(chunk_origin.y), dzf, world_seed);
                     block_id = pick_surface_block_gpu(wy, h, t, sbiome); // r611
                 } else {
                     // Subsurface or deep. Look up: is there air within 3 above?
@@ -1781,7 +1860,7 @@ void main() {
                     if (near_surface) {
                         float h = model_humidity(dxf, dyf, dzf, world_seed);
                         float t = model_temperature(dxf, dyf, dzf, world_seed);
-                        uint sbiome = biome_at_2d(dxf, dzf, world_seed); // r611
+                        uint sbiome = biome_at_3d_gpu(dxf, float(chunk_origin.y), dzf, world_seed); // r613
                         block_id = pick_subsurface_block_gpu(h, t, sbiome); // r611
                     } else {
                         // Deep stone — try ore.

@@ -12201,3 +12201,24 @@ PORT DESIGN (next item, all pieces in place): bake each def's legacy Biome id in
 verdict→registry-land-fit→veto chain in the shader's veto'd classifier at the tree/surface sites, sampling climate at
 the right per-site y (surface_y for trees — now already plumbed). Expect this to close most of the remaining ~10-12k
 terrain diffs (legacy surface branch) and the tree-mass skews together.
+
+## r613 — biome_at_3d PORTED TO GLSL; Pass B adopts it (terrain -94% on seed 90210); tree-site adoption REVERTED with an open puzzle
+The classifier port from the r612 design: bake each def's to_legacy() Biome id into the table's blocks[].z (total —
+Plains for themed, exactly like the CPU's own use), and biome_at_3d_gpu in the shader mirrors the full CPU chain —
+climate at the CALLER'S y, NO jitter (the CPU 3D path has none; the old veto'd biome_at_2d jitters), legacy_verdict,
+the r192 biome-free-base topo veto with the height-modifier-widened threshold, the SHELF REFINEMENT as a bounded
+top-down standable scan over [sl-120, sl+8] mirroring surface_y_at's solidity terms (full-model density + is_cave, no
+cave_field) INCLUDING the fall-through-to-climate case, and the r177 registry-owns-the-land step mapping the best-fit
+def through blocks[].z (registry presence == def_count>0). Forward declarations added (model_density/is_cave/
+registry_best_fit are defined later — the r610 prototype lesson again).
+ADOPTED at the two Pass B sites, mirroring the CPU's Phase 2 exactly (biome_at_3d at the CHUNK ORIGIN's y, one per
+column). MEASURED (4-seed panel, honest counters): seed 90210 terrain 9,507 → 610 (-94%); ocean origin 2,016 → 1,736;
+424242 12,061 → 10,805; 31415926 stays perfect; tree numbers unchanged from r612 (0.921 / 1.369 / exact / exact).
+Best measured state to date on every seed.
+REVERTED at the tree site after measurement: classifying tree columns with biome_at_3d_gpu(surface_target) regressed
+mass hard (0.92→2.35, 1.37→2.68, 239 phantom tree cells on the ocean seed) — the OPEN PUZZLE for next round: why does
+the ALIGNED classifier over-plant when the CPU, using the same chain, does not? Suspects in the revert comment:
+profile/density keyed off registry-mapped biomes interacting with the by-design u32 spawn hashes, or a
+shelf-refinement edge hit at scale on land seeds. The tree site keeps the r612 form until answered. Cumulative
+context: terrain diffs at the panel's worst seed are down from ~105k (pre-r607) to ~10.8k, with two seeds at 0 and
+610. No soak this round (three shader rounds without one — it MUST lead the next slice before any device claim).
