@@ -1601,3 +1601,44 @@ and the client.
   Built first because it is what makes the daemon SAFE TO ADD. A daemon
   whose absence breaks the editor is worse than no daemon: the failure
   is invisible, intermittent, and looks like the editor's fault.
+
+## 31. logscope-egui as a daemon CLIENT
+
+aperture now asks the daemon before loading its own weights (§30). The
+same is worth doing for logscope-egui, which is the heaviest consumer —
+it is the app the 7.2 GiB and 86-second figures came from.
+
+**The seam already exists and is a good one.** `backend::BackendKind` is
+`{LlamaCpp, Wgpu}` with a `make(kind) -> Box<dyn Backend>` factory and a
+`preferred()` that picks by what is compiled in. A `Daemon` variant
+drops into exactly that shape, and `preferred()` is where "use the
+daemon if one is listening" belongs — it already answers "which backend
+should this be" and is consulted by both the load and the chat path, so
+they cannot disagree.
+
+**C12-31a — not built, and one wrinkle to decide first.** `Backend::
+generate` takes `on_token: &mut dyn FnMut(&str) -> bool` and streams.
+The daemon's HTTP endpoint returns the whole reply. So a naive Daemon
+backend would call `on_token` once with everything, and the difference
+is visible: today tokens appear as they are produced, and through the
+daemon the UI would sit still and then paint a paragraph. On a 4 tok/s
+decode that is a ~40-second stare at nothing for a 170-token reply.
+
+Three options, in increasing order of work:
+  1. Accept it, and say so in the status line ("via daemon — replies
+     arrive whole"). Honest, cheap, and worse to use.
+  2. Chunked transfer on the daemon side, streaming through the socket.
+     The endpoint already speaks HTTP/1.1; this is the conventional
+     answer and it keeps one protocol for both doors.
+  3. A second framed protocol on the unix socket only.
+
+(2) is almost certainly right — it preserves the property that the unix
+door is the SAME endpoint rather than a second one, which is what has
+kept the two from drifting so far. Worth doing before wiring
+logscope-egui, because shipping (1) first would teach people that the
+daemon makes the app feel worse.
+
+**Note on scope:** this is where the daemon's value is largest AND where
+its UX cost is most visible, which is why the streaming question has to
+be answered here rather than deferred. aperture's completions are short
+bursts where whole-reply delivery barely shows; logscope's chat is not.
