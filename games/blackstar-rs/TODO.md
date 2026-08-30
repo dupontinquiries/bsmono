@@ -509,6 +509,20 @@ much of `raidcon.rs`'s roster is speculative/future content, not a
 near-term integration target)? That's a real product decision, not
 something I should guess at by picking one and building toward it.
 
+One more thing worth distinguishing precisely, since it's easy to
+conflate: not every "the C engine does X" comment in this codebase
+means "these two need to be reconciled." `weapons.rs`'s 12 physics-verb
+forms (verified solid earlier this session — 23 passing tests) also
+reference the C engine's `exengine/weapon.h`, but explicitly as a
+**deliberate departure**: the module's own doc comment says the C
+engine's twelve forms are mostly "the same weapon... written for a
+shooter," and the Rust rebuild intentionally asks a different question
+rather than porting them. That's the opposite situation from the raid
+bosses above, where the two systems are meant to stay comparable
+(`Mech`'s own comment says so) and currently don't. Worth checking
+which category any other cross-engine reference falls into before
+assuming a gap needs closing.
+
 **Not implemented at all:** anything that exempts a boss from the
 standard vehicle<->robot fold. Every chassis, boss or not, goes through
 the same `xform`/`Morph` pipeline today — "not always transformable in
