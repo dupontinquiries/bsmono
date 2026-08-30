@@ -7755,8 +7755,36 @@ if let Some(msg) = self.error_banner.clone() {
             });
         }
 
-        if self.show_context {
-            egui::SidePanel::right("chat_right").resizable(true).default_width(330.0).show_inside(ui, |ui| {
+        // ADAPTIVE, not a fixed 330 px. `chat_layout` has existed and been
+        // tested since the port and nothing called it — grep src/tabs for
+        // DeviceClass and there were no hits at all, so every tab
+        // hard-coded a desktop shape. On a phone a 330 px side panel plus
+        // a transcript leaves neither usable.
+        //
+        // `chat_layout_for_width` rather than the DeviceClass form: the
+        // width egui reports here is what actually constrains this panel,
+        // and it already accounts for a narrow window on a desktop —
+        // which a device class does not.
+        //
+        // CAUTION for anyone reading more fields off `cl`: `any_touches()`
+        // is true only WHILE a finger is down, so it flickers between
+        // frames on a touch device. `split` does not depend on it (see
+        // `chat_layout`), which is why it is safe here — but
+        // `input_docked_bottom` and `touch_target` do, and reading those
+        // from this call would make the input bar jump as you tap. Those
+        // want a sticky "this is a touch device" flag, which the app does
+        // not have yet.
+        let cl = crate::chat_layout::chat_layout_for_width(
+            ui.available_width(),
+            ui.ctx().input(|i| i.any_touches()),
+        );
+        // `split` false means the pane does not fit beside the transcript.
+        // The context is then reachable through the existing toggle
+        // rather than shown, which is the same information one tap away
+        // instead of two panes fighting for the same 400 px.
+        if self.show_context && cl.split {
+            let w = (ui.available_width() * 0.38).clamp(240.0, 330.0);
+            egui::SidePanel::right("chat_right").resizable(true).default_width(w).show_inside(ui, |ui| {
                 ui.add_space(theme::PAD_XS as f32);
                 ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(self.right_page == RightPage::Files, RichText::new("📄 Files").small()).clicked() { self.right_page = RightPage::Files; }

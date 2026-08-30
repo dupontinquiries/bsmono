@@ -2368,10 +2368,30 @@ hand-check I gave the voiceterm five, and §33's did get one.
   The cost is per-tab and belongs with someone who can run the app on a
   phone.
 
-  STILL TO DECIDE: `chat_layout` (tab_layout's stated sibling — likely
-  the same wire-up verdict), `workbench` (claims "the non-chat tabs",
-  which `tabs/` already owns, so possibly a picking-shaped duplicate),
-  and the remaining seven.
+  `chat_layout` — WIRED (partly). Same verdict as tab_layout and for the
+  same reason: nothing in `src/tabs/` referenced DeviceClass at all. The
+  chat tab's context pane was `SidePanel::right(...).default_width(330)`
+  unconditionally, so on a phone a 330 px pane plus a transcript left
+  neither usable. It now shows only when `cl.split` says the width can
+  carry both, and its width scales (38% clamped 240–330) instead of
+  being fixed.
+
+  `workbench` — NOT a duplicate, contrary to the guess. It is a
+  taxonomy, not a renderer: `WbTab`, `Workbench`, `members()`,
+  `is_surgical()` — a grouping of the non-chat tabs into related sets
+  for gesture navigation between them. `tabs/` owns the RENDERING and
+  has nothing that groups tabs, so this is unfinished work rather than
+  superseded work. Still uncalled.
+
+  HAZARD FOUND while wiring, documented at the call site: `ChatLayout`'s
+  `input_docked_bottom` and `touch_target` derive from the `touch`
+  argument, and the obvious source for it — `any_touches()` — is true
+  only WHILE a finger is down. Reading those fields from a per-frame
+  call would make the input bar jump as you tap. `split` does not depend
+  on touch, which is why this wiring is safe; anything more needs a
+  sticky "is a touch device" flag the app does not have.
+
+  STILL TO DECIDE: the remaining seven.
 
 - **C12-40c — the original entry, for the reasoning:** These
   split into two piles and the piles want opposite treatment. A module
