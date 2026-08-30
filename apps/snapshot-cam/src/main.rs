@@ -9,7 +9,23 @@ use snapshot_cam::{Roll, ShareTarget, Shot, capture_filename};
 fn main() -> eframe::Result<()> {
     eframe::run_native(
         "snapshot-cam",
-        eframe::NativeOptions::default(),
+        // Glow SAID, not merely implied by the feature list.
+        //
+        // This crate's Cargo.toml documents the crash it learned first:
+        // eframe 0.34 defaults include wgpu but not glow, so
+        // Renderer::default() picks wgpu, whose default device
+        // descriptor asks for 8 colour attachments and dies on a phone
+        // GPU that allows 5.
+        //
+        // The manifest fix works only while nothing else in the build
+        // pulls egui-wgpu in. gitmind-egui declared the same glow-only
+        // features and still got wgpu through feature unification — so
+        // relying on the dependency graph to hold this steady is the
+        // part that already failed once, elsewhere.
+        eframe::NativeOptions {
+            renderer: eframe::Renderer::Glow,
+            ..Default::default()
+        },
         Box::new(|_cc| Ok(Box::new(Cam::default()))),
     )
 }

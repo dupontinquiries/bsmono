@@ -51,6 +51,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "bo-suite (egui)",
         eframe::NativeOptions {
+        // Glow SAID, not left to eframe: its 0.34 defaults include
+        // wgpu but not glow, and wgpu's default device descriptor
+        // asks for 8 colour attachments — which dies at startup on
+        // a phone GPU allowing 5. A glow-only feature list is not
+        // enough; gitmind-egui declared one and still got wgpu
+        // through feature unification.
+        renderer: eframe::Renderer::Glow,
         viewport: uikit_egui::desktop::viewport(APP_ID, "Bo Suite", [900.0, 700.0]),
         ..Default::default()
     },

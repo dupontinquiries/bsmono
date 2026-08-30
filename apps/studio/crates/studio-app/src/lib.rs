@@ -4394,6 +4394,13 @@ impl App {
 #[cfg(feature = "app")]
 pub fn run(title: &str) -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
+        // Glow SAID, not left to eframe: its 0.34 defaults include
+        // wgpu but not glow, and wgpu's default device descriptor
+        // asks for 8 colour attachments — which dies at startup on
+        // a phone GPU allowing 5. A glow-only feature list is not
+        // enough; gitmind-egui declared one and still got wgpu
+        // through feature unification.
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]),
         ..Default::default()
     };

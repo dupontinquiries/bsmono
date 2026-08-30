@@ -63,6 +63,17 @@ impl eframe::App for BSettings {
 }
 
 fn main() -> eframe::Result<()> {
-    let opts = eframe::NativeOptions::default();
+    let opts = eframe::NativeOptions {
+        // Glow SAID, not left to eframe.
+        //
+        // eframe 0.34's defaults include wgpu but not glow, so
+        // Renderer::default() picks wgpu — whose default device
+        // descriptor asks for 8 colour attachments and dies on a phone
+        // GPU allowing 5. A glow-only feature list is not enough:
+        // gitmind-egui declared exactly that and still got wgpu through
+        // feature unification with something else in the build.
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
     eframe::run_native("bsettings", opts, Box::new(|_cc| Ok(Box::new(BSettings::new()))))
 }

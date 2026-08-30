@@ -738,6 +738,13 @@ pub fn run(title: &str) -> eframe::Result<()> {
         return Ok(());
     }
     let opts = eframe::NativeOptions {
+        // Glow SAID, not left to eframe: its 0.34 defaults include
+        // wgpu but not glow, and wgpu's default device descriptor
+        // asks for 8 colour attachments — which dies at startup on
+        // a phone GPU allowing 5. A glow-only feature list is not
+        // enough; gitmind-egui declared one and still got wgpu
+        // through feature unification.
+        renderer: eframe::Renderer::Glow,
         // An on-screen keyboard wants to be WIDE and SHORT, and it must not
         // steal focus from the app being typed into — a keyboard that takes
         // focus types into itself.

@@ -4420,3 +4420,28 @@ workspace manifest with no bin — the phantom-entry failure from §72.
 
   21/21 with `--features app`, 14/14 headless — the split this crate's
   header describes still holds.
+
+## 83. The renderer pin, swept across the fleet
+
+§76 pinned glow in the three apps that used `NativeOptions::default()`.
+That was the wrong scope: the exposure is not the DEFAULT, it is leaving
+the renderer unstated at all.
+
+Swept every `run_native` call in `apps/`. Sixteen more were unstated,
+now pinned — including snapshot-cam, whose own Cargo.toml DOCUMENTS this
+crash in eight lines of comment and still left the choice to eframe. It
+learned the bug first and fixed it in the manifest, which works only
+while nothing else in the build pulls `egui-wgpu` in. gitmind-egui
+declared exactly the same glow-only feature list and got wgpu anyway.
+
+Three were left alone deliberately, because they genuinely use wgpu:
+cadscope (its renderer is skydribble's object pass in an `egui_wgpu`
+paint callback), snapclone's camera-bridge (which clamps device limits
+instead — the correct fix when you want wgpu), and beatspace.
+
+Checked by compiling four of the edited crates rather than trusting a
+scripted edit across sixteen files.
+
+The general shape: a feature list expresses a PREFERENCE and the
+renderer field expresses a DECISION. Only the second survives someone
+else's dependency change.

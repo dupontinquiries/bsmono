@@ -869,6 +869,13 @@ pub fn run(choice: BackendChoice) -> eframe::Result<()> {
     };
 
     let opts = eframe::NativeOptions {
+        // Glow SAID, not left to eframe: its 0.34 defaults include
+        // wgpu but not glow, and wgpu's default device descriptor
+        // asks for 8 colour attachments — which dies at startup on
+        // a phone GPU allowing 5. A glow-only feature list is not
+        // enough; gitmind-egui declared one and still got wgpu
+        // through feature unification.
+        renderer: eframe::Renderer::Glow,
         viewport: uikit_egui::desktop::viewport(APP_ID, "Dialer", [400.0, 640.0]),
         ..Default::default()
     };
