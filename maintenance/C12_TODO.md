@@ -1938,4 +1938,18 @@ table" sound like in a commit subject.
   voiceterm's launcher, now these). Consistent enough to be a standing
   check rather than a coincidence: after any merge, grep each new module
   for references outside itself. `orphan_check` catches files nothing
-  compiles; nothing yet catches modules that compile and nothing calls.
+  compiles; `maintenance/tools/unhosted_check.py` now catches modules
+  that compile fine and nothing calls.
+
+  It independently reproduced the manual finding — helmai and holomap as
+  `cli-only [tested]`, fleet and align correctly absent — and found 12
+  more uncalled-but-tested modules in blackstar-rs I had not looked at,
+  plus 36 in snapclone.
+
+  Three states, not pass/fail, because "no callers" alone is too blunt
+  to act on: tested+uncalled is usually work that stopped one step
+  early; untested+uncalled is usually dead code; cli-only may be
+  entirely intentional, since headless sims are how this repo tests
+  raids, physics and folding. It never fails a build — a gate would grow
+  an allowlist nobody maintains, and the value is a list a person reads
+  after a merge.
