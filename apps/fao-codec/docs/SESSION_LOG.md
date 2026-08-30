@@ -3328,3 +3328,42 @@ docs/full_v11_dz32_halfpel.csv):
 One construction closed 1.3 of the 2 dB whole-video quality gap while
 shrinking bytes — the residual ledger pointed at the right bucket.
 Quarter-pel is the next rung of the same ladder.
+
+### Quarter-pel + the gain/offset term: whole-video quality parity with AV1 (same session)
+
+Quarter-pel (third refinement ring, quarter-pel MV wire units):
+measured near-neutral (−1.7% on the worst shot, +0.13 dB for +2% on
+the control) — diminishing returns; the sub-pel ladder's next real
+rung is TAP QUALITY (6-tap interpolation), not finer steps. Kept.
+
+The gain/offset term (per-region a·pred+b, least-squares fit,
+a quantized to 1/64 steps ±31, b to ints ±31, ~2 bytes/region where
+used, gated on a 96-L1 rate cover; correction mutates the composite
+before residual coding so encoder/recon consistency is by
+construction): ledger-measured ceiling ~42% of residual energy on
+the worst shot — and the realized win is the LARGEST single RD move
+of the session:
+  shot 9: 7.51 → 5.26 MB (−30.0%) AND +0.68 dB AND +0.025 SSIM —
+    strict dominance. Cumulative on shot 9 this session: −39.7%
+    bytes at +2.04 dB.
+  shotB: +20% bytes for +1.80 dB — an up-curve move at/above the
+    dz-tradeoff line (not strict dominance; stated as such).
+The mechanism, per the ledger: gain<1 is a first-order model of
+motion blur's contrast reduction ("air"), offset models exposure
+flutter ("light sources") — two of the named invisible filters,
+captured by two parameters per region. (The ledger's ceiling probe
+itself needed a fix on the way: it had compared MC'd raw SAD against
+gain-corrected UNcompensated prediction — 226% "corrected" energy
+was the probe's bug, recorded.)
+
+Full-suite ladder, all 19 shots at dz32:
+  int-pel  : 45.95 MB @ 31.33 dB / 0.895   (46.5× AV1, −2.00 dB)
+  half-pel : 42.88 MB @ 32.62 dB / 0.922   (43.4×, −0.71 dB)
+  qpel+gain: 39.90 MB @ 33.69 dB / 0.934   (40.3×, +0.36 dB)
+
+WHOLE-VIDEO QUALITY PARITY WITH AV1: CROSSED (+0.36 dB over the full
+45 s) — while v11's own bytes fell 13% across the ladder. Every rung
+was chosen by residual-ledger attribution, not intuition. The
+remaining gap is pure rate: 40.3×, owned by entropy coding (2–3×
+estimated), intra modes, lookahead RD, mover compositing, and — for
+the target regimes — canonical citation amortization.

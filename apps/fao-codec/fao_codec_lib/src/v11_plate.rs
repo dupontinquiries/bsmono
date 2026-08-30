@@ -722,7 +722,11 @@ fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usi
             }
         }
     }
-    // Half-pel refinement around the integer winner.
+    // Half-pel refinement around the integer winner, then quarter-pel
+    // around the half-pel winner. Returned units are QUARTER-PEL
+    // (so (6, -2) means (+1.5, -0.5) px); ±12px range = ±48, fits i8.
+    // Each ring is accepted only on a clear SAD win (>16 half, >8
+    // quarter) so refinement never pays rate for noise.
     let (mut hx, mut hy) = (best_dx * 2, best_dy * 2);
     let mut hp_sad = best_sad;
     for (ddx, ddy) in [
@@ -740,18 +744,35 @@ fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usi
             hy = cy;
         }
     }
-    ((hx as i8, hy as i8), hp_sad)
+    let (mut qx, mut qy) = (hx * 2, hy * 2);
+    let mut qp_sad = hp_sad;
+    for (ddx, ddy) in [
+        (-1i32, -1i32), (0, -1), (1, -1),
+        (-1, 0), (1, 0),
+        (-1, 1), (0, 1), (1, 1),
+    ] {
+        let (cx, cy) = (hx * 2 + ddx, hy * 2 + ddy);
+        let fx = rx as f32 + cx as f32 * 0.25;
+        let fy = ry as f32 + cy as f32 * 0.25;
+        let s = sad_region_hp(prev_y, w, h, fx, fy, cur_y, rx, ry);
+        if s + 8 < qp_sad {
+            qp_sad = s;
+            qx = cx;
+            qy = cy;
+        }
+    }
+    ((qx as i8, qy as i8), qp_sad)
 }
 
 fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8, i8)) {
-    // mv is in HALF-PEL units. Even components take the exact integer
-    // path (bit-identical to the old behavior); odd components sample
-    // bilinearly. Chroma moves at quarter-pel of its plane, always
-    // bilinear when fractional.
+    // mv is in QUARTER-PEL units. Whole-pixel components take the
+    // exact integer path (bit-identical to the original behavior);
+    // fractional components sample bilinearly. Chroma moves at 1/8-pel
+    // of its plane, always bilinear when fractional.
     let (w, h) = (dst.w, dst.h);
     let (mvx, mvy) = (mv.0 as i32, mv.1 as i32);
-    if mvx % 2 == 0 && mvy % 2 == 0 {
-        let (ix, iy) = (mvx / 2, mvy / 2);
+    if mvx % 4 == 0 && mvy % 4 == 0 {
+        let (ix, iy) = (mvx / 4, mvy / 4);
         for dy in 0..REGION {
             for dx in 0..REGION {
                 let sx = (rx as i32 + dx as i32 + ix).clamp(0, w as i32 - 1) as usize;
@@ -771,7 +792,7 @@ fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8
         }
         return;
     }
-    let (fx0, fy0) = (mvx as f32 * 0.5, mvy as f32 * 0.5);
+    let (fx0, fy0) = (mvx as f32 * 0.25, mvy as f32 * 0.25);
     for dy in 0..REGION {
         for dx in 0..REGION {
             dst.y[(ry + dy) * w + rx + dx] = bilinear(
@@ -874,11 +895,11 @@ pub fn build_plate_fused(takes: &[(&[Yuv420], &[PlateMotion])]) -> Plate {
                 if var / (REGION * REGION) as u64 >= 64 {
                     let (mv, sad) = search_mv(ref_y, fw, fh, cur_y, x, y);
                     if sad < (REGION * REGION * 12) as u32 {
-                        // search_mv returns half-pel units of cur->ref block
-                        // offset; the take offset convention below matches
-                        // motion dx (content shift), so negate.
-                        dxs.push(-(mv.0 as f32) * 0.5);
-                        dys.push(-(mv.1 as f32) * 0.5);
+                        // search_mv returns quarter-pel units of cur->ref
+                        // block offset; the take offset convention below
+                        // matches motion dx (content shift), so negate.
+                        dxs.push(-(mv.0 as f32) * 0.25);
+                        dys.push(-(mv.1 as f32) * 0.25);
                     }
                 }
                 x += step;
@@ -1022,7 +1043,7 @@ pub fn align_plate_affine(plate: &Plate, frame0: &Yuv420) -> (Plate, crate::glob
                 let (mv, sad) = search_mv(&pred0.y, fw, fh, &frame0.y, x, y);
                 // half-pel units -> px; reject poor matches.
                 if sad < (REGION * REGION * 12) as u32 {
-                    let (mx, my) = (mv.0 as f32 * 0.5, mv.1 as f32 * 0.5);
+                    let (mx, my) = (mv.0 as f32 * 0.25, mv.1 as f32 * 0.25);
                     let (cx, cy) = (x as f32 + REGION as f32 / 2.0, y as f32 + REGION as f32 / 2.0);
                     pairs.push((cx + mx, cy + my, cx, cy));
                 }
@@ -1087,6 +1108,7 @@ pub fn residual_ledger(frames: &[Yuv420]) -> String {
     let (gw, gh) = (fw / REGION, fh / REGION);
     let mut cls_count = [0u64; 3];
     let mut cls_energy = [0f64; 3];
+    let mut cls_corrected = [0f64; 3];
     let mut unsolved_cells: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (fi, (f, m)) in frames.iter().zip(&motions).enumerate() {
         if fi == 0 {
@@ -1099,8 +1121,64 @@ pub fn residual_ledger(frames: &[Yuv420]) -> String {
                 let (rx, ry) = (gx * REGION, gy * REGION);
                 let sad_plate =
                     sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
-                let (_mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
+                let (mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
                 let fin = sad_plate.min(sad_prev) as f64;
+                // Exposure-term ceiling: residual energy after the OPTIMAL
+                // per-region gain+offset correction of the winning
+                // predictor (least squares a,b on pred→actual). If
+                // lighting flutter is a real cost, corrected energy sits
+                // well under raw energy on tracked-changed regions; if
+                // not, the exposure term isn't worth its side-info.
+                let corrected = {
+                    let use_plate = sad_plate <= sad_prev;
+                    // Prev branch must be sampled AT ITS MC OFFSET — the
+                    // raw comparator (fin) is the motion-compensated SAD,
+                    // and correcting an UNcompensated prediction inflated
+                    // "corrected" energy past raw on drifting content
+                    // (measured 226% before this fix — the probe's bug,
+                    // not the codec's).
+                    let (fx0, fy0) = (mv.0 as f32 * 0.25, mv.1 as f32 * 0.25);
+                    let pv_at = |dx: usize, dy: usize| -> f64 {
+                        if use_plate {
+                            plate_pred.y[(ry + dy) * fw + rx + dx] as f64
+                        } else {
+                            bilinear(
+                                &prev.y, fw, fh,
+                                (rx + dx) as f32 + fx0,
+                                (ry + dy) as f32 + fy0,
+                            ) as f64
+                        }
+                    };
+                    let (mut sp, mut sa, mut spp, mut spa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                    let n = (REGION * REGION) as f64;
+                    for dy in 0..REGION {
+                        for dx in 0..REGION {
+                            let pi = (ry + dy) * fw + rx + dx;
+                            let pv = pv_at(dx, dy);
+                            let av = f.y[pi] as f64;
+                            sp += pv;
+                            sa += av;
+                            spp += pv * pv;
+                            spa += pv * av;
+                        }
+                    }
+                    let denom = n * spp - sp * sp;
+                    let (a, b) = if denom.abs() > 1e-6 {
+                        let a = (n * spa - sp * sa) / denom;
+                        (a.clamp(0.5, 2.0), (sa - a.clamp(0.5, 2.0) * sp) / n)
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    let mut e = 0.0f64;
+                    for dy in 0..REGION {
+                        for dx in 0..REGION {
+                            let pi = (ry + dy) * fw + rx + dx;
+                            let pv = pv_at(dx, dy);
+                            e += (a * pv + b - f.y[pi] as f64).abs();
+                        }
+                    }
+                    e
+                };
                 let per_px = fin / (REGION * REGION) as f64;
                 let c = if per_px < 8.0 {
                     0
@@ -1112,13 +1190,14 @@ pub fn residual_ledger(frames: &[Yuv420]) -> String {
                 };
                 cls_count[c] += 1;
                 cls_energy[c] += fin;
+                cls_corrected[c] += corrected;
             }
         }
     }
     let tot_c: u64 = cls_count.iter().sum();
     let tot_e: f64 = cls_energy.iter().sum::<f64>().max(1.0);
     format!(
-        "regions: skip {:.1}% tracked-changed {:.1}% unsolved {:.1}% | residual-energy share: skip {:.1}% tracked-changed {:.1}% unsolved {:.1}% | unsolved-cell footprint {:.1}% of frame",
+        "regions: skip {:.1}% tracked-changed {:.1}% unsolved {:.1}% | residual-energy share: skip {:.1}% tracked-changed {:.1}% unsolved {:.1}% | unsolved-cell footprint {:.1}% of frame | gain-corrected energy: skip {:.0}% tc {:.0}% uns {:.0}% of raw",
         100.0 * cls_count[0] as f64 / tot_c as f64,
         100.0 * cls_count[1] as f64 / tot_c as f64,
         100.0 * cls_count[2] as f64 / tot_c as f64,
@@ -1126,6 +1205,9 @@ pub fn residual_ledger(frames: &[Yuv420]) -> String {
         100.0 * cls_energy[1] / tot_e,
         100.0 * cls_energy[2] / tot_e,
         100.0 * unsolved_cells.len() as f64 / (gw * gh) as f64,
+        100.0 * cls_corrected[0] / cls_energy[0].max(1.0),
+        100.0 * cls_corrected[1] / cls_energy[1].max(1.0),
+        100.0 * cls_corrected[2] / cls_energy[2].max(1.0),
     )
 }
 
@@ -1189,6 +1271,74 @@ pub fn encode_gop_v3(
             comp
         };
 
+        // ── Per-region gain/offset correction (the "light sources" +
+        // first-order blur term). Ledger-measured ceiling: optimal
+        // (a,b) per region removes ~42% of total residual energy on the
+        // worst motion shot (gain<1 models blur's contrast reduction;
+        // offset models exposure flutter). Encoder fits least-squares
+        // (a,b) on the composed predictor per region, quantizes a to
+        // 1/64 steps around 1.0 (6 bits) and b to integers (6 bits),
+        // and applies only when the L1 win clears the ~2-byte rate.
+        // The correction mutates the composite BEFORE residual coding,
+        // so encoder and inline recon stay consistent by construction.
+        let mut composite = composite;
+        let mut gain_flags = vec![0u8; (gw * gh + 7) / 8];
+        let mut gain_vals: Vec<u8> = Vec::new();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let (rx, ry) = (gx * REGION, gy * REGION);
+                let n = (REGION * REGION) as f64;
+                let (mut sp, mut sa, mut spp, mut spa) = (0.0f64, 0.0, 0.0, 0.0);
+                for dy in 0..REGION {
+                    for dx in 0..REGION {
+                        let pi = (ry + dy) * fw + rx + dx;
+                        let pv = composite.y[pi] as f64;
+                        let av = f.y[pi] as f64;
+                        sp += pv;
+                        sa += av;
+                        spp += pv * pv;
+                        spa += pv * av;
+                    }
+                }
+                let denom = n * spp - sp * sp;
+                if denom.abs() < 1e-6 {
+                    continue;
+                }
+                let a = ((n * spa - sp * sa) / denom).clamp(0.516, 1.484);
+                let qa = ((a - 1.0) * 64.0).round().clamp(-31.0, 31.0) as i8;
+                let a = 1.0 + qa as f64 / 64.0;
+                let b = ((sa - a * sp) / n).round().clamp(-31.0, 31.0);
+                if qa == 0 && b == 0.0 {
+                    continue;
+                }
+                let (mut e_raw, mut e_cor) = (0i64, 0i64);
+                for dy in 0..REGION {
+                    for dx in 0..REGION {
+                        let pi = (ry + dy) * fw + rx + dx;
+                        let pv = composite.y[pi] as f64;
+                        let av = f.y[pi] as f64;
+                        e_raw += (pv - av).abs() as i64;
+                        e_cor += ((a * pv + b).clamp(0.0, 255.0) - av).abs() as i64;
+                    }
+                }
+                if e_cor + 96 >= e_raw {
+                    continue;
+                }
+                let gi = gy * gw + gx;
+                gain_flags[gi / 8] |= 1 << (gi % 8);
+                gain_vals.push(qa as u8);
+                gain_vals.push(b as i8 as u8);
+                for dy in 0..REGION {
+                    for dx in 0..REGION {
+                        let pi = (ry + dy) * fw + rx + dx;
+                        let pv = composite.y[pi] as f64;
+                        composite.y[pi] = (a * pv + b).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+        let composite = composite;
+
         // Side info, three streams zstd'd together:
         //   bitmap 1: plate(0) vs prev(1) per region
         //   bitmap 2: for prev regions only — zero-MV(0) vs coded-MV(1).
@@ -1246,6 +1396,8 @@ pub fn encode_gop_v3(
         }
         side.extend_from_slice(&nz_bits);
         side.extend_from_slice(&mv_deltas);
+        side.extend_from_slice(&gain_flags);
+        side.extend_from_slice(&gain_vals);
         let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
 
         let p444 = interleave_444(&composite);
