@@ -853,6 +853,53 @@ mod voice_prefs_tests {
             "only {checked} keys differed from default; the helper has stopped exercising the schema");
     }
 
+    /// `all()` must list every variant, and the COMPILER must be what enforces
+    /// that. Each arm below is an exhaustive match, so adding a variant to the
+    /// enum fails to compile here until someone decides where it belongs in the
+    /// offered order — which is the only mechanism that survives a contributor
+    /// who has never read this file. A runtime length check alone would pass a
+    /// stale `all()` that simply omits the newcomer, and the symptom of that is
+    /// an option a user can never select, with nothing failing anywhere.
+    #[test]
+    fn all_lists_every_variant_of_every_offered_enum() {
+        for v in AnimationStyle::all() {
+            match v { AnimationStyle::Snappy | AnimationStyle::Smooth | AnimationStyle::Heavy
+                    | AnimationStyle::Reduced => {} }
+            assert_eq!(AnimationStyle::parse(v.as_str()), v, "{v:?} must survive as_str/parse");
+        }
+        for v in Handedness::all() {
+            match v { Handedness::Right | Handedness::Left => {} }
+            assert_eq!(Handedness::parse(v.as_str()), v);
+        }
+        for v in MovementLayout::all() {
+            match v { MovementLayout::Wasd | MovementLayout::Dvorak | MovementLayout::Esdf
+                    | MovementLayout::Arrows => {} }
+            assert_eq!(MovementLayout::parse(v.as_str()), v);
+        }
+        for v in VoiceFilter::all() {
+            match v { VoiceFilter::Off | VoiceFilter::Light | VoiceFilter::Standard
+                    | VoiceFilter::Strict => {} }
+            assert_eq!(VoiceFilter::parse(v.as_str()), v);
+        }
+        for v in ColorFilter::all() {
+            match v { ColorFilter::None | ColorFilter::Grayscale | ColorFilter::Protanopia
+                    | ColorFilter::Deuteranopia | ColorFilter::Tritanopia | ColorFilter::Warm => {} }
+            assert_eq!(ColorFilter::parse(v.as_str()), v);
+        }
+        // No duplicates, and a label for each — a settings row with two entries
+        // reading the same is indistinguishable from a bug in the panel.
+        for labels in [
+            ColorFilter::all().iter().map(|v| v.label()).collect::<Vec<_>>(),
+            MovementLayout::all().iter().map(|v| v.label()).collect(),
+            VoiceFilter::all().iter().map(|v| v.label()).collect(),
+        ] {
+            let mut seen = labels.clone();
+            seen.sort_unstable(); seen.dedup();
+            assert_eq!(seen.len(), labels.len(), "duplicate labels in {labels:?}");
+            assert!(labels.iter().all(|l| !l.trim().is_empty()), "an empty label in {labels:?}");
+        }
+    }
+
     #[test]
     fn a_fully_non_default_prefs_survives_a_round_trip() {
         // The whole-struct complement to the per-key test: catches a value that
