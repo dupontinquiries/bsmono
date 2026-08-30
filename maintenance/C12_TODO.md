@@ -3502,3 +3502,47 @@ this pattern has come up.
 
   Still untested end to end (plan → button → runner → ssh), but the
   semantics now match what `execute` documents.
+
+## 66. gitmind's cockpit toolbox: 3,382 lines, 92 tests, no entry anywhere
+
+Hand-checked gitmind's twelve remaining uncalled modules at the corrected
+(whole-tree) scope, and by a method the tool does not use: whether the
+CLI exposes them as subcommands. None does.
+
+    apkcache   383 lines   9 tests      session    416 lines  11 tests
+    fbdiag     230         7            encode     218          4
+    join       314        10            remote     158          3
+    kerneltry  342        10            similarity 102          3
+    klog       364        10
+    repomap    138         5
+    sparse     301         9
+    udevcheck  416        11
+
+3,382 lines, 92 tests, and no path from any binary. Checked the GTK GUI
+too, in case the egui port had simply not caught up — it does not
+reference them either. These were written for a host that has never
+existed.
+
+**They are not junk, which is what makes this the worst case of the
+pattern.** They are the diagnostics a fleet operator needs when a phone
+will not cooperate:
+  - `udevcheck` — "does this phone actually reach a rule that grants
+    access?", for the failure where a rules file is installed, looks
+    right, `lsusb` sees the device, and nothing works.
+  - `klog` — kernel output from `/sys/fs/pstore` turned into something
+    analysable; `kerneltry` says when to read it.
+  - `fbdiag`, `sparse`, `apkcache`, `join`, `session` — the rest of a
+    coherent bring-up toolkit.
+
+The cross-references between them (`klog`'s doc points at `kerneltry`)
+say these were designed together as a set.
+
+- **C12-66a — this wants ONE page, not twelve wirings.** A "Diagnostics"
+  page in gitmind-egui holding the toolkit is a smaller change than
+  hooking each into somewhere plausible, and it matches how they were
+  designed. I have not built it: choosing which of twelve tools a person
+  reaches for first, and in what order, is a design question and I would
+  be guessing.
+- **C12-66b — `encode`, `remote`, `similarity` are core, not cockpit**,
+  and may be a different case (library API for a consumer that has not
+  been written). Not separated yet.
