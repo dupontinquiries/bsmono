@@ -12029,3 +12029,25 @@ CAPSTONE VERIFIED (take 4): host logs "first entity state from peer 4294967296";
 32×InGame; keepalive rejoins 2 total, quiescing 3 s before InGame; zero panics both sides. BIDIRECTIONAL entity
 replication + join-sync + clock adoption all live in one soak. Cosmetic residue: the joiner re-logs "first entity"
 after prune gaps between seconds-long lavapipe frames — a software-rasterizer artifact, not a device behavior.
+
+## r604 — TREE SILHOUETTES from the operator's field studies + THE NOISE FORK (major pre-existing finding)
+The operator supplied two West-African forest field studies (distilled in docs/design/biomes_west_africa.md). First
+landing: world/tree_form — tree SILHOUETTES as pure layer geometry (CanopyForm::{Dome, FlatTop, Baobab, Shrub}), with
+Dome pinned BYTE-IDENTICAL to the pre-r604 inline formula (unit test), so all existing biomes are untouched. Savanna
+now grows FlatTop umbrellas (clear trunk, thin wide crown, radius capped at 3 — radius 4 would silently truncate at
+chunk borders: both backends' canopy scans are sized for 3+1). Baobab brings 2×2 trunks; Shrub is the understory
+stratum for r605's islands. CPU generator routes canopy+trunk through the form fns; the GLSL twin
+(chunk_generation.comp) mirrors all of it — form rides two previously-free bits in the packed tree decision. Gates:
+tree_form 5/0 including a LITERAL GLSL-transliteration test (the mirror's real gate — see below), biomes+cpu_generator
+42/0, fullgame clean, 90 s in-world soak exit 0 / zero watchdog lines. Both .spv artifacts rebuilt.
+THE FINDING: building a worldgen-parity probe for the mirror (gpu-headless-probe UNENDLICH_PROBE_PARITY=1, _FAR=1,
+_SEED=N) surfaced a PRE-EXISTING CPU↔GPU fork: shader noise is f32, CPU is f64, and over land the backends disagree on
+~0.5%+ of blocks (surface ±1 along contours; shoreline-origin seeds diverge massively at once; separate deep-band
+y-chunk-1 mismatch even at origin: world (0,32,0) cpu=Stone gpu=Water — suspects: env-gated multi_scale_caves and the
+CPU-side aquifer pass). terrain_generator.rs's "byte-identical" claim holds only over boundary-free ocean. MULTIPLAYER
+IMPLICATION: join-sync's "same seed ⇒ same terrain" carries a same-backend caveat (a CPU-only joiner on a GPU host
+forks terrain). Probe seeds on record: 3405691582/7777 exact-but-treeless (ocean origins); 424242/90210/1337/8888/
+555000/271828/31415926/12648430 all diverge over land. The world-level mirror is UNGATEABLE until the fork is fixed
+(fix directions ranked in the design doc); the probe stays as the drift instrument. r605 (forest islands with
+per-island palettes — the 8%-species-overlap rule — plus termite micro-clusters) is designed in the doc and waits on
+the operator's on-device art check of the r604 silhouettes.

@@ -945,10 +945,23 @@ impl WorldGenerator {
                 };
 
                 // ---- Stamp trunk (with lean offset per block) ----
+                // r604: thickness from the form — the baobab's 2×2 trunk
+                // mass IS its silhouette. Extra columns extend +x/+z.
+                let tt = crate::world::tree_form::trunk_thickness(profile.form);
                 for h in 1..=trunk_height {
                     let off_x = (lean_dx * h as f64).round() as i32;
                     let off_z = (lean_dz * h as f64).round() as i32;
-                    try_write(&mut blocks, wx + off_x, surface_y + h, wz + off_z, profile.trunk_block);
+                    for txo in 0..tt {
+                        for tzo in 0..tt {
+                            try_write(
+                                &mut blocks,
+                                wx + off_x + txo,
+                                surface_y + h,
+                                wz + off_z + tzo,
+                                profile.trunk_block,
+                            );
+                        }
+                    }
                 }
 
                 // ---- Stamp leaf canopy (centered on trunk-top, lean-shifted) ----
@@ -957,14 +970,19 @@ impl WorldGenerator {
                 let canopy_off_z = (lean_dz * trunk_height as f64).round() as i32;
                 let canopy_cx = wx + canopy_off_x;
                 let canopy_cz = wz + canopy_off_z;
-                let v_extent = r_max.max(1);
+                // r604: canopy geometry now comes from the profile's FORM
+                // (world::tree_form). Dome reproduces the old inline math
+                // byte-for-byte (pinned by unit test); FlatTop/Baobab/Shrub
+                // are the new West-African silhouettes. MIRRORED in
+                // chunk_generation.comp — the worldgen-parity probe diffs
+                // full chunks across backends to keep the twins honest.
+                use crate::world::tree_form as tf;
+                let v_extent = tf::canopy_v_extent(profile.form, r_max);
                 for cy in (canopy_cy - v_extent) ..= (canopy_cy + v_extent) {
                     let dy = cy - canopy_cy;
-                    let r = if v_extent <= 1 {
-                        1
-                    } else {
-                        let frac = 1.0 - (dy.abs() as f64 / v_extent as f64);
-                        ((r_max as f64) * frac).round().max(1.0) as i32
+                    let Some(r) = tf::canopy_layer_radius(profile.form, dy, v_extent, r_max)
+                    else {
+                        continue;
                     };
                     for cz in (canopy_cz - r) ..= (canopy_cz + r) {
                         for cx in (canopy_cx - r) ..= (canopy_cx + r) {
