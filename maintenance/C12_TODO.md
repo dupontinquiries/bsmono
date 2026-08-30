@@ -1654,11 +1654,26 @@ of those pin failures that would each be invisible in a happy-path test:
   Chunk extensions (`1a;foo=bar`) are tolerated — legal HTTP that
   hand-rolled parsers usually choke on.
 
-  STILL TO DO: a streaming `gen` signature. The current one is
-  `Fn(&str, usize) -> String`, which cannot emit tokens as it goes, so
-  the handler needs a sibling taking `&mut dyn FnMut(&str) -> bool`
-  before the codec has anything to stream. Then the client side, then
-  logscope-egui's `Daemon` backend variant.
+  **The streaming SERVER is now built.** `StreamGen` is
+  `Fn(&str, usize, &mut dyn FnMut(&str) -> bool)`, `serve_unix_streaming`
+  serves it, and `stream_whole` adapts an existing whole-reply generator
+  so no current caller has to be rewritten first.
+
+  Only `/generate` streams; everything else goes out whole through the
+  existing `handle`, so there is ONE routing table rather than two that
+  could disagree about what `/version` returns. `on_token` returning
+  false stops generation when the reader has gone — otherwise a closed
+  pane would keep burning GPU time producing tokens nobody reads.
+
+  The test asserts the FIRST token is readable while the generator is
+  still working (it sleeps 300ms before its second, and the client reads
+  with a 150ms timeout). A test that only checked the final text would
+  have passed against the non-streaming server too, which is the trap
+  here.
+
+  STILL TO DO: the client side (`DaemonBackend::generate` reads whole
+  bodies today and needs to decode chunks as they arrive), then
+  logscope-egui's `Daemon` backend variant. gpu-gemm 1255/1255.
 
 **Note on scope:** this is where the daemon's value is largest AND where
 its UX cost is most visible, which is why the streaming question has to

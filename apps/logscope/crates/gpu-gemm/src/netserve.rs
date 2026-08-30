@@ -259,6 +259,100 @@ pub fn handle(
     }
 }
 
+/// A generator that emits tokens as it produces them.
+///
+/// The whole point of the chunked codec above: `Fn(&str, usize) -> String`
+/// cannot report progress, so a daemon reply arrives as a paragraph after
+/// a long silence. This shape can. `on_token` returns false to ask the
+/// generator to stop — a client that hung up, or a cancel.
+pub type StreamGen =
+    Arc<dyn Fn(&str, usize, &mut dyn FnMut(&str) -> bool) + Send + Sync>;
+
+/// Adapt a whole-reply generator to the streaming shape.
+///
+/// Emits once at the end. Provided so every existing caller keeps
+/// working unchanged rather than being forced to rewrite its generator
+/// before it can use the streaming server — the adapter is honest about
+/// what it is, and a backend that genuinely cannot stream should use it
+/// rather than pretending.
+pub fn stream_whole(gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync>) -> StreamGen {
+    Arc::new(move |prompt: &str, max: usize, on: &mut dyn FnMut(&str) -> bool| {
+        let out = gen(prompt, max);
+        let _ = on(&out);
+    })
+}
+
+/// Handle one request, writing the reply as it is generated.
+///
+/// Only `/generate` streams; everything else is small and goes out whole
+/// through the existing `handle`, so there is ONE routing table rather
+/// than two that can disagree about what `/version` returns.
+///
+/// Errors from the write are swallowed deliberately: a client that hung
+/// up mid-reply is ordinary (someone closed a pane), and the only
+/// correct response is to stop generating, which `on_token` returning
+/// false already does.
+fn handle_streaming<W: Write>(
+    req: &HttpRequest, keys: &Keyring, gen: &StreamGen, out: &mut W,
+) {
+    let token = req.token.as_deref().unwrap_or("");
+    let streaming = req.method == "POST" && req.path == "/generate";
+    if !streaming || !keys.accepts(token.as_bytes()) {
+        // Non-streaming path, including the 401: an auth failure is a
+        // short body and there is no reason to chunk it.
+        let whole: Arc<dyn Fn(&str, usize) -> String + Send + Sync> =
+            Arc::new(|_: &str, _: usize| String::new());
+        let resp = handle(req, keys, whole.as_ref());
+        let _ = out.write_all(&resp.bytes());
+        return;
+    }
+    let prompt = String::from_utf8_lossy(&req.body).into_owned();
+    let max = req.max_param(128);
+    if out.write_all(&chunked::head(200, "OK", "text/plain")).is_err() {
+        return;
+    }
+    let mut dead = false;
+    gen(&prompt, max, &mut |piece: &str| {
+        if dead {
+            return false;
+        }
+        if out.write_all(&chunked::chunk(piece)).is_err() || out.flush().is_err() {
+            // The reader is gone. Report it so generation stops rather
+            // than burning GPU time producing tokens nobody will read.
+            dead = true;
+            return false;
+        }
+        true
+    });
+    if !dead {
+        let _ = out.write_all(&chunked::end());
+        let _ = out.flush();
+    }
+}
+
+/// Serve a unix socket with a STREAMING generator.
+pub fn serve_unix_streaming(
+    path: &std::path::Path, keys: Keyring, gen: StreamGen, life: Option<LifeHandle>,
+) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    let keys = Arc::new(keys);
+    let start = std::time::Instant::now();
+    for stream in listener.incoming().flatten() {
+        let (keys, gen, life) = (keys.clone(), gen.clone(), life.clone());
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            if let Some(req) = read_request(&mut stream) {
+                let _busy = life.as_ref().map(|l| Busy::begin(l.clone(), start));
+                handle_streaming(&req, &keys, &gen, &mut stream);
+            }
+            let _ = stream.flush();
+        });
+    }
+    Ok(())
+}
+
 /// Serve forever: accept connections, handle each on its own thread. `gen` is shared via
 /// `Arc`, so the engine's `Gpu` + `Model` back every connection with no reload.
 /// Where the daemon's unix socket lives by default.
@@ -538,6 +632,66 @@ mod unix_tests {
         assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
         assert!(raw.contains("echo:fn f() { :32"), "prompt and max both arrived: {raw}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tokens_arrive_before_the_generator_has_finished() {
+        // THE WHOLE POINT. A test that only checks the final text would
+        // pass against the non-streaming server too, so this asserts the
+        // FIRST token is readable while the generator is still working —
+        // which is the difference between a live UI and forty seconds of
+        // silence.
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("gg-stream-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("s.sock");
+        let p2 = path.clone();
+
+        std::thread::spawn(move || {
+            let gen: StreamGen = Arc::new(|_p: &str, _m: usize, on: &mut dyn FnMut(&str) -> bool| {
+                if !on("first ") { return; }
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = on("second");
+            });
+            let _ = serve_unix_streaming(&p2, Keyring::new(vec![]), gen, None);
+        });
+
+        let mut sock = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::os::unix::net::UnixStream::connect(&path) { sock = Some(s); break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut sock = sock.expect("no socket");
+        sock.write_all(b"POST /generate?max=8 HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nq").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+
+        // Read only what is available within 150ms — far less than the
+        // 300ms the generator sleeps before its second token.
+        let mut r = BufReader::new(sock);
+        let mut seen = String::new();
+        for _ in 0..8 {
+            let mut line = String::new();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => seen.push_str(&line),
+            }
+        }
+        assert!(seen.contains("Transfer-Encoding: chunked"), "{seen:?}");
+        assert!(seen.contains("first"), "the first token did not arrive early: {seen:?}");
+        assert!(!seen.contains("second"), "the whole reply arrived at once: {seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_streaming_generator_still_works_through_the_adapter() {
+        // Existing callers must not have to rewrite their generator
+        // before they can use the streaming server.
+        let whole: Arc<dyn Fn(&str, usize) -> String + Send + Sync> =
+            Arc::new(|p: &str, m: usize| format!("whole:{p}:{m}"));
+        let s = stream_whole(whole);
+        let mut got = String::new();
+        s("hi", 4, &mut |piece: &str| { got.push_str(piece); true });
+        assert_eq!(got, "whole:hi:4");
     }
 
     #[test]
