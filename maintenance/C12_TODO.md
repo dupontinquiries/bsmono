@@ -3240,6 +3240,22 @@ Three things follow:
   answer here: yes, and the reference material was already in-tree. The
   limit was mine, not the sandbox's.
 
+  **DONE: `voiceask` is the hop.** `asks_from(&utterances, round) ->
+  Vec<Ask>`, so an operator speaking while a panel runs competes for the
+  same interrupt budget as a debater's question — which is the point of
+  going through `Ask` rather than shoving the transcript into the
+  prompt. `triage` already knows how to spend that budget.
+
+  `leverage` comes from FORM, not meaning: imperative > question >
+  statement, because those are the utterances that change what happens
+  next. A model call could score it better and `promptroute`'s argument
+  applies — a table is inspectable and wrong in ways a person can see.
+  Only the ORDERING is load bearing; `triage` sorts and takes a budget.
+
+  All interjections use one `from` (`OPERATOR`), because `triage`
+  dedupes by it and a two-microphone fleet would otherwise have the
+  operator competing with themselves.
+
   The honest next step is one entry point — the menu item
   `coordinator.rs` says is missing — not another layer.
 

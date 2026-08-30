@@ -57,6 +57,8 @@ pub use logscope_fan::bridge;
 #[allow(dead_code)] pub mod whisper_pool;
 #[allow(dead_code)] pub mod voice;
 pub mod voice_session;
+/// The hop from a spoken utterance to a `panelvoice::Ask`.
+pub mod voiceask;
 pub mod voice_intent;
 pub mod imprint;
 pub mod physui;
