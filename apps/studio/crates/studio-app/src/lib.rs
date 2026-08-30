@@ -3777,6 +3777,14 @@ impl App {
                             .on_disabled_hover_text("select clips on the timeline first");
                     });
                     ui.selectable_value(&mut plan.scope, export::Scope::RackLoop, "rack loop");
+                    // The album: one file per song, timeline order. Greyed
+                    // rather than hidden with no songs — a control that
+                    // vanishes teaches nothing about why.
+                    let has_songs = !self.studio.session.doc.project.groups.is_empty();
+                    ui.add_enabled_ui(has_songs, |ui| {
+                        ui.selectable_value(&mut plan.scope, export::Scope::EachSong, "each song")
+                            .on_disabled_hover_text("group clips into songs first");
+                    });
                 });
                 ui.checkbox(&mut plan.stems,
                     if plan.scope == export::Scope::RackLoop { "stems — one file per channel" }

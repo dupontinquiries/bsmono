@@ -488,10 +488,10 @@ What's still needed, roughly in dependency order:
   - **Clip-stretching/alignment DSP.** Explicitly still hard, explicitly
     NOT "stretch every clip to the workspace tempo" — that's the
     antipattern `TempoMap` was designed around, not toward.
-  - **Export-popup wizard grouping.** By-section vs. chapters vs. a
-    single export, as a distinct grouping/wizard on the export popup —
-    ties into C12-14e below (what "export the album" means) but is its
-    own UI work regardless of how that question resolves.
+  - **Export-popup wizard grouping — the per-song half landed with
+    C12-14e's `Scope::EachSong` (see below); by-section/chapters beyond
+    per-song remains open, and now has a settled foundation to extend
+    (another Scope variant producing Jobs, same pure planner).**
   - **Palette wiring for tempo — closed (`4b4f6ada`).** "set song tempo"
     mirrors "set song key"'s walk, one step shorter: song, then a BPM
     from a curated ladder (60–174, the list doubling as a readout of
@@ -500,12 +500,24 @@ What's still needed, roughly in dependency order:
     Tested to land on the group op, never project-wide. Tap-tempo and
     free numeric entry remain open — both are one more candidate row
     on the same `SongTempoPick` step, no new op.
-- **C12-14e — what "the whole project" means once songs exist.** Export
-  (`bounce`), the mixer, and anything that currently assumes one
-  timeline for the whole project need a decision: does exporting "the
-  album" concatenate every song's timeline, or is each song exported
-  independently and the album is an organizational container only?
-  Affects `studio-app`'s export flow, not yet looked at.
+- **C12-14e — DECIDED and first slice landed: the album is an
+  organizational container; songs export independently.** Rationale (in
+  `Scope::EachSong`'s docs): a concatenated single-file album would
+  invent an ordering and a gaplessness the model never stated, and
+  distribution wants per-track files; "whole timeline as one file"
+  already exists as `Scope::Full`, untouched. `Scope::EachSong`: one
+  job per song, TIMELINE order (the one ordering the model expresses),
+  span = the group's clip hull, named after the song with id
+  disambiguation on duplicates. The governing principle — a song's
+  export is its SPAN of the arrangement, exactly what playback of that
+  span plays — cuts both ways: ungrouped material inside the span is
+  included, and two songs sharing a time range are REFUSED out loud
+  (their files would bleed into each other) rather than shipped as a
+  surprise. Stems×EachSong refused with the workaround named. Dialog
+  shows "each song", greyed (not hidden) without songs. Six new
+  assertions across three tests. STILL OPEN from the original item:
+  the mixer's own per-song awareness, and the export-popup's
+  by-section/chapters refinement beyond this per-song grouping.
 
 ## 14g. studio, c13 session: presence sends, ghosts sweep, rooms exist
 

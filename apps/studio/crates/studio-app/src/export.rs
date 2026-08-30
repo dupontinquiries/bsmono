@@ -48,6 +48,15 @@ pub enum Scope {
     /// One pass of the current rack pattern, rendered by the same
     /// `render_pattern` the audition loop plays.
     RackLoop,
+    /// One file per song (group), named after it, spanning its clips'
+    /// hull, in TIMELINE order — the one ordering the model actually
+    /// expresses. This is C12-14e's answer, decided: **the album is an
+    /// organizational container; songs export independently.** A
+    /// concatenated single-file album would have to invent an ordering
+    /// and a gaplessness the model never stated, and distribution wants
+    /// per-track files anyway; a "whole timeline as one file" already
+    /// exists as [`Scope::Full`], untouched.
+    EachSong,
 }
 
 /// Everything the dialog decides, as a value.
@@ -104,6 +113,49 @@ pub fn plan_jobs(plan: &Plan, project: &Project, selection: &[ClipId])
             (from, to)
         }
         Scope::RackLoop => return Err("rack jobs are planned by plan_rack_jobs".into()),
+        Scope::EachSong => {
+            // A song's export is its SPAN of the arrangement — exactly what
+            // playback of that span plays, ungrouped material included. The
+            // principle cuts both ways: two songs sharing a time range
+            // would bleed into each other's files, so that is refused out
+            // loud instead of shipped as a surprise.
+            if plan.stems {
+                return Err("stems per song multiply fast — pick the song with \
+                            'switch song', select its clips, and export selection \
+                            stems instead".into());
+            }
+            let mut spans: Vec<(String, Ticks, Ticks)> = Vec::new();
+            for (gid, g) in &project.groups {
+                let clips: Vec<_> = g.clips.iter()
+                    .filter_map(|c| project.clips.get(c)).collect();
+                if clips.is_empty() { continue; } // every member deleted
+                let from = clips.iter().map(|c| c.pos).min().unwrap();
+                let to = clips.iter().map(|c| c.end()).max().unwrap();
+                // Name collisions (two songs both called "interlude")
+                // disambiguate by id rather than overwriting a file.
+                let name = if project.groups.values()
+                    .filter(|o| o.name == g.name).count() > 1 {
+                    format!("{} ({})", g.name, gid.0)
+                } else { g.name.clone() };
+                spans.push((name, from, to));
+            }
+            if spans.is_empty() {
+                return Err("no songs — group clips into songs first ('switch song' \
+                            lists them)".into());
+            }
+            spans.sort_by_key(|(_, from, _)| *from);
+            for w in spans.windows(2) {
+                if w[1].1 < w[0].2 {
+                    return Err(format!(
+                        "'{}' and '{}' overlap on the timeline — their exports \
+                         would bleed into each other. Separate them in time, or \
+                         export each via selection.", w[0].0, w[1].0));
+                }
+            }
+            return Ok(spans.into_iter()
+                .map(|(name, from, to)| Job { name, from, to, solo: Vec::new() })
+                .collect());
+        }
     };
     if !plan.stems {
         return Ok(vec![Job { name: String::new(), from, to, solo: Vec::new() }]);
@@ -407,6 +459,77 @@ mod tests {
                 gain: 1.0, effects: vec![] } }).unwrap();
         }
         p
+    }
+
+
+    /// C12-14e, decided and pinned: the album is a container, songs
+    /// export independently, in timeline order, named after themselves.
+    #[test]
+    fn each_song_is_one_job_in_timeline_order() {
+        let mut p = project();
+        // Two songs, deliberately DEFINED out of timeline order: "closer"
+        // (clip 3, at 3s) gets the lower GroupId, "opener" (clips 1+2,
+        // 0..2s) the higher. Timeline order must win over id order.
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(1), name: "closer".into(),
+            clips: vec![ClipId(3)] }).unwrap();
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(2), name: "opener".into(),
+            clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+        let plan = Plan { scope: Scope::EachSong, ..Plan::default() };
+        let jobs = plan_jobs(&plan, &p, &[]).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].name, "opener");
+        assert_eq!((jobs[0].from, jobs[0].to),
+                   (Ticks::ZERO, Ticks::from_seconds(2.0)),
+                   "the hull of clips 1 and 2");
+        assert_eq!(jobs[1].name, "closer");
+        assert_eq!((jobs[1].from, jobs[1].to),
+                   (Ticks::from_seconds(3.0), Ticks::from_seconds(4.0)));
+        assert!(jobs.iter().all(|j| j.solo.is_empty()),
+                "a song is a mixdown of its span, not a stem");
+    }
+
+    /// The refusals, each a sentence the dialog shows instead of closing:
+    /// overlap would bleed, stems would multiply, and no songs means the
+    /// scope has nothing to mean.
+    #[test]
+    fn each_song_refuses_overlap_stems_and_emptiness() {
+        let mut p = project();
+        // No groups at all: nothing to export per-song.
+        let plan = Plan { scope: Scope::EachSong, ..Plan::default() };
+        assert!(plan_jobs(&plan, &p, &[]).unwrap_err().contains("no songs"));
+        // A group whose every clip was deleted is skipped, and if it was
+        // the ONLY group that is still "no songs", not a zero-length job.
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(1), name: "ghost".into(),
+            clips: vec![ClipId(99)] }).unwrap();
+        assert!(plan_jobs(&plan, &p, &[]).unwrap_err().contains("no songs"));
+        // Overlapping songs: clip 1 (0..1s) and clip 2 (1..2s) vs a song
+        // holding clip 3 (3..4s) is fine — but a song holding clips 2 and 3
+        // (1..4s) against one holding clip 1 and clip 3... build a real
+        // overlap: song A = clips 1+3 (0..4s hull), song B = clip 2 (1..2s).
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(1), name: "a".into(),
+            clips: vec![ClipId(1), ClipId(3)] }).unwrap();
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(2), name: "b".into(),
+            clips: vec![ClipId(2)] }).unwrap();
+        let err = plan_jobs(&plan, &p, &[]).unwrap_err();
+        assert!(err.contains("overlap"), "got: {err}");
+        // Stems per song: refused with the workaround named.
+        let stems = Plan { scope: Scope::EachSong, stems: true, ..Plan::default() };
+        assert!(plan_jobs(&stems, &p, &[]).unwrap_err().contains("switch song"));
+    }
+
+    /// Two songs with one name must not overwrite one file — the id
+    /// disambiguates, and only when needed.
+    #[test]
+    fn duplicate_song_names_disambiguate_by_id() {
+        let mut p = project();
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(1), name: "interlude".into(),
+            clips: vec![ClipId(1)] }).unwrap();
+        p.apply(&Op::SetGroup { id: studio_core::GroupId(2), name: "interlude".into(),
+            clips: vec![ClipId(3)] }).unwrap();
+        let plan = Plan { scope: Scope::EachSong, ..Plan::default() };
+        let jobs = plan_jobs(&plan, &p, &[]).unwrap();
+        assert_eq!(jobs[0].name, "interlude (1)");
+        assert_eq!(jobs[1].name, "interlude (2)");
     }
 
     #[test]
