@@ -4615,6 +4615,32 @@ impl World {
                 }
             }
         }
+        // KUIPER'S SOFT BOUNDARY — the drift-recovery half of the void
+        // decision. Void ambient made a missed jump able to drift forever:
+        // beyond every well, nothing pulls. The recovery is INWARD, never
+        // downward (downward is the exact bug the void fix removed): past
+        // the field's own edge a gentle pull toward the field takes over,
+        // ramping with distance, so a drifter is returned to play in tens
+        // of seconds rather than stranded — and inside the edge it is
+        // exactly zero, so the void within the field stays a void. The
+        // edge is measured from the nodes rather than a constant because
+        // the field's reach already depends on world scale.
+        if self.kuiper && !self.grav.is_empty() {
+            let inv = 1.0 / self.grav.len() as f32;
+            let centre = self.grav.iter().fold(Vec3::ZERO, |a, n| a + n.pos) * inv;
+            let edge = self
+                .grav
+                .iter()
+                .map(|n| n.pos.distance(centre) + n.r * 1.5)
+                .fold(0.0f32, f32::max);
+            let out = p.distance(centre);
+            if out > edge {
+                let pull = ((out - edge) / 60.0).clamp(0.0, 1.0) * 0.25;
+                if pull > g {
+                    return ((centre - p).normalize_or(Vec3::NEG_Y), pull);
+                }
+            }
+        }
         (dir, g)
     }
 
