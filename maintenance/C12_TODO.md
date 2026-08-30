@@ -516,12 +516,31 @@ Three things this queue's studio sections implied but never listed:
   C-1..C-4, palette entries, sidecar-vocabulary, camera untouched. Panel
   tabs go through `responsive_nav` (studio is its third adopter);
   compact width gets a picker so no panel is unreachable.
-- **Open next steps, named:** the Pages-mode swipe layer should adopt
-  snapclone's over-scroll detent model (`snapclone-gesture` — would be
-  its second call site outside snapclone, i.e. the extraction bar);
-  keybind customization (rebinds model + Settings capture UI) designed
-  but not started; display_name now exists in the sidecar + Settings,
-  which is what a rebind section would sit beside.
+- **Keybind customization — closed (`42c2cb2d`).** Rebinds as a raw-input
+  translation (pressed→effective, one step, identity-is-absence,
+  codepoint-encoded in the sidecar because , . < > are the likeliest
+  targets), applied once in the shell's typed loop; the palette's
+  Act::Key deliberately bypasses it. Settings press-to-capture section
+  over eight everyday verbs, keys_for() readout, reset-all. STILL OPEN
+  from it: hints (CLIP_HINTS, palette hint column) show defaults —
+  rebind-aware hints across every key-printing surface is its own item.
+- **gesture-kit extracted (`shared/gesture-kit`).** snapclone's two-tier
+  over-scroll model, moved at its second call site per the house rule;
+  `apps/snapclone`'s crate is now a re-export + its FFI seam (11 kit
+  tests + 4 ffi tests green). `system/snapclone`'s copy deliberately
+  untouched — that tree's divergence is SNAPCLONE_TWO_TREES.md's thread,
+  not this one. studio-egui gained `touch::PanelNav` (detent→neighbour
+  panel, clamped never wrapped, tested) as the DECISION layer only.
+  STILL OPEN: shell wiring — the shell owns the scrollbars, so it must
+  decide per-panel when the inner view is at its limit before feeding
+  deltas; wiring it blind risks panels jumping during normal scrolling,
+  worse than absent. Needs a session that can run the app, or at least
+  per-panel scroll-ownership reasoning (timeline pans both axes; mixer
+  and rack scroll vertically).
+- **Perf (`42c2cb2d`):** library sidebar's per-frame DirListing clones
+  removed (ensure+borrow, arrange over refs); presence_beat compares
+  before building. Both were every-frame paths; neither was measured
+  end-to-end — the fixes are allocation-shape arguments, honestly.
 
 ## 15. responsive_nav: two apps done, and a bug found along the way
 

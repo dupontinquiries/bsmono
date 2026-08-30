@@ -309,3 +309,124 @@ mod tests {
         assert_eq!(Panel::ALL.len(), 4);
     }
 }
+
+// ── Pages-mode panel navigation: the over-scroll detent ─────────────────────
+
+/// Sustained over-scroll at a panel's edge advances to the neighbouring
+/// panel — snapclone's tuned two-tier gesture (`gesture-kit`), applied to
+/// the one navigation problem `responsive_nav`'s Pages mode leaves open on
+/// a phone: the picker is the floor (no panel unreachable), this is the
+/// flow (the next panel one thumb-drag away, no chrome hunt).
+///
+/// Decision layer only, deliberately mirroring `responsive_nav`: the SHELL
+/// owns the scrollbars, so the shell decides when the inner view is at its
+/// limit and feeds deltas here; this type answers "does that motion mean a
+/// panel change, and to which one". Feeding it deltas while the inner view
+/// still has room to scroll is the caller's bug — call [`PanelNav::still_scrolling`]
+/// on those frames instead, so a fresh pull starts a fresh streak.
+pub struct PanelNav {
+    gesture: gesture_kit::TwoTierGesture,
+}
+
+impl Default for PanelNav {
+    fn default() -> Self {
+        PanelNav {
+            // Page size feeds the flick tier's distance test; a phone panel
+            // is roughly a screen, and the tuned defaults key off it.
+            gesture: gesture_kit::TwoTierGesture::new(
+                gesture_kit::GestureConfig::for_page_size(800.0)),
+        }
+    }
+}
+
+impl PanelNav {
+    /// An over-scroll sample (the inner view is at its limit — caller's
+    /// call). Positive delta = toward the NEXT panel. Returns the panel to
+    /// switch to, already clamped: over-scrolling past the last panel is
+    /// nothing, not a wrap — a wrap would make "keep pulling" ambiguous
+    /// between "further" and "start over", and the detent's whole feel is
+    /// that a pull means one definite thing.
+    pub fn on_overscroll(&mut self, current: Panel, delta: f32, now_ms: f64)
+        -> Option<Panel>
+    {
+        match self.gesture.on_scroll(delta as f64, now_ms) {
+            gesture_kit::Outcome::DetentFired { dir } => {
+                let ix = Panel::ALL.iter().position(|p| *p == current)?;
+                let next = match dir {
+                    gesture_kit::Direction::Next => ix + 1,
+                    gesture_kit::Direction::Prev => ix.checked_sub(1)?,
+                };
+                Panel::ALL.get(next).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// The inner view moved normally this frame — reset the streak so the
+    /// next edge-pull starts clean instead of inheriting stale progress.
+    pub fn still_scrolling(&mut self) { self.gesture.reset_streak(); }
+}
+
+#[cfg(test)]
+mod panel_nav_tests {
+    use super::*;
+
+    /// Sustained over-scroll fires exactly one advance, clamped at the
+    /// ends — the tuned feel imported whole from gesture-kit, with only
+    /// the Panel mapping to pin down here.
+    #[test]
+    fn sustained_overscroll_advances_one_panel_and_clamps() {
+        let mut nav = PanelNav::default();
+        // Feed within the rate budget (0.75 raw/ms) until the 220 raw
+        // threshold: 20 raw every 30ms clears it in ~11 samples.
+        let mut fired = None;
+        let mut t = 0.0;
+        for _ in 0..40 {
+            t += 30.0;
+            if let Some(p) = nav.on_overscroll(Panel::Timeline, 20.0, t) {
+                fired = Some(p);
+                break;
+            }
+        }
+        assert_eq!(fired, Some(Panel::Rack), "Timeline's forward neighbour");
+
+        // From the LAST panel, the same pull is nothing — clamp, not wrap.
+        let mut nav = PanelNav::default();
+        let mut t = 0.0;
+        for _ in 0..40 {
+            t += 30.0;
+            assert_eq!(nav.on_overscroll(Panel::Program, 20.0, t), None,
+                       "past the end means nothing, never a wrap");
+        }
+
+        // Backward from the FIRST panel likewise.
+        let mut nav = PanelNav::default();
+        let mut t = 0.0;
+        for _ in 0..40 {
+            t += 30.0;
+            assert_eq!(nav.on_overscroll(Panel::Timeline, -20.0, t), None);
+        }
+    }
+
+    /// Normal scrolling between edge-pulls resets the streak: progress
+    /// must not silently accumulate across separate gestures.
+    #[test]
+    fn a_reset_streak_starts_from_zero() {
+        let mut nav = PanelNav::default();
+        let mut t = 0.0;
+        // Half a threshold's worth of pull…
+        for _ in 0..5 {
+            t += 30.0;
+            assert_eq!(nav.on_overscroll(Panel::Rack, 20.0, t), None);
+        }
+        // …then the view scrolls normally (not at its limit)…
+        nav.still_scrolling();
+        // …and the next pull needs the FULL threshold again: five more
+        // part-pulls stay silent where continuation would have fired.
+        for _ in 0..5 {
+            t += 30.0;
+            assert_eq!(nav.on_overscroll(Panel::Rack, 20.0, t), None,
+                       "stale progress must not survive a reset");
+        }
+    }
+}

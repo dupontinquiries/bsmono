@@ -9,3 +9,4 @@ license = "MIT OR Apache-2.0"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+gesture-kit = { path = "../../../../shared/gesture-kit" }
