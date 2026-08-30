@@ -3044,3 +3044,36 @@ stop asking for frames — the same bug wearing a different hat.
   (`if s.reveal() < 1.0 || s.halo() > 0.0`). `all_tracks.rs:247` and
   `lib.rs:1199` are unconditional and unexamined; 1199 claims "the
   stroke lives — it advances every frame", which may be honest.
+
+## 55. Perf: a 60-second animation repainted at 60fps
+
+Finishing C12-54a's sweep of the remaining repaint sites.
+
+`all_tracks.rs:247` is CORRECT — gated on `kin.tick()` returning true,
+so the kinetic scroll only asks for frames while it is still moving.
+Worth recording as a pass.
+
+`lib.rs:1199` was not. `ui.ctx().request_repaint()` unconditionally,
+commented "the stroke lives — it advances every frame". Both halves true,
+and the second was the bug: `dial_watermark`'s QUIET loop is 60 SECONDS
+(`LOOP_QUIET_MS = 60_000`), so full-rate repainting spent 3,600 frames
+advancing one cycle of a dash pattern behind a dial. Nobody can see a
+sixtieth of a percent of a minute-long rotation.
+
+Now `request_repaint_after(loop_ms / 500)`, clamped 50–125 ms. Checked
+the arithmetic rather than assuming it:
+
+    quiet  (60s loop) -> 120 ms = 8.3 fps, 0.200% of the loop per frame
+    active (25s loop) ->  50 ms = 20  fps, 0.200% of the loop per frame
+
+The constant phase step is the point: the motion is identical, the cost
+is not. And because `tick` is time-based, a slower frame advances
+further rather than moving slower — the animation cannot be made to drag
+by repainting less.
+
+STILL UNCONDITIONAL, deliberately, and this is the difference from §54.
+ambient-learner's timer ran when nothing was moving; this animation
+genuinely never stops — `loop_ms` slows with activity but never reaches
+zero, which is `dial_watermark`'s design. The fix there was a gate; here
+it is a rate. Applying the wrong one of those to the other would have
+frozen a live animation or left a dead one running.

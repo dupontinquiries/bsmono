@@ -1196,7 +1196,25 @@ impl Controller {
             if self.transport.playing { (self.dial.value / 100.0).clamp(0.0, 1.0) } else { 0.0 });
         self.watermark.tick(ui.input(|i| i.stable_dt).min(0.1) * 1000.0);
         watermark_paint(ui, &self.watermark, ui.cursor().min + egui::vec2(70.0, 70.0), 100.0, c);
-        ui.ctx().request_repaint(); // the stroke lives — it advances every frame
+        // THE STROKE LIVES, BUT NOT AT SIXTY HERTZ. The comment here used
+        // to be "it advances every frame", which was true and was the
+        // bug: the quiet loop is 60 SECONDS long, so full-rate repainting
+        // spends 3,600 frames advancing one cycle of a dash pattern
+        // behind a dial. Nobody can see a sixtieth of a percent of a
+        // minute-long rotation.
+        //
+        // Asking for a frame proportional to the loop gives the same
+        // motion at a cost you can defend: ~8 fps when quiet, ~20 fps at
+        // full activity, and the phase is time-based so a slower frame
+        // advances further rather than moving slower.
+        //
+        // Still unconditional, deliberately: unlike ambient-learner's
+        // timer this animation genuinely never stops — `loop_ms` slows
+        // with activity but never reaches zero, which is the design (see
+        // `dial_watermark`). The fix is the rate, not a gate.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(
+            (self.watermark.loop_ms() / 500.0).clamp(50.0, 125.0) as u64,
+        ));
         // THE CARD FRAME, at last drawn. ControlCard has carried a rise, a
         // fade and an active glow since the port, the controller built one per
         // section with a staggered entrance delay, and a test asserts the
