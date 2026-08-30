@@ -1642,6 +1642,12 @@ impl AgentRun {
     /// Append a streamed token to the current turn's reply.
     pub fn on_token(&mut self, t: &str) { self.reply.push_str(t); }
 
+    /// This turn's accumulated tokens, for read-only display.
+    ///
+    /// `&str` rather than exposing the field: callers must not be able
+    /// to edit the buffer the token stream is appending to.
+    pub fn reply_so_far(&self) -> &str { &self.reply }
+
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
@@ -1837,6 +1843,48 @@ impl AgentFan {
     pub fn active_branches(&self) -> Vec<usize> { self.in_flight.iter().map(|f| f.branch).collect() }
     pub fn reviewing(&self) -> bool { self.phase == Phase::Reviewing }
     pub fn all_done(&self) -> bool { self.phase == Phase::Done }
+
+    /// The fan as debate slots, for `debatepanel::ui`.
+    ///
+    /// Lives here rather than in the chat tab because `branches` and
+    /// `in_flight` are private: exposing them so a caller could do the
+    /// mapping would let anything reorder or index them, and the panel
+    /// only ever wants a read-only projection.
+    ///
+    /// `last_line` is the branch's LAST COMPLETE line, not its live tail
+    /// — `debatepanel` exists because four jittering token streams are
+    /// unreadable, and handing it a partial line would reintroduce
+    /// exactly that.
+    pub fn debate_slots(&self) -> Vec<crate::debatepanel::Slot> {
+        let active = self.active_branches();
+        self.branches
+            .iter()
+            .enumerate()
+            .map(|(i, b)| crate::debatepanel::Slot {
+                model: b.label.clone(),
+                state: match &b.state {
+                    BranchState::InFlight => crate::debatepanel::State::Writing,
+                    BranchState::Finished(_) => crate::debatepanel::State::Done,
+                    // Ready but not in flight: waiting for the worker,
+                    // which reads as Done rather than Writing — nothing
+                    // is being produced for this slot right now, and a
+                    // spinner on an idle branch is a lie about progress.
+                    BranchState::Ready(_) if !active.contains(&i) => {
+                        crate::debatepanel::State::Done
+                    }
+                    BranchState::Ready(_) => crate::debatepanel::State::Writing,
+                },
+                last_line: crate::debatepanel::last_complete_line(b.run.reply_so_far())
+                    .map(|l| crate::debatepanel::elide(l, crate::debatepanel::MAX_LINE_CHARS))
+                    .unwrap_or_default(),
+                // Blindness is a `panelvoice` concept the fan does not
+                // model yet. False rather than guessed: marking a
+                // debater blind when it saw the input would make the
+                // panel's own divergence signal untrustworthy.
+                blind: false,
+            })
+            .collect()
+    }
     /// How many branches may generate concurrently. 1 (default) is the single-worker round-robin; a
     /// lane pool raises it to its lane count. Width only gates NEW submissions — lowering it mid-run
     /// lets in-flight work drain naturally.

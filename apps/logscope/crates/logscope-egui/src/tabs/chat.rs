@@ -8749,6 +8749,24 @@ session's budget from 2470 down to 814 tokens over seventeen turns without sayin
                         if overflow { ui.menu_button("⋯ modes", |ui| modes(ui)); } else { modes(ui); }
                     }
                     self.panel_mode = panel_mode; self.stepwise = stepwise;
+                    // THE PANEL, at last drawn. `panel_mode` was read
+                    // only to draw its own checkbox and written straight
+                    // back — a toggle a person could flip that changed
+                    // nothing, which is the same class as voiceterm's
+                    // microphone setting.
+                    //
+                    // Shown only with a fan running: `debatepanel::ui`
+                    // returns early on empty slots, but drawing an empty
+                    // strip would still take vertical space from the
+                    // transcript and suggest a debate is happening.
+                    if self.panel_mode {
+                        if let Some(fan) = self.agent_fan.as_ref() {
+                            let slots = fan.debate_slots();
+                            if !slots.is_empty() {
+                                crate::debatepanel::ui(ui, &slots);
+                            }
+                        }
+                    }
                     self.auto_continue = auto_continue; self.patch_mode = patch_mode;
                     self.summarize_on_squeeze = summarize_on_squeeze;
                     if self.hit_cap && !streaming {

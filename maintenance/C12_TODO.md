@@ -3142,3 +3142,43 @@ timestamp math does not crash, so a clock-skew bug produces a
 behavioural silence rather than a stack trace. The unsigned version of
 the same mistake would have panicked on the first NTP correction and
 been fixed years ago.
+
+## 58. debatepanel wired — the toggle did nothing
+
+`debatepanel` was on logscope's uncalled list (§40a). It turns out the
+chat tab already had its CONTROL: a "debate panel" checkbox, which I
+registered with the a11y scene two sessions ago without noticing it was
+inert.
+
+`self.panel_mode` was read exactly twice, both at the checkbox: once to
+draw its state and once to write it straight back. A toggle a person can
+flip, that persists, and changes nothing — the same class as voiceterm's
+microphone setting (§45), found by a different route.
+
+Wired via `AgentFan::debate_slots()`, a read-only projection added on
+the fan rather than in the chat tab because `branches` and `in_flight`
+are private; exposing them so a caller could do the mapping would let
+anything reorder or index them.
+
+Three judgements in the mapping, each of which could have gone wrong
+quietly:
+  - `last_line` uses `last_complete_line`, never the live tail.
+    `debatepanel` exists because four jittering token streams are
+    unreadable, so handing it a partial line would reintroduce the exact
+    problem it was written to solve.
+  - `Ready` but not in flight maps to `Done`, not `Writing`. Nothing is
+    being produced for that slot, and a spinner on an idle branch is a
+    lie about progress.
+  - `blind` is false rather than guessed. Blindness is a `panelvoice`
+    concept the fan does not model, and marking a debater blind when it
+    saw the input would make the panel's own divergence signal
+    untrustworthy — which is the one thing the strip exists to show.
+
+Also added `AgentRun::reply_so_far()`, returning `&str` rather than
+exposing the field: a caller must not be able to edit the buffer the
+token stream is appending to.
+
+- **C12-58a — NOT COMPILED.** Per the standing instruction.
+- **C12-58b — `blind` is always false**, so `diverged()` still works but
+  the "held back as a control" state can never display. That needs the
+  fan to model blindness, which is a design change rather than wiring.
