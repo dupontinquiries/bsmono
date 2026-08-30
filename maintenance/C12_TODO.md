@@ -2056,5 +2056,16 @@ missing.
   reason: the tabs exist as `src/tabs/{bloc,cargo,code,modify,rotate,
   sources}.rs` and the Qt class names appear nowhere, not even in a doc
   comment. So `absent` means "this tool cannot find it", not "it is not
-  there" — a fourth category the split still does not capture. Checking
-  `ambient-learner`'s `EguiLib` is C12-35c and not done.
+  there" — a fourth category the split still does not capture. `ambient-learner`'s `EguiLib` is now RESOLVED: it was
+  `src/egui_lib.rs`, a feature-gate shim whose own header says "the
+  module is empty unless the feature is on" — not a screen. It
+  CamelCased into a phantom surface. The file now carries
+  `parity-audit: not-a-surface`, and the tool honours that marker in the
+  Rust branch, which it previously only did for `.qml`. ambient-learner's
+  code score went 67% -> 73% and its ABSENT line is gone.
+
+  Wrong turn worth recording: I first guessed the phantom came from
+  CamelCasing `lib.rs`/`main.rs` and added a guard for those. It did
+  not — the file is `egui_lib.rs` — so the guard protected nothing and I
+  reverted it. An unused guard is a thing the next reader has to rule
+  out, which is a real cost for a line that never fires.

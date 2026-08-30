@@ -169,7 +169,20 @@ def surfaces(app_dir):
                              r'[^)]*(?:&mut\s+(?:egui::)?Ui|&mut\s+Frame|Renderer|'
                              r'Painter|&mut\s+Canvas|cairo::Context|'
                              r'adw::Application|gtk::|&Context)', txt):
-                    found.add(''.join(w.capitalize() for w in f[:-3].split('_')))
+                    # HONOUR THE OPT-OUT HERE TOO. `parity-audit:
+                    # not-a-surface` was only checked in the .qml branch,
+                    # so a Rust file could not decline — and one needed
+                    # to: ambient-learner's `egui_lib.rs` is a
+                    # feature-gate shim ("the module is empty unless the
+                    # feature is on"), not a screen, and it CamelCased
+                    # into the phantom `EguiLib` that has sat in the
+                    # ABSENT column ever since.
+                    #
+                    # A phantom in `absent` is worse than one anywhere
+                    # else in this table: every other column is a bound
+                    # to interpret, that one reads as a to-do list.
+                    if 'parity-audit: not-a-surface' not in txt[:400]:
+                        found.add(''.join(w.capitalize() for w in f[:-3].split('_')))
 
     # Everything reachable from a Qt widget base is a surface. Transitive, so
     # ContactEditorDialog : public MobileDialog : public QDialog counts.

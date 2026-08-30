@@ -1,3 +1,5 @@
+//! parity-audit: not-a-surface
+//!
 //! GATED AT THE FILE, because Cargo ignores `required-features` on `[lib]`.
 //!
 //! Without this the target compiles on every `cargo check --all-targets` with
