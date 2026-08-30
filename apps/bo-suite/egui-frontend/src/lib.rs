@@ -271,6 +271,15 @@ pub fn page_from_source(
 }
 
 pub fn page(idx: usize, sign: i32, n: usize) -> usize {
+    // `n == 0` would be `clamp(0, -1)`, and clamp PANICS when min > max.
+    // Unreachable today — the only caller passes `VIEWS.len()`, a
+    // non-empty const — but this is `pub`, so the next caller decides
+    // whether it stays unreachable, and a panic in a paging helper lands
+    // in a draw path where it takes the app down rather than showing a
+    // wrong page.
+    if n == 0 {
+        return 0;
+    }
     (idx as i32 + sign).clamp(0, n as i32 - 1) as usize
 }
 
@@ -500,7 +509,18 @@ impl Controller {
     }
 
     pub fn current(&self) -> &'static str {
-        VIEWS[self.view_idx]
+        // NOT `VIEWS[self.view_idx]`. `view_idx` is written from
+        // `strip_ui`'s return (line ~609) and from `page()`, so its bound
+        // is enforced by the strip having been built from VIEWS — true
+        // today, and not a property this function can see. An index that
+        // drifts out of range would panic INSIDE THE DRAW PATH, which
+        // takes the whole app down rather than showing a wrong tab name.
+        //
+        // Falling back to the first view is the recoverable answer:
+        // wrong label, working app, and `view_idx` is corrected on the
+        // next select. LIBRARY_TABS has a `from_index` guard and a test
+        // for exactly this drift; VIEWS never got one.
+        VIEWS.get(self.view_idx).copied().unwrap_or(VIEWS[0])
     }
 
     /// Not called yet, and that is not an oversight: see below — the gesture
@@ -1392,6 +1412,27 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn paging_an_empty_list_does_not_panic() {
+        // `clamp(0, n-1)` with n == 0 is `clamp(0, -1)`, and clamp panics
+        // when min > max. Unreachable from today's only caller, but this
+        // is a `pub` helper in a crate whose panics land in draw paths.
+        assert_eq!(page(0, 1, 0), 0);
+        assert_eq!(page(5, -1, 0), 0);
+    }
+
+    #[test]
+    fn the_current_view_name_survives_an_out_of_range_index() {
+        // `view_idx` is written from a widget's return value, so its
+        // bound depends on that widget having been built from VIEWS.
+        // True today; not something `current()` can check. A wrong label
+        // is recoverable, a panic in the draw path is not.
+        let mut c = Controller::default();
+        c.view_idx = VIEWS.len() + 7;
+        assert_eq!(c.current(), VIEWS[0], "fell back rather than panicking");
+    }
 
     /// A source with two artists and a shared album.
     struct FakeSrc(Vec<crate::catalog_source::CatalogTrack>);

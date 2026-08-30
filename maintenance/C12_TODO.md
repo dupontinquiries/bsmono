@@ -2506,3 +2506,30 @@ a contact from half of one.
   now REPORTS what it would import ("N read, M skipped — no store yet")
   instead of doing nothing. Deliberately not stubbed further: a fake
   success is the failure being fixed, one layer up.
+
+## 42. Bughunt: two latent panics in bo-suite's draw path
+
+Hunted unchecked indexing across the egui frontends. Most hits were
+tests or already guarded — `LIBRARY_TABS[self as usize]` looks unsafe
+and is not: the author documented the drift risk and
+`shell_bits.rs:335` tests `from_index` against the array length.
+
+`VIEWS` never got the same treatment, and two things follow from it:
+
+  - `Controller::current()` was `VIEWS[self.view_idx]`. `view_idx` is
+    written from `strip_ui`'s return value, so its bound is enforced by
+    the strip having been constructed from VIEWS — true today, and not a
+    property `current()` can see. Now falls back to the first view:
+    wrong label, working app, corrected on the next select.
+  - `page(idx, sign, n)` is `(idx + sign).clamp(0, n as i32 - 1)`, and
+    with `n == 0` that is `clamp(0, -1)`, which PANICS because min
+    exceeds max. Unreachable from the only current caller
+    (`VIEWS.len()`, a non-empty const), but the function is `pub`.
+
+Both are latent rather than live, and both were worth fixing for the
+same reason: a panic anywhere in these crates lands in a DRAW PATH,
+where it takes the whole app down rather than producing a wrong pixel.
+The cost of the guard is two lines; the cost of being wrong about
+"unreachable" is the app.
+
+Two tests, each stating why the impossible case is worth pinning.
