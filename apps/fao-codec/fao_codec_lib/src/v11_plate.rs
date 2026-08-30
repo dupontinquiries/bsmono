@@ -1217,3 +1217,229 @@ pub fn classify_highpass(cur: &Yuv420, pred: &Yuv420) -> (f32, f32, f32) {
         ((total / n).sqrt()) as f32,
     )
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// v11.5 — spacetime residual volumes (the "merge residuals across
+// frames via a continuous function" experiment, in its simplest
+// falsifiable form).
+//
+// If per-frame residuals share structure over time — model error that
+// drifts smoothly, lighting ramps, warp misfit — then a transform with
+// a TEMPORAL axis concentrates that shared structure into the
+// temporal-DC plane and a few low-t-frequency coefficients, and one
+// quantized volume replaces four quantized planes. If the residual is
+// temporally white (grain), the temporal axis concentrates nothing and
+// 3D coding pays pure overhead. So this module both CODES 4×4×4
+// (x,y,t) volumes and MEASURES the split: `temporal_dc_share` is the
+// fraction of pre-quantization residual energy living at t-frequency 0
+// — the ceiling on what ANY cross-frame merge (polynomial, Fourier,
+// learned, or otherwise) can exploit.
+//
+// Frames are processed in groups of 4 predicted OPEN-LOOP from the
+// previous group's last reconstruction (mode {plate, anchor+MV} per
+// 16×16 region per frame, same machinery as v3) — the temporal block
+// needs all four residual planes before any frame can finalize, so
+// within-group closed loop is impossible by construction. Drift is
+// bounded by the group length and resets at each group boundary.
+// ═══════════════════════════════════════════════════════════════════
+
+use crate::transform::{dct3d_4x4x4, idct3d_4x4x4, quantize_4x4x4, dequantize_4x4x4, QUANT_MATRIX_4X4X4};
+
+pub struct T3dReport {
+    pub plate_bytes: usize,
+    pub side_bytes: usize,
+    pub residual_bytes: usize,
+    pub recon: Vec<Yuv420>,
+    /// Fraction of residual energy in the t-frequency-0 plane (pre-quant).
+    pub temporal_dc_share: f32,
+    pub prev_mode_share: f32,
+}
+
+pub fn encode_gop_t3d(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    dead_zone: f32,
+    skip_thr: i8,
+) -> T3dReport {
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+    let (gw, gh) = (fw / REGION, fh / REGION);
+    let (rw, rh) = (fw / 4, fh / 4);
+    let mut plate_raw = Vec::with_capacity(plate.y.len() + plate.u.len() + plate.v.len());
+    plate_raw.extend_from_slice(&plate.y);
+    plate_raw.extend_from_slice(&plate.u);
+    plate_raw.extend_from_slice(&plate.v);
+    let plate_bytes = zstd::encode_all(plate_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(plate_raw.len());
+
+    let mut recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
+    let mut side_bytes = 0usize;
+    let mut residual_bytes = 0usize;
+    let mut e_tdc = 0.0f64;
+    let mut e_all = 0.0f64;
+    let mut prev_share_acc = 0.0f64;
+    let mut prev_share_n = 0usize;
+
+    let mut g0 = 0usize;
+    while g0 < frames.len() {
+        let glen = 4.min(frames.len() - g0);
+        // Anchor: last recon of the previous group (None for the first).
+        let anchor: Option<Yuv420> = if g0 == 0 { None } else { Some(recon[g0 - 1].clone()) };
+
+        // 1. Per frame: composite prediction vs {plate, anchor+MV}.
+        let mut composites: Vec<Yuv420> = Vec::with_capacity(glen);
+        let mut group_side: Vec<u8> = Vec::new();
+        for t in 0..glen {
+            let f = &frames[g0 + t];
+            let m = &motions[g0 + t];
+            let plate_pred = predict_frame(plate, m, fw, fh);
+            match &anchor {
+                None => {
+                    // First group codes against the plate alone.
+                    group_side.push(0);
+                    composites.push(plate_pred);
+                }
+                Some(anc) => {
+                    let mut comp = plate_pred.clone();
+                    let mut modes = vec![0u8; gw * gh];
+                    let mut mvs: Vec<(i8, i8)> = Vec::new();
+                    let mut prev_regions = 0usize;
+                    for gy in 0..gh {
+                        for gx in 0..gw {
+                            let (rx, ry) = (gx * REGION, gy * REGION);
+                            let sad_plate = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                            let (mv, sad_prev) = search_mv(&anc.y, fw, fh, &f.y, rx, ry);
+                            if sad_prev + 64 < sad_plate {
+                                modes[gy * gw + gx] = 1;
+                                mvs.push(mv);
+                                prev_regions += 1;
+                                copy_region_mc(&mut comp, anc, rx, ry, mv);
+                            }
+                        }
+                    }
+                    prev_share_acc += prev_regions as f64 / (gw * gh) as f64;
+                    prev_share_n += 1;
+                    group_side.push(1);
+                    let mut bits = vec![0u8; (modes.len() + 7) / 8];
+                    for (i, &b) in modes.iter().enumerate() {
+                        if b == 1 {
+                            bits[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    group_side.extend_from_slice(&bits);
+                    for &(dx, dy) in &mvs {
+                        group_side.push(dx as u8);
+                        group_side.push(dy as u8);
+                    }
+                    composites.push(comp);
+                }
+            }
+        }
+        side_bytes += zstd::encode_all(group_side.as_slice(), 19).map(|c| c.len()).unwrap_or(group_side.len());
+
+        // 2. Residual volumes: 4×4×glen per channel (glen<4 pads with 0 —
+        //    padded slices quantize to nothing and decode is truncated).
+        let comp444: Vec<Vec<u8>> = composites.iter().map(interleave_444).collect();
+        let tgt444: Vec<Vec<u8>> = (0..glen).map(|t| interleave_444(&frames[g0 + t])).collect();
+        let mut payload: Vec<u8> = Vec::new();
+        let mut skip_bits = vec![0u8; (rw * rh + 7) / 8];
+        let mut vols: Vec<Option<([[i8; 64]; 3], [crate::transform::QuantParams; 3])>> =
+            vec![None; rw * rh];
+        for by in 0..rh {
+            for bx in 0..rw {
+                let mut q3: [[i8; 64]; 3] = [[0; 64]; 3];
+                let mut p3 = [crate::transform::QuantParams { scale_byte: 0, saliency_boost: 0 }; 3];
+                let mut all_skip = true;
+                for c in 0..3 {
+                    let mut buf = [0.0f32; 64];
+                    for z in 0..glen {
+                        for ly in 0..4 {
+                            for lx in 0..4 {
+                                let px = bx * 4 + lx;
+                                let py = by * 4 + ly;
+                                let i = (py * fw + px) * 3 + c;
+                                buf[z * 16 + ly * 4 + lx] =
+                                    tgt444[z][i] as f32 - comp444[z][i] as f32;
+                            }
+                        }
+                    }
+                    dct3d_4x4x4(&mut buf);
+                    // Energy bookkeeping (luma only, pre-deadzone): z=0
+                    // slice is the cross-frame-mergeable component.
+                    if c == 0 {
+                        for (k, &v) in buf.iter().enumerate() {
+                            let e = (v as f64) * (v as f64);
+                            e_all += e;
+                            if k < 16 {
+                                e_tdc += e;
+                            }
+                        }
+                    }
+                    if dead_zone > 0.0 {
+                        for (k, v) in buf.iter_mut().enumerate() {
+                            if v.abs() < dead_zone * QUANT_MATRIX_4X4X4[k] as f32 {
+                                *v = 0.0;
+                            }
+                        }
+                    }
+                    let (q, p) = quantize_4x4x4(&buf, 0);
+                    if q.iter().any(|&x| x.unsigned_abs() > skip_thr as u8) {
+                        all_skip = false;
+                    }
+                    q3[c] = q;
+                    p3[c] = p;
+                }
+                if !all_skip {
+                    let bi = by * rw + bx;
+                    skip_bits[bi / 8] |= 1 << (bi % 8);
+                    vols[bi] = Some((q3, p3));
+                }
+            }
+        }
+        payload.extend_from_slice(&skip_bits);
+        for v in vols.iter().flatten() {
+            for c in 0..3 {
+                payload.push(v.1[c].pack());
+                for &q in &v.0[c] {
+                    payload.push(q as u8);
+                }
+            }
+        }
+        residual_bytes += zstd::encode_all(payload.as_slice(), 12).map(|c| c.len()).unwrap_or(payload.len());
+
+        // 3. Reconstruct the group (decoder path: dequant, idct, add).
+        for t in 0..glen {
+            let mut r444 = comp444[t].clone();
+            for by in 0..rh {
+                for bx in 0..rw {
+                    if let Some((q3, p3)) = &vols[by * rw + bx] {
+                        for c in 0..3 {
+                            let mut buf = dequantize_4x4x4(&q3[c], p3[c]);
+                            idct3d_4x4x4(&mut buf);
+                            for ly in 0..4 {
+                                for lx in 0..4 {
+                                    let px = bx * 4 + lx;
+                                    let py = by * 4 + ly;
+                                    let i = (py * fw + px) * 3 + c;
+                                    let v = r444[i] as f32 + buf[t * 16 + ly * 4 + lx];
+                                    r444[i] = v.clamp(0.0, 255.0) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            recon.push(deinterleave_420(&r444, fw, fh));
+        }
+        g0 += glen;
+    }
+
+    T3dReport {
+        plate_bytes,
+        side_bytes,
+        residual_bytes,
+        recon,
+        temporal_dc_share: if e_all > 0.0 { (e_tdc / e_all) as f32 } else { 0.0 },
+        prev_mode_share: if prev_share_n > 0 { (prev_share_acc / prev_share_n as f64) as f32 } else { 0.0 },
+    }
+}

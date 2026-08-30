@@ -2548,3 +2548,28 @@ prev-mode share 0.69→0.33 and cost ~1.5 dB at matched dz — the
 plate-vs-prev decision uses raw SAD, a weak proxy for post-deadzone
 residual cost. Needs a deadzone-aware cost (SATD or coefficient-count
 above threshold) before further grain/entropy work.
+
+### v11.5 — spacetime residual volumes (2026-08-30, same session)
+
+Tests the "merge residuals across frames via a continuous function"
+idea in its simplest falsifiable form: 4×4×4 (x,y,t) residual volumes
+through the existing dct3d_4x4x4, groups of 4 frames predicted
+open-loop from the previous group's last recon (a temporal block needs
+all its planes before any frame finalizes, so within-group closed loop
+is impossible by construction).
+
+Headline measurement, shotB: **temporal_dc_share = 0.74–0.75** — three
+quarters of pre-quantization residual energy lives in the t-frequency-0
+plane. The premise is real: most of what the per-frame coder re-codes
+every frame is cross-frame-continuous and mergeable by ANY functional
+family (this transform, polynomials, or learned). The white quarter is
+the grain floor, unreachable by construction.
+
+RD verdict is operating-point-dependent and honest: at high quality
+(dz8) t3d beats the per-frame path (+0.9 dB for +14% bytes — 65 KB/f
+@ 41.7 dB/0.977) because surviving structure packs into the volume; at
+low quality (dz32: 15.1 KB/f @ 37.6) the open-loop anchor penalty
+(prediction from up to 4 frames back; prev share falls to 0.34) eats
+the transform gain — the classic MCTF-vs-closed-loop tradeoff. A
+hierarchical (bidirectional) group structure would recover most of the
+anchor penalty; noted, not built.

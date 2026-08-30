@@ -136,7 +136,23 @@ fn main() {
     );
 
     let t2 = std::time::Instant::now();
-    if let Some(bandstr) = arg_val(&args, "--band") {
+    if args.iter().any(|a| a == "--t3d") {
+        let dz: f32 = arg_val(&args, "--dz").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let rep = plate::encode_gop_t3d(&frames, &motions, &pl, dz, opts.skip_threshold);
+        let n = frames.len();
+        let total = rep.plate_bytes + rep.side_bytes + rep.residual_bytes;
+        println!("plate_bytes {}", rep.plate_bytes);
+        println!(
+            "side_bytes {} residual_bytes {}  prev_mode_share {:.3}  temporal_dc_share {:.3}",
+            rep.side_bytes, rep.residual_bytes, rep.prev_mode_share, rep.temporal_dc_share
+        );
+        println!(
+            "total_bytes {total}  amortized_per_frame {}  marginal_per_frame {}",
+            total / n,
+            (rep.side_bytes + rep.residual_bytes) / n
+        );
+        write_y4m(&args[1], &header, &rep.recon);
+    } else if let Some(bandstr) = arg_val(&args, "--band") {
         let band: i32 = bandstr.parse().unwrap_or(0);
         let (rep, sigma, rho) = plate::encode_gop_v4(&frames, &motions, &pl, &opts, band);
         // Two-branch high-pass classification on a mid-GOP frame: how much
