@@ -318,7 +318,141 @@ fn main() {
                     max_rot
                 );
             }
-            if args.iter().any(|a| a == "--affine") {
+            if args.iter().any(|a| a == "--rot") {
+                // Full rotation rectification: per-pair homography from
+                // static tracks → R = nearest rotation to K⁻¹HK →
+                // accumulate → unproject/rotate/reproject every
+                // observation into frame-0's orientation. Translation is
+                // then RE-estimated from the rectified tracks (the raw
+                // phase-corr translation contains rotation-induced shift
+                // and would be inconsistent with rectified observations).
+                use fao_codec::two_view as tv;
+                let (fx, fy) = (w as f32, w as f32); // square pixels; v8's
+                // focal=[w,h] convention is anisotropic and unphysical for
+                // rotation math.
+                let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+                let mut r_cum: Vec<tv::Mat3> = vec![tv::M3_IDENTITY; nfr];
+                let mut total_angle = 0.0f32;
+                for t in 1..nfr {
+                    let mut prs: Vec<(f32, f32, f32, f32)> = Vec::new();
+                    for (id, &(x1, y1)) in &per_frame[t] {
+                        if let Some(&(x0, y0)) = per_frame[t - 1].get(id) {
+                            prs.push((x0, y0, x1, y1));
+                        }
+                    }
+                    // Per-pair MODEL SELECTION. A rotation-only homography
+                    // fitted to translation-dominant (parallax) flow eats
+                    // the parallax as phantom rotation — measured: 14.4°
+                    // of fictitious rotation on a handheld GOP, degrading
+                    // its triangulation. Apply the rotation only when the
+                    // homography out-explains the pure-translation model
+                    // by a clear margin; otherwise identity. Rotating
+                    // content passes (H captures position-dependent shift
+                    // translation cannot), parallax content fails the
+                    // margin (its variance is depth structure both models
+                    // leave behind).
+                    let r = match tv::fit_homography(&prs) {
+                        Some(hm) => {
+                            let t_rms = {
+                                let mut dx: Vec<f32> = prs.iter().map(|p| p.2 - p.0).collect();
+                                let mut dy: Vec<f32> = prs.iter().map(|p| p.3 - p.1).collect();
+                                dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                dy.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                let (mx, my) = (dx[dx.len() / 2], dy[dy.len() / 2]);
+                                let ss: f32 = prs
+                                    .iter()
+                                    .map(|p| (p.2 - p.0 - mx).powi(2) + (p.3 - p.1 - my).powi(2))
+                                    .sum();
+                                (ss / prs.len() as f32).sqrt()
+                            };
+                            let h_rms = {
+                                let ss: f32 = prs
+                                    .iter()
+                                    .map(|&(x, y, xp, yp)| {
+                                        let pr = tv::m3_apply(&hm, [x, y, 1.0]);
+                                        let wq = if pr[2].abs() > 1e-9 { pr[2] } else { 1e-9 };
+                                        (pr[0] / wq - xp).powi(2) + (pr[1] / wq - yp).powi(2)
+                                    })
+                                    .sum();
+                                (ss / prs.len() as f32).sqrt()
+                            };
+                            if h_rms * 1.5 < t_rms {
+                                tv::rotation_from_homography(&hm, fx, fy, cx, cy)
+                            } else {
+                                tv::M3_IDENTITY
+                            }
+                        }
+                        None => tv::M3_IDENTITY,
+                    };
+                    total_angle += tv::rotation_angle(&r);
+                    r_cum[t] = tv::m3_mul(&r, &r_cum[t - 1]);
+                }
+                println!("accumulated rotation over GOP: {:.2} deg (sum of per-pair magnitudes)", total_angle.to_degrees());
+                // Rectify all observations.
+                for (_, v) in world.iter_mut() {
+                    for o in v.iter_mut() {
+                        let ray = [(o.screen_x - cx) / fx, (o.screen_y - cy) / fy, 1.0];
+                        let r0 = tv::m3_apply(&tv::m3_transpose(&r_cum[o.frame_idx as usize]), ray);
+                        if r0[2] > 1e-6 {
+                            o.screen_x = fx * r0[0] / r0[2] + cx;
+                            o.screen_y = fy * r0[1] / r0[2] + cy;
+                        }
+                    }
+                }
+                // Re-estimate translation from rectified static tracks.
+                let mut rect_pf: Vec<std::collections::HashMap<u32, (f32, f32)>> =
+                    vec![std::collections::HashMap::new(); nfr];
+                for (id, v) in &world {
+                    for o in v {
+                        rect_pf[o.frame_idx as usize].insert(*id, (o.screen_x, o.screen_y));
+                    }
+                }
+                // Translation-source selection, driven by what the
+                // classifier learned about this content. On broadcast
+                // footage phase correlation is HUD-locked (reads ≈0 —
+                // near-zero baselines were silently poisoning every pose
+                // downstream), so the median of the CLASSIFIED static
+                // world tracks is the trustworthy camera estimate: gating
+                // it in took the game GOP from 61 to 106 triangulated.
+                // On parallax-dominant film the opposite holds — the
+                // track median mixes depth-dependent flow and
+                // UNDERestimates camera motion, while phase corr's
+                // dominant peak locks to the background (measured: track-
+                // median poses dropped the handheld GOP from 93 to 81).
+                // The UiOverlay fraction is the regime detector: a big
+                // screen-locked population is exactly the condition that
+                // contaminates phase correlation.
+                let ui_frac = {
+                    let ui = classes.values().filter(|c| matches!(c, MotionClass::UiOverlay)).count();
+                    ui as f32 / classes.len().max(1) as f32
+                };
+                if ui_frac > 0.15 {
+                    let mut cx_cum = 0.0f32;
+                    let mut cy_cum = 0.0f32;
+                    for t in 1..nfr {
+                        let mut dx: Vec<f32> = Vec::new();
+                        let mut dy: Vec<f32> = Vec::new();
+                        for (id, &(x1, y1)) in &rect_pf[t] {
+                            if let Some(&(x0, y0)) = rect_pf[t - 1].get(id) {
+                                dx.push(x1 - x0);
+                                dy.push(y1 - y0);
+                            }
+                        }
+                        if dx.len() >= 8 {
+                            dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            dy.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            cx_cum += -dx[dx.len() / 2];
+                            cy_cum += -dy[dy.len() / 2];
+                        }
+                        poses[t].position.x = cx_cum;
+                        poses[t].position.y = cy_cum;
+                    }
+                    println!("translation source: static-track median (ui_frac {:.2} — phase-corr HUD-contaminated)", ui_frac);
+                } else {
+                    println!("translation source: phase correlation (ui_frac {:.2})", ui_frac);
+                }
+                println!("observations rectified by accumulated rotation");
+            } else if args.iter().any(|a| a == "--affine") {
                 // Rectify observations into frame-0's rotational frame using
                 // the LINEAR part of the accumulated affine (translation
                 // zeroed → pan/parallax preserved in the observations).

@@ -2821,3 +2821,38 @@ Measured:
     PARALLAX (depth-dependent flow no global model should explain);
     rectification correctly neutral (1.13 → 1.21px). The layer knows
     when it isn't needed.
+
+### Two-view rotation + regime-gated pose sources (same session)
+
+two_view.rs: robust homography fit (normalized DLT, iterative median
+rejection) + nearest-rotation extraction from K⁻¹HK (hand-rolled
+Jacobi symmetric eigensolver → polar decomposition). Unit test
+recovers a 1.7° mostly-yaw rotation to <0.003 rad through 10% mover
+contamination.
+
+Always-on rotation rectification measured HONESTLY before gating:
+coherent on the orbit camera (baselines 22→112px, depths collapsing to
+the fixed-radius shell an orbit should produce) but it EATS PARALLAX
+as phantom rotation on translation-dominant film (14.4° fictitious on
+the handheld GOP, reprojection 1.13→2.53px). Two per-pair/per-content
+gates fix both directions:
+
+1. Model selection per pair: apply R only when the homography
+   out-explains pure translation by 1.5×. Parallax content fails the
+   margin (its variance is depth structure both models leave behind).
+2. Translation-source selection by UiOverlay fraction: broadcast
+   content (ui_frac > 0.15) uses the CLASSIFIED static-track median —
+   phase correlation there is HUD-locked at ≈0 and had been silently
+   poisoning every pose with near-zero baselines, which retro-explains
+   v8's historic game-content failures. Film keeps phase correlation
+   (the track median mixes depth-dependent flow and underestimates
+   camera motion — measured 93→81 when misapplied).
+
+Final gated results (--triangulate --rot):
+  smiteB 102/168 (61%) @ 1.59px   [plain: 61 — +67%]
+  shotA   91/247       @ 1.07px   [plain: 93 @ 1.13 — parity]
+  shotB   96/302       @ 1.94px   [identical passthrough]
+
+The discovery chain that produced the smiteB jump: HUD segmentation →
+trustworthy static-track pool → usable track-median translation →
+real baselines. Each stage this session unblocked the next.
