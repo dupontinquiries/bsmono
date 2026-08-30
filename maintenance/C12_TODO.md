@@ -4292,3 +4292,53 @@ one is focused, and the modified-chord path underneath is untouched.
   guard exists for them; none of them calls it yet.
 - **C79b — studio-app did not compile HERE**, but the failure is
   `wayland-protocols`, a known sandbox gap. No errors in our code.
+
+## 80. USB webcams never appeared because nothing enumerated them
+
+Operator: USB webcams still do not show up in snapclone-egui.
+
+`App.cameras` is `Vec::new()` at construction. The only assignment
+anywhere is `HostEvent::CamerasFound(list) => self.cameras = list`, and
+**nothing in the tree sends that event.** The picker is guarded by
+`if !self.cameras.is_empty()`, so it drew nothing — on any machine, with
+any hardware. Not a USB-specific bug: no camera of any kind could appear.
+
+Everything downstream was already built and tested against a list nobody
+produced: `camera_select` (picking, PIP, capture groups), `camera_source`
+(pipelines), `camera_policy` (health, staleness). This is the fourth
+"complete logic, absent producer" find of the week and the most visible
+one, because the symptom is a feature that simply is not there.
+
+`camera_enumerate::enumerate()` reads `/dev/video*` and is sent once at
+startup, beside the settings load.
+
+Four decisions:
+  - **v4l2, not PipeWire.** `Device::id` documents itself as the
+    PipeWire node name and on the FP5 that is right — but a USB webcam
+    on a desktop is reachable through v4l2 with no daemon, no session
+    bus, and no new dependency. `pipelines_for` already treats the
+    chosen device as the plan and probe findings as fallbacks, which is
+    the shape that lets both sources coexist.
+  - **Odd nodes filtered by capability.** A UVC webcam registers TWO
+    `/dev/video` nodes, capture and metadata. Listing both shows every
+    camera twice, and selecting the metadata one gives a stream that
+    never produces a frame — indistinguishable from broken hardware.
+  - **Read from sysfs, never by opening the device.** Opening a camera
+    to ask what it is can block, and fails when another app holds it —
+    so a camera already in use would VANISH rather than appear busy.
+  - **Unreadable capability accepts the node.** Over-listing is
+    recoverable (it fails to open, and `camera_policy` records that);
+    under-listing is the bug being fixed.
+
+Facing delegates to `camera_source::looks_front_facing` rather than
+reimplementing it — a second copy would let the picker and the pipeline
+disagree about mirroring. A webcam that is not front-facing is
+`Unknown`, not `Rear`: claiming Rear applies a phone's rear-camera
+rotation to a webcam on a desk.
+
+- **C80a — NOT verified end to end.** This sandbox has no `/dev/video*`
+  at all, so the parsing is tested and the enumeration is not. 1425/1425
+  otherwise.
+- **C80b — startup only, no hotplug.** A camera plugged in after launch
+  will not appear. That needs a netlink or inotify watch; the case that
+  was broken is a camera present at launch.

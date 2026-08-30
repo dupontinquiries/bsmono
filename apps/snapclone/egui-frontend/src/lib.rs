@@ -63,6 +63,8 @@ pub mod ambient_camera;
 pub mod ambient_inbox;
 pub mod ambient_palette;
 pub mod camera_select;
+/// Reading the actual camera list, so the picker has something to show.
+pub mod camera_enumerate;
 pub mod chevron_confirm;
 pub mod dht_bootstrap;
 pub mod face_consent;

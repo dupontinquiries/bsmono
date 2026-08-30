@@ -68,6 +68,17 @@ impl App {
         // config does not come up reporting unsaved changes with the Save
         // button lit.
         snap.apply(HostEvent::SettingsLoaded(Box::new(snapclone_egui::settings_store::load())));
+        // THE CAMERA LIST. `App.cameras` starts empty and only
+        // `CamerasFound` fills it — and nothing in the tree sent that
+        // event, so the picker was permanently blank and no USB webcam
+        // could appear on any machine. Everything downstream
+        // (camera_select, camera_source, camera_policy) was built and
+        // tested against a list nobody produced.
+        //
+        // Sent once at startup rather than polled: hotplug needs a
+        // netlink or inotify watch, which is a bigger change, and a
+        // camera present at launch is the case that was broken.
+        snap.apply(HostEvent::CamerasFound(snapclone_egui::camera_enumerate::enumerate()));
         let port = snap.settings.current.network.gossip_port;
         let gossip = match snapclone_egui::gossip_wire::GossipSocket::bind(port) {
             Ok(s) => Some(s),
