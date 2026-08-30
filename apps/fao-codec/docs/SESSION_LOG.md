@@ -2793,3 +2793,31 @@ model. smiteB's 107 rejected candidates are dominated by
 rotation-as-translation inconsistency; the reserved CameraMotion.zoom
 field and log-polar phase correlation are the planned path, or 2-view
 rotation from the now-clean static track pairs.
+
+### Global affine motion layer (same session)
+
+global_motion.rs: robust 6-DOF affine fit from static-track
+correspondences (least squares, iterative MEDIAN-based outlier
+rejection — mean+3σ measurably collapses under a mover's high-leverage
+correspondences: the contaminated fit chases them AND their presence
+inflates σ past the cut). Unit test recovers a known 2° roll + 1.5%
+zoom under 10% mover contamination.
+
+--triangulate now reports the translation-vs-affine pairwise residual
+(the "does rotation/zoom matter" metric) and --affine rectifies
+observations by the accumulated LINEAR part about the principal point
+(roll/zoom/shear removed; pan and parallax preserved for
+triangulation).
+
+Measured:
+  smiteB: translation RMS 2.18px vs affine 1.83px; rectification cuts
+    mean reprojection 1.67 → 1.11px at the same 61 points and tightens
+    the depth spread (p90 3775 → 2728). The orbit camera's zoom/shear
+    was real. Count unchanged — the 107 remaining rejects are
+    yaw/pitch folded into translation, which the affine's linear part
+    cannot separate from pan; that requires rotation-aware two-view
+    geometry (homography/essential decomposition), the next tier.
+  shotA: translation 17.58px vs affine 17.30px — the residual is
+    PARALLAX (depth-dependent flow no global model should explain);
+    rectification correctly neutral (1.13 → 1.21px). The layer knows
+    when it isn't needed.

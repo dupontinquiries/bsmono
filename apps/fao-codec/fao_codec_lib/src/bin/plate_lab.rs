@@ -257,10 +257,85 @@ fn main() {
             prev = Some(&f.y);
         }
         // Static world tracks only, ≥4 observations.
-        let world: Vec<(u32, Vec<FeatureObservation>)> = obs
+        let mut world: Vec<(u32, Vec<FeatureObservation>)> = obs
             .into_iter()
             .filter(|(id, v)| v.len() >= 4 && matches!(classes.get(id), Some(MotionClass::Static)))
             .collect();
+        // Global-affine analysis + optional rectification (--affine):
+        // fit per-consecutive-pair affines from the static observations,
+        // report how much motion translation-only leaves unexplained vs
+        // the affine (the "does rotation/zoom matter here" metric), then
+        // rectify every observation by the accumulated LINEAR part —
+        // removing roll/zoom/shear (inexpressible in the pose model)
+        // while preserving pan + parallax (what triangulation eats).
+        {
+            use fao_codec::global_motion as gm;
+            // observations per frame: feature_id -> (x, y)
+            let nfr = frames.len();
+            let mut per_frame: Vec<std::collections::HashMap<u32, (f32, f32)>> =
+                vec![std::collections::HashMap::new(); nfr];
+            for (id, v) in &world {
+                for o in v {
+                    per_frame[o.frame_idx as usize].insert(*id, (o.screen_x, o.screen_y));
+                }
+            }
+            let (mut rms_t_acc, mut rms_a_acc, mut np) = (0.0f64, 0.0f64, 0usize);
+            let mut max_rot = 0.0f32;
+            let mut cum: Vec<gm::Affine> = vec![gm::IDENTITY; nfr];
+            for t in 1..nfr {
+                let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+                for (id, &(x1, y1)) in &per_frame[t] {
+                    if let Some(&(x0, y0)) = per_frame[t - 1].get(id) {
+                        pairs.push((x0, y0, x1, y1));
+                    }
+                }
+                let a = gm::fit(&pairs).unwrap_or(gm::IDENTITY);
+                // translation-only comparator: median displacement.
+                let tmodel = {
+                    let mut dx: Vec<f32> = pairs.iter().map(|p| p.2 - p.0).collect();
+                    let mut dy: Vec<f32> = pairs.iter().map(|p| p.3 - p.1).collect();
+                    dx.sort_by(|u, v| u.partial_cmp(v).unwrap());
+                    dy.sort_by(|u, v| u.partial_cmp(v).unwrap());
+                    let (mx, my) = if dx.is_empty() { (0.0, 0.0) } else { (dx[dx.len() / 2], dy[dy.len() / 2]) };
+                    [1.0, 0.0, mx, 0.0, 1.0, my]
+                };
+                if pairs.len() >= 6 {
+                    rms_t_acc += gm::rms(&pairs, &tmodel) as f64;
+                    rms_a_acc += gm::rms(&pairs, &a) as f64;
+                    np += 1;
+                    let (rot, _) = gm::describe(&a);
+                    if rot.abs() > max_rot.abs() {
+                        max_rot = rot;
+                    }
+                }
+                cum[t] = gm::compose(&a, &cum[t - 1]);
+            }
+            if np > 0 {
+                println!(
+                    "pairwise residual RMS: translation {:.2}px affine {:.2}px | max per-pair rot {:.3}rad",
+                    rms_t_acc / np as f64,
+                    rms_a_acc / np as f64,
+                    max_rot
+                );
+            }
+            if args.iter().any(|a| a == "--affine") {
+                // Rectify observations into frame-0's rotational frame using
+                // the LINEAR part of the accumulated affine (translation
+                // zeroed → pan/parallax preserved in the observations).
+                let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+                for (_, v) in world.iter_mut() {
+                    for o in v.iter_mut() {
+                        let m = &cum[o.frame_idx as usize];
+                        let lin_inv = gm::invert(&[m[0], m[1], 0.0, m[3], m[4], 0.0]).unwrap_or(gm::IDENTITY);
+                        // rotate about the principal point, not the origin
+                        let (rx, ry) = gm::apply(&lin_inv, o.screen_x - cx, o.screen_y - cy);
+                        o.screen_x = rx + cx;
+                        o.screen_y = ry + cy;
+                    }
+                }
+                println!("observations rectified by accumulated linear affine");
+            }
+        }
         let cam_span = {
             let (mut minx, mut maxx, mut miny, mut maxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
             for p in &poses {
