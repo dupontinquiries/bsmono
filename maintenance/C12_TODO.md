@@ -3634,3 +3634,39 @@ guessed twice.
   were missing executors (written), one was near-duplicate scanning with
   no path to the UI (written), and eight are the cockpit diagnostics
   toolkit that wants one page (§66a, still open).
+
+## 68. log_gestures had no input; the Peek tab had no gestures
+
+Hand-checked logscope-egui's remaining eight at whole-app scope. Four
+were already accounted for (`tab_layout` §40d, `workbench` §40b,
+`voiceconfirm` §59, `chat_layout` wired). Of the rest, `repo`'s single
+apparent reference was a false hit and `assets`, `spatial_audio`,
+`textsurface` have none.
+
+`log_gestures` is the one with an obvious host. It resolves
+`(mode, gesture, hit)` into a `LogAction` and its header names the
+surface it was written for — "the Diagnose/Peek surface", whose touch
+bits "never landed a coherent scheme". Grepping `tabs/peek.rs` for
+gesture, swipe or tap returns ZERO. So a tested decision table sat next
+to the tab it was designed for, with no input.
+
+Wired: `touchkit::Recognizer` on the tab, fed from egui's pointer,
+resolved through `map_gesture`. `FoldAll`/`UnfoldAll` map onto the
+`collapse` flag Peek already has.
+
+**Only the actions Peek can honour are handled**, and the rest are named
+rather than silently dropped. Selection needs a selection model this tab
+does not have, and `Hit::Nothing` is passed because Peek draws rows
+inside a ScrollArea and does not know which row a point landed on —
+guessing a row index would fold the WRONG section, which is worse than
+not folding. Scroll is left to egui, since applying it here would double
+every drag.
+
+The recogniser lives on the tab, not per frame: a tap is a press AND a
+release, so a recogniser rebuilt each frame can never see the second
+half of one.
+
+- **C68a — row hit-testing is the next step**, and it unlocks the other
+  half of the table (tap-to-fold a section, selection). It needs row
+  rects from the draw loop, which is a real change rather than a wiring
+  one.

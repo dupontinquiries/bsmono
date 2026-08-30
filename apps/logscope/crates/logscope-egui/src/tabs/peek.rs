@@ -5,9 +5,25 @@ use crate::analysis::Doc;
 use crate::theme;
 use egui::{Color32, RichText};
 
-pub struct Peek { syntax: bool, collapse: bool, goto_top: bool }
+pub struct Peek {
+    syntax: bool,
+    collapse: bool,
+    goto_top: bool,
+    /// Touch gesture recogniser. Held on the tab rather than built per
+    /// frame because it accumulates state across frames — a tap is a
+    /// press AND a release, and a per-frame recogniser can never see the
+    /// second half of one.
+    touch: touchkit::Recognizer,
+}
 impl Default for Peek {
-    fn default() -> Self { Self { syntax: true, collapse: false, goto_top: false } }
+    fn default() -> Self {
+        Self {
+            syntax: true,
+            collapse: false,
+            goto_top: false,
+            touch: touchkit::Recognizer::new(touchkit::Config::default()),
+        }
+    }
 }
 
 /// A folded run of identical consecutive lines: (1-based start line, text, count).
@@ -47,6 +63,47 @@ impl Peek {
         };
         ui.label(RichText::new(status).color(theme::DIM()).small());
         ui.add_space(theme::PAD_XS as f32);
+
+        // TOUCH GESTURES. `log_gestures` has resolved (mode, gesture,
+        // hit) into a `LogAction` since it was written and nothing fed
+        // it — the Peek surface it was designed for had NO gesture
+        // handling at all, so tap-to-fold and section select existed as
+        // a tested decision table with no input.
+        //
+        // Only the actions this tab can honour are handled. Selection
+        // needs a selection model Peek does not have, and mapping those
+        // to nothing would make the table look wired while half of it
+        // silently did nothing — the failure this session keeps finding.
+        {
+            use crate::log_gestures::{map_gesture, Hit, LogAction, Mode};
+            let now = ui.input(|i| i.time) * 1000.0;
+            let touches: Vec<touchkit::Touch> = ui.input(|i| {
+                i.pointer.interact_pos()
+                    .filter(|_| i.pointer.any_down())
+                    .map(|p| touchkit::Touch { id: 0, pos: touchkit::Vec2 { x: p.x, y: p.y } })
+                    .into_iter()
+                    .collect()
+            });
+            for g in self.touch.update(&touches, now) {
+                // `Hit::Nothing` because Peek draws rows inside a
+                // ScrollArea and does not currently know which row a
+                // point landed on. Passing a real hit needs row rects,
+                // which is the next step rather than a guess — a wrong
+                // row index folds the wrong section.
+                match map_gesture(Mode::Read, &g, Hit::Nothing) {
+                    LogAction::FoldAll => self.collapse = true,
+                    LogAction::UnfoldAll => self.collapse = false,
+                    // Scroll is egui's own job inside a ScrollArea;
+                    // applying it here would double every drag.
+                    LogAction::Scroll { .. } | LogAction::None => {}
+                    other => {
+                        // Named rather than ignored, so a reader can see
+                        // which half of the table is still unreachable.
+                        let _ = other; // needs a row hit / selection model
+                    }
+                }
+            }
+        }
 
         let mut sa = egui::ScrollArea::vertical().id_salt("peek").auto_shrink([false, false]);
         if self.goto_top { sa = sa.vertical_scroll_offset(0.0); self.goto_top = false; }
