@@ -2856,3 +2856,17 @@ Final gated results (--triangulate --rot):
 The discovery chain that produced the smiteB jump: HUD segmentation →
 trustworthy static-track pool → usable track-median translation →
 real baselines. Each stage this session unblocked the next.
+
+### Colored cloud export (same session)
+
+--export-ply writes the triangulated cloud as ASCII PLY, colors sampled
+from the source frame at each point's last raw observation (rectified
+coords are geometry-only; pixels index by raw). Track capacity raised
+to 2500 for scene capture (the 500 default is a codec budget, not a
+mapping budget): smiteB 118 points @ 1.25px, shotA 128 @ 1.26px.
+Candidate growth outpaced triangulation growth — the marginal
+adaptive-threshold corners are lower-grade, as expected. Visual check:
+coherent near-field clusters with a sparse far-depth tail; the clouds
+are small but geometrically sane. Delivered as cloud_smiteB.ply /
+cloud_shotA.ply. Densification path when wanted: DepthMap +
+MeshIntegrator (dense contract) fed from these sparse anchors.

@@ -209,7 +209,13 @@ fn main() {
         use fao_codec::geometry::Vec3;
         use fao_codec::phase_correlation::PhaseCorrelationPass;
         let (w, h) = (frames[0].w, frames[0].h);
-        let mut pass = FeatureTrackPass::default();
+        let mut pass = FeatureTrackPass {
+            // Density for geometry export: default 500 is sized for the
+            // codec's per-frame budget, not for scene capture.
+            max_track_count: 2500,
+            min_track_count: 500,
+            ..FeatureTrackPass::default()
+        };
         let consensus = MotionConsensusPass::default();
         let pc = PhaseCorrelationPass::new(512.min(w.min(h)));
         let mut prev: Option<&Vec<u8>> = None;
@@ -470,6 +476,15 @@ fn main() {
                 println!("observations rectified by accumulated linear affine");
             }
         }
+        // Color-sampling positions from the RAW observations (rectification
+        // below mutates geometry coords; pixels are indexed by raw coords).
+        let color_at: std::collections::HashMap<u32, (u32, f32, f32)> = world
+            .iter()
+            .map(|(id, v)| {
+                let o = v.last().unwrap();
+                (*id, (o.frame_idx, o.screen_x, o.screen_y))
+            })
+            .collect();
         let cam_span = {
             let (mut minx, mut maxx, mut miny, mut maxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
             for p in &poses {
@@ -501,6 +516,48 @@ fn main() {
             mean_rep,
             mean_base
         );
+        if let Some(ply_path) = arg_val(&args, "--export-ply") {
+            // Colored sparse cloud, ASCII PLY: position from triangulation,
+            // color sampled from the source frame at the point's last raw
+            // observation (BT.601 full-range approximation).
+            let mut body = String::new();
+            let mut n_out = 0usize;
+            for p in &pts {
+                let Some(&(fi, sx, sy)) = color_at.get(&p.feature_id) else { continue };
+                let f = &frames[fi as usize];
+                let xi = (sx as usize).min(w - 1);
+                let yi = (sy as usize).min(h - 1);
+                let yv = f.y[yi * w + xi] as f32;
+                let uv = f.u[(yi / 2) * (w / 2) + xi / 2] as f32 - 128.0;
+                let vv = f.v[(yi / 2) * (w / 2) + xi / 2] as f32 - 128.0;
+                let r = (yv + 1.402 * vv).round().clamp(0.0, 255.0) as u8;
+                let g = (yv - 0.344 * uv - 0.714 * vv).round().clamp(0.0, 255.0) as u8;
+                let b = (yv + 1.772 * uv).round().clamp(0.0, 255.0) as u8;
+                // Flip Y so the cloud reads upright in standard viewers.
+                body.push_str(&format!(
+                    "{:.1} {:.1} {:.1} {} {} {}
+",
+                    p.world_pos.x, -p.world_pos.y, p.world_pos.z, r, g, b
+                ));
+                n_out += 1;
+            }
+            let header = format!(
+                "ply
+format ascii 1.0
+comment fao-codec sparse triangulated cloud
+element vertex {n_out}
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+end_header
+"
+            );
+            std::fs::write(&ply_path, header + &body).unwrap_or_else(|e| die(&format!("write {ply_path}: {e}")));
+            println!("exported {} colored points -> {}", n_out, ply_path);
+        }
         return;
     }
     if args.iter().any(|a| a == "--track") {
