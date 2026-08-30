@@ -2041,8 +2041,20 @@ missing.
   `code` column can be read at a glance instead of investigated from
   scratch, which is what cost me an hour here.
 
-  Run across the fleet, the answer is the same everywhere: bo-suite 13
-  doc-only, snapclone 24, voiceterm 2, bot-arena 1, and **ZERO absent in
-  any app**. So every `code` score below 100% in this repo is currently
-  the naming convention, not a missing surface. Worth knowing before the
-  next person reads that column as a to-do list.
+  Fleet-wide: bo-suite 13 doc-only, snapclone 24, voiceterm 2,
+  bot-arena 1 — and **two apps DO have absent surfaces**:
+  ambient-learner 1 (`EguiLib`) and logscope 6 (`BlocTab`, `CargoTab`,
+  `CodeTab`, `ModifyTab`, `RotationTab`, `SourcesTab`).
+
+  CORRECTION, recorded because I claimed the opposite in the commit that
+  added this: I wrote "zero absent in any app" from a grep that returned
+  before the ABSENT lines printed. It was wrong within a minute of being
+  written, which is a fair argument for the split existing — the
+  distinction only helps if the numbers are then read.
+
+  The six logscope ones are NOT missing work either, but for a third
+  reason: the tabs exist as `src/tabs/{bloc,cargo,code,modify,rotate,
+  sources}.rs` and the Qt class names appear nowhere, not even in a doc
+  comment. So `absent` means "this tool cannot find it", not "it is not
+  there" — a fourth category the split still does not capture. Checking
+  `ambient-learner`'s `EguiLib` is C12-35c and not done.
