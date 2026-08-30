@@ -3389,6 +3389,16 @@ pub struct FastDetector {
     pub nms_radius: usize,
     /// Maximum keypoints to return per frame (top-N by score)
     pub max_keypoints: usize,
+    /// Per-tile adaptive thresholding. A fixed threshold tuned for bright
+    /// content (20) exceeds the entire local contrast range of dark
+    /// footage — measured: a dark film interior yielded 654 keypoints and
+    /// 24% spatial coverage while a bright shot of the same clip covered
+    /// 87%. When enabled, the effective threshold per 32px tile is
+    /// clamp(1.0 × tile MAD, 8, threshold): scales down with local
+    /// contrast, floored above the grain band (σ≈2 grain ⇒ deltas ≲6)
+    /// so noise doesn't become corners, capped at `threshold` so bright
+    /// content behaves exactly as before.
+    pub adaptive_threshold: bool,
 }
 
 impl Default for FastDetector {
@@ -3398,6 +3408,7 @@ impl Default for FastDetector {
             min_score: 200,
             nms_radius: 3,
             max_keypoints: 500,
+            adaptive_threshold: true,
         }
     }
 }
@@ -3423,13 +3434,48 @@ impl FastDetector {
         if yuv.len() < width * height || width < 8 || height < 8 { return Vec::new(); }
         
         let mut candidates = Vec::with_capacity(2048);
+        // Per-32px-tile threshold grid (see adaptive_threshold docs).
+        let tw = (width + 31) / 32;
+        let th = (height + 31) / 32;
+        let tile_thr: Vec<i32> = if self.adaptive_threshold {
+            let mut g = vec![self.threshold as i32; tw * th];
+            for ty in 0..th {
+                for tx in 0..tw {
+                    let x0 = tx * 32;
+                    let y0 = ty * 32;
+                    let x1 = (x0 + 32).min(width);
+                    let y1 = (y0 + 32).min(height);
+                    let mut sum = 0u32;
+                    let mut n = 0u32;
+                    for yy in y0..y1 {
+                        for xx in x0..x1 {
+                            sum += yuv[yy * width + xx] as u32;
+                            n += 1;
+                        }
+                    }
+                    let mean = (sum / n.max(1)) as i32;
+                    let mut mad = 0u32;
+                    for yy in y0..y1 {
+                        for xx in x0..x1 {
+                            mad += (yuv[yy * width + xx] as i32 - mean).unsigned_abs();
+                        }
+                    }
+                    let mad = (mad / n.max(1)) as i32;
+                    g[ty * tw + tx] = mad.clamp(8, self.threshold as i32);
+                }
+            }
+            g
+        } else {
+            vec![self.threshold as i32; tw * th]
+        };
         // Stay 4 pixels from edges so the radius-3 circle is in-bounds
         let margin = 4;
         for y in margin..height - margin {
             for x in margin..width - margin {
                 let center = yuv[y * width + x] as i32;
-                let bright = center + self.threshold as i32;
-                let dim = center - self.threshold as i32;
+                let thr = tile_thr[(y / 32) * tw + (x / 32)];
+                let bright = center + thr;
+                let dim = center - thr;
                 
                 // Quick reject via the 4 cardinal points (top, right,
                 // bottom, left). For the arc-9 test used below, the sound
@@ -4039,7 +4085,7 @@ mod feature_tests {
                 img[y * 32 + x] = 50;
             }
         }
-        let det = FastDetector { threshold: 30, min_score: 100, nms_radius: 3, max_keypoints: 100 };
+        let det = FastDetector { threshold: 30, min_score: 100, nms_radius: 3, max_keypoints: 100, adaptive_threshold: true };
         let kps = det.detect(&img, 32, 32);
         assert!(!kps.is_empty(), "FAST should find a corner");
         // Best keypoint should be near (16, 16)
@@ -4050,42 +4096,65 @@ mod feature_tests {
     
     #[test]
     fn lk_tracks_pure_translation() {
-        // Build a 64x64 image with texture (so LK gradients are non-zero).
-        // Then build a translated copy. Track points and verify they moved.
+        // The original pattern here, (x*7 + y*13) % 256, is a LINEAR RAMP:
+        // its gradient is the constant (7, 13) everywhere away from the
+        // mod-wrap seams, which makes the LK structure tensor EXACTLY
+        // singular (det = n²(Ix²·Iy² − (IxIy)²) = 0 for constant
+        // gradients — the total aperture problem). Whether a window
+        // happened to include a wrap seam decided between "ill-conditioned
+        // bail" and "seam-dominated garbage estimate"; the test was
+        // asserting on an input the algorithm is defined to fail on.
+        // Replaced with SMOOTH well-conditioned texture and made the
+        // assertions STRICTER: tracks must succeed (Some), not just be
+        // right when present. Two constraints on the pattern, both
+        // learned the hard way: gradients must VARY across the window
+        // (else the tensor is singular — the original ramp's failure),
+        // and the texture wavelength must EXCEED the displacement (LK's
+        // linearization basin — per-pixel noise texture put a 2px shift
+        // outside it and the solver converged to a spurious minimum near
+        // zero). Product-of-sines at ~18px wavelength satisfies both.
         let mut a = vec![128u8; 64 * 64];
         let mut b = vec![128u8; 64 * 64];
+        let tex = |x: f32, y: f32| -> u8 {
+            (128.0 + 50.0 * (x * 0.35).sin() * (y * 0.28).sin()
+                   + 20.0 * ((x + y) * 0.15).sin()) as u8
+        };
         for y in 0..64 {
             for x in 0..64 {
-                let v = ((x * 7 + y * 13) % 256) as u8;
-                a[y * 64 + x] = v;
-                if x + 2 < 64 {
-                    b[y * 64 + (x + 2)] = v;  // shift +2 in x
-                }
+                a[y * 64 + x] = tex(x as f32, y as f32);
+                b[y * 64 + x] = tex(x as f32 - 2.0, y as f32); // content shifted +2
             }
         }
         let lk = LkTracker::default();
         let pts = vec![(20.0, 20.0), (30.0, 40.0)];
         let results = lk.track(&a, &b, 64, 64, &pts);
-        // Both should track to roughly +2 in x, ~0 in y
         for (r, p) in results.iter().zip(pts.iter()) {
-            if let Some((nx, ny, _)) = r {
-                let dx = nx - p.0;
-                let dy = ny - p.1;
-                // Allow some slack — 1-scale LK isn't perfect on synthetic noise
-                assert!((dx - 2.0).abs() < 1.0, "dx={}", dx);
-                assert!(dy.abs() < 1.0, "dy={}", dy);
-            }
+            let (nx, ny, _) = r.expect("well-conditioned texture must track");
+            let dx = nx - p.0;
+            let dy = ny - p.1;
+            assert!((dx - 2.0).abs() < 1.0, "dx={}", dx);
+            assert!(dy.abs() < 1.0, "dy={}", dy);
         }
     }
     
     #[test]
     fn feature_track_pass_assigns_stable_ids() {
         // Two-frame pass: same image. Tracks should keep their IDs.
+        // The original image, (x*11 + y*17) % 256, is a linear ramp: a
+        // constant gradient field whose only structure is straight wrap
+        // seams. It contains NO corners in FAST's sense — a straight edge
+        // never yields a 9-contiguous same-polarity arc — so "frame 0
+        // should produce features" asserted on an input with nothing to
+        // detect. Checkerboard + cross-term texture provides real
+        // right-angle corners (the case the arc-9 prefilter fix made
+        // detectable) at every tile intersection.
         let img = {
             let mut buf = vec![100u8; 64 * 64];
             for y in 0..64 {
                 for x in 0..64 {
-                    buf[y * 64 + x] = ((x * 11 + y * 17) % 256) as u8;
+                    let tile = ((x / 8) + (y / 8)) % 2;
+                    let tex = ((x * 37 + y * 101 + x * y * 13) % 31) as u8;
+                    buf[y * 64 + x] = if tile == 0 { 60 + tex } else { 170 + tex };
                 }
             }
             buf
