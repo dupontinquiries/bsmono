@@ -3393,3 +3393,35 @@ same binary.
   Those are the paths worth exercising and the ones a sandbox cannot
   reach — writing the impl blind would produce a plausible adapter whose
   error handling has never once run.
+
+## 64. Voice interjections reach the panel's interrupt budget
+
+The next hop after §63. When a panel is running, what the operator says
+now goes through `voiceask` → `panelvoice::triage` instead of becoming a
+chat turn.
+
+**A monotonic round counter was the missing piece.** `Fan.rounds_left`
+counts DOWN and resets when a new fan starts, so an interjection from a
+long fan would look newer than one from a short fan that started later.
+`triage` expires asks by comparing round numbers, so it needs one that
+counts UP: `Chat.panel_round`, incremented in `fan_step`, which is the
+actual round boundary.
+
+Three decisions:
+  - Asks ACCUMULATE across frames. `triage` ranks a batch, so a remark
+    dropped the frame it was heard could never compete with one made a
+    moment later.
+  - Budget of 1. An interruption is expensive and two at once is not an
+    interruption, it is a conversation the panel did not agree to have.
+  - The buffer clears whether or not an ask was chosen. One that lost
+    has already been ranked against its competitors; keeping it would
+    let it win later on staleness rather than on merit.
+
+- **C12-64a — the chosen ask only sets `self.note`.** It is heard,
+  ranked, and displayed — it does not yet reach the panel's prompt. That
+  is the last hop and it needs a decision I should not make alone:
+  whether an interjection joins the next round's prompt for every
+  debater, or only for the one it was aimed at. `panelvoice::Share`
+  models that choice and `voiceconfirm` exists to show the operator
+  which it will be, so the remaining work is those two rather than more
+  plumbing.

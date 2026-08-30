@@ -1361,7 +1361,14 @@ pub struct Chat {
     /// Cached context-card contents. See the draw site: this block
     /// re-scanned the transcript and re-extracted keywords on every
     /// frame.
-    ctx_card_key: Option<(usize, usize)>,
+    /// Rounds the panel has run, ever. Counts UP so
+    /// `panelvoice::triage` can expire stale asks; see `fan_step`.
+    panel_round: u32,
+    /// Operator interjections heard while a panel is running, waiting to
+    /// be triaged. Kept across frames because `triage` ranks a BATCH —
+    /// a question dropped the frame it was heard cannot compete with
+    /// one raised a moment later.
+    pending_asks: Vec<logscope::panelvoice::Ask>,
     ctx_card_code: Option<String>,
     ctx_card_kws: Vec<String>,
     /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
@@ -1494,6 +1501,7 @@ impl Default for Chat {
             workers: crate::workerroster::WorkerRoster::new(),
             route_persona: None,
             ctx_card_key: None, ctx_card_code: None, ctx_card_kws: Vec::new(),
+            panel_round: 0, pending_asks: Vec::new(),
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -2055,6 +2063,14 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     fn fan_step(&mut self) {
         let Some(mut fan) = self.fan.take() else { return; };
         if fan.rounds_left == 0 { return; }
+        // MONOTONIC round number, separate from `rounds_left`.
+        //
+        // `panelvoice::triage` expires an ask after ASK_TTL_ROUNDS by
+        // comparing round numbers, so it needs one that COUNTS UP.
+        // `rounds_left` counts down and resets whenever a new fan
+        // starts — using it would make an interjection from a long fan
+        // look newer than one from a short fan that started later.
+        self.panel_round = self.panel_round.saturating_add(1);
         // `only` anchors the fan to ONE line (`:continue`): each round descends to the current live tip
         // under the anchor, so it deepens that line linearly even when other branches exist. `None` fans
         // the whole frontier (`:ca`/`:fa`).
@@ -7543,6 +7559,35 @@ if let Some(msg) = self.error_banner.clone() {
                     if self.agent_run.take().is_some() || self.agent_fan.take().is_some() { self.agent_pending_submit = None; self.note = "agent run cancelled (barge-in)".into(); }
                 }
             }
+        }
+        // A PANEL IS RUNNING: what you say competes for its interrupt
+        // budget rather than becoming a chat turn.
+        //
+        // `voiceask` puts an operator interjection in the same currency
+        // as a debater's question so `triage` can rank them against each
+        // other. Without this the two could not be compared and whoever
+        // spoke last would win, which is the opposite of a budget.
+        //
+        // Asks ACCUMULATE across frames on purpose: `triage` ranks a
+        // batch, so a remark dropped the frame it was heard could never
+        // compete with one made a moment later.
+        if self.panel_mode && self.agent_fan.is_some() {
+            let round = self.panel_round;
+            self.pending_asks
+                .extend(crate::voiceask::asks_from(&tick.utterances, round));
+            // Budget of 1: an interruption is expensive and two at once
+            // is not an interruption, it is a conversation the panel did
+            // not agree to have.
+            let chosen = logscope::panelvoice::triage(&self.pending_asks, round, 1);
+            if let Some(a) = chosen.first() {
+                self.note = format!("heard: {}", a.text);
+            }
+            // Cleared whether or not one was chosen. An ask that lost
+            // this round has already been ranked against its
+            // competitors; keeping it would let it win later on
+            // staleness rather than on merit.
+            self.pending_asks.clear();
+            return;
         }
         for u in tick.utterances { self.on_voice_utterance(u, infer, doc, ui, streaming); }
     }
