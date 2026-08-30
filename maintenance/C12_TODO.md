@@ -2658,3 +2658,42 @@ microphone was off.
   screens that offer accessibility toggles — which is the worst possible
   place for it, because the people who most need those settings are the
   least able to verify they did anything.
+
+## 46. Perf: bo-suite re-sorted the whole album library every frame
+
+Performance hunt through the egui draw paths. The worst find:
+
+`browse_ui` calls `visible_albums()`, which CLONED the entire album list
+and re-sorted it, on every frame. At 60fps on a 5,000-album library that
+is 300,000 `Album` clones per second plus a full sort, producing the
+identical answer each time until the mode or sort changes.
+
+The comparator made it worse. `sort_albums` used
+`a.title.to_lowercase().cmp(&b.title.to_lowercase())` — two String
+allocations PER COMPARISON, inside an O(n log n) sort. ~250,000
+comparisons on that library, so roughly half a million short-lived
+Strings per frame.
+
+Two fixes:
+  - `cmp_fold` compares lowercase char streams directly, no allocation.
+    Uses `flat_map(char::to_lowercase)` rather than `to_ascii_lowercase`
+    because one uppercase char can fold to several, and a cheaper
+    comparison that ORDERS DIFFERENTLY from the allocating one would be
+    a behaviour change wearing a performance fix's clothes.
+  - `visible_albums` caches on `(mode, sort, len)` and returns a slice.
+
+The cache key is the interesting decision. Length rather than a content
+hash: the list is replaced wholesale on reload so a changed length
+catches every real update, and hashing 5,000 albums per frame to avoid
+sorting them would cost what it saves. The gap — a re-scan returning the
+same count with different tags — is covered by `invalidate_albums`, and
+there is a test that FAILS if that method stops being needed, so the
+hole is documented by something executable rather than a comment.
+
+- **C12-46a — `invalidate_albums` has no callers yet.** Nothing in the
+  app currently replaces `albums` after the first load, so the gap is
+  theoretical today. Whoever wires catalogue reload must call it; the
+  test names the consequence.
+- **C12-46b — `visible_artists` was not examined.** It sits beside
+  `visible_albums` and is called the same way. Likely the same shape,
+  not confirmed.

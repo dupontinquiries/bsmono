@@ -228,17 +228,39 @@ impl ArtistSort {
     }
 }
 
+/// Case-insensitive string compare that allocates nothing.
+///
+/// `a.to_lowercase().cmp(&b.to_lowercase())` is the obvious spelling and
+/// builds two Strings per comparison — inside a sort comparator that is
+/// O(n log n) allocations for a list that is redrawn every frame.
+///
+/// `flat_map(char::to_lowercase)` because one uppercase char can fold to
+/// several (İ → i̇), and comparing char-by-char without it would order
+/// those differently from the allocating version. This is not a
+/// hypothetical: it is the difference between "same order, less garbage"
+/// and "a faster sort that sorts differently".
+fn cmp_fold(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
+}
+
 /// Order albums the way `all_albums_sorted` does, tiebreaks included. The
 /// tiebreak is not decoration: without it a re-sort reshuffles equal rows every
 /// time the page is re-entered, which reads as the list being unstable.
 pub fn sort_albums(albums: &mut [Album], sort: AlbumSort) {
-    let lower = |s: &str| s.to_lowercase();
+    // CASE-FOLDED COMPARISON WITHOUT ALLOCATING. `to_lowercase()` builds a
+    // String, and a comparator runs O(n log n) times — on a 5,000-album
+    // library that is ~250,000 comparisons and half a million Strings,
+    // every time this is called. `visible_albums` calls it once per FRAME.
+    //
+    // `cmp_fold` compares lowercase char streams directly. Same ordering
+    // for the ASCII and common Latin cases this sorts (album titles and
+    // artist names), no allocation at all.
     match sort {
         AlbumSort::Title => albums.sort_by(|a, b| {
-            lower(&a.title).cmp(&lower(&b.title)).then(lower(&a.primary_artist).cmp(&lower(&b.primary_artist)))
+            cmp_fold(&a.title, &b.title).then_with(|| cmp_fold(&a.primary_artist, &b.primary_artist))
         }),
         AlbumSort::Artist => albums.sort_by(|a, b| {
-            lower(&a.primary_artist).cmp(&lower(&b.primary_artist)).then(lower(&a.title).cmp(&lower(&b.title)))
+            cmp_fold(&a.primary_artist, &b.primary_artist).then_with(|| cmp_fold(&a.title, &b.title))
         }),
         // Newest first; albums with no year sink to the bottom rather than
         // sorting as year 0 at the top, which would fill the first screen of a
@@ -577,6 +599,11 @@ pub struct Browse {
     pub album_sort: AlbumSort,
     pub artist_sort: ArtistSort,
     pub albums: Vec<Album>,
+    /// The last order `visible_albums` produced, and what it was for.
+    /// See that method: the caller is a draw path and this used to
+    /// re-clone and re-sort the whole library every frame.
+    albums_cache: Vec<Album>,
+    albums_cache_key: Option<(Mode, AlbumSort, usize)>,
     /// TOP artists: unpaginated, capped at 50.
     pub artists_top: Vec<Artist>,
     /// A→Z artists: the paged accumulator.
@@ -608,15 +635,44 @@ impl Browse {
     }
 
     /// The albums the grid draws, for the current mode and sort.
-    pub fn visible_albums(&self) -> Vec<Album> {
-        match self.album_mode {
-            Mode::Top => top_albums(&self.albums, TOP_ALBUMS),
-            Mode::Alpha => {
-                let mut v = self.albums.clone();
-                sort_albums(&mut v, self.album_sort);
-                v
-            }
+    ///
+    /// CACHED, because the caller is a draw path. This cloned the entire
+    /// album list and re-sorted it EVERY FRAME — at 60fps on a
+    /// 5,000-album library that is 300,000 Album clones a second plus a
+    /// full sort, to produce the same answer each time until the mode or
+    /// the sort changes.
+    ///
+    /// The cache key is (mode, sort, len). Length rather than a content
+    /// hash: the list is replaced wholesale when the catalogue reloads,
+    /// so a changed length catches every real update, and hashing 5,000
+    /// albums per frame to avoid sorting them would cost what it saves.
+    /// `invalidate_albums` covers the case where a reload returns the
+    /// same count.
+    pub fn visible_albums(&mut self) -> &[Album] {
+        let key = (self.album_mode, self.album_sort, self.albums.len());
+        if self.albums_cache_key != Some(key) {
+            self.albums_cache = match self.album_mode {
+                Mode::Top => top_albums(&self.albums, TOP_ALBUMS),
+                Mode::Alpha => {
+                    let mut v = self.albums.clone();
+                    sort_albums(&mut v, self.album_sort);
+                    v
+                }
+            };
+            self.albums_cache_key = Some(key);
         }
+        &self.albums_cache
+    }
+
+    /// Drop the cached order.
+    ///
+    /// Needed because the key cannot see a reload that returns the same
+    /// number of albums with different contents — a re-scan that finds
+    /// the same 5,000 files with corrected tags, say. Callers that
+    /// replace `albums` should call this; it is cheap and forgetting it
+    /// shows as a stale grid rather than a crash.
+    pub fn invalidate_albums(&mut self) {
+        self.albums_cache_key = None;
     }
 
     /// The artists the list draws. TOP is the capped ranked list; A→Z is the
@@ -1121,8 +1177,51 @@ mod tests {
     }
 
     #[test]
+    fn the_album_cache_follows_mode_and_sort_without_going_stale() {
+        // `visible_albums` is called from a draw path, so it caches. The
+        // risk a cache adds is showing yesterday's order, which is worse
+        // than the cost it removes — so the key has to move with every
+        // input that changes the answer.
+        let mut b = Browse::default();
+        b.albums = vec![
+            Album { title: "beta".into(), primary_artist: "z".into(), ..Default::default() },
+            Album { title: "Alpha".into(), primary_artist: "a".into(), ..Default::default() },
+        ];
+        b.album_mode = Mode::Alpha;
+
+        b.album_sort = AlbumSort::Title;
+        assert_eq!(b.visible_albums()[0].title, "Alpha", "case-insensitive: Alpha before beta");
+
+        // Changing the sort must change the answer, not return the cache.
+        b.album_sort = AlbumSort::Artist;
+        assert_eq!(b.visible_albums()[0].primary_artist, "a");
+
+        // And the same call twice is stable.
+        let first = b.visible_albums().to_vec();
+        assert_eq!(b.visible_albums(), &first[..]);
+    }
+
+    #[test]
+    fn invalidating_is_what_covers_a_same_length_reload() {
+        // The key includes the LENGTH, not a content hash — hashing every
+        // album per frame would cost what the cache saves. So a re-scan
+        // that finds the same number of albums with corrected tags is the
+        // one case the key cannot see, and `invalidate_albums` is the
+        // answer. If this ever fails, the cache is lying to the grid.
+        let mut b = Browse::default();
+        b.album_mode = Mode::Alpha;
+        b.albums = vec![Album { title: "old".into(), ..Default::default() }];
+        assert_eq!(b.visible_albums()[0].title, "old");
+
+        b.albums = vec![Album { title: "new".into(), ..Default::default() }];
+        assert_eq!(b.visible_albums()[0].title, "old", "same length: the key cannot tell");
+        b.invalidate_albums();
+        assert_eq!(b.visible_albums()[0].title, "new", "and this is why the method exists");
+    }
+
+    #[test]
     fn an_unloaded_browse_does_not_claim_the_library_is_empty() {
-        let b = Browse::default();
+        let mut b = Browse::default();
         assert!(!b.loaded, "the distinction the empty-state text depends on");
         assert!(b.visible_albums().is_empty());
     }
