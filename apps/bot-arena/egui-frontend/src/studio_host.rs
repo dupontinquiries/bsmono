@@ -121,6 +121,17 @@ pub fn settings_path() -> PathBuf {
     user_config_dir().join("corpus-studio").join("settings.conf")
 }
 
+/// Read the settings map, or an empty one.
+///
+/// The missing error here is DELIBERATE, unlike the one that used to be
+/// in `save_settings_to`. A settings file that does not exist is the
+/// normal first run, and every key has a default — so "could not read"
+/// and "nothing configured yet" want the same behaviour, and returning a
+/// Result would force every caller to write the same `unwrap_or_default`.
+///
+/// Saving is the opposite case: nothing downstream can recover from a
+/// failed write, and the person needs to know their choices were not
+/// kept.
 pub fn load_settings_from(path: &Path) -> HashMap<String, String> {
     let mut m = HashMap::new();
     if let Ok(text) = std::fs::read_to_string(path) {
@@ -133,8 +144,19 @@ pub fn load_settings_from(path: &Path) -> HashMap<String, String> {
     m
 }
 
-pub fn save_settings_to(path: &Path, m: &HashMap<String, String>) {
+/// Persist the settings map.
+///
+/// RETURNS THE ERROR rather than discarding it. This was
+/// `let _ = std::fs::write(...)` inside a `()` function, so a failed
+/// save — a read-only home, a full disk, a permissions change — was
+/// indistinguishable from a successful one at every call site. The next
+/// run silently used the old settings, which presents as "it forgot what
+/// I chose" rather than as a write error.
+pub fn save_settings_to(path: &Path, m: &HashMap<String, String>) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
+        // Still discarded, and correctly: a create_dir_all failure will
+        // surface as the write error a few lines down, with a message
+        // naming the actual problem. Reporting it twice would be noise.
         let _ = std::fs::create_dir_all(dir);
     }
     let mut out = String::new();
@@ -144,7 +166,7 @@ pub fn save_settings_to(path: &Path, m: &HashMap<String, String>) {
         out.push_str(v);
         out.push('\n');
     }
-    let _ = std::fs::write(path, out);
+    std::fs::write(path, out)
 }
 
 impl StudioConfig {
@@ -615,7 +637,13 @@ impl StudioHost {
                     self.status = msg;
                     return;
                 }
-                save_settings_to(&settings_path(), &self.cfg.sticky_map());
+                if let Err(e) = save_settings_to(&settings_path(), &self.cfg.sticky_map()) {
+                    // Said, not swallowed — but the run STARTS anyway.
+                    // Losing the settings is annoying; refusing to run
+                    // because they could not be written would be worse,
+                    // and the person can see the warning and decide.
+                    self.status = format!("settings not saved ({e}) — running anyway");
+                }
                 self.stop.store(false, Ordering::Relaxed);
                 self.status = "running…".into();
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -792,7 +820,11 @@ mod tests {
         cfg.corpus = PathBuf::from("/data/my corpus/html"); // path with spaces
         cfg.merges = 8192;
         cfg.preprocess = true;
-        save_settings_to(&path, &cfg.sticky_map());
+        // Unwrapped rather than ignored: this test asserts a round-trip,
+        // and a failed write would otherwise make it pass against the
+        // PREVIOUS file — or against nothing, if the load also silently
+        // returns an empty map.
+        save_settings_to(&path, &cfg.sticky_map()).expect("settings written");
         let back = StudioConfig::default().load_sticky(&load_settings_from(&path));
         assert_eq!(back.corpus, PathBuf::from("/data/my corpus/html"));
         assert_eq!(back.merges, 8192);

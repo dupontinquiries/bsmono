@@ -3077,3 +3077,38 @@ genuinely never stops — `loop_ms` slows with activity but never reaches
 zero, which is `dial_watermark`'s design. The fix there was a gate; here
 it is a rate. Applying the wrong one of those to the other would have
 frozen a live animation or left a dead one running.
+
+## 56. Bughunt: a settings save that could not fail
+
+Swept the egui frontends for discarded errors on write paths — the class
+where the cost is data loss rather than a wrong pixel. One hit, and the
+sweep is otherwise clean.
+
+`bot-arena/studio_host.rs`: `save_settings_to` was a `()` function ending
+in `let _ = std::fs::write(path, out);`. A failed save — read-only home,
+full disk, a permissions change — was indistinguishable from a
+successful one at every call site. The next run silently used the old
+settings, which presents to a person as "it forgot what I chose" rather
+than as a write error, and sends them looking in the wrong place.
+
+Now returns `io::Result<()>`. The live call site reports it into
+`self.status`, which was already right there, and STARTS THE RUN ANYWAY:
+losing the settings is annoying, refusing to run because they could not
+be written would be worse, and the person can see the warning and
+decide.
+
+The test call site now `.expect()`s rather than ignoring — it asserts a
+round-trip, and a failed write would have let it pass against the
+PREVIOUS file.
+
+Two things deliberately left discarding errors, and documented as such:
+  - `create_dir_all` above the write. Its failure surfaces as the write
+    error a few lines down with a message naming the real problem;
+    reporting both would be noise.
+  - `load_settings_from` returning an empty map. A missing file is the
+    normal first run and every key has a default, so "could not read"
+    and "nothing configured yet" want the same behaviour. Saving is the
+    opposite case — nothing downstream can recover from a lost write.
+
+That asymmetry is the useful part: the same `let _ =` is right on the
+read and wrong on the write, and only the consequence distinguishes them.
