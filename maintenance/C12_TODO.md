@@ -484,17 +484,44 @@ What's still needed, roughly in dependency order:
     single export, as a distinct grouping/wizard on the export popup —
     ties into C12-14e below (what "export the album" means) but is its
     own UI work regardless of how that question resolves.
-  - **Palette wiring for tempo.** "Set song tempo" doesn't exist yet in
-    `palette.rs` — should mirror "set song key"'s three-step shape
-    (`Ask::SongForKey` → root → scale becomes something equivalent for
-    a BPM value or a tap-tempo entry) now that `SetGroupTempo` is
-    verified, the same order C12-14a/14d already followed.
+  - **Palette wiring for tempo — closed (`4b4f6ada`).** "set song tempo"
+    mirrors "set song key"'s walk, one step shorter: song, then a BPM
+    from a curated ladder (60–174, the list doubling as a readout of
+    each song's current tempo), landing on `Op::SetGroupTempo` with
+    `TempoMap::constant`, plus "clear (follow the project)" → `None`.
+    Tested to land on the group op, never project-wide. Tap-tempo and
+    free numeric entry remain open — both are one more candidate row
+    on the same `SongTempoPick` step, no new op.
 - **C12-14e — what "the whole project" means once songs exist.** Export
   (`bounce`), the mixer, and anything that currently assumes one
   timeline for the whole project need a decision: does exporting "the
   album" concatenate every song's timeline, or is each song exported
   independently and the album is an organizational container only?
   Affects `studio-app`'s export flow, not yet looked at.
+
+## 14g. studio, c13 session: presence sends, ghosts sweep, rooms exist
+
+Three things this queue's studio sections implied but never listed:
+
+- **Presence had no sending half (`d3304ab5`).** The timeline drew peer
+  playheads since the wire existed and drew an empty room between two
+  real shells. `Studio::presence_beat` (change-triggered, rate-limited,
+  heartbeat at LIVENESS_MS/3), `Packet::Presence` routed through
+  `Session::presence` (was `doc.presence` — the exact bypass its own doc
+  warns about), and `Session.heard` + sweep pruning for presence-only
+  ghosts (the wire has no join packet, so silence is the only leave an
+  ad-hoc peer ever sends). Shell sweeps and beats in the carrier block.
+- **Workspaces (`4b4f6ada`).** The dashboard/workspace/workflow decision:
+  presets over existing primitives, rationale in `workspace.rs`' docs.
+  C-1..C-4, palette entries, sidecar-vocabulary, camera untouched. Panel
+  tabs go through `responsive_nav` (studio is its third adopter);
+  compact width gets a picker so no panel is unreachable.
+- **Open next steps, named:** the Pages-mode swipe layer should adopt
+  snapclone's over-scroll detent model (`snapclone-gesture` — would be
+  its second call site outside snapclone, i.e. the extraction bar);
+  keybind customization (rebinds model + Settings capture UI) designed
+  but not started; display_name now exists in the sidecar + Settings,
+  which is what a rebind section would sit beside.
 
 ## 15. responsive_nav: two apps done, and a bug found along the way
 
