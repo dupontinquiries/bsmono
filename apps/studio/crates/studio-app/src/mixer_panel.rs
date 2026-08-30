@@ -55,7 +55,8 @@ pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
+pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors)
+    -> crate::scroll_edge::ScrollReport {
     // The map explains what the rows below edit: the whole graph at once,
     // tracks → busses → master, sends dashed. Collapsed state is egui's
     // own; default open, because 'where does my signal go' is the first
@@ -141,9 +142,12 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
         }
     });
     ui.separator();
-    egui::ScrollArea::vertical()
+    // The report comes from the FADERS area (the body you actually scroll);
+    // the routing map above keeps its own horizontal area out of nav.
+    let out = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| show_inner(ui, s, c));
+    crate::scroll_edge::report(ui, &out)
 }
 
 fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {

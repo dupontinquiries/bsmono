@@ -539,18 +539,21 @@ Three things this queue's studio sections implied but never listed:
   untouched — that tree's divergence is SNAPCLONE_TWO_TREES.md's thread,
   not this one. studio-egui gained `touch::PanelNav` (detent→neighbour
   panel, clamped never wrapped, tested) as the DECISION layer only.
-  STILL OPEN: shell wiring — and the per-panel scroll-ownership survey
-  is now DONE, so the next session starts from facts: rack_panel and
-  program_panel are `ScrollArea::both()`, mixer_panel is horizontal (the
-  routing map) + vertical (faders), timeline pans both axes itself. No
-  panel leaves an axis free, so the wiring needs each panel's show() to
-  return its ScrollArea at-limit state (offset vs content size) for the
-  shell to gate `PanelNav::on_overscroll` / `still_scrolling` on — three
-  signature changes — plus confirmation of whether egui 0.34 leaves
-  at-limit scroll deltas readable in ctx.input after a ScrollArea eats
-  what it can, which needs a running display to verify. Wiring it blind
-  was considered twice and rejected twice; panels jumping during normal
-  scrolling is worse than the picker-only floor that already works.
+  Shell wiring — DONE, with the risk profile inverted rather than
+  accepted. `scroll_edge::classify` (pure, tested) gates the gesture:
+  any frame the offset MOVED is normal scrolling regardless of deltas,
+  so the feared failure (panels jumping mid-scroll) is structurally
+  excluded, not merely unlikely; the three panels' show() return a
+  ScrollReport from their own ScrollAreaOutput (offset vs content size,
+  frame-to-frame offset memory in egui temp data keyed by area id); the
+  central panel is the only reporter the nav reads (side-slot/workbench
+  copies discard theirs), the timeline never reports, and pages_mode is
+  recomputed from real width every frame. A pane with no scroll room is
+  at both limits and pages both ways — the phone-height mixer case,
+  pinned by test. STILL UNVERIFIED (needs a display): whether egui 0.34
+  leaves smooth_scroll_delta readable beside a consuming ScrollArea; if
+  not, the failure direction is SAFE — over-scroll never fires and the
+  compact picker remains the route.
 - **Perf (`42c2cb2d`):** library sidebar's per-frame DirListing clones
   removed (ensure+borrow, arrange over refs); presence_beat compares
   before building. Both were every-frame paths; neither was measured

@@ -33,6 +33,7 @@ pub mod viewport;
 pub mod voice;
 pub mod workspace;
 pub mod rebinds;
+pub mod scroll_edge;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -1592,6 +1593,10 @@ pub struct App {
     /// The settings popup is waiting for the next typed key to bind to
     /// this action's default char. Consumes exactly one keypress.
     rebind_capture: Option<char>,
+    /// Pages-mode over-scroll navigation — the detent between panels on a
+    /// screen too narrow for tabs. Fed only from the CENTRAL panel's
+    /// scroll report, only when the nav actually chose Pages.
+    panel_nav: studio_egui::touch::PanelNav,
     /// The export dialog's plan while it is open, plus its last refusal —
     /// shown inline so a bad plan is a message, not a closed window.
     export_dialog: Option<export::Plan>,
@@ -1720,6 +1725,7 @@ impl Default for App {
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: ws.library_open,
               rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
+              panel_nav: Default::default(),
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1843,6 +1849,10 @@ impl eframe::App for App {
         }
 
         let colors = uikit_egui::palette_colors("midnight");
+        // Whether the top bar chose Pages this frame — read by the central
+        // panel below to gate over-scroll navigation. A local, not a field:
+        // it is one frame's fact, recomputed from real width every time.
+        let mut pages_mode = false;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Tabs when the labels actually fit, a compact picker when
@@ -1857,6 +1867,7 @@ impl eframe::App for App {
                     (ui.available_width() - BAR_RESERVE).max(0.0),
                     Panel::ALL.len(),
                     uikit_egui::responsive_nav::DEFAULT_MIN_TAB_WIDTH);
+                pages_mode = fit == uikit_egui::responsive_nav::NavLayout::Pages;
                 match fit {
                     uikit_egui::responsive_nav::NavLayout::Tabs => {
                         for p in Panel::ALL {
@@ -2808,11 +2819,11 @@ impl eframe::App for App {
                         SideSlot::Viewport => viewport::show(
                             ui, &self.studio.session.doc.project, self.studio.playhead(),
                             &base, &mut self.frame_cache, &colors),
-                        SideSlot::Mixer => mixer_panel::show(ui, &mut self.studio, &colors),
-                        SideSlot::Rack => rack_panel::show(
-                            ui, &mut self.studio, &colors, playhead_col),
-                        SideSlot::Program => program_panel::show(
-                            ui, &mut self.studio, &colors, playhead_col),
+                        SideSlot::Mixer => { mixer_panel::show(ui, &mut self.studio, &colors); }
+                        SideSlot::Rack => { rack_panel::show(
+                            ui, &mut self.studio, &colors, playhead_col); }
+                        SideSlot::Program => { program_panel::show(
+                            ui, &mut self.studio, &colors, playhead_col); }
                         SideSlot::Off => {}
                     }
                 });
@@ -2837,23 +2848,29 @@ impl eframe::App for App {
                     });
                     self.studio.panel = tab;
                     match tab {
-                        Panel::Rack => rack_panel::show(ui, &mut self.studio, &colors, playhead_col),
-                        Panel::Program => program_panel::show(ui, &mut self.studio, &colors, playhead_col),
-                        Panel::Mixer => mixer_panel::show(ui, &mut self.studio, &colors),
+                        Panel::Rack => { rack_panel::show(ui, &mut self.studio, &colors, playhead_col); }
+                        Panel::Program => { program_panel::show(ui, &mut self.studio, &colors, playhead_col); }
+                        Panel::Mixer => { mixer_panel::show(ui, &mut self.studio, &colors); }
                         Panel::Timeline => {}
                     }
                 });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
+            // The central panel's scroll report, when the panel has one.
+            // Pages-mode over-scroll navigation reads ONLY this — the
+            // side-slot and workbench copies of the same panels discard
+            // theirs, because paging away from a slot would be paging away
+            // from the wrong thing.
+            let mut edge: Option<scroll_edge::ScrollReport> = None;
             match if self.studio.combined { Panel::Timeline } else { self.studio.panel } {
                 Panel::Rack => {
-                    rack_panel::show(ui, &mut self.studio, &colors, playhead_col);
+                    edge = Some(rack_panel::show(ui, &mut self.studio, &colors, playhead_col));
                 }
                 Panel::Mixer => {
-                    mixer_panel::show(ui, &mut self.studio, &colors);
+                    edge = Some(mixer_panel::show(ui, &mut self.studio, &colors));
                 }
                 Panel::Program => {
-                    program_panel::show(ui, &mut self.studio, &colors, playhead_col);
+                    edge = Some(program_panel::show(ui, &mut self.studio, &colors, playhead_col));
                 }
                 Panel::Timeline => {
                     // The inspector sits above the arrangement rather than
@@ -3015,7 +3032,28 @@ impl eframe::App for App {
                     }
                 }
             }
-        });
+        
+            // ── Pages-mode over-scroll navigation ────────────────────────
+            // Only when the top bar actually chose Pages (real width, this
+            // frame), and only from the central panel's own report. The
+            // classify() rule that MOVED always wins is what makes normal
+            // scrolling structurally unable to page; the timeline is
+            // excluded (it owns both axes) by simply never reporting.
+            if pages_mode {
+                match edge {
+                    Some(e) if e.moved => self.panel_nav.still_scrolling(),
+                    Some(e) if e.overscroll != 0.0 => {
+                        let now_ms = ctx.input(|i| i.time) * 1000.0;
+                        if let Some(p) = self.panel_nav.on_overscroll(
+                            self.studio.panel, e.overscroll, now_ms) {
+                            self.studio.panel = p;
+                            self.studio.status = format!("{}", p.label());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+});
     }
 }
 

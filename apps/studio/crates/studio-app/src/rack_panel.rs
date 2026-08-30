@@ -16,16 +16,21 @@ use uikit_egui::PaletteColors;
 use crate::Studio;
 
 /// One frame of the rack panel. `playhead` is the loop column the audition
-/// sink reports (already wrapped), or `None` when stopped.
-pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Option<u32>) {
+/// sink reports (already wrapped), or `None` when stopped. Returns what
+/// the scroll area did, for the shell's Pages-mode over-scroll nav —
+/// ignored at the side-slot and workbench call sites on purpose (only
+/// the CENTRAL panel navigates).
+pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Option<u32>)
+    -> crate::scroll_edge::ScrollReport {
     // Both axes scroll: a 64-step pattern is ~1.5k px of grid, and this
     // repo's stated targets include phone-sized viewports where even the
     // 16-step kit plus the channel strip overruns the height. auto_shrink
     // off so the scroll region is the panel, not the content — otherwise
     // the area collapses to fit and nothing scrolls at all.
-    egui::ScrollArea::both()
+    let out = egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| show_inner(ui, s, c, playhead));
+    crate::scroll_edge::report(ui, &out)
 }
 
 fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Option<u32>) {
