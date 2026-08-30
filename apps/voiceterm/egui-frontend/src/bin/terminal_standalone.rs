@@ -43,7 +43,17 @@ fn main() -> eframe::Result<()> {
     let colors = uikit_egui::palette_colors("system");
     eframe::run_native(
         "terminal (standalone)",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+        // Glow explicitly. Left to eframe, the renderer depends on
+        // whether egui-wgpu happens to be linked by feature unification
+        // — and when it is, eframe asks for `wgpu::Limits::default()`
+        // (8 colour attachments) without clamping to the adapter, which
+        // killed gitmind-egui at startup on an Asahi GPU allowing 5.
+        // This crate only ever asked for glow; saying so makes that
+        // true regardless of what else is in the build.
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    },
         Box::new(move |_cc| Ok(Box::new(StandaloneTerminal { app, colors }))),
     )
 }

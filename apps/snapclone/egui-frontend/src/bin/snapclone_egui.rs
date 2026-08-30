@@ -292,6 +292,14 @@ fn main() -> eframe::Result<()> {
         // compositor can never find the .desktop entry — there is no WM_CLASS to
         // fall back on there, so this IS the desktop integration.
         viewport: uikit_egui::desktop::viewport(APP_ID, "SnapClone", [420.0, 820.0]),
+        // Glow explicitly. Left to eframe the renderer depends on whether
+        // egui-wgpu happens to be linked by feature unification, and when
+        // it is, eframe asks for `wgpu::Limits::default()` — 8 colour
+        // attachments — without clamping to the adapter. That killed
+        // gitmind-egui at startup on an Asahi GPU allowing 5, and this
+        // crate declares glow and no wgpu, so it was exposed to the same
+        // accident.
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(APP_ID, opts, Box::new(|_cc| Ok(Box::new(App::new()))))

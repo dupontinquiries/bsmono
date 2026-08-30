@@ -4147,3 +4147,37 @@ per-machine config rather than in a Cargo.toml.
   misleading.** Two of the ten (beatspace and beatspace+features) are
   one upstream compile error counted twice. Worth knowing before anyone
   treats that number as a defect backlog.
+
+## 76. gitmind-egui died at startup on Asahi: the wrong renderer, not the wrong limit
+
+    LimitsExceeded(FailedLimit { name: "max_color_attachments",
+                                 requested: 8, allowed: 5 })
+
+The obvious fix is to clamp the limits, and it would work. It is not the
+bug.
+
+`gui-egui/Cargo.toml` declares `features = ["glow", "wayland", "x11"]`
+and NO wgpu. But `NativeOptions::default()` leaves the renderer to
+eframe, and when `egui-wgpu` is linked — which it was, through feature
+unification with something else in the build — eframe PREFERS wgpu.
+Then it asks for `wgpu::Limits::default()`, which wants 8 colour
+attachments and never clamps to what the adapter reports.
+
+So an app that asked for glow got wgpu because of what else happened to
+be compiled alongside it. Clamping the limits would have made the crash
+go away while leaving the renderer choice dependent on the build graph.
+
+Fixed by saying `renderer: Renderer::Glow` explicitly in all three apps
+that used `NativeOptions::default()`: gitmind-egui, voiceterm's terminal
+standalone, and snapclone-egui (which already built its options for the
+Wayland app id, so it just gained the field).
+
+snapclone's camera-bridge hit the SAME crash and its comment records it
+on Asahi — but that crate genuinely wants wgpu, so it clamps limits
+instead. Two apps, one symptom, two correct and different fixes: clamp
+if you want wgpu, pin if you never did.
+
+- **C76a — NOT COMPILED, and the renderer choice is a runtime property**
+  this sandbox cannot test at all. If gitmind still dies with the same
+  error, the wgpu path is being taken for a reason I have not found and
+  the limits clamp is then the right fix after all.
