@@ -1845,3 +1845,54 @@ of those pin failures that would each be invisible in a happy-path test:
 its UX cost is most visible, which is why the streaming question has to
 be answered here rather than deferred. aperture's completions are short
 bursts where whole-reply delivery barely shows; logscope's chat is not.
+
+## 32. The uuid "failure" was a stale index cache, not our lockfiles
+
+A fleet run reported 25 of 38 targets broken with
+
+    failed to select a version for the requirement `uuid = "^1"` (locked to 1.24.1)
+
+which reads as a lockfile problem and is not one.
+
+**The evidence, in the order that settled it.**
+1. Checked crates.io directly: NOTHING in uuid 1.2x is yanked, up to
+   1.26.0. So the locked versions exist.
+2. Read the full error rather than the summary line. The second line is
+   the one that matters: `candidate versions found which didn't match:
+   0.8.1, 0.8.0, 0.7.4`. Those are the versions cargo could SEE. uuid
+   1.x has existed since 2022; an index offering 0.8.1 as its best has
+   not learned uuid 1 exists.
+3. Confirmed the same lockfile resolves here: `cargo metadata` in
+   `apps/aperture` returns uuid 1.24.1, no error, from the identical
+   `Cargo.lock` that failed on the reporting machine.
+
+So the lock is right and the local index cache is stale for that one
+crate. The giveaway that it is ONE crate rather than a generally old
+index: the same build resolves egui 0.34 and accesskit 0.24 fine — a
+genuinely old index would have failed on those first.
+
+**Why it takes down "half the monorepo" and none of it is ours:** `uuid`
+is a transitive dep of `accesskit`, which every egui app pulls in. One
+bad cache entry fails every GUI app simultaneously, which looks exactly
+like a repo-wide breakage.
+
+**The fix is one directory:**
+
+    rm -rf ~/.cargo/registry/index/*/.cache/uu/id/uuid
+
+`maintenance/tools/registry_doctor.sh [root] [crate]` automates the
+diagnosis: locked versions across all lockfiles, what crates.io actually
+publishes, and what the local cache's newest known version is. When that
+last number is older than the locked one, this is the fault.
+
+- **C12-32a — do NOT "fix" this by regenerating lockfiles.** Every
+  search result for this error says delete Cargo.lock or run `cargo
+  update`. On this repo that is 36 lockfiles of collateral damage for a
+  fault in none of them: it would replace a one-directory fix with a
+  fleet-wide version bump nobody asked for, and produce a diff large
+  enough to hide whatever the next real problem turns out to be.
+- **C12-32b — `rusty-board` is a DIFFERENT failure** and was hidden in
+  the same list: `failed to run custom build command for
+  gtk4-layer-shell-sys`. A missing system library, unrelated to uuid.
+  Worth separating, because a summary that groups 25 failures under one
+  heading buries the one that is not that heading.
