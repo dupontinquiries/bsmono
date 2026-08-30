@@ -2639,3 +2639,34 @@ detection lever is adaptive/per-tile thresholding (or local contrast
 normalization before detect); after that, FeatureTrackPass's own
 pre-existing failure and single-scale LK (no pyramid → small motions
 only) are the tracking debt.
+
+### Detection round 2 + mode-decision experiment (same session)
+
+Adaptive per-tile FAST threshold (clamp(tile MAD, 8, 20)): shotB
+654→1223 keypoints, coverage 24→36%; smiteB coverage →0.66–0.70.
+Remaining shotB empty cells are genuinely near-flat shadow (MAD<8) —
+detection floor reached; the next gain there is tracking, not detection.
+
+Both remaining tracker test failures were DEGENERATE INPUTS, not
+tracker bugs: (x·7+y·13)%256 is a linear ramp — constant gradient ⇒
+exactly singular LK structure tensor (total aperture problem), and the
+detection test's ramp contains zero FAST corners (straight seams never
+make a 9-arc). The LK solver verifies correct on smooth
+well-conditioned texture with STRICTER asserts (Some required). Its
+real contract is now test-documented: correct within the linear basin
+(displacement < ~texture wavelength/2); pyramid LK remains the future
+work for large motions. Pre-existing failures 5→3 (library ×2, densify
+cadence).
+
+Mode-decision experiment — negative result, recorded: replaced the raw
+SAD plate-vs-prev decision with a deadzone-aware codable cost. Every
+variant lost to SAD on shotB at matched dz: quiet-region all-plate
+drops real drift (35.0 dB vs 35.5), all-prev accumulates quantization
+drift (34.7), deterministic rotating plate refresh K=4/K=8 lands
+0.15–0.25 dB under SAD at ~equal bytes. Diagnosis: SAD's
+grain-alignment noise dithers quiet regions between predictors — an
+accidental but effective intra-refresh that single-frame proxies don't
+replicate. The principled successor is lookahead RD (charge plate-mode's
+persistent error across future frames), not a better proxy. SAD stays
+by measurement; region_codable_cost kept #[allow(dead_code)] as the
+experiment record.

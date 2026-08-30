@@ -624,6 +624,41 @@ fn sad_region(a: &[u8], w: usize, h: usize, ax: i32, ay: i32, b: &[u8], bx: usiz
     s
 }
 
+/// Deadzone-aware prediction cost: sum of |cur − pred| EXCESS over the
+/// threshold the residual coder will discard anyway. Raw SAD is a bad
+/// mode-selection proxy at aggressive deadzones: grain contributes a
+/// large SAD floor to EVERY candidate while costing zero bits, so
+/// candidates get ranked by their grain alignment instead of by the
+/// bits they will actually cause. (Measured: the SAD-based decision
+/// plus MV rate bias dropped prev-mode share 0.69→0.33 and ~1.5 dB at
+/// matched dz.) `thr` ≈ dead_zone/2: a flat delta d maps to DC 4d
+/// against a DC zone of 2·dead_zone, so deltas below dead_zone/2 are
+/// invisible to the coder.
+#[allow(dead_code)] // kept: documents a measured negative result (see encode_gop_v3)
+fn region_codable_cost(
+    pred: &[u8],
+    w: usize,
+    h: usize,
+    ax: i32,
+    ay: i32,
+    cur: &[u8],
+    bx: usize,
+    by: usize,
+    thr: i32,
+) -> u32 {
+    let mut s = 0u32;
+    for ly in 0..REGION {
+        let sy = (ay + ly as i32).clamp(0, h as i32 - 1) as usize;
+        let brow = (by + ly) * w + bx;
+        for lx in 0..REGION {
+            let sx = (ax + lx as i32).clamp(0, w as i32 - 1) as usize;
+            let d = (pred[sy * w + sx] as i32 - cur[brow + lx] as i32).abs();
+            s += (d - thr).max(0) as u32;
+        }
+    }
+    s
+}
+
 /// Rate-biased cost of a motion vector: zero is free, anything else must
 /// buy back its ~2 bytes of side info in SAD. Without this, the search
 /// wanders onto shallow ±1–2px minima created by film grain (grain
@@ -699,6 +734,7 @@ pub fn encode_gop_v3(
     plate: &Plate,
     opts: &ResidualOpts,
 ) -> PlateEncodeReportV2 {
+
     let fw = frames[0].w;
     let fh = frames[0].h;
     let (gw, gh) = (fw / REGION, fh / REGION);
@@ -727,8 +763,19 @@ pub fn encode_gop_v3(
                     let (rx, ry) = (gx * REGION, gy * REGION);
                     let sad_plate = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
                     let (mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
-                    // The MV costs ~2 bytes of side info; charge it ~64
-                    // SAD units so trivial wins don't buy side info.
+                    // Decision stays raw-SAD BY MEASUREMENT, not by
+                    // principle. A deadzone-aware codable cost was built
+                    // (region_codable_cost) and lost on every tuning:
+                    // all-plate quiet regions discard real drift (−0.5 dB),
+                    // all-prev accumulates quantization drift (−0.8 dB),
+                    // and a deterministic rotating plate refresh (K=4, K=8)
+                    // lands ~0.15–0.25 dB under this SAD decision at equal
+                    // bytes. SAD's grain-alignment noise dithers quiet
+                    // regions between the two predictors — an accidental
+                    // but effective intra-refresh. The principled
+                    // replacement is lookahead RD (charging plate-mode's
+                    // persistent error across future frames), not a better
+                    // single-frame proxy. Numbers in SESSION_LOG.
                     if sad_prev + 64 < sad_plate {
                         modes[gy * gw + gx] = 1;
                         mvs.push(mv);
