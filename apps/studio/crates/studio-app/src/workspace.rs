@@ -40,6 +40,15 @@ pub struct WorkspaceState {
     /// Genre vocabularies the voice fastpath listens with — per device,
     /// because the ears follow the room, not the song.
     pub voice_domains: String,
+    /// Whether the library sidebar is showing — layout, so it lives here
+    /// with `combined` and friends rather than being forgotten every
+    /// launch (it was: the flag existed only in the shell).
+    pub library_open: bool,
+    /// What presence packets call this device's person. Per DEVICE on
+    /// purpose — the same person on a phone and a desktop may want
+    /// "kes (phone)" vs "kes", and the sidecar is exactly the file that
+    /// distinction lives in. Empty means "site N", never an error.
+    pub display_name: String,
 }
 
 impl Default for WorkspaceState {
@@ -50,14 +59,15 @@ impl Default for WorkspaceState {
                          closed_groups: Vec::new(),
                          bounce_format: "opus-192".into(),
                          pinned: Vec::new(), demoted: Vec::new(),
-                         voice_domains: "common,instruments".into() }
+                         voice_domains: "common,instruments".into(),
+                         library_open: true, display_name: String::new() }
     }
 }
 
 impl WorkspaceState {
     pub fn encode(&self) -> String {
         format!("# per-device layout; safe to delete, never load-bearing\n\
-                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\n",
+                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\nlibrary_open={}\ndisplay_name={}\n",
                 self.combined, self.panel, self.side_slot,
                 self.px_per_sec, self.scroll_ticks,
                 self.closed_groups.iter().map(|g| g.to_string())
@@ -68,7 +78,7 @@ impl WorkspaceState {
                 // silent, confusing failure.
                 self.pinned.join("\t"),
                 self.demoted.join("\t"),
-                self.voice_domains)
+                self.voice_domains, self.library_open, self.display_name)
     }
     /// Parse leniently: defaults underneath, known keys on top, everything
     /// else ignored. There is no error case ON PURPOSE.
@@ -96,10 +106,83 @@ impl WorkspaceState {
                 "demoted" => w.demoted = v.split('\t')
                     .filter(|x| !x.trim().is_empty()).map(str::to_string).collect(),
                 "voice_domains" => w.voice_domains = v.trim().to_string(),
+                "library_open" => if let Ok(b) = v.trim().parse() { w.library_open = b },
+                "display_name" => w.display_name = v.trim().to_string(),
                 _ => {} // a newer build's key, not our business
             }
         }
         w
+    }
+}
+
+/// A named arrangement of the layout primitives that already exist —
+/// which panel is central, whether the workbench strip is on, what the
+/// side slot shows, whether the library rides along. Expressed in the
+/// sidecar's OWN vocabulary (panel labels, slot tokens), so a preset is
+/// literally a partial `WorkspaceState` and can never say something the
+/// sidecar cannot.
+///
+/// ## Why presets, not a dock or a dashboard
+///
+/// Three shapes were on the table for "the layout system":
+///
+/// * **Dashboarding** — every panel visible at once. The workbench
+///   (`combined`) already IS the desktop's version of this, scoped to
+///   what fits; a full four-panel dashboard dies on a phone, and
+///   `uikit_egui::responsive_nav` exists precisely because even a TAB
+///   ROW doesn't reliably fit there.
+/// * **Free workflowing** — user-arranged docking. A new dependency, a
+///   giant persisted state space, and a seam for a future that may not
+///   come; `ambient-learner`'s shell doc is the cautionary tale about
+///   layouts whose states outnumber their routes in ("nine of its ten
+///   pages had no route in").
+/// * **Workspacing** — this: a handful of NAMED arrangements over the
+///   primitives that already exist and already persist. kdenlive ships
+///   exactly this (Logging / Editing / Audio / Color); it is one
+///   keypress to switch and zero new state to store, because a preset
+///   only ever writes fields the sidecar already owns.
+///
+/// A preset deliberately does NOT touch the camera (`px_per_sec`,
+/// `scroll_ticks`) or triage (`pinned`/`demoted`): switching how the
+/// room is arranged must not move where you were looking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub name: &'static str,
+    /// `Panel` label, the same string `WorkspaceState.panel` stores.
+    pub panel: &'static str,
+    pub combined: bool,
+    /// Side-slot token, the same vocabulary the sidecar stores.
+    pub side_slot: &'static str,
+    pub library_open: bool,
+}
+
+/// The four rooms. Order is the keybinding (`C-1`..`C-4`).
+pub const LAYOUTS: [Layout; 4] = [
+    // Arrange & trim: the kdenlive posture. Timeline central, media
+    // library at hand, viewport beside it when there is video.
+    Layout { name: "edit", panel: "Timeline", combined: false,
+             side_slot: "viewport", library_open: true },
+    // Beatmaking: the FL posture. The rack full-screen, the sample
+    // library open — the two things a beat is made of.
+    Layout { name: "beat", panel: "Rack", combined: false,
+             side_slot: "off", library_open: true },
+    // Mixing: faders full-screen, nothing else pulling the eye.
+    Layout { name: "mix", panel: "Mixer", combined: false,
+             side_slot: "off", library_open: false },
+    // Performing/producing: the workbench — timeline on top, rack in
+    // the strip below, mixer one slot away. The "shown together" room.
+    Layout { name: "perform", panel: "Timeline", combined: true,
+             side_slot: "mixer", library_open: false },
+];
+
+impl Layout {
+    /// Write this preset's fields over a state, leaving everything a
+    /// preset has no opinion on (camera, triage, formats, name) alone.
+    pub fn apply(&self, w: &mut WorkspaceState) {
+        w.panel = self.panel.to_string();
+        w.combined = self.combined;
+        w.side_slot = self.side_slot.to_string();
+        w.library_open = self.library_open;
     }
 }
 
@@ -129,7 +212,8 @@ mod tests {
             side_slot: "mixer".into(), px_per_sec: 250.0, scroll_ticks: 12345,
             closed_groups: vec![3, 9], bounce_format: "flac".into(),
             pinned: vec!["kicks/808, big.wav".into()], demoted: vec!["hats/tick.opus".into()],
-            voice_domains: "trap,film".into() };
+            voice_domains: "trap,film".into(),
+            library_open: false, display_name: "kes".into() };
         assert_eq!(WorkspaceState::decode(&w.encode()), w);
         // A newer build's key rides along harmlessly; garbage lines too.
         let with_future = format!("{}\nfuture_key=whatever\n<<<garbage", w.encode());
@@ -148,5 +232,47 @@ mod tests {
         assert_eq!(sidecar(Path::new("cut.studioarch")),
                    Path::new("cut.workspace"),
                    "an archive's layout sidecar shares the stem too");
+    }
+
+    /// A preset is a partial state in the sidecar's own vocabulary — so
+    /// every panel label and slot token it names must be one the decode
+    /// path and the shell's lookup actually recognise, and applying one
+    /// must leave the camera exactly where it was.
+    #[test]
+    fn presets_speak_the_sidecar_vocabulary_and_leave_the_camera_alone() {
+        let panels: Vec<&str> = studio_egui::touch::Panel::ALL.iter()
+            .map(|p| p.label()).collect();
+        let slots = ["off", "viewport", "rack", "program", "mixer"];
+        for l in LAYOUTS {
+            assert!(panels.contains(&l.panel),
+                    "{}: panel {:?} is not a real Panel label", l.name, l.panel);
+            assert!(slots.contains(&l.side_slot),
+                    "{}: slot {:?} is not a token the shell maps", l.name, l.side_slot);
+        }
+        let mut w = WorkspaceState::default();
+        w.px_per_sec = 37.5;
+        w.scroll_ticks = 9_000;
+        w.display_name = "kes".into();
+        LAYOUTS[3].apply(&mut w);
+        assert_eq!(w.panel, "Timeline");
+        assert!(w.combined, "perform is the workbench room");
+        assert_eq!((w.px_per_sec, w.scroll_ticks), (37.5, 9_000),
+                   "switching rooms must not move the camera");
+        assert_eq!(w.display_name, "kes", "or rename anyone");
+    }
+
+    /// The two new keys ride the same tolerant format: encoded, decoded,
+    /// and absent-means-default (an old sidecar written before they
+    /// existed must load with the library open and no name).
+    #[test]
+    fn library_and_name_round_trip_and_default() {
+        let mut w = WorkspaceState::default();
+        w.library_open = false;
+        w.display_name = "kes (phone)".into();
+        let back = WorkspaceState::decode(&w.encode());
+        assert_eq!(back, w);
+        let old = WorkspaceState::decode("combined=true\npanel=Mixer\n");
+        assert!(old.library_open, "missing key means the old default");
+        assert!(old.display_name.is_empty());
     }
 }

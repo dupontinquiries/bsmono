@@ -1661,6 +1661,7 @@ impl Default for App {
             pinned: ws.pinned.iter().map(std::path::PathBuf::from).collect(),
             demoted: ws.demoted.iter().map(std::path::PathBuf::from).collect(),
         };
+        studio.display_name = ws.display_name.clone();
         studio.status = match load_note {
             Some(e) => format!("{e} — started fresh (Ctrl+S will overwrite!)"),
             None => format!("{} — audition: {}", studio.status, sink.describe()),
@@ -1704,7 +1705,7 @@ impl Default for App {
               find_ui: None,
               mic: capture::open_capture(),
               take_from: studio_core::Ticks::ZERO,
-              settings_open: false, library_open: true,
+              settings_open: false, library_open: ws.library_open,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1751,6 +1752,15 @@ impl eframe::App for App {
                 Some(_) => None, // C-p again closes: a toggle, not a stack
                 None => Some(palette::Palette::open()),
             };
+        }
+        // C-1..C-4: the workspaces. One keypress per room, the kdenlive
+        // habit; the palette lists them with these hints so the shortcut
+        // teaches itself.
+        for (i, key) in [egui::Key::Num1, egui::Key::Num2,
+                         egui::Key::Num3, egui::Key::Num4].iter().enumerate() {
+            if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::COMMAND, *key)) {
+                self.apply_layout(i);
+            }
         }
         // While the palette is open it owns the keyboard — typing 'd' is a
         // search, not a delete.
@@ -1804,9 +1814,39 @@ impl eframe::App for App {
         let colors = uikit_egui::palette_colors("midnight");
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for p in Panel::ALL {
-                    if ui.add(egui::Button::selectable(self.studio.panel == p, p.label())).clicked() {
-                        self.studio.panel = p;
+                // Tabs when the labels actually fit, a compact picker when
+                // they don't — decided from a WIDTH FIT via responsive_nav,
+                // not a device-class guess (its module doc explains why the
+                // guess is wrong in both directions). The reserve keeps the
+                // fit honest: the transport half of this bar needs room too,
+                // and "the tabs fit" while play/timecode wrap would be a
+                // lie about the same width.
+                const BAR_RESERVE: f32 = 260.0;
+                let fit = uikit_egui::responsive_nav::choose(
+                    (ui.available_width() - BAR_RESERVE).max(0.0),
+                    Panel::ALL.len(),
+                    uikit_egui::responsive_nav::DEFAULT_MIN_TAB_WIDTH);
+                match fit {
+                    uikit_egui::responsive_nav::NavLayout::Tabs => {
+                        for p in Panel::ALL {
+                            if ui.add(egui::Button::selectable(self.studio.panel == p, p.label())).clicked() {
+                                self.studio.panel = p;
+                            }
+                        }
+                    }
+                    uikit_egui::responsive_nav::NavLayout::Pages => {
+                        // One panel at a time on a screen this narrow; the
+                        // picker is the route between them. (The swipe layer
+                        // — snapclone's over-scroll detents — is the named
+                        // next step; the picker is the floor, so no panel is
+                        // ever unreachable. ambient-learner's lesson.)
+                        egui::ComboBox::from_id_salt("panel-pick")
+                            .selected_text(self.studio.panel.label())
+                            .show_ui(ui, |ui| {
+                                for p in Panel::ALL {
+                                    ui.selectable_value(&mut self.studio.panel, p, p.label());
+                                }
+                            });
                     }
                 }
                 ui.separator();
@@ -1929,6 +1969,8 @@ impl eframe::App for App {
                             .map(|p| p.display().to_string()).collect(),
                         demoted: self.library_prefs.demoted.iter()
                             .map(|p| p.display().to_string()).collect(),
+                        library_open: self.library_open,
+                        display_name: self.studio.display_name.clone(),
                     });
                     // The directory must exist (and be ours) BEFORE the
                     // file is written: a save into a fresh project root
@@ -2027,6 +2069,11 @@ impl eframe::App for App {
             let mut open = true;
             egui::Window::new("Settings").open(&mut open).resizable(false)
                 .collapsible(false).show(ctx, |ui| {
+                    ui.label("your name, as peers see it beside your playhead:");
+                    let hint = format!("site {}", self.studio.session.doc.site.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.studio.display_name)
+                        .hint_text(hint));
+                    ui.separator();
                     ui.label("bounce fidelity — what library-bound renders cost on THIS device:");
                     let all = morph_pad::BounceFormat::ALL;
                     let mut ix = all.iter().position(|f| *f == self.bounce_format).unwrap_or(1);
@@ -3228,6 +3275,7 @@ impl App {
                     self.export_dialog = Some(Default::default());
                 }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
+                palette::ShellVerb::Workspace(ix) => self.apply_layout(ix as usize),
                 palette::ShellVerb::ToggleWorkbench => {
                     self.studio.combined = !self.studio.combined;
                 }
@@ -3253,6 +3301,25 @@ impl App {
     /// IT STARTED — recording then behaves like every other edit: one op,
     /// undoable, shareable, archivable. Its asset is stored FLAC-encoded,
     /// so a phone session's takes do not cost three times what they need.
+    /// Put the shell in one of the named rooms — a preset writes only the
+    /// layout fields it owns (see `workspace::LAYOUTS`' docs for why
+    /// presets beat a dock here), through the same vocabulary the sidecar
+    /// stores, so what C-1 does and what a saved sidecar restores can
+    /// never drift apart.
+    fn apply_layout(&mut self, ix: usize) {
+        let Some(l) = workspace::LAYOUTS.get(ix) else { return };
+        if let Some(p) = studio_egui::touch::Panel::ALL.iter()
+            .find(|p| p.label() == l.panel) { self.studio.panel = *p; }
+        self.studio.combined = l.combined;
+        self.side_slot = match l.side_slot {
+            "viewport" => SideSlot::Viewport, "rack" => SideSlot::Rack,
+            "program" => SideSlot::Program, "mixer" => SideSlot::Mixer,
+            _ => SideSlot::Off,
+        };
+        self.library_open = l.library_open;
+        self.studio.status = format!("workspace: {}", l.name);
+    }
+
     fn toggle_take(&mut self) {
         if self.mic.recording() {
             let Some(take) = self.mic.stop() else {
