@@ -1999,3 +1999,45 @@ across two fleet runs were test-isolation races over a process-global
 assertion. None were product bugs. A `parallel_test_hazard` check —
 grep for `set_var` inside `#[cfg(test)]` without a serialising lock —
 would have found all three mechanically.
+
+## 35. snapclone's `wired 51%` is a measurement artifact, not a gap
+
+Last commit ended by naming snapclone's 25-of-49 `wired` score as "the
+next thing worth understanding". Understood, and the answer is that
+there is nothing to fix.
+
+All 24 surfaces the audit cannot see in code DO exist:
+
+    SegmentedTabStrip -> src/nav_chrome.rs (+ uikit segmented_tabs)
+    UnifiedNavBar     -> src/unified_nav.rs
+    FocusReticle      -> src/reticle.rs
+    GlassIconButton   -> src/glass.rs
+    GlassScrim        -> src/glass.rs
+    SnapTile          -> src/snaps.rs
+    ContactCard       -> src/lib.rs
+    SwipeNavigator    -> src/swipe_physics.rs
+    ... and 16 more
+
+Checked mechanically: of the 24, **24 are mentioned somewhere in the
+source and 0 are absent entirely**. `covered_in_code` requires the Qt
+name OUTSIDE a comment, and this app follows the same house style the
+function's own docstring warns about — the Qt class is named in the
+MODULE DOC and the code below uses idiomatic Rust names (`glass.rs`,
+`reticle.rs`, `unified_nav.rs`). That is the documented false negative,
+in a new app.
+
+So `wired` is behaving exactly as designed: it is the LOWER bound, and
+`named`/`live` at 100% are the upper. The gap between them is where to
+LOOK, not a count of missing work — and here looking found nothing
+missing.
+
+- **C12-35a — do not "fix" this by renaming.** Making the code say
+  `SegmentedTabStrip` to satisfy an audit would trade idiomatic Rust for
+  a metric, and the metric already reports both bounds precisely so it
+  does not have to be gamed.
+- **C12-35b — worth one improvement to the tool, though.** It could
+  report the three-way split itself: named-and-in-code, named-in-doc-only
+  (this case), and absent. The middle bucket is currently
+  indistinguishable from the third in the headline number, which is what
+  made this look like 24 missing surfaces. That is a real reporting gap
+  even though it is not a code gap.
