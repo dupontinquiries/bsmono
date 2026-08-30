@@ -2588,3 +2588,51 @@ explaining why it derives the index instead of hardcoding 2, and
 bot-arena's Start button hardcoded 1 with no comment. Same codebase,
 same author, opposite habits — which is what makes a sweep worth more
 than reasoning about who wrote it.
+
+## 45. voiceterm: seven settings that save and do nothing
+
+New hunt: preferences written by a settings screen and read nowhere —
+the same class as §41's vCard button, but harder to notice because the
+control gives correct feedback. The checkbox ticks, the value persists,
+it reloads on restart. Nothing changes.
+
+Checked every field voiceterm's settings panel writes for a reader
+outside `shell.rs` (the editor itself):
+
+    voice            0
+    tts              0
+    voice_filter     0
+    mic_enabled      0
+    offload_enabled  0
+    speaker_id       0
+    double_tilt      0
+
+All seven. Including the four I registered with the a11y scene last
+session — which made them reachable by a screen reader, and they still
+did nothing when reached.
+
+**WIRED: `mic_enabled`.** It has an unambiguous consumer — the mic FAB
+at voiceterm_egui.rs:3362, drawn unconditionally, with push-to-talk
+live. Turning the microphone off in settings left the button on screen
+and the mic working. That is worse than the setting not existing:
+someone who turned it off for privacy would reasonably believe the
+microphone was off.
+
+- **C12-45a — the other six are NOT wired, deliberately.** Each needs a
+  consumer that does not obviously exist yet: `tts` needs a speech
+  output path, `voice_filter` needs the recogniser, `offload_enabled`
+  needs the compute-host client, `speaker_id` needs diarisation,
+  `double_tilt` needs the gesture layer. Wiring them to nothing would
+  reproduce the bug one layer down.
+
+  The honest interim: a settings screen should not offer a control it
+  cannot honour. Marking the six as "not yet" in the panel is a smaller
+  change than implementing five subsystems, and it stops the screen
+  lying — recorded rather than done because it needs a decision about
+  whether to hide or disable them.
+
+- **C12-45b — this is worth sweeping across the other apps.** The same
+  shape (a settings-kit `Prefs` field with an editor and no reader) is
+  cheap to grep for and was not visible in any audit before this one:
+  `unhosted_check` works at module granularity, `parity_audit` counts
+  surfaces, and neither sees a field.

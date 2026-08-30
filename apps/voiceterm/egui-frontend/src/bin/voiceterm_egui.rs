@@ -3358,9 +3358,20 @@ impl eframe::App for VoicetermApp {
             // So the margin belongs here rather than in the shared helper: the
             // shared behaviour is right, this call site just needs to hand it a
             // rect that already has room.
-            let fab = fab_rect(term_rect.shrink(10.0), 56.0);
-            let resp = mic_fab_ui(ui, fab, &self.colors);
-            let _ = self.compass.ui_from_host(ui, &resp, &mut self.app);
+            // HONOUR THE PREFERENCE. `voice.mic_enabled` is drawn as a
+            // checkbox in the settings panel, saved, reloaded — and was
+            // read NOWHERE. Turning the microphone off in settings left
+            // the FAB on screen and push-to-talk working, which is worse
+            // than the setting not existing: someone who turned it off
+            // for privacy would reasonably believe the mic was off.
+            //
+            // Seven prefs are in this state (see C12-45); this is the one
+            // with an unambiguous consumer, so it is the one wired here.
+            if self.app.prefs.voice.mic_enabled {
+                let fab = fab_rect(term_rect.shrink(10.0), 56.0);
+                let resp = mic_fab_ui(ui, fab, &self.colors);
+                let _ = self.compass.ui_from_host(ui, &resp, &mut self.app);
+            }
         });
     }
 }
