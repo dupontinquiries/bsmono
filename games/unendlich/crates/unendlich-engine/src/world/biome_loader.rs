@@ -290,6 +290,14 @@ impl BiomeRegistry {
     ///   - 0.20 = strong bias, themed only in very extreme corners
     ///
     /// Returns `None` only if the registry is empty.
+    /// r611: the loaded defs, for baking the GPU-side registry table.
+    /// The shader runs the SAME best_fit argmin over this list (climate
+    /// coords + themed penalty + resolved blocks), so the two backends
+    /// pick surfaces from the same data.
+    pub fn defs(&self) -> &[BiomeDef] {
+        &self.biomes
+    }
+
     pub fn best_fit(&self, temperature: f64, humidity: f64) -> Option<&BiomeDef> {
         const THEMED_PENALTY: f64 = 0.10;
         let target_t = (temperature / TEMPERATURE_NORMALISATION).clamp(0.0, 1.0);

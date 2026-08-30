@@ -12159,3 +12159,26 @@ added) — correct and kept, but ineffective until the surface SOURCE matches; t
 numbers re-verified unchanged post-gate (expected, per the analysis). GLSL gotcha recorded: use-before-declaration
 needs a prototype — the first "clean" spv rebuild had silently FAILED compile ("SPIR-V is not generated") while the
 stale artifact kept running; always grep validator output for ERROR, not just exit status.
+
+## r611 — REGISTRY TABLE UPLOADED TO THE SHADER: the r609 leak now leaks IDENTICALLY on both backends
+Implemented r609 fix path (a), parity-faithful. Rust side: BiomeRegistry::defs() accessor; gpu_generator bakes the
+loaded registry into a fixed table ({count; vec4 climate[64] = (t, h, themed_penalty_sq, 0); uvec4 blocks[64] =
+(surface, subsurface, ·, ·), sentinel 0xFFFFFFFF = "def declares nothing"}), uploaded write-once into a NEW binding-1
+SSBO (descriptor layout grew to two bindings; pool count 2; dual writes; buffer freed in Drop). Registry is loaded
+inside VulkanChunkGenerator::new the same way TerrainGenerator loads it (deliberate duplicate read of read-only json —
+kept new()'s signature stable everywhere incl. the probe's pristine mode). Empty/absent registry bakes count 0 →
+shader falls back to legacy mirrors = the CPU's no-registry path. GLSL side: registry_best_fit is the EXACT argmin
+(squared euclid on climate_coord with the 0.01 themed penalty pre-baked per def; target = (model temp, model humid)
+clamped — the CPU's mc_temp×2-then-÷2 cancels), plus pick_surface_block_gpu / pick_subsurface_block_gpu (registry →
+sentinel → legacy; NEW legacy_subsurface_mirror = exact CPU legacy_subsurface_block). Rerouted: Pass B surface pick,
+Pass B subsurface pick (sbiome now computed in that branch — scope fix), and the r610 tree substrate gate.
+RESULTS (probe seed panel, honest counters green): seed 31415926 now FULLY CLEAN — 64 chunks, terrain diffs 0, tree
+mass exact (the CPU's arena-surface treeless band is now reproduced by the GPU, warts-as-specified); ocean origin
+11,242 → 2,016 terrain diffs (-82%, the gravel shell matches); phantom GPU trees eliminated on every seed (the r610
+substrate gate now bites). RESIDUALS, bounded and named: 424242 12k / 90210 9.5k terrain diffs and tree-mass 0.72 /
+1.49 — the per-cell registry fits still disagree at some columns, most plausibly a CLIMATE-EVALUATION-Y mismatch
+between call sites (CPU tree gate samples temp/humid at the column's surface_y; the shader's decision climate comes
+from the surface-target probe height sl+10; Phase-2 CPU per-cell y vs my per-cell dyf should already align — audit
+each site's exact y next). Verification honesty: no soak this round, but the probe panel exercised the full
+production TerrainGenerator GPU path (4 seeds × 64 chunks through the new binding) without error; fullgame check
+clean; biome_loader 11/0. Next: per-site climate-y audit, then promote the probe to a gate on the clean seeds.

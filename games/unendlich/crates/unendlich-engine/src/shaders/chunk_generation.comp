@@ -27,6 +27,18 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 // unchanged. `coherent` is not needed because workgroup barrier() +
 // memoryBarrierBuffer() between phases provides sufficient ordering.
 
+// r611: the baked biome-def registry (see gpu_generator::bake_biome_def_table).
+// climate[i] = (t, h, themed_penalty_sq, 0); blocks[i] = (surface, subsurface,
+// 0, 0) with 0xFFFFFFFF = "def declares nothing — use the legacy mirror".
+layout(std430, binding = 1) readonly buffer BiomeDefTable {
+    uint biome_def_count;
+    uint _bdt_pad0;
+    uint _bdt_pad1;
+    uint _bdt_pad2;
+    vec4 biome_def_climate[64];
+    uvec4 biome_def_blocks[64];
+};
+
 layout(std430, binding = 0) buffer Blocks {
     uint blocks_packed[]; // length = 32*32*32 / 4 = 8192 uints per chunk * batch
 };
@@ -851,6 +863,55 @@ void fi_island_profile(int palette, int stratum, inout TreeProfile p) {
 // substrate gate.
 uint surface_block_type(int wy, float humidity, float temperature, uint biome);
 
+// ── r611: registry best_fit — the EXACT argmin biome_loader::best_fit
+// runs. target coords: the CPU calls best_fit(mc_temp = temp*2, humid) and
+// best_fit divides by TEMPERATURE_NORMALISATION (2) again, so the target
+// is just (model temp, model humid), clamped. Squared euclid + the themed
+// penalty already baked into climate[i].z. Returns the def index or -1.
+int registry_best_fit(float temp, float humid) {
+    if (biome_def_count == 0u) return -1;
+    float tt = clamp(temp, 0.0, 1.0);
+    float th = clamp(humid, 0.0, 1.0);
+    int best = -1;
+    float best_d2 = 1e30;
+    for (uint i = 0u; i < biome_def_count && i < 64u; i++) {
+        vec4 c = biome_def_climate[i];
+        float dt = c.x - tt;
+        float dh = c.y - th;
+        float d2 = dt * dt + dh * dh + c.z;
+        if (d2 < best_d2) { best_d2 = d2; best = int(i); }
+    }
+    return best;
+}
+
+// Mirror of cpu_generator::legacy_subsurface_block.
+uint legacy_subsurface_mirror(uint biome) {
+    if (biome == BIOME_DESERT || biome == BIOME_BEACH) return BLOCK_SAND;
+    if (biome == BIOME_RED_SANDSTONE_CANYON || biome == BIOME_BLOOMING_CANYON)
+        return BLOCK_RED_SANDSTONE;
+    return BLOCK_DIRT;
+}
+
+// pick_surface_block / pick_subsurface_block mirrors: registry def first
+// (per-CELL climate, exactly like the CPU's biome_def_at(x, y, z)), legacy
+// on sentinel or no registry.
+uint pick_surface_block_gpu(int wy, float humidity, float temperature, uint biome) {
+    int i = registry_best_fit(temperature, humidity);
+    if (i >= 0) {
+        uint b = biome_def_blocks[i].x;
+        if (b != 0xFFFFFFFFu) return b;
+    }
+    return surface_block_type(wy, humidity, temperature, biome);
+}
+uint pick_subsurface_block_gpu(float humidity, float temperature, uint biome) {
+    int i = registry_best_fit(temperature, humidity);
+    if (i >= 0) {
+        uint b = biome_def_blocks[i].y;
+        if (b != 0xFFFFFFFFu) return b;
+    }
+    return legacy_subsurface_mirror(biome);
+}
+
 // Tree decision returned by Phase A's per-column computation.
 // `has_tree` false means this column doesn't spawn a tree; everything
 // else is don't-care. `has_tree` true: trunk_height, canopy_radius,
@@ -1007,7 +1068,7 @@ TreeDecision compute_tree_decision(
     // CPU requires aligns the DENSITY of trees even though their
     // POSITIONS remain split by design (u32 vs u64 origin hashes).
     {
-        uint sb = surface_block_type(d.surface_y, humidity, temperature, biome);
+        uint sb = pick_surface_block_gpu(d.surface_y, humidity, temperature, biome);
         if (sb != BLOCK_GRASS && sb != BLOCK_MOSS) return d;
     }
 
@@ -1697,7 +1758,7 @@ void main() {
                     float h = model_humidity(dxf, dyf, dzf, world_seed);
                     float t = model_temperature(dxf, dyf, dzf, world_seed);
                     uint sbiome = biome_at_2d(dxf, dzf, world_seed); // r462: biome→surface map
-                    block_id = surface_block_type(wy, h, t, sbiome);
+                    block_id = pick_surface_block_gpu(wy, h, t, sbiome); // r611
                 } else {
                     // Subsurface or deep. Look up: is there air within 3 above?
                     // RC39: all probes are same column → same cached surface_target.
@@ -1712,7 +1773,8 @@ void main() {
                     if (near_surface) {
                         float h = model_humidity(dxf, dyf, dzf, world_seed);
                         float t = model_temperature(dxf, dyf, dzf, world_seed);
-                        block_id = subsurface_block_type(h, t);
+                        uint sbiome = biome_at_2d(dxf, dzf, world_seed); // r611
+                        block_id = pick_subsurface_block_gpu(h, t, sbiome); // r611
                     } else {
                         // Deep stone — try ore.
                         // Match CPU: only place ores below baseline sea level.
