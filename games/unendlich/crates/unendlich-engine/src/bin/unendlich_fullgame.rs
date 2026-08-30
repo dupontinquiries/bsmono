@@ -2912,9 +2912,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // inert state, so single-player is unaffected if binding can't happen.
     let lan_mp_enabled = std::env::var("UNENDLICH_LAN_MP").map(|v| v != "0").unwrap_or(true);
     let lan_beacon: Option<unendlich_engine::sim::lan_discovery::LanBeacon> = if lan_mp_enabled {
-        match unendlich_engine::sim::lan_discovery::LanBeacon::bind() {
-            Ok(b) => {
-                log::info!("[lan-mp] discovery beacon bound (UNENDLICH_LAN_MP=1)");
+        match unendlich_engine::sim::lan_discovery::LanBeacon::bind_or_muted() {
+            Ok((b, muted)) => {
+                if muted {
+                    // r602: the gossip port is taken (second instance on this
+                    // machine) — beacon is on an ephemeral port: adverts SEND
+                    // but the host list stays empty here. Direct-connect
+                    // (UNENDLICH_LAN_HOST) and the whole session socket still
+                    // run — they were wrongly dead in this case before.
+                    log::warn!("[lan-mp] gossip port taken — discovery muted (direct-connect still works)");
+                } else {
+                    log::info!("[lan-mp] discovery beacon bound (UNENDLICH_LAN_MP=1)");
+                }
                 Some(b)
             }
             Err(e) => {
@@ -3030,6 +3039,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // in the host's evening rather than a fresh dawn.
     let mut lan_join_syncs: Vec<(std::net::SocketAddrV4, unendlich_engine::sim::net::join_sync::SyncPlan)> = Vec::new();
     let mut lan_adopt_time_ms: Option<u64> = None;
+    // r602: the (name, seed) we already joined — duplicate Accepts for it
+    // are no-ops instead of world relaunches.
+    let mut lan_joined_world: Option<(String, u64)> = None;
+    // r602: join-sync records that arrived while the joined world was still
+    // LOADING (the host paces batches right after Accept; the rebuild is a
+    // blocking, seconds-long call under software Vulkan) — applying them to
+    // the pre-launch chunk manager would let the rebuild erase them. Drained
+    // right after the launch handler, alongside clock adoption.
+    let mut lan_joinsync_backlog: Vec<unendlich_engine::sim::net::join_sync::ChunkEditRecord> = Vec::new();
+    let mut lan_joinsync_retry_ms: u64 = 0;
     let lan_local_ip: Option<[u8; 4]> = if lan_beacon.is_some() {
         let ip = unendlich_engine::sim::lan_discovery::local_lan_ipv4();
         match ip {
@@ -14358,6 +14377,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         "[lan-mp] adopted host world clock: {:.0}s into the day cycle",
                         sky_state.time_seconds
                     );
+                }
+                // r602: drain join-sync records that arrived during the load —
+                // NOW they land in the world they were meant for.
+                if !lan_joinsync_backlog.is_empty() {
+                    let records = std::mem::take(&mut lan_joinsync_backlog);
+                    let (n, rest) = chunk_manager.apply_edit_records(&records);
+                    log::info!(
+                        "[lan-mp] join-sync applied {n} backlogged edit(s) post-load ({} awaiting chunk load)",
+                        rest.len()
+                    );
+                    lan_joinsync_backlog = rest;
                 }                    renderer.ui_pointer_active = false;
                     window.set_cursor_mode(CursorMode::Disabled);
                     log::info!("fullgame: launch {plan:?} — entering game");
@@ -14486,6 +14516,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                             }
                                         }
                                         Some(LanJoin::Accept { world_name, world_seed, entity_id, world_time_ms }) => {
+                                            // r602 (found by the two-process soak): Accepts can
+                                            // arrive REPEATEDLY — the direct-connect loop retries
+                                            // every 2 s until lan_peer_addr is set, and it was
+                                            // never set on this path, so every duplicate Accept
+                                            // RELAUNCHED the world (~every 6 s). Both halves
+                                            // fixed here: adopt the sender as our upstream so the
+                                            // retry loop stops, and treat a duplicate Accept for
+                                            // the world we already joined as a no-op.
+                                            if let Some(a) = src4 {
+                                                lan_peer_addr = Some(a);
+                                            }
+                                            let dup = lan_joined_world
+                                                .as_ref()
+                                                .is_some_and(|(n, s)| *n == world_name && *s == world_seed);
+                                            if dup {
+                                                // keep the freshest id/clock, but do NOT reload
+                                                if let Some(eid) = entity_id {
+                                                    lan_my_eid = eid;
+                                                }
+                                            } else {
                                             // Adopt the host-assigned id (fixes the both-bound-
                                             // 9878 collision). An old host sends none → keep the
                                             // legacy port-derived id.
@@ -14498,10 +14548,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                             log::info!(
                                                 "[lan-mp] accepted by host: joining world '{world_name}' seed {world_seed} as entity {lan_my_eid}"
                                             );
+                                            lan_joined_world = Some((world_name.clone(), world_seed));
                                             // Adopt the host's seed and load via the existing
                                             // synthetic-StartLocal launch path (rebuild_for_seed →
                                             // MainMenu→Loading→InGame). Same seed ⇒ same terrain.
                                             fg_pending_load = Some((world_name, world_seed, false));
+                                            }
                                         }
                                         Some(LanJoin::Deny { reason }) => {
                                             log::info!("[lan-mp] join denied: {reason}");
@@ -14617,9 +14669,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         if src4.is_some() && src4 == lan_peer_addr {
                                             if let Some(raw) = unendlich_engine::sim::net::packet_compress::unpack(payload, 256 * 1024) {
                                                 if let Some(records) = unendlich_engine::sim::net::join_sync::decode_records(&raw) {
-                                                    let n = chunk_manager.apply_edit_records(&records);
-                                                    if n > 0 {
-                                                        log::info!("[lan-mp] join-sync applied {n} edit(s) from host");
+                                                    // r602: while the joined world is still loading,
+                                                    // BACKLOG — applying now would target the
+                                                    // pre-launch manager and the rebuild erases it.
+                                                    if fg_pending_load.is_some()
+                                                        || fg_app.state() != unendlich_engine::sim::game_flow::AppState::InGame
+                                                    {
+                                                        lan_joinsync_backlog.extend(records);
+                                                    } else {
+                                                        let (n, rest) = chunk_manager.apply_edit_records(&records);
+                                                        if n > 0 {
+                                                            log::info!("[lan-mp] join-sync applied {n} edit(s) from host");
+                                                        }
+                                                        // chunks still streaming — retry as they land
+                                                        lan_joinsync_backlog.extend(rest);
                                                     }
                                                 }
                                             }
@@ -14661,6 +14724,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // Drain join-sync catch-up plans, a few batches per frame per
                     // joiner. A peer that vanished mid-sync gets dropped with its
                     // table entry (send_to just fails silently either way).
+                    // r602: re-drain OUR backlog as chunks stream in (joiner
+                    // side; applied records fall out, the rest wait).
+                    if !lan_joinsync_backlog.is_empty()
+                        && now_ms.saturating_sub(lan_joinsync_retry_ms) >= 2000
+                    {
+                        lan_joinsync_retry_ms = now_ms;
+                        let records = std::mem::take(&mut lan_joinsync_backlog);
+                        let (n, rest) = chunk_manager.apply_edit_records(&records);
+                        if n > 0 {
+                            log::info!(
+                                "[lan-mp] join-sync applied {n} edit(s) as chunks loaded ({} still waiting)",
+                                rest.len()
+                            );
+                        }
+                        lan_joinsync_backlog = rest;
+                    }
                     lan_join_syncs.retain_mut(|(addr, plan)| {
                         for batch in plan.drain_frame() {
                             let mut dg = vec![CH_JOINSYNC];

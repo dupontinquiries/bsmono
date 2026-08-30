@@ -46,6 +46,25 @@ impl LanBeacon {
         Ok(LanBeacon { sock })
     }
 
+    /// r602: bind on an EPHEMERAL port when the gossip port is taken — a
+    /// second instance on the same machine (the two-process test, or a
+    /// player and a dedicated server side by side). Sending beacons still
+    /// works (multicast tx needs no fixed port); RECEIVING adverts won't
+    /// (wrong port), so the host list stays empty — which direct-connect
+    /// (UNENDLICH_LAN_HOST) doesn't need. Returns (beacon, muted).
+    pub fn bind_or_muted() -> std::io::Result<(LanBeacon, bool)> {
+        match Self::bind() {
+            Ok(b) => Ok((b, false)),
+            Err(_) => {
+                let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+                let _ = sock.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED);
+                let _ = sock.set_multicast_loop_v4(true);
+                sock.set_nonblocking(true)?;
+                Ok((LanBeacon { sock }, true))
+            }
+        }
+    }
+
     /// Multicast one JOIN beacon for `advert`. Cheap; call on a timer (~1/sec)
     /// while hosting.
     pub fn announce(&self, advert: &WorldAdvert) -> std::io::Result<()> {

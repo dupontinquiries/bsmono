@@ -585,16 +585,22 @@ impl ChunkManager {
     }
 
     /// Joiner side of join-sync: overlay received edit records onto the
-    /// regenerated base. Records for chunks not yet loaded flow through the
-    /// normal set_block carry path and apply when the chunk loads. Returns
-    /// how many edits were applied (or carried).
+    /// regenerated base. `set_block` REFUSES writes into chunks that aren't
+    /// resident yet (r602 finding: there is no implicit carry), so this
+    /// returns `(applied, remaining)` — the caller keeps `remaining` and
+    /// re-drains as chunks stream in; records self-clear as the world loads.
     pub fn apply_edit_records(
         &self,
         records: &[crate::sim::net::join_sync::ChunkEditRecord],
-    ) -> usize {
+    ) -> (usize, Vec<crate::sim::net::join_sync::ChunkEditRecord>) {
         let cs = crate::constants::CHUNK_SIZE;
         let mut applied = 0usize;
+        let mut remaining = Vec::new();
         for r in records {
+            if !self.chunks.contains_key(&r.coord) {
+                remaining.push(r.clone());
+                continue;
+            }
             for e in &r.edits {
                 let i = e.index as i32;
                 // Inverse of Chunk::block_index: x + z*S + y*S*S.
@@ -608,7 +614,7 @@ impl ChunkManager {
                 }
             }
         }
-        applied
+        (applied, remaining)
     }
 
     /// B1 (r102): the current world epoch. Incremented on every world reset
@@ -2667,6 +2673,43 @@ mod tests {
     use crate::world::terrain_generator::TerrainGenerator;
 
     #[test]
+    /// r602: apply_edit_records applies into RESIDENT chunks and returns the
+    /// rest — the joiner's re-drain loop depends on exactly this: records
+    /// wait out chunk streaming instead of being silently dropped (set_block
+    /// refuses non-resident writes), and fall out once their chunk loads.
+    #[test]
+    fn edit_records_wait_for_their_chunk_then_apply() {
+        use crate::sim::net::join_sync::{ChunkEditRecord, StampedEdit};
+        let mgr = make_manager();
+        let here = ChunkCoord::new(0, 0, 0);
+        let far = ChunkCoord::new(9, 0, 0);
+        insert_chunk_at(&mgr, here);
+        let records = vec![
+            ChunkEditRecord {
+                coord: here,
+                edits: vec![StampedEdit { tick: 0, index: crate::world::chunk::Chunk::block_index(3, 4, 5) as u16, block: crate::world::blocks::BlockId::Stone as u8 }],
+            },
+            ChunkEditRecord {
+                coord: far,
+                edits: vec![StampedEdit { tick: 0, index: 0, block: crate::world::blocks::BlockId::Dirt as u8 }],
+            },
+        ];
+        let (applied, rest) = mgr.apply_edit_records(&records);
+        assert_eq!(applied, 1, "resident chunk's edit applies immediately");
+        assert_eq!(rest.len(), 1, "non-resident chunk's record WAITS, not drops");
+        assert_eq!(rest[0].coord, far);
+        assert_eq!(
+            mgr.block_at(3, 4, 5),
+            crate::world::blocks::BlockId::Stone,
+            "the applied edit is really in the world"
+        );
+        // The chunk streams in; the re-drain applies the remainder.
+        insert_chunk_at(&mgr, far);
+        let (applied2, rest2) = mgr.apply_edit_records(&rest);
+        assert_eq!(applied2, 1);
+        assert!(rest2.is_empty(), "backlog self-clears once the chunk is resident");
+    }
+
     /// r599: the virtual counter steps exactly when `due` fires — same
     /// cadence, same phase — so the clone-free path re-meshes on the old
     /// sweep's schedule.

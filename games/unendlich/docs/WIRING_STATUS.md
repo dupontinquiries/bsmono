@@ -11972,3 +11972,23 @@ identical; everything else still trips), the upload site uses it, eviction treat
 never churned), and all five traps + the drain fingerprint exempt exactly it. PROOF: 90 s moving in-world soak with a
 COMPLETELY CLEAN log — exit 0, zero panics, zero watchdog lines. The armed traps stay in-tree for real NaN classes.
 Elimination work retained: roamer sanity sweep, player-pose watchdog, set_block wild-write refusal — all real nets.
+
+## r602 — THE TWO-MACHINE JOIN, RUN IN-SANDBOX: three live bugs fixed, the full chain verified
+Two fullgame processes (host: UNENDLICH_AUTOPLAY create+host; joiner: UNENDLICH_LAN_HOST=127.0.0.1:9878 direct-connect)
+under xvfb+lavapipe. Six takes, three REAL bugs any hardware pair would have hit:
+1. SESSION SOCKET NESTED IN THE BEACON: a second instance (gossip port taken) had its ENTIRE LAN I/O silently dead —
+   direct-connect never fired. Fix: LanBeacon::bind_or_muted (ephemeral fallback: adverts still SEND, the host list
+   stays empty, direct-connect + session socket live). Log: "gossip port taken — discovery muted".
+2. DUPLICATE ACCEPTS RELAUNCHED THE WORLD (~every 6 s): the direct path never set lan_peer_addr, so the 2 s retry kept
+   re-joining and each Accept re-triggered a full world load. Fix: sender becomes upstream on Accept; a duplicate
+   Accept for the already-joined (name, seed) is a no-op (lan_joined_world).
+3. JOIN-SYNC EDITS SILENTLY DROPPED, twice over: batches arriving during the blocking world load applied to the
+   PRE-LAUNCH chunk manager (rebuild erased them), and set_block REFUSES non-resident chunks (no implicit carry — an
+   assumption in the r-join bundle's comment, now corrected). Fix: a load-spanning backlog drained post-launch, and
+   apply_edit_records returns (applied, remaining) with a 2 s re-drain — records wait out chunk streaming and
+   self-clear (unit-tested: resident applies, non-resident waits, applies after load).
+VERIFIED CHAIN (take 6 logs): direct-connect JOIN → Accept (assigned eid 1<<32) → clock adopted ONCE → world loads →
+join-sync 7 records / 17 batches from the host → joiner applies 758 then 602 edits as chunks stream ("N still
+waiting" shrinking). Zero panics both sides. Residue: records for chunks beyond the joiner's render distance sit in
+the backlog until the player walks there — arguably correct; revisit if backlogs ever grow large (persist-on-carry
+would be the deep fix).
