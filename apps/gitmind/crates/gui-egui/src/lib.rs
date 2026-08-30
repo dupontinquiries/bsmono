@@ -3,6 +3,8 @@
 //! needs no display); the runnable window lives behind the `app` feature (eframe) in `main.rs`.
 pub mod app;
 pub mod remote_browse;
+/// The ssh/cargo adapter that lets a fleet reroll execute.
+pub mod ssh_runner;
 pub mod pages;
 /// The changed-file list's model: porcelain parsing and stage decisions.
 pub mod device_picker;

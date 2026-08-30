@@ -3385,14 +3385,40 @@ So this is not missing capability, it is a missing adapter: one impl of
 a six-method trait over functions that are already used elsewhere in the
 same binary.
 
-- **C12-62a — write the Runner impl.** Not started here because it needs
-  a real device to test against, and `reroll::execute`'s value is
-  entirely in its FAILURE rules (a failed enrolment skips that device's
-  installs; a failed build skips that app on every device sharing the
-  triple; a failed install is confined to one device and one app).
-  Those are the paths worth exercising and the ones a sandbox cannot
-  reach — writing the impl blind would produce a plausible adapter whose
-  error handling has never once run.
+- **C12-62a — WRITTEN: `gui-egui/src/ssh_runner.rs`.** Reversed the
+  earlier decision on the operator's point that an unexercised error
+  path is better written-and-flagged than left undone, since he can test
+  on real hardware and feed back.
+
+  Every method is backed by something cockpit already has and the push
+  page already drives for one device: `trust_host` + `setup_key` for
+  enroll, `flow::deploy_app_remote_logged` for install,
+  `remote_capture` for rename and refresh, the roster for `triple_of`.
+
+  THE COMPROMISE, stated because it changes behaviour: `build` does not
+  build. `flow::deploy_app_remote_logged` builds AND installs in one
+  call — it needs the binary's path to scp it and then runs
+  `push_install_script` to place it and write the `.desktop` entry, and
+  splitting that pair would reimplement a contract documented in
+  `installer`. So `build` logs "deferred to install" and returns Ok.
+
+  The visible consequence: a compile error surfaces against the INSTALL
+  step. `reroll::execute`'s rules say a failed build should skip that app
+  on every device sharing the triple, and through this runner it will
+  not — the failure is confined to one device instead. That is a real
+  divergence from the documented semantics and is the first thing to
+  check on real hardware.
+
+  Two guards that are worth keeping regardless: `rename` rejects
+  anything but `[A-Za-z0-9-]` before it reaches
+  `sudo hostnamectl set-hostname` (an operator-typed field interpolated
+  into a shell command), and an unknown device id is an ERROR rather
+  than a silent skip, since a fleet run that quietly omits a device is
+  worse than one that stops and names it.
+
+  NOT COMPILED, NOT RUN against a device. The happy path is a thin
+  wrapper over exercised functions; the error paths have never
+  executed.
 
 ## 64. Voice interjections reach the panel's interrupt budget
 
