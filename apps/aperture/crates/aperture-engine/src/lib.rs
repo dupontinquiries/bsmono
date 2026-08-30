@@ -472,6 +472,35 @@ pub mod daemon {
         }
     }
 
+    /// Decode an HTTP/1.1 chunked body.
+    ///
+    /// Mirrors `gpu_gemm::netserve::chunked::decode`, and is duplicated
+    /// on purpose: the default build of this crate does not depend on
+    /// gpu-gemm at all (that is the whole point of the `gpu` feature), so
+    /// linking the daemon crate to parse eight lines of framing would
+    /// drag a GPU engine into an editor that only wanted to talk to a
+    /// socket. The two are pinned equal by a test.
+    ///
+    /// `None` on a malformed length or a truncated chunk — a connection
+    /// cut mid-reply is an error, not a short answer.
+    pub fn decode_chunked(body: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut rest = body;
+        loop {
+            let (len_s, tail) = rest.split_once("\r\n")?;
+            let len_s = len_s.split(';').next()?.trim(); // chunk extensions
+            let n = usize::from_str_radix(len_s, 16).ok()?;
+            if n == 0 {
+                return Some(out);
+            }
+            if tail.len() < n {
+                return None;
+            }
+            out.push_str(&tail[..n]);
+            rest = tail.get(n + 2..)?;
+        }
+    }
+
     /// A [`Backend`] that asks a daemon holding the weights.
     ///
     /// Speaks the SAME request shape as `logscope-serve`'s HTTP endpoint
@@ -525,7 +554,33 @@ pub mod daemon {
             let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
             let status = head.lines().next().unwrap_or("");
             if status.contains(" 200") {
-                Ok(body.to_string())
+                // CHUNKED OR NOT. The daemon grew a streaming endpoint
+                // that answers with `Transfer-Encoding: chunked`, and
+                // this client only ever read whole bodies — so turning
+                // streaming on server-side would have delivered hex
+                // length prefixes INSIDE the completion text. Not a
+                // crash: a completion containing "1a" and stray CRLFs,
+                // which is the kind of corruption that gets blamed on
+                // the model.
+                //
+                // Decided by the header rather than by sniffing the
+                // body, because a completion can legitimately begin with
+                // a hex-looking line.
+                if head
+                    .lines()
+                    .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:")
+                        && l.to_ascii_lowercase().contains("chunked"))
+                {
+                    decode_chunked(body).ok_or_else(|| {
+                        // A truncated chunked body must not read as a
+                        // short answer: the daemon died mid-generation
+                        // and a half-completion accepted as whole is
+                        // worse than a visible error.
+                        "daemon closed the connection mid-reply".to_string()
+                    })
+                } else {
+                    Ok(body.to_string())
+                }
             } else {
                 // Carry the daemon's own first line rather than a generic
                 // failure: it is the only place that knows whether the
@@ -633,6 +688,93 @@ mod tests {
         // connect, and a key here would be ceremony with a storage
         // problem attached.
         assert!(!req.contains("Authorization"), "{req}");
+    }
+
+    /// A fake daemon that answers with chunked transfer, like the
+    /// streaming endpoint does.
+    fn chunked_daemon(pieces: &'static [&'static str]) -> std::path::PathBuf {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!(
+            "ap-chunk-{}-{:?}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let mut body = String::new();
+                for p in pieces {
+                    body.push_str(&format!("{:x}\r\n{p}\r\n", p.len()));
+                }
+                body.push_str("0\r\n\r\n");
+                let _ = s.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                     Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{body}"
+                ).as_bytes());
+            }
+        });
+        path
+    }
+
+    #[test]
+    fn a_chunked_reply_arrives_as_text_not_as_framing() {
+        // THE BREAK THIS PREVENTS: the daemon grew a streaming endpoint
+        // and this client only read whole bodies, so turning streaming on
+        // would have delivered hex length prefixes inside the completion.
+        // Not a crash — a completion containing "b" and stray CRLFs,
+        // which gets blamed on the model.
+        let path = chunked_daemon(&["let x", " = 1", ";"]);
+        let b = daemon::DaemonBackend::new(&path);
+        let out = b.generate("fn f() {", 32).expect("generated");
+        assert_eq!(out, "let x = 1;", "framing leaked into the text: {out:?}");
+    }
+
+    /// The duplicated decoder must match the server's, or the two halves
+    /// disagree about what a reply says.
+    ///
+    /// Only runs with the `gpu` feature, since that is the only build
+    /// that links the daemon crate — which is the point of the
+    /// duplication: an editor that only wants to talk to a socket should
+    /// not drag in a GPU engine to parse eight lines of framing.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_two_chunked_decoders_agree() {
+        let cases = [
+            "5\r\nhello\r\n0\r\n\r\n",
+            "2;x=1\r\nhi\r\n0\r\n\r\n",
+            "0\r\n\r\n",
+            "5\r\nab\r\n",          // truncated
+            "zz\r\nhi\r\n0\r\n\r\n", // bad length
+            "",
+        ];
+        for c in cases {
+            assert_eq!(
+                daemon::decode_chunked(c),
+                gpu_kernels::netserve::chunked::decode(c),
+                "decoders disagree on {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_chunked_reply_is_an_error_not_a_short_answer() {
+        // A daemon killed mid-generation must not look like it finished.
+        // `decode_chunked` returns None and the caller must surface that.
+        assert_eq!(daemon::decode_chunked("5\r\nab\r\n"), None, "truncated read as success");
+        assert_eq!(daemon::decode_chunked("zz\r\nhi\r\n0\r\n\r\n"), None, "bad length");
+        // And a well-formed one still works, including chunk extensions.
+        assert_eq!(daemon::decode_chunked("2;x=1\r\nhi\r\n0\r\n\r\n").as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn a_plain_reply_still_works_unchanged() {
+        // The non-streaming endpoint is still what `serve_unix` uses, so
+        // the Content-Length path must not regress.
+        let (path, _rx) = fake_daemon("plain body", "200 OK");
+        let b = daemon::DaemonBackend::new(&path);
+        assert_eq!(b.generate("x", 8).expect("generated"), "plain body");
     }
 
     #[test]
