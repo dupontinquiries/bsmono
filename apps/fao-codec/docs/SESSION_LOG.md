@@ -2450,3 +2450,69 @@ needed types directly from `phase_correlation` rather than the old
 `use crate::v7_perception_codec::*;` wildcard.
 
 Ready for library + migration testing next session.
+
+## v11 plate codec — measuring the web thesis in 2D (2026-08-30)
+
+Test material: Lone Ranger bloopers 45s (1920x800 active, film grain,
+~19 shots) + SMITE esports broadcast 17s (1920x1080@60, no grain, big
+static HUD). 48-frame GOPs, scored with ffmpeg psnr/ssim against
+lossless y4m, identical scoring for SVT-AV1 preset 6 baselines.
+
+### Fixed first: residual DC-prediction was silently broken both ways
+
+`residual::tests::small_constant_offset` (mean err 9.375 on a +10
+offset = exactly 15/16 blocks losing the offset) root-caused to TWO
+masking bugs: decoder re-quantized the propagated true DC through each
+block's OWN scale — skip blocks carry scale_byte 0 whose 127 steps max
+out at ~0.008, so propagated DC clamped to nothing while the prediction
+chain tracked it as delivered; and the encoder wrote DC deltas into
+scales chosen from pre-prediction coefficients, so a flat block after a
+high-DC neighbor saturated q0 at ±127 of a microscopic step. Decoder now
+carries true DC as f32 into reconstruction (never re-quantized); encoder
+widens scale_byte until the delta fits, re-quantizing AC under the new
+scale. All 4 residual tests green. Every dc_prediction residual v8.1+
+ever produced was degraded by this.
+
+Added `ResidualOpts::dead_zone` — the rate knob the coder lacked
+(per-block maxabs scaling otherwise preserves grain near-losslessly).
+
+### v11 ladder on the static-camera store shot (shotB), marginal B/frame
+
+  v11.1 plate+residual only          ~88 KB @ 38.1 dB
+  v11.2 + zero-motion prev mode      ~47 KB @ 38.1 dB
+  v11.3 + MC (16x16, ±12 diamond,
+          MV rate bias, pred deltas)  9.2 KB @ 37.1 dB / 0.956
+  SVT-AV1 preset6 crf54 (same GOP)    1.27 KB @ 37.6 dB / 0.975
+
+Each structural addition bought 2–5x. Remaining ~7x on this shot;
+9–12x on SMITE GOPs (rotating 3D camera defeats translation-only MC;
+deadzone punishes HUD text); shotA handheld: plate useless (prev share
+0.89), degenerates to pure inter.
+
+### What the residue is (measured, not guessed)
+
+1. Film grain dominates residual on film content at matched-AV1 quality:
+   temporally white, unpredictable by ANY world model. v11.4 implements
+   the denoise+synthesize split (deterministic xorshift grain, σ byte per
+   frame); at dz≥32 the deadzone already discards grain so bytes barely
+   move, and white triangular synth grain HURTS psnr/ssim (real scan
+   grain is spatially correlated — needs AR filtering à la AV1 FGS).
+   Mechanism kept, off by default, honest verdict recorded.
+2. Entropy coding: zstd over quantized coefficient bytes vs adaptive
+   arithmetic coding — worth ~2–3x.
+3. Sub-pixel MC, variable block sizes, real intra prediction, RD-driven
+   mode decisions — the rest of the gap. This is codec engineering, not
+   thesis failure; but it is exactly what "near AV1" costs.
+
+The defensible thesis claim is ASYMPTOTIC marginal cost on web-covered
+content: the plate (348 KB zstd'd for shotB) amortizes across GOPs today
+and across a library tomorrow, and the v1→v3 ladder shows marginal cost
+falling 10x while quality holds. The indefensible claim is 10x under AV1
+at matched PSNR on a 45s grainy clip — the grain alone forbids it.
+
+Files: fao_codec_lib/src/v11_plate.rs (5 unit tests), src/bin/plate_lab.rs
+(y4m in → accounting + recon y4m out; --static --v1 --v2 --dz --band
+--skip-thr --boost). Known limits: translation-only motion model; plate
+median is O(frames) per pixel; chroma coded at full res through the
+3-channel interleave (2x chroma waste); mode decision uses raw SAD which
+is a weak proxy at high deadzone.

@@ -85,6 +85,17 @@ pub struct ResidualOpts {
     /// coefficient is below this become skip blocks. Tuned for the 
     /// quant matrix in transform::QUANT_MATRIX_4X4.
     pub skip_threshold: i8,
+    /// Dead-zone floor — the rate-control knob this coder was missing.
+    /// Any DCT coefficient with |c| < dead_zone * matrix[i] is zeroed
+    /// BEFORE quantization. 0.0 = off (legacy near-lossless behavior).
+    /// Because quantize_4x4 derives its scale from each block's own
+    /// maxabs, small residuals (film grain!) otherwise get arbitrarily
+    /// FINE steps and are preserved almost losslessly — the coder had
+    /// fidelity but no way to spend fewer bits. The matrix weighting
+    /// makes the zone frequency-shaped like a real codec's QP: high
+    /// frequencies (where grain lives) are culled hardest. Encoder-only;
+    /// no wire or decoder change.
+    pub dead_zone: f32,
 }
 
 impl Default for ResidualOpts {
@@ -95,6 +106,7 @@ impl Default for ResidualOpts {
             channel_deinterleave: true,
             saliency_boost: 0,
             skip_threshold: 1,
+            dead_zone: 0.0,
         }
     }
 }
@@ -191,6 +203,18 @@ pub fn encode(
                 }
                 // DCT.
                 dct2d_4x4(&mut buf);
+                // Dead zone (rate control): cull coefficients below the
+                // frequency-shaped floor so the per-block scale is chosen
+                // from surviving signal, not from grain.
+                if opts.dead_zone > 0.0 {
+                    for (k, c) in buf.iter_mut().enumerate() {
+                        let zone = opts.dead_zone
+                            * crate::transform::QUANT_MATRIX_4X4[k] as f32;
+                        if c.abs() < zone {
+                            *c = 0.0;
+                        }
+                    }
+                }
                 // Quantize.
                 let (q, p) = quantize_4x4(&buf, opts.saliency_boost);
                 q_per_channel[c] = q;
@@ -226,13 +250,45 @@ pub fn encode(
                     // Write the residual DC back. The decoder will add 
                     // its own predicted DC to recover.
                     let delta = cur_dc - pred;
-                    // Re-quantize delta into the [0] coefficient using 
-                    // the same scale.
+                    // The block's scale was chosen from its own (pre-
+                    // prediction) coefficients. A flat block sitting next
+                    // to a high-DC neighbor needs to carry a LARGE delta
+                    // inside a scale sized for zeros — q0 saturates at
+                    // ±127 of a microscopic step and the delta silently
+                    // never fits (the second half of the bug behind
+                    // small_constant_offset; the decoder's old clamp
+                    // coincidentally hid it). Widen scale_byte until
+                    // 127 steps cover |delta|, re-quantizing the AC
+                    // coefficients under the new scale (slightly coarser
+                    // for these rare boundary blocks; strictly better
+                    // than dropping the DC entirely).
                     let p = blocks[bi].1[c];
-                    let log = p.scale_byte as f32 - 8.0;
-                    let scale = 2.0_f32.powf(log) / 127.0;
+                    let m0 = crate::transform::QUANT_MATRIX_4X4[0] as f32;
                     let boost_div = (1u8 << p.saliency_boost.min(3)) as f32;
-                    let step = crate::transform::QUANT_MATRIX_4X4[0] as f32 * scale / boost_div;
+                    let mut sb = p.scale_byte;
+                    let step_of = |sb: u8| -> f32 {
+                        let log = sb as f32 - 8.0;
+                        m0 * (2.0_f32.powf(log) / 127.0) / boost_div
+                    };
+                    if delta.abs() > 127.0 * step_of(sb) {
+                        let needed = 8.0 + (delta.abs() * boost_div / m0).log2();
+                        let sb_needed = needed.ceil().clamp(0.0, 63.0) as u8;
+                        if sb_needed > sb {
+                            // Re-quantize every coefficient under the wider scale.
+                            let old = dequantize_4x4(&blocks[bi].0[c], p);
+                            let new_p = QuantParams { scale_byte: sb_needed, saliency_boost: p.saliency_boost };
+                            let log = sb_needed as f32 - 8.0;
+                            let scale = 2.0_f32.powf(log) / 127.0;
+                            for k in 0..16 {
+                                let stepk = crate::transform::QUANT_MATRIX_4X4[k] as f32 * scale / boost_div;
+                                blocks[bi].0[c][k] =
+                                    (old[k] / stepk.max(1e-6)).round().clamp(-127.0, 127.0) as i8;
+                            }
+                            blocks[bi].1[c] = new_p;
+                            sb = sb_needed;
+                        }
+                    }
+                    let step = step_of(sb);
                     let new_q0 = (delta / step.max(1e-6)).round().clamp(-127.0, 127.0) as i8;
                     blocks[bi].0[c][0] = new_q0;
                     // Track reconstructed-as-decoder-will-see DC for 
@@ -424,7 +480,16 @@ pub fn apply(predicted: Vec<u8>, residual_bytes: &[u8], w: usize, h: usize) -> V
     };
     if !parse_ok { return predicted; }
     
-    // Inverse DC prediction — reconstruct true DC from delta.
+    // Inverse DC prediction — reconstruct true DC from delta. The true DC
+    // is carried FORWARD AS f32 into the reconstruction loop below, never
+    // re-quantized: a skip block's default params have scale_byte 0 (the
+    // finest scale, max representable DC ≈ 0.008), so converting a
+    // propagated DC of e.g. 40 back into that block's q0 clamps it to
+    // ~nothing — which silently dropped the entire predicted DC for every
+    // skip block while the prediction chain tracked it as delivered
+    // (root cause of residual::tests::small_constant_offset's 15/16-blocks
+    // -lost-the-offset failure).
+    let mut dc_override: Option<Vec<[f32; 3]>> = None;
     if dc_pred {
         let mut recon_dc: Vec<[f32; 3]> = vec![[0.0; 3]; n_blocks];
         for by in 0..rh {
@@ -443,16 +508,11 @@ pub fn apply(predicted: Vec<u8>, residual_bytes: &[u8], w: usize, h: usize) -> V
                     let boost_div = (1u8 << p.saliency_boost.min(3)) as f32;
                     let step = crate::transform::QUANT_MATRIX_4X4[0] as f32 * scale / boost_div;
                     let delta_dc = blocks[bi].0[c][0] as f32 * step;
-                    let true_dc = pred + delta_dc;
-                    recon_dc[bi][c] = true_dc;
-                    // Convert true_dc back to a q0 value that, when 
-                    // dequantized, yields true_dc. The decode loop below 
-                    // assumes q[0] is the absolute DC.
-                    let new_q0 = (true_dc / step.max(1e-6)).round().clamp(-127.0, 127.0) as i8;
-                    blocks[bi].0[c][0] = new_q0;
+                    recon_dc[bi][c] = pred + delta_dc;
                 }
             }
         }
+        dc_override = Some(recon_dc);
     }
     
     // Now per-block: dequantize, inverse-DCT, add to predicted.
@@ -464,6 +524,9 @@ pub fn apply(predicted: Vec<u8>, residual_bytes: &[u8], w: usize, h: usize) -> V
             for c in 0..3 {
                 let dq = dequantize_4x4(&blocks[bi].0[c], blocks[bi].1[c]);
                 buf.copy_from_slice(&dq);
+                if let Some(dcs) = &dc_override {
+                    buf[0] = dcs[bi][c];
+                }
                 idct2d_4x4(&mut buf);
                 // Add the recovered residual to the predicted pixels.
                 for ly in 0..4 {

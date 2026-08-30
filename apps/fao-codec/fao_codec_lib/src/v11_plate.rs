@@ -1,0 +1,1102 @@
+//! # v11 "plate" codec — the web thesis in its strongest 2D form
+//!
+//! Before spending bits on 3D geometry, measure the ceiling of the core
+//! FAO idea in 2D: transmit the world ONCE (a background plate = the
+//! simplest possible "web"), send per-frame camera motion (a translation,
+//! for now), and pay per-frame only for what the plate cannot predict —
+//! moving actors and model error — through the (just-fixed) DCT residual
+//! coder, whose skip-block RLE zeroes the cost of every 4×4 block the
+//! plate already explains.
+//!
+//! Why this module exists when v8 already builds meshes: on a locked-off
+//! or panning shot, a full 3D reconstruction reprojects to exactly what a
+//! 2D plate gives — so every byte v8 spends on depth, features and pose
+//! beyond a 2D translation is pure overhead THERE. v11 is the control
+//! experiment: it measures what "world once + camera + residual" is worth
+//! with zero geometry risk. If v11's marginal per-frame cost cannot beat
+//! AV1's marginal (post-keyframe) cost on plate-friendly shots, no amount
+//! of 3D will save the thesis; if it can, v8's job is to extend the same
+//! ratio to parallax shots that break a 2D plate.
+//!
+//! Accounting contract (what the lab reports):
+//!   * `plate_bytes`  — the web. Amortizes across the GOP today; across
+//!     entire libraries in FAO's cross-video mode (a UUID + alignment).
+//!   * `motion_bytes` — 8 bytes/frame (dx, dy as f32s). The "camera".
+//!   * `residual_bytes[f]` — the honest per-frame marginal cost.
+//!
+//! The plate is a per-pixel TEMPORAL MEDIAN in plate coordinates. The
+//! median does two jobs at once: it rejects moving foreground (an actor
+//! covering a pixel <50% of frames leaves no trace), and it averages away
+//! film grain — the plate is a denoised background by construction. Grain
+//! then lives in the residual (and gets quantized), or can be re-synthesized
+//! at decode; that split is deliberate and is the same trick AV1's
+//! film-grain synthesis plays.
+
+use crate::phase_correlation::PhaseCorrelationPass;
+use crate::residual::{self, ResidualOpts};
+
+/// One 4:2:0 frame, planar.
+#[derive(Clone)]
+pub struct Yuv420 {
+    pub w: usize,
+    pub h: usize,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+impl Yuv420 {
+    pub fn new(w: usize, h: usize) -> Self {
+        Yuv420 { w, h, y: vec![0; w * h], u: vec![0; (w / 2) * (h / 2)], v: vec![0; (w / 2) * (h / 2)] }
+    }
+}
+
+/// Per-frame camera parameters (translation-only, v0).
+#[derive(Clone, Copy, Debug)]
+pub struct PlateMotion {
+    pub dx: f32,
+    pub dy: f32,
+    pub confidence: f32,
+}
+
+/// The web: a background plate the size of the union of all warped frame
+/// footprints (for a static camera, exactly the frame size).
+pub struct Plate {
+    pub w: usize,
+    pub h: usize,
+    /// Plate origin in frame-0 coordinates (negative when later frames
+    /// panned up/left past frame 0's edge).
+    pub ox: f32,
+    pub oy: f32,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+/// Estimate per-frame global translation with cumulative pairwise phase
+/// correlation (pairwise is robust to lighting drift; the cumulative sum
+/// gives each frame's offset in frame-0 coordinates).
+pub fn estimate_motions(frames: &[Yuv420]) -> Vec<PlateMotion> {
+    let mut out = Vec::with_capacity(frames.len());
+    if frames.is_empty() {
+        return out;
+    }
+    let w = frames[0].w;
+    let h = frames[0].h;
+    let pass = PhaseCorrelationPass::new(512.min(w.min(h)));
+    out.push(PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 });
+    let (mut ax, mut ay) = (0.0f32, 0.0f32);
+    for i in 1..frames.len() {
+        let m = pass.estimate(&frames[i].y, &frames[i - 1].y, w, h);
+        // Low confidence (cut, or motion beyond the window) → hold position
+        // rather than inject a garbage jump; the residual absorbs the error
+        // and the caller can see confidence per frame.
+        if m.confidence > 0.15 {
+            ax += m.dx;
+            ay += m.dy;
+        }
+        out.push(PlateMotion { dx: ax, dy: ay, confidence: m.confidence });
+    }
+    out
+}
+
+/// Build the plate: temporal median per plate pixel over every frame that
+/// covers it (nearest-pixel placement; sub-pixel handled at predict time).
+pub fn build_plate(frames: &[Yuv420], motions: &[PlateMotion]) -> Plate {
+    assert_eq!(frames.len(), motions.len());
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+    // Plate bounds in frame-0 coords: frame f occupies [-dx, -dx+fw) —
+    // a camera pan of +dx moves CONTENT by -dx in frame-0 space.
+    let (mut minx, mut miny, mut maxx, mut maxy) = (0.0f32, 0.0f32, fw as f32, fh as f32);
+    for m in motions {
+        minx = minx.min(-m.dx);
+        miny = miny.min(-m.dy);
+        maxx = maxx.max(-m.dx + fw as f32);
+        maxy = maxy.max(-m.dy + fh as f32);
+    }
+    let pw = (maxx - minx).ceil() as usize;
+    let ph = (maxy - miny).ceil() as usize;
+    let pw = pw + (pw & 1); // keep even for the half-res chroma plate
+    let ph = ph + (ph & 1);
+
+    let median_plane = |get: &dyn Fn(&Yuv420) -> &Vec<u8>,
+                        pw: usize,
+                        ph: usize,
+                        fw: usize,
+                        fh: usize,
+                        sub: usize|
+     -> Vec<u8> {
+        let mut plane = vec![0u8; pw * ph];
+        let mut samples: Vec<u8> = Vec::with_capacity(frames.len());
+        for py in 0..ph {
+            for px in 0..pw {
+                samples.clear();
+                for (f, m) in frames.iter().zip(motions) {
+                    // plate pixel (px,py) in frame f's coords:
+                    let fx = px as f32 + minx / sub as f32 + m.dx / sub as f32;
+                    let fy = py as f32 + miny / sub as f32 + m.dy / sub as f32;
+                    let (fx, fy) = (fx.round() as isize, fy.round() as isize);
+                    if fx >= 0 && fy >= 0 && (fx as usize) < fw && (fy as usize) < fh {
+                        samples.push(get(f)[fy as usize * fw + fx as usize]);
+                    }
+                }
+                if !samples.is_empty() {
+                    samples.sort_unstable();
+                    plane[py * pw + px] = samples[samples.len() / 2];
+                }
+            }
+        }
+        plane
+    };
+
+    let y = median_plane(&|f| &f.y, pw, ph, fw, fh, 1);
+    let u = median_plane(&|f| &f.u, pw / 2, ph / 2, fw / 2, fh / 2, 2);
+    let v = median_plane(&|f| &f.v, pw / 2, ph / 2, fw / 2, fh / 2, 2);
+    Plate { w: pw, h: ph, ox: minx, oy: miny, y, u, v }
+}
+
+fn bilinear(plane: &[u8], pw: usize, ph: usize, x: f32, y: f32) -> u8 {
+    let x = x.clamp(0.0, (pw - 1) as f32);
+    let y = y.clamp(0.0, (ph - 1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(pw - 1);
+    let y1 = (y0 + 1).min(ph - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let p00 = plane[y0 * pw + x0] as f32;
+    let p10 = plane[y0 * pw + x1] as f32;
+    let p01 = plane[y1 * pw + x0] as f32;
+    let p11 = plane[y1 * pw + x1] as f32;
+    let top = p00 + (p10 - p00) * tx;
+    let bot = p01 + (p11 - p01) * tx;
+    (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8
+}
+
+/// Render the plate through a frame's camera (bilinear, sub-pixel).
+pub fn predict_frame(plate: &Plate, m: &PlateMotion, fw: usize, fh: usize) -> Yuv420 {
+    let mut out = Yuv420::new(fw, fh);
+    // Signs, written out once so nobody re-derives them wrong:
+    // frame pixel (fx,fy) shows content at frame-0 coordinate
+    // (fx - m.dx, fy - m.dy); that content lives at plate coordinate
+    // (fx - m.dx - ox, fy - m.dy - oy).
+    for fy in 0..fh {
+        for fx in 0..fw {
+            let px = fx as f32 - m.dx - plate.ox;
+            let py = fy as f32 - m.dy - plate.oy;
+            out.y[fy * fw + fx] = bilinear(&plate.y, plate.w, plate.h, px, py);
+        }
+    }
+    let (cw, ch) = (fw / 2, fh / 2);
+    for fy in 0..ch {
+        for fx in 0..cw {
+            let px = fx as f32 - m.dx / 2.0 - plate.ox / 2.0;
+            let py = fy as f32 - m.dy / 2.0 - plate.oy / 2.0;
+            out.u[fy * cw + fx] = bilinear(&plate.u, plate.w / 2, plate.h / 2, px, py);
+            out.v[fy * cw + fx] = bilinear(&plate.v, plate.w / 2, plate.h / 2, px, py);
+        }
+    }
+    out
+}
+
+/// Interleave a 4:2:0 frame into the residual coder's 3-channel layout
+/// (chroma bilinear-upsampled to full res). Channel 0=Y, 1=U, 2=V.
+pub fn interleave_444(f: &Yuv420) -> Vec<u8> {
+    let (w, h) = (f.w, f.h);
+    let (cw, ch) = (w / 2, h / 2);
+    let mut out = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            out[i] = f.y[y * w + x];
+            let ux = (x as f32 - 0.5) / 2.0;
+            let uy = (y as f32 - 0.5) / 2.0;
+            out[i + 1] = bilinear(&f.u, cw, ch, ux, uy);
+            out[i + 2] = bilinear(&f.v, cw, ch, ux, uy);
+        }
+    }
+    out
+}
+
+/// Inverse of `interleave_444` (2×2 box down for chroma).
+pub fn deinterleave_420(buf: &[u8], w: usize, h: usize) -> Yuv420 {
+    let mut f = Yuv420::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            f.y[y * w + x] = buf[(y * w + x) * 3];
+        }
+    }
+    let (cw, ch) = (w / 2, h / 2);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let mut su = 0u32;
+            let mut sv = 0u32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = ((cy * 2 + dy) * w + cx * 2 + dx) * 3;
+                    su += buf[i + 1] as u32;
+                    sv += buf[i + 2] as u32;
+                }
+            }
+            f.u[cy * cw + cx] = (su / 4) as u8;
+            f.v[cy * cw + cx] = (sv / 4) as u8;
+        }
+    }
+    f
+}
+
+/// Everything the lab needs to report for one encoded GOP.
+pub struct PlateEncodeReport {
+    pub plate_bytes: usize,
+    pub motion_bytes: usize,
+    pub residual_bytes: Vec<usize>,
+    pub recon: Vec<Yuv420>,
+}
+
+/// Encode a GOP against a prebuilt plate; returns byte accounting plus the
+/// decoder-side reconstruction (computed through the same residual::apply
+/// path a real decoder would run — no encoder-only shortcuts).
+pub fn encode_gop(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+) -> PlateEncodeReport {
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+    let mut plate_raw = Vec::with_capacity(plate.y.len() + plate.u.len() + plate.v.len());
+    plate_raw.extend_from_slice(&plate.y);
+    plate_raw.extend_from_slice(&plate.u);
+    plate_raw.extend_from_slice(&plate.v);
+    let plate_bytes = zstd::encode_all(plate_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(plate_raw.len());
+
+    let mut residual_bytes = Vec::with_capacity(frames.len());
+    let mut recon = Vec::with_capacity(frames.len());
+    for (f, m) in frames.iter().zip(motions) {
+        let predicted = predict_frame(plate, m, fw, fh);
+        let p444 = interleave_444(&predicted);
+        let t444 = interleave_444(f);
+        match residual::encode(&p444, &t444, fw, fh, opts) {
+            Some(trailer) => {
+                residual_bytes.push(trailer.len());
+                let r = residual::apply(p444, &trailer, fw, fh);
+                recon.push(deinterleave_420(&r, fw, fh));
+            }
+            None => {
+                residual_bytes.push(0);
+                recon.push(predicted);
+            }
+        }
+    }
+    PlateEncodeReport { plate_bytes, motion_bytes: frames.len() * 8, residual_bytes, recon }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Static background with a moving square: the median plate must
+    /// recover the CLEAN background (actor rejected), and marginal
+    /// per-frame cost must collapse to skip-RLE noise outside the square.
+    #[test]
+    fn plate_rejects_mover_and_marginal_cost_is_local() {
+        let (w, h) = (64, 64);
+        let mut frames = Vec::new();
+        for t in 0..9 {
+            let mut f = Yuv420::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    f.y[y * w + x] = (((x / 8) + (y / 8)) % 2 * 120 + 60) as u8;
+                }
+            }
+            for p in f.u.iter_mut() {
+                *p = 128;
+            }
+            for p in f.v.iter_mut() {
+                *p = 128;
+            }
+            // 12×12 mover sweeping across; covers any pixel < 50% of frames.
+            let sx = 4 + t * 5;
+            for y in 20..32 {
+                for x in sx..(sx + 12).min(w) {
+                    f.y[y * w + x] = 250;
+                }
+            }
+            frames.push(f);
+        }
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let plate = build_plate(&frames, &motions);
+        // Plate background is the checkerboard, mover fully rejected.
+        for y in 20..32 {
+            for x in 10..50 {
+                let bg = (((x / 8) + (y / 8)) % 2 * 120 + 60) as u8;
+                assert_eq!(plate.y[y * plate.w + x], bg, "mover leaked into plate at {x},{y}");
+            }
+        }
+        let opts = ResidualOpts::default();
+        let rep = encode_gop(&frames, &motions, &plate, &opts);
+        // Reconstruction must contain the mover (residual carries it).
+        let f4 = &rep.recon[4];
+        let mover_x = 4 + 4 * 5 + 6;
+        let got = f4.y[25 * w + mover_x] as i32;
+        assert!((got - 250).abs() <= 12, "mover not reconstructed: {got}");
+        // And the background must match the source closely.
+        let src = &frames[4];
+        let mut err = 0.0f64;
+        for i in 0..w * h {
+            err += (src.y[i] as f64 - f4.y[i] as f64).abs();
+        }
+        assert!(err / (w * h) as f64 <= 2.0, "background error too high: {}", err / (w * h) as f64);
+    }
+
+    #[test]
+    fn panning_plate_is_wider_than_a_frame_and_predicts_back() {
+        let (w, h) = (64, 48);
+        // A wide "world" the camera pans across.
+        let world_w = 128;
+        let world: Vec<u8> = (0..world_w * h).map(|i| ((i * 7) % 251) as u8).collect();
+        let mut frames = Vec::new();
+        let mut motions = Vec::new();
+        for t in 0..8 {
+            let mut f = Yuv420::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    f.y[y * w + x] = world[y * world_w + (x + t * 6)];
+                }
+            }
+            for p in f.u.iter_mut() {
+                *p = 128;
+            }
+            for p in f.v.iter_mut() {
+                *p = 128;
+            }
+            frames.push(f);
+            // Frame t shows world x ∈ [6t, 6t+w); frame 0 IS world coords,
+            // so frame t's pixel fx shows frame-0 coordinate fx + 6t. The
+            // predict convention is "fx shows frame-0 coord fx - m.dx",
+            // hence m.dx = -6t. (Content moving left in the viewport =
+            // negative dx; the camera's own rightward pan is the negation.)
+            motions.push(PlateMotion { dx: -((t * 6) as f32), dy: 0.0, confidence: 1.0 });
+        }
+        let plate = build_plate(&frames, &motions);
+        assert!(plate.w >= w + 7 * 6, "plate too narrow: {}", plate.w);
+        // Every frame must be predictable from the plate almost exactly.
+        for (f, m) in frames.iter().zip(&motions) {
+            let p = predict_frame(&plate, m, w, h);
+            let mut err = 0.0f64;
+            for i in 0..w * h {
+                err += (p.y[i] as f64 - f.y[i] as f64).abs();
+            }
+            assert!(err / (w * h) as f64 <= 1.5, "pan predict err {}", err / (w * h) as f64);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v11.2 — per-block predictor selection: plate OR previous recon.
+//
+// The v1 accounting exposed the structural cost: the plate predicts the
+// BACKGROUND, so every foreground (actor) pixel was residual-coded from
+// scratch in every frame — exactly the work AV1 avoids with motion-
+// compensated inter prediction. v11.2 gives each 4×4 block a choice of
+// predictor: the warped plate, or the co-located block of the PREVIOUS
+// RECONSTRUCTED frame (closed loop — the decoder has the same frame, so
+// drift cannot accumulate). Slow-moving/paused actors collapse to
+// near-zero residual; the mode map costs 1 bit per block, zstd'd.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Per-frame payload accounting for v2.
+pub struct FrameCost {
+    pub mode_bytes: usize,
+    pub residual_bytes: usize,
+}
+
+pub struct PlateEncodeReportV2 {
+    pub plate_bytes: usize,
+    pub motion_bytes: usize,
+    pub frames: Vec<FrameCost>,
+    pub recon: Vec<Yuv420>,
+    /// Fraction of blocks that chose the previous-frame predictor,
+    /// averaged over frames after the first — the "how much did temporal
+    /// prediction matter" dial.
+    pub prev_mode_share: f32,
+}
+
+/// Sum of absolute differences over one 4×4 luma block.
+fn sad4(a: &[u8], b: &[u8], w: usize, bx: usize, by: usize) -> u32 {
+    let mut s = 0u32;
+    for ly in 0..4 {
+        let row = (by * 4 + ly) * w + bx * 4;
+        for lx in 0..4 {
+            s += (a[row + lx] as i32 - b[row + lx] as i32).unsigned_abs();
+        }
+    }
+    s
+}
+
+pub fn encode_gop_v2(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+) -> PlateEncodeReportV2 {
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+    let (rw, rh) = (fw / 4, fh / 4);
+    let mut plate_raw = Vec::with_capacity(plate.y.len() + plate.u.len() + plate.v.len());
+    plate_raw.extend_from_slice(&plate.y);
+    plate_raw.extend_from_slice(&plate.u);
+    plate_raw.extend_from_slice(&plate.v);
+    let plate_bytes = zstd::encode_all(plate_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(plate_raw.len());
+
+    let mut out_frames = Vec::with_capacity(frames.len());
+    let mut recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
+    let mut prev_share_acc = 0.0f64;
+
+    for (fi, (f, m)) in frames.iter().zip(motions).enumerate() {
+        let plate_pred = predict_frame(plate, m, fw, fh);
+        // Build the composite prediction + mode map. Frame 0 has no
+        // previous → all-plate (and the map codes to ~nothing).
+        let mut modes = vec![0u8; rw * rh]; // 0 = plate, 1 = prev
+        let composite = if fi == 0 {
+            plate_pred.clone()
+        } else {
+            let prev = &recon[fi - 1];
+            let mut comp = plate_pred.clone();
+            let mut prev_blocks = 0usize;
+            for by in 0..rh {
+                for bx in 0..rw {
+                    let sad_plate = sad4(&f.y, &plate_pred.y, fw, bx, by);
+                    let sad_prev = sad4(&f.y, &prev.y, fw, bx, by);
+                    // Strictly-better wins; ties keep the plate (its mode
+                    // bit RLEs better since background dominates).
+                    if sad_prev < sad_plate {
+                        modes[by * rw + bx] = 1;
+                        prev_blocks += 1;
+                        for ly in 0..4 {
+                            let row = (by * 4 + ly) * fw + bx * 4;
+                            comp.y[row..row + 4].copy_from_slice(&prev.y[row..row + 4]);
+                        }
+                        // Chroma at half res: copy the co-located 2×2.
+                        let (cw, _chh) = (fw / 2, fh / 2);
+                        for ly in 0..2 {
+                            let crow = (by * 2 + ly) * cw + bx * 2;
+                            comp.u[crow..crow + 2].copy_from_slice(&prev.u[crow..crow + 2]);
+                            comp.v[crow..crow + 2].copy_from_slice(&prev.v[crow..crow + 2]);
+                        }
+                    }
+                }
+            }
+            prev_share_acc += prev_blocks as f64 / (rw * rh) as f64;
+            comp
+        };
+
+        // Mode map cost: bit-packed then zstd (the decoder needs it to
+        // rebuild the composite prediction).
+        let mut packed = vec![0u8; (modes.len() + 7) / 8];
+        for (i, &b) in modes.iter().enumerate() {
+            if b == 1 {
+                packed[i / 8] |= 1 << (i % 8);
+            }
+        }
+        let mode_bytes = zstd::encode_all(packed.as_slice(), 19).map(|c| c.len()).unwrap_or(packed.len());
+
+        let p444 = interleave_444(&composite);
+        let t444 = interleave_444(f);
+        let (residual_bytes, rec) = match residual::encode(&p444, &t444, fw, fh, opts) {
+            Some(trailer) => {
+                let r = residual::apply(p444, &trailer, fw, fh);
+                (trailer.len(), deinterleave_420(&r, fw, fh))
+            }
+            None => (0, composite),
+        };
+        out_frames.push(FrameCost { mode_bytes, residual_bytes });
+        recon.push(rec);
+    }
+    let denom = (frames.len().saturating_sub(1)).max(1) as f64;
+    PlateEncodeReportV2 {
+        plate_bytes,
+        motion_bytes: frames.len() * 8,
+        frames: out_frames,
+        recon,
+        prev_mode_share: (prev_share_acc / denom) as f32,
+    }
+}
+
+#[cfg(test)]
+mod tests_v2 {
+    use super::*;
+
+    /// A static scene with a PAUSED mover: v2's prev-mode must make later
+    /// frames dramatically cheaper than v1 (which re-codes the mover every
+    /// frame from the plate it was rejected from).
+    #[test]
+    fn prev_mode_collapses_static_foreground_cost() {
+        let (w, h) = (96, 64);
+        let mut frames = Vec::new();
+        for t in 0..12 {
+            let mut f = Yuv420::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    f.y[y * w + x] = (((x / 8) + (y / 8)) % 2 * 100 + 70) as u8;
+                }
+            }
+            for p in f.u.iter_mut() {
+                *p = 128;
+            }
+            for p in f.v.iter_mut() {
+                *p = 128;
+            }
+            // Mover: sweeps t=0..7, then FREEZES at t>=8. The freeze
+            // covers 5 of 12 frames at the final position — UNDER half,
+            // so the median plate still rejects it there (a longer freeze
+            // would put the mover INTO the plate and hand v1 the
+            // prediction for free, hiding the mechanism). TEXTURED
+            // (position-locked pseudo-noise), not flat: a flat square
+            // zstd-flattens to ~nothing per frame in BOTH variants.
+            let sx = if t < 8 { 4 + t * 6 } else { 4 + 7 * 6 };
+            for y in 24..40 {
+                for x in sx..(sx + 16).min(w) {
+                    let (mx, my) = (x - sx, y - 24);
+                    let n = (mx * 37 + my * 101 + mx * my * 13) % 97;
+                    f.y[y * w + x] = (150 + n) as u8;
+                }
+            }
+            frames.push(f);
+        }
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let plate = build_plate(&frames, &motions);
+        let opts = ResidualOpts { dead_zone: 2.0, ..ResidualOpts::default() };
+        let v1 = encode_gop(&frames, &motions, &plate, &opts);
+        let v2 = encode_gop_v2(&frames, &motions, &plate, &opts);
+        // Frozen-mover frames (9..) must be far cheaper in v2: their
+        // previous recon already contains the mover, the plate never does.
+        let v1_tail: usize = v1.residual_bytes[9..].iter().sum();
+        let v2_tail: usize = v2.frames[9..].iter().map(|c| c.residual_bytes + c.mode_bytes).sum();
+        assert!(
+            v2_tail * 3 < v1_tail,
+            "prev-mode didn't collapse frozen-foreground cost: v1 {v1_tail} v2 {v2_tail}"
+        );
+        assert!(v2.prev_mode_share > 0.02, "prev mode never chosen: {}", v2.prev_mode_share);
+        // And reconstruction must still contain the mover.
+        let f11 = &v2.recon[11];
+        {
+            let sx = 4 + 7 * 6;
+            let (mx, my) = (50usize - sx, 30usize - 24);
+            let expect = (150 + (mx * 37 + my * 101 + mx * my * 13) % 97) as i32;
+            assert!((f11.y[30 * w + 50] as i32 - expect).abs() <= 16);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v11.3 — 16×16 mode regions + motion-compensated prev mode.
+//
+// v11.2's accounting showed two costs the design itself was paying:
+//   * mode map at 4×4 granularity = 5–7 KB/frame of side info — a
+//     quarter of the whole marginal at aggressive quality settings;
+//   * zero-motion prev only predicts PAUSED foreground. An actor in
+//     motion misses their own previous position by a few pixels and
+//     falls back to full residual — the exact bytes AV1 never pays
+//     because motion compensation is its bread and butter.
+//
+// v11.3: decisions per 16×16 region (16× less side info), and prev mode
+// carries a motion vector found by diamond search (±MV_RANGE, then ±1
+// refine) on the previous RECONSTRUCTION's luma. Side info per region:
+// 1 mode bit; for prev regions an (dx,dy) i8 pair. Everything zstd'd.
+// ═══════════════════════════════════════════════════════════════════
+
+const REGION: usize = 16;
+const MV_RANGE: i32 = 12;
+
+fn sad_region(a: &[u8], w: usize, h: usize, ax: i32, ay: i32, b: &[u8], bx: usize, by: usize) -> u32 {
+    // SAD of REGION×REGION: a sampled at (ax,ay) (clamped), b at (bx,by).
+    let mut s = 0u32;
+    for ly in 0..REGION {
+        let sy = (ay + ly as i32).clamp(0, h as i32 - 1) as usize;
+        let brow = (by + ly) * w + bx;
+        for lx in 0..REGION {
+            let sx = (ax + lx as i32).clamp(0, w as i32 - 1) as usize;
+            s += (a[sy * w + sx] as i32 - b[brow + lx] as i32).unsigned_abs();
+        }
+    }
+    s
+}
+
+/// Rate-biased cost of a motion vector: zero is free, anything else must
+/// buy back its ~2 bytes of side info in SAD. Without this, the search
+/// wanders onto shallow ±1–2px minima created by film grain (grain
+/// decorrelates every frame, so SOME small offset always "matches" the
+/// noise slightly better) and nearly every region reports a junk nonzero
+/// MV — which is exactly what the v3 side-info accounting showed.
+fn mv_rate_bias(dx: i32, dy: i32) -> u32 {
+    if dx == 0 && dy == 0 {
+        0
+    } else {
+        400 + 16 * (dx.unsigned_abs() + dy.unsigned_abs())
+    }
+}
+
+/// Small diamond motion search on luma, minimizing SAD + rate bias.
+/// Returns (mv, raw sad of the chosen mv).
+fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usize) -> ((i8, i8), u32) {
+    let (mut best_dx, mut best_dy) = (0i32, 0i32);
+    let mut best_sad = sad_region(prev_y, w, h, rx as i32, ry as i32, cur_y, rx, ry);
+    let mut best_cost = best_sad; // zero-MV bias is 0
+    // Coarse: step-4 diamond out to MV_RANGE, then step-2, then step-1.
+    for &step in &[4i32, 2, 1] {
+        let mut improved = true;
+        while improved {
+            improved = false;
+            for (ddx, ddy) in [(step, 0), (-step, 0), (0, step), (0, -step)] {
+                let (dx, dy) = (best_dx + ddx, best_dy + ddy);
+                if dx.abs() > MV_RANGE || dy.abs() > MV_RANGE {
+                    continue;
+                }
+                let s = sad_region(prev_y, w, h, rx as i32 + dx, ry as i32 + dy, cur_y, rx, ry);
+                let cost = s + mv_rate_bias(dx, dy);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_sad = s;
+                    best_dx = dx;
+                    best_dy = dy;
+                    improved = true;
+                }
+            }
+        }
+    }
+    ((best_dx as i8, best_dy as i8), best_sad)
+}
+
+fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8, i8)) {
+    let (w, h) = (dst.w, dst.h);
+    for ly in 0..REGION {
+        for lx in 0..REGION {
+            let dx_ = rx + lx;
+            let dy_ = ry + ly;
+            let sx = (dx_ as i32 + mv.0 as i32).clamp(0, w as i32 - 1) as usize;
+            let sy = (dy_ as i32 + mv.1 as i32).clamp(0, h as i32 - 1) as usize;
+            dst.y[dy_ * w + dx_] = prev.y[sy * w + sx];
+        }
+    }
+    let (cw, chh) = (w / 2, h / 2);
+    for ly in 0..REGION / 2 {
+        for lx in 0..REGION / 2 {
+            let dx_ = rx / 2 + lx;
+            let dy_ = ry / 2 + ly;
+            let sx = (dx_ as i32 + mv.0 as i32 / 2).clamp(0, cw as i32 - 1) as usize;
+            let sy = (dy_ as i32 + mv.1 as i32 / 2).clamp(0, chh as i32 - 1) as usize;
+            dst.u[dy_ * cw + dx_] = prev.u[sy * cw + sx];
+            dst.v[dy_ * cw + dx_] = prev.v[sy * cw + sx];
+        }
+    }
+}
+
+pub fn encode_gop_v3(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+) -> PlateEncodeReportV2 {
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+    let (gw, gh) = (fw / REGION, fh / REGION);
+    let mut plate_raw = Vec::with_capacity(plate.y.len() + plate.u.len() + plate.v.len());
+    plate_raw.extend_from_slice(&plate.y);
+    plate_raw.extend_from_slice(&plate.u);
+    plate_raw.extend_from_slice(&plate.v);
+    let plate_bytes = zstd::encode_all(plate_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(plate_raw.len());
+
+    let mut out_frames = Vec::with_capacity(frames.len());
+    let mut recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
+    let mut prev_share_acc = 0.0f64;
+
+    for (fi, (f, m)) in frames.iter().zip(motions).enumerate() {
+        let plate_pred = predict_frame(plate, m, fw, fh);
+        let mut modes = vec![0u8; gw * gh];
+        let mut mvs: Vec<(i8, i8)> = Vec::new();
+        let composite = if fi == 0 {
+            plate_pred.clone()
+        } else {
+            let prev = recon[fi - 1].clone();
+            let mut comp = plate_pred.clone();
+            let mut prev_regions = 0usize;
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let (rx, ry) = (gx * REGION, gy * REGION);
+                    let sad_plate = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                    let (mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
+                    // The MV costs ~2 bytes of side info; charge it ~64
+                    // SAD units so trivial wins don't buy side info.
+                    if sad_prev + 64 < sad_plate {
+                        modes[gy * gw + gx] = 1;
+                        mvs.push(mv);
+                        prev_regions += 1;
+                        copy_region_mc(&mut comp, &prev, rx, ry, mv);
+                    }
+                }
+            }
+            prev_share_acc += prev_regions as f64 / (gw * gh) as f64;
+            comp
+        };
+
+        // Side info, three streams zstd'd together:
+        //   bitmap 1: plate(0) vs prev(1) per region
+        //   bitmap 2: for prev regions only — zero-MV(0) vs coded-MV(1).
+        //     On a locked-off shot most prev regions ARE zero-motion;
+        //     charging 2 MV bytes for (0,0) was half the side-info bill.
+        //   MV bytes: only for coded-MV regions, as deltas from the
+        //     median of (left, top) coded neighbors — real MV fields are
+        //     piecewise-constant over an actor, so deltas cluster at 0
+        //     and zstd finally has something to bite on.
+        let mut side = vec![0u8; (modes.len() + 7) / 8];
+        for (i, &b) in modes.iter().enumerate() {
+            if b == 1 {
+                side[i / 8] |= 1 << (i % 8);
+            }
+        }
+        let mut nz_bits: Vec<u8> = Vec::new();
+        let mut mv_deltas: Vec<u8> = Vec::new();
+        {
+            // mvs are pushed in raster order for mode-1 regions; rebuild a
+            // per-region MV grid to do spatial prediction.
+            let mut grid: Vec<Option<(i8, i8)>> = vec![None; gw * gh];
+            let mut it = mvs.iter();
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    if modes[gy * gw + gx] == 1 {
+                        grid[gy * gw + gx] = it.next().copied();
+                    }
+                }
+            }
+            let mut nz = vec![0u8; (modes.len() + 7) / 8];
+            let mut n_prev_seen = 0usize;
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let gi = gy * gw + gx;
+                    let Some(mv) = grid[gi] else { continue };
+                    let idx = n_prev_seen; // bit index within prev regions, in order
+                    n_prev_seen += 1;
+                    if mv == (0, 0) {
+                        continue;
+                    }
+                    nz[idx / 8] |= 1 << (idx % 8);
+                    // Median-of-neighbors prediction (left, top; 0 when absent).
+                    let left = if gx > 0 { grid[gi - 1].unwrap_or((0, 0)) } else { (0, 0) };
+                    let top = if gy > 0 { grid[gi - gw].unwrap_or((0, 0)) } else { (0, 0) };
+                    let pred = (
+                        ((left.0 as i32 + top.0 as i32) / 2) as i8,
+                        ((left.1 as i32 + top.1 as i32) / 2) as i8,
+                    );
+                    mv_deltas.push((mv.0.wrapping_sub(pred.0)) as u8);
+                    mv_deltas.push((mv.1.wrapping_sub(pred.1)) as u8);
+                }
+            }
+            nz.truncate((n_prev_seen + 7) / 8);
+            nz_bits = nz;
+        }
+        side.extend_from_slice(&nz_bits);
+        side.extend_from_slice(&mv_deltas);
+        let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
+
+        let p444 = interleave_444(&composite);
+        let t444 = interleave_444(f);
+        let (residual_bytes, rec) = match residual::encode(&p444, &t444, fw, fh, opts) {
+            Some(trailer) => {
+                let r = residual::apply(p444, &trailer, fw, fh);
+                (trailer.len(), deinterleave_420(&r, fw, fh))
+            }
+            None => (0, composite),
+        };
+        out_frames.push(FrameCost { mode_bytes, residual_bytes });
+        recon.push(rec);
+    }
+    let denom = (frames.len().saturating_sub(1)).max(1) as f64;
+    PlateEncodeReportV2 {
+        plate_bytes,
+        motion_bytes: frames.len() * 8,
+        frames: out_frames,
+        recon,
+        prev_mode_share: (prev_share_acc / denom) as f32,
+    }
+}
+
+#[cfg(test)]
+mod tests_v3 {
+    use super::*;
+
+    /// A textured mover in CONSTANT MOTION: v2's zero-motion prev misses
+    /// it every frame; v3's MC prev must track it and beat v2 clearly.
+    #[test]
+    fn mc_tracks_a_moving_texture() {
+        let (w, h) = (96, 64);
+        let mut frames = Vec::new();
+        for t in 0..10 {
+            let mut f = Yuv420::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    f.y[y * w + x] = (((x / 8) + (y / 8)) % 2 * 90 + 70) as u8;
+                }
+            }
+            for p in f.u.iter_mut() {
+                *p = 128;
+            }
+            for p in f.v.iter_mut() {
+                *p = 128;
+            }
+            let sx = 4 + t * 6; // constant 6px/frame — inside MV_RANGE
+            for y in 24..44 {
+                for x in sx..(sx + 20).min(w) {
+                    let (mx, my) = (x - sx, y - 24);
+                    let n = (mx * 41 + my * 97 + mx * my * 7) % 89;
+                    f.y[y * w + x] = (140 + n) as u8;
+                }
+            }
+            frames.push(f);
+        }
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let plate = build_plate(&frames, &motions);
+        let opts = ResidualOpts { dead_zone: 2.0, ..ResidualOpts::default() };
+        let v2 = encode_gop_v2(&frames, &motions, &plate, &opts);
+        let v3 = encode_gop_v3(&frames, &motions, &plate, &opts);
+        let cost = |fr: &[FrameCost]| -> usize { fr.iter().skip(1).map(|c| c.residual_bytes + c.mode_bytes).sum() };
+        let (c2, c3) = (cost(&v2.frames), cost(&v3.frames));
+        assert!(
+            c3 * 2 < c2 * 3,
+            "MC prev should cut moving-texture cost ≥ ~1.5x: v2 {c2} v3 {c3}"
+        );
+        // Reconstruction carries the mover at its final position.
+        let f9 = &v3.recon[9];
+        let sx = 4 + 9 * 6;
+        let (px, py) = (sx + 10, 34);
+        let (mx, my) = (px - sx, py - 24);
+        let expect = (140 + (mx * 41 + my * 97 + mx * my * 7) % 89) as i32;
+        assert!((f9.y[py * w + px] as i32 - expect).abs() <= 16, "mover lost under MC");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v11.4 — the grain split.
+//
+// Accounting on real footage showed the residual at matched-AV1 quality
+// is dominated by FILM GRAIN: temporally white noise that neither the
+// plate (whose median removed it — correctly) nor MC-prev (grain never
+// matches across frames) can predict, so the DCT coder transcribes it
+// pixel by pixel. AV1 does not pay this bill: it denoises and ships a
+// film-grain-synthesis model (§AV1 spec, film_grain_params). v11.4 makes
+// the same split explicit, in FAO's own terms: the "shader" that brings
+// back detail is a deterministic grain synthesizer.
+//
+//   encode: target' = temporal_denoise(target, mc_composite)  — average
+//           where |target − prediction| is within a grain-sized band;
+//           real signal differences exceed the band and stay untouched.
+//           Estimate grain σ from what the denoise removed. Residual-code
+//           against target' (cheap: the band'd noise is gone).
+//   decode: recon' + synth_grain(σ, frame_seed) — xorshift PRNG, so the
+//           decoder reproduces it bit-exactly from (σ, frame index).
+//
+// Metric honesty: synthesized grain is not the ORIGINAL grain, so
+// PSNR-vs-grainy-source saturates near the grain power for ANY codec
+// that does this (AV1 included, at low rates). The lab therefore reports
+// grain σ and lets the caller score both raw and denoised references.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Temporal denoise: where |cur − pred| ≤ band, average toward pred
+/// (grain is temporally independent; averaging halves its power). Where
+/// the difference exceeds the band it is signal — leave it alone.
+/// Returns (denoised, estimated grain σ from the removed component).
+pub fn temporal_denoise(cur: &Yuv420, pred: &Yuv420, band: i32) -> (Yuv420, f32) {
+    let mut out = cur.clone();
+    let mut acc = 0.0f64;
+    let mut n = 0usize;
+    for i in 0..cur.y.len() {
+        let d = cur.y[i] as i32 - pred.y[i] as i32;
+        if d.abs() <= band {
+            out.y[i] = ((cur.y[i] as i32 + pred.y[i] as i32 + 1) / 2) as u8;
+            acc += (d * d) as f64;
+            n += 1;
+        }
+    }
+    // Chroma grain on scanned film is weaker; same rule, half band.
+    for i in 0..cur.u.len() {
+        let du = cur.u[i] as i32 - pred.u[i] as i32;
+        if du.abs() <= band / 2 {
+            out.u[i] = ((cur.u[i] as i32 + pred.u[i] as i32 + 1) / 2) as u8;
+        }
+        let dv = cur.v[i] as i32 - pred.v[i] as i32;
+        if dv.abs() <= band / 2 {
+            out.v[i] = ((cur.v[i] as i32 + pred.v[i] as i32 + 1) / 2) as u8;
+        }
+    }
+    // The in-band diff is grain(cur) − grain(pred): two independent draws,
+    // so Var(diff) = 2σ² → σ = rms/√2.
+    let sigma = if n > 0 { ((acc / n as f64).sqrt() / std::f64::consts::SQRT_2) as f32 } else { 0.0 };
+    (out, sigma)
+}
+
+/// Deterministic luma grain, reproducible from (seed, σ). Triangular
+/// distribution (sum of two uniforms) ≈ film grain's soft look, cheap.
+pub fn synth_grain(f: &mut Yuv420, sigma: f32, seed: u64) {
+    if sigma <= 0.05 {
+        return;
+    }
+    let mut s = seed | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // Triangular on [-a, a] has σ = a/√6 → a = σ·√6.
+    let a = sigma * 2.449_49;
+    for p in f.y.iter_mut() {
+        let r = next();
+        let u1 = ((r & 0xFFFF) as f32 / 65535.0) - 0.5;
+        let u2 = (((r >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5;
+        let g = (u1 + u2) * 2.0 * a;
+        *p = (*p as f32 + g).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// v11.4 = v3's mode machinery + the grain split. `band` in luma levels
+/// (0 disables, reproducing v3 exactly); grain is re-synthesized onto the
+/// reconstruction so the output is displayable as-is.
+pub fn encode_gop_v4(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+    band: i32,
+) -> (PlateEncodeReportV2, f32) {
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+    let (gw, gh) = (fw / REGION, fh / REGION);
+    let mut plate_raw = Vec::with_capacity(plate.y.len() + plate.u.len() + plate.v.len());
+    plate_raw.extend_from_slice(&plate.y);
+    plate_raw.extend_from_slice(&plate.u);
+    plate_raw.extend_from_slice(&plate.v);
+    let plate_bytes = zstd::encode_all(plate_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(plate_raw.len());
+
+    let mut out_frames = Vec::with_capacity(frames.len());
+    // Two parallel lists: MC references must be CLEAN reconstructions
+    // (referencing grained frames would feed synthetic noise into the
+    // next frame's motion search and residual); the report's recon list
+    // is the displayable output and carries the synthesized grain.
+    let mut clean_recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
+    let mut display_recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
+    let mut prev_share_acc = 0.0f64;
+    let mut sigma_acc = 0.0f64;
+
+    for (fi, (f, m)) in frames.iter().zip(motions).enumerate() {
+        let plate_pred = predict_frame(plate, m, fw, fh);
+        let mut modes = vec![0u8; gw * gh];
+        let mut mvs: Vec<(i8, i8)> = Vec::new();
+        let composite = if fi == 0 {
+            plate_pred.clone()
+        } else {
+            let prev = &clean_recon[fi - 1];
+            let mut comp = plate_pred.clone();
+            let mut prev_regions = 0usize;
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let (rx, ry) = (gx * REGION, gy * REGION);
+                    let sad_plate = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                    let (mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
+                    if sad_prev + 64 < sad_plate {
+                        modes[gy * gw + gx] = 1;
+                        mvs.push(mv);
+                        prev_regions += 1;
+                        copy_region_mc(&mut comp, prev, rx, ry, mv);
+                    }
+                }
+            }
+            prev_share_acc += prev_regions as f64 / (gw * gh) as f64;
+            comp
+        };
+
+        // The grain split: denoise the target toward the prediction, code
+        // the clean difference, remember σ for decode-side synthesis.
+        let (target, sigma) = if band > 0 {
+            temporal_denoise(f, &composite, band)
+        } else {
+            (f.clone(), 0.0)
+        };
+        sigma_acc += sigma as f64;
+
+        let mut side = vec![0u8; (modes.len() + 7) / 8];
+        for (i, &b) in modes.iter().enumerate() {
+            if b == 1 {
+                side[i / 8] |= 1 << (i % 8);
+            }
+        }
+        {
+            let mut grid: Vec<Option<(i8, i8)>> = vec![None; gw * gh];
+            let mut it = mvs.iter();
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    if modes[gy * gw + gx] == 1 {
+                        grid[gy * gw + gx] = it.next().copied();
+                    }
+                }
+            }
+            let mut nz: Vec<u8> = vec![0u8; (gw * gh + 7) / 8];
+            let mut deltas: Vec<u8> = Vec::new();
+            let mut n_prev_seen = 0usize;
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let gi = gy * gw + gx;
+                    let Some(mv) = grid[gi] else { continue };
+                    let idx = n_prev_seen;
+                    n_prev_seen += 1;
+                    if mv == (0, 0) {
+                        continue;
+                    }
+                    nz[idx / 8] |= 1 << (idx % 8);
+                    let left = if gx > 0 { grid[gi - 1].unwrap_or((0, 0)) } else { (0, 0) };
+                    let top = if gy > 0 { grid[gi - gw].unwrap_or((0, 0)) } else { (0, 0) };
+                    let pred = (
+                        ((left.0 as i32 + top.0 as i32) / 2) as i8,
+                        ((left.1 as i32 + top.1 as i32) / 2) as i8,
+                    );
+                    deltas.push((mv.0.wrapping_sub(pred.0)) as u8);
+                    deltas.push((mv.1.wrapping_sub(pred.1)) as u8);
+                }
+            }
+            nz.truncate((n_prev_seen + 7) / 8);
+            side.extend_from_slice(&nz);
+            side.extend_from_slice(&deltas);
+        }
+        // σ ships as one byte (σ×16, saturating) per frame.
+        side.push(((sigma * 16.0).round() as u32).min(255) as u8);
+        let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
+
+        let p444 = interleave_444(&composite);
+        let t444 = interleave_444(&target);
+        let (residual_bytes, mut rec) = match residual::encode(&p444, &t444, fw, fh, opts) {
+            Some(trailer) => {
+                let r = residual::apply(p444, &trailer, fw, fh);
+                (trailer.len(), deinterleave_420(&r, fw, fh))
+            }
+            None => (0, composite),
+        };
+        // Clean reconstruction is the reference for the NEXT frame's MC;
+        // the display copy gets the synthesized grain. Referencing grained
+        // frames would feed synthetic noise back into motion search.
+        clean_recon.push(rec.clone());
+        synth_grain(&mut rec, sigma, 0x5EED_0000 + fi as u64);
+        display_recon.push(rec);
+        out_frames.push(FrameCost { mode_bytes, residual_bytes });
+    }
+    let denom = (frames.len().saturating_sub(1)).max(1) as f64;
+    (
+        PlateEncodeReportV2 {
+            plate_bytes,
+            motion_bytes: frames.len() * 8,
+            frames: out_frames,
+            recon: display_recon,
+            prev_mode_share: (prev_share_acc / denom) as f32,
+        },
+        (sigma_acc / frames.len() as f64) as f32,
+    )
+}
