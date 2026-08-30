@@ -1,8 +1,0 @@
-[package]
-name = "sim-mat"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-description = "Material properties with provenance. Cross-cutting: every layer depends on this, and no layer defines its own coefficients."
-
-[dependencies]

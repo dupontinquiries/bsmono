@@ -1,9 +1,0 @@
-[package]
-name = "cad-motion"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-description = "Modal input grammar (Normal/Grow/Sketch) — pure key->action mapping in the logscope-fan vimmode style."
-
-[dependencies]
-

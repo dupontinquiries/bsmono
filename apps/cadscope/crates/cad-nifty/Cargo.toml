@@ -1,9 +1,0 @@
-[package]
-name = "cad-nifty"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-description = "niftyplot's hardware kind: components, pins, traces, vias, zones — the dimensioned board description CADscope designs around. Intended to upstream into shared/nifty-core."
-
-[dependencies]
-glam.workspace = true

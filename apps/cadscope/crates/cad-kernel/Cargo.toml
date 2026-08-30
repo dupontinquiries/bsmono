@@ -1,9 +1,0 @@
-[package]
-name = "cad-kernel"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-description = "CADscope geometry kernel v0: analytic SDF primitives, CSG, ray casting. std+glam only."
-
-[dependencies]
-glam.workspace = true

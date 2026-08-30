@@ -1,8 +1,0 @@
-[package]
-name = "sim-num"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-description = "The shared numeric core: deterministic reductions, compensated arithmetic, SIMD f64 kernels, and the Newton solver every physics layer reuses."
-
-[dependencies]
