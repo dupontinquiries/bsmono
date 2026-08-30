@@ -220,10 +220,37 @@ pub fn skeletonize(prims: &[&[Vec3]]) -> Skeleton {
             sk.core.push(i);
         }
     }
-    // a body with no middle is one piece: call the biggest prim the core
-    // so the rest still has something to attach to
+    // a body with no middle is one piece: fall back to whichever SINGLE
+    // prim's own centroid sits closest to the whole body's mass-weighted
+    // middle, so the rest still has something to attach to.
+    //
+    // This used to be "the biggest prim by point count", and that is a
+    // real bug, not a hypothetical: reproduced with a body of 25 small
+    // detail prims plus one large off-center appendage (25 x 8-point
+    // debris + 1 x 200-point offender) — the offender IS the biggest
+    // prim, so it was picked as the core itself, every debris prim was
+    // then adopted as ITS orphan, and the appendage the whole system
+    // exists to shorten never became a limb at all. Confirmed the same
+    // failure on five real chassis (`examples/trace_compact.rs`):
+    // hardboil, tank, jet_alphastar, starlord, void all reported ZERO
+    // limbs despite `starlord` and `void` visibly having an oversized
+    // Wing/Wheel/Thruster respectively (`silhouette_audit.rs`) that
+    // `compact` should have been shortening every frame.
+    //
+    // Closest-to-middle is what "the core" is supposed to mean in the
+    // first place — point count is a proxy for "big", and the biggest
+    // thing in a body is not reliably the thing nearest its middle.
     if sk.core.is_empty() {
-        if let Some((i, _)) = prims.iter().enumerate().max_by_key(|(_, p)| p.len()) {
+        if let Some((i, _)) = cents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !prims[*i].is_empty())
+            .min_by(|(_, a), (_, b)| {
+                let da = ((**a - mid) / half.max(Vec3::splat(1e-4))).length_squared();
+                let db = ((**b - mid) / half.max(Vec3::splat(1e-4))).length_squared();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
             sk.core.push(i);
         }
     }
@@ -698,8 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_halves_the_overhang_without_detaching_it() {
-        let j = jet();
+    fn compaction_halves_the_overhang_without_detaching_it() {        let j = jet();
         let refs: Vec<&[Vec3]> = j.iter().map(|v| v.as_slice()).collect();
         let sk = skeletonize(&refs);
         let before = sk.max_reach();
