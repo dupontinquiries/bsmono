@@ -3304,3 +3304,27 @@ exact (no grain decorrelation). The full mover-layer design —
 movers as objects with their own motion, composited per frame —
 remains the named construction; this MVP measured its static
 approximation.
+
+### Per-take routing + half-pel full-suite rerun (same session)
+
+--route (with --use-plate): encodes BOTH branches and picks by RD
+cost J = SSE + λ·bytes, λ = dz²/3. Validation on the takes taught a
+real subtlety: w1 → SELF (correct), and w2 → SELF as well — which is
+λ-CONSISTENT, not a bug. The earlier "citation wins at matched
+quality" compared cited@dz20 to self@dz32, a cross-λ hull
+comparison; on the hull, citation wins below ~37.2 dB and ties near
+38, and a router at dz20's λ sits where self edges ahead. Routing
+decisions are λ-dependent — standard RD practice, now recorded
+precisely: the citation win is a low-to-mid-quality-tier phenomenon
+on this grain-decorrelated content, and tier-independent only when
+canonicals stop decorrelating (engine-exact).
+
+Half-pel full-suite rerun (all 19 shots, dz32, same protocol; CSV in
+docs/full_v11_dz32_halfpel.csv):
+  int-pel : 45.95 MB @ 31.33 dB / SSIM 0.895
+  half-pel: 42.88 MB @ 32.62 dB / SSIM 0.922
+  → −6.7% bytes AND +1.29 dB AND +0.027 SSIM across the whole 45 s.
+  vs AV1-150k (0.99 MB @ 33.33): 46.5× @ −2.00 dB → 43.4× @ −0.71 dB.
+One construction closed 1.3 of the 2 dB whole-video quality gap while
+shrinking bytes — the residual ledger pointed at the right bucket.
+Quarter-pel is the next rung of the same ladder.

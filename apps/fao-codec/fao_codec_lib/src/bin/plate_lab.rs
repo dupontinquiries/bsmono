@@ -136,6 +136,15 @@ fn main() {
     // building+transmitting one. Motions get re-based by a phase-corr
     // alignment of frame 0 against the plate (8 wire bytes). This is
     // the library-citation bridge in its 2D-native form.
+    // --route: encoder-side per-take routing. Encodes BOTH branches
+    // (self-plate and cited canonical) and picks by RD cost
+    // J = SSE + lambda*bytes with lambda ~ dz^2/3 (the standard
+    // quantizer-tied multiplier shape). This turns the measured
+    // routing law — cite only when the canonical beats your
+    // self-model — into a code path instead of arithmetic in a log.
+    // Lab-grade: runs both encodes in full; a production encoder
+    // would estimate one branch cheaply first.
+    let do_route = args.iter().any(|a| a == "--route") && arg_val(&args, "--use-plate").is_some();
     let (pl, motions, cited) = if let Some(pp) = arg_val(&args, "--use-plate") {
         let mut ext = plate::load_plate(&pp).unwrap_or_else(|e| die(&format!("load_plate: {e}")));
         if args.iter().any(|a| a == "--align-affine") {
@@ -997,7 +1006,45 @@ end_header
         let rep = if args.iter().any(|a| a == "--v2") {
             plate::encode_gop_v2(&frames, &motions, &pl, &opts)
         } else {
-            plate::encode_gop_v3(&frames, &motions, &pl, &opts)
+            if do_route {
+                // Branch A: self (own motions + own plate).
+                let m_self = if args.iter().any(|a| a == "--static") {
+                    vec![plate::PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()]
+                } else {
+                    plate::estimate_motions(&frames)
+                };
+                let pl_self = plate::build_plate(&frames, &m_self);
+                let rep_a = plate::encode_gop_v3(&frames, &m_self, &pl_self, &opts);
+                // Branch B: cited (pl/motions from --use-plate path).
+                let rep_b = plate::encode_gop_v3(&frames, &motions, &pl, &opts);
+                let sse = |rep: &plate::PlateEncodeReportV2| -> f64 {
+                    let mut acc = 0.0f64;
+                    for (r, f) in rep.recon.iter().zip(&frames) {
+                        for (a, b) in r.y.iter().zip(&f.y) {
+                            let d = *a as f64 - *b as f64;
+                            acc += d * d;
+                        }
+                    }
+                    acc
+                };
+                let bytes_a = rep_a.plate_bytes
+                    + rep_a.motion_bytes
+                    + rep_a.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).sum::<usize>();
+                let bytes_b = 24
+                    + rep_b.motion_bytes
+                    + rep_b.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).sum::<usize>();
+                let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
+                let (ja, jb) = (sse(&rep_a) + lambda * bytes_a as f64, sse(&rep_b) + lambda * bytes_b as f64);
+                let pick_cited = jb < ja;
+                println!(
+                    "route: self J {:.3e} ({} B) | cited J {:.3e} ({} B) -> {}",
+                    ja, bytes_a, jb, bytes_b,
+                    if pick_cited { "CITED" } else { "SELF" }
+                );
+                if pick_cited { rep_b } else { rep_a }
+            } else {
+                plate::encode_gop_v3(&frames, &motions, &pl, &opts)
+            }
         };
         let res_total: usize = rep.frames.iter().map(|c| c.residual_bytes).sum();
         let mode_total: usize = rep.frames.iter().map(|c| c.mode_bytes).sum();
