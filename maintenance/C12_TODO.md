@@ -3293,7 +3293,22 @@ Checked rather than assumed, which is the same discipline the last
 commit was about.
 
 - **C12-61a — NOT COMPILED.**
-- **C12-61b — `dest` is not yet USED by the push itself.** The field is
-  collected and the deploy call has not been updated to pass it, so this
-  is half the wiring: the destination is now expressible but not yet
-  honoured.
+- **C12-61b — RESOLVED by NOT wiring it, and that is the finding.**
+  I went to pass `dest` into the install and read the install path
+  first. `deploy_app_remote_logged` scp's to `/tmp/<app>` as a STAGING
+  step, then runs `installer::push_install_script`, which moves it to
+  `$HOME/.local/bin` and writes a `.desktop` entry pointing there.
+
+  That pairing is a contract, not an oversight. A binary installed
+  somewhere else would not be on PATH and its launcher entry would point
+  at nothing — so a free-text destination for app install would let a
+  person break their own install with a valid-looking path.
+
+  The browser is still right for the page's OTHER destinations (artifact
+  and file transfer). Relabelled from "install to" to "device folder",
+  which is what it can actually honour. My first label promised
+  something the install path cannot do.
+
+  The general shape: "this field has no consumer" is not always a gap to
+  close. Sometimes the consumer is deliberately fixed, and wiring the
+  field would be the bug.

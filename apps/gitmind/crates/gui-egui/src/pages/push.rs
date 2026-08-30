@@ -9,8 +9,10 @@ pub struct State {
     pub user: String,
     pub host: String,
     pub target: String,
-    /// Where on the device the binary lands. Browsed rather than typed
-    /// blind — see the "install to" row.
+    /// A folder on the device, for transfers. NOT the app install path:
+    /// that is fixed at `$HOME/.local/bin` by
+    /// `installer::push_install_script`, which also writes the .desktop
+    /// entry pointing there.
     pub dest: String,
     /// The open folder picker, when browsing.
     pub browser: Option<crate::remote_browse::Browser>,
@@ -145,12 +147,23 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     // WHERE ON THE DEVICE IT LANDS. `remote_browse` has existed with
-    // tests since the port and nothing constructed it — the page had
-    // fields for user, host and target triple and none for the
-    // destination path, so the GTK build's folder picker had no
-    // equivalent here and the destination was simply unreachable.
+    // tests since the port and nothing constructed it.
+    //
+    // READ THIS BEFORE WIRING `dest` INTO THE INSTALL. The app install
+    // path does NOT take a destination and should not: `deploy_app_remote`
+    // scp's to `/tmp/<app>` as a staging step and then runs
+    // `installer::push_install_script`, which moves it to
+    // `$HOME/.local/bin` and writes a .desktop entry beside it. That
+    // pairing is the contract — a binary somewhere else would not be on
+    // PATH and its launcher entry would point at nothing.
+    //
+    // So this browser is for the OTHER destinations the page deals in
+    // (artifact and file transfer), not for relocating an installed app.
+    // Labelled accordingly rather than left as a general "install to",
+    // which is what I first wrote and which would have promised
+    // something the install path cannot honour.
     ui.horizontal(|ui| {
-        ui.label("install to");
+        ui.label("device folder");
         ui.text_edit_singleline(&mut app.push.dest);
         if ui.button("browse…").clicked() {
             let mut b = crate::remote_browse::Browser::new(&app.push.user, &app.push.host);
