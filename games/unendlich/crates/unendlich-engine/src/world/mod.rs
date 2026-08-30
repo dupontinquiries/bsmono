@@ -254,6 +254,7 @@ pub mod alluvial_fan;
 pub mod batch_canyon_carve;
 pub mod altitude_temp;
 pub mod rain_shadow;
+pub mod forest_islands;
 pub mod tree_form;
 pub mod tree_line;
 pub mod batch_altitude_temp;

@@ -47,10 +47,14 @@ along rivers. Three findings translate directly:
   shrub-ring micro-clusters scattered in open savanna, independent of the
   big island field.
 
-→ **r605, PLANNED**: pure `world/forest_islands` module (island field +
-per-island palette + termite micro-clusters), applied to Savanna columns in
-BOTH backends. Blocked on nothing, but see the caveat below before it
-lands.
+→ **r605, LANDED**: pure `world/forest_islands` (island field with jittered
+cell centres, per-island palettes, termite micro-clusters, D/d/o strata at
+20/35/45), applied on Savanna columns in BOTH backends (CPU branch +
+line-for-line GLSL twin gated by transliteration tests — the r604 lesson).
+End-to-end pinned CPU-side: an island-core chunk carries ≥2× the tree
+blocks of open grass under the same seed. VISUALLY UNVERIFIED in-sandbox —
+both r604 silhouettes and r605 islands await the operator's on-device art
+check together.
 
 ## Caveat discovered while gating r604 (the noise fork)
 

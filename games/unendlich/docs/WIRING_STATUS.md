@@ -12051,3 +12051,20 @@ forks terrain). Probe seeds on record: 3405691582/7777 exact-but-treeless (ocean
 (fix directions ranked in the design doc); the probe stays as the drift instrument. r605 (forest islands with
 per-island palettes — the 8%-species-overlap rule — plus termite micro-clusters) is designed in the doc and waits on
 the operator's on-device art check of the r604 silhouettes.
+
+## r605 — FOREST ISLANDS in the savanna (the Comoé study, live in both backends)
+world/forest_islands: the island field (96-block cells, p=0.18, jittered centres, radius 12-44), per-island PALETTES
+(each island rolls one of 3 — the study's 8%-species-overlap finding as a mechanic: crossing islands reads as visiting
+different forests; palettes differ by silhouette mix, height bands, and Oak/Birch species since those are the blocks
+that exist), three strata per the Comoé tables (Dominant/Mid/Under at 20/35/45; Under is always Shrub), and
+termite-mound micro-clusters (24-block fine field, p=0.05, r=3.5) out in open grass. All pure f32/u32 math chosen to
+transliterate: the GLSL twin in chunk_generation.comp is line-for-line (fi_* helpers + the BIOME_SAVANNA override in
+the tree decision), gated by the transliteration test in forest_islands.rs (the r604 lesson — world-level parity can't
+gate mirrors while the noise fork stands). CPU wiring overrides density (0.006 → up to 0.046 at core) + profile per
+column. Gates: forest_islands 4/0; combined tree_form+biomes+cpu_generator+islands 52/0; the END-TO-END pin
+(savanna_islands_are_denser_than_open_grass: island-core chunk ≥2× open-grass tree blocks, analytic island-centre
+enumeration + fixed seed list); shader validated (-V; note: bare `glslangValidator -S comp` without -V rejects
+push_constant — Vulkan mode is required), both .spv artifacts rebuilt; fullgame clean; 90 s in-world soak exit 0 /
+zero watchdog lines. VISUALLY UNVERIFIED — r604 silhouettes + r605 islands are one on-device art-check item now.
+Deferred per the design doc: forêt claire biome (new id 29, both backends), gallery forests (needs the river field),
+giant 200-300 ha islands (biome-scale).

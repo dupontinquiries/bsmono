@@ -855,7 +855,7 @@ impl WorldGenerator {
                 // Determine biome at surface; reject biomes that don't
                 // have trees (oceans, deserts, etc.).
                 let surface_sample = self.biome_at_3d(wx, surface_y, wz);
-                let profile = match surface_sample.biome.tree_profile() {
+                let mut profile = match surface_sample.biome.tree_profile() {
                     Some(p) => p,
                     None => continue,
                 };
@@ -867,7 +867,25 @@ impl WorldGenerator {
                 let temp = surface_sample.temperature;
                 let humid = surface_sample.humidity;
                 let climate_factor = climate_tree_factor(temp, humid);
-                let effective_density = profile.base_density * climate_factor;
+                let mut effective_density = profile.base_density * climate_factor;
+
+                // r605: FOREST ISLANDS in the savanna (Comoé study — see
+                // docs/design/biomes_west_africa.md and world::forest_islands).
+                // Inside an island, density rises with the core and each
+                // tree draws a STRATUM (D/d/o) from the island's own
+                // palette — crossing to the next island reads as a
+                // different forest (the 8 %-species-overlap rule as a
+                // mechanic). MIRRORED in chunk_generation.comp; the
+                // transliteration tests in forest_islands.rs gate the twin.
+                if surface_sample.biome == Biome::Savanna {
+                    use crate::world::forest_islands as fi;
+                    let isl = fi::sample(wx, wz, self.seed());
+                    if isl.in_island {
+                        effective_density = fi::island_density(isl.core) * climate_factor as f64;
+                        let strat_h = fi::cell_hash01(wx, wz, 0x57A7, self.seed());
+                        profile = fi::island_profile(isl.palette, fi::stratum_for(strat_h));
+                    }
+                }
                 if pos_hash >= effective_density { continue; }
 
                 // Reject if surface block isn't a tree-suitable substrate.
@@ -1734,6 +1752,99 @@ mod tests {
         let f = climate_tree_factor(0.9, 0.1);
         assert_eq!(f, 0.0,
             "hot+dry should fully suppress trees, got {}", f);
+    }
+
+    /// r605 end-to-end: forest islands make savanna chunks measurably
+    /// denser. Scan a seed for a savanna column sitting in an island CORE
+    /// and one in open grass, generate both chunks, and require the island
+    /// chunk to carry clearly more tree blocks. (The exact counts are seed
+    /// noise; the ORDER is the invariant.)
+    #[test]
+    fn savanna_islands_are_denser_than_open_grass() {
+        use crate::world::forest_islands as fi;
+        use crate::world::biomes::Biome;
+        // Savanna placement is seed luck; try a fixed list until one seed
+        // yields both an island-core column and open grass. Deterministic:
+        // the list is fixed and the first hit wins.
+        let mut found: Option<(WorldGenerator, (i32, i32), (i32, i32))> = None;
+        'seeds: for s in [0xBEEF_5A7Au32, 42, 7, 12345, 999_331, 0xCAFE, 2024, 555_000] {
+        let g = WorldGenerator::new(s);
+        let seed = g.seed();
+        // Enumerate island CENTRES analytically from the cell field (a
+        // blind grid scan strides over the 5–18-block cores), then keep
+        // the first whose centre is savanna.
+        let mut island_col: Option<(i32, i32)> = None;
+        let mut open_col: Option<(i32, i32)> = None;
+        'cells: for cx in -60i32..60 {
+            for cz in -60i32..60 {
+                if fi::cell_hash01(cx, cz, 0x15AD, seed) >= fi::ISLAND_P {
+                    continue;
+                }
+                let jx = fi::cell_hash01(cx, cz, 0xC311, seed);
+                let jz = fi::cell_hash01(cx, cz, 0xC312, seed);
+                let wx = (cx as f32 * fi::ISLAND_CELL as f32
+                    + (0.25 + 0.5 * jx) * fi::ISLAND_CELL as f32) as i32;
+                let wz = (cz as f32 * fi::ISLAND_CELL as f32
+                    + (0.25 + 0.5 * jz) * fi::ISLAND_CELL as f32) as i32;
+                let sy = match g.surface_y_at(wx, wz, -64, 256) {
+                    Some(y) => y,
+                    None => continue,
+                };
+                if g.biome_at_3d(wx, sy, wz).biome != Biome::Savanna {
+                    continue;
+                }
+                let isl = fi::sample(wx, wz, seed);
+                if isl.in_island && isl.core > 0.6 && isl.palette != fi::TERMITE_PALETTE {
+                    island_col = Some((wx, wz));
+                    // Open grass: walk outward until the field says open
+                    // AND biome is still savanna.
+                    for step in 1..40 {
+                        let (ox, oz) = (wx + step * 13, wz + step * 7);
+                        let osy = match g.surface_y_at(ox, oz, -64, 256) {
+                            Some(y) => y,
+                            None => continue,
+                        };
+                        if g.biome_at_3d(ox, osy, oz).biome == Biome::Savanna
+                            && !fi::sample(ox, oz, seed).in_island
+                        {
+                            open_col = Some((ox, oz));
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+        }
+        if let (Some(i), Some(o)) = (island_col, open_col) {
+            found = Some((g, i, o));
+            break 'seeds;
+        }
+        }
+        let (g, (ix, iz), (ox, oz)) =
+            found.expect("no seed in the fixed list yields a savanna island + open grass pair");
+        let count_trees = |wx: i32, wz: i32| -> usize {
+            let cs = crate::constants::CHUNK_SIZE;
+            let coord = ChunkCoord::new(wx.div_euclid(cs), 2, wz.div_euclid(cs));
+            let chunk = g.generate_chunk(coord);
+            chunk
+                .blocks
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        **b,
+                        BlockId::OakLog
+                            | BlockId::OakLeaves
+                            | BlockId::BirchLog
+                            | BlockId::BirchLeaves
+                    )
+                })
+                .count()
+        };
+        let dense = count_trees(ix, iz);
+        let open = count_trees(ox, oz);
+        assert!(
+            dense > open.saturating_mul(2).max(20),
+            "island chunk ({ix},{iz}) must be much denser than open ({ox},{oz}): {dense} vs {open}"
+        );
     }
 
     /// Climate tree factor: peak in mild + humid (>1.0).
