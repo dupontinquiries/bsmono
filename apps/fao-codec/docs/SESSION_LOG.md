@@ -3126,3 +3126,40 @@ are unrigged fused meshes and the only transform is rigid alignment
 (compute_alignment_transform); the aging question is therefore
 another argument for engine-grade canonicals, where non-rigid
 parameterized deltas come with the representation.
+
+### The citation bridge, built and priced (same session)
+
+save_plate/load_plate + motions_against_plate + plate_lab
+--save-plate/--use-plate: a stored plate is the 2D-native canonical,
+and a GOP can now CITE one — alignment (phase-corr of frame 0 vs the
+plate's zero-motion prediction) + motions + residual travel; the
+plate costs a 24-byte reference. This is the library-citation
+infrastructure in its minimum form; an engine-rendered canonical
+slots into the same interface.
+
+Measured on the store takes (w2 citing w1's plate, dz32):
+  self-coded: 937 KB @ 37.19 dB (own plate 570 KB)
+  cited:      481 KB @ 33.22 dB (−48.7% bytes, −3.97 dB)
+  cited, quality-matched (~37.2 dB, interpolated dz≈16): ~1.5 MB —
+    MORE than self-coding. The cross-take mismatch residual (~+1 MB
+    at matched quality) exceeds the plate saved (570 KB), so at high
+    quality this pair NEVER amortizes, at any reuse count.
+  wrong-canonical control (desert citing the store plate): 1.18 MB —
+    not catastrophic, because v3's mode decision routes regions to
+    prev-MC when the plate is useless. Graceful degradation is
+    built in.
+
+The economics are now a formula: citation wins iff
+ΔR(quality) < P_saved / N_reuses, and ΔR is the research object.
+Named levers, in order, all with tools already in-tree:
+  1. Alignment is translation-only today — the affine/homography
+     machinery from the pose arc should align the cited plate
+     (zoom/rotation between takes currently lands in residual).
+  2. Canonical refinement: fuse takes into the canonical (union
+     median) so the canonical converges on the SET rather than one
+     take's sampling of it.
+  3. Illumination compensation — the "light sources" term again:
+     per-region gain/offset vs the canonical before residual.
+At the low-quality tier (~33 dB) citation already wins today (481 vs
+~600+ KB), which matters for the game-content regime where the
+canonical will eventually be engine-exact and ΔR → grain floor.

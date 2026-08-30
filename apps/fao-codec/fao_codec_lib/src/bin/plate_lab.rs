@@ -117,8 +117,23 @@ fn main() {
     );
 
     let t1 = std::time::Instant::now();
-    let pl = plate::build_plate(&frames, &motions);
-    eprintln!("plate: {}x{} origin ({:.1},{:.1})  ({:.1}s)", pl.w, pl.h, pl.ox, pl.oy, t1.elapsed().as_secs_f32());
+    // --use-plate <path>: CITE a stored canonical plate instead of
+    // building+transmitting one. Motions get re-based by a phase-corr
+    // alignment of frame 0 against the plate (8 wire bytes). This is
+    // the library-citation bridge in its 2D-native form.
+    let (pl, motions, cited) = if let Some(pp) = arg_val(&args, "--use-plate") {
+        let ext = plate::load_plate(&pp).unwrap_or_else(|e| die(&format!("load_plate: {e}")));
+        let m2 = plate::motions_against_plate(&frames, &ext);
+        (ext, m2, true)
+    } else {
+        (plate::build_plate(&frames, &motions), motions, false)
+    };
+    eprintln!("plate: {}x{} origin ({:.1},{:.1}) cited={cited}  ({:.1}s)", pl.w, pl.h, pl.ox, pl.oy, t1.elapsed().as_secs_f32());
+    if let Some(sp) = arg_val(&args, "--save-plate") {
+        plate::save_plate(&pl, &sp).unwrap_or_else(|e| die(&format!("save_plate: {e}")));
+        eprintln!("plate saved to {sp}");
+    }
+    let cited_plate = cited;
 
     let mut opts = ResidualOpts::default();
     if let Some(v) = arg_val(&args, "--skip-thr") {
@@ -877,9 +892,12 @@ end_header
         let res_total: usize = rep.frames.iter().map(|c| c.residual_bytes).sum();
         let mode_total: usize = rep.frames.iter().map(|c| c.mode_bytes).sum();
         let n = frames.len();
-        let total = rep.plate_bytes + rep.motion_bytes + res_total + mode_total;
+        // A cited plate travels as a reference (UUID+alignment ≈ 24
+        // bytes), not as payload.
+        let plate_cost = if cited_plate { 24 } else { rep.plate_bytes };
+        let total = plate_cost + rep.motion_bytes + res_total + mode_total;
         let mut per: Vec<usize> = rep.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).collect();
-        println!("plate_bytes {}", rep.plate_bytes);
+        println!("plate_bytes {} (cited: {})", plate_cost, cited_plate);
         println!("mode_total {} residual_total {}  prev_mode_share {:.3}", mode_total, res_total, rep.prev_mode_share);
         per.sort_unstable();
         println!("per_frame min {} median {} max {}", per[0], per[n / 2], per[n - 1]);

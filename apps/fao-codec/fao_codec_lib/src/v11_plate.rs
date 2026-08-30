@@ -814,6 +814,64 @@ fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8
 /// Byte attribution is by final-SAD energy share of the GOP residual —
 /// approximate (bytes aren't exactly ∝ SAD at a fixed dead-zone) but
 /// honest about ranking which missing factor costs most.
+/// Serialize a plate: [w:u32][h:u32][ox:f32][oy:f32][y][u][v], zstd.
+/// A stored plate is the 2D-native CANONICAL: the first infrastructure
+/// of the library-citation department. A GOP encoded with --use-plate
+/// transmits alignment + motions + residual and CITES the plate
+/// instead of carrying it — the byte-level form of "match a canonical
+/// from last week and ship a reference." An engine-rendered canonical
+/// slots into this same interface later.
+pub fn save_plate(plate: &Plate, path: &str) -> std::io::Result<()> {
+    let mut raw = Vec::with_capacity(16 + plate.y.len() + plate.u.len() + plate.v.len());
+    raw.extend_from_slice(&(plate.w as u32).to_le_bytes());
+    raw.extend_from_slice(&(plate.h as u32).to_le_bytes());
+    raw.extend_from_slice(&plate.ox.to_le_bytes());
+    raw.extend_from_slice(&plate.oy.to_le_bytes());
+    raw.extend_from_slice(&plate.y);
+    raw.extend_from_slice(&plate.u);
+    raw.extend_from_slice(&plate.v);
+    let z = zstd::encode_all(raw.as_slice(), 19)?;
+    std::fs::write(path, z)
+}
+
+pub fn load_plate(path: &str) -> std::io::Result<Plate> {
+    let z = std::fs::read(path)?;
+    let raw = zstd::decode_all(z.as_slice())?;
+    let rd_u32 = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+    let rd_f32 = |o: usize| f32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+    let (w, h) = (rd_u32(0) as usize, rd_u32(4) as usize);
+    let (ox, oy) = (rd_f32(8), rd_f32(12));
+    let ysz = w * h;
+    let csz = (w / 2) * (h / 2);
+    Ok(Plate {
+        w,
+        h,
+        ox,
+        oy,
+        y: raw[16..16 + ysz].to_vec(),
+        u: raw[16 + ysz..16 + ysz + csz].to_vec(),
+        v: raw[16 + ysz + csz..16 + ysz + 2 * csz].to_vec(),
+    })
+}
+
+/// Motions for a GOP against an EXTERNAL (cited) plate: align frame 0
+/// to the plate via phase correlation against the plate's zero-motion
+/// prediction, then offset the GOP's own cumulative motions by that
+/// alignment. Costs 8 bytes on the wire (two f32s).
+pub fn motions_against_plate(frames: &[Yuv420], plate: &Plate) -> Vec<PlateMotion> {
+    use crate::phase_correlation::PhaseCorrelationPass;
+    let (fw, fh) = (frames[0].w, frames[0].h);
+    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 };
+    let pred0 = predict_frame(plate, &zero, fw, fh);
+    let pc = PhaseCorrelationPass::new(512.min(fw.min(fh)));
+    let a = pc.estimate(&frames[0].y, &pred0.y, fw, fh);
+    let (ax, ay) = if a.confidence > 0.1 { (-a.dx, -a.dy) } else { (0.0, 0.0) };
+    estimate_motions(frames)
+        .into_iter()
+        .map(|m| PlateMotion { dx: m.dx + ax, dy: m.dy + ay, confidence: m.confidence })
+        .collect()
+}
+
 pub fn residual_ledger(frames: &[Yuv420]) -> String {
     let (fw, fh) = (frames[0].w, frames[0].h);
     let motions = estimate_motions(frames);
