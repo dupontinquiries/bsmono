@@ -12240,3 +12240,23 @@ adoption would fix once its over-plant is understood. NEXT-SESSION PLAY, one mov
 classifier switch, run THIS histogram at 424242, and the biome the 2.35x excess concentrates in names the amplifier
 (prime candidates: a registry-mapped biome with a dense profile, or the Savanna→islands branch activating where the
 2D classifier didn't).
+
+## r615 — THE AMPLIFIER CORNERED TO ONE TERM: TemperateForest effective-density inputs under the r613 form
+The one-move diagnosis ran: tree-site switch re-applied, per-biome histogram at seed 424242, then reverted (verified
+restored: ratio 0.921). THE EXCESS IS ENTIRELY TemperateForest — 18,046 cpu vs 45,482 gpu tree cells on columns BOTH
+backends classify identically (histogram classifies CPU-side; the mirror is exactness-proven per r614). Eliminated
+this round with measurements: (1) tree_origin_hash's low tail is FAIR — python transliteration over the near-set
+footprint gives P(h<thr) within 1% of thr at 0.01/0.02/0.04/0.06; (2) climate_tree_factor formulas are line-identical
+both sides (same bell, same humid slope, same hot-dry cutoff). With classification, profile tables, hash fairness,
+and the factor formula all equal, the only term left is the FACTOR'S INPUTS: under r613 the GPU feeds
+climate_tree_factor temp/humid at surface_target while the CPU feeds it climate at the SCANNED surface_y — and the
+r612 "balance" (0.921) is now understood as two errors partially cancelling (wrong biome source × wrong climate y).
+Arithmetic bound: the factor spans [0.06, 1.5], so a 2.5x input-driven swing is possible iff temp/humid move
+materially between those y's — which indicts the MODEL'S y-dependence (lapse strength) as the quantity to measure.
+NEXT MEASUREMENT, precisely: CPU-side, over the histogram's TemperateForest columns, print
+(temp, humid, factor) at scanned-surface_y vs surface_target vs sl+10 — three numbers per column, averaged; whichever
+input pair reproduces the 2.5x factor ratio identifies the exact term, and the fix is then either aligning the
+GPU's climate y to the scanned surface (the decision already scans it — reorder so climate is computed AFTER
+d.surface_y) or documenting a model-lapse quirk. State shipped: tree site at r612 form (best measured), all
+instruments in-tree, panel numbers unchanged from r613's best (0/610/10.8k/1.7k terrain; 1.000/1.369/0.921/1.000
+mass).
