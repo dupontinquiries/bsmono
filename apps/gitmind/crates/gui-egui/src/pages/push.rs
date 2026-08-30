@@ -9,6 +9,11 @@ pub struct State {
     pub user: String,
     pub host: String,
     pub target: String,
+    /// Where on the device the binary lands. Browsed rather than typed
+    /// blind — see the "install to" row.
+    pub dest: String,
+    /// The open folder picker, when browsing.
+    pub browser: Option<crate::remote_browse::Browser>,
     pub strategy: String,
     pub note: String,
     pub subnet: String,
@@ -32,6 +37,8 @@ impl Default for State {
             user: "user".to_string(),
             host: String::new(),
             target: "aarch64-unknown-linux-musl".to_string(),
+            dest: String::new(),
+            browser: None,
             strategy: String::new(),
             note: String::new(),
             subnet: String::new(),
@@ -137,6 +144,72 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             app.push.strategy = format!("{:?} — {}", c.strategy, c.reason);
         }
     });
+    // WHERE ON THE DEVICE IT LANDS. `remote_browse` has existed with
+    // tests since the port and nothing constructed it — the page had
+    // fields for user, host and target triple and none for the
+    // destination path, so the GTK build's folder picker had no
+    // equivalent here and the destination was simply unreachable.
+    ui.horizontal(|ui| {
+        ui.label("install to");
+        ui.text_edit_singleline(&mut app.push.dest);
+        if ui.button("browse…").clicked() {
+            let mut b = crate::remote_browse::Browser::new(&app.push.user, &app.push.host);
+            // Starting at the destination already typed rather than at
+            // `/`: someone who half-remembers the path gets to correct
+            // it instead of walking the tree from the root.
+            let start = if app.push.dest.trim().is_empty() { "/" } else { app.push.dest.trim() };
+            b.open(start, cockpit::deploy::list_remote_dirs);
+            app.push.browser = Some(b);
+        }
+    });
+    if let Some(b) = app.push.browser.as_mut() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(b.current().unwrap_or("/")).monospace().small());
+            if b.can_go_up() && ui.small_button("up").clicked() {
+                b.up(cockpit::deploy::list_remote_dirs);
+            }
+            if ui.small_button("use this").clicked() {
+                if let Some(p) = b.choose() {
+                    app.push.dest = p.to_string();
+                }
+                app.push.browser = None;
+            }
+            if ui.small_button("cancel").clicked() {
+                app.push.browser = None;
+            }
+        });
+        // Entries drawn after the controls so a long listing cannot push
+        // "cancel" off the bottom — the one button a person needs when a
+        // browse goes somewhere unexpected.
+        //
+        // Every state is shown, including Failed. `remote_browse` keeps a
+        // failure as a STATE rather than a popup precisely so the path
+        // stack survives, and swallowing it here would waste that: a
+        // permission error two levels deep should say so and leave the
+        // navigation intact.
+        match &b.state {
+            crate::remote_browse::State::Loading => {
+                ui.label(egui::RichText::new("listing…").weak().small());
+            }
+            crate::remote_browse::State::Failed(e) => {
+                ui.label(egui::RichText::new(e).small().color(egui::Color32::from_rgb(220, 120, 90)));
+            }
+            crate::remote_browse::State::Idle => {}
+            crate::remote_browse::State::Ready(listing) => {
+                let dirs: Vec<String> = listing.dirs.clone();
+                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                    if dirs.is_empty() {
+                        ui.label(egui::RichText::new("no subdirectories").weak().small());
+                    }
+                    for name in dirs {
+                        if ui.selectable_label(false, &name).clicked() {
+                            b.enter(&name, cockpit::deploy::list_remote_dirs);
+                        }
+                    }
+                });
+            }
+        }
+    }
     if !app.push.strategy.is_empty() {
         ui.label(egui::RichText::new(&app.push.strategy).color(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)).small());
     }

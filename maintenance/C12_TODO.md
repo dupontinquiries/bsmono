@@ -3259,3 +3259,41 @@ from the machine.
 - **C12-60a — logscope's remaining 8 and gitmind's 13 are unexamined**
   at the new scope. Same rule: hand-check with a WHOLE-TREE grep before
   claiming anything about them.
+
+## 61. gitmind-egui: the deploy destination was unreachable
+
+`remote_browse` is gitmind-egui's only uncalled module at the corrected
+scope, and its own header says exactly what was missing: "The push page
+has fields for user, host and target triple, and none for WHERE ON THE
+DEVICE the code should land. The GTK build browses it ... The egui port
+uses five of `cockpit::deploy`'s functions and not that one."
+
+Confirmed: `pages/push.rs` has `target` (the triple) and no destination
+path at all. So fleet deployment from the egui build could not say where
+to install.
+
+Wired. `PushState` gains `dest` and an optional `Browser`; an "install
+to" row with a "browse…" button drives `cockpit::deploy::list_remote_dirs`
+— the signature `Browser::open` expects, exactly.
+
+Three details:
+  - Browsing STARTS at the destination already typed, falling back to
+    `/`. Someone who half-remembers the path corrects it rather than
+    walking the tree from the root.
+  - Controls are drawn ABOVE the listing so a long directory cannot push
+    "cancel" off the bottom — the one button a person needs when a
+    browse goes somewhere unexpected.
+  - `State::Failed` is displayed, not swallowed. `remote_browse` keeps a
+    failure as a state rather than a popup precisely so the path stack
+    survives, and hiding it here would waste that design.
+
+Also corrected a mistake mid-edit: I wrote `b.entries()` from memory and
+there is no such method — the listing lives in `State::Ready(Listing)`.
+Checked rather than assumed, which is the same discipline the last
+commit was about.
+
+- **C12-61a — NOT COMPILED.**
+- **C12-61b — `dest` is not yet USED by the push itself.** The field is
+  collected and the deploy call has not been updated to pass it, so this
+  is half the wiring: the destination is now expressible but not yet
+  honoured.
