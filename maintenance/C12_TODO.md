@@ -2533,3 +2533,27 @@ The cost of the guard is two lines; the cost of being wrong about
 "unreachable" is the app.
 
 Two tests, each stating why the impossible case is worth pinning.
+
+## 43. The same two panics again, in bot-arena
+
+Checked whether §42's bo-suite findings appeared elsewhere. They did,
+verbatim: `bot-arena/egui-frontend` has the identical
+`VIEWS[self.view_idx]` and the identical
+`page() = clamp(0, n as i32 - 1)`. The two apps were built from one
+another and the bugs travelled with the shape.
+
+Worth stating because it changes what the §42 fix was worth: a bug that
+appears twice is not a slip, it is a PATTERN in how these frontends get
+started, and the next app cloned from either will carry it too.
+
+One difference, and it is the more dangerous of the two. bot-arena also
+sets `self.view_idx = 1` from the Start button — a LITERAL index into
+VIEWS. That is worse than the unchecked read: a reorder of VIEWS sends
+Start to whatever moved into slot 1, silently, with nothing to report
+because an index cannot be wrong the way a name can. It now looks the
+view up by name and keeps the current view if it is missing, so a rename
+presents as "Start did nothing" rather than "Start opened Standings".
+
+- **C12-43a — check the other frontends for literal view indices.**
+  `VIEWS.iter().position(...)` is cheap and a literal is not detectably
+  wrong. Not swept yet.

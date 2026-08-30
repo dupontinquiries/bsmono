@@ -42,6 +42,12 @@ pub const VIEWS: [&str; 6] = ["Setup", "Arena", "Standings", "Replays", "Logs", 
 
 /// Move the view index by a swipe sign (-1 / +1), clamped to the ends.
 pub fn page(idx: usize, sign: i32, n: usize) -> usize {
+    // `n == 0` is `clamp(0, -1)`, and clamp PANICS when min > max. The
+    // same helper, with the same hole, exists in bo-suite — these two
+    // apps were built from one another and the bug came along.
+    if n == 0 {
+        return 0;
+    }
     (idx as i32 + sign).clamp(0, n as i32 - 1) as usize
 }
 
@@ -115,7 +121,14 @@ impl Dashboard {
     }
 
     pub fn current(&self) -> &'static str {
-        VIEWS[self.view_idx]
+        // `view_idx` is written from a widget's return (line ~170), from
+        // `page()`, and from a LITERAL 1 at the Start button — that last
+        // one is why this matters more here than in bo-suite: a literal
+        // index survives a VIEWS reorder silently and only fails when
+        // the list shrinks, in the draw path, taking the app with it.
+        //
+        // Wrong label, working app, corrected on the next select.
+        VIEWS.get(self.view_idx).copied().unwrap_or(VIEWS[0])
     }
 
     /// Drain both workers into their models. Call once per frame, before
@@ -262,7 +275,17 @@ impl Dashboard {
                 {
                     self.engine.start(self.form.to_config(), &mut self.model);
                     self.replay_sel = None;
-                    self.view_idx = 1; // jump to the arena, like the GTK Start does
+                    // BY NAME, not by the literal 1. A reorder of VIEWS
+                    // would have sent Start to whatever moved into slot
+                    // 1 — silently, with no error anywhere, because an
+                    // index cannot be wrong the way a name can. The
+                    // fallback keeps the current view rather than
+                    // guessing, so a rename shows up as "Start did
+                    // nothing" instead of "Start opened Standings".
+                    self.view_idx = VIEWS
+                        .iter()
+                        .position(|v| *v == "Arena")
+                        .unwrap_or(self.view_idx);
                 }
                 if ui
                     .add_enabled(self.engine.running(), egui::Button::new("Stop"))
@@ -530,6 +553,33 @@ fn path_edit(ui: &mut Ui, a11y: &mut uikit_egui::a11y::A11yScene, id: u64,
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn paging_an_empty_list_does_not_panic() {
+        // clamp(0, -1) panics because min > max. Same helper, same hole,
+        // in bo-suite — these two apps were built from one another.
+        assert_eq!(page(0, 1, 0), 0);
+        assert_eq!(page(3, -1, 0), 0);
+    }
+
+    #[test]
+    fn the_start_button_finds_the_arena_by_name() {
+        // It used to be `view_idx = 1`. A reorder of VIEWS would have
+        // sent Start to whatever moved into slot 1, silently — an index
+        // cannot be wrong the way a name can, so nothing would have
+        // reported it.
+        let want = VIEWS.iter().position(|v| *v == "Arena");
+        assert_eq!(want, Some(1), "if this moves, the lookup still finds it");
+        assert!(VIEWS.contains(&"Arena"), "Start has somewhere to go");
+    }
+
+    #[test]
+    fn an_out_of_range_view_index_does_not_take_the_app_down() {
+        let mut c = Controller::default();
+        c.view_idx = 99;
+        assert_eq!(c.current(), VIEWS[0]);
+    }
     use super::*;
 
     #[test]
