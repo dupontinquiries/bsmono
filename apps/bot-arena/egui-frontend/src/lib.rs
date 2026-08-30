@@ -576,7 +576,11 @@ mod tests {
 
     #[test]
     fn an_out_of_range_view_index_does_not_take_the_app_down() {
-        let mut c = Controller::default();
+        // `Dashboard`, not `Controller` — that is bo-suite's type. The
+        // two apps were built from one another, which is how the same
+        // two bugs appeared in both, and it is also how I copied a test
+        // that named the wrong struct.
+        let mut c = Dashboard::new();
         c.view_idx = 99;
         assert_eq!(c.current(), VIEWS[0]);
     }

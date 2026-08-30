@@ -338,7 +338,7 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
                 // appears. Dropping it would leave "install failed" with
                 // nothing to act on.
                 for l in &r.log { sink.push(l); }
-                format!("reroll finished — {} device(s) reported", report.devices.len())
+                format!("reroll finished — {} device(s) reported", report.per_device.len())
             });
         }
         if !can_run && !app.task.is_running() {

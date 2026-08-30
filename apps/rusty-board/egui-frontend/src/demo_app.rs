@@ -102,6 +102,33 @@ struct Feel {
 }
 
 impl Feel {
+    /// Send text to the sink and mirror it in the preview.
+    ///
+    /// ONE place, so a key path added later cannot quietly skip the sink
+    /// the way the direct `self.typed.push_str` calls did. The preview
+    /// is a mirror of what was sent, never the destination.
+    fn emit_text(&mut self, text: &str) {
+        if let Err(e) = self.sink.commit_text(text) {
+            self.sink_error = Some(e);
+        }
+        self.typed.push_str(text);
+    }
+
+    /// Send a non-character key by keysym name, and mirror its effect.
+    fn emit_key(&mut self, keysym: &str) {
+        if let Err(e) = self.sink.press_keysym(keysym) {
+            self.sink_error = Some(e);
+        }
+        match keysym {
+            "BackSpace" => {
+                self.typed.pop();
+            }
+            "Return" => self.typed.push('\n'),
+            "Tab" => self.typed.push('\t'),
+            _ => {}
+        }
+    }
+
     pub fn new() -> Feel {
         Feel {
             a11y: uikit_egui::a11y::A11yScene::new(),
@@ -150,33 +177,6 @@ impl eframe::App for Feel {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     #[allow(deprecated)]
-    /// Send text to the sink and mirror it in the preview.
-    ///
-    /// ONE place, so a key path added later cannot quietly skip the sink
-    /// the way the direct `self.typed.push_str` calls did. The preview
-    /// is a mirror of what was sent, never the destination.
-    fn emit_text(&mut self, text: &str) {
-        if let Err(e) = self.sink.commit_text(text) {
-            self.sink_error = Some(e);
-        }
-        self.typed.push_str(text);
-    }
-
-    /// Send a non-character key by keysym name, and mirror its effect.
-    fn emit_key(&mut self, keysym: &str) {
-        if let Err(e) = self.sink.press_keysym(keysym) {
-            self.sink_error = Some(e);
-        }
-        match keysym {
-            "BackSpace" => {
-                self.typed.pop();
-            }
-            "Return" => self.typed.push('\n'),
-            "Tab" => self.typed.push('\t'),
-            _ => {}
-        }
-    }
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx);
         // Drain the service queue once per frame. Without this `pending` grows

@@ -33,7 +33,7 @@
 //! could only diagnose the local host would be useless in exactly the
 //! case it exists for. Paste the output, get the verdict.
 
-use crate::App;
+use crate::app::App;
 
 #[derive(Default)]
 pub struct State {

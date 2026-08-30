@@ -3034,12 +3034,16 @@ impl eframe::App for VoicetermApp {
             // WHAT THE SHELL SAID. Drained every frame and fed to the same
             // parser the local echo uses, so there is one path into the
             // grid rather than two that can disagree about cursor state.
-            if let Some(host) = &self.pty {
-                let out = host.drain();
+            // Drained into a local FIRST, then the borrow ends: `feed_pty`
+            // takes `&mut self` and holding `&self.pty` across it is
+            // E0502. Same shape as aperture's typeout fix — a borrow of
+            // one field held across a whole-self method.
+            let drained = self.pty.as_ref().map(|h| (h.drain(), h.ended()));
+            if let Some((out, ended)) = drained {
                 if !out.is_empty() {
                     self.feed_pty(&out);
                 }
-                if host.ended() {
+                if ended {
                     // Say so once. A terminal whose shell has exited but
                     // still accepts keystrokes is the confusing state
                     // this avoids.

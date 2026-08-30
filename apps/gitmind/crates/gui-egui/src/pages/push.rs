@@ -175,20 +175,25 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             app.push.browser = Some(b);
         }
     });
+    let (mut picked, mut dismiss) = (None::<String>, false);
     if let Some(b) = app.push.browser.as_mut() {
+        // The closure cannot touch `app` — it already holds `b`, which
+        // borrows `app.push.browser` (E0500). So the buttons record an
+        // INTENT and the decisions are applied after the borrow ends.
+        // Same shape as the borrow splits in the chat tab and the fleet
+        // page; fourth time this week.
+        let (mut chosen, mut close) = (None::<String>, false);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(b.current().unwrap_or("/")).monospace().small());
             if b.can_go_up() && ui.small_button("up").clicked() {
                 b.up(cockpit::deploy::list_remote_dirs);
             }
             if ui.small_button("use this").clicked() {
-                if let Some(p) = b.choose() {
-                    app.push.dest = p.to_string();
-                }
-                app.push.browser = None;
+                chosen = b.choose().map(str::to_string);
+                close = true;
             }
             if ui.small_button("cancel").clicked() {
-                app.push.browser = None;
+                close = true;
             }
         });
         // Entries drawn after the controls so a long listing cannot push
@@ -222,6 +227,19 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 });
             }
         }
+        // Applied here, outside the closure but still inside the borrow
+        // — so the writes go through locals captured above rather than
+        // through `app`.
+        if let Some(p) = chosen.take() {
+            picked = Some(p);
+        }
+        dismiss = close;
+    }
+    if let Some(p) = picked {
+        app.push.dest = p;
+    }
+    if dismiss {
+        app.push.browser = None;
     }
     if !app.push.strategy.is_empty() {
         ui.label(egui::RichText::new(&app.push.strategy).color(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)).small());

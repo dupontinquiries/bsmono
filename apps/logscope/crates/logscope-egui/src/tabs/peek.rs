@@ -120,7 +120,7 @@ impl Peek {
                             .find(|(_, r)| r.contains(egui::pos2(p.x, p.y)))
                             .map(|(line, _)| Hit::Line(*line))
                     })
-                    .unwrap_or(Hit::Nothing);
+                    .unwrap_or(Hit::Empty);
                 match map_gesture(Mode::Read, &g, hit) {
                     LogAction::FoldAll => self.collapse = true,
                     LogAction::UnfoldAll => self.collapse = false,

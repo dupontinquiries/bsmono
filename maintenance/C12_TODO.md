@@ -3882,3 +3882,40 @@ one string in the `coding` group, and the fleet picks it up.
   they are gone everywhere, the 760-commit history the index calls
   "almost certainly skydribble's real development history" is gone with
   them, and that is a bigger loss than the app.
+
+## 73. Build 117 feedback: eleven compile errors, all mine
+
+First real compile of the work written under "don't compile, I'll test".
+The trade played out exactly as expected and is worth tallying honestly:
+**9 broken builds, 2048 tests passing, and every build error was in code
+I wrote blind.**
+
+Fixed:
+  - **aperture** E0499 — the typeout Tab handler held `self.typeout`
+    across `after_edit(&mut self)`. Take the bit and the done-flag out
+    in a small scope, then act.
+  - **voiceterm** E0502 — same shape: `&self.pty` held across
+    `feed_pty(&mut self)`. Drain into a local first.
+  - **gitmind** ×3 — `crate::App` should be `crate::app::App`;
+    `Report.devices` is `per_device`; and the browse closure cleared
+    `app.push.browser` while borrowing it (E0500), fixed by recording an
+    intent and applying it after the borrow.
+  - **logscope** — the `ctx_card_*` field DECLARATIONS never landed
+    (initialiser and uses did), and `Hit::Nothing` is `Hit::Empty`.
+  - **bo-suite** — I deleted the `lower` closure and left two callers;
+    `Album`/`Artist` needed `Default` for the test fixtures;
+    `Controller::default()` does not exist (`new(devices, scenes)` does).
+  - **bot-arena** — my test named `Controller`, which is BO-SUITE's
+    type. These two apps were built from one another, which is how the
+    same two panics appeared in both, and also how I copied a test that
+    named the wrong struct.
+
+The pattern in my own errors: **six of eleven are borrow or naming
+mistakes that a compile catches in seconds and a reader does not.** The
+two borrow conflicts are the same shape (a field borrow held across a
+whole-self method) and I made it twice in different apps on the same
+day.
+
+- **C73a — test failures NOT yet examined.** 10 crates failing,
+  including beatspace at 12 — the largest and not one I have touched
+  recently.

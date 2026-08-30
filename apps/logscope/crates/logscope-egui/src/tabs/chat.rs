@@ -1359,6 +1359,13 @@ pub struct Chat {
     /// plain engine.
     route_persona: Option<String>,
     /// Cached context-card contents. See the draw site: this block
+    /// re-scanned the transcript and re-extracted keywords every frame.
+    /// Keyed on (message count, last message length) so a STREAMING
+    /// reply growing in place still invalidates it.
+    ctx_card_key: Option<(usize, usize)>,
+    ctx_card_code: Option<String>,
+    ctx_card_kws: Vec<String>,
+    /// Cached context-card contents. See the draw site: this block
     /// re-scanned the transcript and re-extracted keywords on every
     /// frame.
     /// Rounds the panel has run, ever. Counts UP so

@@ -64,7 +64,10 @@ pub const ROW_H: f32 = 60.0;
 
 /// One album card. Mirrors `media::library::AlbumSummary` field for field so
 /// the mapping is checkable by eye.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Default` so tests can build one with `..Default::default()` and name
+// only the fields under test — a fixture that lists every field reads as
+// if all of them matter to the assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Album {
     pub title: String,
     pub primary_artist: String,
@@ -130,7 +133,7 @@ impl Heat {
 }
 
 /// One artist row. Mirrors `media::library::ArtistDetail`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Artist {
     pub id: i64,
     pub name: String,
@@ -266,10 +269,12 @@ pub fn sort_albums(albums: &mut [Album], sort: AlbumSort) {
         // sorting as year 0 at the top, which would fill the first screen of a
         // "newest" list with the least-tagged files in the library.
         AlbumSort::Year => albums.sort_by(|a, b| {
-            b.year.unwrap_or(0).cmp(&a.year.unwrap_or(0)).then(lower(&a.title).cmp(&lower(&b.title)))
+            b.year.unwrap_or(0).cmp(&a.year.unwrap_or(0))
+                .then_with(|| cmp_fold(&a.title, &b.title))
         }),
         AlbumSort::MostPlayed => albums.sort_by(|a, b| {
-            b.total_plays.cmp(&a.total_plays).then(lower(&a.title).cmp(&lower(&b.title)))
+            b.total_plays.cmp(&a.total_plays)
+                .then_with(|| cmp_fold(&a.title, &b.title))
         }),
     }
 }

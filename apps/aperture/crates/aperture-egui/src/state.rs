@@ -1724,9 +1724,17 @@ impl AppState {
                                 Some(aperture_complete::multipass::Typeout::new(text));
                         }
                     }
-                    if let Some(t) = self.typeout.as_mut() {
-                        if let Some(bit) = t.next_bit() {
-                            let bit = bit.to_string();
+                    // The borrow on `self.typeout` is CLOSED before any
+                    // `self.` call: `after_edit` takes `&mut self`, and
+                    // holding the typeout across it is E0499. Taking the
+                    // bit and the done-flag out in one small scope is
+                    // the fix, and it is why this reads as three steps
+                    // rather than one.
+                    let taken = self.typeout.as_mut().and_then(|t| {
+                        t.next_bit().map(|b| b.to_string()).map(|b| (b, t.done()))
+                    });
+                    match taken {
+                        Some((bit, done)) => {
                             self.editor.insert_text(&bit, now_ms);
                             self.after_edit(now_ms);
                             self.debounce.cancel();
@@ -1735,12 +1743,13 @@ impl AppState {
                             // ahead of the caret as if it were still
                             // pending.
                             self.ghost.consume(&bit);
-                            if t.done() {
+                            if done {
                                 self.typeout = None;
                             }
-                            return;
                         }
-                        self.typeout = None;
+                        // Exhausted: drop it so the next Tab rebuilds
+                        // from whatever the ghost now holds.
+                        None => self.typeout = None,
                     }
                     return;
                 }

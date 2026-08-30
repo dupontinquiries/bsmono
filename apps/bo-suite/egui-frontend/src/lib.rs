@@ -1447,7 +1447,11 @@ mod tests {
         // bound depends on that widget having been built from VIEWS.
         // True today; not something `current()` can check. A wrong label
         // is recoverable, a panic in the draw path is not.
-        let mut c = Controller::default();
+        // `Controller::new` rather than `default()`: it has no Default
+        // impl, and adding one to satisfy a test would put a
+        // deviceless, sceneless Controller in the public API for no
+        // other reason.
+        let mut c = Controller::new(Vec::new(), Vec::new());
         c.view_idx = VIEWS.len() + 7;
         assert_eq!(c.current(), VIEWS[0], "fell back rather than panicking");
     }
