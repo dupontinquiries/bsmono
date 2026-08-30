@@ -12222,3 +12222,21 @@ profile/density keyed off registry-mapped biomes interacting with the by-design 
 shelf-refinement edge hit at scale on land seeds. The tree site keeps the r612 form until answered. Cumulative
 context: terrain diffs at the panel's worst seed are down from ~105k (pre-r607) to ~10.8k, with two seeds at 0 and
 610. No soak this round (three shader rounds without one — it MUST lead the next slice before any device claim).
+
+## r614 — SOAK DEBT PAID; the tree-site puzzle narrowed: the classifier mirror is EXACT, the regression is downstream
+Soak first (the r613 debt): fullgame rebuilt on the accumulated r611-r613 shader state, 90 s autoplay soak exit 0,
+zero panics/watchdog, 39 InGame frames — the registry SSBO + classifier port are live-stable in-world.
+THE PUZZLE INSTRUMENTED: (1) glsl_biome_at_3d_transliteration_vs_cpu — a literal f32 Rust transliteration of
+biome_at_3d_gpu (defs baked pre-Arc; registry loaded workspace-relative for test cwd) diffed against the REAL
+biome_at_3d over a 6,873-column surface grid at the regressing seed: **0 mismatches**. The classifier mirror is
+EXACT; the r613 tree-site regression is entirely DOWNSTREAM of classification. (Caveat recorded: the transliteration
+reuses the CPU's surface_y_at for the shelf refinement rather than re-transliterating the GLSL scan — the scan itself
+is pinned only indirectly.) (2) Biome-id-table audit: Rust discriminants vs GLSL BIOME_* constants match 0-28 exactly
+— the baked blocks[].z ids are sound. (3) NEW probe instrument UNENDLICH_PROBE_TREE_BIOMES=1: per-biome tree-cell
+histograms, classifying each tree column CPU-side (valid because the mirror is exact). BASELINE at seed 424242 under
+the current r612 tree site: TemperateForest (18,046 cpu / 17,131 gpu) and Plains (1,918 / 1,091) balanced; small
+GPU-only leakage on Beach (6/109) and Ocean (0/71) — the old 2D classifier planting shoreline trees, which the r613
+adoption would fix once its over-plant is understood. NEXT-SESSION PLAY, one move: temporarily re-apply the tree-site
+classifier switch, run THIS histogram at 424242, and the biome the 2.35x excess concentrates in names the amplifier
+(prime candidates: a registry-mapped biome with a dense profile, or the Savanna→islands branch activating where the
+2D classifier didn't).

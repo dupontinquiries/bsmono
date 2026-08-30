@@ -379,6 +379,38 @@ fn main() {
         println!(
             "  tree mass: cpu={cpu_tree_total} gpu={gpu_tree_total} ratio={mass_ratio:.3}"
         );
+        // r614: per-biome tree-cell histograms. The biome_at_3d mirror is
+        // proven exact (0/6873 transliteration test), so classifying each
+        // tree cell's column CPU-side tells us which biome the GPU's
+        // excess concentrates in — naming the downstream amplifier.
+        if std::env::var("UNENDLICH_PROBE_TREE_BIOMES").map(|v| v == "1").unwrap_or(false) {
+            use unendlich_engine::world::biome_loader::BiomeRegistry;
+            use unendlich_engine::world::cpu_generator::WorldGenerator;
+            let mut reg = BiomeRegistry::empty();
+            let _ = reg.load_directory("assets/biomes");
+            let wg = WorldGenerator::with_biome_registry(seed as u32, std::sync::Arc::new(reg));
+            let cs = unendlich_engine::constants::CHUNK_SIZE as usize;
+            let mut hist: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
+            for ((coord, cc), gc) in coords.iter().zip(cpu_chunks.iter()).zip(gpu_chunks.iter()) {
+                for i in 0..cc.blocks.len() {
+                    let (a, b) = (cc.blocks[i], gc.blocks[i]);
+                    let ta = is_tree(a);
+                    let tb = is_tree(b);
+                    if !ta && !tb { continue; }
+                    let wx = coord.x * cs as i32 + (i % cs) as i32;
+                    let wz = coord.z * cs as i32 + ((i / cs) % cs) as i32;
+                    let sy = wg.surface_y_at(wx, wz, -64, 256).unwrap_or(64);
+                    let biome = format!("{:?}", wg.biome_at_3d(wx, sy, wz).biome);
+                    let e = hist.entry(biome).or_default();
+                    if ta { e.0 += 1; }
+                    if tb { e.1 += 1; }
+                }
+            }
+            let mut v: Vec<_> = hist.into_iter().collect();
+            v.sort_by_key(|(_, (c, g))| std::cmp::Reverse(*c.max(g)));
+            v.truncate(6);
+            println!("  tree cells by biome (cpu, gpu): {v:?}");
+        }
         let ratio = if tree_cells > 0 { tree_diff as f64 / tree_cells as f64 } else { 0.0 };
         println!(
             "worldgen-parity: {} chunks | terrain diffs {} | tree cells {} | tree diffs {} ({:.1}%)",

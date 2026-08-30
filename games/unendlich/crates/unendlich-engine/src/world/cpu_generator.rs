@@ -1847,6 +1847,123 @@ mod tests {
         );
     }
 
+    /// r614: the tree-site puzzle instrument. The GLSL biome_at_3d_gpu
+    /// (transliterated below, f32, literally) is diffed against the REAL
+    /// biome_at_3d over a coordinate grid at the regressing seed. Zero or
+    /// near-zero mismatches ⇒ the r613 tree-site regression is DOWNSTREAM
+    /// of classification (profile/density/hash interplay); a large count
+    /// ⇒ a mirror bug, located by the printed mismatch cases.
+    #[test]
+    fn glsl_biome_at_3d_transliteration_vs_cpu() {
+        use crate::world::biome_loader::BiomeRegistry;
+        // load_standard resolves cwd-dependently; tests run from the
+        // crate dir, so try the workspace-relative path explicitly.
+        let mut reg = BiomeRegistry::empty();
+        let loaded = ["../../assets/biomes", "assets/biomes"]
+            .iter()
+            .find_map(|p| reg.load_directory(p).ok());
+        if loaded.is_none() {
+            eprintln!("SKIP: no biome assets from test cwd");
+            return;
+        }
+        // Bake the def table BEFORE the registry moves into the Arc.
+        let defs: Vec<(f32, f32, f32, u32)> = reg
+            .defs()
+            .iter()
+            .map(|d| {
+                let (t, h) = d.climate_coord();
+                let pen = if d.legacy_enum.is_none() { 0.01f32 } else { 0.0 };
+                (t as f32, h as f32, pen, d.to_legacy() as u32)
+            })
+            .collect();
+        let g = WorldGenerator::with_biome_registry(424242, std::sync::Arc::new(reg));
+
+        // ---- literal transliteration of biome_at_3d_gpu (f32) ----
+        let glsl = |x: f32, y: f32, z: f32| -> u32 {
+            let temp = g.model().temperature(x as f64, y as f64, z as f64, 0.0) as f32;
+            let humid = g.model().humidity(x as f64, y as f64, z as f64, 0.0) as f32;
+            let erosion_raw = ((crate::world::noise::fbm_2d(
+                (x * 0.0008) as f64,
+                (z * 0.0008) as f64,
+                g.seed().wrapping_add(0xE105),
+                2,
+                1.0,
+                1.0,
+            ) as f32)
+                - 0.5)
+                * 2.0;
+            let erosion_unit = (erosion_raw + 1.0) * 0.5;
+            let legacy_verdict =
+                determine_biome(temp as f64, humid as f64, erosion_unit as f64);
+            let sl = g.model().sea_level(x as f64, z as f64, 0.0) as f32;
+            let st = sl
+                + g.model().continental(x as f64, z as f64) as f32 * 30.0
+                + g.model().hills(x as f64, z as f64) as f32 * 15.0;
+            let ocean_threshold =
+                sl - 2.0 - (legacy_verdict.height_modifier() as f32).max(0.0);
+            let shelf_threshold = sl + 6.0;
+            let mut topo: Option<Biome> = None;
+            if st < ocean_threshold {
+                topo = Some(Biome::Ocean);
+            } else if st < shelf_threshold {
+                match g.surface_y_at(x as i32, z as i32, (sl - 120.0) as i32, (sl + 8.0) as i32)
+                {
+                    Some(sy) if (sy as f32) < sl - 2.0 => topo = Some(Biome::Ocean),
+                    Some(sy) if (sy as f32) < sl + 2.0 => topo = Some(Biome::Beach),
+                    _ => {}
+                }
+            }
+            if let Some(t) = topo {
+                return t as u32;
+            }
+            if matches!(legacy_verdict, Biome::Ocean | Biome::Beach) {
+                return legacy_verdict as u32;
+            }
+            let (tt, th) = (temp.clamp(0.0, 1.0), humid.clamp(0.0, 1.0));
+            let mut best = -1i32;
+            let mut best_d2 = f32::INFINITY;
+            for (i, &(dt_, dh_, pen, _)) in defs.iter().enumerate() {
+                let dt = dt_ - tt;
+                let dh = dh_ - th;
+                let d2 = dt * dt + dh * dh + pen;
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = i as i32;
+                }
+            }
+            if best >= 0 {
+                return defs[best as usize].3;
+            }
+            legacy_verdict as u32
+        };
+        // ---- end transliteration ----
+
+        let (mut mismatch, mut total) = (0u32, 0u32);
+        let mut cases: Vec<(i32, i32, u32, u32)> = Vec::new();
+        for wx in (-1600..1600).step_by(37) {
+            for wz in (-1600..1600).step_by(41) {
+                let sy = match g.surface_y_at(wx, wz, -64, 256) {
+                    Some(y) => y,
+                    None => continue,
+                };
+                total += 1;
+                let cpu = g.biome_at_3d(wx, sy, wz).biome as u32;
+                let gpu = glsl(wx as f32, sy as f32, wz as f32);
+                if cpu != gpu {
+                    mismatch += 1;
+                    if cases.len() < 8 {
+                        cases.push((wx, wz, cpu, gpu));
+                    }
+                }
+            }
+        }
+        println!("biome_at_3d transliteration: {mismatch}/{total} mismatches; first: {cases:?}");
+        assert!(
+            (mismatch as f64) < (total as f64) * 0.02,
+            "mirror diverges materially: {mismatch}/{total}, cases {cases:?}"
+        );
+    }
+
     /// Climate tree factor: peak in mild + humid (>1.0).
     #[test]
     fn climate_tree_factor_peaks_in_mild_humid() {
