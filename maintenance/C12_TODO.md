@@ -3725,3 +3725,36 @@ half of one.
 
 - **C68b — selection is the last unreachable part** of the table, and it
   needs a selection model Peek does not have. Not a wiring job.
+
+## 69. join: the step before every other step
+
+`join` was one of the four cockpit utilities I left off the Diagnostics
+page as "wanting call sites in the flows that use them". This is that
+call site, and it turned out to be the most important of the eight.
+
+Its header says why: a fresh postmarketOS image has `user`/`147147` and
+NO SSHD RUNNING. So every scan-trust-enrol step on the fleet page is
+unreachable until someone types one command on the phone itself — and
+that module had tests and no caller, meaning the step the operator
+repeats most was the one step the UI did not help with.
+
+Added above the enrolment picker: a "join command" button that copies
+the one-liner. Deliberately a copy rather than anything automatic —
+there is no network path to a device that is not listening yet, which is
+the definition of this state.
+
+**A placeholder would have been worse than nothing.** My first version
+copied `http://<this-host>:8080/...`, which gets pasted verbatim and
+fails on the phone with a DNS timeout — the least diagnosable error
+available, on a device with no sshd to log into and find out why.
+
+So `deploy::local_ipv4()`: same UDP-socket technique as the existing
+`local_subnet24`, which throws away the last octet because it scans a
+/24. The join flow needs the whole address. `None` on IPv6-only or no
+route is SAID rather than guessed, because a wrong address in a copied
+command is indistinguishable from a broken phone.
+
+- **C69a — `sparse`, `apkcache`, `repomap` still have no call sites.**
+  They are genuinely lower-stakes than `join`: image chunking, cache
+  decisions, and a crate index, none of which block a workflow the way
+  first contact does.

@@ -76,6 +76,55 @@ pub struct State {
 fn picker_ui(ui: &mut egui::Ui, p: &mut crate::device_picker::Picker) {
     use crate::device_picker::Job;
     ui.separator();
+    // FIRST CONTACT, before enrolment can happen at all.
+    //
+    // `join`'s header says it: a fresh postmarketOS image has
+    // `user`/`147147` and NO SSHD RUNNING, so every scan-and-trust step
+    // below is unreachable until someone types one command on the phone
+    // itself. That module has existed with tests and no caller, so the
+    // step the operator actually repeats was the one step the UI did not
+    // help with.
+    //
+    // A command to copy rather than anything automatic: there is no
+    // network path to a device that is not listening yet, which is the
+    // whole definition of this state.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("no sshd yet?").weak().small());
+        if ui.small_button("join command").clicked() {
+            // Code derived from the current time. Single-use is enforced
+            // by `JoinCode` on the serving side; this is only the string
+            // the operator carries to the phone.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let code = cockpit::join::code_from_bytes(&now.to_le_bytes());
+            // A REAL address, not a placeholder. A copied command
+            // containing `<this-host>` gets pasted verbatim and fails on
+            // the phone with a DNS timeout — the least diagnosable error
+            // there is, and on a device with no sshd there is nothing to
+            // log into to find out why.
+            match cockpit::deploy::local_ipv4() {
+                Some(ip) => {
+                    let cmd = cockpit::join::join_command(&format!("http://{ip}:8080"), &code);
+                    ui.ctx().copy_text(cmd);
+                }
+                // Said rather than guessed: on IPv6-only or with no
+                // route there is no address to put in, and a wrong one
+                // is worse than none.
+                None => ui.ctx().copy_text(
+                    "no IPv4 route found — fill in this host's address".to_string()),
+            }
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "type it on the phone — it installs your key and starts sshd,              which is what everything below needs")
+            .weak()
+            .small(),
+    );
+    ui.separator();
+
     ui.label(egui::RichText::new("Enrol a device").strong());
     ui.label(egui::RichText::new(p.status_line()).weak().small());
 

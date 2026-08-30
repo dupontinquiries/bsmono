@@ -62,6 +62,26 @@ pub struct Device {
 /// Derive the local /24 prefix (e.g. "192.168.1") by asking the OS which source
 /// address it would use to reach a public IP. `UdpSocket::connect` only sets the
 /// default route on the socket; no packets are sent.
+/// This host's LAN address, as a phone would reach it.
+///
+/// `local_subnet24` throws away the last octet because it scans a /24;
+/// the join flow needs the WHOLE address, because the phone has to fetch
+/// a script from this machine. Same technique — connect a UDP socket and
+/// read the local end, which needs no traffic and picks the interface
+/// the routing table would actually use.
+///
+/// `None` on IPv6-only or no route: the caller must then ask, because a
+/// guessed address in a copied command fails on the phone with a
+/// timeout, which is the least diagnosable error available.
+pub fn local_ipv4() -> Option<String> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) => Some(v4.to_string()),
+        IpAddr::V6(_) => None,
+    }
+}
+
 pub fn local_subnet24() -> Option<String> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
