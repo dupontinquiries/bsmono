@@ -74,8 +74,21 @@ def audit(rs: Path):
         if not mod_file.exists():
             continue
 
-        # Callers: any file other than the module itself using `m::`.
-        pat = re.compile(rf"\b{re.escape(m)}::")
+        # Callers: any file other than the module itself using `m::`,
+        # OR importing it under an alias.
+        #
+        # THE ALIAS CASE MATTERS AND WAS MISSED. `use crate::mail as mp;`
+        # then `mp::inbox_ui(...)` never writes `mail::` anywhere, so a
+        # `name::` search reports the module as uncalled. voiceterm does
+        # this in all five of its surface modules, and the checker
+        # confidently listed every one as dead — five false positives out
+        # of five, which is worse than no checker, because a report that
+        # is wrong about the app it is run on teaches people to ignore
+        # the report.
+        pat = re.compile(
+            rf"\b{re.escape(m)}::"
+            rf"|\buse\s+[\w:{{}}, ]*\b{re.escape(m)}\s+as\s+\w+"
+        )
         callers = 0
         flagged_only = True
         for s in siblings + [rs]:

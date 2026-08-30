@@ -2292,6 +2292,44 @@ Two decisions:
   destination, which is what stops it and the focused window
   disagreeing.
 
+## 40. unhosted_check was wrong about five modules out of five
+
+Ran it on voiceterm-egui and it reported five tested-but-uncalled
+modules: favorites, layered_graph, mail, missing_pkg, model_picker.
+Checked each by hand before acting, and ALL FIVE ARE CALLED.
+
+The idiom it missed:
+
+    use voiceterm_egui::missing_pkg as mp;
+    mp::missing_pkg_ui(ui, ...)
+
+`missing_pkg::` never appears anywhere, so a `name::` search finds
+nothing. voiceterm aliases every one of its surface modules this way, so
+the checker was wrong about the entire app.
+
+Fixed by also matching `use ... <name> as <alias>`. voiceterm now
+reports 0 uncalled, which matches reality.
+
+RE-RAN the apps I had already reported on with the broken tool:
+  - blackstar-rs 14 -> 13 uncalled, and the finding that mattered
+    survives: helmai and holomap are still `cli-only [tested]`, so §33's
+    conclusion stands.
+  - snapclone 0, unchanged.
+  - logscope 12 uncalled, spot-checked `debatepanel` and `chat_layout`
+    by hand — genuinely declared, documented, and never called. Real.
+
+The lesson is about the tool's own risk, and it is worth stating
+plainly: a checker that is WRONG ABOUT THE APP IT IS RUN ON is worse
+than no checker. Five false positives out of five would have taught
+anyone reading it to ignore the report — including on blackstar, where
+it was right. Every finding it produced before this fix deserved the
+hand-check I gave the voiceterm five, and §33's did get one.
+
+- **C12-40a — logscope's 12 are unexamined.** `debatepanel` and
+  `chat_layout` are confirmed real; the other ten are not yet checked
+  individually, and after this the rule is that they get checked before
+  anything is said about them.
+
 ## 39. snapclone-egui: the host boundary is honest, and one arm is not
 
 Operator says the QML/Qt-translation approach is working here — agreed,
