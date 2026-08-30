@@ -4110,3 +4110,40 @@ exists.
   The remaining 754 commits of the fork are shared monorepo history that
   predates the divergence; only the 39 that touch these two apps are
   ours to take.
+
+## 75. beatspace's 12 "test failures" are an aarch64 codegen error upstream
+
+Examined C73a's worst entry. They are not test failures — the crate
+never compiles on that machine:
+
+    error: instruction requires: fullfp16
+    fmla v0.8h, v1.8h, v2.h[0]
+    --> gemm-common-0.19.0/src/simd.rs:1994
+
+Inline aarch64 assembly using half-precision FMA, emitted without the
+`fullfp16` target feature enabled. Not our code and not our assembly.
+
+The chain: `candle-core 0.11.0` → `gemm 0.19.0` → `gemm-common 0.19.0`.
+
+**Our lockfile pins BOTH 0.18.2 and 0.19.0**, and only 0.19.0 carries
+the bad path — so this is a resolution outcome rather than a single bad
+pin, and the fix is a version constraint, not a code change.
+
+Three options, and the choice is the operator's because it depends on
+hardware I cannot see:
+  1. `RUSTFLAGS="-C target-feature=+fp16"` — the Fairphone and the M-series
+     Asahi host both HAVE fullfp16; the compiler is being conservative
+     about the baseline, not reporting a missing capability.
+  2. Pin `gemm` to 0.18.2 so only the working path is built.
+  3. Report upstream: emitting fp16 instructions without gating on the
+     feature is a gemm-common bug, and 0.18.2 apparently does not do it.
+
+(1) is the smallest and probably right on this fleet, since every target
+is aarch64 with fp16. It is also the one that stops working the moment
+something older joins the fleet, which is why it belongs in a
+per-machine config rather than in a Cargo.toml.
+
+- **C75a — this makes the "10 crates failing" count from build 117
+  misleading.** Two of the ten (beatspace and beatspace+features) are
+  one upstream compile error counted twice. Worth knowing before anyone
+  treats that number as a defect backlog.
