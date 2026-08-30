@@ -2960,3 +2960,38 @@ rasterizer + WGSL phase correlation exist behind the `gpu` feature
 (compile-checked only here — no GPU in this sandbox; they target the
 Asahi Vulkan stack), core DCT/color has NEON/SSE/AVX2 paths; all
 session code is deliberate CPU lab code, tested not optimized.
+
+### Full-45s suite measurement: v11 vs AV1 (same session)
+
+Question asked directly: enough to measure AV1 vs web over the full
+video? Answer: yes for the 2D web (v11), no for the 3D web — matching
+canonicals works as of this session, but residual-coding against a
+matched canonical's render does not exist yet, so the 3D path produces
+match scores, not bytes. That bridge is the named missing construction.
+
+Protocol: all 19 shots of the cropped 45s clip through v11.3 at dz32
+(one operating point), per-shot PSNR/SSIM aggregated by frame-weighted
+MSE; anchor = user's AV1-150k file scored on identical cropped frames
+in one pass (33.33 dB, 988,908 bytes video-only). Full table in
+docs/full_v11_dz32.csv.
+
+VERDICT: v11 45.95 MB @ 31.33 dB vs AV1 0.99 MB @ 33.33 dB —
+46× larger AND 2 dB worse. The per-GOP experiments (7× on shotB)
+flattered the codec by using content its model fits. The full clip is
+dominated by handheld/fast-motion shots at 25–80 KB/frame where plate
+prediction collapses (worst: shot 9, 118 frames, 74 KB/f @ 27.2 dB),
+and the plates alone (11.1 MB) cost 11× the entire AV1 file.
+
+The same table shows the other half of the story: on shots the model
+actually fits, v11 is AV1-class or beyond — 45 B/frame @ 54 dB and
+481 B/frame @ 95 dB on locked shots, 67 B/f near-lossless on a frozen
+6-framer, 16–17 KB/f @ 38–39 dB on gentle ones — against AV1's 915
+B/f clip average. Model-based coding measured bimodal: it wins where
+the world model holds and loses catastrophically where it doesn't.
+The honest implications, in order: (1) the marginal-cost thesis needs
+the 3D/library path to produce BYTES (residual vs canonical render)
+before any cross-video amortization claim can be tested; (2) hard-
+motion shots need the standard toolbox (subpel MC, intra, entropy
+coding) or a hybrid that falls back to a conventional coder; (3) the
+per-shot plate overhead is the tax the library exists to amortize —
+today every shot pays it fresh.
