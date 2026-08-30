@@ -4342,3 +4342,53 @@ rotation to a webcam on a desk.
 - **C80b — startup only, no hotplug.** A camera plugged in after launch
   will not appear. That needs a netlink or inotify watch; the case that
   was broken is a camera present at launch.
+
+## 81. voiceterm panes had one shell between them
+
+Operator: panes added via the press-and-hold menu show an empty
+terminal, text entry does not update the viewport, only the bottom bar
+works.
+
+**One `pty: Option<PtyHost>` on the app, while sessions, grids and
+terminal state are all per-pane.** A pane opened from the hold menu got
+a fresh `PaneSession`, a fresh `uikit_term::App` — and nothing to talk
+to. Keys went into its `pty_out` and no output ever came back.
+
+That explains the symptom exactly, including the part that sounds like a
+routing bug: the bottom bar works because it does not go through a
+shell.
+
+The code already anticipated this. The retire branch was commented "the
+session goes with the pane — and with it its pty, on device", written
+before there was a pty to go with it.
+
+Fixed: one shell per pane, spawned in the `diff.spawn` loop where the
+pane is created, dropped in `diff.retire` (which kills and reaps the
+child, so a closed pane leaves nothing running).
+
+Three decisions:
+  - **The map holds `Option<PtyHost>`, not `PtyHost`.** That lets
+    `pane_host::swap_focus` move the same type in and out of `self.pty`,
+    and it makes a failed spawn a REMEMBERED None rather than a missing
+    key that the next focus change would retry — once per switch,
+    forever.
+  - **The shell swaps with focus**, alongside the session and the
+    terminal app. Without it the focused pane types into the previous
+    pane's shell, and output appears in the wrong terminal — more
+    confusing than no output.
+  - **The swap's fresh value is `None`, not a new spawn.** Spawning on
+    focus change would start a second shell every time you switched
+    panes; the spawn belongs where a failure can be reported once, for
+    the pane that caused it.
+
+voiceterm-egui 1106/1106.
+
+## 82. aperture added to the gitmind app list
+
+Same shape as cadscope: a WORKSPACE whose runnable crate is
+`crates/aperture-egui`, producing bin `aperture`. A bare name in the
+simple list would look for a package at `apps/aperture` and find a
+workspace manifest with no bin — the phantom-entry failure from §72.
+
+- **C82a — snapshot-cam's preview window is NOT done.** Asked for in the
+  same message; snapclone's viewfinder is the model. Not started.

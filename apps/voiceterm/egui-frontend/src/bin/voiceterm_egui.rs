@@ -557,6 +557,18 @@ struct VoicetermApp {
     /// launching. A terminal that will not open because it could not
     /// find a shell is worse than one that opens and says so.
     pty: Option<voiceterm_egui::pty_host::PtyHost>,
+    /// One shell per pane, keyed the same way `pane_sessions` is.
+    ///
+    /// `pty` above is the FOCUSED pane's, kept for the single-pane path
+    /// that predates panes; this map is every other pane's. They are
+    /// swapped together on a focus change, exactly like the session and
+    /// the terminal app, so every existing `self.pty` call site keeps
+    /// meaning "the pane you are looking at".
+    /// `Option` inside the map, not `PtyHost`, so `swap_focus` can move
+    /// the same type in and out of `self.pty` — and so a pane whose
+    /// shell failed to spawn is a REMEMBERED None rather than a missing
+    /// key that the next swap would try to spawn again.
+    pane_ptys: std::collections::HashMap<u64, Option<voiceterm_egui::pty_host::PtyHost>>,
     /// One-shot latch so "shell exited" is said once, not every frame.
     pty_ended_noted: bool,
     /// The QML settingsPopup's launcher half — four doors plus voice
@@ -3086,6 +3098,20 @@ impl eframe::App for VoicetermApp {
                 &mut self.session, &mut self.pane_sessions,
                 self.pane_focus, focus_now,
                 voiceterm_egui::pane_host::PaneSession::new);
+            // The shell swaps with its pane too, or the focused pane
+            // would be typing into the previous pane's shell — output
+            // appearing in the wrong terminal, which is more confusing
+            // than no output at all.
+            //
+            // `Option<PtyHost>` is the swapped type, and the fresh value
+            // is None rather than a new spawn: the spawn belongs in the
+            // `diff.spawn` loop below, where a failure can be reported
+            // once for the pane that caused it. Spawning here would
+            // silently start a second shell on every focus change.
+            voiceterm_egui::pane_host::swap_focus(
+                &mut self.pty, &mut self.pane_ptys,
+                self.pane_focus, focus_now,
+                || None);
             self.pane_focus = focus_now;
             // Reconcile hosts against the model: a split wants one more terminal, a closed
             // pane's terminal is dropped (and with it its pty, on device).
@@ -3099,11 +3125,40 @@ impl eframe::App for VoicetermApp {
             for id in &diff.spawn {
                 self.pane_apps.insert(*id, uikit_term::App::new(80, 24));
                 self.pane_sessions.insert(*id, voiceterm_egui::pane_host::PaneSession::new());
+                // A PANE WITHOUT A SHELL IS AN EMPTY TERMINAL.
+                //
+                // `pty` was a single Option on the app while sessions and
+                // grids are per-pane, so a pane opened from the hold menu
+                // got a fresh grid, a fresh session — and nothing to talk
+                // to. Keys went into its `pty_out` and no output ever came
+                // back, which is exactly "text entry does not update the
+                // viewport": the bottom bar worked because it does not go
+                // through a shell.
+                //
+                // One shell per pane, spawned here where the pane is. A
+                // failure is logged and left as None: that pane falls back
+                // to local echo, which is worse than a shell and much
+                // better than a dead rectangle.
+                let host = match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        eprintln!("[voiceterm] pane {id}: no shell: {e}");
+                        None
+                    }
+                };
+                // Inserted either way — see the field doc: a remembered
+                // None is what stops the next focus swap retrying a spawn
+                // that already failed, once per switch, forever.
+                self.pane_ptys.insert(*id, host);
             }
             for id in &diff.retire {
                 self.pane_apps.remove(id);
-                // the session goes with the pane — and with it its pty, on device
+                // the session goes with the pane — and with it its pty
                 self.pane_sessions.remove(id);
+                // Dropping the host kills and reaps the child (see
+                // `PtyHost::drop`), so closing a pane does not leave a
+                // shell running with nothing attached to it.
+                self.pane_ptys.remove(id);
             }
 
             // THE PANE GRID. A tab can hold several panes now, so the terminal no longer owns
@@ -3524,6 +3579,7 @@ fn main() -> eframe::Result<()> {
                     }
                 },
                 pty_ended_noted: false,
+                pane_ptys: std::collections::HashMap::new(),
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 view: CentralView::Terminal,

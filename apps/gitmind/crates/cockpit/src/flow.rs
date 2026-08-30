@@ -1095,6 +1095,19 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // nothing and fail on every device with a confusing "no such
     // package", which is the phantom-entry failure I refused to ship
     // when the source was missing.
+    // aperture: same shape as cadscope — a WORKSPACE whose runnable crate
+    // is `crates/aperture-egui`, producing bin `aperture`. The bare name
+    // in the simple list would look for a package at apps/aperture and
+    // find a workspace manifest with no bin.
+    let aperture = || crate::suite::SuiteApp {
+        name: "aperture".into(),
+        path: "apps/aperture/crates/aperture-egui".into(),
+        features: vec![],
+        no_default: false,
+        target: String::new(),
+        run_flags: String::new(),
+        bin_name: Some("aperture".into()),
+    };
     let cadscope = || crate::suite::SuiteApp {
         name: "cadscope".into(),
         path: "apps/cadscope/crates/cadscope-egui".into(),
@@ -1184,6 +1197,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     all_group.apps.push(bsettings());
     all_group.apps.push(beatspace());
     all_group.apps.push(studio());
+    all_group.apps.push(aperture());
     all_group.apps.push(cadscope());
     all_group.apps.push(simscope());
     all_group.apps.push(unendlich());
@@ -1194,6 +1208,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
             // expects a package at `apps/<name>` and these are
             // workspaces whose runnable crate is one level down.
             let mut c = group("coding", "Development & analysis tools", &coding);
+            c.apps.push(aperture());
             c.apps.push(cadscope());
             c.apps.push(simscope());
             c
