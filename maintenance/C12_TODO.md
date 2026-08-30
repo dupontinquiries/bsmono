@@ -2557,3 +2557,34 @@ presents as "Start did nothing" rather than "Start opened Standings".
 - **C12-43a — check the other frontends for literal view indices.**
   `VIEWS.iter().position(...)` is cheap and a literal is not detectably
   wrong. Not swept yet.
+
+## 44. Sweep: literal indices and len()-1 underflow — clean
+
+Ran the two sweeps C12-43a asked for. Both came back clean, which is
+worth recording so nobody runs them a third time.
+
+**Literal view/tab indices**: bot-arena's `view_idx = 1` (fixed in §43)
+was the only one in any egui frontend. Grepping every `self.X = <n>;`
+assignment across the frontends, filtered for non-dimension fields,
+returns nothing else.
+
+**`len() - 1` underflow** (usize, so it wraps to a huge number and the
+next index panics): eight sites, all guarded, checked individually —
+  - `bot-arena` replays: `is_empty()` early return above it
+  - `snapclone` snaps ×2: `is_empty()` early return in both
+  - `bo-suite` settings_page: guarded by `len() > 1`
+  - `snapclone` relay_preset: `ALL` is a non-empty const of 3, AND is
+    already derived by `position(...)` rather than hardcoded — the same
+    fix §43 applied to bot-arena's Start button, done here first
+  - the rest are in tests
+
+So the bug that appeared twice in §42/§43 did NOT generalise. The
+`VIEWS[idx]` pattern travelled between two apps that were built from
+one another; the underflow shape did not travel at all, because
+everywhere else the author guarded it.
+
+Worth noting the asymmetry: `relay_preset::custom_index` has a comment
+explaining why it derives the index instead of hardcoding 2, and
+bot-arena's Start button hardcoded 1 with no comment. Same codebase,
+same author, opposite habits — which is what makes a sweep worth more
+than reasoning about who wrote it.
