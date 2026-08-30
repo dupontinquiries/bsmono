@@ -2631,8 +2631,30 @@ microphone was off.
   lying — recorded rather than done because it needs a decision about
   whether to hide or disable them.
 
-- **C12-45b — this is worth sweeping across the other apps.** The same
-  shape (a settings-kit `Prefs` field with an editor and no reader) is
-  cheap to grep for and was not visible in any audit before this one:
-  `unhosted_check` works at module granularity, `parity_audit` counts
-  surfaces, and neither sees a field.
+- **C12-45b — SWEPT. Mostly clean, and two fields are fleet-wide dead.**
+
+  Only two apps host a settings editor at all. bo-suite, bot-arena,
+  fao-codec, rusty-board and snapclone READ prefs (palette, gesture
+  animation, text scale) without writing them, so they cannot have this
+  bug — there is no control to lie.
+
+  The dedicated `settings` app writes seven fields and five have real
+  consumers elsewhere in the fleet: `gesture.sensitivity` (3 readers),
+  `gesture.commit_fraction` (2), `gesture.flick_velocity` (2),
+  `touch.min_target` (3), `touch.scale` (2). Healthy.
+
+  **`a11y.tts` and `a11y.voice` have TWO editors and NO readers.**
+  Written by the settings app and by voiceterm's panel, defined in
+  settings-kit, consumed nowhere in any app or shared crate. That is the
+  same bug as §45 but worse: two separate screens each offer the control,
+  so a person who finds it dead in one might reasonably try the other.
+
+  Not wired, same reason as the other six: `tts` needs a speech-output
+  path that does not exist, and `voice` gates a voice-input layer whose
+  consumer is unclear. Pointing them at nothing repeats the bug.
+
+  So the sweep's real finding is narrower than feared and sharper than
+  expected: this is not a widespread rot, it is concentrated in the two
+  screens that offer accessibility toggles — which is the worst possible
+  place for it, because the people who most need those settings are the
+  least able to verify they did anything.
