@@ -258,11 +258,17 @@ number is not evidence either way. Compared directly instead, file by file:
   Revised order, with what each actually needs:
   1. **IRC** — still genuinely absent (zero irc-anything in egui-frontend), and
      `shared/irc-kit` exists, so check it before writing a client.
-  2. **The unexposed `Prefs` fields** — the cheapest real win here. The kit
-     already defines, persists and round-trips handedness, touch sizing, a11y
-     and colour filters; only the PANEL is missing rows. That is UI work with
-     no model, no protocol and no new state, and it is what makes the mobile
-     affordances reachable.
+  2. **The unexposed `Prefs` fields — DONE (`55480f35`).** All twelve now have
+     rows: `input.{handedness,double_tilt,movement}`, `touch.{min_target,scale,
+     button_scale}`, `a11y.{voice,tts,voice_filter}`,
+     `display.{color_filter,white_point}`, `model.pool_dir`. Rows iterate the
+     kit's `all()` rather than a local variant list, and `6d9541d5` makes the
+     compiler enforce that `all()` stays complete, so the panel cannot drift
+     silently behind the kit.
+     **NOT rendered.** No display here, so layout, wrapping and touch ergonomics
+     are unverified, and the sections roughly double the panel's length —
+     whether it now needs scrolling, grouping or a second surface is a question
+     only a screen answers. That is the first thing to look at on hardware.
   3. **Niftycharts** — unchanged, still a wiring job over `nifty-core`.
   4. **The four Qt settings areas** the panel lacks (model setup, wake-word,
      alignment recalibration, notification toggles) — these are the real
