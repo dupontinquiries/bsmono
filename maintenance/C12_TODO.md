@@ -285,13 +285,21 @@ purpose; that is the documented expected failure, not a surprise to debug.
   itself: an architecture becomes supported only once it has completed a
   forward pass on a real checkpoint and produced coherent output — that is
   the acceptance test, not "it loads without erroring."
-- **C12-10b** — separately, `.block_count` being absent under the expected
-  hparam key but present under `["muse-glimmer"]` suggests the GGUF
-  metadata key convention for this model family differs from what the
-  loader's hparam-prefix guesser expects. Worth checking whether that
-  guesser needs a fallback more general than "read the tensor names"
-  (which is what it fell back to here and which worked) for OTHER
-  metadata fields beyond block count.
+- **C12-10b — CLOSED (`007218a0`).** The guesser did need generalising, and the
+  defect was narrower than this item guessed: it was not a family-specific key
+  convention. `arch()` anchored on `<prefix>.embedding_length` ALONE, so a file
+  whose hparams sit under one prefix but which omits or renames that single key
+  fell through to the declared arch — and then every `<arch>.*` lookup missed at
+  once, which presents as a pile of "missing X" rather than one resolution
+  failure. It now trusts a declared arch backed by ANY known hyperparameter and
+  scores candidate prefixes by how many they carry, `min` on ties as before.
+  `HPARAM_SUFFIXES` is an allowlist rather than "count every key", because the
+  latter resolves the architecture to `tokenizer` — hundreds of entries in a
+  real GGUF against an arch block's dozen — and that failure would be silent
+  and total. `NON_ARCH_PREFIXES` gained `audio` and `adapter`, since a wider
+  net needs wider exclusions. 1242/1242; --gate-arch/-qwen3/-loadpath green.
+  Does NOT make `block_count_from_tensors` redundant: that fallback handles a
+  file with no metadata hparam block at all, and is untouched.
 
 ## 11. bo-suite-egui: split into the apps it already claims to be
 
