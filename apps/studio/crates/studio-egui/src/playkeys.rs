@@ -113,13 +113,16 @@ pub fn note_for(physical: char, octave: i8) -> Option<i8> {
 }
 
 /// One key press in `Playing` mode, resolved to a note with velocity.
+/// `zones` are the device's calibrated regions; empty means the tracker
+/// layout alone, exactly as before calibration existed.
 pub fn play_note(
     physical: char,
     octave: i8,
     key: &Key,
     analog: &dyn AnalogSource,
+    zones: &Zones,
 ) -> Option<PlayNote> {
-    let semitone = note_for(physical, octave)?;
+    let semitone = note_for_zoned(zones, physical, octave)?;
     // A note with zero velocity is not a note; a digital keyboard's held key
     // is 1.0, so this only filters analog keys resting above the actuation
     // point the SDK reports.
@@ -168,9 +171,9 @@ mod tests {
     #[test]
     fn an_analog_keyboard_supplies_velocity_and_a_plain_one_supplies_full() {
         let k = Key::c('a');
-        let plain = play_note('a', 0, &k, &NullAnalog).expect("a note");
+        let plain = play_note('a', 0, &k, &NullAnalog, &Zones::default()).expect("a note");
         assert_eq!(plain.velocity, 1.0, "a digital press is a full press");
-        let analog = play_note('a', 0, &k, &HalfPressed).expect("a note");
+        let analog = play_note('a', 0, &k, &HalfPressed, &Zones::default()).expect("a note");
         assert_eq!(analog.velocity, 0.5, "travel becomes velocity");
         assert_eq!(analog.semitone, plain.semitone, "same key, same pitch");
     }
@@ -184,3 +187,116 @@ mod tests {
         assert_eq!(InputMode::Playing.label(), "playing");
     }
 }
+
+// ── calibrated zones: YOUR keyboard's shape, not the tracker's ─────────────
+
+/// Per-device physical-key → semitone zones, layered over the built-in
+/// tracker layout. The built-in rows are already physical-position based
+/// (Dvorak/AZERTY safe); zones exist for the step beyond that — a hand
+/// that wants piano-like spacing, or SEVERAL adjacent physical keys per
+/// piano key (wide regions, so a fingertip landing between two keycaps
+/// still plays the note it aimed at). Calibrated once, saved in the
+/// per-device sidecar like every other "this hardware, this hand" fact.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Zones {
+    /// physical key char → semitone offset from the base C. Many keys may
+    /// map to ONE note — that is the region idea, not a conflict.
+    map: std::collections::BTreeMap<char, i8>,
+}
+
+impl Zones {
+    pub fn is_empty(&self) -> bool { self.map.is_empty() }
+    pub fn assign(&mut self, physical: char, note: i8) { self.map.insert(physical, note); }
+    pub fn resolve(&self, physical: char) -> Option<i8> { self.map.get(&physical).copied() }
+    /// Sidecar form: codepoint>note pairs — the same reasoning as key
+    /// rebinds, because the keys people reach for include punctuation.
+    pub fn encode(&self) -> String {
+        self.map.iter().map(|(k, v)| format!("{}>{v}", *k as u32))
+            .collect::<Vec<_>>().join(",")
+    }
+    pub fn decode(s: &str) -> Zones {
+        let mut z = Zones::default();
+        for pair in s.split(',') {
+            let Some((a, b)) = pair.split_once('>') else { continue };
+            let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<i8>())
+                else { continue };
+            if let Some(a) = char::from_u32(a) { z.assign(a, b); }
+        }
+        z
+    }
+}
+
+/// The one-time walk: for each semitone from C upward, press every
+/// physical key that should mean it (one, or a whole region), then
+/// advance. The state is just "which note are we on" — the UI shows
+/// [`Calibration::note_name`], the typed keys land here, Enter advances.
+#[derive(Debug, Clone, Default)]
+pub struct Calibration {
+    pub zones: Zones,
+    pub note: i8,
+}
+
+impl Calibration {
+    pub fn press(&mut self, physical: char) { self.zones.assign(physical, self.note); }
+    pub fn advance(&mut self) { self.note = self.note.saturating_add(1); }
+    pub fn note_name(&self) -> String {
+        const N: [&str; 12] = ["C", "C#", "D", "D#", "E", "F",
+                               "F#", "G", "G#", "A", "A#", "B"];
+        format!("{}{}", N[self.note.rem_euclid(12) as usize], self.note.div_euclid(12) + 1)
+    }
+}
+
+/// The note a physical key means, zones first, tracker layout as the
+/// fallback — so a half-finished calibration still plays: calibrated keys
+/// answer from the zones, everything else answers as before.
+pub fn note_for_zoned(zones: &Zones, physical: char, octave: i8) -> Option<i8> {
+    match zones.resolve(physical) {
+        Some(n) => Some(n.saturating_add(octave.saturating_mul(12))),
+        None => note_for(physical, octave),
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+
+    /// The region idea: several physical keys, one piano key — and the
+    /// tracker layout keeps answering for everything uncalibrated.
+    #[test]
+    fn regions_map_many_keys_to_one_note_and_fall_back_elsewhere() {
+        let mut cal = Calibration::default();
+        assert_eq!(cal.note_name(), "C1");
+        // Two adjacent keys both mean C — the fingertip-between-keycaps case.
+        cal.press('a');
+        cal.press('s');
+        cal.advance();
+        assert_eq!(cal.note_name(), "C#1");
+        cal.press('w');
+        let z = cal.zones;
+        assert_eq!(z.resolve('a'), Some(0));
+        assert_eq!(z.resolve('s'), Some(0), "same note, second key of the region");
+        assert_eq!(z.resolve('w'), Some(1));
+        assert_eq!(note_for_zoned(&z, 'a', 0), Some(0));
+        assert_eq!(note_for_zoned(&z, 'a', 1), Some(12), "octave shifts zones too");
+        // 'h' was never calibrated: the tracker layout answers.
+        assert_eq!(note_for_zoned(&z, 'h', 0), note_for('h', 0));
+        assert!(note_for_zoned(&z, 'h', 0).is_some(),
+                "the fallback is the layout, not silence");
+    }
+
+    /// Sidecar round trip, punctuation included — the same keys that
+    /// forced rebinds into codepoints.
+    #[test]
+    fn zones_survive_the_sidecar() {
+        let mut z = Zones::default();
+        z.assign(',', 3);
+        z.assign('a', 0);
+        z.assign(';', -2);
+        assert_eq!(Zones::decode(&z.encode()), z);
+        assert_eq!(Zones::decode("garbage,44>3,x>y,>"),
+                   { let mut w = Zones::default(); w.assign(',', 3); w },
+                   "each bad pair is skipped alone");
+        assert!(Zones::decode("").is_empty());
+    }
+}
+

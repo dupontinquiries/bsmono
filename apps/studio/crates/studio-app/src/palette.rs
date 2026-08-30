@@ -61,6 +61,17 @@ pub enum ShellVerb {
     /// Put the shell in one of the named rooms (`workspace::LAYOUTS`
     /// order — the same index `C-1`..`C-4` reaches).
     Workspace(u8),
+    /// Publish the CURRENT rack pattern to the machine-wide cache
+    /// (`pattern_pack::cache_dir()`), where every project's palette can
+    /// import it. Acts on the pattern being edited — the same "verbs act
+    /// on where you are" simplification 'split at playhead' uses.
+    SharePattern,
+    /// Import the i-th pack from the cache's name-sorted listing. The
+    /// index is resolved against a FRESH listing at act time; a pack
+    /// removed between the menu and the choice simply misses, with a
+    /// status line, never imports the wrong one silently (names are
+    /// re-checked).
+    ImportPack(u8),
 }
 
 /// One offer in the current step.
@@ -122,6 +133,11 @@ pub enum Ask {
     /// …then which BPM (carries the chosen song) — the same shape as
     /// the key's root/scale walk, one step shorter.
     SongTempoPick(studio_core::GroupId),
+    /// Which shared pack to import — enumerated from the cache, the one
+    /// candidate list that reads the filesystem rather than the project
+    /// (the shelf IS a directory; pretending otherwise would just move
+    /// the read somewhere less visible).
+    SharedPack,
 }
 
 /// The BPMs the tempo step offers. A curated ladder, not a free-text
@@ -150,6 +166,9 @@ pub fn root() -> Vec<Choice> {
         c("switch song", None, Then::Ask(Ask::SwitchSong)),
         c("set song key", None, Then::Ask(Ask::SongForKey)),
         c("set song tempo", None, Then::Ask(Ask::SongForTempo)),
+        c("share pattern with other projects", None,
+          Then::Do(Act::Shell(ShellVerb::SharePattern))),
+        c("import shared pattern", None, Then::Ask(Ask::SharedPack)),
         c("voice vocabulary (genre words)", None, Then::Ask(Ask::VoiceVocab)),
         c("toggle out-of-key dimming", None,
           Then::Do(Act::Shell(ShellVerb::ToggleKeyGuide))),
@@ -228,6 +247,18 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             out.push(plain("whole project".into(),
                 Then::Do(Act::Shell(ShellVerb::SwitchSong(None)))));
             out
+        }
+        Ask::SharedPack => {
+            let shelf = crate::pattern_pack::list(&crate::pattern_pack::cache_dir());
+            if shelf.is_empty() {
+                return vec![plain("(nothing shared yet — 'share pattern' \
+                                   publishes the one you're on)".into(),
+                    Then::Do(Act::Shell(ShellVerb::ImportPack(u8::MAX))))];
+            }
+            shelf.into_iter().enumerate()
+                .map(|(i, (name, _))| plain(name,
+                    Then::Do(Act::Shell(ShellVerb::ImportPack(i as u8)))))
+                .collect()
         }
         Ask::SongForTempo => project.groups.iter()
             .map(|(id, g)| plain(

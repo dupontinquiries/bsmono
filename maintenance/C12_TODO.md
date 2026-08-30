@@ -594,6 +594,43 @@ Three things this queue's studio sections implied but never listed:
   before building. Both were every-frame paths; neither was measured
   end-to-end — the fixes are allocation-shape arguments, honestly.
 
+## 14h. studio, c13 continued: shared pattern packs and calibrated piano zones
+
+Two asks landed in one stretch, plus their named leftovers:
+
+- **Pattern packs (`pattern_pack.rs`).** The shareable unit is pattern +
+  channels + the sample FILES (the compressed originals — import_audio's
+  own rule). Own small container (magic/length/whole-file refusal, JSON
+  meta + binary media; Pattern's tuple-keyed maps flattened for JSON —
+  the wire's hand-rolled binary never met that, serde_json does), NOT a
+  bent .studioarch: an archive means "reopen this session", a pack means
+  "drop this loop into a DIFFERENT session". Publishing IS placement in
+  `$XDG_CACHE_HOME/studio-live` (`$STUDIO_LIVE_CACHE` overrides; ~/.cache
+  fallback) — no second public/private flag to disagree with where the
+  file is; a pack is also just a file to throw around. Import mints
+  sources through ordinary ops and SHIFTS rows/mods/rolls by the
+  importing rack's channel count (pinned by test — an off-by-one plays
+  the hat pattern on the kick); tempo/swing deliberately not adopted.
+  Palette: "share pattern with other projects" (acts on the CURRENT
+  pattern — the 'split at playhead' simplification, because a wizard
+  would need candidates() to see the Rack, a 25-call-site signature
+  change), "import shared pattern" (candidates read the cache — the one
+  fs-reading candidate list, on purpose: the shelf IS a directory).
+  STILL OPEN: the library-sidebar "patterns" section (per-project rows +
+  the shared shelf with share/import buttons) — palette-only today; and
+  candidates() seeing the Rack, which unlocks share-any-pattern wizards.
+- **Piano zones (`playkeys::Zones`/`Calibration`).** The layout was
+  ALREADY physical-position based (Dvorak/AZERTY safe) and analog-kit
+  was ALREADY wired (WootingAnalog in the shell — skydribble's POC was
+  extracted in c9); what was missing was the step beyond: per-device
+  calibrated regions, several physical keys per piano key (a fingertip
+  between keycaps still plays the note it aimed at). Calibration walk in
+  Settings: press every key that should mean C, Enter, C#, … — closing
+  mid-walk KEEPS the half-calibration (zones first, tracker fallback, so
+  it always plays). Saved in the sidecar as codepoints beside rebinds.
+  STILL OPEN: nothing structural; a display session should feel the
+  velocity curve and the region widths.
+
 ## 15. responsive_nav: two apps done, and a bug found along the way
 
 `3619091f`/`e77ba72a`: `uikit_egui::responsive_nav` (`NavLayout::{Tabs,

@@ -3059,6 +3059,8 @@ dependencies = [
  "egui",
  "midir",
  "rfd",
+ "serde",
+ "serde_json",
  "studio-audio",
  "studio-collab",
  "studio-copilot",

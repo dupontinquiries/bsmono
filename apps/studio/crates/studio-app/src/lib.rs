@@ -34,6 +34,7 @@ pub mod voice;
 pub mod workspace;
 pub mod rebinds;
 pub mod scroll_edge;
+pub mod pattern_pack;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -1324,6 +1325,113 @@ impl Studio {
         Some(id)
     }
 
+
+    /// Pack one rack pattern for sharing: the pattern, the channels it
+    /// fires, and — for `Sampler` channels — the sample FILES read back
+    /// from each source's path (the compact representation IS the file,
+    /// `import_audio`'s own rule). A missing file refuses the whole pack:
+    /// a loop that ships without its kick is worse than no loop.
+    pub fn export_pattern_pack(&self, pattern_ix: usize)
+        -> Result<pattern_pack::PatternPack, String>
+    {
+        let p = self.rack.patterns.get(pattern_ix)
+            .ok_or_else(|| "no such pattern".to_string())?;
+        let mut media_meta = Vec::new();
+        let mut media = Vec::new();
+        for ch in &self.rack.channels {
+            if let studio_live::SynthKind::Sampler { source } = ch.kind {
+                if media_meta.iter().any(|(id, _)| *id == source.0) { continue; }
+                let src = self.session.doc.project.sources.get(&source)
+                    .ok_or_else(|| format!("channel '{}' references a source the \
+                                            project no longer has", ch.name))?;
+                let bytes = std::fs::read(&src.path)
+                    .map_err(|e| format!("'{}': {e} — the pack would ship without \
+                                          its sample", src.path))?;
+                let hint = std::path::Path::new(&src.path).file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "sample".into());
+                media_meta.push((source.0, hint));
+                media.push(bytes);
+            }
+        }
+        Ok(pattern_pack::PatternPack {
+            meta: pattern_pack::PackMeta {
+                name: if p.name.is_empty() {
+                    format!("pattern {}", pattern_ix + 1)
+                } else { p.name.clone() },
+                tempo_bpm: self.rack.tempo_bpm,
+                swing: self.rack.swing,
+                channels: self.rack.channels.clone(),
+                pattern: pattern_pack::PatternFlat::from_pattern(p),
+                media: media_meta,
+            },
+            media,
+        })
+    }
+
+    /// Drop a pack's loop into THIS project: fresh sources minted through
+    /// ordinary `AddSource` ops (so peers converge and undo works),
+    /// `Sampler` channels rewritten to them, channels appended, and the
+    /// pattern's rows/mods/rolls SHIFTED by the existing channel count —
+    /// they are indexed by position, and an off-by-one here plays the hat
+    /// pattern on the kick. Returns the decoded audio + raw bytes per new
+    /// source for the shell to land in peaks/audio and register as assets.
+    /// Tempo/swing are deliberately NOT adopted: an import is "this loop,
+    /// in my session", not "my session, at their tempo".
+    pub fn import_pattern_pack(&mut self, pack: pattern_pack::PatternPack)
+        -> Result<Vec<(studio_core::SourceId, studio_audio::SourceAudio, Vec<u8>)>, String>
+    {
+        let mut remap: std::collections::BTreeMap<u64, studio_core::SourceId> =
+            Default::default();
+        let mut landed = Vec::new();
+        for ((old, hint), raw) in pack.meta.media.iter().zip(&pack.media) {
+            let ext = std::path::Path::new(hint).extension()
+                .and_then(|e| e.to_str());
+            let audio = studio_media::decode_bytes(raw.clone(), ext)
+                .map_err(|e| format!("'{hint}': {e}"))?;
+            let id = studio_core::SourceId(
+                self.session.doc.project.sources.keys()
+                    .map(|s| s.0).max().unwrap_or(0) + 1);
+            self.edit(studio_core::Op::AddSource {
+                source: studio_core::Source {
+                    id, path: hint.clone(),
+                    len: Ticks::from_samples(audio.frames() as i64, audio.sample_rate),
+                    sample_rate: audio.sample_rate,
+                    channels: audio.channels.len() as u16,
+                    has_video: false,
+                },
+            }, "pack sample");
+            remap.insert(*old, id);
+            landed.push((id, audio, raw.clone()));
+        }
+        let base = self.rack.channels.len();
+        for ch in &pack.meta.channels {
+            let mut ch = ch.clone();
+            if let studio_live::SynthKind::Sampler { source } = &mut ch.kind {
+                *source = *remap.get(&source.0)
+                    .ok_or_else(|| format!("channel '{}' references media the \
+                                            pack does not carry", ch.name))?;
+            }
+            self.rack.channels.push(ch);
+        }
+        let mut p = pack.meta.pattern.into_pattern();
+        p.rows = {
+            let mut rows = vec![0u64; base];
+            rows.extend(p.rows);
+            rows
+        };
+        p.mods = p.mods.into_iter()
+            .map(|((ch, st), m)| ((ch + base, st), m)).collect();
+        p.rolls = p.rolls.into_iter()
+            .map(|(ch, n)| (ch + base, n)).collect();
+        let name = p.name.clone();
+        self.rack.patterns.push(p);
+        self.current_pattern = self.rack.patterns.len() - 1;
+        self.loop_dirty = true;
+        self.status = format!("imported '{name}' — {} new channels", pack.meta.channels.len());
+        Ok(landed)
+    }
+
     /// Render the current pattern's loop at `rate` — what the audition sink
     /// plays and what a bounce stores. One function so they cannot drift.
     pub fn render_loop(
@@ -1501,6 +1609,86 @@ mod tests {
     /// lands on a video track — creating one when none has room, because
     /// §6's words are "give the timeline a video track to put it on" and
     /// AddTrack is an ordinary undoable op.
+
+    /// The pack round trip through a real Studio: export from one, import
+    /// into another with a busy rack, and the loop plays on ITS channels —
+    /// rows, mods and rolls all shifted by the importing rack's channel
+    /// count, sources minted fresh through ops.
+    #[test]
+    fn a_pattern_pack_survives_the_project_border_with_indices_intact() {
+        // Exporter: trap kit + a sampler channel whose file exists on disk.
+        let dir = std::env::temp_dir()
+            .join(format!("stpack-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("clap.wav");
+        // A tiny valid WAV: studio_media must decode it on import.
+        let mut w = Vec::new();
+        let (rate, frames): (u32, u32) = (48_000, 8);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());   // PCM
+        w.extend_from_slice(&1u16.to_le_bytes());   // mono
+        w.extend_from_slice(&rate.to_le_bytes());
+        w.extend_from_slice(&(rate * 2).to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(frames * 2).to_le_bytes());
+        for i in 0..frames { w.extend_from_slice(&((i as i16) * 100).to_le_bytes()); }
+        std::fs::write(&wav, &w).unwrap();
+
+        let mut a = Studio::demo();
+        let sid = studio_core::SourceId(
+            a.session.doc.project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        a.edit(studio_core::Op::AddSource { source: studio_core::Source {
+            id: sid, path: wav.display().to_string(),
+            len: studio_core::Ticks::from_samples(frames as i64, rate),
+            sample_rate: rate, channels: 1, has_video: false } }, "s");
+        a.rack.channels.push(studio_live::Channel {
+            name: "clap".into(),
+            kind: studio_live::SynthKind::Sampler { source: sid },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None });
+        let clap_ix = a.rack.channels.len() - 1;
+        let pat_ix = a.rack.patterns.len() - 1;
+        {
+            let p = &mut a.rack.patterns[pat_ix];
+            while p.rows.len() <= clap_ix { p.rows.push(0); }
+            p.rows[clap_ix] = 0b1010;
+            p.mods.insert((clap_ix, 1), studio_live::StepMod {
+                vel: 0.4, ..Default::default() });
+        }
+        let pack = a.export_pattern_pack(pat_ix).expect("exports");
+        assert_eq!(pack.media.len(), 1, "one sampler, one media entry");
+
+        // Importer: a different project whose rack already has channels —
+        // the shift everything below must survive.
+        let mut b = Studio::demo();
+        let base = b.rack.channels.len();
+        let landed = b.import_pattern_pack(
+            pattern_pack::PatternPack::decode(&pack.encode()).unwrap())
+            .expect("imports");
+        assert_eq!(landed.len(), 1);
+        let new_sid = landed[0].0;
+        assert!(b.session.doc.project.sources.contains_key(&new_sid),
+                "the source arrived as an ordinary op");
+        let p = b.rack.patterns.last().unwrap();
+        assert_eq!(p.rows.len(), base + pack.meta.channels.len());
+        assert!(p.rows[..base].iter().all(|r| *r == 0),
+                "the importing rack's own channels stay silent in the new pattern");
+        assert_eq!(p.rows[base + clap_ix], 0b1010,
+                   "the clap fires on the CLAP's shifted row");
+        assert_eq!(p.mods.get(&(base + clap_ix, 1)).map(|m| m.vel), Some(0.4),
+                   "mods shifted with their channel");
+        match b.rack.channels[base + clap_ix].kind {
+            studio_live::SynthKind::Sampler { source } =>
+                assert_eq!(source, new_sid, "the sampler points at the MINTED source"),
+            ref k => panic!("expected a sampler, got {k:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_video_import_keeps_its_picture_and_finds_or_makes_a_video_track() {
         // Studio::demo() may or may not ship a video track; build bare.
@@ -1715,6 +1903,11 @@ pub struct App {
     /// The settings popup is waiting for the next typed key to bind to
     /// this action's default char. Consumes exactly one keypress.
     rebind_capture: Option<char>,
+    /// Calibrated piano zones for playing mode; empty = tracker layout.
+    zones: studio_egui::playkeys::Zones,
+    /// The zone calibration walk, when running. Typed keys land on the
+    /// current note; Enter advances; closing Settings saves and stops.
+    piano_cal: Option<studio_egui::playkeys::Calibration>,
     /// Pages-mode over-scroll navigation — the detent between panels on a
     /// screen too narrow for tabs. Fed only from the CENTRAL panel's
     /// scroll report, only when the nav actually chose Pages.
@@ -1848,6 +2041,8 @@ impl Default for App {
               settings_open: false, library_open: ws.library_open,
               rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
               panel_nav: Default::default(),
+              zones: studio_egui::playkeys::Zones::decode(&ws.piano_zones),
+              piano_cal: None,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1907,6 +2102,18 @@ impl eframe::App for App {
         // While the palette is open it owns the keyboard — typing 'd' is a
         // search, not a delete.
         let typed: Vec<char> = if self.palette.is_some() { Vec::new() } else { typed };
+        // A running piano calibration eats every typed key: each one joins
+        // the current note's region. Enter advances the note; closing
+        // Settings (below) saves and stops.
+        let typed: Vec<char> = if let Some(cal) = &mut self.piano_cal {
+            for ch in &typed { cal.press(*ch); }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                cal.advance();
+            }
+            self.studio.status = format!("calibrating: press key(s) for {}, \
+                                          Enter for the next note", cal.note_name());
+            Vec::new()
+        } else { typed };
         // A pending rebind capture eats exactly one key — the next thing
         // typed IS the answer to "press the new key", not an edit.
         let typed: Vec<char> = if let Some(target) = self.rebind_capture {
@@ -2136,6 +2343,7 @@ impl eframe::App for App {
                         library_open: self.library_open,
                         display_name: self.studio.display_name.clone(),
                         rebinds: self.rebinds.encode(),
+                        piano_zones: self.zones.encode(),
                     });
                     // The directory must exist (and be ours) BEFORE the
                     // file is written: a save into a fresh project root
@@ -2272,6 +2480,35 @@ impl eframe::App for App {
                         "raw keys only — the palette and its hints keep the defaults. \
                          Saved per device with the workspace.");
                     ui.separator();
+                    ui.label("piano keys — calibrate playing mode to YOUR hands:");
+                    ui.horizontal(|ui| {
+                        match &self.piano_cal {
+                            None => {
+                                if ui.button("calibrate").clicked() {
+                                    self.piano_cal = Some(Default::default());
+                                }
+                                ui.label(if self.zones.is_empty() {
+                                    "tracker layout (uncalibrated)".to_string()
+                                } else { "calibrated".to_string() });
+                                if !self.zones.is_empty() && ui.button("reset").clicked() {
+                                    self.zones = Default::default();
+                                }
+                            }
+                            Some(cal) => {
+                                ui.label(format!("press every key that should mean \
+                                                  {}, then Enter", cal.note_name()));
+                                if ui.button("done").clicked() {
+                                    if let Some(cal) = self.piano_cal.take() {
+                                        self.zones = cal.zones;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ui.colored_label(egui::Color32::GRAY,
+                        "several keys can share one note — wide regions like real \
+                         piano-key spacing. Uncalibrated keys keep the tracker rows.");
+                    ui.separator();
                     ui.label("your name, as peers see it beside your playhead:");
                     let hint = format!("site {}", self.studio.session.doc.site.0);
                     ui.add(egui::TextEdit::singleline(&mut self.studio.display_name)
@@ -2289,7 +2526,13 @@ impl eframe::App for App {
                          Saved per device with the workspace — a phone and a desktop \
                          answer this differently on purpose.");
                 });
-            if !open { self.settings_open = false; self.rebind_capture = None; }
+            if !open {
+                self.settings_open = false;
+                self.rebind_capture = None;
+                // Closing mid-calibration keeps what was walked so far —
+                // a half-calibration plays (zones first, layout fallback).
+                if let Some(cal) = self.piano_cal.take() { self.zones = cal.zones; }
+            }
         }
         if let Some((bus, bus_name)) = self.studio.mix_pass_request.take() {
             // Measure the ACTUAL mixdown — the thing being mastered, not a
@@ -2402,7 +2645,8 @@ impl eframe::App for App {
             }).unwrap_or(0);
             for c in pressed {
                 if let Some(note) = studio_egui::playkeys::play_note(
-                    c, self.studio.octave, &studio_egui::keys::Key::c(c), &*self.analog)
+                    c, self.studio.octave, &studio_egui::keys::Key::c(c), &*self.analog,
+                    &self.zones)
                 {
                     self.studio.play_note_at(note, column);
                 }
@@ -3541,6 +3785,39 @@ impl App {
                 }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
                 palette::ShellVerb::Workspace(ix) => self.apply_layout(ix as usize),
+                palette::ShellVerb::SharePattern => {
+                    match self.studio.export_pattern_pack(self.studio.current_pattern)
+                        .and_then(|pack| pattern_pack::publish(
+                            &pack, &pattern_pack::cache_dir())
+                            .map_err(|e| e.to_string())) {
+                        Ok(path) => self.studio.status =
+                            format!("shared — other projects see it now ({})",
+                                    path.display()),
+                        Err(e) => self.studio.status = format!("share refused: {e}"),
+                    }
+                }
+                palette::ShellVerb::ImportPack(i) => {
+                    let shelf = pattern_pack::list(&pattern_pack::cache_dir());
+                    match shelf.get(i as usize) {
+                        None => self.studio.status =
+                            "that pack is gone from the shelf".into(),
+                        Some((_, path)) => {
+                            match std::fs::read(path).ok()
+                                .and_then(|b| pattern_pack::PatternPack::decode(&b))
+                                .ok_or_else(|| "unreadable pack".to_string())
+                                .and_then(|p| self.studio.import_pattern_pack(p)) {
+                                Ok(landed) => for (id, audio, raw) in landed {
+                                    self.peaks.insert(id,
+                                        studio_audio::Peaks::build(&audio, 256, 256));
+                                    self.audio.insert(id, audio);
+                                    self.studio.register_asset(id, &raw);
+                                },
+                                Err(e) => self.studio.status =
+                                    format!("import refused: {e}"),
+                            }
+                        }
+                    }
+                }
                 palette::ShellVerb::ToggleWorkbench => {
                     self.studio.combined = !self.studio.combined;
                 }
@@ -5022,7 +5299,8 @@ mod playing_mode_tests {
     fn a_played_note_lands_in_the_pattern_as_a_tuned_step() {
         let mut s = Studio::demo();
         s.selected_channel = 0; // the 808
-        let note = play_note('d', 0, &Key::c('d'), &NullAnalog).expect("E natural");
+        let note = play_note('d', 0, &Key::c('d'), &NullAnalog,
+            &studio_egui::playkeys::Zones::default()).expect("E natural");
         s.play_note_at(note, 4);
         let p = &s.rack.patterns[s.current_pattern];
         assert!(p.is_set(0, 4), "the step is on");
