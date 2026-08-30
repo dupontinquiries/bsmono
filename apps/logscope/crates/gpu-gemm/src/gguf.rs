@@ -141,17 +141,78 @@ impl Gguf {
 
     pub fn arch(&self) -> String {
         if let Some(a) = self.get_str("general.architecture") {
-            if self.metadata.contains_key(&format!("{a}.embedding_length")) { return a.to_string(); }
+            if HPARAM_SUFFIXES.iter().any(|s| self.metadata.contains_key(&format!("{a}.{s}"))) {
+                return a.to_string();
+            }
         }
-        let recovered = self.metadata.keys()
-            .filter_map(|k| k.strip_suffix(".embedding_length"))
-            .filter(|p| !p.is_empty() && !matches!(*p, "general" | "clip" | "vision" | "mmproj"))
-            .min();
-        recovered.map(str::to_string)
+        // Score candidate prefixes by how many KNOWN hyperparameters they carry, and take the
+        // best (deterministic `min` on ties, as before). Counting known suffixes rather than all
+        // keys is what keeps `tokenizer.ggml.*` — which is enormous — from outvoting the real
+        // architecture, and it means the exclusion list below only has to name towers.
+        let mut best: Option<(usize, &str)> = None;
+        for p in self.hparam_prefix_counts() {
+            best = match best {
+                Some((n, name)) if n > p.0 || (n == p.0 && name <= p.1) => Some((n, name)),
+                _ => Some(p),
+            };
+        }
+        best.map(|(_, p)| p.to_string())
             .or_else(|| self.get_str("general.architecture").map(str::to_string))
             .unwrap_or_else(|| "llama".to_string())
     }
+
+    /// (count, prefix) for every prefix carrying at least one known hyperparameter.
+    fn hparam_prefix_counts(&self) -> Vec<(usize, &str)> {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for k in self.metadata.keys() {
+            for s in HPARAM_SUFFIXES {
+                if let Some(p) = k.strip_suffix(s).and_then(|p| p.strip_suffix('.')) {
+                    if p.is_empty() || NON_ARCH_PREFIXES.contains(&p) { continue; }
+                    *counts.entry(p).or_insert(0) += 1;
+                    break;
+                }
+            }
+        }
+        counts.into_iter().map(|(p, n)| (n, p)).collect()
+    }
 }
+
+/// Metadata suffixes that identify a prefix as an architecture's hyperparameter block.
+///
+/// `embedding_length` alone used to anchor this, and C12-10b is the case that breaks: a file whose
+/// hparams sit under one prefix but which omits or renames that ONE key falls through to the
+/// declared architecture, and then every `<arch>.*` lookup misses at once. The observed shape was a
+/// loader reporting `.block_count is absent, but it IS present as ["muse-glimmer"]` — the prefix
+/// was recoverable from the file and nothing looked for it anywhere but `embedding_length`.
+///
+/// An ALLOWLIST rather than "count every key": `tokenizer.ggml.*` carries hundreds of entries and
+/// would win any unweighted count, and `general.*` a dozen. Naming the suffixes that mean
+/// "architecture hyperparameter" makes those two irrelevant by construction instead of by
+/// remembering to exclude them.
+pub const HPARAM_SUFFIXES: &[&str] = &[
+    "embedding_length",
+    "block_count",
+    "feed_forward_length",
+    "context_length",
+    "attention.head_count",
+    "attention.head_count_kv",
+    "attention.key_length",
+    "attention.value_length",
+    "attention.layer_norm_rms_epsilon",
+    "attention.layer_norm_epsilon",
+    "rope.dimension_count",
+    "rope.freq_base",
+    "expert_count",
+    "expert_used_count",
+];
+
+/// Prefixes that carry hyperparameters but are NOT the language model's architecture.
+///
+/// A VLM's vision tower has its own `embedding_length` and `block_count`, and resolving to it
+/// would load the wrong forward pass. `general` is here because `general.file_type` and friends
+/// share the shape but describe the file, not a model.
+pub const NON_ARCH_PREFIXES: &[&str] = &["general", "clip", "vision", "mmproj", "audio", "adapter"];
+
 
 /// IEEE half → f32.
 pub fn f16_to_f32(h: u16) -> f32 {
@@ -1230,6 +1291,86 @@ mod arch_tests {
         assert_eq!(m2.arch(), "qwen3_5");
         // a negative value is not a valid dimension → still None (caller reports)
         assert_eq!(g(vec![("x.embedding_length", Value::I32(-1))]).get_u32("x.embedding_length"), None);
+    }
+
+    #[test]
+    fn arch_recovers_a_prefix_that_has_no_embedding_length_at_all() {
+        // C12-10b. The anchor used to be `embedding_length` ALONE, so a file whose hparams sit
+        // under one prefix but which omits or renames that single key fell through to the declared
+        // architecture — and then every `<arch>.*` lookup missed at once. The observed shape was a
+        // loader saying `.block_count is absent, but it IS present as ["muse-glimmer"]`: the prefix
+        // was right there in the file and nothing looked for it outside one key.
+        let m = g(vec![
+            ("general.architecture", Value::Str("llama".into())),
+            ("muse-glimmer.block_count", Value::U32(48)),
+            ("muse-glimmer.attention.head_count", Value::U32(32)),
+        ]);
+        assert_eq!(m.arch(), "muse-glimmer",
+            "the prefix must be recoverable from any known hyperparameter, not only embedding_length");
+    }
+
+    #[test]
+    fn the_prefix_with_the_most_hyperparameters_wins() {
+        // A stray key under some other prefix must not outrank the real block. Asserted as a
+        // comparison so it survives either side gaining a key.
+        let m = g(vec![
+            ("stray.context_length", Value::U32(2048)),
+            ("realarch.block_count", Value::U32(48)),
+            ("realarch.attention.head_count", Value::U32(32)),
+            ("realarch.feed_forward_length", Value::U32(11008)),
+        ]);
+        assert_eq!(m.arch(), "realarch");
+    }
+
+    #[test]
+    fn the_tokenizer_block_can_never_win() {
+        // `tokenizer.ggml.*` is the largest metadata block in a real GGUF by a wide margin, so any
+        // unweighted "most keys wins" count resolves the architecture to the tokenizer. The
+        // allowlist makes that impossible by construction rather than by an exclusion someone has
+        // to remember; this pins it, since the failure would be silent and total.
+        let mut pairs = vec![
+            ("qwen3.block_count", Value::U32(28)),
+        ];
+        for k in ["tokenizer.ggml.model", "tokenizer.ggml.pre", "tokenizer.ggml.bos_token_id",
+                  "tokenizer.ggml.eos_token_id", "tokenizer.ggml.padding_token_id",
+                  "tokenizer.ggml.add_bos_token", "tokenizer.ggml.context_length"] {
+            pairs.push((k, Value::U32(1)));
+        }
+        assert_eq!(g(pairs).arch(), "qwen3");
+    }
+
+    #[test]
+    fn general_and_the_towers_are_still_excluded_under_the_wider_net() {
+        // Widening the anchor widens what the exclusions have to hold back. `general.*` now shares
+        // the shape of a hparam block (general.file_type and friends), and a VLM's vision tower has
+        // a full one of its own.
+        let m = g(vec![
+            ("clip.block_count", Value::U32(24)),
+            ("clip.embedding_length", Value::U32(1024)),
+            ("clip.attention.head_count", Value::U32(16)),
+            ("qwen2.block_count", Value::U32(28)),
+        ]);
+        assert_eq!(m.arch(), "qwen2", "a vision tower must never become the language architecture");
+        // And with ONLY a tower present, the tower still does not win — better to fall back to the
+        // declared name and let the caller refuse than to load a vision block as a language model.
+        let only_tower = g(vec![
+            ("general.architecture", Value::Str("llava".into())),
+            ("vision.block_count", Value::U32(24)),
+        ]);
+        assert_eq!(only_tower.arch(), "llava");
+    }
+
+    #[test]
+    fn a_tie_is_broken_deterministically() {
+        // Two prefixes with equally many hyperparameters: the answer must not depend on HashMap
+        // iteration order, or the same file loads differently between runs.
+        let pairs = vec![
+            ("bbb.block_count", Value::U32(1)),
+            ("aaa.block_count", Value::U32(1)),
+        ];
+        let first = g(pairs.clone()).arch();
+        for _ in 0..20 { assert_eq!(g(pairs.clone()).arch(), first, "arch() must be deterministic"); }
+        assert_eq!(first, "aaa", "ties resolve to the lexicographic minimum, as before");
     }
 
     #[test]

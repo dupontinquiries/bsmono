@@ -46,6 +46,15 @@ fn main() {
     // Prefill dispatches scale with the prompt and would swamp the per-token figure, so the
     // baseline is taken AFTER prefill.
     let before = gpu_kernels::GPU_DISPATCHES.load(Relaxed);
+    // SUBMIT CAUSES on this path, which is the whole of C11-21a and the one thing this harness
+    // did not report. Dispatches alone cannot distinguish "the window batched and the readback
+    // is per-window" from "something inside the loop flushed every token" — both leave the
+    // dispatch count identical, and only the second explains a measured 1.0 submits/token
+    // against a windowed prediction of 1/k. Same baseline point as the dispatch count, so
+    // every number below shares one clock.
+    let causes0 = gpu_kernels::SubmitCauseSnapshot::now();
+    let passes0 = gpu_kernels::GPU_PASSES_OPENED.load(Relaxed);
+    let submits0 = gpu_kernels::GPU_SUBMITS.load(Relaxed);
     let produced = match &re {
         ResidentEmbed::F32(t) => gpu.stream_session_window(&m, &mut s, &mut seen, n, None, &sp,
             &mut rng, k, &EmbedT::F32(t), &|| false, |_| true),
@@ -88,4 +97,31 @@ fn main() {
     println!("layers={} window={k} produced={produced} dispatches={} => {:.1} per token, {:.2} per layer-token",
         m.n_layers, after - before, (after - before) as f64 / p as f64,
         (after - before) as f64 / p as f64 / m.n_layers as f64);
+
+    // ── the windowed path's submit budget ────────────────────────────────────────────────────
+    let submits = gpu_kernels::GPU_SUBMITS.load(Relaxed).saturating_sub(submits0);
+    let passes = gpu_kernels::GPU_PASSES_OPENED.load(Relaxed).saturating_sub(passes0);
+    println!("{}", gpu_kernels::submit_attribution_since(causes0, submits));
+    println!("submits={submits} => {:.2} per token (windowed prediction: {:.2} = 1 readback per \
+              window of {k}) | passes={passes} => {:.1} per token",
+        submits as f64 / p as f64, 1.0 / k as f64, passes as f64 / p as f64);
+
+    // THE CEILING THIS MEASURES AGAINST. `stream_session_window` pins
+    // `flush_every = k * per_tok` with `per_tok = 64`, commented as a "generous upper bound on
+    // dispatches/token" — but the comparison it feeds is `frame.passes >= flush_every`, so the
+    // quantity that has to fit under it is PASSES per token, not dispatches. When passes/token
+    // exceeds 64 the pass counter fires inside the window and the window stops being one submit,
+    // silently: nothing logs it, and the run just reports a poor tok/s.
+    //
+    // A tiny fixture has few layers and sits well under the ceiling, which is exactly why this
+    // never showed up here. Extrapolating from the per-layer figure is what makes a 3-layer
+    // measurement say something about a 16-layer model, so the extrapolation is printed rather
+    // than left for the reader.
+    let per_tok_budget = 64.0_f64;
+    let passes_per_layer_token = passes as f64 / p as f64 / m.n_layers.max(1) as f64;
+    let layers_until_overflow = per_tok_budget / passes_per_layer_token.max(f64::MIN_POSITIVE);
+    println!("flush ceiling: per_tok={per_tok_budget:.0} passes/token; this model uses {:.1} \
+              passes/token ({:.2} per layer-token) => the ceiling is crossed at ~{:.0} layers, \
+              and above that the window flushes mid-loop and submits/token climbs toward 1.0",
+        passes as f64 / p as f64, passes_per_layer_token, layers_until_overflow);
 }

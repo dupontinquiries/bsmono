@@ -711,6 +711,48 @@ const POST_READBACK_FLUSH_CAP: u32 = 32;
 /// Metal, large enough that the flush cost amortizes over many dispatches. The `pre` logits the replay
 /// needs are held by the caller, not the frame, so they survive the flush.
 const SLOT_FLUSH: usize = 16;
+
+/// A generous upper bound on DISPATCHES per decoded token, from the model's depth.
+///
+/// Measured with `count-dispatch` on `stream_session_window` (the path the app actually
+/// decodes through): 12.5–14.7 dispatches per LAYER-token across 3, 8 and 16-layer fixtures
+/// on lavapipe. 16 rounds that up; the floor preserves the previous constant for models too
+/// shallow to reach it.
+///
+/// This was the bare constant 64, described in its own comment as a "generous upper bound on
+/// dispatches/token" — true only for a model of about five layers. Nothing noticed, because
+/// the comparison it feeds (`Frame.passes >= flush_every`) was dead until the counter it reads
+/// started being incremented.
+pub fn window_dispatches_per_token(n_layers: usize) -> u32 {
+    (n_layers as u32).saturating_mul(16).max(64)
+}
+
+/// How large a flush bound the decode window should run under.
+///
+/// Pure, and extracted from `stream_session_window` so it can be tested without a GPU. The
+/// mobile/Asahi branch of this decision existed for a long time and bounded nothing at all
+/// (see `Frame.passes`), which is precisely the class of bug an inline `if` inside a 200-line
+/// GPU loop hides: the only way to observe it was to own the hardware and read a submit
+/// profile.
+///
+/// * `bounded` — the device kills long submits (`watchdog_prone`, or already degraded). The
+///   window is deliberately NOT collapsed into one submit: completion callbacks are unreliable
+///   there, so the submit governor disables itself and nothing backpressures queue depth, and
+///   one unflushed window is a job the firmware watchdog can kill. Bound it instead and accept
+///   the per-token submit overhead.
+/// * otherwise — pin the flush above a whole window's dispatch cost, so `begin_frame` batches
+///   the entire window into one encoder. That is the window's entire purpose.
+///
+/// `saved` is the caller's pacing, honoured as a floor in the collapsing case (never pin
+/// LOWER than what the caller already chose) and as a ceiling in the bounded case (never pin
+/// higher than the caller's own bound).
+pub fn window_flush_plan(k: usize, n_layers: usize, bounded: bool, saved: u32) -> u32 {
+    if bounded {
+        saved.clamp(1, 64)
+    } else {
+        (k as u32).saturating_mul(window_dispatches_per_token(n_layers)).clamp(saved, 65536)
+    }
+}
 /// Content-cache cap: distinct (shape) dims that get their own permanent buffer. Sized to comfortably
 /// hold every stable per-shape uniform a model uses after warmup; per-position dims spill to the ring.
 /// Upper bound on the dims content cache. The EFFECTIVE cap is
@@ -3781,8 +3823,24 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
         crate::batchplan::plan(rows, watchdog)
     }
 
+    /// Does this device kill long-running submits?
+    ///
+    /// `LOGSCOPE_FORCE_WATCHDOG=1` forces this ON, and there is deliberately no
+    /// way to force it OFF. The asymmetry is the point: turning it on makes a
+    /// safe device take the conservative path, which costs speed and nothing
+    /// else, while turning it off on a device that really has a watchdog hands
+    /// the firmware a job it can kill — and `LOGSCOPE_WINDOW_ONE_SUBMIT=1`
+    /// already exists for that A/B, scoped to the one decision it affects.
+    ///
+    /// The reason to force it on is that this branch is the ENTIRE mobile and
+    /// Asahi decode path — `watchdog_prone_name` matches adreno, mali, powervr,
+    /// immortalis, xclipse, vivante, apple, agx, honeykrisp — and it could not
+    /// be exercised anywhere else. A path that only runs on hardware the CI does
+    /// not have is a path whose regressions are found by the operator.
     pub fn watchdog_prone(&self) -> bool {
-        self.conservative_vma || watchdog_prone_name(&self.adapter_name)
+        self.conservative_vma
+            || watchdog_prone_name(&self.adapter_name)
+            || std::env::var("LOGSCOPE_FORCE_WATCHDOG").as_deref() == Ok("1")
     }
 
     /// Did the subgroup matvec pass its load-time self-check on this driver?
@@ -4499,6 +4557,29 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
             // exempt by another route: `!frame.batch`. Denoise steps and oracle
             // stats set batch, so they never hit this at all, which is where
             // the diffusion path's submits should fall.
+            //
+            // AND THE INCREMENT WAS NOT HERE. Everything above describes what
+            // this counter means and how often it should advance, and no line
+            // in the crate ever advanced it: `Frame.passes` was declared,
+            // initialised to 0 in two places, read once immediately below, and
+            // never written. `0 >= flush_every` is false for every flush value,
+            // so `over_flush` could not fire, `SUBMIT_BY_PASSES` could only
+            // ever be 0, and the whole flush_every mechanism — the SubmitTuner
+            // that sweeps it, the decode window's `k * per_tok` pin, and the
+            // watchdog-prone `clamp(1, 64)` that exists so a mobile driver is
+            // not handed one enormous submit — was inert.
+            //
+            // `--gate-submit` was already saying so: its "higher flush_every →
+            // fewer submits" check reads `1 at flush=4 vs 1 at flush=64`. The
+            // gate was correct and red, which is the good case; the reason it
+            // reads as new is that it needs a GPU and the sandbox only grew one
+            // (lavapipe) recently.
+            //
+            // Incremented for BOTH branches on purpose. Fused, a dispatch is
+            // queued rather than given its own pass, but it still costs the
+            // same GPU time inside the eventual drained pass, and duration is
+            // what this bounds.
+            frame.passes = frame.passes.saturating_add(1);
             let over_flush = !frame.batch && frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
             let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
             if over_flush || over_retain {
@@ -16728,7 +16809,23 @@ LOWER bound — KV and resident weights are not pooled and are covered by baseli
         // flush (LOGSCOPE_FLUSH_EVERY) is respected as a floor — the user set it deliberately.
         let saved_flush = self.flush_every();
         if !self.flush_every_pinned() {
-            let per_tok = 64u32; // generous upper bound on dispatches/token; keeps a full window in one frame
+            // A GENEROUS UPPER BOUND ON DISPATCHES/TOKEN, DERIVED RATHER THAN GUESSED.
+            //
+            // This was the constant 64, described as exactly that — and it is one only for a model
+            // of about five layers. `count-dispatch` on this path measures 12.5 to 14.7 dispatches
+            // per LAYER-token (3, 8 and 16-layer fixtures, lavapipe), so the real figure scales with
+            // depth: ~200 for a 16-layer model, ~400 for a 32-layer one. Against a pin of k*64 a
+            // single window of 4 already costs 400 dispatches at 16 layers, so the flush fired
+            // mid-window and the window stopped being one submit — which is the entire thing the pin
+            // exists to buy.
+            //
+            // Nobody could see this until `frame.passes` started incrementing, because the
+            // comparison it feeds was dead; the constant was wrong the whole time and inert, so it
+            // cost nothing and showed nothing. It costs something now.
+            //
+            // 16 per layer against a measured 12.5–14.7 keeps the "generous" the old comment
+            // claimed, and the floor keeps the previous value for models too small to reach it.
+            let per_tok = window_dispatches_per_token(m.n_layers);
             // On the conservative (Asahi/Honeykrisp) path, completion callbacks are unreliable — the submit
             // governor disables itself, leaving NO backpressure on queue depth. Batching a whole window into
             // ONE unflushed submit then hands the firmware one huge job the watchdog can kill (a decode hang
@@ -16741,10 +16838,11 @@ LOWER bound — KV and resident weights are not pooled and are covered by baseli
             // WATCHDOG-PRONE, not Apple. Mobile drivers kill long dispatches the same way Honeykrisp
             // does, and this guard bounds the decode window precisely to avoid that — so keying it on
             // an Apple-only flag left a phone taking the unbounded path.
-            if (self.watchdog_prone() || self.degraded()) && !force_collapse {
-                self.set_flush_every(saved_flush.clamp(1, 64));
+            let bounded = (self.watchdog_prone() || self.degraded()) && !force_collapse;
+            if bounded {
+                self.set_flush_every(window_flush_plan(k, m.n_layers, true, saved_flush));
             } else {
-                self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
+                self.set_flush_every(window_flush_plan(k, m.n_layers, false, saved_flush));
             }
         }
         let mut logits_t = Some(self.upload(&s.logits, 1, s.logits.len()));
@@ -21847,6 +21945,107 @@ mod verify_slicing_tests {
 mod window_batching_tests {
     use super::*;
     use std::sync::atomic::Ordering::Relaxed;
+
+    /// The decode window's flush decision, tested without a GPU.
+    ///
+    /// The bounded (mobile / Asahi) branch of this is the one that spent a long time bounding
+    /// nothing, and it could not be observed without owning the hardware. Now it is arithmetic.
+    #[test]
+    fn the_window_flush_plan_bounds_mobile_and_collapses_desktop() {
+        // Desktop: the pin must exceed a WHOLE window's dispatch cost, or the frame flushes
+        // mid-window and the window stops being one submit — which is all it is for.
+        for &(k, layers) in &[(4usize, 16usize), (4, 32), (8, 16), (2, 3)] {
+            let plan = window_flush_plan(k, layers, false, 1);
+            let window_cost = k as u32 * window_dispatches_per_token(layers);
+            assert!(plan >= window_cost,
+                "k={k} layers={layers}: pin {plan} is below the window's own cost {window_cost}, \
+                 so the flush fires inside the window");
+        }
+        // The regression that motivated deriving per_tok: the old constant 64 is below a
+        // 16-layer window's cost, so a fixed pin of k*64 could not have held it.
+        assert!(4 * 64 < 4 * window_dispatches_per_token(16),
+            "a 16-layer window must cost more than the old k*64 pin, or the fix changed nothing");
+        // Shallow models keep the previous value — the floor, not an accident.
+        assert_eq!(window_dispatches_per_token(1), 64);
+        assert_eq!(window_dispatches_per_token(4), 64);
+        assert!(window_dispatches_per_token(16) > 64);
+
+        // Mobile: bounded ABOVE, regardless of how large a window was asked for. This is the
+        // half that must never grow with k, or a big window hands the firmware a job its
+        // watchdog can kill.
+        for &k in &[2usize, 4, 8, 64] {
+            let plan = window_flush_plan(k, 32, true, 1024);
+            assert!((1..=64).contains(&plan),
+                "k={k}: the watchdog bound must stay within 64 dispatches, got {plan}");
+        }
+        // And it honours a caller who already paces tighter than the bound.
+        assert_eq!(window_flush_plan(4, 32, true, 8), 8);
+        // Bounded is strictly tighter than collapsing for any real model — the property the
+        // whole branch exists to provide, asserted as a comparison rather than a constant so
+        // it survives either side being retuned.
+        assert!(window_flush_plan(4, 32, true, 1024) < window_flush_plan(4, 32, false, 1024));
+    }
+
+    /// `flush_every` MUST actually bound submits.
+    ///
+    /// It did not, for as long as anyone can date: `Frame.passes` was declared,
+    /// initialised in two places, read once by `over_flush`, and incremented
+    /// nowhere — so the comparison was `0 >= flush_every`, false for every
+    /// value, and the entire mechanism was inert. The SubmitTuner swept a knob
+    /// wired to nothing, the decode window's pin did nothing, and the
+    /// watchdog-prone `clamp(1, 64)` — which exists so a mobile driver is not
+    /// handed one enormous submit it may kill — bounded nothing at all.
+    ///
+    /// 1235 lib tests passed throughout. `--gate-submit` did catch it, and was
+    /// red, but it needs a GPU and so had not been run here until lavapipe
+    /// arrived in this sandbox. That gap is the reason this lives in the lib
+    /// suite as well: a mechanism only a gate can see is a mechanism that dies
+    /// quietly between the sessions that can run gates.
+    ///
+    /// Asserted as a RANGE with both directions failing, not a floor: too few
+    /// submits means the counter stopped again, and one-per-dispatch means the
+    /// batching stopped. A floor alone is satisfied by either.
+    #[test]
+    fn flush_every_bounds_submits_and_does_not_change_results() {
+        let gpu = Gpu::new();
+        let (n, k) = (128usize, 128);
+        // Same generator as main.rs's `rnd`, inlined: that one is a bin-local
+        // helper and not reachable from the lib suite.
+        let rnd = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n).map(|i| (((i * 1103515245 + seed * 12345 + 7) % 1000) as f32) / 500.0 - 1.0).collect()
+        };
+        let qw = gpu.quantize_q8_resident(&rnd(n * k, 2), n, k);
+        let seed = rnd(k, 3);
+        const CHAIN: usize = 30;
+        let run = |flush: u32| -> (Vec<f32>, u64) {
+            gpu.set_flush_every(flush);
+            gpu.begin_frame();
+            let s0 = GPU_SUBMITS.load(Relaxed);
+            let mut x = gpu.upload(&seed, 1, k);
+            for _ in 0..CHAIN { x = gpu.linear_q8_0_t(&x, &qw, 1); }
+            gpu.end_frame();
+            let submits = GPU_SUBMITS.load(Relaxed) - s0;
+            (gpu.download(&x), submits)
+        };
+        let (tight, s_tight) = run(4);
+        let (loose, s_loose) = run(1024);
+
+        // A tight flush must submit MORE than a loose one — the property the
+        // whole knob exists for, and the one that was false.
+        assert!(s_tight > s_loose,
+            "flush_every does not bound submits: {s_tight} at flush=4 vs {s_loose} at flush=1024. \
+             If these are equal, check that Frame.passes is still being incremented per dispatch.");
+        // And the bound must be roughly the one asked for, not merely nonzero.
+        // A 30-dispatch chain at flush=4 is ~7-8 flushes; allow slack for the
+        // end_frame and download submits without allowing one-per-dispatch.
+        assert!((4..=12).contains(&s_tight),
+            "expected a flush every ~4 dispatches over a {CHAIN}-dispatch chain, got {s_tight} \
+             submits — below this range the counter has stopped, above it the batching has");
+        // Batching changes WHEN work is submitted, never what it computes. A
+        // submit reduction that alters output is not an optimisation.
+        let e = tight.iter().zip(&loose).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert_eq!(e, 0.0, "framed chain must be bit-exact across flush_every, max|delta|={e:.2e}");
+    }
 
     /// C11-21a, measured instead of guessed. Both field profiles logged
     /// `windowed sampling ON (k=4)` — which predicts one readback per WINDOW,

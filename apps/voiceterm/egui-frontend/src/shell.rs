@@ -250,6 +250,81 @@ pub fn settings_panel(ui: &mut Ui, prefs: &mut settings_kit::Prefs) -> bool {
         });
     }
     ui.checkbox(&mut prefs.voice.speaker_id, "speaker identification");
+    ui.add_space(8.0);
+
+    // ── the sections below were UNREACHABLE ────────────────────────────────────
+    // settings-kit defines, persists and round-trips all of these, and no
+    // voiceterm screen offered any of them — so they sat at their defaults with
+    // no way for a user to change them, on a schema that was already carrying
+    // them to disk. Handedness and touch sizing in particular are the mobile
+    // affordances this fleet exists to serve: a left-handed phone user and a
+    // bigger tap target were both one unreachable field away.
+    //
+    // Every row iterates the kit's own `all()`. A variant list written out here
+    // would drift silently the moment the kit gained one — the new option would
+    // simply never appear, and nothing would fail.
+
+    ui.label(egui::RichText::new("handling").strong());
+    ui.horizontal_wrapped(|ui| {
+        for h in settings_kit::Handedness::all() {
+            if ui.selectable_label(prefs.input.handedness == h, h.label()).clicked() {
+                prefs.input.handedness = h;
+            }
+        }
+    });
+    ui.checkbox(&mut prefs.input.double_tilt, "double-tilt gesture");
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("movement keys:").weak().small());
+        for m in settings_kit::MovementLayout::all() {
+            if ui.selectable_label(prefs.input.movement == m, m.label()).clicked() {
+                prefs.input.movement = m;
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    // Touch sizing. `min_target` is a POINT value, not a scale — 44pt is the
+    // touch minimum `mobilelayout` enforces, so the range starts there rather
+    // than at zero: offering a target smaller than a fingertip is offering a
+    // setting whose only effect is to make the app unusable.
+    ui.label(egui::RichText::new("touch").strong());
+    ui.add(egui::Slider::new(&mut prefs.touch.min_target, 44.0..=72.0).text("minimum tap target (pt)"));
+    ui.add(egui::Slider::new(&mut prefs.touch.scale, 0.75..=1.5).step_by(0.05).text("touch scale"));
+    ui.add(egui::Slider::new(&mut prefs.touch.button_scale, 0.75..=1.75).step_by(0.05).text("button scale"));
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("accessibility").strong());
+    ui.checkbox(&mut prefs.a11y.voice, "voice control");
+    ui.checkbox(&mut prefs.a11y.tts, "read replies aloud");
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("transcript filtering:").weak().small());
+        for f in settings_kit::VoiceFilter::all() {
+            if ui.selectable_label(prefs.a11y.voice_filter == f, f.label()).clicked() {
+                prefs.a11y.voice_filter = f;
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("colour").strong());
+    ui.horizontal_wrapped(|ui| {
+        for f in settings_kit::ColorFilter::all() {
+            if ui.selectable_label(prefs.display.color_filter == f, f.label()).clicked() {
+                prefs.display.color_filter = f;
+            }
+        }
+    });
+    // White point in kelvin: lower is warmer. 6500K is daylight-neutral and the
+    // top of the range for that reason — going above it would tint the screen
+    // blue, which is the opposite of every reason someone opens this row.
+    ui.add(egui::Slider::new(&mut prefs.display.white_point, 2700.0..=6500.0).text("white point (K)"));
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("models").strong());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("pool directory:").weak().small());
+        ui.text_edit_singleline(&mut prefs.pool_dir);
+    });
 
     ui.add_space(10.0);
     ui.label(

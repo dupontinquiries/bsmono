@@ -89,6 +89,8 @@
 #[allow(dead_code)] pub mod workerkit;
 #[allow(dead_code)] pub mod buildfarm;
 /// Bringing a machine into the hive: discovery, code, trust level.
+pub mod workermem;
+pub mod roster;
 pub mod adddevice;
 pub mod agentscore;
 #[allow(dead_code)] pub mod ircsrc;

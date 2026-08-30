@@ -245,15 +245,37 @@ number is not evidence either way. Compared directly instead, file by file:
 | Mastodon | **Not a port gap.** Doesn't exist in voiceterm-qt either — `C9_TODO.md` names Tokodon (a separate KDE app) as reading material for an idea never built on either side. Don't spend effort "porting" something with no source. |
 | Niftycharts | Qt has niftyplot-equivalent rendering wired to `nifty-core` (extended this session with the hardware-diagram parser, `fd59fd3c`). egui-frontend has no nifty view file at all, despite already depending on `nifty-core` elsewhere (voiceterm's own `link_graph.rs`). Closest thing to a pure "the pieces exist, nobody wired the last one" gap. |
 | Web browsing | `browser.rs` exists (362 lines) — real module, depth unchecked. |
-| Settings | **Nothing.** No settings module, no settings file, anywhere in egui-frontend. Qt's Settings popup is large (model setup, wake-word config, alignment recalibration, notification toggles, per-section state) and none of it has a home on the egui side. |
+| Settings | **WRONG AS WRITTEN — a settings screen exists and is wired.** `shell.rs::settings_panel` (a real panel: animation, palette, text size, surface opacity, gesture sensitivity/commit/flick, mic, offload host, speaker id), reached as `Surface::Settings` from `voiceterm_egui.rs:1463`, applied live via `App::apply_settings` and persisted through `load_prefs`/`save_prefs` onto `shared/settings-kit`'s kv schema. voiceterm-egui has depended on settings-kit the whole time. What IS missing is four of the five areas the Qt popup carries: model setup, wake-word config, alignment recalibration, and notification toggles — none of which appear in the panel. Also unexposed: `Prefs` fields the kit defines and no voiceterm screen offers — `touch.min_target`, `touch.scale`, `touch.button_scale`, `input.handedness`, `input.double_tilt`, `input.movement`, `a11y.voice`, `a11y.tts`, `a11y.voice_filter`, `display.white_point`, `display.color_filter`, `model.pool_dir`. Those sit at their defaults forever with no way for a user to reach them, and handedness plus touch sizing are precisely the MOBILE affordances (a left-handed PinePhone user, a bigger tap target) this fleet is meant to serve. |
 | Manpages | `manpage_view.rs` exists but documents its own real limitation in its header comment: it renders documents handed to it rather than owning the registry, because that logic lives inside `manpages.rs` (4,117 lines) tangled with Qt-only code, and splitting it needs a Qt-buildable host to verify against — which this sandbox has never had. An honest, named blocker, not neglect. |
 
-- **C12-9a** — IRC and Settings are the two genuine zero-to-something gaps.
-  Niftycharts is close behind (the hard part, `nifty-core`, already exists —
-  this is a wiring job, not a build-from-scratch). Recommended order:
-  Settings, then niftycharts, then IRC, then a real depth-check on
-  graph/mail/browser before touching them (their line counts say "real
-  module," not "feature-complete").
+- **C12-9a — the recommendation was built on the wrong row, and the order
+  changes.** This said "IRC and Settings are the two genuine zero-to-something
+  gaps" and put Settings first. Settings is not a zero-to-something gap: the
+  screen exists, is wired, persists, and applies live (see the corrected row
+  above). Only IRC is. Verified against code this session rather than against
+  the table, which is CLAUDE.md 5's exact failure — a session following this
+  entry would have built a settings screen next to an existing one.
+  Revised order, with what each actually needs:
+  1. **IRC** — still genuinely absent (zero irc-anything in egui-frontend), and
+     `shared/irc-kit` exists, so check it before writing a client.
+  2. **The unexposed `Prefs` fields — DONE (`55480f35`).** All twelve now have
+     rows: `input.{handedness,double_tilt,movement}`, `touch.{min_target,scale,
+     button_scale}`, `a11y.{voice,tts,voice_filter}`,
+     `display.{color_filter,white_point}`, `model.pool_dir`. Rows iterate the
+     kit's `all()` rather than a local variant list, and `6d9541d5` makes the
+     compiler enforce that `all()` stays complete, so the panel cannot drift
+     silently behind the kit.
+     **NOT rendered.** No display here, so layout, wrapping and touch ergonomics
+     are unverified, and the sections roughly double the panel's length —
+     whether it now needs scrolling, grouping or a second surface is a question
+     only a screen answers. That is the first thing to look at on hardware.
+  3. **Niftycharts** — unchanged, still a wiring job over `nifty-core`.
+  4. **The four Qt settings areas** the panel lacks (model setup, wake-word,
+     alignment recalibration, notification toggles) — these are the real
+     Settings gap, and unlike (2) they need backing state that may not exist
+     on the egui side yet. Check before assuming it is only UI.
+  5. **Depth-check graph/mail/browser** before touching them — unchanged; their
+     line counts say "real module", not "feature-complete".
 
 ## 10. logscope gpu-gemm: an architecture the wgpu engine correctly refuses
 
@@ -285,13 +307,21 @@ purpose; that is the documented expected failure, not a surprise to debug.
   itself: an architecture becomes supported only once it has completed a
   forward pass on a real checkpoint and produced coherent output — that is
   the acceptance test, not "it loads without erroring."
-- **C12-10b** — separately, `.block_count` being absent under the expected
-  hparam key but present under `["muse-glimmer"]` suggests the GGUF
-  metadata key convention for this model family differs from what the
-  loader's hparam-prefix guesser expects. Worth checking whether that
-  guesser needs a fallback more general than "read the tensor names"
-  (which is what it fell back to here and which worked) for OTHER
-  metadata fields beyond block count.
+- **C12-10b — CLOSED (`007218a0`).** The guesser did need generalising, and the
+  defect was narrower than this item guessed: it was not a family-specific key
+  convention. `arch()` anchored on `<prefix>.embedding_length` ALONE, so a file
+  whose hparams sit under one prefix but which omits or renames that single key
+  fell through to the declared arch — and then every `<arch>.*` lookup missed at
+  once, which presents as a pile of "missing X" rather than one resolution
+  failure. It now trusts a declared arch backed by ANY known hyperparameter and
+  scores candidate prefixes by how many they carry, `min` on ties as before.
+  `HPARAM_SUFFIXES` is an allowlist rather than "count every key", because the
+  latter resolves the architecture to `tokenizer` — hundreds of entries in a
+  real GGUF against an arch block's dozen — and that failure would be silent
+  and total. `NON_ARCH_PREFIXES` gained `audio` and `adapter`, since a wider
+  net needs wider exclusions. 1242/1242; --gate-arch/-qwen3/-loadpath green.
+  Does NOT make `block_count_from_tensors` redundant: that fallback handles a
+  file with no metadata hparam block at all, and is untouched.
 
 ## 11. bo-suite-egui: split into the apps it already claims to be
 
@@ -850,11 +880,22 @@ not.
   Thinker slice carrying the prompt. `select_invitees_for` gates at
   ADMISSION (not assignment: once a member, dispatch hands it whatever
   the queue holds). 3 tests; 404/404.
-  - **STILL OPEN: no caller passes a registry.** The gate exists and the
-    ungated path is explicit at every call site — `None` is spelled, not
-    defaulted — but the fleet code still calls the ungated form. That is
-    the difference between a rule that CAN be enforced and one that is.
-    Threading the registry through is the remaining work.
+  - **CLOSED (`b41ad86c`): the caller now passes a registry.** `Coordinator`
+    takes `registry` + `duty` via `with_trust()`; `new()` stays ungated so no
+    existing caller changed. BOTH admission paths are gated — `invite()` and
+    `best_untried()`, the latter because gating only the first would let a
+    fleet acquire the refused peer by the side door of someone else declining.
+    `refused()` reports who and why. 409/409; each gate broken in turn to
+    confirm its test is the one that catches it.
+    The original wording of this bullet — "the fleet code still calls the
+    ungated form ... threading the registry through is the remaining work" —
+    is no longer true and is replaced rather than left standing, since a
+    stale open item reads exactly like a real one.
+    What IS still open: no CALLER of `Coordinator` opts in yet. `with_trust`
+    exists and nothing in the app constructs a coordinator with it, so the
+    fleet is gated only where someone asks for it. That is a smaller gap than
+    before (the mechanism now reaches the decision point) but it is the same
+    shape of gap, and worth naming as such rather than calling 23f finished.
   - Method note, now twice-proven: writing a rule as testable code and
     then grepping for its callers is what found both 23e and this. A
     predicate with no callers is the shape to look for — it reads as
@@ -906,6 +947,131 @@ these are only in commit messages where nobody will find them.
 - blackstar-rs `games/blackstar` vs `games/blackstar-rs`: READMEs now
   disambiguate, but the `c5blackstar-NNN` bundle series still carries
   the misleading name.
+
+## 27. Worker creation mode: two of C11-20's four pieces exist now
+
+- **C11-20c — CLOSED (`ab20b46e`).** `workermem::WorkerMemory`: append-only,
+  provenance-tagged (Observation | Decision | Inference), capped, fenced on the
+  way out. Built to `docs/12-queen-and-workers.md`, not from guesswork. Three
+  decisions where the obvious implementation inverts the intent, each pinned by
+  a test: the cap REFUSES rather than evicting (a ring buffer keeps the worker's
+  newest guesses and discards the operator's oldest instructions);
+  `summarize_with` collapses PER PROVENANCE (one blob would destroy the
+  distinction at exactly the moment a revived worker reads it first); and
+  `established()` excludes inferences (recording provenance and then handing
+  consumers one flat list would store the distinction without acting on it).
+  The fencer is INJECTED because `read_harness::fence` lives in logscope-egui,
+  which depends on this crate — copying it is the voiceprint-kit mistake.
+- **C11-20b — HALF DONE (`56d28956`).** `roster::Roster` + `Staffing` +
+  `queen_request`. `QUEEN_PROMPT` always ended with "reuse before creating" and
+  nothing ever gave the Queen a roster to reuse from; it does now. Staffing is
+  by LANE (`owns`) rather than purpose, most-specific-wins, with equal claims
+  returning `Ambiguous` instead of a tiebreak.
+  **Still open from 20b:** the seed workers the doc suggests (reader,
+  test-runner, patcher) are not shipped, so a cold system is still
+  every-task-is-a-Queen-call — which the doc names as an open question
+  ("who writes the first roster?") rather than something already decided.
+- **C12-27a — the two new modules do not know about each other.**
+  `WorkerSpec.name` is documented as the memory directory and nothing joins a
+  roster entry to a `WorkerMemory`. Neither module is constructed at runtime by
+  anything, so both are built-with-no-consumer in the sense of section 24.
+  The join is small; what it needs first is a decision about persistence, since
+  `workermem` is deliberately pure (no I/O) and a memory directory implies
+  someone owns the reading and writing of it.
+- **C12-27b — `continuation::Command` is still not the Delegator's.** The doc
+  says the post-turn question ("keep going linearly / fan out / verify / stop")
+  belongs here, answered by cheap rules first. `roster` answers the STAFFING
+  question only; nothing answers the continuation one.
+- **C11-20a remains the experiment that decides the thesis** and is untouched:
+  same 1B, same task, with and without a lane + two-tool whitelist. Everything
+  in doc 12 — and therefore both modules above — is speculation until that
+  number exists, and it needs a device.
+
+## 26. logscope: flush_every was inert, and what that leaves open
+
+Closed this session (`adf1ecfd`, `1bcec8eb`): `Frame.passes` was never
+incremented, so `over_flush` could not fire and the whole `flush_every`
+mechanism did nothing — including the watchdog-prone `clamp(1, 64)` that
+exists so a mobile driver is not handed one enormous submit. Details in the
+commit; `--gate-submit` is green for the first time (lavapipe).
+
+Also corrected: **C11-21a names the wrong function.** The field path is
+`stream_session_window` (`logscope-egui/src/backend.rs:1543`, `:2103`), not
+`generate_kv_stream`, which has two non-test callers and is not the chat path.
+
+- **C12-26a — the mobile submit bound is now LIVE and unmeasured on real
+  hardware.** Turning the mechanism on changes submit counts wherever a frame
+  reaches its bound. Measured on lavapipe at k=4, 16 layers: desktop path 5
+  submits per 8 tokens, watchdog path 29. That is the intended trade (bounded
+  submit duration vs throughput) but nobody has run it on an actual Asahi or
+  Adreno device since it started working. The field's own numbers were taken
+  while it was inert, so every previous submits/token figure describes the
+  unbounded path and should not be compared against a new run without saying so.
+- **C12-26b — PARTLY CLOSED (`8d0e53f4`).** `LOGSCOPE_FORCE_WATCHDOG=1` forces
+  `watchdog_prone()` on (never off, deliberately) so the mobile decode branch
+  runs on any device; it is what showed the bound was inert. The DECISION is now
+  a pure seam — `window_flush_plan(k, n_layers, bounded, saved)` — and is tested
+  without a GPU, including that the mobile branch is bounded above regardless of
+  k and strictly tighter than the collapsing branch.
+  **Still open:** nothing tests the env var or the end-to-end submit COUNT. An
+  env-based test would mutate process-global state while 1236 tests run in
+  parallel, so it wants a serial-test mechanism (or a `Gpu` constructor taking
+  the flag) rather than `set_var` in a `#[test]`. The arithmetic is pinned; the
+  wiring from `watchdog_prone()` to the plan is not.
+- **C12-26c — `per_tok` is now `n_layers * 16`, derived from a lavapipe
+  measurement** (12.5–14.7 dispatches per layer-token across 3/8/16-layer
+  fixtures). That ratio is measured on ONE driver with tiny fixtures; a real
+  model on real hardware may sit elsewhere, and the constant 16 is a generous
+  round-up rather than a law. `count-dispatch <model> <n> <k>` reports it.
+- **C12-26f — `--gate-qkv`'s end-to-end failure is ONE ULP, and the gate now
+  says so (`f125064f`).** It read `len 48 vs 48, max|Δ|=2.384e-6, rel=5.712e-7`
+  after the diagnostic was added — floating-point reassociation, not a fusion
+  that concatenates wrongly. The evidence is in the same gate: every isolated
+  fusion comparison is EXACTLY zero (int8 m=1/m=4, q4 m=1/m=4, fused bias), and
+  a wrong q/k/v block order produces garbage rather than a last-place bit.
+  NOT diagnosed and deliberately NOT "fixed" by relaxing to a tolerance —
+  lavapipe is documented here as departing from the WGSL spec in four ways
+  including FMA contraction, which would make bit-exactness correct on
+  conformant hardware and unreachable in this sandbox. Telling "the engine
+  reassociates" (fails everywhere) from "this driver contracts differently"
+  (fails only here) needs a second driver. Whoever runs this on real hardware
+  next sees 0.00e0 or 2.4e-6 immediately and the question answers itself.
+- **C12-26g — `forward_kv_q8_fused`'s doc cites `--gate-qkv-e2e`, which does not
+  exist** in `kernel-validate`'s gate list. Its claim ("bit-exact to it") is
+  unverified by anything in the tree. Same class as C11-19b's dangling
+  HiveMind_Strategy citation.
+- **C12-26h — the physical UI's `u_touch` is still dead, and wiring it is a
+  design task, not a fix.** `gpuscene.rs` declares the uniform and
+  `glow_scene.rs` uploads it every frame from `Uniforms::touch`, which nothing
+  outside that file ever sets, so it is `None` forever and the shader helper's
+  first line returns immediately on every fragment. Confirmed further this
+  session: there is NO picking/raycast anywhere in the crate (no `unproject`,
+  no `hit_test`, no ray code), so producing a world-space touch point needs
+  screen-to-world picking that does not exist. `docs/physical-ui-findings.md`
+  is right that this is small ONCE the UV attribute lands; it is not small
+  today, and it cannot be visually verified in this sandbox at all.
+- **C12-26d — two gates fail on lavapipe and predate this work.** Verified
+  pre-existing by re-running with the flush pinned high (the old inert
+  behaviour) and getting identical failures. `--gate-matvec`: the subgroup
+  matvec is wrong on lavapipe (rel 2.0 on attn-kv-gqa and vocab>32768) — a
+  FOURTH driver for the known subgroup problem WORKPLAN-next records.
+  `--gate-qkv`: fused decode is not bit-exact against separate-projection
+  decode. Neither is diagnosed.
+- **C12-26e — the tiny fixtures only go to 3 layers.** `gen3.py` hardcodes
+  `L` per architecture. Depth is what makes the dispatch-per-token figure
+  interesting, so the generator taking a layer count as an argument would be
+  worth doing rather than patching a copy into /tmp as this session did.
+
+**Sandbox lore, both cost time:** cargo cannot run its rustc probe in this
+harness ("couldn't read from stdin, as it did not contain valid UTF-8")
+regardless of `< /dev/null`, `exec 0</dev/null` or RUSTFLAGS, while the same
+probe by hand succeeds — so any workspace without a populated
+`target/.rustc_info.json` is unbuildable. gpu-gemm is a SEPARATE workspace from
+apps/logscope and had a truncated 524-byte cache; copying the good 986-byte one
+from `apps/logscope/target/` fixed it (fingerprints match). This is CLAUDE.md
+5d's "cached poisoned rustc probe" and the transplant is the workaround. Second:
+backgrounded builds (`nohup ... &`) do NOT survive between tool calls; builds
+must run in the foreground.
 
 ## 25. Fleet run on 30 apps: 7 real test failures, and the disk was NOT the cause
 
