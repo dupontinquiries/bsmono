@@ -3798,3 +3798,36 @@ outside itself; not read yet.
   (`cpudecode`, `flash_qblock`, `kvbudget`, `ragged`, `recover`…), which
   are likely the library-API pile rather than gaps — a kernel crate has
   public entry points by design.
+
+## 71. The checker could not see C++ callers either
+
+Third false-positive class in this tool, after aliased imports (§40) and
+crate boundaries (§60). snapclone reported 19 uncalled modules; its Rust
+crates are consumed by the C++/Qt app over a C ABI, and the checker only
+read `.rs` files.
+
+`frame` alone has **109** references from `src/*.cpp`. `chunk` has 18,
+`jitter` 20, `requests_ffi` 3 — the last through a header
+(`snapclone_requests_ffi.h`) that `InboxWidget.cpp` includes by name.
+
+Now scans `.cpp/.cc/.h/.hpp/.qml` too, matching the BARE NAME in those
+files: C++ refers to a Rust module through a header or symbol named
+after it, never as `requests_ffi::`. The bare-name match is restricted
+to non-Rust files, so a Rust file mentioning the word in prose still
+does not count as a caller.
+
+snapclone 19 -> 10. Re-verified the apps I have already reported on:
+gitmind 7, aperture 1, blackstar-rs 12+24 all unchanged; logscope-egui
+8 -> 7.
+
+The pattern across all three fixes is the same and worth stating once:
+every time, the tool was blind to a way a caller can exist that its
+author (me) had not thought of, and every time the symptom was a large
+confident list that was mostly wrong. The rule that saved it each time
+was hand-checking findings before acting — and specifically hand-checking
+by a method that DIFFERS from the tool's, which is the part I got wrong
+in §60 and right afterwards.
+
+- **C71a — the fleet total is now stale.** §70's 142 was measured before
+  this fix; snapclone alone drops 9. Worth re-running before treating
+  any of those counts as a workload.

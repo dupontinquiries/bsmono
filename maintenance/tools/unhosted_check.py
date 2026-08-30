@@ -84,9 +84,19 @@ def audit(rs: Path):
     # the alias fix, one scope up.
     siblings = [p for p in src.rglob("*.rs") if p != rs]
     if _TREE_ROOT is not None:
+        # ALSO the non-Rust sources. A crate exposed over a C ABI has its
+        # callers in C++, and a Rust-only scan cannot see them: snapclone
+        # reported 19 uncalled modules of which `frame` alone has 109
+        # references from src/*.cpp. That is a fifth false-positive class
+        # after aliases and crate boundaries, and the same lesson —
+        # a checker wrong about the app it is run on gets ignored.
+        exts = (".rs", ".cpp", ".cc", ".h", ".hpp", ".qml")
         siblings = [
-            p for p in _TREE_ROOT.rglob("*.rs")
-            if p != rs and "/target/" not in str(p)
+            p for p in _TREE_ROOT.rglob("*")
+            if p.is_file()
+            and p.suffix in exts
+            and p != rs
+            and "/target/" not in str(p)
         ]
     out = []
     for m in mods:
@@ -107,19 +117,26 @@ def audit(rs: Path):
         # of five, which is worse than no checker, because a report that
         # is wrong about the app it is run on teaches people to ignore
         # the report.
+        # The bare NAME matters for the FFI case: C++ refers to a Rust
+        # module through a header or symbol named after it
+        # (`snapclone_requests_ffi.h`), never as `requests_ffi::`. Matched
+        # only in non-Rust files, so a Rust file merely mentioning the
+        # word in prose still does not count as a caller.
         pat = re.compile(
             rf"\b{re.escape(m)}::"
             rf"|\buse\s+[\w:{{}}, ]*\b{re.escape(m)}\s+as\s+\w+"
         )
+        ffi_pat = re.compile(rf"\b{re.escape(m)}\b")
         callers = 0
         flagged_only = True
         for s in siblings + [rs]:
             if s == mod_file:
                 continue
             body = s.read_text(errors="replace")
+            use_pat = ffi_pat if s.suffix != ".rs" else pat
             hits = [
                 ln for ln in body.splitlines()
-                if pat.search(ln) and not ln.lstrip().startswith(("//", "///", "//!"))
+                if use_pat.search(ln) and not ln.lstrip().startswith(("//", "///", "//!", "*"))
             ]
             if not hits:
                 continue
