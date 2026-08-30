@@ -3312,3 +3312,49 @@ commit was about.
   The general shape: "this field has no consumer" is not always a gap to
   close. Sometimes the consumer is deliberately fixed, and wiring the
   field would be the bug.
+
+## 62. Fleet deployment: the plan runs nowhere, and every primitive exists
+
+Audited gitmind-egui's fleet page. Most of it is in better shape than
+the rest of this session's finds, and the exceptions are worth naming
+precisely.
+
+**Sound, and recorded as passes:**
+  - All six `FleetAction` variants are dispatched and handled
+    exhaustively — no catch-all arm, so a new action cannot be silently
+    ignored.
+  - `Export` derives its `ok`/`failed` tally from the log (my earlier
+    fix, intact) and REPORTS write failures rather than discarding them
+    — the exact class that bit bot-arena in §56.
+  - `reroll_ui` is called, so the fleet-wide plan is reachable.
+
+**The gap, and it is honest about itself.** `reroll_ui` can PLAN a
+fleet-wide deploy and cannot RUN one:
+
+    // No dead button: the executor needs a Runner over ssh/cargo/scp and
+    // that is not wired yet. Saying so is better than a control that does
+    // nothing when pressed.
+
+That is the correct handling of an unfinished feature and the opposite
+of what this session keeps finding — it states the gap on screen instead
+of offering a control that lies.
+
+**But every primitive the Runner needs already exists.**
+`reroll::Runner` wants enroll / build / install / rename / refresh /
+triple_of, and cockpit has `deploy::setup_key`, `deploy::trust_host`,
+`deploy::scp_push`, `deploy::remote_capture`, `ops::build_locally_logged`
+and `flow::deploy_app_remote`. The push page already drives most of them
+for ONE device.
+
+So this is not missing capability, it is a missing adapter: one impl of
+a six-method trait over functions that are already used elsewhere in the
+same binary.
+
+- **C12-62a — write the Runner impl.** Not started here because it needs
+  a real device to test against, and `reroll::execute`'s value is
+  entirely in its FAILURE rules (a failed enrolment skips that device's
+  installs; a failed build skips that app on every device sharing the
+  triple; a failed install is confined to one device and one app).
+  Those are the paths worth exercising and the ones a sandbox cannot
+  reach — writing the impl blind would produce a plausible adapter whose
+  error handling has never once run.
