@@ -104,6 +104,76 @@ impl HttpResponse {
     }
 }
 
+/// HTTP/1.1 chunked transfer, so a reply can arrive as it is produced.
+///
+/// The daemon exists to hold one copy of the weights, but its endpoint
+/// returned the whole reply at once — and at the ~4 tok/s this engine
+/// reports, a 170-token answer is forty seconds of a still UI followed
+/// by a paragraph. That would make the daemon feel WORSE than loading
+/// your own model, in exactly the app where its memory saving is
+/// largest.
+///
+/// Chunked rather than a second framed protocol on the unix socket: the
+/// endpoint already speaks HTTP/1.1, this is the conventional mechanism,
+/// and it keeps the unix door the SAME endpoint as the TCP one rather
+/// than a parallel one that can drift.
+pub mod chunked {
+    /// The response head. No Content-Length — that is what tells the
+    /// client to read chunks, and sending both is the classic way to
+    /// produce a response nobody can parse.
+    pub fn head(status: u16, reason: &str, content_type: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// One chunk: hex length, CRLF, payload, CRLF.
+    ///
+    /// An EMPTY piece encodes to nothing rather than to `0\r\n\r\n`,
+    /// because a zero-length chunk is the terminator — a generator that
+    /// emitted an empty token would otherwise end the response early and
+    /// truncate its own reply.
+    pub fn chunk(piece: &str) -> Vec<u8> {
+        if piece.is_empty() {
+            return Vec::new();
+        }
+        let mut out = format!("{:x}\r\n", piece.len()).into_bytes();
+        out.extend_from_slice(piece.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    /// The terminator.
+    pub fn end() -> Vec<u8> {
+        b"0\r\n\r\n".to_vec()
+    }
+
+    /// Decode a chunked body. Returns None on a malformed length or a
+    /// truncated chunk — a connection cut mid-reply must read as an
+    /// error, not as a short answer, or a half-generated completion
+    /// looks like a finished one.
+    pub fn decode(body: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut rest = body;
+        loop {
+            let (len_s, tail) = rest.split_once("\r\n")?;
+            // Chunk extensions (`1a;foo=bar`) are legal and ignored.
+            let len_s = len_s.split(';').next()?.trim();
+            let n = usize::from_str_radix(len_s, 16).ok()?;
+            if n == 0 {
+                return Some(out);
+            }
+            if tail.len() < n {
+                return None; // truncated: the sender died mid-chunk
+            }
+            out.push_str(&tail[..n]);
+            rest = tail.get(n + 2..)?; // skip the payload's trailing CRLF
+        }
+    }
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -338,6 +408,83 @@ pub fn serve_tracked(
             }
             let _ = stream.flush();
         });
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::chunked;
+
+    #[test]
+    fn tokens_round_trip_in_the_order_they_were_produced() {
+        let mut body = Vec::new();
+        for tok in ["let ", "x ", "= ", "1;"] {
+            body.extend_from_slice(&chunked::chunk(tok));
+        }
+        body.extend_from_slice(&chunked::end());
+        let text = String::from_utf8(body).unwrap();
+        assert_eq!(chunked::decode(&text).as_deref(), Some("let x = 1;"));
+    }
+
+    #[test]
+    fn an_empty_token_does_not_terminate_the_reply() {
+        // A zero-length chunk IS the terminator, so a generator emitting
+        // an empty token would end its own response early and the reply
+        // would silently truncate. Empty pieces encode to nothing.
+        assert!(chunked::chunk("").is_empty());
+        let mut body = Vec::new();
+        body.extend_from_slice(&chunked::chunk("a"));
+        body.extend_from_slice(&chunked::chunk(""));
+        body.extend_from_slice(&chunked::chunk("b"));
+        body.extend_from_slice(&chunked::end());
+        let text = String::from_utf8(body).unwrap();
+        assert_eq!(chunked::decode(&text).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn a_truncated_body_is_an_error_not_a_short_answer() {
+        // The failure that matters: a daemon killed mid-generation must
+        // not look like it finished. A half-written completion accepted
+        // as complete is worse than a visible error.
+        let full = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&chunked::chunk("hello world"));
+            b.extend_from_slice(&chunked::end());
+            String::from_utf8(b).unwrap()
+        };
+        assert!(chunked::decode(&full).is_some());
+        // Cut inside the payload.
+        assert_eq!(chunked::decode(&full[..8]), None, "truncation read as success");
+        // A length that is not hex at all.
+        assert_eq!(chunked::decode("zz\r\nhi\r\n0\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn multibyte_text_is_measured_in_bytes_not_characters() {
+        // The length prefix is bytes. Counting chars would desynchronise
+        // the stream on the first non-ASCII token and garble everything
+        // after it.
+        let s = "héllo → ok";
+        let mut b = chunked::chunk(s);
+        b.extend_from_slice(&chunked::end());
+        let text = String::from_utf8(b).unwrap();
+        assert!(text.starts_with(&format!("{:x}\r\n", s.len())));
+        assert_eq!(chunked::decode(&text).as_deref(), Some(s));
+    }
+
+    #[test]
+    fn the_head_does_not_promise_a_length_it_will_not_send() {
+        // Content-Length AND Transfer-Encoding together is the classic
+        // way to produce a response nobody can parse.
+        let h = String::from_utf8(chunked::head(200, "OK", "text/plain")).unwrap();
+        assert!(h.contains("Transfer-Encoding: chunked"), "{h}");
+        assert!(!h.contains("Content-Length"), "{h}");
+    }
+
+    #[test]
+    fn chunk_extensions_are_tolerated() {
+        // Legal HTTP that a hand-rolled parser typically chokes on.
+        assert_eq!(chunked::decode("2;foo=bar\r\nhi\r\n0\r\n\r\n").as_deref(), Some("hi"));
     }
 }
 

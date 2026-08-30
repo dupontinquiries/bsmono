@@ -1638,6 +1638,28 @@ kept the two from drifting so far. Worth doing before wiring
 logscope-egui, because shipping (1) first would teach people that the
 daemon makes the app feel worse.
 
+**The chunked CODEC is now built** (`netserve::chunked`, 6 tests). Four
+of those pin failures that would each be invisible in a happy-path test:
+  - an EMPTY token must encode to nothing, since a zero-length chunk is
+    the terminator — a generator emitting one would end its own response
+    early and silently truncate the reply;
+  - a truncated body decodes to `None`, not to a short string: a daemon
+    killed mid-generation must not look like it finished, because a
+    half-written completion accepted as complete is worse than a visible
+    error;
+  - lengths are BYTES, so the first non-ASCII token does not
+    desynchronise the stream and garble everything after it;
+  - the head does not send Content-Length alongside Transfer-Encoding,
+    which is the classic way to produce a response nobody can parse.
+  Chunk extensions (`1a;foo=bar`) are tolerated — legal HTTP that
+  hand-rolled parsers usually choke on.
+
+  STILL TO DO: a streaming `gen` signature. The current one is
+  `Fn(&str, usize) -> String`, which cannot emit tokens as it goes, so
+  the handler needs a sibling taking `&mut dyn FnMut(&str) -> bool`
+  before the codec has anything to stream. Then the client side, then
+  logscope-egui's `Daemon` backend variant.
+
 **Note on scope:** this is where the daemon's value is largest AND where
 its UX cost is most visible, which is why the streaming question has to
 be answered here rather than deferred. aperture's completions are short
