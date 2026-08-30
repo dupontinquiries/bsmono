@@ -2358,8 +2358,9 @@ hand-check I gave the voiceterm five, and §33's did get one.
   strictly-smaller second implementation of a job already done, and
   wiring it would have put two hit-testers on one scene.
 
-  `tab_layout` — TO WIRE, not delete, and the reason is the opposite of
-  picking's. There is no used sibling: grepping `src/tabs/` for
+  `tab_layout` — VERDICT REVISED, see C12-40d below. I first called it
+  "to wire"; on reading the tabs it describes an architecture they do
+  not have. Original reasoning kept: There is no used sibling: grepping `src/tabs/` for
   `DeviceClass`, `responsive_nav` or `is_compact` returns NOTHING, so no
   tab does adaptive layout by any route. Its own doc says the render
   code "reads these flags instead of hard-coding a desktop layout" —
@@ -2392,6 +2393,34 @@ hand-check I gave the voiceterm five, and §33's did get one.
   sticky "is a touch device" flag the app does not have.
 
   STILL TO DECIDE: the remaining seven.
+
+- **C12-40d — `tab_layout` is a THIRD case: neither superseded nor one
+  step from done.** Correcting my own verdict from two commits ago.
+
+  It describes "master/detail (sources, rotate, cargo)" and
+  "content + controls (peek, code, charts)" archetypes. Those tabs do
+  not have that shape: `sources.rs` is 129 lines of vertical form,
+  `rotate.rs` is 71, and neither has a list beside a detail to split.
+  Wiring `master_detail()` into them would mean RESTRUCTURING each tab
+  into a shape it does not currently take — a design change, not a
+  connection.
+
+  There is also a live neighbour I had missed. `mobilelayout` IS called
+  (app, filepicker, holdmenu, refresh) and does adaptive width work —
+  `dialog_width`, `row_mode`, `fits`, `min_control_pt`. It is not a
+  duplicate of `tab_layout` (controls and widths versus whole-tab
+  archetypes), but it means logscope is NOT missing adaptive layout the
+  way I said: it has one that is used, plus two that are not, at
+  different granularities.
+
+  So the honest label for `tab_layout` is speculative design that the
+  tabs never adopted. That is a third pile, and it wants a decision from
+  someone who knows whether those tabs are meant to become master/detail
+  — not a mechanical wire-up, and not deletion either.
+
+  `chat_layout` was different precisely because it mapped onto a
+  `SidePanel` that already existed. That is what made it wirable in one
+  commit and this one not.
 
 - **C12-40c — the original entry, for the reasoning:** These
   split into two piles and the piles want opposite treatment. A module
