@@ -553,6 +553,8 @@ struct VoicetermApp {
     /// The QML settingsPopup's launcher half — four doors plus voice
     /// activation and theme. Preferences live in `app.prefs`.
     launcher: uikit_egui::quick_launcher::LauncherState,
+    /// The accessibility scene the settings toggles register with.
+    a11y: uikit_egui::a11y::A11yScene,
     /// Document ingest: diagnose a captured page, repair it, confirm or revert.
     ingest: voiceterm_egui::docingest::Ingest,
     /// WHICH SURFACE the central panel shows. voiceterm had twelve ported
@@ -1522,7 +1524,7 @@ impl eframe::App for VoicetermApp {
                     }
                     ui.add_space(10.0);
                     ui.separator();
-                    if settings_panel(ui, &mut self.app.prefs) {
+                    if settings_panel(ui, &mut self.app.prefs, &mut self.a11y) {
                         // palette is owned by prefs; keep the frame-applied theme in sync
                         self.theme = snapclone_theme::PaletteId::from_str(&self.app.prefs.palette);
                         let prefs = self.app.prefs.clone();
@@ -3441,6 +3443,7 @@ fn main() -> eframe::Result<()> {
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
+                a11y: uikit_egui::a11y::A11yScene::new(),
                 view: CentralView::Terminal,
                 mail: Default::default(),
                 browser: Default::default(),

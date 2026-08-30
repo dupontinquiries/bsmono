@@ -494,9 +494,38 @@ mod tests {
     use super::*;
     use std::env;
 
-    /// Each test uses a unique XDG_STATE_HOME so they don't
-    /// stomp on each other or on the user's real snapshot store.
+    /// Serialises the nine tests that use `with_temp_store`.
+    ///
+    /// The comment below used to say a unique XDG_STATE_HOME meant they
+    /// "don't stomp on each other". The DIRECTORY is unique; the
+    /// VARIABLE naming it is process-global, and cargo runs these on
+    /// parallel threads — so one test's `set_var`, and its restore on
+    /// the way out, land in the middle of another's run. The second test
+    /// then reads a store that is not its own, or one that has just been
+    /// deleted.
+    ///
+    /// That is the reported failure: `snapshot_restore_roundtrip` got 0
+    /// files restored instead of 3, because the snapshot it wrote went
+    /// to one store and the restore read another. The restore logic is
+    /// fine.
+    ///
+    /// Fourth instance of this shape this week (bo-suite, aperture-engine,
+    /// gitmind, now this), so the rule is worth stating where the next
+    /// person will read it: A PER-TEST TEMPDIR IS NOT ISOLATION WHEN THE
+    /// THING SELECTING IT IS GLOBAL.
+    ///
+    /// Poison ignored so one panicking test does not mask the rest.
+    fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Each test gets a unique XDG_STATE_HOME, held under `store_lock`
+    /// so the variable really is this test's for the duration.
     fn with_temp_store<F: FnOnce(&Path)>(f: F) {
+        let _serial = store_lock();
         let tmp = env::temp_dir().join(format!(
             "web2qml-snap-test-{}-{}",
             std::process::id(),

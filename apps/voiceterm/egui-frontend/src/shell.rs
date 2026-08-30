@@ -191,7 +191,23 @@ pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> Response {
 /// terminal's touch layer reads (sensitivity / commit fraction / flick velocity) and the voice
 /// mesh (mic, offload + compute host, speaker id). Returns `true` when anything changed this
 /// frame — the caller persists (`save_prefs`) and re-applies (`App::apply_settings`).
-pub fn settings_panel(ui: &mut Ui, prefs: &mut settings_kit::Prefs) -> bool {
+/// The preferences screen. `a11y` is the scene every toggle registers
+/// with, so a voice or switch user can reach these controls by name.
+///
+/// The parity audit reported `a11y=0` for this app: the registry has
+/// existed since bot-arena adopted it, and no screen here fed it. A
+/// settings screen is the worst place for that gap — it is exactly where
+/// someone configuring assistive input needs to be able to work, and the
+/// controls are all named toggles, which is the easiest case there is.
+///
+/// Ids are stable strings rather than positions, because `A11yScene`
+/// keeps focus across frames BY ID: a position-derived id would move
+/// focus to a different control whenever a section above it grew.
+pub fn settings_panel(
+    ui: &mut Ui,
+    prefs: &mut settings_kit::Prefs,
+    a11y: &mut uikit_egui::a11y::A11yScene,
+) -> bool {
     let before = prefs.to_kv();
 
     ui.label(egui::RichText::new("animation").strong());
@@ -241,15 +257,21 @@ pub fn settings_panel(ui: &mut Ui, prefs: &mut settings_kit::Prefs) -> bool {
     ui.add_space(8.0);
 
     ui.label(egui::RichText::new("voice").strong());
-    ui.checkbox(&mut prefs.voice.mic_enabled, "microphone");
-    ui.checkbox(&mut prefs.voice.offload_enabled, "offload transcription to a compute host");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("voiceterm.prefs.mic").value(),
+        "microphone", &mut prefs.voice.mic_enabled);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("voiceterm.prefs.offload").value(),
+        "offload transcription to a compute host", &mut prefs.voice.offload_enabled);
     if prefs.voice.offload_enabled {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("host:").weak().small());
             ui.text_edit_singleline(&mut prefs.voice.compute_host);
         });
     }
-    ui.checkbox(&mut prefs.voice.speaker_id, "speaker identification");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("voiceterm.prefs.speaker_id").value(),
+        "speaker identification", &mut prefs.voice.speaker_id);
     ui.add_space(8.0);
 
     // ── the sections below were UNREACHABLE ────────────────────────────────────
@@ -272,7 +294,9 @@ pub fn settings_panel(ui: &mut Ui, prefs: &mut settings_kit::Prefs) -> bool {
             }
         }
     });
-    ui.checkbox(&mut prefs.input.double_tilt, "double-tilt gesture");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("voiceterm.prefs.double_tilt").value(),
+        "double-tilt gesture", &mut prefs.input.double_tilt);
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new("movement keys:").weak().small());
         for m in settings_kit::MovementLayout::all() {
