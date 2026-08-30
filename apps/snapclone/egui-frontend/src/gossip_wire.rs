@@ -1,0 +1,645 @@
+//! gossip_wire — the datagram format peers actually exchange, and the socket
+//! that carries it.
+//!
+//! `gossip.rs` has the POLICY — a partial view, TTL pruning, fanout selection,
+//! an admission check — and no way to get a record from another machine. There
+//! is no encoder, no decoder and no socket anywhere in this frontend, so
+//! `PeerRecord` could only ever be constructed in a test. Every contact loaded
+//! from disk stays offline forever, because nothing is listening.
+//!
+//! ## The format is Qt's, not a new one
+//!
+//! JSON, as documented in `apps/snapclone/rust/snapclone-gossip/src/message.rs`
+//! and originally `GossipDiscovery.cpp::processDatagram`:
+//!
+//! ```json
+//! {"id":"sc-32a51661","host":"192.168.1.5","port":9876,"ts":1700000000000,
+//!  "peers":[{"id":"sc-aabbccdd","host":"192.168.1.6","port":9876,"ts":...}]}
+//! ```
+//!
+//! That crate does the same job with serde_json, and using it was the first
+//! instinct. It is not in this frontend's lock and pulls serde, serde_json,
+//! chrono, anyhow, rand and tokio behind it — a tokio runtime to read one
+//! datagram. The schema is five fields and an array of five-field objects, so
+//! it is hand-written here against std, and
+//! `the_shape_matches_what_the_serde_crate_documents` pins the field names and
+//! types that make the two interoperable.
+//!
+//! Hand-writing a JSON reader is normally a bad trade. It earns itself here for
+//! a specific reason: **this input is hostile by definition.** Gossip arrives
+//! from anyone on the subnet, so the parser is the attack surface, and one that
+//! refuses depth, refuses trailing data, caps every length and allocates
+//! nothing before it has checked a bound is worth more than one that is
+//! permissive because a general-purpose library has to be.
+//!
+//! ## The signature gap, which is real and is NOT papered over
+//!
+//! `gossip::accept` refuses any record whose `verified` flag is false, citing
+//! the design note that gossip is signed so nodes cannot impersonate each
+//! other. **This wire format carries no signature.** Neither does Qt's. So a
+//! record decoded here is `verified: false` and `accept` rejects it, which
+//! means this socket does not yet make anyone appear online.
+//!
+//! Setting `verified: true` at the decoder would have made presence work this
+//! afternoon and would have been a lie in the one place the codebase
+//! explicitly says not to lie — one host on the subnet announcing itself as
+//! every peer is exactly the attack the flag exists for. So the loop is wired
+//! end to end and visibly refuses: the host gets `GossipAdmitted(false)` for
+//! every datagram and can say why. `a_decoded_record_is_unsigned_and_therefore_
+//! refused` pins that, and it is the test to delete when signing lands —
+//! signing needs a keypair in `identity.conf` and `crypto-kit` as a dependency,
+//! which is a lock change and a decision about the wire format, not something
+//! to slip in under a networking commit.
+
+use crate::gossip::{PeerRecord, Reject, MAX_DATAGRAM_BYTES, MAX_FIELD_LEN};
+
+/// Qt's `kMaxGossipPeers`. A sample, not a full view.
+pub const MAX_GOSSIP_PEERS: usize = 8;
+
+/// How deep a value may nest. The format needs two (object → array → object);
+/// anything more is someone probing for a stack overflow.
+const MAX_DEPTH: usize = 4;
+
+/// One announcement: who is sending, and a sample of who they know.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Announce {
+    pub id: String,
+    pub host: String,
+    pub port: u16,
+    /// Unix ms, as the sender reports it.
+    pub ts: u64,
+    pub peers: Vec<PeerRecord>,
+}
+
+impl Announce {
+    /// The sender's own record.
+    ///
+    /// `verified` is false and stays false until the format carries a
+    /// signature — see the module header. This is the one place a caller might
+    /// be tempted to set it, so it is a function rather than a struct literal
+    /// at four call sites.
+    pub fn sender_record(&self) -> PeerRecord {
+        PeerRecord {
+            id: self.id.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            last_seen_ms: self.ts,
+            verified: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- encoding
+
+fn push_escaped(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Control characters must be escaped or the output is not JSON and
+            // a strict receiver drops the whole datagram.
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Serialise, refusing anything that would not fit in a datagram.
+///
+/// The cap is checked on the RESULT rather than estimated from the peer count,
+/// because a long hostname makes a short list large and the receiving side
+/// enforces the same number.
+pub fn encode(a: &Announce) -> Result<Vec<u8>, Reject> {
+    let mut s = String::with_capacity(256);
+    s.push_str("{\"id\":");
+    push_escaped(&mut s, &a.id);
+    s.push_str(",\"host\":");
+    push_escaped(&mut s, &a.host);
+    s.push_str(&format!(",\"port\":{},\"ts\":{},\"peers\":[", a.port, a.ts));
+    for (i, p) in a.peers.iter().take(MAX_GOSSIP_PEERS).enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str("{\"id\":");
+        push_escaped(&mut s, &p.id);
+        s.push_str(",\"host\":");
+        push_escaped(&mut s, &p.host);
+        s.push_str(&format!(",\"port\":{},\"ts\":{}}}", p.port, p.last_seen_ms));
+    }
+    s.push_str("]}");
+    if s.len() > MAX_DATAGRAM_BYTES { return Err(Reject::TooLarge); }
+    Ok(s.into_bytes())
+}
+
+// ---------------------------------------------------------------- decoding
+
+/// Just enough JSON. Numbers are unsigned integers because every number in this
+/// schema is one; a float where a port belongs is malformed input, not a value
+/// to round.
+#[derive(Debug, Clone, PartialEq)]
+enum Json {
+    Str(String),
+    Num(u64),
+    Bool(bool),
+    Null,
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            // Last wins on a duplicate key, matching what most parsers do, but
+            // the duplicate is not an error: rejecting on it would be stricter
+            // than the senders this has to interoperate with.
+            Json::Obj(kv) => kv.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+    fn as_str(&self) -> Option<&str> {
+        if let Json::Str(s) = self { Some(s) } else { None }
+    }
+    fn as_num(&self) -> Option<u64> {
+        if let Json::Num(n) = self { Some(*n) } else { None }
+    }
+}
+
+struct P<'a> { b: &'a [u8], i: usize }
+
+impl<'a> P<'a> {
+    fn ws(&mut self) {
+        while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) { self.i += 1; }
+    }
+    fn byte(&self) -> Option<u8> { self.b.get(self.i).copied() }
+    fn eat(&mut self, c: u8) -> Option<()> {
+        if self.byte() == Some(c) { self.i += 1; Some(()) } else { None }
+    }
+    fn lit(&mut self, s: &[u8]) -> Option<()> {
+        if self.b[self.i..].starts_with(s) { self.i += s.len(); Some(()) } else { None }
+    }
+
+    fn value(&mut self, depth: usize) -> Option<Json> {
+        if depth > MAX_DEPTH { return None; }
+        self.ws();
+        match self.byte()? {
+            b'"' => self.string().map(Json::Str),
+            b'{' => self.object(depth),
+            b'[' => self.array(depth),
+            b't' => { self.lit(b"true")?; Some(Json::Bool(true)) }
+            b'f' => { self.lit(b"false")?; Some(Json::Bool(false)) }
+            b'n' => { self.lit(b"null")?; Some(Json::Null) }
+            b'0'..=b'9' => self.number(),
+            // A leading '-' is not accepted: every number here is a port, a
+            // count or a millisecond timestamp, and a negative one is either
+            // malformed or an attempt to wrap an unsigned field.
+            _ => None,
+        }
+    }
+
+    fn number(&mut self) -> Option<Json> {
+        let start = self.i;
+        while matches!(self.byte(), Some(b'0'..=b'9')) { self.i += 1; }
+        if self.i == start { return None; }
+        // A run of digits longer than u64 is rejected rather than saturated:
+        // saturating turns a hostile timestamp into u64::MAX, which reads as a
+        // peer seen infinitely recently and never prunes.
+        std::str::from_utf8(&self.b[start..self.i]).ok()?.parse().ok().map(Json::Num)
+    }
+
+    fn string(&mut self) -> Option<String> {
+        self.eat(b'"')?;
+        let mut out = String::new();
+        loop {
+            // Capped as it is built, not after: the length field of a hostile
+            // datagram must not be able to make us allocate first and check
+            // later.
+            if out.len() > MAX_FIELD_LEN { return None; }
+            match self.byte()? {
+                b'"' => { self.i += 1; return Some(out); }
+                b'\\' => {
+                    self.i += 1;
+                    let e = self.byte()?;
+                    self.i += 1;
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'u' => {
+                            let h = self.b.get(self.i..self.i + 4)?;
+                            self.i += 4;
+                            let n = u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?;
+                            // Lone surrogates are dropped rather than
+                            // substituted: a replacement character inside an
+                            // sc-ID would fail validation anyway, and inside a
+                            // hostname it would be a name nobody can resolve
+                            // that looks like a name.
+                            out.push(char::from_u32(n)?);
+                        }
+                        _ => return None,
+                    }
+                }
+                // Raw control bytes are not legal in a JSON string and are the
+                // usual shape of a truncated or injected datagram.
+                c if c < 0x20 => return None,
+                _ => {
+                    // Multi-byte UTF-8 has to travel intact.
+                    let rest = std::str::from_utf8(&self.b[self.i..]).ok()?;
+                    let c = rest.chars().next()?;
+                    out.push(c);
+                    self.i += c.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Option<Json> {
+        self.eat(b'[')?;
+        let mut out = Vec::new();
+        self.ws();
+        if self.eat(b']').is_some() { return Some(Json::Arr(out)); }
+        loop {
+            // Bounded during the walk. An array of ten thousand entries must
+            // not be built before being rejected for being too long.
+            if out.len() > MAX_GOSSIP_PEERS * 2 { return None; }
+            out.push(self.value(depth + 1)?);
+            self.ws();
+            match self.byte()? {
+                b',' => { self.i += 1; }
+                b']' => { self.i += 1; return Some(Json::Arr(out)); }
+                _ => return None,
+            }
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Option<Json> {
+        self.eat(b'{')?;
+        let mut out: Vec<(String, Json)> = Vec::new();
+        self.ws();
+        if self.eat(b'}').is_some() { return Some(Json::Obj(out)); }
+        loop {
+            if out.len() > 32 { return None; }
+            self.ws();
+            let k = self.string()?;
+            self.ws();
+            self.eat(b':')?;
+            let v = self.value(depth + 1)?;
+            out.push((k, v));
+            self.ws();
+            match self.byte()? {
+                b',' => { self.i += 1; }
+                b'}' => { self.i += 1; return Some(Json::Obj(out)); }
+                _ => return None,
+            }
+        }
+    }
+}
+
+fn parse_json(b: &[u8]) -> Option<Json> {
+    let mut p = P { b, i: 0 };
+    let v = p.value(0)?;
+    p.ws();
+    // Trailing bytes mean the datagram is not what it claims to be. Accepting
+    // a valid prefix is how a parser gets used to smuggle a second message.
+    if p.i != b.len() { return None; }
+    Some(v)
+}
+
+/// Why a datagram could not be read.
+///
+/// Separate from [`Reject`], which is about whether a well-formed record is
+/// ADMISSIBLE. Malformed and inadmissible are different events: one is a bad
+/// actor or a bug, the other is normal operation (your own echo arrives every
+/// tick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Malformed {
+    /// Bigger than we will read.
+    TooLarge,
+    /// Not JSON, or not the shape this schema requires.
+    NotOurSchema,
+    /// The sender's id is not an sc-ID.
+    BadSenderId,
+    /// Port zero is not a port, and Qt rejects it too.
+    BadPort,
+}
+
+/// Read a datagram.
+///
+/// Invalid entries inside `peers` are dropped rather than failing the whole
+/// message — Qt does the same, and one bad neighbour in a sample should not
+/// cost the sender's own record, which is the part that matters.
+pub fn decode(data: &[u8]) -> Result<Announce, Malformed> {
+    if data.len() > MAX_DATAGRAM_BYTES { return Err(Malformed::TooLarge); }
+    let v = parse_json(data).ok_or(Malformed::NotOurSchema)?;
+
+    let id = v.get("id").and_then(Json::as_str).ok_or(Malformed::NotOurSchema)?.to_string();
+    if !crate::identity::is_valid(&id) { return Err(Malformed::BadSenderId); }
+    let host = v.get("host").and_then(Json::as_str).ok_or(Malformed::NotOurSchema)?.to_string();
+    let port = v.get("port").and_then(Json::as_num).ok_or(Malformed::NotOurSchema)?;
+    if port == 0 || port > u16::MAX as u64 { return Err(Malformed::BadPort); }
+    let ts = v.get("ts").and_then(Json::as_num).ok_or(Malformed::NotOurSchema)?;
+
+    // `peers` absent is a valid message: a node that knows nobody still
+    // announces itself, and that is exactly the first node on a network.
+    let mut peers = Vec::new();
+    if let Some(Json::Arr(items)) = v.get("peers") {
+        for it in items {
+            let (Some(pid), Some(phost), Some(pport)) = (
+                it.get("id").and_then(Json::as_str),
+                it.get("host").and_then(Json::as_str),
+                it.get("port").and_then(Json::as_num),
+            ) else { continue };
+            if !crate::identity::is_valid(pid) || phost.is_empty()
+                || pport == 0 || pport > u16::MAX as u64 { continue; }
+            peers.push(PeerRecord {
+                id: pid.to_string(),
+                host: phost.to_string(),
+                port: pport as u16,
+                last_seen_ms: it.get("ts").and_then(Json::as_num).unwrap_or(0),
+                verified: false,
+            });
+            if peers.len() == MAX_GOSSIP_PEERS { break; }
+        }
+    }
+    Ok(Announce { id, host, port: port as u16, ts, peers })
+}
+
+// ---------------------------------------------------------------- the socket
+
+/// A non-blocking UDP socket for gossip.
+///
+/// No thread and no runtime. `poll` drains whatever has arrived and returns
+/// immediately, so the caller drives it from wherever it already has a loop —
+/// which for this app is the frame. That keeps the whole path visible in one
+/// place and steppable in a debugger; a background thread would buy nothing
+/// here except a channel to get the datagrams back out of.
+pub struct GossipSocket {
+    sock: std::net::UdpSocket,
+    /// Reused across polls. A 4 KiB allocation per datagram, several times a
+    /// second, for the life of the process is a lot of nothing.
+    buf: Vec<u8>,
+}
+
+impl GossipSocket {
+    /// Bind on all interfaces at `port` and allow broadcast.
+    pub fn bind(port: u16) -> std::io::Result<GossipSocket> {
+        let sock = std::net::UdpSocket::bind(("0.0.0.0", port))?;
+        sock.set_nonblocking(true)?;
+        sock.set_broadcast(true)?;
+        Ok(GossipSocket { sock, buf: vec![0u8; MAX_DATAGRAM_BYTES] })
+    }
+
+    /// The port actually bound. Differs from the requested one when 0 was
+    /// asked for, which is how a test gets two of these talking.
+    pub fn port(&self) -> std::io::Result<u16> { Ok(self.sock.local_addr()?.port()) }
+
+    /// Everything that has arrived, with the address it came from.
+    ///
+    /// `limit` caps one drain. Without it a subnet under load — or one host
+    /// deliberately flooding — keeps this loop running past the frame it was
+    /// called from, and the UI stops drawing while the app services the
+    /// network. Leftovers stay in the kernel buffer for the next call.
+    ///
+    /// A malformed datagram is returned rather than swallowed, because "sixty
+    /// unreadable packets a second from 192.168.1.9" is a thing an operator
+    /// needs to be able to see.
+    pub fn poll(&mut self, limit: usize) -> Vec<(std::net::SocketAddr, Result<Announce, Malformed>)> {
+        let mut out = Vec::new();
+        for _ in 0..limit {
+            match self.sock.recv_from(&mut self.buf) {
+                Ok((n, from)) => out.push((from, decode(&self.buf[..n]))),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // Any other error ends this drain rather than the socket. On a
+                // phone, an interface going away mid-poll is routine.
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Send one announcement to one address.
+    pub fn send_to(&self, a: &Announce, to: std::net::SocketAddr) -> std::io::Result<usize> {
+        let bytes = encode(a).map_err(|_| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "announcement exceeds the datagram cap"))?;
+        self.sock.send_to(&bytes, to)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn announce() -> Announce {
+        Announce {
+            id: "sc-32a51661".into(), host: "192.168.1.5".into(), port: 9876, ts: 1_700_000_000_000,
+            peers: vec![PeerRecord {
+                id: "sc-aabbccdd".into(), host: "192.168.1.6".into(), port: 9876,
+                last_seen_ms: 1_699_999_999_000, verified: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_shape_matches_what_the_serde_crate_documents() {
+        // The interoperability contract, pinned as literal text. snapclone-
+        // gossip and GossipDiscovery.cpp emit these field names and types; a
+        // rename here is a peer that can no longer see us, and nothing else
+        // would notice until two machines were in the same room.
+        let s = String::from_utf8(encode(&announce()).unwrap()).unwrap();
+        assert!(s.starts_with("{\"id\":\"sc-32a51661\""), "{s}");
+        assert!(s.contains("\"host\":\"192.168.1.5\""), "{s}");
+        assert!(s.contains("\"port\":9876"), "{s}");
+        assert!(s.contains("\"ts\":1700000000000"), "{s}");
+        assert!(s.contains("\"peers\":[{\"id\":\"sc-aabbccdd\""), "{s}");
+        assert!(s.ends_with("}]}"), "{s}");
+    }
+
+    #[test]
+    fn an_announcement_round_trips() {
+        assert_eq!(decode(&encode(&announce()).unwrap()).unwrap(), announce());
+    }
+
+    #[test]
+    fn a_node_that_knows_nobody_still_announces_itself() {
+        // The first node on a network. An absent or empty `peers` must not make
+        // the message unreadable, or the second machine to start can never find
+        // the first.
+        let d = decode(br#"{"id":"sc-32a51661","host":"10.0.0.1","port":9876,"ts":1}"#).unwrap();
+        assert!(d.peers.is_empty());
+        assert_eq!(d.id, "sc-32a51661");
+    }
+
+    #[test]
+    fn a_decoded_record_is_unsigned_and_therefore_refused() {
+        // THE GAP, pinned so it cannot be closed by accident. This wire format
+        // carries no signature and gossip::accept refuses anything unverified,
+        // so a real datagram from a real peer does not currently make them
+        // appear online. Setting verified at the decoder would make presence
+        // work and would be the exact lie the flag exists to prevent — one host
+        // announcing itself as every peer. Delete this test when signing lands.
+        let rec = decode(&encode(&announce()).unwrap()).unwrap().sender_record();
+        assert!(!rec.verified);
+        assert_eq!(crate::gossip::accept(&rec, 200, "sc-00000000"),
+                   Err(crate::gossip::Reject::BadSignature));
+    }
+
+    #[test]
+    fn one_bad_neighbour_does_not_cost_the_senders_own_record() {
+        // Qt drops invalid peer entries silently. The sender's record is the
+        // part that matters — it is how they become reachable — and failing the
+        // whole datagram over a garbled third-hand entry would let any peer
+        // deny another peer's discovery.
+        let d = decode(br#"{"id":"sc-32a51661","host":"h","port":1,"ts":1,"peers":[
+            {"id":"not-an-id","host":"h","port":1,"ts":1},
+            {"id":"sc-aabbccdd","host":"","port":1,"ts":1},
+            {"id":"sc-11223344","host":"h","port":0,"ts":1},
+            {"id":"sc-99887766","host":"h","port":7,"ts":1}]}"#).unwrap();
+        assert_eq!(d.peers.len(), 1);
+        assert_eq!(d.peers[0].id, "sc-99887766");
+    }
+
+    #[test]
+    fn a_sender_without_a_valid_sc_id_is_refused_outright() {
+        // Unlike a neighbour entry: the sender's id is the routing key for
+        // everything that follows.
+        assert_eq!(decode(br#"{"id":"nope","host":"h","port":1,"ts":1}"#),
+                   Err(Malformed::BadSenderId));
+        assert_eq!(decode(br#"{"id":"sc-32a51661","host":"h","port":0,"ts":1}"#),
+                   Err(Malformed::BadPort));
+        assert_eq!(decode(br#"{"id":"sc-32a51661","host":"h","port":70000,"ts":1}"#),
+                   Err(Malformed::BadPort));
+    }
+
+    #[test]
+    fn hostile_input_is_refused_rather_than_partially_believed() {
+        // This parser IS the attack surface: gossip arrives from anyone on the
+        // subnet. Each of these is a shape that a permissive reader accepts and
+        // a strict one must not.
+        let cases: &[(&[u8], &str)] = &[
+            (b"", "empty"),
+            (b"not json at all", "garbage"),
+            (br#"{"id":"sc-32a51661","host":"h","port":1,"ts":1}trailing"#,
+             "a valid prefix followed by a second message"),
+            (br#"{"id":"sc-32a51661","host":"h","port":1,"ts":1"#, "truncated mid-object"),
+            (br#"{"id":"sc-32a51661","host":"h","port":-1,"ts":1}"#, "a negative port"),
+            (br#"{"id":"sc-32a51661","host":"h","port":1.5,"ts":1}"#, "a fractional port"),
+            (br#"{"id":"sc-32a51661","host":"h","port":99999999999999999999,"ts":1}"#,
+             "a number wider than u64"),
+            (br#"[[[[[[[[1]]]]]]]]"#, "nesting past the depth limit"),
+        ];
+        for (bytes, why) in cases {
+            assert!(decode(bytes).is_err(), "accepted {why}: {:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn an_oversized_datagram_is_refused_before_it_is_parsed() {
+        // Both directions. The encoder refuses to produce one so we never
+        // become the flooder, and the decoder refuses to read one.
+        let big = vec![b'x'; MAX_DATAGRAM_BYTES + 1];
+        assert_eq!(decode(&big), Err(Malformed::TooLarge));
+
+        let mut a = announce();
+        a.peers = (0..MAX_GOSSIP_PEERS).map(|i| PeerRecord {
+            id: format!("sc-0000000{i}"), host: "x".repeat(MAX_FIELD_LEN), port: 9876,
+            last_seen_ms: 1, verified: false }).collect();
+        a.host = "y".repeat(MAX_FIELD_LEN);
+        // Not asserting which side of the cap this lands on — asserting that
+        // whichever it is, the two agree.
+        match encode(&a) {
+            Ok(bytes) => assert!(decode(&bytes).is_ok(), "we emitted what we will not read"),
+            Err(Reject::TooLarge) => {}
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn an_over_long_field_is_refused_while_it_is_being_read() {
+        // Capped as the string is built, not after. A length field is
+        // attacker-controlled here, so allocating first and checking later is
+        // the whole bug.
+        let d = format!(r#"{{"id":"sc-32a51661","host":"{}","port":1,"ts":1}}"#,
+                        "h".repeat(MAX_FIELD_LEN + 10));
+        assert!(decode(d.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn escapes_and_multibyte_survive_a_round_trip() {
+        // A hostname will not usually contain a quote. A hostile sender's will.
+        let mut a = announce();
+        a.host = "a\"b\\c\td—é".into();
+        let back = decode(&encode(&a).unwrap()).unwrap();
+        assert_eq!(back.host, a.host);
+        // and a raw control byte inside a string is not legal JSON
+        assert!(decode(b"{\"id\":\"sc-32a51661\",\"host\":\"a\nb\",\"port\":1,\"ts\":1}").is_err());
+    }
+
+    #[test]
+    fn two_sockets_on_loopback_actually_exchange_a_record() {
+        // The end-to-end claim, and the reason this module is not another
+        // tested-but-unreachable data structure: real sockets, real bytes, real
+        // decode. Port 0 lets the OS pick, so the test does not fight anything
+        // else on the machine.
+        let mut rx = GossipSocket::bind(0).expect("bind receiver");
+        let tx = GossipSocket::bind(0).expect("bind sender");
+        let to = format!("127.0.0.1:{}", rx.port().unwrap()).parse().unwrap();
+        tx.send_to(&announce(), to).expect("send");
+
+        // UDP on loopback is effectively immediate but not synchronous.
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            got = rx.poll(8);
+            if !got.is_empty() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(got.len(), 1, "nothing arrived");
+        let (from, decoded) = &got[0];
+        assert_eq!(from.ip().to_string(), "127.0.0.1");
+        assert_eq!(decoded.as_ref().unwrap(), &announce());
+    }
+
+    #[test]
+    fn polling_an_idle_socket_returns_immediately_and_empty() {
+        // Non-blocking is the whole reason this can live on the frame loop. If
+        // this ever blocks, the UI stops drawing whenever the subnet is quiet —
+        // which is most of the time.
+        let mut s = GossipSocket::bind(0).expect("bind");
+        let t = std::time::Instant::now();
+        assert!(s.poll(16).is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_millis(100), "poll blocked");
+    }
+
+    #[test]
+    fn a_flood_is_capped_at_the_limit_rather_than_draining_the_frame() {
+        // One host deliberately flooding must not keep this loop running past
+        // the frame that called it. The leftovers stay in the kernel buffer.
+        let mut rx = GossipSocket::bind(0).expect("bind receiver");
+        let tx = GossipSocket::bind(0).expect("bind sender");
+        let to = format!("127.0.0.1:{}", rx.port().unwrap()).parse().unwrap();
+        for _ in 0..20 { let _ = tx.send_to(&announce(), to); }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(rx.poll(4).len() <= 4, "the cap was not honoured");
+    }
+
+    #[test]
+    fn a_garbled_datagram_is_reported_rather_than_dropped_on_the_floor() {
+        // "Sixty unreadable packets a second from 192.168.1.9" is a thing an
+        // operator has to be able to see. Silently discarding them makes a
+        // misconfigured or hostile host indistinguishable from a quiet network.
+        let mut rx = GossipSocket::bind(0).expect("bind receiver");
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind raw sender");
+        let to = format!("127.0.0.1:{}", rx.port().unwrap());
+        tx.send_to(b"definitely not json", &to).expect("send");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let got = rx.poll(4);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, Err(Malformed::NotOurSchema));
+    }
+}

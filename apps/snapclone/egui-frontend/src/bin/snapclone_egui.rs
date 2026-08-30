@@ -15,6 +15,16 @@ struct App {
     snap: Snapclone,
     /// Last reported focus, so the change is sent once rather than every frame.
     focused: bool,
+    /// The discovery socket, or None when the port was unavailable. Absent
+    /// rather than fatal: an app that refuses to start because something else
+    /// holds 9877 is worse than one that runs without discovery and says so.
+    gossip: Option<snapclone_egui::gossip_wire::GossipSocket>,
+    /// When we last announced ourselves, in wall-clock seconds.
+    last_announce: i64,
+    /// The unsigned-gossip warning is printed once. A per-datagram log line
+    /// at three seconds times every peer on the subnet buries everything
+    /// else, and the message is the same every time.
+    warned_unsigned: bool,
 }
 
 impl App {
@@ -48,7 +58,74 @@ impl App {
         // config does not come up reporting unsaved changes with the Save
         // button lit.
         snap.apply(HostEvent::SettingsLoaded(Box::new(snapclone_egui::settings_store::load())));
-        Self { snap, focused: true }
+        let port = snap.settings.current.network.gossip_port;
+        let gossip = match snapclone_egui::gossip_wire::GossipSocket::bind(port) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("snapclone: no discovery — could not bind UDP {port}: {e}");
+                None
+            }
+        };
+        Self { snap, focused: true, gossip, last_announce: 0, warned_unsigned: false }
+    }
+
+    /// Drain the discovery socket into the app, and announce ourselves on the
+    /// tick the protocol asks for.
+    ///
+    /// On the frame loop rather than a thread. The socket is non-blocking and
+    /// the drain is capped, so an idle network costs a syscall and a busy one
+    /// cannot run past the frame that called it — and the whole path stays in
+    /// one place you can step through, which a channel out of a background
+    /// thread would not be.
+    fn pump_gossip(&mut self, now_secs: i64) {
+        let Some(sock) = self.gossip.as_mut() else { return };
+
+        // Capped per frame; leftovers wait in the kernel buffer.
+        for (from, decoded) in sock.poll(8) {
+            match decoded {
+                Ok(a) => {
+                    let len = a.peers.len();
+                    let cmds = self.snap.apply(HostEvent::GossipHeard {
+                        record: a.sender_record(),
+                        // The admission check wants the datagram size and we
+                        // have already consumed the bytes, so this is the
+                        // encoded length of what we understood. It is an
+                        // approximation and the cap it feeds was already
+                        // enforced by the socket's own buffer.
+                        datagram_len: len,
+                    });
+                    self.handle(cmds);
+                }
+                Err(e) => eprintln!("snapclone: unreadable gossip from {from}: {e:?}"),
+            }
+        }
+
+        // TICK_MS is the protocol's rate. Announcing faster is a subnet you are
+        // shouting at; slower and peers prune you before you say anything.
+        let due = now_secs - self.last_announce
+            >= (snapclone_egui::gossip::TICK_MS / 1000).max(1) as i64;
+        if !due || self.snap.local_id.is_empty() { return; }
+        self.last_announce = now_secs;
+        let a = snapclone_egui::gossip_wire::Announce {
+            id: self.snap.local_id.clone(),
+            // The address a peer should dial us back on. Left empty rather than
+            // guessed: picking one of several interfaces here would tell peers
+            // to come back on the wrong one, and the receiver can see the UDP
+            // source address, which is the one that actually worked.
+            host: String::new(),
+            port: self.snap.settings.current.network.listen_port,
+            ts: now_secs.max(0) as u64 * 1000,
+            peers: Vec::new(),
+        };
+        let to = format!("255.255.255.255:{}",
+                         self.snap.settings.current.network.gossip_port);
+        if let Ok(addr) = to.parse() {
+            if let Some(s) = self.gossip.as_ref() {
+                if let Err(e) = s.send_to(&a, addr) {
+                    eprintln!("snapclone: could not announce: {e}");
+                }
+            }
+        }
     }
 
     /// What the app asked the world to do.
@@ -71,6 +148,21 @@ impl App {
                         eprintln!("snapclone: could not save contacts: {e}");
                     }
                 }
+                // Every gossip record is currently refused, and the reason is
+                // in gossip_wire's header: this wire format carries no
+                // signature and `gossip::accept` will not admit an unverified
+                // record. Reported at a low volume rather than silently, so the
+                // gap is visible in a log instead of presenting as "discovery
+                // does not work".
+                HostCommand::GossipAdmitted(false) => {
+                    if !self.warned_unsigned {
+                        self.warned_unsigned = true;
+                        eprintln!("snapclone: gossip received but refused — the datagram \
+                                   format carries no signature and unverified records are \
+                                   not admitted. Peers will not appear online.");
+                    }
+                }
+                HostCommand::GossipAdmitted(true) => {}
                 HostCommand::IdentityUnavailable => {
                     eprintln!("snapclone: no identity — /dev/urandom was unreadable. \
                                Nobody can add this device and the QR code will be blank.");
@@ -110,6 +202,11 @@ impl eframe::App for App {
             .unwrap_or(0);
         let cmds = self.snap.apply(HostEvent::Tick { now_secs });
         self.handle(cmds);
+        self.pump_gossip(now_secs);
+
+        // Discovery is time-driven, not input-driven, so the frame has to come
+        // round on its own or an idle window never polls the socket.
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
         let focused = ctx.input(|i| i.focused);
         if focused != self.focused {

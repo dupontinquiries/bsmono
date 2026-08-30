@@ -24,6 +24,8 @@ pub mod group_voice;
 /// this is the call site the ~35 tested-but-unreached entry points lacked.
 /// Who this installation is, kept across restarts.
 pub mod identity;
+/// The gossip datagram format and the UDP socket that carries it.
+pub mod gossip_wire;
 /// Contacts that survive a restart, with the port the scanner found.
 pub mod contact_book;
 pub mod host;
