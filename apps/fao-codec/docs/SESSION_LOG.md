@@ -3081,3 +3081,48 @@ SMITE endgame restated: the library's canonicals converge on the game
 tree's emission alphabet; with engine-derived canonicals (unendlich
 renders) the codec ships state-like parameters. No hard motion —
 only factors not yet moved from residual to model.
+
+### Half-pel MC — the ledger's 55% bucket, cashed (same session)
+
+search_mv: 8-neighbor half-pel refinement (bilinear SAD) after integer
+diamond convergence, accepted only when beating the integer SAD by
+>16. copy_region_mc: MVs now in half-pel units — even components take
+the exact old integer path (bit-identical), odd components sample
+bilinearly; chroma at quarter-pel of its plane. Wire format unchanged
+in shape (MV deltas still i8, still cluster at 0); encoder and inline
+recon share the functions so consistency is automatic.
+
+A/B at dz32, both dimensions improving simultaneously:
+  shot 9 (worst): 8.72 → 7.64 MB (−12.3%) AND 27.21 → 28.56 dB
+    (+1.35) AND SSIM 0.754 → 0.814 (+0.060)
+  shotB (control): marginal 9.2K → 7.2K B/f (−21%) AND 37.07 → 37.58
+    (+0.51 dB) — gate weave is exactly half-pel territory.
+Suite 82/0. Full-19-shot suite rerun with half-pel pending (expect
+order −10–20% bytes at +0.5–1.4 dB; the 46× headline shrinks but the
+bimodal structure stands). Remaining floor after half-pel: quarter-pel,
+motion blur, lighting flutter — in the ledger's ranked queue.
+
+### Character aging across series — design position (user's question)
+
+Recorded as the library's identity model, to build toward:
+identity = a LINEAGE GRAPH of canonicals connected by parameterized
+transforms, not a single object. Three regimes, chosen economically:
+ 1. Within-work drift (stubble, costume wear, lighting): correction
+    layers on one canonical — weathering as an indirect filter, same
+    family as grain/exposure. Cheap, low-dimensional.
+ 2. Structured biological change across a series: when canonicals are
+    ENGINE-GRADE (rigged bones+skin — the unendlich representation),
+    aging is a trajectory in rig/morph space plus new texture layers;
+    sharing survives a decade of in-world time. This is literally how
+    game series already handle it: one rig, age morphs, new albedo.
+    Biology supplies the PRIOR that aging is low-dimensional.
+ 3. Theseus re-base: when accumulated delta bytes approach a fresh
+    canonical's cost, re-encode — but keep a lineage edge to the
+    ancestor so cross-era matching still fires, and let every future
+    reference cite whichever node in the lineage is cheapest.
+The ship dissolves as a paradox: the ship is the lineage, and the
+codec picks a node per reference by rate alone. Today's canonicals
+are unrigged fused meshes and the only transform is rigid alignment
+(compute_alignment_transform); the aging question is therefore
+another argument for engine-grade canonicals, where non-rigid
+parameterized deltas come with the representation.

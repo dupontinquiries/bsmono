@@ -675,6 +675,26 @@ fn mv_rate_bias(dx: i32, dy: i32) -> u32 {
 
 /// Small diamond motion search on luma, minimizing SAD + rate bias.
 /// Returns (mv, raw sad of the chosen mv).
+/// SAD of a region against a HALF-PEL position in prev (bilinear).
+fn sad_region_hp(prev_y: &[u8], w: usize, h: usize, fx: f32, fy: f32, cur_y: &[u8], rx: usize, ry: usize) -> u32 {
+    let mut acc = 0u32;
+    for dy in 0..REGION {
+        for dx in 0..REGION {
+            let p = bilinear(prev_y, w, h, fx + dx as f32, fy + dy as f32);
+            let c = cur_y[(ry + dy) * w + rx + dx];
+            acc += (p as i32 - c as i32).unsigned_abs();
+        }
+    }
+    acc
+}
+
+/// Returns the best MV in HALF-PEL units (so (3, -1) means (+1.5, -0.5)
+/// pixels) plus its SAD. The residual ledger measured 55% of residual
+/// energy on ALIGNED content — the diffuse floor of integer-pel
+/// ghosting on drifting footage (~½px edge error, everywhere, every
+/// frame). Integer diamond converges first; an 8-neighbor half-pel
+/// refinement then runs, accepted only when it beats the integer SAD
+/// by >16 (covers its rate; refinement carries no separate bias).
 fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usize) -> ((i8, i8), u32) {
     let (mut best_dx, mut best_dy) = (0i32, 0i32);
     let mut best_sad = sad_region(prev_y, w, h, rx as i32, ry as i32, cur_y, rx, ry);
@@ -701,29 +721,73 @@ fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usi
             }
         }
     }
-    ((best_dx as i8, best_dy as i8), best_sad)
+    // Half-pel refinement around the integer winner.
+    let (mut hx, mut hy) = (best_dx * 2, best_dy * 2);
+    let mut hp_sad = best_sad;
+    for (ddx, ddy) in [
+        (-1i32, -1i32), (0, -1), (1, -1),
+        (-1, 0), (1, 0),
+        (-1, 1), (0, 1), (1, 1),
+    ] {
+        let (cx, cy) = (best_dx * 2 + ddx, best_dy * 2 + ddy);
+        let fx = rx as f32 + cx as f32 * 0.5;
+        let fy = ry as f32 + cy as f32 * 0.5;
+        let s = sad_region_hp(prev_y, w, h, fx, fy, cur_y, rx, ry);
+        if s + 16 < hp_sad {
+            hp_sad = s;
+            hx = cx;
+            hy = cy;
+        }
+    }
+    ((hx as i8, hy as i8), hp_sad)
 }
 
 fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8, i8)) {
+    // mv is in HALF-PEL units. Even components take the exact integer
+    // path (bit-identical to the old behavior); odd components sample
+    // bilinearly. Chroma moves at quarter-pel of its plane, always
+    // bilinear when fractional.
     let (w, h) = (dst.w, dst.h);
-    for ly in 0..REGION {
-        for lx in 0..REGION {
-            let dx_ = rx + lx;
-            let dy_ = ry + ly;
-            let sx = (dx_ as i32 + mv.0 as i32).clamp(0, w as i32 - 1) as usize;
-            let sy = (dy_ as i32 + mv.1 as i32).clamp(0, h as i32 - 1) as usize;
-            dst.y[dy_ * w + dx_] = prev.y[sy * w + sx];
+    let (mvx, mvy) = (mv.0 as i32, mv.1 as i32);
+    if mvx % 2 == 0 && mvy % 2 == 0 {
+        let (ix, iy) = (mvx / 2, mvy / 2);
+        for dy in 0..REGION {
+            for dx in 0..REGION {
+                let sx = (rx as i32 + dx as i32 + ix).clamp(0, w as i32 - 1) as usize;
+                let sy = (ry as i32 + dy as i32 + iy).clamp(0, h as i32 - 1) as usize;
+                dst.y[(ry + dy) * w + rx + dx] = prev.y[sy * w + sx];
+            }
+        }
+        let (cw, ch) = (w / 2, h / 2);
+        let (crx, cry) = (rx / 2, ry / 2);
+        for dy in 0..REGION / 2 {
+            for dx in 0..REGION / 2 {
+                let sx = (crx as i32 + dx as i32 + ix / 2).clamp(0, cw as i32 - 1) as usize;
+                let sy = (cry as i32 + dy as i32 + iy / 2).clamp(0, ch as i32 - 1) as usize;
+                dst.u[(cry + dy) * cw + crx + dx] = prev.u[sy * cw + sx];
+                dst.v[(cry + dy) * cw + crx + dx] = prev.v[sy * cw + sx];
+            }
+        }
+        return;
+    }
+    let (fx0, fy0) = (mvx as f32 * 0.5, mvy as f32 * 0.5);
+    for dy in 0..REGION {
+        for dx in 0..REGION {
+            dst.y[(ry + dy) * w + rx + dx] = bilinear(
+                &prev.y, w, h,
+                rx as f32 + dx as f32 + fx0,
+                ry as f32 + dy as f32 + fy0,
+            );
         }
     }
-    let (cw, chh) = (w / 2, h / 2);
-    for ly in 0..REGION / 2 {
-        for lx in 0..REGION / 2 {
-            let dx_ = rx / 2 + lx;
-            let dy_ = ry / 2 + ly;
-            let sx = (dx_ as i32 + mv.0 as i32 / 2).clamp(0, cw as i32 - 1) as usize;
-            let sy = (dy_ as i32 + mv.1 as i32 / 2).clamp(0, chh as i32 - 1) as usize;
-            dst.u[dy_ * cw + dx_] = prev.u[sy * cw + sx];
-            dst.v[dy_ * cw + dx_] = prev.v[sy * cw + sx];
+    let (cw, ch) = (w / 2, h / 2);
+    let (crx, cry) = (rx / 2, ry / 2);
+    for dy in 0..REGION / 2 {
+        for dx in 0..REGION / 2 {
+            let sx = crx as f32 + dx as f32 + fx0 * 0.5;
+            let sy = cry as f32 + dy as f32 + fy0 * 0.5;
+            dst.u[(cry + dy) * cw + crx + dx] = bilinear(&prev.u, cw, ch, sx, sy);
+            dst.v[(cry + dy) * cw + crx + dx] = bilinear(&prev.v, cw, ch, sx, sy);
         }
     }
 }
