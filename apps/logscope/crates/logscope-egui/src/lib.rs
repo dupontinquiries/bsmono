@@ -92,6 +92,8 @@ pub mod voice_lang;
 #[allow(dead_code)] pub mod diag;
 #[allow(dead_code)] pub mod prechecks;
 #[allow(dead_code)] pub mod liaisonhud;
+/// Which model answers a prompt, and what its reply may assert.
+pub mod promptroute;
 #[allow(dead_code)] pub mod metricspanel;
 #[allow(dead_code)] pub mod bracecheck;
 #[allow(dead_code)] pub mod contextsrc;

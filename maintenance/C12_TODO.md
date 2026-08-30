@@ -2800,3 +2800,52 @@ TWO DESYNCS FOUND AND CLOSED while wiring, both invisible until used:
 - **C12-48b — `next_line` has no binding.** Bit and rest are bound; the
   middle granularity is not, because there is no obvious free chord and
   guessing at one is worse than leaving it to whoever uses this.
+
+## 49. Prompt routing matrix: liaison, workers, and the chat box
+
+Three finished pieces with no path between them:
+
+  - `liaison` distinguishes what the OPERATOR said, what the
+    ORGANIZATION knows, and what a model INFERRED, and enforces that a
+    model may not mint the middle one (`Epistemic::model_may_assert`).
+  - `workergen` builds varied workers with stances and taboos.
+  - the chat box sends every prompt to one model with one set of
+    permissions.
+
+The chat box was the weak link. Because every prompt went to the same
+place, `liaison`'s epistemic discipline applied to nothing — the chat
+tab holds a `liaisonhud::Hud` but only ever feeds it ENGINE TELEMETRY
+("N GPU submits"), never a statement carrying an epistemic kind. And
+`workergen` had no caller at all, so the workers had nothing to answer.
+
+`promptroute` is the matrix: `(Need, Available) -> Route { dest,
+ceiling }`.
+
+The CEILING is the part that matters. Routing without one hands every
+model the authority of the runtime — a worker riffing on a stance could
+say "the index is rebuilt", which is an organizational fact only the
+runtime may assert. A test walks every `(need, availability)` pair and
+asserts that no model-backed destination ever carries a ceiling
+`model_may_assert` rejects, so the rule cannot be broken by adding a
+route later.
+
+Decisions worth keeping:
+  - A `RunFact` prompt with no runtime routes to `Nowhere`, NOT to the
+    engine. A refusal is a visible failure; an invented answer is the
+    "I've reached out to our team" failure `liaison` exists to prevent.
+  - `Open` (unclassified) never reaches a worker. A stance applied to a
+    question nobody classified is how a character answers a factual
+    question in character.
+  - Routing is a TABLE, not a model call. Asking a model which model
+    should answer adds a round trip, a failure mode, and a second thing
+    to debug when an answer comes back wrong.
+  - `classify` is a heuristic and says so; it exists so the chat box has
+    a default and should lose to an explicit operator choice.
+
+- **C12-49a — NOT COMPILED, and NOT yet called by the chat box.** The
+  matrix is pure and tested. Wiring it means the chat send path
+  consulting `classify` + `route`, and the HUD recording statements with
+  their real epistemic kind instead of only telemetry.
+- **C12-49b — `workergen` still has no caller.** `Dest::Worker` now
+  names a destination for it, which is the first half; the roster and
+  the corpus source are the second.
