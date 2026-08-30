@@ -4567,7 +4567,20 @@ impl World {
     /// pulls harder near it without changing the sky elsewhere.
     pub fn gravity_field(&self, p: Vec3) -> (Vec3, f32) {
         let dir = self.gravity_dir(p);
-        let mut g = 1.0;
+        // THE AMBIENT IS A PER-MAP DECISION, not a constant. `gravity.rs`
+        // measured this field and found its largest error was exactly
+        // here: beyond every well the pull relaxed to 1.0 pointing at
+        // world -Y, which on a grounded map is the ground's own gravity
+        // and on KUIPER meant THE VOID PULLED DOWNWARD — an asteroid
+        // field reading as rocks hung over an invisible floor. The
+        // grounded maps keep their 1.0 bit-for-bit; kuiper's far field
+        // now relaxes to nothing, and each well still pulls in reach.
+        let amb = crate::gravity::far_field(if self.kuiper {
+            crate::gravity::Ambient::Void
+        } else {
+            crate::gravity::Ambient::Grounded
+        });
+        let mut g = amb;
         if !self.grav.is_empty() {
             let mut best = (f32::MAX, 0usize);
             for (i, n) in self.grav.iter().enumerate() {
@@ -4579,7 +4592,7 @@ impl World {
             let n = &self.grav[best.1];
             let t = best.0 / n.r.max(0.01);
             let w = ((1.5 - t) / 0.75).clamp(0.0, 1.0);
-            g = 1.0 + (n.g - 1.0) * w;
+            g = amb + (n.g - amb) * w;
             // INSIDE A TUBE the pull is strongest at the AXIS and eases off
             // as you reach the wall. A flat pull cannot satisfy both ends:
             // weak enough not to pin you to the bore (which is what it felt

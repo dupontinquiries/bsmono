@@ -50,9 +50,11 @@
 //! ## What is here
 //!
 //! The correct field for a uniform sphere, the engine's field, and the
-//! arithmetic to compare them. Nothing is patched — `world.rs`'s constants
-//! are load-bearing for eighteen grounded maps, and the fix is a per-map
-//! decision about ambient gravity rather than a better exponent.
+//! arithmetic to compare them. Defects 1 and 2 (the falloff shape) are
+//! still unpatched — `world.rs`'s constants are load-bearing for eighteen
+//! grounded maps. Defect 3 IS patched: `World::gravity_field` now takes
+//! its far field from [`far_field`] per map — `Ambient::Void` on kuiper,
+//! `Ambient::Grounded` everywhere else — so the void no longer pulls.
 
 /// `GravNode.r` is this multiple of the planet's drawn radius.
 pub const REACH_MULT: f32 = 2.6;
