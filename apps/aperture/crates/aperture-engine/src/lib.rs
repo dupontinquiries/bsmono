@@ -64,6 +64,34 @@ pub trait Backend: Send + Sync {
     fn describe(&self) -> String;
     /// Generate at most `max_tokens` continuing `prompt`.
     fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String>;
+
+    /// Generate, delivering text AS IT ARRIVES.
+    ///
+    /// `on_piece` returns false to stop — a cancelled completion, a
+    /// closed pane. Implementations that cannot stream should leave this
+    /// default, which calls [`Backend::generate`] and hands the whole
+    /// reply over in one piece: correct, and honest about being
+    /// non-streaming rather than pretending by chopping a finished
+    /// string into fake tokens.
+    ///
+    /// A DEFAULT rather than a required method, so adding this does not
+    /// break every existing Backend — and because most of them genuinely
+    /// cannot stream. The one that can is the daemon client, where the
+    /// difference is a forty-second stare at a still UI versus text
+    /// appearing as the model produces it.
+    ///
+    /// Returns the full text as well, so a caller that also wants the
+    /// finished string does not have to accumulate it itself.
+    fn generate_streaming(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        on_piece: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, String> {
+        let out = self.generate(prompt, max_tokens)?;
+        let _ = on_piece(&out);
+        Ok(out)
+    }
 }
 
 /// How the in-process engine samples. Mirrors `logscope-serve`'s own
@@ -472,6 +500,50 @@ pub mod daemon {
         }
     }
 
+    fn find_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// The request line both paths send, so they cannot drift.
+    fn request(prompt: &str, max_tokens: usize) -> String {
+        format!(
+            "POST /generate?max={} HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{prompt}",
+            max_tokens.clamp(1, 8192),
+            prompt.len(),
+        )
+    }
+
+    /// Pull every COMPLETE chunk out of `buf`.
+    ///
+    /// Returns the decoded text, the undecodable remainder, and whether
+    /// the terminating zero-chunk was seen. A partial chunk at the end is
+    /// LEFT in the remainder rather than guessed at — that is the whole
+    /// difference between streaming and corrupting.
+    fn drain_chunks(buf: &str) -> (String, String, bool) {
+        let mut out = String::new();
+        let mut rest = buf;
+        loop {
+            let Some((len_s, tail)) = rest.split_once("\r\n") else {
+                return (out, rest.to_string(), false);
+            };
+            let Some(first) = len_s.split(';').next() else {
+                return (out, rest.to_string(), false);
+            };
+            let Ok(n) = usize::from_str_radix(first.trim(), 16) else {
+                return (out, rest.to_string(), false);
+            };
+            if n == 0 {
+                return (out, String::new(), true);
+            }
+            if tail.len() < n + 2 {
+                return (out, rest.to_string(), false); // incomplete: wait
+            }
+            out.push_str(&tail[..n]);
+            rest = &tail[n + 2..];
+        }
+    }
+
     /// Decode an HTTP/1.1 chunked body.
     ///
     /// Mirrors `gpu_gemm::netserve::chunked::decode`, and is duplicated
@@ -538,6 +610,73 @@ pub mod daemon {
             format!("daemon ({})", self.path.display())
         }
 
+        /// Reads the socket INCREMENTALLY, decoding each chunk as it
+        /// lands, so text appears while the model is still producing it.
+        /// That is the whole reason the chunked path exists: at ~4 tok/s
+        /// a 170-token reply is otherwise forty seconds of a still UI.
+        ///
+        /// Falls back to the whole-body path when the daemon answers
+        /// without `Transfer-Encoding: chunked` — an older daemon, or
+        /// `serve_unix` rather than `serve_unix_streaming`. Mixed
+        /// versions on one machine are normal during an upgrade.
+        fn generate_streaming(
+            &self,
+            prompt: &str,
+            max_tokens: usize,
+            on_piece: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<String, String> {
+            use std::io::Read;
+            let mut sock = UnixStream::connect(&self.path).map_err(|e| format!("connect: {e}"))?;
+            sock.set_read_timeout(Some(self.timeout)).ok();
+            sock.set_write_timeout(Some(self.timeout)).ok();
+            sock.write_all(request(prompt, max_tokens).as_bytes())
+                .map_err(|e| format!("write: {e}"))?;
+
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let head_end = loop {
+                if let Some(p) = find_seq(&buf, b"\r\n\r\n") { break p; }
+                let n = sock.read(&mut tmp).map_err(|e| format!("read: {e}"))?;
+                if n == 0 { return Err("daemon closed before sending a header".into()); }
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let status = head.lines().next().unwrap_or("").to_string();
+            if !status.contains(" 200") {
+                let body = String::from_utf8_lossy(&buf[head_end + 4..]).into_owned();
+                return Err(format!("{}: {}", status.trim(),
+                                   body.trim().lines().next().unwrap_or("")));
+            }
+            let chunked = head.lines().any(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("transfer-encoding:") && l.contains("chunked")
+            });
+
+            let mut pending = String::from_utf8_lossy(&buf[head_end + 4..]).into_owned();
+            if !chunked {
+                let mut rest = String::new();
+                sock.read_to_string(&mut rest).map_err(|e| format!("read: {e}"))?;
+                pending.push_str(&rest);
+                let _ = on_piece(&pending);
+                return Ok(pending);
+            }
+
+            let mut out = String::new();
+            loop {
+                let (text, rest, done) = drain_chunks(&pending);
+                pending = rest;
+                if !text.is_empty() {
+                    out.push_str(&text);
+                    // The caller stopped caring; dropping the socket is
+                    // what tells the daemon to stop generating.
+                    if !on_piece(&text) { return Ok(out); }
+                }
+                if done { return Ok(out); }
+                let n = sock.read(&mut tmp).map_err(|e| format!("read: {e}"))?;
+                if n == 0 { return Err("daemon closed the connection mid-reply".into()); }
+                pending.push_str(&String::from_utf8_lossy(&tmp[..n]));
+            }
+        }
         fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
             let mut sock = UnixStream::connect(&self.path).map_err(|e| format!("connect: {e}"))?;
             sock.set_read_timeout(Some(self.timeout)).ok();
@@ -756,6 +895,69 @@ mod tests {
                 "decoders disagree on {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn streaming_delivers_pieces_before_the_reply_is_finished() {
+        // The property the whole chunked path exists for. A test that
+        // only checked the final string would pass against the
+        // non-streaming client too, so this asserts the FIRST piece
+        // arrives while the daemon is still generating.
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("ap-stream-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut b = [0u8; 4096];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                let _ = s.write_all(b"6\r\nfirst \r\n");
+                let _ = s.flush();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = s.write_all(b"6\r\nsecond\r\n0\r\n\r\n");
+                let _ = s.flush();
+            }
+        });
+
+        let b = daemon::DaemonBackend::new(&path);
+        let start = std::time::Instant::now();
+        let mut first_at = None;
+        let mut pieces = Vec::new();
+        let out = b
+            .generate_streaming("q", 16, &mut |p: &str| {
+                if first_at.is_none() {
+                    first_at = Some(start.elapsed());
+                }
+                pieces.push(p.to_string());
+                true
+            })
+            .expect("streamed");
+
+        assert_eq!(out, "first second");
+        assert_eq!(pieces.first().map(String::as_str), Some("first "));
+        // The daemon sleeps 250ms before the second piece. If the first
+        // only arrived after that, nothing streamed.
+        let t = first_at.expect("a piece arrived");
+        assert!(t.as_millis() < 200, "first piece waited {t:?} — not streaming");
+        assert!(pieces.len() >= 2, "arrived as one lump: {pieces:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_streaming_daemon_still_works_through_the_same_call() {
+        // Mixed versions on one machine are normal during an upgrade, so
+        // generate_streaming must handle a Content-Length daemon too.
+        let (path, _rx) = fake_daemon("whole reply", "200 OK");
+        let b = daemon::DaemonBackend::new(&path);
+        let mut got = String::new();
+        let out = b
+            .generate_streaming("q", 8, &mut |p: &str| { got.push_str(p); true })
+            .expect("worked");
+        assert_eq!(out, "whole reply");
+        assert_eq!(got, "whole reply", "delivered once, in full");
     }
 
     #[test]
