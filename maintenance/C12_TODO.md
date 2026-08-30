@@ -2325,10 +2325,35 @@ anyone reading it to ignore the report — including on blackstar, where
 it was right. Every finding it produced before this fix deserved the
 hand-check I gave the voiceterm five, and §33's did get one.
 
-- **C12-40a — logscope's 12 are unexamined.** `debatepanel` and
-  `chat_layout` are confirmed real; the other ten are not yet checked
-  individually, and after this the rule is that they get checked before
-  anything is said about them.
+- **C12-40a — DONE: all twelve hand-checked, all twelve real.**
+  Grepped each for `name::`, `as name` and `name as` outside its own
+  file. Eleven have zero references; `picking`'s single hit is the word
+  "picking" in three prose comments, so it is uncalled too.
+
+  2,119 lines of tested, documented, unreached code in one crate.
+
+  The interesting one is `picking` vs `scenepick`. Both do screen-space
+  hit-testing for the physical UI:
+      picking.rs   — "screen-space hit-testing for the PHYSICAL UI"
+      scenepick.rs — "making the physical UI an actual UI"
+  and only `scenepick` is called. That is not one stalled module, it is
+  a SECOND ATTEMPT at the same job that replaced the first without the
+  first being removed — which is a different problem from "stopped one
+  step early" and wants deleting rather than wiring.
+
+  The other pairs to check for the same shape: `tab_layout` (whose own
+  docs call it "the sibling of chat_layout") and `chat_layout` are both
+  uncalled, so the adaptive-layout decision path may be a third
+  duplicate. `workbench` (5 tests) claims to own "the non-chat tabs",
+  which the `tabs/` modules already do.
+
+- **C12-40b — NOT started: decide replace-vs-wire per module.** These
+  split into two piles and the piles want opposite treatment. A module
+  superseded by a working sibling should go; a module nothing else does
+  should be wired. Guessing wrong in either direction is expensive —
+  deleting live design work, or wiring a second hit-tester alongside the
+  one already in use. Each needs a look at its sibling before anything
+  is touched, which is more than a session's tail can do responsibly.
 
 ## 39. snapclone-egui: the host boundary is honest, and one arm is not
 
