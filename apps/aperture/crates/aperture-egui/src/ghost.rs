@@ -115,6 +115,37 @@ impl Ghost {
     }
 
     /// Take the full suggestion for insertion.
+    /// The suggestion text, if one is showing.
+    ///
+    /// Borrowed rather than taken: starting a typeout must not clear the
+    /// ghost, because the ghost is what draws the remaining suggestion
+    /// ahead of the caret while it is being typed out.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Ghost::Shown { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Shrink the suggestion by text that has just been inserted.
+    ///
+    /// Without this the ghost would keep drawing the accepted text ahead
+    /// of the caret, so a typed-out word would appear twice: once as
+    /// real text and once as the suggestion of itself.
+    ///
+    /// A MISMATCH DISMISSES rather than trying to resync. If the inserted
+    /// text is not the ghost's own prefix, the two have diverged — an
+    /// edit landed in between — and a ghost that no longer describes what
+    /// follows the caret is worse than none.
+    pub fn consume(&mut self, typed: &str) {
+        let Ghost::Shown { text } = self else { return };
+        match text.strip_prefix(typed) {
+            Some(rest) if !rest.is_empty() => *text = rest.to_string(),
+            Some(_) => *self = Ghost::Idle, // fully typed out
+            None => *self = Ghost::Idle,
+        }
+    }
+
     pub fn accept_all(&mut self) -> Option<String> {
         match std::mem::replace(self, Ghost::Idle) {
             Ghost::Shown { text } => Some(text),

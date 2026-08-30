@@ -394,6 +394,12 @@ pub struct AppState {
     /// to. No separate mode flag: a flag and a menu that can disagree is
     /// how a UI gets stuck in a mode with nothing in it.
     pub menu: Vec<aperture_complete::multipass::Block>,
+    /// The block currently being typed out, a bit per Tab.
+    ///
+    /// `None` means no accept is in progress — there is no separate
+    /// "accepting" flag, because a flag and a typeout that can disagree
+    /// is how a UI gets stuck mid-suggestion.
+    pub typeout: Option<aperture_complete::multipass::Typeout>,
     pub menu_prose: Vec<String>,
     /// Hold detection for the strip's palette button.
     pub cmd_hold: uikit_egui::cmdstrip::Hold,
@@ -532,6 +538,7 @@ impl AppState {
             helix: aperture_core::helix::Mode::Normal,
             cmd_strip: default_cmd_strip(),
             menu: Vec::new(),
+            typeout: None,
             menu_prose: Vec::new(),
             cmd_hold: uikit_egui::cmdstrip::Hold::new(),
             yank: String::new(),
@@ -1608,6 +1615,20 @@ impl AppState {
             return;
         }
         let consumed = self.ghost.on_text_inserted(t);
+        // TYPING IS ALWAYS ALLOWED, mid-accept included — the "go back to
+        // typing at any time" half of the brief.
+        //
+        // The typeout is dropped on ANY keystroke, including one the
+        // ghost absorbed. That case looks like it should be survivable —
+        // the person typed exactly what the suggestion said next — but
+        // `on_text_inserted` shrinks the GHOST while the typeout's offset
+        // into its own copy does not move, so the two would disagree by
+        // one word and the next Tab would re-insert text already typed.
+        //
+        // Dropping costs nothing: the next Tab rebuilds a typeout from
+        // whatever the ghost now says, which is exactly the remaining
+        // suggestion. One source of truth beats two that need syncing.
+        self.typeout = None;
         self.editor.insert_text(t, now_ms);
         self.dirty = true;
         self.syntax.absorb(&mut self.editor.buffer);
@@ -1684,11 +1705,62 @@ impl AppState {
         if self.ghost.is_shown() {
             match (key, ctrl) {
                 (Tab, false) => {
-                    if let Some(text) = self.ghost.accept_all() {
+                    // TAB TAKES A BIT, not the whole block.
+                    //
+                    // Accepting everything was the gamble: a 12-line
+                    // suggestion is right for 9 lines and wrong for 3,
+                    // and taking it whole means deleting 3 afterwards —
+                    // the manual cleanup this work exists to remove. A
+                    // bit at a time means the wrong part is never typed.
+                    //
+                    // The typeout is created on the FIRST Tab against the
+                    // current ghost, so nothing changes for someone who
+                    // presses Tab once and keeps going: they get the
+                    // first token instead of the whole block, and Tab
+                    // again continues it.
+                    if self.typeout.is_none() {
+                        if let Some(text) = self.ghost.text() {
+                            self.typeout =
+                                Some(aperture_complete::multipass::Typeout::new(text));
+                        }
+                    }
+                    if let Some(t) = self.typeout.as_mut() {
+                        if let Some(bit) = t.next_bit() {
+                            let bit = bit.to_string();
+                            self.editor.insert_text(&bit, now_ms);
+                            self.after_edit(now_ms);
+                            self.debounce.cancel();
+                            // The ghost has to shrink by exactly what was
+                            // typed, or it would redraw the accepted text
+                            // ahead of the caret as if it were still
+                            // pending.
+                            self.ghost.consume(&bit);
+                            if t.done() {
+                                self.typeout = None;
+                            }
+                            return;
+                        }
+                        self.typeout = None;
+                    }
+                    return;
+                }
+                // The whole block in one press, for when it is obviously
+                // right and picking through it is just slower. Ctrl-Tab
+                // rather than a second Tab: a double-press that means
+                // "all of it" would make an accidental repeat unrecoverable.
+                (Tab, true) => {
+                    let rest = self
+                        .typeout
+                        .as_mut()
+                        .and_then(|t| t.rest_of_it().map(str::to_string))
+                        .or_else(|| self.ghost.accept_all());
+                    if let Some(text) = rest {
                         self.editor.insert_text(&text, now_ms);
                         self.after_edit(now_ms);
                         self.debounce.cancel();
                     }
+                    self.typeout = None;
+                    self.ghost.dismiss();
                     return;
                 }
                 (Right, true) => {
@@ -1775,6 +1847,11 @@ impl AppState {
                 // first so one press does the obvious thing: the menu is
                 // the loudest thing on screen when it is up, so it is
                 // what a person means by "get out of this".
+                // A half-typed block stops where it is. What was already
+                // inserted stays — it is real text the person watched
+                // arrive — and the rest is simply never typed, which is
+                // the whole point of a granular accept.
+                self.typeout = None;
                 self.dismiss_menu();
                 self.ghost.dismiss();
                 self.debounce.cancel();
@@ -1995,6 +2072,11 @@ impl AppState {
         blocks: Vec<aperture_complete::multipass::Block>,
         prose: Vec<String>,
     ) {
+        // A NEW REPLY ENDS THE OLD ACCEPT. Without this, Tab would carry
+        // on typing out the previous block against a ghost that has been
+        // replaced — inserting text from a suggestion the person can no
+        // longer see, which is the worst failure this feature could have.
+        self.typeout = None;
         let mut took_ghost = false;
         self.menu = blocks
             .into_iter()

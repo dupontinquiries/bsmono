@@ -2759,3 +2759,44 @@ TWO BUGS FIXED IN MY OWN FIRST DRAFT, both worth naming:
   and tested; nothing constructs one yet. The key routing (Tab for a
   bit, a modifier for a line, ESC to stop) belongs with the §36 menu
   wiring, which is also unbuilt.
+
+## 48. Typeout wired to keys
+
+C12-47a's routing. `Typeout` existed and nothing constructed one.
+
+  - **Tab** takes a BIT. The typeout is built lazily from the ghost on
+    the first Tab, so nothing changes for someone who presses Tab and
+    keeps going — they get the first token instead of the whole block,
+    and Tab again continues.
+  - **Ctrl-Tab** takes the rest. A second Tab meaning "all of it" would
+    make an accidental double-press unrecoverable.
+  - **Esc** stops where it is. What was already inserted STAYS — it is
+    real text the person watched arrive — and the rest is never typed.
+    That is the point of a granular accept.
+  - **Typing anything** ends the accept.
+
+Two supporting methods on `Ghost`: `text()` borrows rather than takes
+(starting a typeout must not clear the ghost, since the ghost is what
+draws the remaining suggestion ahead of the caret), and `consume(typed)`
+shrinks it by what was inserted — without that, a typed-out word would
+appear twice, once as real text and once as the suggestion of itself.
+`consume` DISMISSES on a prefix mismatch rather than resyncing: a ghost
+that no longer describes what follows the caret is worse than none.
+
+TWO DESYNCS FOUND AND CLOSED while wiring, both invisible until used:
+  - A new reply must clear the typeout, or Tab carries on typing out the
+    previous block against a ghost that has been replaced — inserting
+    text from a suggestion the person can no longer see.
+  - Typing a character the ghost ABSORBS looks survivable, and is not:
+    `on_text_inserted` shrinks the ghost while the typeout's offset into
+    its own copy does not move, so the two drift by one word and the
+    next Tab re-inserts text already typed. The typeout is dropped on
+    ANY keystroke instead; the next Tab rebuilds it from the ghost, so
+    there is one source of truth rather than two needing sync.
+
+- **C12-48a — NOT COMPILED.** Per the standing instruction. `Ghost::text`
+  and `Ghost::consume` are new and untested; the state wiring has never
+  been built.
+- **C12-48b — `next_line` has no binding.** Bit and rest are bound; the
+  middle granularity is not, because there is no obvious free chord and
+  guessing at one is worse than leaving it to whoever uses this.
