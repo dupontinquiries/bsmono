@@ -516,6 +516,58 @@ fn main() {
             mean_rep,
             mean_base
         );
+        // Densification: --dense builds a DENSE mesh over the sparse
+        // anchors (DensifyPass depth interpolation at two anchor frames
+        // → MeshIntegrator fusion with real source colors) and swaps it
+        // in for signature/library purposes. This is the step the
+        // cross-take matching experiment demanded: ~100-point sparse PCA
+        // signatures are take-variance-dominated; the signature was
+        // designed for meshes where shape statistics stabilize.
+        let dense_mesh: Option<fao_codec::v8_reconstruction_codec::SceneMesh> =
+            if args.iter().any(|a| a == "--dense") {
+                use fao_codec::v8_reconstruction_codec::{DensifyPass, MeshIntegrator, SceneMesh};
+                let dp = DensifyPass::default();
+                let mi = MeshIntegrator::default();
+                let mut mesh = SceneMesh::default();
+                let mut cov_report = Vec::new();
+                for &af in &[0usize, frames.len() / 2] {
+                    let pose = &poses[af];
+                    // Project triangulated world points into the anchor.
+                    let mut sp: Vec<(f32, f32, f32, f32)> = Vec::new();
+                    for p in &pts {
+                        let cz = p.world_pos.z - pose.position.z;
+                        if cz <= 1.0 {
+                            continue;
+                        }
+                        let sx = pose.principal[0] + pose.focal[0] * (p.world_pos.x - pose.position.x) / cz;
+                        let sy = pose.principal[1] + pose.focal[1] * (p.world_pos.y - pose.position.y) / cz;
+                        if sx < 0.0 || sy < 0.0 || sx >= w as f32 || sy >= h as f32 {
+                            continue;
+                        }
+                        sp.push((sx, sy, cz, p.confidence));
+                    }
+                    let dm = dp.densify(&sp, w as u32, h as u32, af as u32);
+                    let cov = dm.depths.iter().filter(|&&d| d > 0.0).count() as f32
+                        / dm.depths.len() as f32;
+                    cov_report.push(format!("anchor {af}: {} sparse → depth coverage {:.2}", sp.len(), cov));
+                    let f = &frames[af];
+                    let mut yuv = Vec::with_capacity(f.y.len() + f.u.len() + f.v.len());
+                    yuv.extend_from_slice(&f.y);
+                    yuv.extend_from_slice(&f.u);
+                    yuv.extend_from_slice(&f.v);
+                    let tris = mi.integrate(&dm, pose, dp.downsample, &mut mesh, &yuv, w, h);
+                    cov_report.push(format!("anchor {af}: +{tris} triangles"));
+                }
+                println!(
+                    "dense mesh: {} verts {} tris | {}",
+                    mesh.vertices.len(),
+                    mesh.indices.len() / 3,
+                    cov_report.join(" | ")
+                );
+                Some(mesh)
+            } else {
+                None
+            };
         // Cross-shot library experiment: --lib-add <dir> --name <label>
         // adds this GOP's sparse reconstruction as a canonical web;
         // --lib-match <dir> prints the similarity of this GOP's signature
@@ -546,7 +598,7 @@ fn main() {
             use fao_codec::library::Library;
             use fao_codec::v8_reconstruction_codec::WebSignature;
             let name = arg_val(&args, "--name").unwrap_or_else(|| args[0].clone());
-            let mesh = build_mesh(&pts);
+            let mesh = dense_mesh.clone().unwrap_or_else(|| build_mesh(&pts));
             let sig = WebSignature::from_mesh(&mesh);
             let dir = std::path::PathBuf::from(&libdir);
             if !dir.join("manifest.json").exists() {
@@ -561,7 +613,7 @@ fn main() {
         if let Some(libdir) = arg_val(&args, "--lib-match") {
             use fao_codec::library::{signature_similarity, Library};
             use fao_codec::v8_reconstruction_codec::WebSignature;
-            let mesh = build_mesh(&pts);
+            let mesh = dense_mesh.clone().unwrap_or_else(|| build_mesh(&pts));
             let sig = WebSignature::from_mesh(&mesh);
             let lib = Library::open(std::path::Path::new(&libdir)).unwrap_or_else(|e| die(&format!("lib open: {e}")));
             for stub in &lib.manifest.webs {

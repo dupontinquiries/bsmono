@@ -2931,3 +2931,32 @@ matching needs either dense geometry under the signature (densify +
 MeshIntegrator over the sparse anchors — the planned construction) or
 appearance terms (vertex-color histograms exist in the mesh; adding
 them to WebSignature is a wire-format change to take deliberately).
+
+### Dense meshes close the cross-take matching loop (same session)
+
+plate_lab --dense: DensifyPass interpolates depth between the sparse
+triangulated anchors at two anchor frames (coverage 0.46–0.71 of the
+downsampled map), MeshIntegrator fuses both into one mesh with real
+source colors (7.5k–14.9k verts, 18k–29k tris — the density regime
+WebSignature was designed for). The dense mesh replaces the sparse
+cloud for signature/library purposes.
+
+Result, same three-set experiment as before:
+  store-take2 vs store-take1:  sparse 0.609  →  dense 0.789  ✓ fires
+  vs train-car:                        0.523  →        0.404
+  vs desert:                           0.469  →        0.563
+The same-set score crosses the library's 0.75 find_match threshold
+while both wrong sets stay under it; winner margin 0.086 → 0.226.
+
+First time the complete asymptotic mechanism has closed end-to-end:
+reconstruct a take → densify → mesh → signature → MATCH a different
+take of the same set above threshold → (with the manifest reader
+fixed) the matching chunk ships a UUID + alignment instead of
+geometry. Honesty note: this is one same-set pair against two wrong
+sets — a demonstration that the loop closes, not a validation suite;
+building that suite (many takes, many sets, ROC of threshold) is the
+obvious next measurement. GPU status for the record: v8's wgpu
+rasterizer + WGSL phase correlation exist behind the `gpu` feature
+(compile-checked only here — no GPU in this sandbox; they target the
+Asahi Vulkan stack), core DCT/color has NEON/SSE/AVX2 paths; all
+session code is deliberate CPU lab code, tested not optimized.
