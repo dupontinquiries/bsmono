@@ -12,6 +12,66 @@ use unendlich_engine::render::context::VulkanContext;
 fn main() {
     let _ = env_logger::builder().is_test(false).try_init();
 
+    // r606: PRISTINE isolation (UNENDLICH_PROBE_PRISTINE=1) — one process,
+    // ONE VulkanChunkGenerator, no headless context, no TerrainGenerator
+    // pair. Separates instance-count effects from y-dependence in the
+    // deep-band investigation.
+    if std::env::var("UNENDLICH_PROBE_PRISTINE").map(|v| v == "1").unwrap_or(false) {
+        use unendlich_engine::world::gpu_generator::VulkanChunkGenerator;
+        use unendlich_engine::world::ChunkCoord;
+        let bs: u32 = std::env::var("UNENDLICH_PROBE_BS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        println!("PRISTINE batch_size={bs}");
+        let g = VulkanChunkGenerator::new(bs).expect("gen");
+        // Surface altimetry: CPU's surface_y at the origin column vs the
+        // GPU's (recovered from its own chunks: topmost solid in column 0).
+        {
+            use unendlich_engine::world::cpu_generator::WorldGenerator;
+            let cg = WorldGenerator::new(0xCAFE_F00D);
+            println!(
+                "PRISTINE cpu surface_y_at(0,0) = {:?}",
+                cg.surface_y_at(0, 0, -64, 256)
+            );
+            let mut top_solid: Option<i32> = None;
+            for y in (0i32..=3).rev() {
+                let raw = g
+                    .generate_batch(&[ChunkCoord::new(0, y, 0)], 0xCAFE_F00D)
+                    .expect("batch");
+                let cs = unendlich_engine::constants::CHUNK_SIZE as usize;
+                for ly in (0..cs).rev() {
+                    let idx = 0 + 0 * cs + ly * cs * cs; // column (0, _, 0)
+                    let b = raw[0].blocks[idx];
+                    let solidish = !matches!(
+                        b,
+                        unendlich_engine::world::blocks::BlockId::Air
+                            | unendlich_engine::world::blocks::BlockId::Water
+                    );
+                    if solidish && top_solid.is_none() {
+                        top_solid = Some(y * cs as i32 + ly as i32);
+                    }
+                }
+                if top_solid.is_some() {
+                    break;
+                }
+            }
+            println!("PRISTINE gpu top-solid in column (0,_,0) = {top_solid:?}");
+        }
+        for y in [1i32, 2, 0, 3] {
+            let raw = g
+                .generate_batch(&[ChunkCoord::new(0, y, 0)], 0xCAFE_F00D)
+                .expect("batch");
+            let mut hist: std::collections::HashMap<u8, u32> = Default::default();
+            for b in &raw[0].blocks {
+                *hist.entry(*b as u8).or_default() += 1;
+            }
+            let mut hv: Vec<_> = hist.into_iter().collect();
+            hv.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            hv.truncate(6);
+            println!("PRISTINE raw gpu (0,{y},0): {hv:?}");
+        }
+        return;
+    }
+
     let t0 = Instant::now();
     let ctx = match VulkanContext::new_headless() {
         Ok(c) => c,
@@ -51,6 +111,75 @@ fn main() {
     // (non-tree blocks) must match EXACTLY, while tree-block diffs must
     // stay under a generous ceiling. A form/silhouette mismatch (r604's
     // risk) blows straight through that ceiling.
+    // r606: DEEP-BAND diagnostic (UNENDLICH_PROBE_DEEP=1) — the y-chunk-1
+    // origin mismatch found during r604 (world (0,32,0) cpu=Stone
+    // gpu=Water). Per-backend block histograms + the first diffs with
+    // coordinates: the PATTERN identifies the diverging pass (cave-shaped
+    // pockets → carve difference; a flat slab → a fill-plane difference;
+    // bulk Air-vs-Stone → the density model itself).
+    if std::env::var("UNENDLICH_PROBE_DEEP").map(|v| v == "1").unwrap_or(false) {
+        use unendlich_engine::world::blocks::BlockId;
+        use unendlich_engine::world::terrain_generator::{Backend, TerrainGenerator};
+        use unendlich_engine::world::ChunkCoord;
+        let seed: u64 = std::env::var("UNENDLICH_PROBE_PARITY_SEED")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0xCAFE_F00D);
+        let cpu = TerrainGenerator::new(seed, Backend::Cpu, 16).expect("cpu gen");
+        let gpu = TerrainGenerator::new(seed, Backend::Gpu, 16).expect("gpu gen");
+        // RAW readback contrast (bypasses stamp_ruins/Chunk conversion):
+        // the same dispatch mechanics work at y=2 (surface band parity is
+        // byte-exact), so whatever differs is y-dependent inside the
+        // dispatch→shader→readback path.
+        {
+            use unendlich_engine::world::gpu_generator::VulkanChunkGenerator;
+            let raw_gen = VulkanChunkGenerator::new(4).expect("raw gen");
+            for y in [1i32, 2] {
+                let raw = raw_gen
+                    .generate_batch(&[ChunkCoord::new(0, y, 0)], seed as u32)
+                    .expect("raw batch");
+                let mut hist: std::collections::HashMap<u8, u32> = Default::default();
+                for b in &raw[0].blocks {
+                    *hist.entry(*b as u8).or_default() += 1;
+                }
+                let mut hv: Vec<_> = hist.into_iter().collect();
+                hv.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                println!("  RAW gpu (0,{y},0): {hv:?}");
+            }
+        }
+        let coords = vec![ChunkCoord::new(0, 1, 0)];
+        let cc = &cpu.generate(&coords)[0];
+        let gc = &gpu.generate(&coords)[0];
+        let mut hist_c: std::collections::HashMap<BlockId, u32> = Default::default();
+        let mut hist_g: std::collections::HashMap<BlockId, u32> = Default::default();
+        let cs = unendlich_engine::constants::CHUNK_SIZE as usize;
+        let mut printed = 0;
+        let mut diffs = 0u32;
+        for i in 0..cc.blocks.len() {
+            *hist_c.entry(cc.blocks[i]).or_default() += 1;
+            *hist_g.entry(gc.blocks[i]).or_default() += 1;
+            if cc.blocks[i] != gc.blocks[i] {
+                diffs += 1;
+                if printed < 14 {
+                    let lx = i % cs;
+                    let lz = (i / cs) % cs;
+                    let ly = i / (cs * cs);
+                    println!(
+                        "  diff at world ({}, {}, {}): cpu={:?} gpu={:?}",
+                        lx, 32 + ly, lz, cc.blocks[i], gc.blocks[i]
+                    );
+                    printed += 1;
+                }
+            }
+        }
+        let mut hc: Vec<_> = hist_c.into_iter().collect();
+        let mut hg: Vec<_> = hist_g.into_iter().collect();
+        hc.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        hg.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        println!("deep (0,1,0) seed {seed}: {diffs} diffs / {} blocks", cc.blocks.len());
+        println!("  cpu histogram: {hc:?}");
+        println!("  gpu histogram: {hg:?}");
+        return;
+    }
+
     if std::env::var("UNENDLICH_PROBE_PARITY").map(|v| v == "1").unwrap_or(false) {
         // r604 WORLDGEN-PARITY: build the PRODUCTION TerrainGenerator twice
         // (Backend::Cpu vs Backend::Gpu) from the same seed and diff every

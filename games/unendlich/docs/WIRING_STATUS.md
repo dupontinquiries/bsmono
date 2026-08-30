@@ -12068,3 +12068,21 @@ push_constant — Vulkan mode is required), both .spv artifacts rebuilt; fullgam
 zero watchdog lines. VISUALLY UNVERIFIED — r604 silhouettes + r605 islands are one on-device art-check item now.
 Deferred per the design doc: forêt claire biome (new id 29, both backends), gallery forests (needs the river field),
 giant 200-300 ha islands (biome-scale).
+
+## r606 — DEEP-BAND HUNT VERDICT: the GPU worldgen produces a DIFFERENT WORLD (and prior parity results are suspect)
+Instrumented isolation (gpu-headless-probe UNENDLICH_PROBE_DEEP=1 / UNENDLICH_PROBE_PRISTINE=1 / _BS=N), pristine
+single-instance, batch-size-independent, deterministic. PINNED: raw generate_batch at seed 0xCAFE_F00D yields surface
+TERRAIN in y-chunk 0, ALL-Water y-chunk 1, ALL-Air y-chunks 2-3 — a coherent world whose origin surface is y=15 where
+the CPU's is y=54 (altimetry printed by the probe). The "all-water deep band" that started this hunt was never a deep
+bug: it is the GPU world's OCEAN — the GPU worldgen simply generates a DIFFERENT WORLD than the CPU. Structural
+formulas mirror (sea_level/continental/hills read line-equal); the fork is below them, in the noise primitives /
+region sampling / the GLSL SEED_* constants vs Rust seeds::* table — the named next step is a mechanical diff of
+those constant tables. SECOND FINDING, method-critical: TerrainGenerator::generate hides per-batch GPU failure behind
+a SILENT CPU fallback (log::warn only) — so every earlier "byte-identical near origin" parity result is suspect
+(likely CPU-vs-CPU with the warn unnoticed), and the r604 entry's "f32 drift" narrative is DEMOTED to unconfirmed:
+the dominant, reproducible phenomenon is the different-world fork. The parity probe's assertion mode should not be
+trusted until it verifies which backend actually generated (expose a gpu-batches-succeeded counter on
+TerrainGenerator — queued). LIVE IMPACT, honestly bounded: the operator's device falls back to CPU (M2 lacks the
+required feature, per chunk_loader's own comment), and any successful-GPU player would get an internally-consistent
+(just different) world — but a mid-session GPU→CPU fallback, or a CPU joiner on a GPU host, would CROSS worlds. Until
+the fork is fixed, GPU worldgen should be considered NOT world-compatible with CPU worldgen.
