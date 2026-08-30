@@ -3995,6 +3995,17 @@ pub struct FeatureTrack {
     /// EMA of consensus score [0..1] — how often this feature has agreed 
     /// with camera motion. Higher = more confidently static.
     pub static_consensus: f32,
+    /// Screen-lock counters (UiOverlay promotion axis 4): frames where the
+    /// scene visibly moved, and how many of those this track sat still.
+    /// A track that stays under half a pixel while the scene moves is
+    /// screen-attached — HUD, watermark, letterbox edge. On esports
+    /// broadcast footage this is the DOMINANT track class (measured: 182
+    /// of ~410 long tracks on a SMITE GOP) and the motion-consensus pass
+    /// labels them Static — poison for rigid-world pose — because phase
+    /// correlation itself locks onto the static HUD and reports camera
+    /// motion ≈ 0, making HUD agreement look like world agreement.
+    pub screen_moving_frames: u16,
+    pub screen_still_hits: u16,
     /// Number of frames where this feature's pixel landed in a block 
     /// classified as AlphaOverlay (UI). Saturates at 255. When this 
     /// exceeds `ui_overlay_promotion_threshold` (in V8Encoder), the 
@@ -4120,6 +4131,8 @@ impl FeatureTrackPass {
                             prev_y: track.current_y,
                             motion_class: track.motion_class,  // classifier updates separately
                             static_consensus: track.static_consensus,
+                            screen_moving_frames: track.screen_moving_frames,
+                            screen_still_hits: track.screen_still_hits,
                             // Carry the layer/depth diagnostics forward — they're 
                             // updated by the UiOverlay filter pass later in encode_frame_at.
                             layer_overlay_hits: track.layer_overlay_hits,
@@ -4191,6 +4204,8 @@ impl FeatureTrackPass {
                     prev_y: kp.y,
                     motion_class: MotionClass::Unknown,
                     static_consensus: 0.5,  // neutral prior
+                    screen_moving_frames: 0,
+                    screen_still_hits: 0,
                     layer_overlay_hits: 0,
                     layer_active_hits: 0,
                     last_depth: 0.0,
@@ -4928,6 +4943,34 @@ impl MotionConsensusPass {
             (cam_dx, cam_dy)
         };
         
+        // Scene-motion signal for the screen-lock axis: median observed
+        // per-track displacement magnitude. Deliberately NOT the camera
+        // estimate — on HUD-dominated broadcast frames phase correlation
+        // reads ≈0 (it locks onto the UI), and that is precisely the
+        // content where screen-lock detection matters most.
+        let scene_moved = {
+            let mut mags: Vec<f32> = tracks
+                .iter()
+                .filter(|t| t.frames_alive >= self.min_age_for_classification)
+                .map(|t| {
+                    let dx = t.current_x - t.prev_x;
+                    let dy = t.current_y - t.prev_y;
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .collect();
+            if mags.len() < 8 {
+                false
+            } else {
+                // p75, not median: on HUD-dominated broadcasts the still
+                // (screen-locked) population IS the majority, so the
+                // median sits at ~0 exactly when the viewport is moving.
+                // "A quarter of tracks moved" is the robust scene signal.
+                let k = mags.len() * 3 / 4;
+                mags.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+                mags[k] > 1.0
+            }
+        };
+        
         for track in tracks.iter_mut() {
             if track.frames_alive < self.min_age_for_classification { continue; }
             
@@ -4950,6 +4993,24 @@ impl MotionConsensusPass {
             let res_x = obs_dx - pred_dx;
             let res_y = obs_dy - pred_dy;
             let residual = (res_x * res_x + res_y * res_y).sqrt();
+            
+            // UiOverlay promotion axis 4: screen-lock. The scene-motion
+            // signal is the MEDIAN track displacement (computed once
+            // below, passed in via scene_moved) rather than the camera
+            // estimate — phase correlation reads ≈0 on HUD-dominated
+            // broadcast frames, which is exactly when this axis matters.
+            if scene_moved {
+                track.screen_moving_frames = track.screen_moving_frames.saturating_add(1);
+                let own = (obs_dx * obs_dx + obs_dy * obs_dy).sqrt();
+                if own < 0.5 {
+                    track.screen_still_hits = track.screen_still_hits.saturating_add(1);
+                }
+                if track.screen_moving_frames >= 6
+                    && track.screen_still_hits as u32 * 10 >= track.screen_moving_frames as u32 * 9
+                {
+                    track.motion_class = MotionClass::UiOverlay;
+                }
+            }
             
             // Per-frame agreement: 1.0 if residual is below threshold, 
             // tapering to 0.0 at 3x threshold.
@@ -5148,7 +5209,7 @@ mod consensus_tests {
                 feature_id: 1, current_x: 105.0, current_y: 50.0,
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 10, born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,
@@ -5158,7 +5219,7 @@ mod consensus_tests {
                 feature_id: 2, current_x: 101.0, current_y: 50.0,
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 10, born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,
@@ -5184,7 +5245,7 @@ mod consensus_tests {
                 feature_id: 1, current_x: 100.0, current_y: 50.0,
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 10, born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,
@@ -5205,7 +5266,7 @@ mod consensus_tests {
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 1,  // too young
                 born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,

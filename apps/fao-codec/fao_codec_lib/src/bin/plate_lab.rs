@@ -201,10 +201,17 @@ fn main() {
         // per-frame survivors, survival rate across each step, track
         // lifetime distribution, and spatial coverage of LONG tracks
         // (>=8 frames; short tracks can't constrain a pose chain).
-        use fao_codec::v8_reconstruction_codec::FeatureTrackPass;
+        use fao_codec::v8_reconstruction_codec::{FeatureTrackPass, MotionConsensusPass, MotionClass};
+        use fao_codec::phase_correlation::PhaseCorrelationPass;
         let (w, h) = (frames[0].w, frames[0].h);
         let mut pass = FeatureTrackPass::default();
+        let consensus = MotionConsensusPass::default();
+        let pc = PhaseCorrelationPass::new(512.min(w.min(h)));
         let mut prev: Option<&Vec<u8>> = None;
+        // Screen-locked accounting: per track, (frames where cam moved
+        // >1px, frames among those where the track itself moved <0.5px).
+        let mut locked: std::collections::HashMap<u32, (u32, u32)> = std::collections::HashMap::new();
+        let mut classes: std::collections::HashMap<u32, MotionClass> = std::collections::HashMap::new();
         let mut lifetimes: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut long_track_cells: Vec<bool> = vec![false; ((w + 63) / 64) * ((h + 63) / 64)];
         let cw = (w + 63) / 64;
@@ -212,6 +219,22 @@ fn main() {
         for (i, f) in frames.iter().enumerate() {
             let feats = pass.process(&f.y, prev.map(|v| v.as_slice()), w, h, i as u32);
             per_frame.push(feats.len());
+            if let Some(pv) = prev {
+                let cam = pc.estimate(&f.y, pv, w, h);
+                consensus.classify(&mut pass.live_tracks, cam.dx, cam.dy, cam.confidence);
+                let cam_mag = (cam.dx * cam.dx + cam.dy * cam.dy).sqrt();
+                for t in &pass.live_tracks {
+                    classes.insert(t.feature_id, t.motion_class);
+                    if cam.confidence > 0.2 && cam_mag > 1.0 {
+                        let od = ((t.current_x - t.prev_x).powi(2) + (t.current_y - t.prev_y).powi(2)).sqrt();
+                        let e = locked.entry(t.feature_id).or_insert((0, 0));
+                        e.0 += 1;
+                        if od < 0.5 {
+                            e.1 += 1;
+                        }
+                    }
+                }
+            }
             for sf in &feats {
                 let e = lifetimes.entry(sf.feature_id).or_insert(0);
                 *e += 1;
@@ -238,6 +261,27 @@ fn main() {
         println!(
             "per-frame survivors: first {} mid {} last {} | long-track coverage {:.2}",
             per_frame[0], per_frame[n / 2], per_frame[n - 1], long_cov
+        );
+        // Class + screen-lock breakdown over >=8-frame tracks.
+        let (mut st, mut dy, mut ui, mut un, mut scr) = (0usize, 0, 0, 0, 0usize);
+        for (id, &life) in &lifetimes {
+            if life < 8 {
+                continue;
+            }
+            match classes.get(id) {
+                Some(MotionClass::Static) => st += 1,
+                Some(MotionClass::Dynamic) => dy += 1,
+                Some(MotionClass::UiOverlay) => ui += 1,
+                _ => un += 1,
+            }
+            if let Some(&(moving_frames, still_frames)) = locked.get(id) {
+                if moving_frames >= 4 && still_frames * 10 >= moving_frames * 9 {
+                    scr += 1;
+                }
+            }
+        }
+        println!(
+            "long-track classes: static {st} dynamic {dy} ui {ui} unknown {un} | screen-locked {scr}"
         );
         return;
     }

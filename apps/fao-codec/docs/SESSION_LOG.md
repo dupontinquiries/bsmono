@@ -2733,3 +2733,30 @@ items: HUD/world track segmentation for game broadcasts (screen-locked
 tracks are poison for rigid-world pose — likely most of smiteB's
 long-lived cohort), then actually running TriangulatePass on these
 tracks.
+
+### HUD/world track segmentation (same session)
+
+Probe finding first: on the SMITE broadcast GOP, 182 of ~410 long
+tracks are screen-locked (move <0.5px while the scene moves) — and the
+motion-consensus classifier labeled them STATIC world points with zero
+UiOverlay, because phase correlation locks onto the dominant static
+HUD, reads camera ≈ 0, and HUD agreement then looks like world
+agreement. The classifier's world model was inverted on exactly the
+content class (game broadcasts) the whole-scene goal cares about.
+
+Fix: UiOverlay promotion axis 4 (screen-lock) inside
+MotionConsensusPass — per-track counters (screen_moving_frames /
+screen_still_hits on FeatureTrack), latched when a track sits <0.5px
+through ≥90% of ≥6 scene-moving frames. The scene-motion signal is the
+p75 of observed per-track displacement, deliberately NOT the camera
+estimate (which reads ≈0 on HUD-dominated frames) and NOT the median
+(the still population IS the majority there — the median sits at zero
+precisely when the viewport moves).
+
+Measured: smiteB 187 UiOverlay (independent probe: 182 — agreement),
+static pool 351→166; shotB 0 false positives; shotA latches 50 — all
+stuck LK tracks in the defocused foreground that never respond to
+scene motion, whose exclusion from pose is safe (zero parallax
+information) and arguably beneficial. UiOverlay is already
+hard-excluded from v8's pose/densify paths, so the world pool feeding
+pose is now HUD-free on broadcast content.
