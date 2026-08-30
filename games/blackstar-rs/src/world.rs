@@ -4567,7 +4567,20 @@ impl World {
     /// pulls harder near it without changing the sky elsewhere.
     pub fn gravity_field(&self, p: Vec3) -> (Vec3, f32) {
         let dir = self.gravity_dir(p);
-        let mut g = 1.0;
+        // THE AMBIENT IS A PER-MAP DECISION, not a constant. `gravity.rs`
+        // measured this field and found its largest error was exactly
+        // here: beyond every well the pull relaxed to 1.0 pointing at
+        // world -Y, which on a grounded map is the ground's own gravity
+        // and on KUIPER meant THE VOID PULLED DOWNWARD — an asteroid
+        // field reading as rocks hung over an invisible floor. The
+        // grounded maps keep their 1.0 bit-for-bit; kuiper's far field
+        // now relaxes to nothing, and each well still pulls in reach.
+        let amb = crate::gravity::far_field(if self.kuiper {
+            crate::gravity::Ambient::Void
+        } else {
+            crate::gravity::Ambient::Grounded
+        });
+        let mut g = amb;
         if !self.grav.is_empty() {
             let mut best = (f32::MAX, 0usize);
             for (i, n) in self.grav.iter().enumerate() {
@@ -4579,7 +4592,7 @@ impl World {
             let n = &self.grav[best.1];
             let t = best.0 / n.r.max(0.01);
             let w = ((1.5 - t) / 0.75).clamp(0.0, 1.0);
-            g = 1.0 + (n.g - 1.0) * w;
+            g = amb + (n.g - amb) * w;
             // INSIDE A TUBE the pull is strongest at the AXIS and eases off
             // as you reach the wall. A flat pull cannot satisfy both ends:
             // weak enough not to pin you to the bore (which is what it felt
@@ -4599,6 +4612,32 @@ impl World {
                 let d = b.pos.distance(p).max(1.0);
                 if d < b.r * 6.0 {
                     g += (b.r * 6.0 / d).min(9.0);
+                }
+            }
+        }
+        // KUIPER'S SOFT BOUNDARY — the drift-recovery half of the void
+        // decision. Void ambient made a missed jump able to drift forever:
+        // beyond every well, nothing pulls. The recovery is INWARD, never
+        // downward (downward is the exact bug the void fix removed): past
+        // the field's own edge a gentle pull toward the field takes over,
+        // ramping with distance, so a drifter is returned to play in tens
+        // of seconds rather than stranded — and inside the edge it is
+        // exactly zero, so the void within the field stays a void. The
+        // edge is measured from the nodes rather than a constant because
+        // the field's reach already depends on world scale.
+        if self.kuiper && !self.grav.is_empty() {
+            let inv = 1.0 / self.grav.len() as f32;
+            let centre = self.grav.iter().fold(Vec3::ZERO, |a, n| a + n.pos) * inv;
+            let edge = self
+                .grav
+                .iter()
+                .map(|n| n.pos.distance(centre) + n.r * 1.5)
+                .fold(0.0f32, f32::max);
+            let out = p.distance(centre);
+            if out > edge {
+                let pull = ((out - edge) / 60.0).clamp(0.0, 1.0) * 0.25;
+                if pull > g {
+                    return ((centre - p).normalize_or(Vec3::NEG_Y), pull);
                 }
             }
         }

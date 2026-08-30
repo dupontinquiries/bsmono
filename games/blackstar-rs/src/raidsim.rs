@@ -58,10 +58,26 @@ pub fn run(argv: &[String]) {
         Some("codex") => codex(),
         Some("all") => {
             let mut won: Vec<&str> = Vec::new();
+            let mut margins: Vec<(&str, f32)> = Vec::new();
             for b in BOSSES {
-                if one(b.id, seed, body, speed, team_n, forced, true) {
+                if let Some(m) = one(b.id, seed, body, speed, team_n, forced, true) {
                     won.push(b.id);
+                    margins.push((b.id, m));
                 }
+            }
+            // THE TUNING HEADLINE. A sweep that only counts clears cannot
+            // tell a knife-edge roster from a flat one; the margins can.
+            let mut tight: Vec<&(&str, f32)> = margins.iter().filter(|(_, m)| m.is_finite()).collect();
+            tight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            match (tight.first(), tight.last()) {
+                (Some((tid, tm)), Some((sid, sm))) if tight.len() > 1 => println!(
+                    "\n  clocked raids: {} of {}  tightest {} at {:.0}s, slackest {} at {:.0}s",
+                    tight.len(), margins.len(), tid, tm, sid, sm
+                ),
+                (Some((tid, tm)), _) => println!(
+                    "\n  clocked raids: 1 of {}  {} at {:.0}s", margins.len(), tid, tm
+                ),
+                _ => println!("\n  clocked raids: none -- every sky in the sweep was open"),
             }
             // committed: the sweep lands on the save's log. Dry: the sweep
             // is its own hypothetical world, counted from zero.
@@ -81,7 +97,7 @@ pub fn run(argv: &[String]) {
             }
         }
         Some(id) => {
-            let victory = one(id, seed, body, speed, team_n, forced, false);
+            let victory = one(id, seed, body, speed, team_n, forced, false).is_some();
             if victory {
                 settle(id, commit, body == Body::HumanSuited);
             }
@@ -210,10 +226,16 @@ fn codex() {
 }
 
 /// Run one raid end to end. Returns whether the shard came home.
-fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Option<Approach>, brief: bool) -> bool {
+/// Run one raid. `Some(tightest)` on victory — the smallest window
+/// margin the run ever saw, in seconds (INFINITY when every sky was
+/// open) — `None` on any failure. The margin is the tuning number the
+/// sweep was throwing away: 152 consecutive clears say nothing about
+/// difficulty, but the same 152 runs ranked by how CLOSE they came say
+/// everything.
+fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Option<Approach>, brief: bool) -> Option<f32> {
     let Some(boss) = crate::raidcon::boss(id) else {
         println!("no such warden: {id}  (run `--raid` for the roster)");
-        return false;
+        return None;
     };
     let plan = plan_for(boss, 3, seed);
     if !brief {
@@ -223,6 +245,7 @@ fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Optio
 
     let mut run = RaidRun::new(&plan);
     let mut clock_spent = 0.0f32;
+    let mut tightest = f32::INFINITY;
     while !run.over {
         let pi = run.phase;
         let spec = &plan.phases[pi];
@@ -262,7 +285,7 @@ fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Optio
         };
         let Some(fh) = chosen else {
             println!("   REPULSED -- no foothold could be taken inside the window");
-            return false;
+            return None;
         };
         // the planner's rule, exactly: ANY shelter discounts the fighting
         // (LZ fights happen in the ship's shadow, fortress fights under
@@ -294,7 +317,7 @@ fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Optio
                     }
                     if ev == Event::WindowClosed {
                         println!("   x  the weather closed during {} -- {}", nm(e), spec.name);
-                        return false;
+                        return None;
                     }
                 }
                 t += DT;
@@ -337,9 +360,10 @@ fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Optio
         pr.step(DT, &[]);
         if !pr.cleared() {
             println!("   x  {} stalled unexpectedly", spec.name);
-            return false;
+            return None;
         }
         let left = pr.left_s;
+        tightest = tightest.min(left);
         clock_spent += phase_t;
         let is_finale = pi + 1 == plan.phases.len();
         if !brief {
@@ -352,13 +376,14 @@ fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Optio
         if is_finale {
             let walk = pr_raid.extract_m / speed.max(0.1)
                 * if fh.site.approach.pins_the_ship() { 1.0 } else { 1.4 };
+            tightest = tightest.min(left - walk);
             if left - walk < 0.0 {
                 println!(
                     "   x  boss down, and the front caught the team {:.0}s short on the {:.0}m walk out",
                     walk - left,
                     pr_raid.extract_m
                 );
-                return false;
+                return None;
             }
         }
         run.advance();
@@ -373,7 +398,12 @@ fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Optio
             .as_ref()
             .map(|d| format!("{} {:?}", d.grade.label(), d.base.effect))
             .unwrap_or_else(|| "nothing wearable".into());
-        println!("  {:12} CLEARED in {:>5.0}s fight-time -- {}", id, clock_spent, d);
+        let m = if tightest.is_finite() {
+            format!("tightest {:>5.0}s", tightest)
+        } else {
+            "open sky     ".into()
+        };
+        println!("  {:12} CLEARED in {:>5.0}s fight-time  {}  -- {}", id, clock_spent, m, d);
     } else {
         println!("\n== {} is down. the {:.0}m walk out held.", plan.boss.name, finale.extract_m);
         match &drop {
@@ -387,7 +417,7 @@ fn one(id: &str, seed: u64, body: Body, speed: f32, team_n: usize, forced: Optio
         }
         println!("   shard: {}", plan.boss.shard);
     }
-    true
+    Some(tightest)
 }
 
 fn nm(e: &crate::raidgen::EncSpec) -> String {

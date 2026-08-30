@@ -1,6 +1,7 @@
 //! SKYDRIBBLE — a Rocket-League-inspired open-world air-dribble playground.
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
+mod align;
 mod anim;
 mod approach;
 mod actuator;
@@ -31,6 +32,7 @@ mod foldaudit;
 mod foldsim;
 mod font;
 mod foothold;
+mod fleet;
 mod fx;
 mod gamepad;
 mod gyro;
@@ -55,8 +57,10 @@ mod replay;
 mod academy;
 mod stream;
 mod hazard;
+mod helmai;
 mod hive;
 mod hud;
+mod holomap;
 mod hotbar;
 mod hydro;
 mod idle;
@@ -648,6 +652,10 @@ struct Chassis {
     /// them. Separate from `strip` on purpose: a fold is indexed by t and a
     /// walk by phase, and one list cannot say which is which.
     walk: Vec<usize>,
+    /// the walk poses' directories at the scale they were loaded, for the
+    /// same reason `dirs` exists: the walk morph must reload with the SAME
+    /// numbers or the blend rescales between strides
+    walk_dirs: Vec<(PathBuf, f32)>,
     /// the fitted rig, for the catalogue's joint inspector. Empty when the
     /// chassis shipped without a joints.json.
     joints: Vec<joints::Joint>,
@@ -719,6 +727,22 @@ struct Game {
     /// BLENDED rather than stepped. Only the active chassis is kept — the
     /// whole roster would be ~130 MB of vertices resident for no reason.
     morph: Option<xform::Morph>,
+    /// THE WALK, BLENDED — (chassis, blend model, morph). The walk strip
+    /// used to reach the screen as a flipbook: `walk_frame` snapped whole
+    /// poses by phase. The morph is the walk strip with pose 0 appended
+    /// again at the end (loop closure: a stride wraps), aligned by
+    /// `align::unify` exactly as the fold is, sampled at the locomotion
+    /// phase. It writes into a DEDICATED model cloned from the strip —
+    /// never into a walk pose itself — because field bots flip through
+    /// those poses at their own offsets and would otherwise display the
+    /// player's half-stride. Only the player blends; a shared mesh buffer
+    /// cannot hold every bot's phase at once, so minions keep the flipbook.
+    walk_morph: Option<(usize, usize, xform::Morph)>,
+    /// which chassis the last walk-morph BUILD was attempted for — kept
+    /// separately from the morph so a refused strip is remembered as
+    /// refused. Without it, a chassis whose walk `unify` rejects would
+    /// re-load five glTF poses from disk EVERY TICK while standing.
+    walk_morph_tried: Option<usize>,
     /// 0..1 health, which is what picks the fold's personality
     health: f32,
     /// the weapons module owns the lock; the camera borrows it
@@ -1183,6 +1207,18 @@ fn main() {
     if argv.iter().any(|a| a == "--gear") {
         // the bearer's sheet, the ship's vault, the clone gallery
         gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--helm") {
+        helmai::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--holo") {
+        holomap::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--fleet") {
+        fleet::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--fold") {
@@ -1806,6 +1842,7 @@ fn main() {
             // used to before one scale was measured for the whole strip.
             let robot_target = dirs.last().map(|(_, t)| *t).unwrap_or(1.32);
             let mut walk: Vec<usize> = Vec::new();
+            let mut walk_dirs: Vec<(PathBuf, f32)> = Vec::new();
             for k in 0..4usize {
                 // model::load takes the pose DIRECTORY and joins scene.gltf
                 // itself. This used to join it here too, so load saw
@@ -1821,6 +1858,7 @@ fn main() {
                 let m = model::load(&wdir, &mut gpu, robot_target);
                 let idx = cars.models.len();
                 walk.push(idx);
+                walk_dirs.push((wdir.clone(), robot_target));
                 cars.models.push(m);
                 cars.names.push(Box::leak(
                     format!("{} WALK {k}", label.to_uppercase()).into_boxed_str(),
@@ -1835,6 +1873,7 @@ fn main() {
             cars.chassis.push(Chassis {
                 strip,
                 walk,
+                walk_dirs,
                 dirs,
                 joints: joints::load(&bdir.join("joints.json")),
                 scale: {
@@ -1909,6 +1948,8 @@ fn main() {
         cars,
         xf: xform::Xform::new(),
         morph: None,
+        walk_morph: None,
+        walk_morph_tried: None,
         health: 1.0,
         wep: weapons::Weapons::new(),
         autotarget: false,
@@ -2786,16 +2827,68 @@ impl Game {
         if dirs.len() < 2 {
             return;
         }
-        let mut poses: Vec<Vec<Vec<meshgen::Vertex>>> = Vec::new();
-        let mut idx: Vec<Vec<u32>> = Vec::new();
-        for (k, (d, target)) in dirs.iter().enumerate() {
+        let mut strip: Vec<Vec<model::RawPrim>> = Vec::new();
+        for (d, target) in dirs.iter() {
             let (raws, _) = model::load_raw(d, *target);
-            if k == 0 {
-                idx = raws.iter().map(|r| r.idx.clone()).collect();
-            }
-            poses.push(raws.into_iter().map(|r| r.verts).collect());
+            strip.push(raws);
         }
-        self.morph = xform::Morph::build(poses, idx);
+        // ALIGNMENT FIRST. No shipped strip agrees prim-for-prim — pose
+        // counts differ and orders permute — so handing raw poses to
+        // Morph::build refused every chassis and the game has been
+        // stepping the whole time (measured; see align.rs). unify finds
+        // the union-prim correspondence and emits exactly the
+        // uniform-shape input Morph requires. Its refusal is the same
+        // stepping fallback as before, so this path can only improve.
+        let Some(u) = crate::align::unify(strip) else {
+            self.morph = None;
+            self.toastf("strip mismatch — stepping");
+            return;
+        };
+        // UNION PRIMS BEYOND THE BASE MODEL NEED DRAW SLOTS. The blend
+        // path writes mesh `p` of the displayed model from union prim
+        // `p`, and pose-specific parts (present only mid-strip) have no
+        // mesh on the vehicle model to write. Append one per extra,
+        // seeded with its own pose-0 placeholder (a collapsed point —
+        // invisible until the fold brings it out). Idempotent: a second
+        // build_morph on the same chassis finds the slots already there.
+        //
+        // Extras are forced to Tag::Body whatever their source pose
+        // called them: the wheel-spin and roller paths key off tags, and
+        // a transitional panel that spins like a wheel mid-fold is worse
+        // than one that merely moves. Textures are not carried over —
+        // they live in the source POSE's directory and the base model's
+        // cache never saw them — so extras draw flat-coloured. Colour is
+        // kept; if flat panels read wrong on real hardware, the texture
+        // load belongs here, where `self.gpu` and `dirs` are both in
+        // scope.
+        let base = self.cars.chassis[cid].strip[0];
+        let have = self.cars.models[base].prims.len();
+        let want = u.base_prims + u.extras.len();
+        if have == u.base_prims {
+            for (e, extra) in u.extras.iter().enumerate() {
+                let p = u.base_prims + e;
+                let md = meshgen::MeshData {
+                    verts: u.poses[0][p].clone(),
+                    idx: u.idx[p].clone(),
+                };
+                let mesh_id = self.gpu.add_mesh(&md);
+                self.cars.models[base].prims.push(model::Prim {
+                    mesh_id,
+                    tex_id: None,
+                    color: extra.color,
+                    tag: model::Tag::Body,
+                    pivot: Vec3::ZERO,
+                });
+            }
+        } else if have != want {
+            // the base model's prim list is not what alignment mapped
+            // against — writing meshes by index would scramble parts, so
+            // refuse into the known fallback rather than blend garbage
+            self.morph = None;
+            self.toastf("strip slot mismatch — stepping");
+            return;
+        }
+        self.morph = xform::Morph::build(u.poses, u.idx);
         // COMPACTION ON, which it never has been: Morph::build sets
         // `compaction: None` and nothing assigned it, so compact.rs — 
         // written for exactly the "flat vehicle panels still hanging off the
@@ -2834,6 +2927,105 @@ impl Game {
             // a strip whose poses disagree cannot be blended; stepping it is
             // still better than blending garbage
             self.toastf("strip mismatch — stepping");
+        }
+    }
+
+    /// Build the walk morph for the active chassis: the walk strip with
+    /// pose 0 appended again so phase 1.0 lands where phase 0.0 started —
+    /// a stride is a loop and a linear strip is not. Same alignment, same
+    /// refusal semantics as the fold: `unify` says no, the flipbook stays.
+    fn build_walk_morph(&mut self) {
+        let Some(&(cid, _)) = self.cars.xform.get(&self.cars.active) else { return };
+        let wd = self.cars.chassis[cid].walk_dirs.clone();
+        if wd.len() < 2 {
+            return;
+        }
+        let mut strip: Vec<Vec<model::RawPrim>> = Vec::new();
+        for (d, target) in wd.iter().chain(std::iter::once(&wd[0])) {
+            let (raws, _) = model::load_raw(d, *target);
+            strip.push(raws);
+        }
+        let Some(u) = crate::align::unify(strip) else { return };
+        // A DEDICATED MODEL for the blend. The union's first `base_prims`
+        // slots mirror walk pose 0's prims (same order, same materials);
+        // extras get flat-coloured Body slots, the same trade the fold
+        // makes and for the same reason (their textures live in another
+        // pose's directory).
+        let w0 = self.cars.chassis[cid].walk[0];
+        let mut prims: Vec<model::Prim> = Vec::new();
+        for (p, src) in self.cars.models[w0].prims.iter().take(u.base_prims).enumerate() {
+            let md = meshgen::MeshData { verts: u.poses[0][p].clone(), idx: u.idx[p].clone() };
+            prims.push(model::Prim { mesh_id: self.gpu.add_mesh(&md), ..*src });
+        }
+        for (e, extra) in u.extras.iter().enumerate() {
+            let p = u.base_prims + e;
+            let md = meshgen::MeshData { verts: u.poses[0][p].clone(), idx: u.idx[p].clone() };
+            prims.push(model::Prim {
+                mesh_id: self.gpu.add_mesh(&md),
+                tex_id: None,
+                color: extra.color,
+                tag: model::Tag::Body,
+                pivot: Vec3::ZERO,
+            });
+        }
+        if prims.len() != u.poses[0].len() {
+            return; // the mapping does not hold; keep the flipbook
+        }
+        let bm = self.cars.models.len();
+        let src = &self.cars.models[w0];
+        let clone = model::Model {
+            prims,
+            drive: src.drive,
+            hover: None,
+            settle: src.settle,
+            tuck: src.tuck.clone(),
+            pack: src.pack.clone(),
+            fittings: src.fittings.clone(),
+            cloud: Vec::new(),
+            cloud_n: Vec::new(),
+            sdf_half: Vec3::ZERO,
+            half_len: src.half_len,
+            half_h: src.half_h,
+            half_w: src.half_w,
+            wheel_r: src.wheel_r,
+            ride_h: src.ride_h,
+        };
+        self.cars.models.push(clone);
+        self.cars.names.push(Box::leak(
+            format!("{} WALK BLEND", self.cars.names[w0]).into_boxed_str(),
+        ));
+        if let Some(m) = xform::Morph::build(u.poses, u.idx) {
+            self.walk_morph = Some((cid, bm, m));
+        }
+    }
+
+    /// Per tick: keep the blend model's meshes at the player's phase.
+    /// Lazy-builds on the first tick a walking body needs it, and stands
+    /// down (keeping the built morph) whenever the flipbook path would
+    /// not be walking either.
+    fn advance_walk(&mut self) {
+        let Some(&(cid, k)) = self.cars.xform.get(&self.cars.active) else { return };
+        let ch = &self.cars.chassis[cid];
+        if ch.walk_dirs.len() < 2 || k + 1 != ch.strip.len() {
+            return;
+        }
+        match &self.walk_morph {
+            Some((mc, _, _)) if *mc == cid => {}
+            _ if self.walk_morph_tried == Some(cid) => return, // refused once; stay a flipbook
+            _ => {
+                // one chassis at a time, same residency rule as the fold's
+                // morph — the roster's walks resident would be for no reason
+                self.walk_morph = None;
+                self.walk_morph_tried = Some(cid);
+                self.build_walk_morph();
+            }
+        }
+        let Some((_, bm, m)) = &mut self.walk_morph else { return };
+        let t = self.loco_pose.phase.rem_euclid(1.0);
+        let ids: Vec<usize> = self.cars.models[*bm].prims.iter().map(|p| p.mesh_id).collect();
+        for (p, mesh_id) in ids.iter().enumerate().take(m.prims()) {
+            let md = m.sample(p, t);
+            self.gpu.replace_mesh(*mesh_id, &md);
         }
     }
 
@@ -3442,9 +3634,21 @@ impl Game {
         Some(ch.walk[((ph * n as f32) as usize).min(n - 1)])
     }
 
-    /// The player's own frame: no offset, because the phase IS theirs.
+    /// The player's own frame: no offset, because the phase IS theirs —
+    /// and blended when the walk morph is up, so the stride sweeps
+    /// instead of snapping between four baked poses. Field bots keep the
+    /// flipbook (`walk_frame_at`): one mesh buffer cannot hold every
+    /// bot's phase at once.
     fn walk_frame(&self, model: usize) -> Option<usize> {
-        self.walk_frame_at(model, 0.0)
+        let stepped = self.walk_frame_at(model, 0.0)?;
+        if let (Some((mc, bm, _)), Some(&(cid, _))) =
+            (&self.walk_morph, self.cars.xform.get(&model))
+        {
+            if *mc == cid {
+                return Some(*bm);
+            }
+        }
+        Some(stepped)
     }
 
     /// Size multiplier for a model, 1.0 unless it is a boss.
@@ -5276,6 +5480,7 @@ impl Game {
         }
         self.sight.update(dt);
         self.advance_xform(dt);
+        self.advance_walk();
         self.update_autotarget(dt);
         self.update_locomotion(dt);
 
@@ -7762,14 +7967,41 @@ impl Game {
             // vehicle mode contains them inside the hull envelope so the
             // fold reads as a solid object rather than a skeleton in a box
             // (`contain`). Both are zero for a body that never needed it.
+            //
+            // CROSSFADED, not switched. These used to flip on `robot` — a
+            // binary read of eased() > 0.5 — so mid-fold every prim with a
+            // different pack and tuck JUMPED by their difference in one
+            // frame, at exactly the moment the transformation has the
+            // player's eyes on the body. Blend by the same eased fold
+            // parameter the morph itself uses: pack at the vehicle end,
+            // tuck at the robot end, identical to the old values at both
+            // endpoints, continuous everywhere between.
             let base = match &settle_q {
                 Some(q) => base * Mat4::from_quat(*q),
                 None => base,
             };
-            let shift = if robot { active.tuck.get(pi) } else { active.pack.get(pi) };
-            let base = match shift {
-                Some(t) if *t != Vec3::ZERO => base * Mat4::from_translation(*t),
-                _ => base,
+            let fold_t = self.xf.eased().clamp(0.0, 1.0);
+            let pack = active.pack.get(pi).copied().unwrap_or_default();
+            let tuck = active.tuck.get(pi).copied().unwrap_or(Vec3::ZERO);
+            let shift = pack.shift.lerp(tuck, fold_t);
+            let base = if shift.length_squared() > 1e-12 {
+                base * Mat4::from_translation(shift)
+            } else {
+                base
+            };
+            // THE HINGE rides the same crossfade: full at the vehicle end,
+            // slerped away to identity as the body stands up — the wing
+            // that stowed along the hull swings back out through exactly
+            // the arc it stowed by. Rotation about the limb's own root,
+            // because rotating about the origin detaches the limb
+            // (`skeleton::fold_point`'s warning, honoured here).
+            let base = if pack.rot != Quat::IDENTITY {
+                let q = Quat::IDENTITY.slerp(pack.rot, 1.0 - fold_t);
+                base * Mat4::from_translation(pack.pivot)
+                    * Mat4::from_quat(q)
+                    * Mat4::from_translation(-pack.pivot)
+            } else {
+                base
             };
             // DETECTED WHEELS SPIN TOO. `split_wheels` tags wheels it
             // recognises and the match below turns those; an imported bot

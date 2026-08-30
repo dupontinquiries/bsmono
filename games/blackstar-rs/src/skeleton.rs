@@ -515,6 +515,34 @@ pub fn fold_point(p: Vec3, limb: &Limb, up: Vec3, t: f32) -> Vec3 {
     limb.root + fold_rotation(limb, up, t) * (p - limb.root)
 }
 
+/// The per-limb containment shift, given the limb's bounds and the
+/// envelope. Extracted from [`contain`] so the hinged fold can run the
+/// SAME arithmetic on rotated bounds — two copies of the centring cap
+/// would drift.
+fn contain_shift(lo: Vec3, hi: Vec3, elo: Vec3, ehi: Vec3, core_centre: Vec3) -> Vec3 {
+    // how far each axis pokes out, in the direction it pokes
+    let over_hi = (hi - ehi).max(Vec3::ZERO);
+    let over_lo = (elo - lo).max(Vec3::ZERO);
+    let mut shift = over_lo - over_hi;
+    // Never push a limb THROUGH the body — but the cap has to be the
+    // shift that CENTRES it, not `envelope - span`. For any limb WIDER
+    // than the envelope that formula is zero, so the pull is clamped
+    // to nothing and the limb does not move at all: on the test jet
+    // the envelope is 1.25 across and a wing spans 5.2, so cap.x = 0
+    // and the widest limbs — exactly the ones containment is for —
+    // were the only ones it could never touch.
+    //
+    // Centring is the real limit. It is the furthest a limb can travel
+    // while still being pulled toward the body rather than past it, it
+    // is never zero, and for an oversized limb it splits the overhang
+    // evenly instead of driving one end out the far side (measured on
+    // the jet's wing: 1.98 each side, against 3.95 out one side if the
+    // raw shift is applied uncapped).
+    let centre_shift = core_centre - (lo + hi) * 0.5;
+    let cap = centre_shift.abs();
+    shift.clamp(-cap, cap)
+}
+
 pub fn contain(sk: &Skeleton, prims: &[&[Vec3]], slack: f32) -> Vec<Vec3> {
     let mut out = vec![Vec3::ZERO; prims.len()];
     if sk.core_half.max_element() <= 1e-4 {
@@ -535,33 +563,101 @@ pub fn contain(sk: &Skeleton, prims: &[&[Vec3]], slack: f32) -> Vec<Vec3> {
         if !(hi.x >= lo.x) {
             continue;
         }
-        // how far each axis pokes out, in the direction it pokes
-        let over_hi = (hi - ehi).max(Vec3::ZERO);
-        let over_lo = (elo - lo).max(Vec3::ZERO);
-        let mut shift = over_lo - over_hi;
-        // Never push a limb THROUGH the body — but the cap has to be the
-        // shift that CENTRES it, not `envelope - span`. For any limb WIDER
-        // than the envelope that formula is zero, so the pull is clamped
-        // to nothing and the limb does not move at all: on the test jet
-        // the envelope is 1.25 across and a wing spans 5.2, so cap.x = 0
-        // and the widest limbs — exactly the ones containment is for —
-        // were the only ones it could never touch.
-        //
-        // Centring is the real limit. It is the furthest a limb can travel
-        // while still being pulled toward the body rather than past it, it
-        // is never zero, and for an oversized limb it splits the overhang
-        // evenly instead of driving one end out the far side (measured on
-        // the jet's wing: 1.98 each side, against 3.95 out one side if the
-        // raw shift is applied uncapped).
-        let centre_shift = sk.core_centre - (lo + hi) * 0.5;
-        let cap = centre_shift.abs();
-        shift = shift.clamp(-cap, cap);
+        let shift = contain_shift(lo, hi, elo, ehi, sk.core_centre);
         if shift.length_squared() < 1e-8 {
             continue;
         }
         for i in &limb.prims {
             if let Some(slot) = out.get_mut(*i) {
                 *slot = shift;
+            }
+        }
+    }
+    out
+}
+
+/// One prim's share of the VEHICLE-MODE fold: hinge about the limb root,
+/// then a containment translation computed on the ROTATED bounds.
+///
+/// This is the answer to the composition question `fold_rotation` left
+/// open ("how a limb's rotation should COMPOSE with the containment
+/// translation"): rotate FIRST, contain what is left. The hinge is the
+/// physically-real mechanism — swing-wings hinge, undercarriage folds on
+/// an arm — so it does what a hinge can, and translation finishes the
+/// job on the silhouette the hinge produced. The other order (contain
+/// then rotate) measures the overhang of geometry that is about to move,
+/// which is answering the wrong question.
+///
+/// Identity for core prims and for every limb that translation ALONE can
+/// fit — a bonnet stays a bonnet. The hinge is reserved for limbs that
+/// are WIDER than the envelope on an axis they poke out of, which is
+/// precisely the case `contain`'s own doc names as impossible for it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FoldStep {
+    pub rot: Quat,
+    /// hinge point, meaningful only when `rot != IDENTITY`
+    pub pivot: Vec3,
+    pub shift: Vec3,
+}
+
+impl Default for FoldStep {
+    fn default() -> Self {
+        FoldStep { rot: Quat::IDENTITY, pivot: Vec3::ZERO, shift: Vec3::ZERO }
+    }
+}
+
+pub fn fold_pack(sk: &Skeleton, prims: &[&[Vec3]], slack: f32, up: Vec3) -> Vec<FoldStep> {
+    let mut out = vec![FoldStep::default(); prims.len()];
+    if sk.core_half.max_element() <= 1e-4 {
+        return out;
+    }
+    let env = sk.core_half * (1.0 + slack.max(0.0));
+    let (elo, ehi) = (sk.core_centre - env, sk.core_centre + env);
+    for limb in &sk.limbs {
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for i in &limb.prims {
+            for p in prims.get(*i).copied().unwrap_or(&[]) {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+        }
+        if !(hi.x >= lo.x) {
+            continue;
+        }
+        // translation suffices unless the limb is wider than the whole
+        // envelope on an axis it pokes out of — the jet-wing case
+        let span = hi - lo;
+        let pokes = (hi - ehi).max(Vec3::ZERO) + (elo - lo).max(Vec3::ZERO);
+        let needs_hinge = (0..3).any(|a| pokes[a] > 1e-4 && span[a] > 2.0 * env[a]);
+        let step = if needs_hinge {
+            let rot = fold_rotation(limb, up, 1.0);
+            // bounds of the limb AFTER the hinge — the silhouette the
+            // containment translation actually has to deal with
+            let (mut rlo, mut rhi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for i in &limb.prims {
+                for p in prims.get(*i).copied().unwrap_or(&[]) {
+                    let q = limb.root + rot * (*p - limb.root);
+                    rlo = rlo.min(q);
+                    rhi = rhi.max(q);
+                }
+            }
+            FoldStep {
+                rot,
+                pivot: limb.root,
+                shift: contain_shift(rlo, rhi, elo, ehi, sk.core_centre),
+            }
+        } else {
+            FoldStep {
+                shift: contain_shift(lo, hi, elo, ehi, sk.core_centre),
+                ..FoldStep::default()
+            }
+        };
+        if step == FoldStep::default() {
+            continue;
+        }
+        for i in &limb.prims {
+            if let Some(slot) = out.get_mut(*i) {
+                *slot = step;
             }
         }
     }
@@ -773,6 +869,75 @@ mod tests {
         let off = contain(&sk, &refs, 0.25);
         for (i, o) in off.iter().enumerate() {
             assert!(o.length() < 1e-3, "prim {i} moved on a tidy body: {o:?}");
+        }
+    }
+
+    #[test]
+    fn the_oversized_wing_hinges_and_then_fits_where_translation_could_not() {
+        // the exact case contain's doc names as impossible for it: a
+        // wing wider than the whole envelope. The hinge swings it along
+        // the body FIRST; containment then translates the rotated
+        // silhouette. Judge the composition by the overhang it leaves.
+        let j = jet();
+        let refs: Vec<&[Vec3]> = j.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        let env = sk.core_half * 1.25;
+        let (elo, ehi) = (sk.core_centre - env, sk.core_centre + env);
+        let overhang = |pts: &[Vec3]| {
+            pts.iter()
+                .map(|p| {
+                    let over = (*p - ehi).max(Vec3::ZERO) + (elo - *p).max(Vec3::ZERO);
+                    over.max_element()
+                })
+                .fold(0.0f32, f32::max)
+        };
+        let steps = fold_pack(&sk, &refs, 0.25, Vec3::Y);
+        // translation-only, for comparison — the measured 1.98 per side
+        let slide = contain(&sk, &refs, 0.25);
+        let mut hinged = 0;
+        let (mut worst_rotated, mut worst_slid) = (0.0f32, 0.0f32);
+        for limb in &sk.limbs {
+            let i0 = limb.prims[0];
+            if steps[i0].rot == Quat::IDENTITY {
+                continue;
+            }
+            hinged += 1;
+            let s = steps[i0];
+            for i in &limb.prims {
+                let rot: Vec<Vec3> =
+                    refs[*i].iter().map(|p| s.pivot + s.rot * (*p - s.pivot) + s.shift).collect();
+                let sld: Vec<Vec3> = refs[*i].iter().map(|p| *p + slide[*i]).collect();
+                worst_rotated = worst_rotated.max(overhang(&rot));
+                worst_slid = worst_slid.max(overhang(&sld));
+            }
+        }
+        assert!(hinged >= 2, "the wings did not hinge: {}", sk.report());
+        // both directions pinned: the hinge must beat translation by a
+        // wide margin AND land genuinely close to the envelope — a floor
+        // alone would pass a hinge that stopped discriminating
+        assert!(
+            worst_rotated < worst_slid * 0.5,
+            "hinging did not beat sliding: {worst_rotated} vs {worst_slid}"
+        );
+        assert!(
+            worst_rotated < 1.0,
+            "the hinged wing still hangs far outside the hull: {worst_rotated}"
+        );
+    }
+
+    #[test]
+    fn a_tidy_body_gets_identity_fold_steps() {
+        // same fixture and same promise as containment's tidy-body test:
+        // parts already inside their hull are not rotated OR nudged
+        let car = vec![
+            blob(Vec3::ZERO, Vec3::new(1.2, 0.7, 2.4), 600),
+            blob(Vec3::new(0.5, 0.2, 0.4), Vec3::splat(0.25), 80),
+        ];
+        let refs: Vec<&[Vec3]> = car.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        for (i, s) in fold_pack(&sk, &refs, 0.25, Vec3::Y).iter().enumerate() {
+            assert!(s.rot == Quat::IDENTITY, "prim {i} rotated on a tidy body");
+            assert!(s.shift.length() < 1e-3, "prim {i} moved on a tidy body: {:?}", s.shift);
         }
     }
 

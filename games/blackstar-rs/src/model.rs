@@ -81,11 +81,12 @@ pub struct Model {
     /// the destination moves.
     pub settle: Quat,
     pub tuck: Vec<Vec3>,
-    /// per-prim pull-in for VEHICLE MODE: what it takes to get each limb
-    /// inside the hull envelope, so a folded body reads as a solid object
-    /// instead of a skeleton in a box (`skeleton::contain`). Zero for
-    /// anything already tidy.
-    pub pack: Vec<Vec3>,
+    /// per-prim VEHICLE-MODE fold: hinge about the limb root for what
+    /// translation cannot fit, then a containment shift on the rotated
+    /// result, so a folded body reads as a solid object instead of a
+    /// skeleton in a box (`skeleton::fold_pack`). Identity for anything
+    /// already tidy.
+    pub pack: Vec<crate::skeleton::FoldStep>,
     /// what this hull carries: a turret to aim and treads to roll
     /// (`turret::find`). Indices are into `prims`, so the draw path can
     /// give the turret its own rotation without a second model.
@@ -1306,10 +1307,12 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
         let sk = crate::skeleton::skeletonize(&refs);
         (
             crate::skeleton::compact(&sk, refs.len(), 0.5),
-            // vehicle mode is stricter: contain rather than shorten, with
-            // a quarter of the core's own size as slack so a bonnet still
-            // reads as a bonnet
-            crate::skeleton::contain(&sk, &refs, 0.25),
+            // vehicle mode is stricter: hinge what translation cannot
+            // fit, then contain the rotated result — with a quarter of
+            // the core's own size as slack so a bonnet still reads as a
+            // bonnet. `fold_pack`'s own doc records why rotate-first is
+            // the right composition.
+            crate::skeleton::fold_pack(&sk, &refs, 0.25, Vec3::Y),
         )
     };
 
