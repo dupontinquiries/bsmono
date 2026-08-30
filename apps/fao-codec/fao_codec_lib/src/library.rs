@@ -1103,24 +1103,38 @@ fn read_manifest(path: &Path) -> std::io::Result<LibraryManifest> {
     }
     
     // Parse the webs array — split on object boundaries.
-    let webs_start = match raw.find("\"webs\"") {
+    //
+    // The previous version of this loop began depth-counting at the
+    // "webs" KEY rather than at the array's '[' — so the first stub's
+    // '{' was mistaken for "the outer object" (depth 0→1) while capture
+    // required a close at depth 1. Net effect: the FIRST web in every
+    // manifest was silently dropped on read. A one-web library reloaded
+    // as empty (the long-documented manifest_persists failure), and any
+    // production library silently lost its oldest canonical on every
+    // open. Anchor on the '[' and count stub braces from depth 0.
+    let webs_key = match raw.find("\"webs\"") {
         Some(i) => i,
         None => return Ok(m),
     };
-    let webs_section = &raw[webs_start..];
+    let arr_open = match raw[webs_key..].find('[') {
+        Some(i) => webs_key + i + 1,
+        None => return Ok(m),
+    };
+    let webs_section = &raw[arr_open..];
     
     let mut depth = 0i32;
     let mut start = None;
     for (i, c) in webs_section.char_indices() {
         match c {
             '{' => {
-                if depth == 0 { /* outer object — skip */ }
-                if depth >= 1 && start.is_none() { start = Some(i); }
+                if depth == 0 {
+                    start = Some(i);
+                }
                 depth += 1;
             }
             '}' => {
                 depth -= 1;
-                if depth == 1 {
+                if depth == 0 {
                     if let Some(s) = start.take() {
                         let obj = &webs_section[s..=i];
                         if let Some(stub) = parse_web_stub(obj) {
@@ -1129,6 +1143,7 @@ fn read_manifest(path: &Path) -> std::io::Result<LibraryManifest> {
                     }
                 }
             }
+            ']' if depth == 0 => break,
             _ => {}
         }
     }
@@ -1659,7 +1674,19 @@ mod tests {
     use super::*;
     
     fn temp_dir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("fao_lib_test_{}", std::process::id()));
+        // MUST be unique per call, not per process: cargo runs tests in
+        // parallel threads within ONE process, and the old pid-only name
+        // meant every library test shared a directory — with each call
+        // starting remove_dir_all, tests deleted the library out from
+        // under each other. That was the entire cause of the long-
+        // documented "library tests fail (sandbox filesystem quirk?)"
+        // mystery: manifest entries vanishing mid-test (a sibling's
+        // remove_dir_all), size mismatches (two tests' webs interleaved
+        // in one manifest), and run-to-run flakiness in WHICH tests
+        // failed (thread scheduling).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("fao_lib_test_{}_{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&p);
         p
     }

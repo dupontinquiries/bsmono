@@ -6922,12 +6922,20 @@ mod densify_tests {
     
     #[test]
     fn anchor_cadence_correct() {
-        let pass = DensifyPass::default();  // anchor_interval = 30
+        // Default anchor_interval was deliberately raised 30 → 60 (see
+        // the documented perf decision at the Default impl); this test
+        // still asserted the old cadence and had never been updated —
+        // a stale expectation, not a regression. Assert the semantics
+        // against the actual configured interval so a future retune
+        // doesn't strand it again.
+        let pass = DensifyPass::default();
+        let iv = pass.anchor_interval;
+        assert!(iv > 0);
         assert!(pass.is_anchor_frame(0));
-        assert!(pass.is_anchor_frame(30));
-        assert!(pass.is_anchor_frame(60));
-        assert!(!pass.is_anchor_frame(15));
-        assert!(!pass.is_anchor_frame(29));
+        assert!(pass.is_anchor_frame(iv));
+        assert!(pass.is_anchor_frame(iv * 2));
+        assert!(!pass.is_anchor_frame(iv / 2));
+        assert!(!pass.is_anchor_frame(iv - 1));
     }
 }
 

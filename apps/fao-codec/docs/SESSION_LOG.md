@@ -2870,3 +2870,29 @@ coherent near-field clusters with a sparse far-depth tail; the clouds
 are small but geometrically sane. Delivered as cloud_smiteB.ply /
 cloud_shotA.ply. Densification path when wanted: DepthMap +
 MeshIntegrator (dense contract) fed from these sparse anchors.
+
+### Suite fully green — the last three failures root-caused (same session)
+
+1. **Library tests destroyed each other**: temp_dir() keyed on process
+   id alone; cargo's parallel test threads shared one directory, and
+   each test's opening remove_dir_all deleted the library out from
+   under its siblings. This alone was the run-to-run flakiness in WHICH
+   library tests failed. Fixed with a per-call atomic sequence.
+2. **The real one — manifest reader dropped the FIRST web**: the
+   hand-rolled JSON walker began depth-counting at the "webs" KEY, so
+   the first stub's '{' was mistaken for the enclosing object and its
+   close never hit the capture depth. Every manifest reload silently
+   lost its oldest canonical; a one-web library reloaded as empty
+   (manifest_persists), and quick_stats "disagreed" with
+   total_disk_bytes only because the reopened library was missing the
+   blob it should have counted. For production libraries this was
+   compounding data loss on every open — and it sat directly under
+   cross-video web sharing, the codec's core asymptotic thesis. Parser
+   now anchors on the array '[' and terminates at its ']'.
+3. **anchor_cadence_correct was stale**: default anchor_interval was
+   deliberately retuned 30 → 60 (documented at the Default impl); the
+   test still asserted 30. Now asserts the semantics against the
+   configured interval so retunes can't strand it again.
+
+fao-codec-lib: 82 passed / 0 failed. At session start: 66 / 7 with the
+test binary having been uncompilable until 2026-08-19.
