@@ -1953,3 +1953,49 @@ table" sound like in a commit subject.
   raids, physics and folding. It never fails a build — a gate would grow
   an allowlist nobody maintains, and the value is a list a person reads
   after a merge.
+
+## 34. Fleet run after the index fix: 6738 passing, 9 crates failing
+
+Clearing the uuid index cache recovered almost everything: 35 of 38
+builds ok (was 13), 26 crates green, 6738 tests passing. The remainder
+is not one problem — it is at least four, and grouping them hid that
+last time.
+
+**Fixed here:**
+- **studio `analysis_runs_far_faster_than_realtime`** — the test measured
+  the MACHINE, not the code. A flat `took < 0.25` bound: 0.13 s on the
+  x86_64 sandbox, 0.961 s on the Asahi aarch64 laptop, same debug build,
+  algorithm untouched. Now calibrates against a fixed float workload on
+  the same machine and asserts a RATIO (measured 1.9 healthy, limit 12).
+  That still catches an algorithmic regression — decimated coarse search
+  back to a full one is an order of magnitude — while surviving hardware
+  that is uniformly 7x slower. A perf test that fails on slow hardware
+  trains people to ignore it, which costs more than the regression it
+  guards.
+- **gitmind `binpin`** — THIRD instance this week of the same shape.
+  `Scratch` gives each test its own directory and then points at it by
+  setting `HOME`, a process-global env var, while cargo runs the five
+  tests in parallel. One test's `set_var` (and its `remove_dir_all` on
+  drop) lands mid-run in another, so the assertion loaded a manifest
+  from a different test's HOME. Production behaviour was correct; the
+  test could not see it. Serialised, with HOME restored on drop.
+
+**Still open:**
+- **beatspace** (5 build errors) — already fixed after the run's commit
+  (`a66bf03a`); the fleet ran at `aa2816ce`.
+- **rusty-board** — `gtk4-layer-shell-sys` build script. A missing
+  system library, not our code.
+- **C12-34a — bot-arena, fao-codec, logscope, voiceterm, ambient-learner,
+  rusty-board-crates-board-layouts** still failing, unexamined here.
+  `voiceterm::snapshot_store::snapshot_restore_roundtrip` says "3 files
+  restored, left: 0, right: 3", which has the same smell as the gitmind
+  one — a filesystem test whose fixture another test removed. Worth
+  checking for a shared directory or env var before assuming the restore
+  logic is wrong.
+
+**The pattern worth acting on:** three of the failures I have diagnosed
+across two fleet runs were test-isolation races over a process-global
+(HOME, XDG_DATA_HOME, XDG_RUNTIME_DIR), and one was a machine-speed
+assertion. None were product bugs. A `parallel_test_hazard` check —
+grep for `set_var` inside `#[cfg(test)]` without a serialising lock —
+would have found all three mechanically.

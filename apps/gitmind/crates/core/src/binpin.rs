@@ -390,18 +390,58 @@ mod remove_tests {
 
     /// Point HOME at a scratch dir so the store is real but disposable — these
     /// functions touch the filesystem by design, and a mock would test the mock.
-    struct Scratch(std::path::PathBuf);
+    /// Serialises the tests in this module.
+    ///
+    /// `Scratch` gives each test its own directory, which READS like
+    /// isolation and is not: it points at that directory by setting
+    /// `HOME`, a PROCESS-GLOBAL env var, while cargo runs these five
+    /// tests on parallel threads. So one test's `set_var` — and its
+    /// `remove_dir_all` on drop — lands in the middle of another's run,
+    /// and the other one reads a manifest from a directory that has just
+    /// been deleted or repointed.
+    ///
+    /// That is exactly what the fleet reported here: an empty label
+    /// "removed" a version it cannot remove, because the manifest the
+    /// assertion loaded came from a different test's HOME. The
+    /// production behaviour is correct; the test could not see it.
+    ///
+    /// Third instance of this shape found this week (bo-suite's
+    /// audio_capture_dump, aperture-engine's socket_path, now this), so
+    /// it is worth naming plainly: a per-test tempdir is not isolation
+    /// when the thing selecting it is global.
+    ///
+    /// Poison ignored so one panicking test does not mask the rest.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct Scratch(std::path::PathBuf, std::sync::MutexGuard<'static, ()>, Option<String>);
     impl Scratch {
         fn new(tag: &str) -> Scratch {
+            let guard = test_lock();
+            let prev = std::env::var("HOME").ok();
             let p = std::env::temp_dir().join(format!("gitmind-test-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             std::env::set_var("HOME", &p);
-            Scratch(p)
+            Scratch(p, guard, prev)
         }
     }
     impl Drop for Scratch {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            // Put HOME back before releasing the lock. A test that leaves
+            // it pointing at a deleted directory breaks whatever runs
+            // next in this process, which is a failure with no connection
+            // to its cause.
+            match self.2.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn pin(name: &str, label: &str) {
