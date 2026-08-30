@@ -3955,8 +3955,23 @@ exists.
 - **C74a — NOT COMPILED.** The apps built in their own fork against
   their own lockfile; nothing here has resolved them against this tree's
   dependency set yet.
-- **C74b — the histories stay separate.** 793 commits of CADscope
-  lineage live in the bundles, not in `main`. Grafting the working tree
-  keeps the code without pretending the two histories were ever one, and
-  `BRANCH_INDEX.md`'s claim that the corpus is "derived, not upstream"
-  still holds.
+- **C74b — SUPERSEDED: the history is now IN main.** The flat graft was
+  the wrong call. It imported a working tree and dropped 39 commits of
+  authorship and reasoning — for a project whose commit messages carry
+  most of the reasoning, that is the part worth keeping.
+
+  Replayed instead: `git format-patch --root main -- apps/cadscope
+  apps/simscope` from the reconstructed fork, then `git am` onto ours.
+  All 39 applied with no conflicts, because both apps are self-contained
+  and touch nothing else in the tree.
+
+  VERIFIED, not assumed: `git ls-tree -r` over both paths gives 108
+  files on each side with IDENTICAL BLOB HASHES. The replayed tree is
+  byte-for-byte the source, and now it has the history too — messages
+  like "three bugs, and where nacre's toughness comes from" and "the
+  bracket catches two of my wrong expectations" are in `git log` rather
+  than lost to a copy.
+
+  The remaining 754 commits of the fork are shared monorepo history that
+  predates the divergence; only the 39 that touch these two apps are
+  ours to take.
