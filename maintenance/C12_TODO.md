@@ -1221,7 +1221,32 @@ Aperture has the palette toggle ("View: Bottom command strip") and the
 state; `Strip::used` should be called from the palette's own dispatch so
 recents populate themselves.
 
-- **C12-26a — nothing DRAWS the strip yet.** The model, the gesture and
+- **C12-26a — DONE, the strip is drawn.** A bottom panel above the
+  status bar (so the status line stays last), shown only when the
+  palette toggle turns it on. The palette button opens on TAP-AND-HOLD
+  via `cmdstrip::Hold`, which is the way into the palette on a touch
+  screen where Ctrl+P is unreachable.
+
+  Two decisions in the drawing: `Hold::tick` runs BEFORE the widgets, so
+  the menu opens on the frame the threshold is crossed rather than one
+  late — a hold that visibly lags reads as a missed press. And a TAP
+  opens the palette rather than running the first recent, because the
+  strip's own buttons are already the fast path for recents; making the
+  palette button do something else on tap would be two behaviours on one
+  control.
+
+  `AppState::run_strip_command` matches on the label, since the palette
+  has no separate command id and inventing one would be a second naming
+  scheme to keep in step. An unknown id says so rather than guessing at
+  a near match — a stale entry is a real possibility once commands are
+  removed.
+
+  The palette now ALSO records what it ran, so recents populate from
+  normal keyboard use. Without that the strip would only learn from
+  itself, and the command someone reaches for most — picked from the
+  palette — would never appear on it. aperture-egui 67/67.
+
+  **OLD ENTRY:** The model, the gesture and
   the toggle exist; there is no bottom bar in aperture's frame and no
   hold target wired to `cmd_hold`. That is the remaining half and it is
   a rendering job.

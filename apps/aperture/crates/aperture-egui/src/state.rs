@@ -1902,6 +1902,32 @@ impl AppState {
         true
     }
 
+    /// Run a command chosen from the bottom strip, and record the use.
+    ///
+    /// Recording is the point of the strip: it leads with what you just
+    /// used, so a command run from it has to feed that list too — or the
+    /// strip would only ever learn from the palette and the thing you
+    /// press most would drift off it.
+    ///
+    /// Unknown ids are IGNORED rather than silently doing something
+    /// close: a stale entry (a command removed since it was recorded) is
+    /// a real possibility, and guessing is worse than nothing happening.
+    pub fn run_strip_command(&mut self, id: &str, now_ms: u64) {
+        // Matched on the LABEL, which is what the strip stores as its id.
+        // The palette has no separate command id, and inventing one here
+        // would be a second naming scheme to keep in step with the first.
+        let Some((label, cmd)) = crate::palette_ui::command_list()
+            .into_iter()
+            .find(|(l, _)| l == id)
+        else {
+            self.set_status("that command is no longer available", now_ms);
+            return;
+        };
+        self.cmd_strip
+            .used(uikit_egui::cmdstrip::Cmd::new(&label, &label));
+        crate::palette_ui::apply(cmd, self, now_ms);
+    }
+
     pub fn trigger_completion_now(&mut self, _now_ms: u64) {
         let ctx = self.fim_context();
         let Some(engine) = &self.engine else { return };
@@ -2069,7 +2095,7 @@ impl AppState {
         self.loop_log.truncate(40);
     }
 
-    fn open_palette(&mut self) {
+    pub(crate) fn open_palette(&mut self) {
         self.palette = Some(crate::palette_ui::PaletteState::commands());
         self.ghost.dismiss();
         self.debounce.cancel();

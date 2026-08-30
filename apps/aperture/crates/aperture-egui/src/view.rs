@@ -52,6 +52,20 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
             .show_inside(root, |ui| crate::loop_pane::show(ui, state, &colors, now_ms));
     }
 
+    // THE MOBILE COMMAND STRIP, above the status bar so the status line
+    // stays the last thing on screen. Drawn only when asked for — it
+    // costs screen height from the file the person came to read, so the
+    // palette carries the toggle ("View: Bottom command strip").
+    //
+    // This is the way into the palette on a touch screen: Ctrl+P is
+    // unreachable there, which made every command in it desktop-only by
+    // accident rather than by decision.
+    if state.cmd_strip.visible {
+        egui::Panel::bottom("aperture_cmd_strip").show_inside(root, |ui| {
+            cmd_strip_bar(ui, state, &colors, now_ms);
+        });
+    }
+
     egui::Panel::bottom("aperture_status").show_inside(root, |ui| {
         status_bar(ui, state, &colors, now_ms);
     });
@@ -728,6 +742,59 @@ fn mark_span(rail: Rect, line0: usize, line1: usize, total_lines: usize) -> (f32
 }
 
 
+/// The strip: a palette button that opens on tap-and-hold, then recents
+/// and pinned quick actions.
+///
+/// The HOLD is what reaches the palette without a keyboard. A tap runs
+/// the first recent instead, because on a strip whose whole point is the
+/// last thing you used, a tap that opened a menu would put a step in
+/// front of the common case.
+fn cmd_strip_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms: u64) {
+    use uikit_egui::cmdstrip::Release;
+    let dt = ui.input(|i| i.stable_dt);
+    // Tick BEFORE drawing, so the menu opens on the frame the threshold
+    // is crossed rather than one frame late — a hold that visibly lags
+    // reads as a missed press.
+    if state.cmd_hold.tick(dt) {
+        state.open_palette();
+    }
+
+    ui.horizontal(|ui| {
+        let palette = ui.button("⌘");
+        if palette.is_pointer_button_down_on() && !state.cmd_hold.is_open() {
+            state.cmd_hold.press();
+        }
+        if palette.drag_stopped() || palette.clicked() {
+            match state.cmd_hold.release() {
+                Some(Release::Tap) => state.open_palette(),
+                Some(Release::Hold) | None => {}
+            }
+        }
+        palette.on_hover_text("tap or hold for the command palette");
+
+        ui.separator();
+        // Entries are recents first, then pinned — see `cmdstrip::Strip`.
+        let entries: Vec<(String, String)> = state
+            .cmd_strip
+            .entries()
+            .iter()
+            .map(|c| (c.id.clone(), c.label.clone()))
+            .collect();
+        if entries.is_empty() {
+            ui.label(
+                egui::RichText::new("recents appear here as you use commands")
+                    .color(colors.text_weak)
+                    .small(),
+            );
+        }
+        for (id, label) in entries {
+            if ui.small_button(&label).clicked() {
+                state.run_strip_command(&id, now_ms);
+            }
+        }
+    });
+}
+
 fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms: u64) {
     ui.horizontal(|ui| {
         let name = state
@@ -818,7 +885,11 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     });
 
     let close = esc;
-    let mut apply: Option<palette_ui::Cmd> = None;
+    // The chosen command's LABEL travels with it, so a palette use feeds
+    // the strip's recents. Without this the strip would only ever learn
+    // from itself, and the command you actually reach for most — picked
+    // from the palette — would never appear on it.
+    let mut apply: Option<(String, palette_ui::Cmd)> = None;
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
     let mut submit_edit: Option<String> = None;
@@ -893,11 +964,12 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                     .response
                                     .interact(Sense::click());
                                 if resp.clicked() {
-                                    apply = Some(items[i].1.clone());
+                                    apply = Some((items[i].0.clone(), items[i].1.clone()));
                                 }
                             }
                             if enter && shown > 0 {
-                                apply = Some(items[p.selected.min(shown - 1)].1.clone());
+                                let pick = &items[p.selected.min(shown - 1)];
+                                apply = Some((pick.0.clone(), pick.1.clone()));
                             }
                             if shown == 0 && !p.input.is_empty() {
                                 ui.label(egui::RichText::new("no match").color(colors.text_weak).italics());
@@ -1139,7 +1211,10 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
         return;
     }
 
-    if let Some(cmd) = apply {
+    if let Some((label, cmd)) = apply {
+        state
+            .cmd_strip
+            .used(uikit_egui::cmdstrip::Cmd::new(&label, &label));
         palette_ui::apply(cmd, state, now_ms);
         return;
     }
