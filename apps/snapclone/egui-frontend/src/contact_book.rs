@@ -58,9 +58,31 @@ pub struct Contact {
     /// Trust on first use, with everything that implies: the FIRST sighting is
     /// the one that cannot be checked.
     pub public: Option<[u8; 32]>,
+    /// A signed announcement arrived for this id under a DIFFERENT key and was
+    /// refused.
+    ///
+    /// Persisted, and that is the point: a security warning that disappears
+    /// when the app restarts is one the user never sees, because the restart is
+    /// often how they respond to something looking wrong. It stays until the
+    /// contact is deleted and re-added, which is the deliberate act that means
+    /// "I know why the key changed".
+    pub conflict: bool,
 }
 
 impl Contact {
+    /// How much this contact's identity has been checked.
+    ///
+    /// Three states with three meanings, exposed as one call because every
+    /// place that shows a contact has to answer the same question and a bool
+    /// cannot: "not yet seen signing" and "signed by the wrong key" are
+    /// opposites, and collapsing them would show a warning for a contact who
+    /// has simply never been online.
+    pub fn trust(&self) -> Trust {
+        if self.conflict { Trust::Conflict }
+        else if self.public.is_some() { Trust::Pinned }
+        else { Trust::Unseen }
+    }
+
     /// What to show. Never blank — a row with no label cannot be told from
     /// another row with no label.
     pub fn label(&self) -> &str {
@@ -101,7 +123,8 @@ impl ContactBook {
             return true;
         }
         self.entries.push(Contact {
-            sc_id: sc_id.to_string(), nickname: String::new(), port, added_ms, public: None,
+            sc_id: sc_id.to_string(), nickname: String::new(), port, added_ms,
+            public: None, conflict: false,
         });
         true
     }
@@ -129,7 +152,11 @@ impl ContactBook {
         match c.public {
             None => { c.public = Some(public); Pin::First }
             Some(k) if k == public => Pin::Same,
-            Some(_) => Pin::Changed,
+            // The flag is set HERE rather than by the caller, so a conflict
+            // cannot be detected and then not recorded — which is what happened
+            // when this edit silently failed to apply and `trust()` went on
+            // reporting Pinned for a contact whose key had just been refused.
+            Some(_) => { c.conflict = true; Pin::Changed }
         }
     }
 
@@ -149,6 +176,30 @@ impl ContactBook {
         self.entries.iter()
             .map(|c| crate::Peer { name: c.label().to_string(), online: false })
             .collect()
+    }
+}
+
+/// How far a contact's identity has been checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trust {
+    /// Added, never yet seen signing. Not a warning — most contacts are here
+    /// until the other device is switched on.
+    Unseen,
+    /// A key is on file and every announcement since has matched it.
+    Pinned,
+    /// An announcement arrived under a different key and was refused.
+    Conflict,
+}
+
+impl Trust {
+    /// A short label for a contact row. Deliberately plain language: "key
+    /// mismatch" tells a user nothing about what to do.
+    pub fn label(self) -> &'static str {
+        match self {
+            Trust::Unseen => "not yet seen",
+            Trust::Pinned => "verified",
+            Trust::Conflict => "identity changed — refused",
+        }
     }
 }
 
@@ -186,6 +237,7 @@ pub fn render(book: &ContactBook) -> String {
         out.push_str(&format!("nickname = {}\n", c.nickname));
         out.push_str(&format!("port = {}\n", c.port));
         out.push_str(&format!("added_ms = {}\n", c.added_ms));
+        if c.conflict { out.push_str("conflict = true\n"); }
         if let Some(k) = c.public {
             out.push_str(&format!("public = {}\n",
                                   k.iter().map(|b| format!("{b:02x}")).collect::<String>()));
@@ -229,6 +281,7 @@ pub fn parse(text: &str) -> ContactBook {
             port,
             added_ms,
             public,
+            conflict: ini.get(sc_id, "conflict").map(|v| v.trim() == "true").unwrap_or(false),
         });
     }
     // Oldest first, so the list a user sees does not reshuffle when the file's
@@ -389,6 +442,45 @@ mod tests {
         // as a key CHANGE and refuse a peer who did nothing wrong.
         let broken = parse("[sc-aabbccdd]\nport = 9876\npublic = beef\n");
         assert_eq!(broken.get("sc-aabbccdd").unwrap().public, None);
+    }
+
+    #[test]
+    fn the_three_trust_states_are_kept_apart() {
+        // "Not yet seen signing" and "signed by the wrong key" are opposites.
+        // A bool would show a warning for every contact whose device is simply
+        // switched off.
+        let mut b = book();
+        assert_eq!(b.get("sc-aabbccdd").unwrap().trust(), Trust::Unseen);
+        b.pin("sc-aabbccdd", [7u8; 32]);
+        assert_eq!(b.get("sc-aabbccdd").unwrap().trust(), Trust::Pinned);
+        b.pin("sc-aabbccdd", [8u8; 32]);
+        assert_eq!(b.get("sc-aabbccdd").unwrap().trust(), Trust::Conflict);
+    }
+
+    #[test]
+    fn a_refused_key_change_survives_a_restart() {
+        // A security warning that disappears when the app restarts is one the
+        // user never sees — restarting is often how people respond to something
+        // looking wrong.
+        let mut b = book();
+        b.pin("sc-aabbccdd", [7u8; 32]);
+        b.pin("sc-aabbccdd", [8u8; 32]);
+        let back = parse(&render(&b));
+        assert_eq!(back.get("sc-aabbccdd").unwrap().trust(), Trust::Conflict);
+        assert_eq!(back, b);
+    }
+
+    #[test]
+    fn deleting_and_re_adding_clears_the_conflict() {
+        // The deliberate act that means "I know why the key changed". There is
+        // no other way to clear it, on purpose: a one-tap dismiss on a warning
+        // like this gets tapped.
+        let mut b = book();
+        b.pin("sc-aabbccdd", [7u8; 32]);
+        b.pin("sc-aabbccdd", [8u8; 32]);
+        b.remove("sc-aabbccdd");
+        b.upsert("sc-aabbccdd", 9876, 3_000);
+        assert_eq!(b.get("sc-aabbccdd").unwrap().trust(), Trust::Unseen);
     }
 
     #[test]

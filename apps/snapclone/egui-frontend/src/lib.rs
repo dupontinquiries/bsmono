@@ -2913,6 +2913,55 @@ impl Snapclone {
             if ui.button("Scan code").clicked() { self.open_qr_scan(true); }
             if ui.button("Enter code").clicked() { self.open_qr_scan(false); }
         });
+
+        // WHAT DISCOVERY FOUND, and what the app makes of it. Two gaps this
+        // closes, both of which left real state with no way to see or act on
+        // it:
+        //
+        // 1. A peer found by gossip appears as a row and is NOT in the address
+        //    book, so it is gone on restart and there was no way to keep it.
+        //    Discovery deliberately does not auto-save strangers — an address
+        //    book that fills itself from the subnet is not an address book —
+        //    but "I see them, keep them" had no button.
+        // 2. A refused key change reached stderr and nowhere else. On a phone
+        //    that is the same as nowhere.
+        let mut keep: Option<(String, u16)> = None;
+        for p in &self.peers {
+            match self.contact_book.get(&p.name) {
+                // `entry`, not `c` — the palette is already `c` in this
+                // function and shadowing it here produced three field errors
+                // that read as the Contact type being wrong.
+                Some(entry) => {
+                    let t = entry.trust();
+                    let col = match t {
+                        crate::contact_book::Trust::Conflict => c.danger,
+                        _ => c.text_weak,
+                    };
+                    ui.colored_label(col, format!("{}  ·  {}", entry.label(), t.label()));
+                }
+                None => {
+                    // Only a real sc-ID can be saved: the book is keyed by id,
+                    // and a row named after a hostname has nothing to store.
+                    if !crate::identity::is_valid(&p.name) { continue; }
+                    ui.horizontal(|ui| {
+                        ui.colored_label(c.text_weak, format!("{}  ·  discovered", p.name));
+                        if ui.button("Keep").clicked() {
+                            let port = self.view.peers().iter()
+                                .find(|r| r.id == p.name)
+                                .map(|r| r.port)
+                                .unwrap_or(crate::qr::DEFAULT_PORT);
+                            keep = Some((p.name.clone(), port));
+                        }
+                    });
+                }
+            }
+        }
+        // Applied after the loop: `keep` exists because the buttons are drawn
+        // while `self.peers` is borrowed, and adding a contact mutates it.
+        if let Some((id, port)) = keep {
+            self.apply_friends(crate::friends::Action::Add(
+                crate::friends::AddPeer { host: id, port }));
+        }
         if let Some(a) = crate::friends::friends_ui(
             ui, &self.roster, &mut self.cards, &mut self.add_form, c) {
             self.apply_friends(a);
