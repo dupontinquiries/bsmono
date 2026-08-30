@@ -181,9 +181,15 @@ impl Picker {
             .collect();
         // favourites first, then alphabetical — a list that reorders itself
         // between frames is one you misclick
+        // `then_with`, so the name comparison — two String allocations —
+        // only runs when the favourite flags tie, rather than on every
+        // pair. A contact list is small, so this is not about the cycles:
+        // it is that the eager form is the one someone copies into a
+        // bigger list later, which is how bo-suite's album sort ended up
+        // allocating half a million Strings a frame.
         v.sort_by(|a, b| b.favourite.cmp(&a.favourite)
-            .then(a.label().to_lowercase().cmp(&b.label().to_lowercase()))
-            .then(a.id.cmp(&b.id)));
+            .then_with(|| cmp_fold(a.label(), b.label()))
+            .then_with(|| a.id.cmp(&b.id)));
         v
     }
 }
@@ -241,6 +247,18 @@ impl Editor {
         self.contact.as_ref().map(|c| !c.sc_id.is_empty() || !c.display_name.is_empty())
             .unwrap_or(false)
     }
+}
+
+/// Case-insensitive compare with no allocation.
+///
+/// `a.to_lowercase().cmp(&b.to_lowercase())` builds two Strings per
+/// comparison. `flat_map(char::to_lowercase)` rather than
+/// `to_ascii_lowercase` because one uppercase char can fold to several,
+/// and a cheaper comparison that ORDERED DIFFERENTLY would be a
+/// behaviour change wearing a performance fix's clothes — contact names
+/// are exactly where non-ASCII shows up.
+fn cmp_fold(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
 }
 
 #[cfg(test)]

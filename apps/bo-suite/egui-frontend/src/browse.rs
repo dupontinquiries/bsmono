@@ -279,8 +279,14 @@ pub fn sort_albums(albums: &mut [Album], sort: AlbumSort) {
 pub fn top_albums(all: &[Album], limit: usize) -> Vec<Album> {
     let mut v: Vec<Album> = all.iter().filter(|a| a.total_plays > 0).cloned().collect();
     v.sort_by(|a, b| {
+        // `then_with` so the two `unwrap_or` calls only run when the
+        // play counts tie. Cheap either way — this one is for
+        // consistency with its neighbours rather than for the cycles:
+        // a comparator that mixes `then` and `then_with` invites the
+        // next reader to assume the difference is meaningful.
         b.total_plays.cmp(&a.total_plays)
-            .then(b.last_played_at.unwrap_or(i64::MIN).cmp(&a.last_played_at.unwrap_or(i64::MIN)))
+            .then_with(|| b.last_played_at.unwrap_or(i64::MIN)
+                .cmp(&a.last_played_at.unwrap_or(i64::MIN)))
     });
     v.truncate(limit);
     v
@@ -310,9 +316,15 @@ pub fn sort_artists(artists: &mut [Artist], sort: ArtistSort) {
 pub fn top_artists(all: &[Artist], limit: usize) -> Vec<Artist> {
     let mut v = all.to_vec();
     v.sort_by(|a, b| {
+        // `then_with` on both tiebreaks, and `cmp_fold` for the name.
+        // `then` evaluates eagerly, so the NAME comparison — two String
+        // allocations — ran on every pair even when the play counts had
+        // already decided the order, which is almost always. This is the
+        // same fix as `sort_artists` and I missed it here on that pass:
+        // `top_artists` is a separate function with its own comparator.
         b.total_plays.cmp(&a.total_plays)
-            .then(b.track_count.cmp(&a.track_count))
-            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| b.track_count.cmp(&a.track_count))
+            .then_with(|| cmp_fold(&a.name, &b.name))
     });
     v.truncate(limit);
     v

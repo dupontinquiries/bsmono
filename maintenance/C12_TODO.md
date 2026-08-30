@@ -2973,3 +2973,37 @@ Also fixed `keywords` itself, since it has other callers:
 I got that second comment backwards on the first pass ("once per kept
 word rather than once per unique word" — those are the same thing) and
 corrected it. The saving is over REPEATS, not over uniques.
+
+## 53. Perf: two more allocating comparators, one live and one not
+
+Followed the `to_lowercase()`-in-a-comparator pattern out of bo-suite's
+browse into the rest of the fleet.
+
+**bo-suite `top_artists` — LIVE, and I missed it in §46b.** It is a
+separate function from `sort_artists` with its own comparator, so fixing
+one did not fix the other. Same shape: `.then(a.name.to_lowercase()
+.cmp(&b.name.to_lowercase()))`, where `then` is EAGER — the two String
+allocations ran on every pair even though the play counts had already
+decided the order, which is almost always. Now `then_with` + `cmp_fold`.
+
+`top_albums` got `then_with` too. That one is cheap either way and the
+change is for consistency: a comparator that mixes `then` and
+`then_with` invites the next reader to assume the difference is
+meaningful.
+
+**snapclone `ContactPicker::visible` — NOT live.** Same eager-`then`
+allocating comparator, but `visible()` has no caller outside its own
+tests, so the picker is unhosted and this costs nothing today. Fixed
+anyway, and the comment says why: the eager form is the one somebody
+copies into a bigger list later, which is how bo-suite's album sort
+ended up allocating half a million Strings a frame.
+
+Being precise about which of these two mattered is the point. One was a
+real cost in a draw path; the other is a latent pattern in dead code.
+Reporting them as equivalent findings would inflate the work.
+
+- **C12-53a — `visible()` also lowercases the query and BOTH fields per
+  contact on every call.** Not fixed: the right shape is to fold the
+  query once outside the loop and compare with a case-insensitive
+  `contains`, which Rust has no std method for. Worth doing when the
+  picker gets a caller, not before.
